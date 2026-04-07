@@ -1906,13 +1906,13 @@ where
     let reml_seed_config = SeedConfig {
         bounds: (-12.0, 12.0),
         max_seeds: if k <= 4 {
-            8
+            6
         } else if k <= 12 {
-            10
+            8
         } else {
-            12
+            10
         },
-        seed_budget: if k <= 6 { 2 } else { 3 },
+        seed_budget: if k <= 6 { 1 } else { 2 },
         risk_profile: if matches!(cfg.link_function(), LinkFunction::Identity) {
             SeedRiskProfile::Gaussian
         } else {

@@ -10560,6 +10560,7 @@ mod tests {
         needs_special_generate_handling, needs_special_predict_handling, run_fit, run_predict,
         write_model_json,
     };
+    use clap::Parser;
     use csv::StringRecord;
     use gam::basis::{
         BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,

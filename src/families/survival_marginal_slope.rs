@@ -5,7 +5,7 @@ use crate::custom_family::{
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
     first_psi_linear_map, fit_custom_family, second_psi_linear_map,
     slice_joint_into_block_working_sets,
 };
@@ -13113,12 +13113,12 @@ pub fn fit_survival_marginal_slope_terms(
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
-            let eval = evaluate_custom_family_joint_hyper(
+            let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
                 options,
                 &rho,
-                &derivative_blocks,
+                derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
                 if need_hessian && analytic_joint_hessian_available {
                     crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
@@ -13142,12 +13142,12 @@ pub fn fit_survival_marginal_slope_terms(
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
-            let eval = evaluate_custom_family_joint_hyper_efs(
+            let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
                 options,
                 &rho,
-                &derivative_blocks,
+                derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )?;
             exact_warm_start.replace(Some(eval.warm_start));

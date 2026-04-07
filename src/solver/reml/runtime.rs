@@ -1603,16 +1603,16 @@ impl<'a> RemlState<'a> {
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
-            // Guard: Firth operator requires dense design materialization.
             let firth_n = pirls_result.x_transformed.nrows();
             let firth_p = pirls_result.x_transformed.ncols();
-            const FIRTH_MAX_DENSE_WORK: usize = 50_000_000;
-            if firth_n.saturating_mul(firth_p) > FIRTH_MAX_DENSE_WORK {
-                log::warn!(
-                    "disabling Firth bias reduction for large model (n={}, p={}): \
-                     Firth operator requires dense design and is a small-model-only feature",
+            if !super::firth_problem_scale_allows(firth_n, firth_p) {
+                log::info!(
+                    "disabling Firth bias reduction for large model (n={}, p={}, n*p={}, n*p^2={}): \
+                     exact Firth operator is small-model-only",
                     firth_n,
                     firth_p,
+                    firth_n.saturating_mul(firth_p),
+                    firth_n.saturating_mul(firth_p).saturating_mul(firth_p),
                 );
             } else {
                 let x_dense = pirls_result
@@ -1758,16 +1758,16 @@ impl<'a> RemlState<'a> {
         let firth_dense_operator_original = if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
         {
-            // Guard: Firth operator requires dense design materialization.
             let firth_n = self.x().nrows();
             let firth_p = self.x().ncols();
-            const FIRTH_MAX_DENSE_WORK: usize = 50_000_000;
-            if firth_n.saturating_mul(firth_p) > FIRTH_MAX_DENSE_WORK {
-                log::warn!(
-                    "disabling Firth bias reduction for large model (n={}, p={}): \
-                     Firth operator requires dense design and is a small-model-only feature",
+            if !super::firth_problem_scale_allows(firth_n, firth_p) {
+                log::info!(
+                    "disabling Firth bias reduction for large model (n={}, p={}, n*p={}, n*p^2={}): \
+                     exact Firth operator is small-model-only",
                     firth_n,
                     firth_p,
+                    firth_n.saturating_mul(firth_p),
+                    firth_n.saturating_mul(firth_p).saturating_mul(firth_p),
                 );
                 None
             } else {
@@ -2391,6 +2391,20 @@ impl<'a> RemlState<'a> {
 
         if let Some(z) = free_basis_opt.as_ref() {
             let x_projected = pirls_result.x_transformed.to_dense().dot(z);
+            if !super::firth_problem_scale_allows(x_projected.nrows(), x_projected.ncols()) {
+                log::info!(
+                    "disabling Firth bias reduction for projected outer basis (n={}, p={}, n*p={}, n*p^2={}): \
+                     exact Firth operator is small-model-only",
+                    x_projected.nrows(),
+                    x_projected.ncols(),
+                    x_projected.nrows().saturating_mul(x_projected.ncols()),
+                    x_projected
+                        .nrows()
+                        .saturating_mul(x_projected.ncols())
+                        .saturating_mul(x_projected.ncols()),
+                );
+                return Ok(None);
+            }
             return Ok(Some(std::sync::Arc::new(Self::build_firth_dense_operator(
                 &x_projected,
                 &pirls_result.final_eta,

@@ -5923,10 +5923,6 @@ pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
 /// are handled via smooth spectral regularization `r_ε(σ)` rather than hard
 /// clamping, ensuring that logdet and inverse use the same smooth mapping.
 pub struct DenseSpectralOperator {
-    /// Raw eigenvalues `σ_i` from the eigendecomposition.
-    raw_eigenvalues: Vec<f64>,
-    /// Regularization parameter ε used in `r_ε(σ)`.
-    epsilon: f64,
     /// Regularized eigenvalues: `r_ε(σ_i)` for each raw eigenvalue `σ_i`.
     reg_eigenvalues: Vec<f64>,
     /// Eigenvectors of H (columns).
@@ -6033,11 +6029,7 @@ impl DenseSpectralOperator {
         // Precompute logdet: Σ ln(r_ε(σ_i))
         let cached_logdet: f64 = reg_eigenvalues.iter().map(|&v| v.ln()).sum();
 
-        let raw_eigenvalues: Vec<f64> = eigenvalues.to_vec();
-
         Ok(Self {
-            raw_eigenvalues,
-            epsilon,
             reg_eigenvalues,
             eigenvectors,
             w_factor,

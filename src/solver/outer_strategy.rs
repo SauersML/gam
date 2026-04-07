@@ -23,7 +23,7 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Matrix-free outer Hessian operator.
 ///
@@ -295,6 +295,9 @@ pub struct OuterCapability {
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
+    /// Policy hint: even when an analytic Hessian exists, prefer a gradient-only
+    /// outer solver because each second-order evaluation is too expensive.
+    pub prefer_gradient_only: bool,
 }
 
 impl OuterCapability {
@@ -373,16 +376,114 @@ fn effective_seed_budget(
     requested_budget: usize,
     solver: Solver,
     risk_profile: crate::seeding::SeedRiskProfile,
+    screening_enabled: bool,
 ) -> usize {
     let requested_budget = requested_budget.max(1);
     let capped = match (solver, risk_profile) {
-        (Solver::Efs | Solver::HybridEfs, crate::seeding::SeedRiskProfile::Survival) => 1,
-        (Solver::Efs | Solver::HybridEfs, _) => 2,
+        (Solver::Efs | Solver::HybridEfs, _) => 1,
         (Solver::Arc, crate::seeding::SeedRiskProfile::Survival) => 1,
+        (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) if screening_enabled => 1,
         (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) => 2,
         _ => requested_budget,
     };
     requested_budget.min(capped)
+}
+
+#[inline]
+fn should_screen_seeds(
+    config: &OuterConfig,
+    solver: Solver,
+    generated_seed_count: usize,
+    seed_budget: usize,
+) -> bool {
+    config.screening_cap.is_some()
+        && generated_seed_count > seed_budget
+        && matches!(solver, Solver::Arc | Solver::Efs | Solver::HybridEfs)
+}
+
+#[inline]
+fn expensive_unsuccessful_seed_limit(
+    solver: Solver,
+    risk_profile: crate::seeding::SeedRiskProfile,
+) -> Option<usize> {
+    match (solver, risk_profile) {
+        (Solver::Efs | Solver::HybridEfs, _) => Some(1),
+        (Solver::Arc, crate::seeding::SeedRiskProfile::Survival) => Some(1),
+        (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) => Some(2),
+        _ => None,
+    }
+}
+
+fn rank_seeds_with_screening(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    seeds: &[Array1<f64>],
+) -> Vec<Array1<f64>> {
+    let Some(screening_cap) = config.screening_cap.as_ref() else {
+        return seeds.to_vec();
+    };
+
+    let previous_cap = screening_cap.swap(
+        config.seed_config.screen_max_inner_iterations.max(1),
+        Ordering::Relaxed,
+    );
+    let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
+    let mut rejected = 0usize;
+
+    for (idx, seed) in seeds.iter().enumerate() {
+        obj.reset();
+        match obj.eval_cost(seed) {
+            Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
+            Ok(_) | Err(_) => rejected += 1,
+        }
+    }
+
+    screening_cap.store(previous_cap, Ordering::Relaxed);
+    obj.reset();
+
+    if ranked.is_empty() {
+        log::info!(
+            "[OUTER] {context}: seed screening produced no finite cheap costs; keeping heuristic order"
+        );
+        return seeds.to_vec();
+    }
+
+    ranked.sort_by(|(idx_a, cost_a), (idx_b, cost_b)| {
+        cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
+    });
+
+    let mut ordered = Vec::with_capacity(seeds.len());
+    let mut seen = vec![false; seeds.len()];
+    for (idx, _) in ranked {
+        seen[idx] = true;
+        ordered.push(seeds[idx].clone());
+    }
+    for (idx, seed) in seeds.iter().enumerate() {
+        if !seen[idx] {
+            ordered.push(seed.clone());
+        }
+    }
+
+    log::info!(
+        "[OUTER] {context}: seed screening ranked {}/{} candidates with capped eval_cost \
+         (screen_max_inner_iterations={}); rejected={}",
+        ordered.len() - rejected,
+        seeds.len(),
+        config.seed_config.screen_max_inner_iterations.max(1),
+        rejected,
+    );
+
+    ordered
+}
+
+#[inline]
+fn candidate_improves_best(candidate: &OuterResult, best: Option<&OuterResult>) -> bool {
+    match best {
+        None => true,
+        Some(best) if candidate.converged != best.converged => candidate.converged,
+        Some(best) => candidate.final_value < best.final_value,
+    }
 }
 
 /// How the Hessian will be obtained for the outer optimizer.
@@ -421,6 +522,8 @@ pub struct OuterPlan {
     pub hessian_source: HessianSource,
 }
 
+pub(crate) const EFS_FIRST_ORDER_FALLBACK_MARKER: &str = "[outer-efs-first-order-fallback]";
+
 /// Whether outer_strategy should automatically derive a downgrade ladder from
 /// the primary capability, or disable retries entirely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,8 +554,16 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
 
     match (cap.gradient, cap.declared_hessian_for_planning()) {
         (Analytic, Analytic) => OuterPlan {
-            solver: S::Arc,
-            hessian_source: H::Analytic,
+            solver: if cap.prefer_gradient_only {
+                S::Bfgs
+            } else {
+                S::Arc
+            },
+            hessian_source: if cap.prefer_gradient_only {
+                H::BfgsApprox
+            } else {
+                H::Analytic
+            },
         },
         // EFS: all penalty-like coords, no analytic Hessian, many params.
         // Multiplicative fixed-point needs only traces — no gradient evals.
@@ -549,6 +660,10 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         cap.hessian,
         the_plan,
     );
+}
+
+fn requests_immediate_first_order_fallback(message: &str) -> bool {
+    message.contains(EFS_FIRST_ORDER_FALLBACK_MARKER)
 }
 
 fn downgrade_hessian(cap: &OuterCapability) -> Option<OuterCapability> {
@@ -1364,6 +1479,7 @@ pub struct OuterProblem {
     n_params: usize,
     gradient: Derivative,
     hessian: Derivative,
+    prefer_gradient_only: bool,
     psi_dim: usize,
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
@@ -1384,6 +1500,7 @@ impl OuterProblem {
             n_params,
             gradient: Derivative::Unavailable,
             hessian: Derivative::Unavailable,
+            prefer_gradient_only: false,
             psi_dim: 0,
             barrier_config: None,
             tolerance: 1e-5,
@@ -1405,6 +1522,10 @@ impl OuterProblem {
     }
     pub fn with_hessian(mut self, d: Derivative) -> Self {
         self.hessian = d;
+        self
+    }
+    pub fn with_prefer_gradient_only(mut self, prefer_gradient_only: bool) -> Self {
+        self.prefer_gradient_only = prefer_gradient_only;
         self
     }
     pub fn with_psi_dim(mut self, dim: usize) -> Self {
@@ -1459,6 +1580,7 @@ impl OuterProblem {
         OuterCapability {
             gradient: self.gradient,
             hessian: self.hessian,
+            prefer_gradient_only: self.prefer_gradient_only,
             n_params: self.n_params,
             psi_dim: self.psi_dim,
             fixed_point_available: false,
@@ -2027,12 +2149,17 @@ fn run_outer_with_plan(
         )));
     }
 
+    let screening_enabled = config.screening_cap.is_some();
     let seed_budget = effective_seed_budget(
         config.seed_config.seed_budget,
         the_plan.solver,
         config.seed_config.risk_profile,
+        screening_enabled,
     )
     .min(seeds.len());
+    if should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget) {
+        seeds = rank_seeds_with_screening(obj, config, context, &seeds);
+    }
     log::info!(
         "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
         seeds.len(),
@@ -2045,11 +2172,6 @@ fn run_outer_with_plan(
             seed_budget,
             the_plan.solver,
             config.seed_config.risk_profile,
-        );
-    }
-    if config.screening_cap.is_some() && log::log_enabled!(log::Level::Trace) {
-        log::trace!(
-            "[OUTER] {context}: screening cap is configured but no global seed-screening pass is used"
         );
     }
     if seeds.len() > seed_budget {
@@ -2071,6 +2193,9 @@ fn run_outer_with_plan(
     let mut last_seed_error: Option<String> = None;
     let layout = cap.theta_layout();
     let mut started_seeds = 0usize;
+    let expensive_seed_limit =
+        expensive_unsuccessful_seed_limit(the_plan.solver, config.seed_config.risk_profile);
+    let mut unsuccessful_expensive_seeds = 0usize;
 
     'seed_attempts: for seed in &seeds {
         if started_seeds == seed_budget {
@@ -2093,6 +2218,9 @@ fn run_outer_with_plan(
                                 EstimationError::RemlOptimizationFailed(message)
                             }
                         };
+                        if requests_immediate_first_order_fallback(&err.to_string()) {
+                            return Err(err);
+                        }
                         log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                         last_seed_error = Some(err.to_string());
                         continue 'seed_attempts;
@@ -2301,6 +2429,9 @@ fn run_outer_with_plan(
                                 EstimationError::RemlOptimizationFailed(message)
                             }
                         };
+                        if requests_immediate_first_order_fallback(&err.to_string()) {
+                            return Err(err);
+                        }
                         log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                         last_seed_error = Some(err.to_string());
                         continue 'seed_attempts;
@@ -2316,6 +2447,9 @@ fn run_outer_with_plan(
                         },
                     );
                 if let Err(err) = seed_eval {
+                    if requests_immediate_first_order_fallback(&err.to_string()) {
+                        return Err(err);
+                    }
                     log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                     last_seed_error = Some(err.to_string());
                     continue 'seed_attempts;
@@ -2360,6 +2494,9 @@ fn run_outer_with_plan(
                                 EstimationError::RemlOptimizationFailed(message)
                             }
                         };
+                        if requests_immediate_first_order_fallback(&err.to_string()) {
+                            return Err(err);
+                        }
                         log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                         last_seed_error = Some(err.to_string());
                         continue 'seed_attempts;
@@ -2375,6 +2512,9 @@ fn run_outer_with_plan(
                         },
                     );
                 if let Err(err) = seed_eval {
+                    if requests_immediate_first_order_fallback(&err.to_string()) {
+                        return Err(err);
+                    }
                     log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                     last_seed_error = Some(err.to_string());
                     continue 'seed_attempts;
@@ -2411,6 +2551,7 @@ fn run_outer_with_plan(
         let seed_elapsed = t_seed_start.elapsed().as_secs_f64();
         match result {
             Ok(candidate) => {
+                let candidate_converged = candidate.converged;
                 log::info!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
                     seed_slot,
@@ -2420,17 +2561,31 @@ fn run_outer_with_plan(
                     candidate.final_value,
                     candidate.converged,
                 );
-                let dominated = best.as_ref().is_some_and(|b| {
-                    b.converged && (!candidate.converged || b.final_value <= candidate.final_value)
-                });
-                if !dominated {
+                if candidate_improves_best(&candidate, best.as_ref()) {
                     best = Some(candidate);
                 }
                 if best.as_ref().is_some_and(|b| b.converged) {
                     break;
                 }
+                if !candidate_converged && matches!(expensive_seed_limit, Some(limit) if limit > 0)
+                {
+                    unsuccessful_expensive_seeds += 1;
+                    if let Some(limit) = expensive_seed_limit
+                        && unsuccessful_expensive_seeds >= limit
+                    {
+                        log::info!(
+                            "[OUTER] {context}: stopping expensive multi-start after {} non-converged {:?} seed(s)",
+                            unsuccessful_expensive_seeds,
+                            the_plan.solver,
+                        );
+                        break;
+                    }
+                }
             }
             Err(e) => {
+                if requests_immediate_first_order_fallback(&e.to_string()) {
+                    return Err(e);
+                }
                 log::info!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  FAILED: {}",
                     seed_slot,
@@ -2440,6 +2595,17 @@ fn run_outer_with_plan(
                     e,
                 );
                 last_seed_error = Some(e.to_string());
+                if let Some(limit) = expensive_seed_limit {
+                    unsuccessful_expensive_seeds += 1;
+                    if unsuccessful_expensive_seeds >= limit {
+                        log::info!(
+                            "[OUTER] {context}: stopping expensive multi-start after {} failed {:?} seed(s)",
+                            unsuccessful_expensive_seeds,
+                            the_plan.solver,
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
@@ -2472,6 +2638,7 @@ fn run_outer_with_plan(
 mod tests {
     use super::*;
     use ndarray::array;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     struct FailingSeedMaterializationOperator {
@@ -2501,10 +2668,27 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
         assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn plan_prefer_gradient_only_downgrades_analytic_hessian_to_bfgs() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 3,
+            psi_dim: 1,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: true,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
@@ -2516,6 +2700,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2531,6 +2716,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2546,6 +2732,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2562,6 +2749,7 @@ mod tests {
                 psi_dim: 0,
                 fixed_point_available: false,
                 barrier_config: None,
+                prefer_gradient_only: false,
             };
             let p = plan(&cap);
             assert_eq!(p.solver, Solver::Bfgs);
@@ -2578,6 +2766,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2592,6 +2781,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2607,6 +2797,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2622,6 +2813,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2637,6 +2829,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2652,6 +2845,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2667,6 +2861,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         // Arc is always preferred when analytic Hessian is available.
@@ -2684,6 +2879,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2707,6 +2903,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: Some(barrier),
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2730,6 +2927,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: Some(barrier),
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2779,6 +2977,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -2806,6 +3005,7 @@ mod tests {
                 psi_dim: 0,
                 fixed_point_available: false,
                 barrier_config: None,
+                prefer_gradient_only: false,
             },
             cost_fn: |_: &mut i32, _: &Array1<f64>| Ok(1.0),
             eval_fn: |_: &mut i32, _: &Array1<f64>| {
@@ -2952,6 +3152,7 @@ mod tests {
             psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::HybridEfs);
@@ -2967,6 +3168,7 @@ mod tests {
             psi_dim: 1,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2984,6 +3186,7 @@ mod tests {
             psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::HybridEfs);
@@ -2999,6 +3202,7 @@ mod tests {
             psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -3016,6 +3220,7 @@ mod tests {
             psi_dim: 1,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -3032,6 +3237,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: true,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -3047,6 +3253,7 @@ mod tests {
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
+            prefer_gradient_only: false,
         };
         let attempts = automatic_fallback_attempts(&cap);
         assert_eq!(attempts.len(), 2);
@@ -3281,6 +3488,61 @@ mod tests {
     }
 
     #[test]
+    fn candidate_selection_prefers_lower_cost_within_same_convergence_class() {
+        let nonconverged_hi = OuterResult {
+            rho: array![0.0],
+            final_value: 9.0,
+            iterations: 1,
+            final_grad_norm: 1.0,
+            final_gradient: None,
+            final_hessian: None,
+            converged: false,
+            plan_used: OuterPlan {
+                solver: Solver::Bfgs,
+                hessian_source: HessianSource::BfgsApprox,
+            },
+        };
+        let nonconverged_lo = OuterResult {
+            rho: array![1.0],
+            final_value: 1.0,
+            iterations: 1,
+            final_grad_norm: 1.0,
+            final_gradient: None,
+            final_hessian: None,
+            converged: false,
+            plan_used: OuterPlan {
+                solver: Solver::Bfgs,
+                hessian_source: HessianSource::BfgsApprox,
+            },
+        };
+        let converged = OuterResult {
+            rho: array![2.0],
+            final_value: 5.0,
+            iterations: 1,
+            final_grad_norm: 0.0,
+            final_gradient: None,
+            final_hessian: None,
+            converged: true,
+            plan_used: OuterPlan {
+                solver: Solver::Bfgs,
+                hessian_source: HessianSource::BfgsApprox,
+            },
+        };
+
+        assert!(candidate_improves_best(&nonconverged_hi, None));
+        assert!(candidate_improves_best(
+            &nonconverged_lo,
+            Some(&nonconverged_hi)
+        ));
+        assert!(!candidate_improves_best(
+            &nonconverged_hi,
+            Some(&nonconverged_lo)
+        ));
+        assert!(candidate_improves_best(&converged, Some(&nonconverged_lo)));
+        assert!(!candidate_improves_best(&nonconverged_lo, Some(&converged)));
+    }
+
+    #[test]
     fn run_starts_solver_with_direct_startup_eval() {
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
@@ -3325,6 +3587,68 @@ mod tests {
             first_eval_idx == 0,
             "startup should not perform a separate cost-screening pass first: {calls:?}"
         );
+    }
+
+    #[test]
+    fn run_screening_reorders_expensive_seeds_before_full_startup_eval() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        seed_config.risk_profile = crate::seeding::SeedRiskProfile::GeneralizedLinear;
+        let screening_cap = Arc::new(AtomicUsize::new(0));
+        let initial_seed = array![9.0];
+        let valid_seed = crate::seeding::generate_rho_candidates(1, None, &seed_config)
+            .first()
+            .expect("seed generator should yield at least one candidate")
+            .clone();
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_seed_config(seed_config)
+            .with_screening_cap(Arc::clone(&screening_cap))
+            .with_initial_rho(initial_seed.clone())
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let valid_seed = valid_seed.clone();
+                move |_: &mut (), theta: &Array1<f64>| {
+                    if theta == &valid_seed {
+                        Ok(0.0)
+                    } else {
+                        Ok(1000.0)
+                    }
+                }
+            },
+            {
+                let valid_seed = valid_seed.clone();
+                let started = Arc::clone(&started);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    started.lock().unwrap().push(theta.clone());
+                    if theta == &valid_seed {
+                        Ok(OuterEval {
+                            cost: 0.0,
+                            gradient: array![0.0],
+                            hessian: HessianResult::Analytic(array![[1.0]]),
+                        })
+                    } else {
+                        Ok(OuterEval::infeasible(theta.len()))
+                    }
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "screening should reorder expensive seeds")
+            .expect("screened startup should reach the best generated seed");
+        assert_eq!(result.rho, valid_seed);
+        assert_eq!(
+            started.lock().unwrap().first().cloned(),
+            Some(valid_seed),
+            "screening should move the lowest-cost seed to the front before full startup eval",
+        );
+        assert_eq!(screening_cap.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3424,6 +3748,50 @@ mod tests {
     }
 
     #[test]
+    fn run_efs_runtime_fallback_marker_degrades_to_bfgs_immediately() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 2;
+        let efs_calls = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(12)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_seed_config(seed_config)
+            .with_initial_rho(Array1::zeros(12))
+            .with_max_iter(5);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(0.5 * theta.dot(theta)),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.5 * theta.dot(theta),
+                    gradient: theta.clone(),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            None::<fn(&mut ())>,
+            {
+                let efs_calls = Arc::clone(&efs_calls);
+                Some(move |_: &mut (), _: &Array1<f64>| {
+                    efs_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(EstimationError::RemlOptimizationFailed(format!(
+                        "{} synthetic runtime escape hatch",
+                        EFS_FIRST_ORDER_FALLBACK_MARKER,
+                    )))
+                })
+            },
+        );
+        let result = problem
+            .run(&mut obj, "efs runtime fallback marker")
+            .expect("runtime EFS escape hatch should degrade to BFGS");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        assert_eq!(
+            efs_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "runtime fallback marker should abort the EFS attempt immediately"
+        );
+    }
+
+    #[test]
     fn run_rejects_invalid_theta_layout() {
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
@@ -3459,15 +3827,17 @@ mod tests {
             effective_seed_budget(
                 4,
                 Solver::Efs,
-                crate::seeding::SeedRiskProfile::GeneralizedLinear
+                crate::seeding::SeedRiskProfile::GeneralizedLinear,
+                false,
             ),
-            2
+            1
         );
         assert_eq!(
             effective_seed_budget(
                 4,
                 Solver::HybridEfs,
-                crate::seeding::SeedRiskProfile::Survival
+                crate::seeding::SeedRiskProfile::Survival,
+                false,
             ),
             1
         );
@@ -3475,16 +3845,27 @@ mod tests {
             effective_seed_budget(
                 3,
                 Solver::Arc,
-                crate::seeding::SeedRiskProfile::GeneralizedLinear
+                crate::seeding::SeedRiskProfile::GeneralizedLinear,
+                true,
             ),
-            2
-        );
-        assert_eq!(
-            effective_seed_budget(3, Solver::Arc, crate::seeding::SeedRiskProfile::Survival),
             1
         );
         assert_eq!(
-            effective_seed_budget(3, Solver::Bfgs, crate::seeding::SeedRiskProfile::Survival),
+            effective_seed_budget(
+                3,
+                Solver::Arc,
+                crate::seeding::SeedRiskProfile::Survival,
+                false,
+            ),
+            1
+        );
+        assert_eq!(
+            effective_seed_budget(
+                3,
+                Solver::Bfgs,
+                crate::seeding::SeedRiskProfile::Survival,
+                false,
+            ),
             3
         );
     }
