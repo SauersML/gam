@@ -1288,7 +1288,8 @@ pub struct ExternalOptimOptions {
     /// Relative shrinkage floor for penalized block eigenvalues.
     /// See [`FitOptions::penalty_shrinkage_floor`] for details.
     pub penalty_shrinkage_floor: Option<f64>,
-    /// Fixed prior on smoothing parameters used by joint HMC fallback.
+    /// Fixed prior on smoothing parameters for explicit joint HMC sampling
+    /// flows. Standard fitting stays on the REML/Laplace path.
     pub rho_prior: crate::types::RhoPrior,
     /// Kronecker-factored penalty system for tensor-product smooth terms.
     pub kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
@@ -2476,7 +2477,7 @@ where
     // automatically densify the Hessian or escalate into NUTS.
     let (final_rho, pirls_res) = (final_rho, pirls_res);
 
-    // Recompute beta in case pirls_res was updated by joint HMC
+    // Recompute beta in the finalized basis/parameterization.
     let beta_orig_internal = pirls_res
         .reparam_result
         .qs
@@ -2774,7 +2775,8 @@ pub struct FitOptions {
     /// Typical value: `Some(1e-6)`. Set to `None` or `Some(0.0)` to disable.
     /// Default: `Some(1e-6)`.
     pub penalty_shrinkage_floor: Option<f64>,
-    /// Fixed prior on smoothing parameters used by joint HMC fallback.
+    /// Fixed prior on smoothing parameters for explicit joint HMC sampling
+    /// flows.
     ///
     /// This prior is part of the sampled target itself, unlike `rho_mode`,
     /// which is only used to initialize chains near the REML solution.

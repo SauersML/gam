@@ -3638,12 +3638,6 @@ fn cubic_power_iteration_refinement(
     best
 }
 
-/// Threshold for triggering joint (β, ρ) HMC.
-/// When max directional cubic non-Gaussianity exceeds this, the Laplace
-/// approximation is considered unreliable and NUTS on the joint space is used
-/// to refine smoothing parameters.
-pub const SKEWNESS_HMC_THRESHOLD: f64 = 0.5;
-
 /// Result of joint (β, ρ) sampling.
 #[derive(Clone, Debug)]
 pub struct JointBetaRhoResult {
