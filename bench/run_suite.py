@@ -75,10 +75,6 @@ for _k, _v in _SERIAL_ENV_OVERRIDES.items():
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from lifelines import CoxPHFitter, KaplanMeierFitter, LogNormalAFTFitter, WeibullAFTFitter  # noqa: E402
-from lifelines.exceptions import ConvergenceWarning  # noqa: E402
-from lifelines.utils import concordance_index  # noqa: E402
-from sklearn.metrics import roc_auc_score  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench"
@@ -93,6 +89,40 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 _MAX_CAPTURE_CHARS = 200000
+
+
+def _require_lifelines_survival_helpers():
+    from lifelines import CoxPHFitter, KaplanMeierFitter
+
+    return CoxPHFitter, KaplanMeierFitter
+
+
+def _require_lifelines_coxph():
+    from lifelines import CoxPHFitter
+    from lifelines.exceptions import ConvergenceWarning
+
+    return CoxPHFitter, ConvergenceWarning
+
+
+def _require_lifelines_aft_fitters():
+    from lifelines import LogNormalAFTFitter, WeibullAFTFitter
+    from lifelines.exceptions import ConvergenceWarning
+
+    return LogNormalAFTFitter, WeibullAFTFitter, ConvergenceWarning
+
+
+def _require_lifelines_kaplan_meier():
+    from lifelines import KaplanMeierFitter
+
+    return KaplanMeierFitter
+
+
+def _require_lifelines_concordance_index():
+    from lifelines.utils import concordance_index
+
+    return concordance_index
+
+
 NON_BLOCKING_FAILURE_CONTENDERS = {
     # These external stacks are kept in the benchmark output for visibility,
     # but occasional fit/predict failures should not fail the whole CI shard.
@@ -578,11 +608,33 @@ def _evaluation_label_for_n_folds(n_folds: int) -> str:
 
 def auc_score(y: np.ndarray, p: np.ndarray) -> float:
     y_bin = (np.asarray(y) > 0.5).astype(int)
+    score = np.asarray(p, dtype=float).reshape(-1)
+    if y_bin.shape != score.shape:
+        raise ValueError(
+            f"auc_score length mismatch: got y={y_bin.shape[0]} and score={score.shape[0]}"
+        )
     n_pos = int(np.sum(y_bin == 1))
     n_neg = int(np.sum(y_bin == 0))
     if n_pos == 0 or n_neg == 0:
         return 0.5
-    return float(roc_auc_score(y_bin, np.asarray(p, dtype=float)))
+    order = np.argsort(score, kind="mergesort")
+    sorted_score = score[order]
+    sorted_y = y_bin[order]
+    concordant = 0.0
+    negatives_below = 0
+    i = 0
+    while i < sorted_score.shape[0]:
+        j = i + 1
+        while j < sorted_score.shape[0] and sorted_score[j] == sorted_score[i]:
+            j += 1
+        group = sorted_y[i:j]
+        pos_in_group = int(np.sum(group == 1))
+        neg_in_group = int(group.shape[0] - pos_in_group)
+        concordant += pos_in_group * negatives_below
+        concordant += 0.5 * pos_in_group * neg_in_group
+        negatives_below += neg_in_group
+        i = j
+    return float(concordant / (n_pos * n_neg))
 
 
 def brier_score(y: np.ndarray, p: np.ndarray) -> float:
@@ -659,6 +711,7 @@ def _survival_matrix_from_risk_calibration(
     test_risk: np.ndarray,
     grid: np.ndarray,
 ) -> np.ndarray:
+    CoxPHFitter, KaplanMeierFitter = _require_lifelines_survival_helpers()
     train_times = train_df[time_col].to_numpy(dtype=float)
     train_events = (train_df[event_col].to_numpy(dtype=float) > 0.5).astype(float)
     tr_risk = np.asarray(train_risk, dtype=float).reshape(-1)
@@ -711,6 +764,7 @@ def _survival_null_curve_from_train(
     event_col: str,
     grid: np.ndarray,
 ) -> np.ndarray:
+    KaplanMeierFitter = _require_lifelines_kaplan_meier()
     train_times = train_df[time_col].to_numpy(dtype=float)
     train_events = (train_df[event_col].to_numpy(dtype=float) > 0.5).astype(float)
     finite_mask = np.isfinite(train_times) & np.isfinite(train_events) & (train_times > 0.0)
@@ -989,6 +1043,7 @@ def _survival_risk_from_rust_pred(pred_df: pd.DataFrame) -> tuple[np.ndarray, st
 
 def _lifelines_cindex_from_risk(event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray) -> float:
     # Convert risk (higher => earlier failure) to lifelines survival score.
+    concordance_index = _require_lifelines_concordance_index()
     return float(concordance_index(event_times, -risk_score, event_observed=events))
 
 
@@ -7080,6 +7135,15 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
+    try:
+        CoxPHFitter, ConvergenceWarning = _require_lifelines_coxph()
+    except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
+        return {
+            "contender": "python_lifelines_coxph_enet",
+            "scenario_name": scenario["name"],
+            "status": "failed",
+            "error": f"lifelines import failed: {e}",
+        }
 
     if folds is None:
         folds = folds_for_dataset(ds)
@@ -7512,6 +7576,15 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
+    try:
+        LogNormalAFTFitter, WeibullAFTFitter, ConvergenceWarning = _require_lifelines_aft_fitters()
+    except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
+        return {
+            "contender": "python_lifelines_weibull_aft",
+            "scenario_name": scenario["name"],
+            "status": "failed",
+            "error": f"lifelines import failed: {e}",
+        }
 
     if folds is None:
         folds = folds_for_dataset(ds)
@@ -8398,6 +8471,7 @@ def _plot_survival_panel(ax, payload: dict, *, text_color: str) -> None:
     df["group"] = group.fillna(0).astype(int)
     labels = ["Low risk", "Mid risk", "High risk"]
     colors = ["#56d364", "#d29922", "#f85149"]
+    KaplanMeierFitter = _require_lifelines_kaplan_meier()
     kmf = KaplanMeierFitter()
     for grp in sorted(df["group"].unique()):
         sub = df[df["group"] == grp]

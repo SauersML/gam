@@ -807,7 +807,7 @@ impl RemlConfig {
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
@@ -1957,9 +1957,14 @@ where
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{Derivative, OuterEvalOrder, OuterProblem};
 
+        let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
-            .with_hessian(Derivative::Analytic)
+            .with_hessian(if analytic_outer_hessian_available {
+                Derivative::Analytic
+            } else {
+                Derivative::Unavailable
+            })
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
             ))
@@ -1980,7 +1985,14 @@ where
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                state.compute_outer_eval(rho)
+                state.compute_outer_eval_with_order(
+                    rho,
+                    if analytic_outer_hessian_available {
+                        OuterEvalOrder::ValueGradientHessian
+                    } else {
+                        OuterEvalOrder::ValueAndGradient
+                    },
+                )
             },
             |state: &mut &mut self::reml::RemlState<'_>,
              rho: &Array1<f64>,
@@ -2459,216 +2471,10 @@ where
         0.0
     };
 
-    // ---- Skewness diagnostic & automatic joint (β, ρ) HMC fallback ----
-    //
-    // For non-Gaussian models, check if the Laplace approximation to the
-    // marginal likelihood is reliable. If the posterior has high skewness,
-    // LAML picks the wrong λ. We detect this and automatically fall back
-    // to joint (β, ρ) NUTS sampling which bypasses Laplace entirely.
-    let (final_rho, pirls_res) = if !matches!(cfg.link_function(), LinkFunction::Identity)
-        && !pirls_res.solve_c_array.is_empty()
-    {
-        let h_eff = &pirls_res.stabilizedhessian_transformed;
-        let p_eff = h_eff.ncols();
-        let hessian_dense = h_eff.to_dense();
-
-        let c_arr = {
-            let mut c = pirls_res.solve_c_array.clone();
-            for val in c.iter_mut() {
-                if !val.is_finite() {
-                    *val = 0.0;
-                }
-            }
-            c
-        };
-        let (max_skewness, skewness_vec) = crate::hmc::laplace_directional_cubic_diagnostic(
-            &hessian_dense,
-            &pirls_res.x_transformed,
-            &c_arr,
-        )
-        .unwrap_or_else(|_| (0.0, Array1::zeros(p_eff)));
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum EstimationApproach {
-            Reml,
-            JointHmc,
-        }
-
-        // `run_outer` handles solver selection inside the REML approach.
-        // This loop only handles cross-paradigm escalation from REML to joint HMC.
-        let approaches = if max_skewness > crate::hmc::SKEWNESS_HMC_THRESHOLD {
-            log::warn!(
-                "[REML] High directional cubic non-Gaussianity detected (max |gamma_r| = {:.3}). \
-                 Escalating from REML to joint (β, ρ) HMC refinement.",
-                max_skewness,
-            );
-            let n_skewed = skewness_vec.iter().filter(|s| s.abs() > 0.3).count();
-            log::info!(
-                "[Joint HMC] {}/{} Hessian directions have |gamma_r| > 0.3",
-                n_skewed,
-                p_eff,
-            );
-            vec![EstimationApproach::Reml, EstimationApproach::JointHmc]
-        } else {
-            if max_skewness > 0.1 {
-                log::info!(
-                    "[REML] Directional cubic non-Gaussianity moderate (max |gamma_r| = {:.3}); \
-                     TK correction sufficient.",
-                    max_skewness,
-                );
-            }
-            vec![EstimationApproach::Reml]
-        };
-
-        let mut selected_rho = final_rho;
-        let mut selected_pirls_res = pirls_res;
-
-        for approach in approaches {
-            match approach {
-                EstimationApproach::Reml => {}
-                EstimationApproach::JointHmc => {
-                    let firth_bias_reduction = selected_pirls_res.jeffreys_logdet().is_some();
-                    if firth_bias_reduction && !opts.family.supports_firth() {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "joint HMC Firth refinement requires a Firth-supported family; {} does not support it",
-                            opts.family.pretty_name()
-                        )));
-                    }
-
-                    let sampling_result = {
-                        // Guard: joint HMC densifies design and Hessian — refuse at biobank scale.
-                        let hmc_n = selected_pirls_res.x_transformed.nrows();
-                        let hmc_p = selected_pirls_res.x_transformed.ncols();
-                        const HMC_MAX_DENSE_WORK: usize = 50_000_000;
-                        if hmc_n.saturating_mul(hmc_p) > HMC_MAX_DENSE_WORK {
-                            return Err(EstimationError::InvalidInput(format!(
-                                "joint HMC requires dense design materialization (n={hmc_n}, p={hmc_p}); \
-                                 this is a small-model-only feature. Use --approach=laplace for large models."
-                            )));
-                        }
-                        let x_dense = selected_pirls_res.x_transformed.to_dense_arc();
-                        let hessian_dense =
-                            selected_pirls_res.stabilizedhessian_transformed.to_dense();
-                        let hmc_inverse_link = if let Some(state) = final_mixture_state.clone() {
-                            InverseLink::Mixture(state)
-                        } else if let Some(state) = final_sas_state.clone() {
-                            if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
-                                InverseLink::BetaLogistic(state)
-                            } else {
-                                InverseLink::Sas(state)
-                            }
-                        } else {
-                            cfg.link_kind.clone()
-                        };
-                        let hmc_inputs = crate::hmc::JointBetaRhoInputs {
-                            x: x_dense.view(),
-                            y: y_o.view(),
-                            weights: w_o.view(),
-                            likelihood_family: opts.family,
-                            inverse_link: hmc_inverse_link,
-                            gamma_shape: selected_pirls_res.likelihood.gamma_shape(),
-                            mode: selected_pirls_res.beta_transformed.view(),
-                            hessian: hessian_dense.view(),
-                            penalty_roots: selected_pirls_res
-                                .reparam_result
-                                .canonical_transformed
-                                .clone(),
-                            rho_mode: selected_rho.view(),
-                            rho_prior: opts.rho_prior.clone(),
-                            firth_bias_reduction,
-                            trigger_skewness: max_skewness,
-                        };
-
-                        let total_dim = p_eff + selected_rho.len();
-                        let hmc_config = crate::hmc::NutsConfig {
-                            n_samples: (400 + 50 * total_dim).min(4000),
-                            nwarmup: (400 + 50 * total_dim).min(4000),
-                            n_chains: 2,
-                            target_accept: 0.8,
-                            seed: 31_415,
-                        };
-                        crate::hmc::run_joint_beta_rho_sampling(&hmc_inputs, &hmc_config)
-                    };
-                    match sampling_result {
-                        Ok(result) if result.converged => {
-                            log::info!(
-                                "[Joint HMC] Converged (R-hat={:.3}, ESS={:.1}). \
-                                 Updating smoothing parameters from posterior mean.",
-                                result.rhat,
-                                result.ess,
-                            );
-                            let new_rho = result.rho_mean;
-                            match pirls::fit_model_for_fixed_rho(
-                                LogSmoothingParamsView::new(new_rho.view()),
-                                pirls::PirlsProblem {
-                                    x: reml_state.x(),
-                                    offset: offset_o.view(),
-                                    y: y_o.view(),
-                                    priorweights: w_o.view(),
-                                    covariate_se: None,
-                                },
-                                pirls::PenaltyConfig {
-                                    canonical_penalties: reml_state.canonical_penalties(),
-                                    balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
-                                    reparam_invariant: None,
-                                    p,
-                                    coefficient_lower_bounds: None,
-                                    linear_constraints_original: fit_linear_constraints.as_ref(),
-                                    penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-                                    kronecker_factored: None,
-                                },
-                                &pirls::PirlsConfig {
-                                    link_kind: if let Some(state) = final_mixture_state.clone() {
-                                        InverseLink::Mixture(state)
-                                    } else if let Some(state) = final_sas_state.clone() {
-                                        if matches!(cfg.link_function(), LinkFunction::BetaLogistic)
-                                        {
-                                            InverseLink::BetaLogistic(state)
-                                        } else {
-                                            InverseLink::Sas(state)
-                                        }
-                                    } else {
-                                        cfg.link_kind.clone()
-                                    },
-                                    ..cfg.as_pirls_config()
-                                },
-                                None,
-                            ) {
-                                Ok((new_pirls_res, _)) => {
-                                    selected_rho = new_rho;
-                                    selected_pirls_res = new_pirls_res;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[Joint HMC] Re-PIRLS at posterior ρ failed ({:?}); \
-                                         keeping REML estimates.",
-                                        e,
-                                    );
-                                }
-                            }
-                        }
-                        Ok(result) => {
-                            log::warn!(
-                                "[Joint HMC] Did not converge (R-hat={:.3}, ESS={:.1}); \
-                                 keeping REML estimates.",
-                                result.rhat,
-                                result.ess,
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[Joint HMC] Sampling failed ({}); keeping REML estimates.",
-                                e,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        (selected_rho, selected_pirls_res)
-    } else {
-        (final_rho, pirls_res)
-    };
+    // Default solver policy stays on the REML/Laplace path. Joint HMC remains
+    // available through explicit sampling flows, but fitting does not
+    // automatically densify the Hessian or escalate into NUTS.
+    let (final_rho, pirls_res) = (final_rho, pirls_res);
 
     // Recompute beta in case pirls_res was updated by joint HMC
     let beta_orig_internal = pirls_res
@@ -4485,7 +4291,7 @@ where
         ));
     }
     validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
-    let mut ext_opts = ExternalOptimOptions {
+    let ext_opts = ExternalOptimOptions {
         family: resolved_family,
         latent_cloglog: opts.latent_cloglog,
         mixture_link: opts.mixture_link.clone(),
@@ -4497,93 +4303,23 @@ where
         tol: opts.tol,
         nullspace_dims: opts.nullspace_dims.clone(),
         linear_constraints: opts.linear_constraints.clone(),
-        firth_bias_reduction: None,
+        firth_bias_reduction: Some(false),
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
         rho_prior: Default::default(),
         kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
         kronecker_factored: opts.kronecker_factored.clone(),
     };
 
-    let result = if matches!(
-        resolved_family,
-        crate::types::LikelihoodFamily::BinomialLogit
-    ) {
-        let weighted_events = y
-            .iter()
-            .zip(weights.iter())
-            .map(|(&yy, &ww)| yy.clamp(0.0, 1.0) * ww.max(0.0))
-            .sum::<f64>();
-        let weighted_total = weights.iter().map(|w| w.max(0.0)).sum::<f64>();
-        let weightednonevents = (weighted_total - weighted_events).max(0.0);
-        let minority_support = weighted_events.min(weightednonevents);
-        let startwith_firth = should_enable_firth_from_class_support(minority_support, x.ncols());
-
-        // Start with Firth when class support is low relative to model complexity.
-        ext_opts.firth_bias_reduction = Some(startwith_firth);
-        let first_try = optimize_external_designwith_heuristic_lambdas_andwarm_start(
-            y,
-            weights,
-            &x,
-            offset,
-            specs.clone(),
-            heuristic_lambdas,
-            warm_start_beta,
-            &ext_opts,
-        );
-
-        match first_try {
-            Ok(res) => {
-                let unstable_status = matches!(
-                    res.pirls_status,
-                    crate::pirls::PirlsStatus::MaxIterationsReached
-                        | crate::pirls::PirlsStatus::Unstable
-                );
-                let extreme_eta = res.max_abs_eta > 15.0;
-                if !startwith_firth && (unstable_status || extreme_eta) {
-                    ext_opts.firth_bias_reduction = Some(true);
-                    optimize_external_designwith_heuristic_lambdas_andwarm_start(
-                        y,
-                        weights,
-                        &x,
-                        offset,
-                        specs.clone(),
-                        heuristic_lambdas,
-                        warm_start_beta,
-                        &ext_opts,
-                    )?
-                } else {
-                    res
-                }
-            }
-            Err(err) => {
-                if startwith_firth {
-                    return Err(err);
-                }
-                ext_opts.firth_bias_reduction = Some(true);
-                optimize_external_designwith_heuristic_lambdas_andwarm_start(
-                    y,
-                    weights,
-                    &x,
-                    offset,
-                    specs.clone(),
-                    heuristic_lambdas,
-                    warm_start_beta,
-                    &ext_opts,
-                )?
-            }
-        }
-    } else {
-        optimize_external_designwith_heuristic_lambdas_andwarm_start(
-            y,
-            weights,
-            &x,
-            offset,
-            specs.clone(),
-            heuristic_lambdas,
-            warm_start_beta,
-            &ext_opts,
-        )?
-    };
+    let result = optimize_external_designwith_heuristic_lambdas_andwarm_start(
+        y,
+        weights,
+        &x,
+        offset,
+        specs.clone(),
+        heuristic_lambdas,
+        warm_start_beta,
+        &ext_opts,
+    )?;
     let log_lambdas = result.lambdas.mapv(|v| v.max(1e-300).ln());
     let edf = result
         .inference
@@ -4658,9 +4394,6 @@ where
     fit_gamwith_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
 }
 
-const FIRTH_BASE_MINORITY_SUPPORT: f64 = 20.0;
-const FIRTH_MINORITY_PER_PARAMETER: f64 = 2.0;
-
 #[inline]
 fn sas_log_deltaridgeweight() -> f64 {
     // Weak fixed stabilization for the SAS tail parameter to avoid
@@ -4709,13 +4442,6 @@ fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
     let epsilon = bound * t;
     let d_epsilon_d_raw = 1.0 - t * t;
     (epsilon, d_epsilon_d_raw)
-}
-
-#[inline]
-fn should_enable_firth_from_class_support(minority_support: f64, n_features: usize) -> bool {
-    let complexity_threshold =
-        (FIRTH_MINORITY_PER_PARAMETER * n_features as f64).max(FIRTH_BASE_MINORITY_SUPPORT);
-    minority_support < complexity_threshold
 }
 
 fn computefdgradient(
@@ -4873,20 +4599,6 @@ mod fd_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-
-    #[test]
-    fn test_firth_support_rule_respects_legacy_low_support_floor() {
-        assert!(should_enable_firth_from_class_support(19.99, 1));
-        assert!(!should_enable_firth_from_class_support(20.0, 1));
-    }
-
-    #[test]
-    fn test_firth_support_rule_scaleswith_model_dimension() {
-        // High-dimensional setting: minority support that would pass the old
-        // <20 rule still triggers Firth because support per parameter is weak.
-        assert!(should_enable_firth_from_class_support(425.0, 225));
-        assert!(!should_enable_firth_from_class_support(460.0, 225));
-    }
 
     #[test]
     fn resolve_external_family_rejects_unsupported_firth_request() {

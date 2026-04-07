@@ -1033,9 +1033,13 @@ def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -
         spatial,
     ]
     if spec.mean_linkwiggle_knots is not None:
-        mean_terms.append(f"linkwiggle(knots={int(spec.mean_linkwiggle_knots)})")
+        mean_terms.append(
+            f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})"
+        )
     if spec.logslope_linkwiggle_knots is not None:
-        logslope_terms.append(f"linkwiggle(knots={int(spec.logslope_linkwiggle_knots)})")
+        logslope_terms.append(
+            f"linkwiggle(internal_knots={int(spec.logslope_linkwiggle_knots)})"
+        )
     mean_formula = "phenotype ~ " + " + ".join(mean_terms)
     logslope_formula = " + ".join(logslope_terms)
     return mean_formula, logslope_formula
@@ -1112,9 +1116,13 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
         f"survmodel(spec=net, distribution={distribution})",
     ]
     if spec.mean_linkwiggle_knots is not None:
-        terms.append(f"linkwiggle(knots={int(spec.mean_linkwiggle_knots)})")
+        terms.append(
+            f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})"
+        )
     if spec.timewiggle_knots is not None:
-        terms.append(f"timewiggle(knots={int(spec.timewiggle_knots)})")
+        terms.append(
+            f"timewiggle(internal_knots={int(spec.timewiggle_knots)})"
+        )
     return " + ".join(terms)
 
 

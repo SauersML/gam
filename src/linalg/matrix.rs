@@ -1093,7 +1093,7 @@ pub enum DesignBlock {
 }
 
 impl DesignBlock {
-    fn nrows(&self) -> usize {
+    pub(crate) fn nrows(&self) -> usize {
         match self {
             Self::Dense(d) => d.nrows(),
             Self::Sparse(s) => s.nrows(),
@@ -1102,7 +1102,7 @@ impl DesignBlock {
         }
     }
 
-    fn ncols(&self) -> usize {
+    pub(crate) fn ncols(&self) -> usize {
         match self {
             Self::Dense(d) => d.ncols(),
             Self::Sparse(s) => s.ncols(),

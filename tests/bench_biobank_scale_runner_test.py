@@ -61,8 +61,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertIn("duchon(pc1_std, pc2_std", mean_formula)
         self.assertIn("centers=20", mean_formula)
         self.assertNotIn("pgs_std", mean_formula)
-        self.assertIn("linkwiggle(knots=8)", mean_formula)
-        self.assertIn("linkwiggle(knots=7)", logslope_formula)
+        self.assertIn("linkwiggle(internal_knots=8)", mean_formula)
+        self.assertIn("linkwiggle(internal_knots=7)", logslope_formula)
 
     def test_effective_marginal_slope_centers_caps_biobank_and_wiggle_modes(self) -> None:
         spec = _RUNNER.MethodSpec(
@@ -253,8 +253,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             timewiggle_knots=8,
         )
         rhs = _RUNNER.rust_survival_formula_rhs(spec)
-        self.assertIn("linkwiggle(knots=8)", rhs)
-        self.assertIn("timewiggle(knots=8)", rhs)
+        self.assertIn("linkwiggle(internal_knots=8)", rhs)
+        self.assertIn("timewiggle(internal_knots=8)", rhs)
 
     def test_generate_raw_cohort_populates_pc_columns_from_each_row(self) -> None:
         cfg = {

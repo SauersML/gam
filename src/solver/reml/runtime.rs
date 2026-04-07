@@ -36,6 +36,30 @@ struct DerivativeContext {
 }
 
 impl<'a> RemlState<'a> {
+    pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
+        if self.config.link_function() == LinkFunction::Identity {
+            return true;
+        }
+
+        let n_obs = self.x().nrows();
+        let p_coeff = self.x().ncols();
+        let enabled = super::exact_outer_hessian_problem_scale_allows(n_obs, p_coeff);
+        if !enabled
+            && !self
+                .outer_hessian_downgrade_logged
+                .swap(true, Ordering::Relaxed)
+        {
+            log::info!(
+                "[OUTER] standard REML: disabling analytic outer Hessian for large corrected model (n={}, p={}, n*p={}, n*p^2={})",
+                n_obs,
+                p_coeff,
+                n_obs.saturating_mul(p_coeff),
+                n_obs.saturating_mul(p_coeff).saturating_mul(p_coeff),
+            );
+        }
+        enabled
+    }
+
     fn tk_disabled_terms(rho: &Array1<f64>, mode: super::unified::EvalMode) -> TkCorrectionTerms {
         TkCorrectionTerms {
             value: 0.0,
@@ -1098,6 +1122,7 @@ impl<'a> RemlState<'a> {
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
+            outer_hessian_downgrade_logged: AtomicBool::new(false),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -3190,14 +3215,13 @@ impl<'a> RemlState<'a> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
+        let allow_second_order = matches!(
+            order,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+        ) && self.analytic_outer_hessian_enabled();
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
-            let cache_satisfies_request = match order {
-                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => true,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
-                    eval.hessian.is_analytic()
-                }
-            };
+            let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {
                 return Ok(eval);
             }
@@ -3229,7 +3253,11 @@ impl<'a> RemlState<'a> {
         let decision = match order {
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
-                Some(self.selecthessian_strategy_policy(p, &bundle))
+                if allow_second_order {
+                    Some(self.selecthessian_strategy_policy(p, &bundle))
+                } else {
+                    None
+                }
             }
         };
         let eval_mode = match decision.as_ref().map(|decision| decision.strategy) {
@@ -3268,13 +3296,6 @@ impl<'a> RemlState<'a> {
         };
         self.cache_manager.store_outer_eval(&rho_key, &eval);
         Ok(eval)
-    }
-
-    pub fn compute_outer_eval(&self, p: &Array1<f64>) -> Result<OuterEval, EstimationError> {
-        self.compute_outer_eval_with_order(
-            p,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
-        )
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

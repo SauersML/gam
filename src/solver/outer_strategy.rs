@@ -368,6 +368,23 @@ pub enum Solver {
     HybridEfs,
 }
 
+#[inline]
+fn effective_seed_budget(
+    requested_budget: usize,
+    solver: Solver,
+    risk_profile: crate::seeding::SeedRiskProfile,
+) -> usize {
+    let requested_budget = requested_budget.max(1);
+    let capped = match (solver, risk_profile) {
+        (Solver::Efs | Solver::HybridEfs, crate::seeding::SeedRiskProfile::Survival) => 1,
+        (Solver::Efs | Solver::HybridEfs, _) => 2,
+        (Solver::Arc, crate::seeding::SeedRiskProfile::Survival) => 1,
+        (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) => 2,
+        _ => requested_budget,
+    };
+    requested_budget.min(capped)
+}
+
 /// How the Hessian will be obtained for the outer optimizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HessianSource {
@@ -1952,7 +1969,18 @@ fn run_outer(
         obj.reset();
 
         match run_outer_with_plan(obj, config, context, attempt_cap, &the_plan) {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                if result.converged || attempt_idx + 1 == attempts.len() {
+                    return Ok(result);
+                }
+
+                let message = format!(
+                    "{context}: attempt {} (plan={the_plan}) exhausted without convergence",
+                    attempt_idx + 1
+                );
+                log::info!("[OUTER] {message}; trying degraded fallback plan");
+                last_error = Some(EstimationError::RemlOptimizationFailed(message));
+            }
             Err(e) => {
                 log::debug!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) failed: {e}",
@@ -1999,12 +2027,26 @@ fn run_outer_with_plan(
         )));
     }
 
-    let seed_budget = config.seed_config.seed_budget.max(1).min(seeds.len());
+    let seed_budget = effective_seed_budget(
+        config.seed_config.seed_budget,
+        the_plan.solver,
+        config.seed_config.risk_profile,
+    )
+    .min(seeds.len());
     log::info!(
         "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
         seeds.len(),
         seed_budget,
     );
+    if seed_budget < config.seed_config.seed_budget.max(1) {
+        log::info!(
+            "[OUTER] {context}: capped requested seed budget {} -> {} for {:?} ({:?})",
+            config.seed_config.seed_budget.max(1),
+            seed_budget,
+            the_plan.solver,
+            config.seed_config.risk_profile,
+        );
+    }
     if config.screening_cap.is_some() && log::log_enabled!(log::Level::Trace) {
         log::trace!(
             "[OUTER] {context}: screening cap is configured but no global seed-screening pass is used"
@@ -3208,6 +3250,37 @@ mod tests {
     }
 
     #[test]
+    fn run_nonconverged_arc_falls_back_to_first_order_plan() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_seed_config(seed_config)
+            .with_initial_rho(array![5.0])
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0].powi(4)),
+            |_: &mut (), theta: &Array1<f64>| {
+                let x = theta[0];
+                Ok(OuterEval {
+                    cost: x.powi(4),
+                    gradient: array![4.0 * x.powi(3)],
+                    hessian: HessianResult::Analytic(array![[12.0 * x.powi(2)]]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "nonconverged arc should fall back")
+            .expect("automatic fallback should continue after a nonconverged Arc attempt");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
+        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
     fn run_starts_solver_with_direct_startup_eval() {
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
@@ -3377,6 +3450,42 @@ mod tests {
         assert!(
             err.to_string().contains("invalid outer theta layout"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn effective_seed_budget_caps_expensive_solver_retries() {
+        assert_eq!(
+            effective_seed_budget(
+                4,
+                Solver::Efs,
+                crate::seeding::SeedRiskProfile::GeneralizedLinear
+            ),
+            2
+        );
+        assert_eq!(
+            effective_seed_budget(
+                4,
+                Solver::HybridEfs,
+                crate::seeding::SeedRiskProfile::Survival
+            ),
+            1
+        );
+        assert_eq!(
+            effective_seed_budget(
+                3,
+                Solver::Arc,
+                crate::seeding::SeedRiskProfile::GeneralizedLinear
+            ),
+            2
+        );
+        assert_eq!(
+            effective_seed_budget(3, Solver::Arc, crate::seeding::SeedRiskProfile::Survival),
+            1
+        );
+        assert_eq!(
+            effective_seed_budget(3, Solver::Bfgs, crate::seeding::SeedRiskProfile::Survival),
+            3
         );
     }
 }

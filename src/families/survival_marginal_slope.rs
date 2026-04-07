@@ -12956,18 +12956,14 @@ pub fn fit_survival_marginal_slope_terms(
         }
     }
 
-    // Check analytic derivatives
-    let marginal_derivatives =
-        build_block_spatial_psi_derivatives(data, &marginalspec_boot, &marginal_design)?;
-    let logslope_derivatives =
-        build_block_spatial_psi_derivatives(data, &logslopespec_boot, &logslope_design)?;
-    let analytic_joint_derivatives_available = marginal_derivatives.is_some()
-        || logslope_derivatives.is_some()
-        || setup.log_kappa_dim() == 0;
+    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+    let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
+    let marginal_has_spatial = !marginal_terms.is_empty();
+    let logslope_has_spatial = !logslope_terms.is_empty();
+    let analytic_joint_derivatives_available =
+        marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0;
 
-    if setup.log_kappa_dim() > 0
-        && !(marginal_derivatives.is_some() || logslope_derivatives.is_some())
-    {
+    if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
         return Err(
             "exact survival marginal-slope spatial optimization requires analytic joint psi derivatives"
                 .to_string(),
@@ -12991,10 +12987,6 @@ pub fn fit_survival_marginal_slope_terms(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
-    // Only the baseline and slope surface blocks can have spatial terms
-    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
-    let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
-
     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
         if sigma_learnable {
             Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
@@ -13002,16 +12994,54 @@ pub fn fit_survival_marginal_slope_terms(
             initial_sigma
         }
     };
-    let build_derivative_blocks = |specs: &[TermCollectionSpec],
-                                   designs: &[TermCollectionDesign]|
+    let derivative_block_cache = RefCell::new(
+        None::<(
+            Array1<f64>,
+            Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+        )>,
+    );
+    let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
+    };
+    let get_derivative_blocks = |theta: &Array1<f64>,
+                                 specs: &[TermCollectionSpec],
+                                 designs: &[TermCollectionDesign]|
      -> Result<
-        Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+        Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
         String,
     > {
+        if let Some((cached_theta, cached_blocks)) = derivative_block_cache.borrow().as_ref()
+            && theta_matches(cached_theta, theta)
+        {
+            return Ok(Arc::clone(cached_blocks));
+        }
+
         let mut derivative_blocks = vec![
             Vec::new(),
-            build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.unwrap_or_default(),
-            build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.unwrap_or_default(),
+            if marginal_has_spatial {
+                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                    || {
+                        "survival marginal-slope: marginal block has spatial terms but spatial psi derivatives are unavailable"
+                            .to_string()
+                    },
+                )?
+            } else {
+                Vec::new()
+            },
+            if logslope_has_spatial {
+                build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?.ok_or_else(
+                    || {
+                        "survival marginal-slope: logslope block has spatial terms but spatial psi derivatives are unavailable"
+                            .to_string()
+                    },
+                )?
+            } else {
+                Vec::new()
+            },
         ];
         if score_warp_runtime.is_some() {
             derivative_blocks.push(Vec::new());
@@ -13033,6 +13063,8 @@ pub fn fit_survival_marginal_slope_terms(
                     None,
                 ));
         }
+        let derivative_blocks = Arc::new(derivative_blocks);
+        derivative_block_cache.replace(Some((theta.clone(), Arc::clone(&derivative_blocks))));
         Ok(derivative_blocks)
     };
 
@@ -13080,7 +13112,7 @@ pub fn fit_survival_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1], sigma);
-            let derivative_blocks = build_derivative_blocks(specs, designs)?;
+            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper(
                 &family,
                 &blocks,
@@ -13109,7 +13141,7 @@ pub fn fit_survival_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1], sigma);
-            let derivative_blocks = build_derivative_blocks(specs, designs)?;
+            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &family,
                 &blocks,

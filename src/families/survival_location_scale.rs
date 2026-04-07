@@ -10,8 +10,8 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
     first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi,
     resolve_custom_family_x_psi_psi, second_psi_linear_map, shared_dense_arc,
-    should_materialize_custom_family_psi_dense, slice_joint_into_block_working_sets,
-    weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
+    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
+    wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
@@ -3031,16 +3031,8 @@ fn build_survival_covariate_block_psi_derivatives(
                                     None
                                 };
                             let design_operator = implicit_operator.or(dense_operator);
-                            let total_rows = design_operator
-                                .as_ref()
-                                .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
-                            let materialize_dense_design = !info.x_psi_local.is_empty()
-                                && should_materialize_custom_family_psi_dense(
-                                    total_rows,
-                                    info.total_p,
-                                    psi_dim,
-                                    design_operator.is_some(),
-                                );
+                            let materialize_dense_design =
+                                !info.x_psi_local.is_empty() && design_operator.is_none();
                             let x_full = if !materialize_dense_design {
                                 Array2::<f64>::zeros((0, 0))
                             } else {
@@ -3162,17 +3154,8 @@ fn build_survival_covariate_block_psi_derivatives(
                                     )
                                 })
                                 .transpose()?;
-                            let p_total = info.total_p * time_basis_exit.ncols();
-                            let total_rows = implicit_operator
-                                .as_ref()
-                                .map_or_else(|| 3 * info.x_psi_local.nrows(), |op| op.n_data());
-                            let materialize_dense_design = !info.x_psi_local.is_empty()
-                                && should_materialize_custom_family_psi_dense(
-                                    total_rows,
-                                    p_total,
-                                    psi_dim,
-                                    implicit_operator.is_some(),
-                                );
+                            let materialize_dense_design =
+                                !info.x_psi_local.is_empty() && implicit_operator.is_none();
                             let x_psi = if !materialize_dense_design {
                                 Array2::<f64>::zeros((0, 0))
                             } else {
