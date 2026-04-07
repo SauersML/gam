@@ -308,6 +308,19 @@ pub fn generate_rho_candidates(
     add_seed_dedup(&mut seeds, &mut seen, primary.clone());
     // Always include neutral baseline independently of heuristic anchor.
     add_seed_dedup(&mut seeds, &mut seen, Array1::zeros(num_penalties));
+    // Generalized and survival models can hit PIRLS separation at moderate
+    // smoothing levels. Put an aggressively over-smoothed isotropic seed near
+    // the front so startup validation can still find a stable basin.
+    match config.risk_profile {
+        SeedRiskProfile::Gaussian => {}
+        SeedRiskProfile::GeneralizedLinear | SeedRiskProfile::Survival => {
+            add_seed_dedup(
+                &mut seeds,
+                &mut seen,
+                Array1::from_elem(num_penalties, bounds.1),
+            );
+        }
+    }
     // For exactly three penalties (mass/tension/stiffness), inject
     // physically coherent manifold seeds in rho-space:
     // - general SPDE manifold over (log_tau, log_kappa, nu),
@@ -552,6 +565,24 @@ mod tests {
             .iter()
             .any(|s| s.iter().all(|v| (*v - 0.0).abs() < 1e-12));
         assert!(haszero);
+    }
+
+    #[test]
+    fn generalized_linear_seeds_include_early_stability_retreat_seed() {
+        let cfg = SeedConfig {
+            risk_profile: SeedRiskProfile::GeneralizedLinear,
+            ..SeedConfig::default()
+        };
+        let seeds = generate_rho_candidates(3, None, &cfg);
+        let retreat = Array1::from_elem(3, cfg.bounds.1);
+        let retreat_idx = seeds
+            .iter()
+            .position(|seed| seed == &retreat)
+            .expect("generalized-linear seeds should include an upper-bound retreat seed");
+        assert!(
+            retreat_idx <= 2,
+            "retreat seed should be available before broader exploratory seeds: {retreat_idx}"
+        );
     }
 
     #[test]
