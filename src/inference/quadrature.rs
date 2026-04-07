@@ -1204,23 +1204,6 @@ fn logit_posterior_meanwith_deriv_controlled(
 }
 
 #[inline]
-fn logit_posterior_meanwith_deriv_pirls(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-) -> Result<IntegratedMeanDerivative, EstimationError> {
-    if !(mu.is_finite() && sigma.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "logit integrated moments require finite mu and sigma".to_string(),
-        ));
-    }
-    Ok(match logit_posterior_meanwith_deriv_exact(mu, sigma) {
-        Ok(out) => out,
-        Err(_) => logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma),
-    })
-}
-
-#[inline]
 fn log_normal_cdf_stable(x: f64) -> f64 {
     if !x.is_finite() {
         return if x.is_sign_negative() {
@@ -2510,7 +2493,9 @@ pub fn integrated_logit_inverse_link_jet_pirls(
     integrate_logit_inverse_link_jet_from_scalar_backend(
         mu,
         sigma,
-        |m, s| logit_posterior_meanwith_deriv_pirls(quadctx, m, s),
+        // Hot PIRLS path: exact special-function backend first, GHQ only if
+        // the exact backend rejects the inputs.
+        |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
         |x| component_point_jet(LinkComponent::Logit, x),
     )
 }

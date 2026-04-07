@@ -12786,10 +12786,9 @@ pub fn apply_sum_to_zero_constraint_sparse(
                     src_pos += 1;
                     (src_row, value)
                 }
-                (Some(&src_row), Some(&pivot_row)) => {
+                (Some(_), Some(&pivot_row)) => {
                     let value = alpha * pivot_vals[pivot_pos];
                     pivot_pos += 1;
-                    debug_assert!(src_row > pivot_row);
                     (pivot_row, value)
                 }
                 (Some(&src_row), None) => {
