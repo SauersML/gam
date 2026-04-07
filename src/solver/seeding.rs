@@ -28,9 +28,9 @@ impl Default for SeedConfig {
     fn default() -> Self {
         Self {
             bounds: (-12.0, 12.0),
-            max_seeds: 16,
-            seed_budget: 4,
-            screen_max_inner_iterations: 5,
+            max_seeds: 12,
+            seed_budget: 2,
+            screen_max_inner_iterations: 3,
             risk_profile: SeedRiskProfile::GeneralizedLinear,
             num_auxiliary_trailing: 0,
         }

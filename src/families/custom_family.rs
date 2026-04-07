@@ -24,6 +24,7 @@ use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -567,9 +568,9 @@ pub trait CustomFamily {
             return crate::seeding::SeedConfig::default();
         }
         let mut config = crate::seeding::SeedConfig::default();
-        config.max_seeds = if n_params <= 4 { 8 } else { 6 };
-        config.seed_budget = if n_params <= 4 { 2 } else { 1 };
-        config.screen_max_inner_iterations = 3;
+        config.max_seeds = if n_params <= 4 { 6 } else { 4 };
+        config.seed_budget = 1;
+        config.screen_max_inner_iterations = 2;
         config
     }
 
@@ -1514,6 +1515,8 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub implicit_axis: usize,
     pub implicit_group_id: Option<usize>,
 }
+
+pub(crate) type SharedDerivativeBlocks = Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>>;
 
 impl CustomFamilyBlockPsiDerivative {
     /// Public constructor for use in tests and external consumers.
@@ -4338,6 +4341,75 @@ fn total_quadratic_penalty(
     total
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RidgedSurrogateRemlGuardState {
+    warning_limit: usize,
+    warning_count: usize,
+}
+
+thread_local! {
+    static RIDGED_SURROGATE_REML_GUARD: RefCell<Option<RidgedSurrogateRemlGuardState>> =
+        const { RefCell::new(None) };
+}
+
+const RIDGED_SURROGATE_REML_WARNING_ABORT_LIMIT: usize = 8;
+
+fn with_ridged_surrogate_reml_guard<T>(
+    warning_limit: usize,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, usize), String> {
+    RIDGED_SURROGATE_REML_GUARD.with(|guard| {
+        let previous = {
+            let mut slot = guard.borrow_mut();
+            (*slot).replace(RidgedSurrogateRemlGuardState {
+                warning_limit,
+                warning_count: 0,
+            })
+        };
+
+        let result = f();
+        let warning_count = guard
+            .borrow()
+            .as_ref()
+            .map(|state| state.warning_count)
+            .unwrap_or(0);
+        *guard.borrow_mut() = previous;
+        result.map(|value| (value, warning_count))
+    })
+}
+
+fn record_ridged_surrogate_reml_warning(n_negative: usize, ridge: f64) -> Result<(), String> {
+    let mut warning_idx = None;
+    let mut warning_limit = None;
+    RIDGED_SURROGATE_REML_GUARD.with(|guard| {
+        let mut slot = guard.borrow_mut();
+        if let Some(state) = slot.as_mut() {
+            state.warning_count += 1;
+            warning_idx = Some(state.warning_count);
+            warning_limit = Some(state.warning_limit);
+        }
+    });
+
+    let warning_idx = warning_idx.unwrap_or(1);
+    let warning_limit = warning_limit.unwrap_or(usize::MAX);
+    log::warn!(
+        "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after ridging \
+         (ridge={:.2e}, warning {warning_idx}/{warning_limit}). The Laplace approximation \
+         is not valid in these directions; the surrogate objective ignores them.",
+        n_negative,
+        ridge,
+    );
+    if warning_idx >= warning_limit {
+        return Err(format!(
+            "{} custom-family EFS aborted after {warning_idx} repeated \
+             surrogate positive-part Hessian warnings (ridge={ridge:.2e}); \
+             degrade to a first-order outer plan",
+            crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER,
+        ));
+    }
+    Ok(())
+}
+
 fn stable_logdet_with_ridge_policy(
     matrix: &Array2<f64>,
     ridge_floor: f64,
@@ -4387,13 +4459,7 @@ fn stable_logdet_with_ridge_policy(
                 Ok((evals, _)) => {
                     let n_negative = evals.iter().filter(|&&ev| ev < -floor).count();
                     if n_negative > 0 {
-                        log::warn!(
-                            "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after \
-                             ridging (ridge={:.2e}). The Laplace approximation is not valid in \
-                             these directions; the surrogate objective ignores them.",
-                            n_negative,
-                            ridge,
-                        );
+                        record_ridged_surrogate_reml_warning(n_negative, ridge)?;
                     }
                     let mut logdet = 0.0;
                     for &ev in &evals {
@@ -7430,209 +7496,232 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
-    let efs_eval = if let Some(joint_bundle) =
-        build_joint_hessian_closures(family, &inner.block_states, specs, total)?
-    {
-        let JointHessianBundle {
-            source: h_joint_unpen,
-            beta_flat,
-            compute_dh,
-            compute_d2h,
-            rho_curvature_scale,
-            hessian_logdet_correction,
-        } = joint_bundle;
-        joint_outer_evaluate_efs(
-            &inner,
-            specs,
-            &per_block,
-            rho,
-            &beta_flat,
-            h_joint_unpen,
-            &ranges,
-            total,
-            ridge,
-            moderidge,
-            extra_logdet_ridge,
-            rho_curvature_scale,
-            hessian_logdet_correction,
-            include_logdet_h,
-            include_logdet_s,
-            strict_spd,
-            options,
-            compute_dh.as_ref(),
-            compute_d2h.as_ref(),
-            None,
-            None,
-            None,
-        )?
-    } else {
-        if family.requires_joint_outer_hyper_path() {
-            return Err(
-                "outer hyper fixed-point evaluation requires a joint exact path for this family"
-                    .to_string(),
-            );
-        }
-        if specs.len() != 1 {
-            return Err(
-                "generic fixed-point outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
-                    .to_string(),
-            );
-        }
-
-        let eval = family.evaluate(&inner.block_states)?;
-        let block_idx = 0;
-        let spec = &specs[block_idx];
-        let work = &eval.blockworking_sets[block_idx];
-        let p = spec.design.ncols();
-        let mut diagonal_design = None::<DesignMatrix>;
-        let h_joint_unpen = match work {
-            BlockWorkingSet::Diagonal {
-                working_response: _,
-                working_weights,
-            } => with_block_geometry(family, &inner.block_states, spec, block_idx, |x_dyn, _| {
-                let w = floor_positiveworking_weights(working_weights, options.minweight);
-                let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
-                diagonal_design = Some(x_dyn.clone());
-                Ok(xtwx)
-            })?,
-            BlockWorkingSet::ExactNewton {
-                gradient: _,
-                hessian,
-            } => {
-                if hessian.nrows() != p || hessian.ncols() != p {
-                    return Err(format!(
-                        "block {block_idx} exact-newton Hessian shape mismatch in fixed-point outer evaluation: got {}x{}, expected {}x{}",
-                        hessian.nrows(),
-                        hessian.ncols(),
-                        p,
-                        p
-                    ));
+    let (efs_eval, surrogate_warning_count) = with_ridged_surrogate_reml_guard(
+        RIDGED_SURROGATE_REML_WARNING_ABORT_LIMIT,
+        || {
+            if let Some(joint_bundle) =
+                build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+            {
+                let JointHessianBundle {
+                    source: h_joint_unpen,
+                    beta_flat,
+                    compute_dh,
+                    compute_d2h,
+                    rho_curvature_scale,
+                    hessian_logdet_correction,
+                } = joint_bundle;
+                joint_outer_evaluate_efs(
+                    &inner,
+                    specs,
+                    &per_block,
+                    rho,
+                    &beta_flat,
+                    h_joint_unpen,
+                    &ranges,
+                    total,
+                    ridge,
+                    moderidge,
+                    extra_logdet_ridge,
+                    rho_curvature_scale,
+                    hessian_logdet_correction,
+                    include_logdet_h,
+                    include_logdet_s,
+                    strict_spd,
+                    options,
+                    compute_dh.as_ref(),
+                    compute_d2h.as_ref(),
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                if family.requires_joint_outer_hyper_path() {
+                    return Err(
+                        "outer hyper fixed-point evaluation requires a joint exact path for this family"
+                            .to_string(),
+                    );
                 }
-                hessian.to_dense()
-            }
-        };
-        let beta_flat = inner.block_states[block_idx].beta.clone();
-        let compute_dh = |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-            if !include_logdet_h {
-                return Ok(None);
-            }
-            match work {
-                BlockWorkingSet::ExactNewton { .. } => {
-                    match family.exact_newton_hessian_directional_derivative(
-                        &inner.block_states,
-                        block_idx,
-                        direction,
-                    )? {
-                        Some(h_exact) => {
-                            Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
-                                h_exact,
-                                p,
-                                &format!(
-                                    "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
-                                ),
-                            )?)))
-                        }
-                        None => Err(format!(
-                            "missing exact-newton dH callback for block {block_idx} while fixed-point evaluation requires H_beta term"
-                        )),
-                    }
+                if specs.len() != 1 {
+                    return Err(
+                        "generic fixed-point outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
+                            .to_string(),
+                    );
                 }
-                BlockWorkingSet::Diagonal {
-                    working_response: _,
-                    working_weights,
-                } => {
-                    let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
-                        format!(
-                            "missing dynamic design for block {block_idx} diagonal fixed-point correction"
-                        )
-                    })?;
-                    let wwork = floor_positiveworking_weights(working_weights, options.minweight);
-                    let x_dense = x_dyn.to_dense();
-                    let n = x_dense.nrows();
 
-                    let mut d_eta = x_dyn.matrixvectormultiply(direction);
-                    let geom = family.block_geometry_directional_derivative(
+                let eval = family.evaluate(&inner.block_states)?;
+                let block_idx = 0;
+                let spec = &specs[block_idx];
+                let work = &eval.blockworking_sets[block_idx];
+                let p = spec.design.ncols();
+                let mut diagonal_design = None::<DesignMatrix>;
+                let h_joint_unpen = match work {
+                    BlockWorkingSet::Diagonal {
+                        working_response: _,
+                        working_weights,
+                    } => with_block_geometry(
+                        family,
                         &inner.block_states,
-                        block_idx,
                         spec,
-                        direction,
-                    )?;
-                    let mut correction_mat = Array2::<f64>::zeros((p, p));
-
-                    if let Some(geom_dir) = geom {
-                        d_eta += &geom_dir.d_offset;
-                        if let Some(dx) = geom_dir.d_design {
-                            d_eta += &dx.dot(&beta_flat);
-                            let mut wx = x_dense.clone();
-                            let mut wdx = dx.clone();
-                            for i in 0..n {
-                                let wi = wwork[i];
-                                if wi != 1.0 {
-                                    wx.row_mut(i).mapv_inplace(|v| v * wi);
-                                    wdx.row_mut(i).mapv_inplace(|v| v * wi);
+                        block_idx,
+                        |x_dyn, _| {
+                            let w =
+                                floor_positiveworking_weights(working_weights, options.minweight);
+                            let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+                            diagonal_design = Some(x_dyn.clone());
+                            Ok(xtwx)
+                        },
+                    )?,
+                    BlockWorkingSet::ExactNewton {
+                        gradient: _,
+                        hessian,
+                    } => {
+                        if hessian.nrows() != p || hessian.ncols() != p {
+                            return Err(format!(
+                                "block {block_idx} exact-newton Hessian shape mismatch in fixed-point outer evaluation: got {}x{}, expected {}x{}",
+                                hessian.nrows(),
+                                hessian.ncols(),
+                                p,
+                                p
+                            ));
+                        }
+                        hessian.to_dense()
+                    }
+                };
+                let beta_flat = inner.block_states[block_idx].beta.clone();
+                let compute_dh =
+                    |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                        if !include_logdet_h {
+                            return Ok(None);
+                        }
+                        match work {
+                            BlockWorkingSet::ExactNewton { .. } => {
+                                match family.exact_newton_hessian_directional_derivative(
+                                    &inner.block_states,
+                                    block_idx,
+                                    direction,
+                                )? {
+                                    Some(h_exact) => Ok(Some(DriftDerivResult::Dense(
+                                        symmetrized_square_matrix(
+                                            h_exact,
+                                            p,
+                                            &format!(
+                                                "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
+                                            ),
+                                        )?,
+                                    ))),
+                                    None => Err(format!(
+                                        "missing exact-newton dH callback for block {block_idx} while fixed-point evaluation requires H_beta term"
+                                    )),
                                 }
                             }
-                            correction_mat += &dx.t().dot(&wx);
-                            correction_mat += &x_dense.t().dot(&wdx);
+                            BlockWorkingSet::Diagonal {
+                                working_response: _,
+                                working_weights,
+                            } => {
+                                let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                                    format!(
+                                        "missing dynamic design for block {block_idx} diagonal fixed-point correction"
+                                    )
+                                })?;
+                                let wwork = floor_positiveworking_weights(
+                                    working_weights,
+                                    options.minweight,
+                                );
+                                let x_dense = x_dyn.to_dense();
+                                let n = x_dense.nrows();
+
+                                let mut d_eta = x_dyn.matrixvectormultiply(direction);
+                                let geom = family.block_geometry_directional_derivative(
+                                    &inner.block_states,
+                                    block_idx,
+                                    spec,
+                                    direction,
+                                )?;
+                                let mut correction_mat = Array2::<f64>::zeros((p, p));
+
+                                if let Some(geom_dir) = geom {
+                                    d_eta += &geom_dir.d_offset;
+                                    if let Some(dx) = geom_dir.d_design {
+                                        d_eta += &dx.dot(&beta_flat);
+                                        let mut wx = x_dense.clone();
+                                        let mut wdx = dx.clone();
+                                        for i in 0..n {
+                                            let wi = wwork[i];
+                                            if wi != 1.0 {
+                                                wx.row_mut(i).mapv_inplace(|v| v * wi);
+                                                wdx.row_mut(i).mapv_inplace(|v| v * wi);
+                                            }
+                                        }
+                                        correction_mat += &dx.t().dot(&wx);
+                                        correction_mat += &x_dense.t().dot(&wdx);
+                                    }
+                                }
+
+                                let dw = family
+                                    .diagonalworking_weights_directional_derivative(
+                                        &inner.block_states,
+                                        block_idx,
+                                        &d_eta,
+                                    )?
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "missing diagonal dW callback for block {block_idx} while fixed-point evaluation requires H_beta term"
+                                        )
+                                    })?;
+                                if dw.len() != n {
+                                    return Err(format!(
+                                        "block {block_idx} diagonal dW length mismatch in fixed-point outer evaluation: got {}, expected {}",
+                                        dw.len(),
+                                        n
+                                    ));
+                                }
+                                let mut scaled_x = x_dense.clone();
+                                for i in 0..n {
+                                    scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
+                                }
+                                correction_mat += &x_dense.t().dot(&scaled_x);
+
+                                Ok(Some(DriftDerivResult::Dense(correction_mat)))
+                            }
                         }
-                    }
-
-                    let dw = family
-                        .diagonalworking_weights_directional_derivative(
-                            &inner.block_states,
-                            block_idx,
-                            &d_eta,
-                        )?
-                        .ok_or_else(|| {
-                            format!(
-                                "missing diagonal dW callback for block {block_idx} while fixed-point evaluation requires H_beta term"
-                            )
-                        })?;
-                    if dw.len() != n {
-                        return Err(format!(
-                            "block {block_idx} diagonal dW length mismatch in fixed-point outer evaluation: got {}, expected {}",
-                            dw.len(),
-                            n
-                        ));
-                    }
-                    let mut scaled_x = x_dense.clone();
-                    for i in 0..n {
-                        scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
-                    }
-                    correction_mat += &x_dense.t().dot(&scaled_x);
-
-                    Ok(Some(DriftDerivResult::Dense(correction_mat)))
-                }
+                    };
+                let compute_d2h =
+                    |_: &Array1<f64>,
+                     _: &Array1<f64>|
+                     -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+                joint_outer_evaluate_efs(
+                    &inner,
+                    specs,
+                    &per_block,
+                    rho,
+                    &beta_flat,
+                    JointHessianSource::Dense(h_joint_unpen),
+                    &ranges,
+                    total,
+                    ridge,
+                    moderidge,
+                    extra_logdet_ridge,
+                    1.0,
+                    0.0,
+                    include_logdet_h,
+                    include_logdet_s,
+                    strict_spd,
+                    options,
+                    &compute_dh,
+                    &compute_d2h,
+                    None,
+                    None,
+                    None,
+                )
             }
-        };
-        let compute_d2h = |_: &Array1<f64>,
-                           _: &Array1<f64>|
-         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-        joint_outer_evaluate_efs(
-            &inner,
-            specs,
-            &per_block,
-            rho,
-            &beta_flat,
-            JointHessianSource::Dense(h_joint_unpen),
-            &ranges,
-            total,
-            ridge,
-            moderidge,
-            extra_logdet_ridge,
-            1.0,
-            0.0,
-            include_logdet_h,
-            include_logdet_s,
-            strict_spd,
-            options,
-            &compute_dh,
-            &compute_d2h,
-            None,
-            None,
-            None,
-        )?
-    };
+        },
+    )?;
+    if surrogate_warning_count > 0 {
+        log::info!(
+            "[custom-family outer] rho-only EFS evaluation encountered \
+             {surrogate_warning_count} surrogate positive-part Hessian warning(s)"
+        );
+    }
 
     let warm = ConstrainedWarmStart {
         rho: rho.clone(),
@@ -7967,7 +8056,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    derivative_blocks: SharedDerivativeBlocks,
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
@@ -7987,7 +8076,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         &Array1::from_vec(rho.to_vec()),
         penalty_counts,
     )?);
-    let derivative_blocks = Arc::new(derivative_blocks.to_vec());
     let specs_arc = Arc::new(specs.to_vec());
     let beta_arc = Arc::new(beta_flat.clone());
     let synced_arc = Arc::new(synced_states.to_vec());
@@ -8287,7 +8375,7 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    derivative_blocks_arc: SharedDerivativeBlocks,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
 ) -> Option<FixedDriftDerivFn> {
@@ -8298,7 +8386,6 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
 
     let synced_arc = Arc::new(synced_states.to_vec());
     let specs_arc = Arc::new(specs.to_vec());
-    let derivative_blocks_arc = Arc::new(derivative_blocks.to_vec());
     let family_arc = Arc::new(family.clone());
     let psi_workspace = psi_workspace;
 
@@ -8335,6 +8422,28 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     penalty_counts: &[usize],
     rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    warm_start: Option<&ConstrainedWarmStart>,
+    eval_mode: EvalMode,
+) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
+    evaluate_custom_family_hyper_internal_shared(
+        family,
+        specs,
+        options,
+        penalty_counts,
+        rho_current,
+        Arc::new(derivative_blocks.to_vec()),
+        warm_start,
+        eval_mode,
+    )
+}
+
+fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    penalty_counts: &[usize],
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
@@ -8517,7 +8626,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
             family.exact_newton_joint_psi_workspace(
                 synced_joint_states.as_ref(),
                 specs,
-                derivative_blocks,
+                derivative_blocks.as_ref(),
             )?
         } else {
             None
@@ -8533,7 +8642,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                 family,
                 synced_joint_states.as_ref(),
                 specs,
-                derivative_blocks,
+                derivative_blocks.as_ref(),
                 &beta_flat,
                 rho_slice,
                 &penalty_counts,
@@ -8548,7 +8657,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                     family,
                     synced_joint_states.as_ref(),
                     specs,
-                    derivative_blocks,
+                    Arc::clone(&derivative_blocks),
                     &beta_flat,
                     rho_slice,
                     &penalty_counts,
@@ -8559,7 +8668,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
                     family,
                     synced_joint_states.as_ref(),
                     specs,
-                    derivative_blocks,
+                    Arc::clone(&derivative_blocks),
                     hessian_beta_independent,
                     psi_workspace,
                 );
@@ -8910,6 +9019,31 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
 }
 
+pub(crate) fn evaluate_custom_family_joint_hyper_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
+    warm_start: Option<&CustomFamilyWarmStart>,
+    eval_mode: EvalMode,
+) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
+    let penalty_counts = validate_blockspecs(specs)?;
+    let eval_result = evaluate_custom_family_hyper_internal_shared(
+        family,
+        specs,
+        options,
+        &penalty_counts,
+        rho_current,
+        derivative_blocks,
+        warm_start.map(|w| &w.inner),
+        eval_mode,
+    )?;
+    Ok(outer_eval_result_to_joint_hyper_result(eval_result))
+}
+
 fn evaluate_custom_family_joint_hyper_efs_internal<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -8919,6 +9053,28 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
     penalty_counts: &[usize],
     rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(crate::solver::outer_strategy::EfsEval, ConstrainedWarmStart), CustomFamilyError> {
+    evaluate_custom_family_joint_hyper_efs_internal_shared(
+        family,
+        specs,
+        options,
+        penalty_counts,
+        rho_current,
+        Arc::new(derivative_blocks.to_vec()),
+        warm_start,
+    )
+}
+
+fn evaluate_custom_family_joint_hyper_efs_internal_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    penalty_counts: &[usize],
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<(crate::solver::outer_strategy::EfsEval, ConstrainedWarmStart), CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
@@ -9089,7 +9245,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
         family.exact_newton_joint_psi_workspace(
             synced_joint_states.as_ref(),
             specs,
-            derivative_blocks,
+            derivative_blocks.as_ref(),
         )?
     } else {
         None
@@ -9101,7 +9257,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
         family,
         synced_joint_states.as_ref(),
         specs,
-        derivative_blocks,
+        derivative_blocks.as_ref(),
         &beta_flat,
         rho_slice,
         penalty_counts,
@@ -9169,30 +9325,40 @@ fn evaluate_custom_family_joint_hyper_efs_internal<
         hessian_workspace,
     );
 
-    let efs_eval = joint_outer_evaluate_efs(
-        &inner,
-        specs,
-        &per_block,
-        rho_current,
-        &beta_flat,
-        h_joint_unpen,
-        &ranges,
-        total,
-        ridge,
-        moderidge,
-        extra_logdet_ridge,
-        rho_curvature_scale,
-        hessian_logdet_correction,
-        include_logdet_h,
-        include_logdet_s,
-        strict_spd,
-        options,
-        &compute_dh,
-        &compute_d2h,
-        Some(owned_compute_dh),
-        Some(owned_compute_d2h),
-        Some(ext_bundle),
-    )?;
+    let (efs_eval, surrogate_warning_count) =
+        with_ridged_surrogate_reml_guard(RIDGED_SURROGATE_REML_WARNING_ABORT_LIMIT, || {
+            joint_outer_evaluate_efs(
+                &inner,
+                specs,
+                &per_block,
+                rho_current,
+                &beta_flat,
+                h_joint_unpen,
+                &ranges,
+                total,
+                ridge,
+                moderidge,
+                extra_logdet_ridge,
+                rho_curvature_scale,
+                hessian_logdet_correction,
+                include_logdet_h,
+                include_logdet_s,
+                strict_spd,
+                options,
+                &compute_dh,
+                &compute_d2h,
+                Some(owned_compute_dh),
+                Some(owned_compute_d2h),
+                Some(ext_bundle),
+            )
+        })
+        .map_err(CustomFamilyError::from)?;
+    if surrogate_warning_count > 0 {
+        log::info!(
+            "[custom-family outer] joint EFS evaluation encountered \
+             {surrogate_warning_count} surrogate positive-part Hessian warning(s)"
+        );
+    }
 
     let warm = ConstrainedWarmStart {
         rho: rho_current.clone(),
@@ -9238,6 +9404,51 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
         .map_err(CustomFamilyError::from)?
     } else {
         evaluate_custom_family_joint_hyper_efs_internal(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            rho_current,
+            derivative_blocks,
+            warm_start.map(|w| &w.inner),
+        )?
+    };
+    Ok(outer_efs_result_to_joint_hyper_efs_result(
+        efs_eval, warm_start,
+    ))
+}
+
+pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
+    let penalty_counts = validate_blockspecs(specs)?;
+    if derivative_blocks.len() != specs.len() {
+        return Err(format!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        )
+        .into());
+    }
+    let (efs_eval, warm_start) = if derivative_blocks.iter().all(Vec::is_empty) {
+        outerobjectiveefs(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            rho_current,
+            warm_start.map(|w| &w.inner),
+        )
+        .map_err(CustomFamilyError::from)?
+    } else {
+        evaluate_custom_family_joint_hyper_efs_internal_shared(
             family,
             specs,
             options,
@@ -9843,8 +10054,13 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         last_error: Option<String>,
     }
 
+    let screening_cap = Arc::new(AtomicUsize::new(0));
+    let mut outer_options = options.clone();
+    outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
+
     let n_rho = rho0.len();
-    let (cap_gradient, cap_hessian) = custom_family_outer_derivatives(family, specs, options);
+    let (cap_gradient, cap_hessian) =
+        custom_family_outer_derivatives(family, specs, &outer_options);
     let hessian = cap_hessian;
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
     let problem = OuterProblem::new(n_rho)
@@ -9854,6 +10070,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_max_iter(options.outer_max_iter)
         .with_fd_step(1e-4)
         .with_seed_config(family.outer_seed_config(n_rho))
+        .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone());
 
     let eval_outer = |outer: &mut CustomOuterState,
@@ -9866,7 +10083,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         let eval_result = match outerobjectivegradienthessian_internal(
             family,
             specs,
-            options,
+            &outer_options,
             &penalty_counts,
             rho,
             warm_ref,
@@ -9943,7 +10160,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             match outerobjectivegradienthessian(
                 family,
                 specs,
-                options,
+                &outer_options,
                 &penalty_counts,
                 rho,
                 warm_ref,
@@ -9979,7 +10196,14 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         }),
         Some(|outer: &mut CustomOuterState, rho: &Array1<f64>| {
             let warm_ref = outer.warm_cache.as_ref();
-            match outerobjectiveefs(family, specs, options, &penalty_counts, rho, warm_ref) {
+            match outerobjectiveefs(
+                family,
+                specs,
+                &outer_options,
+                &penalty_counts,
+                rho,
+                warm_ref,
+            ) {
                 Ok((eval, warm)) => {
                     outer.warm_cache = Some(warm);
                     outer.last_error = None;
@@ -10015,6 +10239,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     let rho_star = outer_result.rho;
     let outer_iters = outer_result.iterations;
     let outer_grad_norm = outer_result.final_grad_norm;
+    screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
     let final_seed = obj.state.warm_cache.clone();
@@ -10112,14 +10337,14 @@ mod tests {
         let family = OneBlockIdentityFamily;
 
         let small = family.outer_seed_config(4);
-        assert_eq!(small.max_seeds, 8);
-        assert_eq!(small.seed_budget, 2);
-        assert_eq!(small.screen_max_inner_iterations, 3);
+        assert_eq!(small.max_seeds, 6);
+        assert_eq!(small.seed_budget, 1);
+        assert_eq!(small.screen_max_inner_iterations, 2);
 
         let large = family.outer_seed_config(16);
-        assert_eq!(large.max_seeds, 6);
+        assert_eq!(large.max_seeds, 4);
         assert_eq!(large.seed_budget, 1);
-        assert_eq!(large.screen_max_inner_iterations, 3);
+        assert_eq!(large.screen_max_inner_iterations, 2);
     }
 
     #[test]
@@ -10176,7 +10401,7 @@ mod tests {
             &ZeroFamily,
             &[],
             &[],
-            &[],
+            Arc::new(Vec::new()),
             false,
             Some(Arc::new(BlockLocalPsiWorkspace)),
         )
@@ -11638,6 +11863,23 @@ mod tests {
         )
         .expect("slq logdet");
         assert!((slq - exact).abs() < 5e-2, "slq={slq}, exact={exact}");
+    }
+
+    #[test]
+    fn ridged_surrogate_reml_guard_aborts_repeated_positive_part_path() {
+        let h = array![[-1.0, 0.0], [0.0, 2.0]];
+        let err = with_ridged_surrogate_reml_guard(1, || {
+            stable_logdet_with_ridge_policy(
+                &h,
+                1e-12,
+                RidgePolicy::explicit_stabilization_pospart(),
+            )
+        })
+        .expect_err("repeated positive-part surrogate warnings should abort EFS");
+        assert!(
+            err.contains(crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]

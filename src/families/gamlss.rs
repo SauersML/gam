@@ -43,6 +43,7 @@ use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
@@ -2968,6 +2969,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         wiggle_knots: wiggle_knots_cloned.clone(),
         wiggle_degree,
     };
+    let screening_cap = Arc::new(AtomicUsize::new(0));
+    let mut outer_options = options.clone();
+    outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
     // This outer problem is design-moving in the spatial block, so we
     // intentionally plan it as gradient/fixed-point rather than ARC/Newton.
     let analytic_outer_hessian_available = false;
@@ -3060,7 +3064,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         let eval = evaluate_custom_family_joint_hyper(
             &outer_family,
             &blocks,
-            options,
+            &outer_options,
             &theta.slice(s![0..rho_dim]).to_owned(),
             &[eta_derivs, Vec::new()],
             warm_cache,
@@ -3080,7 +3084,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         evaluate_custom_family_joint_hyper_efs(
             &outer_family,
             &blocks,
-            options,
+            &outer_options,
             &theta.slice(s![0..rho_dim]).to_owned(),
             &[eta_derivs, Vec::new()],
             warm_cache,
@@ -3101,6 +3105,13 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     //
     // Spatial log-kappa coordinates are ψ (design-moving) dimensions because
     // they rebuild the spatial basis and penalties at each outer proposal.
+    let prefer_gradient_only =
+        analytic_outer_hessian_available && baseline_design.design.as_sparse().is_none();
+    if prefer_gradient_only {
+        log::info!(
+            "[OUTER] binomial mean wiggle joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    }
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
@@ -3112,6 +3123,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         } else {
             Derivative::Unavailable
         })
+        .with_prefer_gradient_only(prefer_gradient_only)
         .with_psi_dim(theta_dim - rho_dim)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
@@ -3125,6 +3137,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             num_auxiliary_trailing: theta_dim - rho_dim,
             ..Default::default()
         })
+        .with_screening_cap(Arc::clone(&screening_cap))
         .with_rho_bound(12.0)
         .with_heuristic_lambdas(seed_heuristic);
 

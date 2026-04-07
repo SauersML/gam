@@ -665,10 +665,12 @@ impl KroneckerPenaltySystem {
 pub struct TermCollectionDesign {
     /// The full design matrix.
     ///
-    /// Prefer a true sparse matrix when every block is sparse-compatible and
-    /// the assembled density stays low enough for the sparse-native PIRLS path.
-    /// Otherwise keep the lazy block operator so dense/operator-backed terms
-    /// avoid eager materialization.
+    /// Prefer a true sparse matrix when every block is sparse-compatible.
+    /// If the collection already contains intrinsically sparse blocks, preserve
+    /// that storage and let PIRLS decide later whether the penalized system is
+    /// sparse-native eligible. Purely dense materialized blocks still fall back
+    /// to the lazy block operator when sparse storage would just re-encode a
+    /// dense matrix.
     pub design: DesignMatrix,
     pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
@@ -1332,6 +1334,12 @@ struct RandomEffectBlock {
 const BLOCK_SPARSE_ZERO_EPS: f64 = 1e-12;
 const BLOCK_SPARSE_MAX_DENSITY: f64 = 0.20;
 
+fn blocks_have_intrinsic_sparse_structure(blocks: &[DesignBlock]) -> bool {
+    blocks
+        .iter()
+        .any(|block| matches!(block, DesignBlock::Sparse(_) | DesignBlock::RandomEffect(_)))
+}
+
 fn sparse_compatible_block_nnz(block: &DesignBlock) -> Option<usize> {
     match block {
         DesignBlock::Intercept(n) => Some(*n),
@@ -1360,8 +1368,13 @@ fn try_build_sparse_design_from_blocks(
         return Ok(None);
     }
 
-    let total_cells = nrows.saturating_mul(ncols);
-    let sparse_nnz_limit = ((total_cells as f64) * BLOCK_SPARSE_MAX_DENSITY).floor() as usize;
+    let preserve_sparse_storage = blocks_have_intrinsic_sparse_structure(blocks);
+    let sparse_nnz_limit = if preserve_sparse_storage {
+        usize::MAX
+    } else {
+        let total_cells = nrows.saturating_mul(ncols);
+        ((total_cells as f64) * BLOCK_SPARSE_MAX_DENSITY).floor() as usize
+    };
     let mut nnz = 0usize;
     for block in blocks {
         let block_nnz = if let Some(block_nnz) = sparse_compatible_block_nnz(block) {
@@ -5708,6 +5721,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
+    let prefer_gradient_only =
+        analytic_outer_hessian_available && baseline.design.design.as_sparse().is_none();
+    if prefer_gradient_only {
+        log::info!(
+            "[OUTER] spatial-adaptive exact REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    }
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -5715,6 +5735,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         } else {
             Derivative::Unavailable
         })
+        .with_prefer_gradient_only(prefer_gradient_only)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(options.max_iter)
@@ -8805,11 +8826,22 @@ fn exact_joint_spatial_outer_hessian_available(
     family: LikelihoodFamily,
     design: &TermCollectionDesign,
 ) -> bool {
-    family.link_function() == crate::types::LinkFunction::Identity
-        || crate::estimate::reml::exact_outer_hessian_problem_scale_allows(
+    let sparse_design = design.design.as_sparse().is_some();
+    (family.link_function() == crate::types::LinkFunction::Identity || sparse_design)
+        && crate::estimate::reml::exact_outer_hessian_problem_scale_allows(
             design.design.nrows(),
             design.design.ncols(),
         )
+}
+
+fn dense_joint_exact_design_prefers_gradient_only(design: &TermCollectionDesign) -> bool {
+    design.design.as_sparse().is_none()
+}
+
+fn dense_joint_exact_designs_prefer_gradient_only(designs: &[TermCollectionDesign]) -> bool {
+    designs
+        .iter()
+        .any(dense_joint_exact_design_prefers_gradient_only)
 }
 
 fn smooth_term_penalty_index(
@@ -9745,6 +9777,13 @@ fn try_exact_joint_spatial_aniso_optimization(
     let psi_dim = theta_dim - rho_dim;
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
+    let prefer_gradient_only = analytic_outer_hessian_available
+        && dense_joint_exact_design_prefers_gradient_only(baseline_design);
+    if prefer_gradient_only {
+        log::info!(
+            "[OUTER] aniso-psi joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    }
 
     log::trace!(
         "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
@@ -9911,6 +9950,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         } else {
             Derivative::Unavailable
         },
+        prefer_gradient_only,
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
@@ -10016,6 +10056,13 @@ fn try_exact_joint_spatial_isotropic_optimization(
     let kappa_dim = theta_dim - rho_dim;
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
+    let prefer_gradient_only = analytic_outer_hessian_available
+        && dense_joint_exact_design_prefers_gradient_only(baseline_design);
+    if prefer_gradient_only {
+        log::info!(
+            "[OUTER] iso-kappa joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    }
 
     log::trace!(
         "[spatial-iso-joint] starting analytic optimization: rho_dim={}, kappa_dim={}, dims_per_term={:?}",
@@ -10180,6 +10227,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         } else {
             Derivative::Unavailable
         },
+        prefer_gradient_only,
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
@@ -11481,6 +11529,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     n_params: usize,
     gradient: crate::solver::outer_strategy::Derivative,
     hessian: crate::solver::outer_strategy::Derivative,
+    prefer_gradient_only: bool,
     risk_profile: crate::seeding::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
@@ -11493,6 +11542,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     crate::solver::outer_strategy::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
+        .with_prefer_gradient_only(prefer_gradient_only)
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
@@ -11612,6 +11662,13 @@ where
         )
     })?;
     let analytic_outer_hessian_available = analytic_joint_hessian_available;
+    let prefer_gradient_only = analytic_outer_hessian_available
+        && dense_joint_exact_designs_prefer_gradient_only(&boot_designs);
+    if prefer_gradient_only {
+        log::info!(
+            "[OUTER] n-block exact-joint spatial: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    }
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
@@ -11664,6 +11721,7 @@ where
         } else {
             Derivative::Unavailable
         },
+        prefer_gradient_only,
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
@@ -12662,20 +12720,13 @@ mod tests {
     }
 
     #[test]
-    fn term_collection_design_keeps_linear_plus_bspline_sparse() {
+    fn term_collection_design_keeps_intercept_plus_bspline_sparse() {
         let n = 96usize;
         let x = Array1::linspace(0.0, 1.0, n);
         let mut data = Array2::<f64>::zeros((n, 1));
         data.column_mut(0).assign(&x);
         let spec = TermCollectionSpec {
-            linear_terms: vec![LinearTermSpec {
-                name: "x".to_string(),
-                feature_col: 0,
-                double_penalty: false,
-                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
-                coefficient_min: None,
-                coefficient_max: None,
-            }],
+            linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
                 name: "s_x".to_string(),
@@ -12686,7 +12737,7 @@ mod tests {
                         penalty_order: 2,
                         knotspec: BSplineKnotSpec::Generate {
                             data_range: (0.0, 1.0),
-                            num_internal_knots: 24,
+                            num_internal_knots: 32,
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
@@ -14125,6 +14176,42 @@ mod tests {
         ));
         assert!(exact_joint_spatial_outer_hessian_available(
             LikelihoodFamily::GaussianIdentity,
+            &design,
+        ));
+    }
+
+    #[test]
+    fn exact_joint_spatial_outer_hessian_available_for_sparse_designs() {
+        let n = 96usize;
+        let x = Array1::linspace(0.0, 1.0, n);
+        let mut data = Array2::<f64>::zeros((n, 1));
+        data.column_mut(0).assign(&x);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "s_x".to_string(),
+                basis: SmoothBasisSpec::BSpline1D {
+                    feature_col: 0,
+                    spec: BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (0.0, 1.0),
+                            num_internal_knots: 32,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+
+        assert!(matches!(design.design, DesignMatrix::Sparse(_)));
+        assert!(exact_joint_spatial_outer_hessian_available(
+            LikelihoodFamily::BinomialLogit,
             &design,
         ));
     }
