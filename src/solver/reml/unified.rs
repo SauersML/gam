@@ -5934,9 +5934,15 @@ pub struct DenseSpectralOperator {
     /// Precomputed: W = U diag(1/√r_ε(σ)) for efficient traces.
     /// trace(H⁻¹ A) = Σ (AW ⊙ W)
     w_factor: Array2<f64>,
+    /// Precomputed kernel K_ab = 1 / (r_a r_b) for exact H⁻¹ cross traces in
+    /// the eigenbasis.
+    hinv_cross_kernel: Array2<f64>,
     /// Precomputed: G = U diag(1/√(√(σ² + 4ε²))) for logdet gradient traces.
     /// trace(G_ε(H) A) = Σ (AG ⊙ G) where G_ε uses φ'(σ) = 1/√(σ² + 4ε²).
     g_factor: Array2<f64>,
+    /// Precomputed divided-difference kernel Γ for exact logdet Hessian cross traces
+    /// in the eigenbasis.
+    logdet_hessian_kernel: Array2<f64>,
     /// Precomputed log-determinant: Σ ln(r_ε(σ_i)).
     cached_logdet: f64,
     /// Full dimension.
@@ -5982,6 +5988,14 @@ impl DenseSpectralOperator {
             }
         }
 
+        let mut hinv_cross_kernel = Array2::zeros((n, n));
+        for a in 0..n {
+            let inv_ra = 1.0 / reg_eigenvalues[a];
+            for b in 0..n {
+                hinv_cross_kernel[[a, b]] = inv_ra / reg_eigenvalues[b];
+            }
+        }
+
         // Build G factor for logdet gradient traces: G[:, j] = u_j / sqrt(√(σ_j² + 4ε²))
         // φ'(σ) = 1/√(σ² + 4ε²), so we need 1/√(φ'(σ)) = (σ² + 4ε²)^{1/4}
         // Actually: tr(G_ε A) = Σ_j φ'(σ_j) u_jᵀ A u_j = Σ (AG ⊙ G)
@@ -5997,6 +6011,25 @@ impl DenseSpectralOperator {
             }
         }
 
+        let mut logdet_hessian_kernel = Array2::zeros((n, n));
+        let sqrt_disc: Vec<f64> = eigenvalues
+            .iter()
+            .map(|&s| (s * s + four_eps_sq).sqrt())
+            .collect();
+        for a in 0..n {
+            let sigma_a = eigenvalues[a];
+            let sqrt_a = sqrt_disc[a];
+            for b in 0..n {
+                logdet_hessian_kernel[[a, b]] = if a == b {
+                    -sigma_a / (sqrt_a * sqrt_a * sqrt_a)
+                } else {
+                    let sigma_b = eigenvalues[b];
+                    let sqrt_b = sqrt_disc[b];
+                    -(sigma_a + sigma_b) / (sqrt_a * sqrt_b * (sqrt_a + sqrt_b))
+                };
+            }
+        }
+
         // Precompute logdet: Σ ln(r_ε(σ_i))
         let cached_logdet: f64 = reg_eigenvalues.iter().map(|&v| v.ln()).sum();
 
@@ -6008,7 +6041,9 @@ impl DenseSpectralOperator {
             reg_eigenvalues,
             eigenvectors,
             w_factor,
+            hinv_cross_kernel,
             g_factor,
+            logdet_hessian_kernel,
             cached_logdet,
             n_dim: n,
         })
@@ -6023,9 +6058,8 @@ impl DenseSpectralOperator {
     fn trace_hinv_product_cross_rotated(&self, a_rot: &Array2<f64>, b_rot: &Array2<f64>) -> f64 {
         let mut result = 0.0;
         for a in 0..self.n_dim {
-            let inv_ra = 1.0 / self.reg_eigenvalues[a];
             for b in 0..self.n_dim {
-                result += a_rot[[a, b]] * b_rot[[b, a]] * inv_ra / self.reg_eigenvalues[b];
+                result += self.hinv_cross_kernel[[a, b]] * a_rot[[a, b]] * b_rot[[b, a]];
             }
         }
         result
@@ -6044,26 +6078,10 @@ impl DenseSpectralOperator {
         h_i_rot: &Array2<f64>,
         h_j_rot: &Array2<f64>,
     ) -> f64 {
-        let four_eps_sq = 4.0 * self.epsilon * self.epsilon;
-        let sqrt_disc: Vec<f64> = self
-            .raw_eigenvalues
-            .iter()
-            .map(|&s| (s * s + four_eps_sq).sqrt())
-            .collect();
-
         let mut result = 0.0;
         for a in 0..self.n_dim {
-            let sigma_a = self.raw_eigenvalues[a];
-            let sqrt_a = sqrt_disc[a];
             for b in 0..self.n_dim {
-                let gamma_ab = if a == b {
-                    -sigma_a / (sqrt_a * sqrt_a * sqrt_a)
-                } else {
-                    let sigma_b = self.raw_eigenvalues[b];
-                    let sqrt_b = sqrt_disc[b];
-                    -(sigma_a + sigma_b) / (sqrt_a * sqrt_b * (sqrt_a + sqrt_b))
-                };
-                result += gamma_ab * h_i_rot[[a, b]] * h_j_rot[[b, a]];
+                result += self.logdet_hessian_kernel[[a, b]] * h_i_rot[[a, b]] * h_j_rot[[b, a]];
             }
         }
         result
