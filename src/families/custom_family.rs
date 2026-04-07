@@ -430,6 +430,26 @@ impl ExactOuterDerivativeOrder {
 /// first-order when a caller insists on materializing it. This gate is keyed
 /// to the actual outer dimension K, not the inner coefficient dimension p.
 const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
+const EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
+const EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM: usize = 32;
+const EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK: usize = 4_000_000;
+const EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK: usize = 50_000_000;
+
+pub(crate) fn exact_outer_hessian_problem_scale_allows(specs: &[ParameterBlockSpec]) -> bool {
+    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let max_n: usize = specs
+        .iter()
+        .map(|spec| spec.design.nrows())
+        .max()
+        .unwrap_or(0);
+    let linear_work = max_n.saturating_mul(total_p);
+    let quadratic_work = linear_work.saturating_mul(total_p);
+
+    !((max_n >= EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD
+        && total_p >= EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM)
+        || linear_work > EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK
+        || quadratic_work > EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK)
+}
 
 /// Shared cost-aware gate for second-order exact outer derivatives.
 ///
@@ -439,6 +459,10 @@ const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
 /// proxy here is the size of a dense K×K outer Hessian if one were
 /// materialized.
 pub fn cost_gated_outer_order(specs: &[ParameterBlockSpec]) -> ExactOuterDerivativeOrder {
+    if !exact_outer_hessian_problem_scale_allows(specs) {
+        return ExactOuterDerivativeOrder::First;
+    }
+
     let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
     let outer_elements = k.saturating_mul(k);
     if outer_elements > DEFAULT_EXACT_OUTER_MAX_ELEMENTS {
@@ -542,7 +566,11 @@ pub trait CustomFamily {
         if n_params == 0 {
             return crate::seeding::SeedConfig::default();
         }
-        crate::seeding::SeedConfig::default()
+        let mut config = crate::seeding::SeedConfig::default();
+        config.max_seeds = if n_params <= 4 { 8 } else { 6 };
+        config.seed_budget = if n_params <= 4 { 2 } else { 1 };
+        config.screen_max_inner_iterations = 3;
+        config
     }
 
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
@@ -2224,24 +2252,6 @@ pub(crate) fn wrap_spatial_implicit_psi_operator(
 
 const CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD: usize = 1_000_000_000; // 1 GB
 
-fn custom_family_psi_dense_payload_bytes(total_rows: usize, p: usize, psi_dim: usize) -> usize {
-    total_rows
-        .saturating_mul(p)
-        .saturating_mul(8)
-        .saturating_mul(1usize.saturating_add(psi_dim))
-}
-
-pub(crate) fn should_materialize_custom_family_psi_dense(
-    total_rows: usize,
-    p: usize,
-    psi_dim: usize,
-    implicit_available: bool,
-) -> bool {
-    !implicit_available
-        || custom_family_psi_dense_payload_bytes(total_rows, p, psi_dim)
-            <= CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD
-}
-
 fn should_resolve_custom_family_psi_dense(total_rows: usize, p: usize) -> bool {
     total_rows.saturating_mul(p).saturating_mul(8)
         <= CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD
@@ -2289,16 +2299,8 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 None
             };
             let design_operator = implicit_operator.or(dense_operator);
-            let dense_row_count = design_operator
-                .as_ref()
-                .map_or_else(|| info.x_psi_local.nrows(), |op| op.n_data());
-            let materialize_dense_design = !info.x_psi_local.is_empty()
-                && should_materialize_custom_family_psi_dense(
-                    dense_row_count,
-                    info.total_p,
-                    psi_dim,
-                    design_operator.is_some(),
-                );
+            let materialize_dense_design =
+                !info.x_psi_local.is_empty() && design_operator.is_none();
             let embed_design = |local: &Array2<f64>| -> Array2<f64> {
                 if local.ncols() == 0 || local.nrows() == 0 {
                     return Array2::<f64>::zeros((local.nrows(), info.total_p));
@@ -5261,6 +5263,7 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
         Derivative::FiniteDifference
     };
     let hessian = if options.use_outer_hessian
+        && exact_outer_hessian_problem_scale_allows(specs)
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()
         && exact_newton_outer_geometry_supports_second_order_solver(family)
@@ -5588,21 +5591,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
     let use_joint_newton = has_joint_exacthessian && specs.len() >= 2;
-    // Tighten tolerance and raise cycle cap only when the joint Newton
-    // path will actually be used.  Joint Newton converges quadratically
-    // (5-10 steps), so 1e-10 tolerance and 4000 cap are safe.  The
-    // blockwise fallback converges linearly and would waste thousands of
-    // cycles trying to reach 1e-10.
-    let inner_tol = if use_joint_newton {
-        options.inner_tol.min(1e-10)
-    } else {
-        options.inner_tol
-    };
-    let inner_max_cycles = if use_joint_newton {
-        options.inner_max_cycles.max(4000)
-    } else {
-        options.inner_max_cycles
-    };
+    let inner_tol = options.inner_tol;
+    let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
     let mut s_lambdas = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
@@ -10118,6 +10108,21 @@ mod tests {
     struct OneBlockIdentityFamily;
 
     #[test]
+    fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {
+        let family = OneBlockIdentityFamily;
+
+        let small = family.outer_seed_config(4);
+        assert_eq!(small.max_seeds, 8);
+        assert_eq!(small.seed_budget, 2);
+        assert_eq!(small.screen_max_inner_iterations, 3);
+
+        let large = family.outer_seed_config(16);
+        assert_eq!(large.max_seeds, 6);
+        assert_eq!(large.seed_budget, 1);
+        assert_eq!(large.screen_max_inner_iterations, 3);
+    }
+
+    #[test]
     fn floor_positiveworking_weights_preserves_exactzeros() {
         let weights = array![0.0, 1.0e-16, 0.25];
         let floored = floor_positiveworking_weights(&weights, 1.0e-6);
@@ -10342,6 +10347,59 @@ mod tests {
     }
 
     #[test]
+    fn custom_family_outer_derivatives_disables_large_model_second_order() {
+        #[derive(Clone)]
+        struct StrictFamily;
+
+        impl CustomFamily for StrictFamily {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                let n = block_states[0].eta.len();
+                Ok(FamilyEvaluation {
+                    log_likelihood: 0.0,
+                    blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                        working_response: Array1::zeros(n),
+                        working_weights: Array1::ones(n),
+                    }],
+                })
+            }
+
+            fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+                ExactNewtonOuterObjective::StrictPseudoLaplace
+            }
+        }
+
+        let specs = vec![ParameterBlockSpec {
+            name: "x".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((20_100, 50)),
+            )),
+            offset: Array1::zeros(20_100),
+            penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(50))],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.0],
+            initial_beta: None,
+        }];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::Derivative::Unavailable
+        );
+    }
+
+    #[test]
     fn build_block_spatial_psi_derivatives_populates_aniso_cross_rows() {
         let n = 10usize;
         let mut data = Array2::<f64>::zeros((n, 2));
@@ -10404,16 +10462,24 @@ mod tests {
             "info list should expose the same two psi rows"
         );
 
-        let x_cross_01 = derivs[0]
-            .x_psi_psi
-            .as_ref()
-            .expect("psi0 second-derivative rows")[1]
-            .clone();
-        let x_cross_10 = derivs[1]
-            .x_psi_psi
-            .as_ref()
-            .expect("psi1 second-derivative rows")[0]
-            .clone();
+        let x_cross_01 = resolve_custom_family_x_psi_psi(
+            &derivs[0],
+            &derivs[1],
+            1,
+            resolved_design.design.nrows(),
+            resolved_design.design.ncols(),
+            "psi0 cross design",
+        )
+        .expect("resolve psi0 cross design");
+        let x_cross_10 = resolve_custom_family_x_psi_psi(
+            &derivs[1],
+            &derivs[0],
+            0,
+            resolved_design.design.nrows(),
+            resolved_design.design.ncols(),
+            "psi1 cross design",
+        )
+        .expect("resolve psi1 cross design");
         assert_eq!(
             x_cross_01.dim(),
             (

@@ -103,14 +103,14 @@ def main():
          "1",
          ["--disable-score-warp", "--disable-link-dev"])
     bern("bern_scorewarp",
-         "1 + linkwiggle(knots=6)",
+         "1 + linkwiggle(internal_knots=6)",
          ["--disable-link-dev"])
     bern("bern_frailty",
          "1",
          ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3",
           "--disable-score-warp", "--disable-link-dev"])
     bern("bern_sw_frailty",
-         "1 + linkwiggle(knots=6)",
+         "1 + linkwiggle(internal_knots=6)",
          ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.2",
           "--disable-link-dev"])
 
@@ -124,7 +124,7 @@ def main():
          ["--z-column", "z",
           "--survival-likelihood", "marginal-slope",
           "--disable-link-dev"],
-         logslope_formula="1 + linkwiggle(knots=6)")
+         logslope_formula="1 + linkwiggle(internal_knots=6)")
     surv("surv_ms_frailty", "s(bmi)",
          ["--z-column", "z",
           "--survival-likelihood", "marginal-slope",

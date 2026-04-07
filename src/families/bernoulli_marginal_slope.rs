@@ -7960,25 +7960,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
     };
 
-    let marginal_psi_result =
-        build_block_spatial_psi_derivatives(data_view, &marginalspec_boot, &marginal_design);
-    let logslope_psi_result =
-        build_block_spatial_psi_derivatives(data_view, &logslopespec_boot, &logslope_design);
-    // Track which blocks actually have spatial psi-dependence.  A block that is
-    // entirely non-spatial returns Ok(None), which is fine — its psi contribution
-    // is identically zero.  We only require that at least one block has spatial
-    // derivatives when the model has kappa dimensions to optimize.
-    let marginal_has_spatial = marginal_psi_result
-        .as_ref()
-        .map(|r| r.is_some())
-        .unwrap_or(false);
-    let logslope_has_spatial = logslope_psi_result
-        .as_ref()
-        .map(|r| r.is_some())
-        .unwrap_or(false);
-    let analytic_joint_derivatives_available = marginal_psi_result.is_ok()
-        && logslope_psi_result.is_ok()
-        && (marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0);
+    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+    let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
+    let marginal_has_spatial = !marginal_terms.is_empty();
+    let logslope_has_spatial = !logslope_terms.is_empty();
+    let analytic_joint_derivatives_available =
+        marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0;
     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
         return Err(
             "exact bernoulli marginal-slope spatial optimization requires analytic joint psi derivatives"
@@ -8002,8 +7989,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
-    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
-    let logslope_terms = spatial_length_scale_term_indices(&logslopespec_boot);
     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
         if sigma_learnable {
             Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
@@ -8011,10 +7996,38 @@ pub fn fit_bernoulli_marginal_slope_terms(
             initial_sigma
         }
     };
-    let build_derivative_blocks =
-        |specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign]|
-         -> Result<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>, String> {
+    let derivative_block_cache = RefCell::new(
+        None::<(
+            Array1<f64>,
+            Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+        )>,
+    );
+    let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
+    };
+    let get_derivative_blocks = |theta: &Array1<f64>,
+                                 specs: &[TermCollectionSpec],
+                                 designs: &[TermCollectionDesign]|
+     -> Result<
+        Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+        String,
+    > {
+        if let Some((cached_theta, cached_blocks)) = derivative_block_cache.borrow().as_ref()
+            && theta_matches(cached_theta, theta)
+        {
+            return Ok(Arc::clone(cached_blocks));
+        }
+
+        let built = |specs: &[TermCollectionSpec],
+                     designs: &[TermCollectionDesign]|
+         -> Result<
+            Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+            String,
+        > {
             let marginal_psi_derivs = if marginal_has_spatial {
                 build_block_spatial_psi_derivatives(data_view, &specs[0], &designs[0])?.ok_or_else(
                     || {
@@ -8059,7 +8072,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     ));
             }
             Ok(derivative_blocks)
-        };
+        }(specs, designs)?;
+        let built = Arc::new(built);
+        derivative_block_cache.replace(Some((theta.clone(), Arc::clone(&built))));
+        Ok(built)
+    };
 
     let solved = optimize_spatial_length_scale_exact_joint(
         data_view,
@@ -8105,7 +8122,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1], sigma);
-            let derivative_blocks = build_derivative_blocks(specs, designs)?;
+            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper(
                 &family,
                 &blocks,
@@ -8134,7 +8151,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let family = make_family(&designs[0], &designs[1], sigma);
-            let derivative_blocks = build_derivative_blocks(specs, designs)?;
+            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &family,
                 &blocks,

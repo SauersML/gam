@@ -582,10 +582,6 @@ fn blockwise_options_from_fit_args(
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
     options.use_outer_hessian = true;
-    // User-facing nonlinear blockwise fits should persist explicit covariance so
-    // posterior-mean and uncertainty prediction do not need to reconstruct it
-    // from the saved Hessian on every load.
-    options.compute_covariance = true;
     Ok(options)
 }
 
@@ -1757,6 +1753,7 @@ fn run_fitwith_predict_noise(
                 1.0,
                 beta_covariance,
                 beta_covariance_corrected,
+                fit.geometry.clone(),
                 SavedFitSummary::from_blockwise_fit(&fit)?
                     .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
@@ -1938,6 +1935,7 @@ fn run_fitwith_predict_noise(
             1.0,
             fit.covariance_conditional.clone(),
             fit.covariance_corrected.clone(),
+            fit.geometry.clone(),
             SavedFitSummary::from_blockwise_fit(&fit)?,
         );
         let dense_binom_mean = solved.fit.mean_design.design.to_dense();
@@ -8928,6 +8926,7 @@ fn compact_saved_multiblock_fit_result(
     standard_deviation: f64,
     beta_covariance: Option<Array2<f64>>,
     beta_covariance_corrected: Option<Array2<f64>>,
+    geometry: Option<gam::estimate::FitGeometry>,
     summary: SavedFitSummary,
 ) -> UnifiedFitResult {
     let total: usize = blocks.iter().map(|block| block.beta.len()).sum();
@@ -8948,6 +8947,14 @@ fn compact_saved_multiblock_fit_result(
         summary,
     );
     fit_result.blocks = blocks;
+    if let Some(geom) = geometry {
+        if let Some(inf) = fit_result.inference.as_mut() {
+            inf.penalized_hessian = geom.penalized_hessian.clone();
+            inf.working_weights = geom.working_weights.clone();
+            inf.working_response = geom.working_response.clone();
+        }
+        fit_result.geometry = Some(geom);
+    }
     fit_result
 }
 
@@ -8961,6 +8968,7 @@ fn compact_saved_survival_location_scale_fit_result(
         1.0,
         fit.covariance_conditional.clone(),
         fit.covariance_corrected.clone(),
+        fit.geometry.clone(),
         SavedFitSummary::from_blockwise_fit(fit)?,
     );
     apply_inverse_link_state_to_fit_result(&mut fit_result, inverse_link);
@@ -11289,6 +11297,7 @@ mod tests {
             1.0,
             Some(Array2::<f64>::eye(3)),
             None,
+            None,
             saved_fit_summary_stub(),
         );
         let mut payload = test_payload(
@@ -11892,6 +11901,7 @@ mod tests {
             1.0,
             None,
             None,
+            None,
             saved_fit_summary_stub(),
         );
         let mut payload = test_payload(
@@ -11949,6 +11959,7 @@ mod tests {
             1.0,
             Some(covariance.clone()),
             Some(covariance),
+            None,
             saved_fit_summary_stub(),
         );
         let mut payload = test_payload(
@@ -12844,6 +12855,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_linkwiggle_rejects_unknown_options() {
+        let err = parse_formula("y ~ x + linkwiggle(knots=9)")
+            .expect_err("unknown linkwiggle options should be rejected");
+        assert!(err.contains("linkwiggle() does not support option(s) knots"));
+    }
+
+    #[test]
     fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
         let parsed = parse_formula(
             "y ~ x + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
@@ -13042,6 +13060,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_timewiggle_rejects_unknown_options() {
+        let err = parse_formula("Surv(entry, exit, event) ~ timewiggle(knots=9)")
+            .expect_err("unknown timewiggle options should be rejected");
+        assert!(err.contains("timewiggle() does not support option(s) knots"));
+    }
+
+    #[test]
     fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         let model = super::build_bernoulli_marginal_slope_saved_model(
             "y ~ 1".to_string(),
@@ -13105,6 +13130,7 @@ mod tests {
             ],
             Array1::zeros(0),
             1.0,
+            None,
             None,
             None,
             SavedFitSummary {
@@ -13973,6 +13999,7 @@ mod tests {
             1.0,
             None,
             None,
+            None,
             saved_fit_summary_stub(),
         );
 
@@ -14105,6 +14132,7 @@ mod tests {
             ],
             Array1::zeros(0),
             1.0,
+            None,
             None,
             None,
             saved_fit_summary_stub(),
@@ -14412,6 +14440,7 @@ mod tests {
             Array1::zeros(0),
             1.0,
             Some(Array2::<f64>::eye(p_time + 1)),
+            None,
             None,
             saved_fit_summary_stub(),
         );

@@ -290,6 +290,26 @@ pub trait HessianOperator: Send + Sync {
         -(&y_j.t() * &y_i).sum()
     }
 
+    /// Batched cross traces for the logdet Hessian:
+    /// `cross[i,j] = trace_logdet_hessian_cross(H_i, H_j)`.
+    ///
+    /// The default implementation applies `trace_logdet_hessian_cross`
+    /// pairwise. Dense spectral backends override this to rotate each drift
+    /// into the eigenbasis once and reuse the same divided-difference kernel
+    /// across all pairs.
+    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
+        let n = matrices.len();
+        let mut out = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            for j in i..n {
+                let value = self.trace_logdet_hessian_cross(matrices[i], matrices[j]);
+                out[[i, j]] = value;
+                out[[j, i]] = value;
+            }
+        }
+        out
+    }
+
     /// Number of active dimensions (rank of pseudo-inverse).
     fn active_rank(&self) -> usize;
 
@@ -314,6 +334,25 @@ pub trait HessianOperator: Send + Sync {
     /// have the same preference even though they do not store a dense factor.
     fn prefers_stochastic_trace_estimation(&self) -> bool {
         self.is_dense()
+    }
+
+    /// Whether stochastic Hutchinson estimates based on `H⁻¹` are valid for
+    /// logdet-gradient / logdet-Hessian trace terms on this backend.
+    ///
+    /// This is true for plain SPD-logdet operators where
+    /// `trace_logdet_gradient(A) = tr(H⁻¹ A)` and
+    /// `trace_logdet_hessian_cross(A, B) = -tr(H⁻¹ A H⁻¹ B)`.
+    ///
+    /// Smooth spectral regularization does not satisfy those identities, so
+    /// dense spectral backends must override this to `false`.
+    fn logdet_traces_match_hinv_kernel(&self) -> bool {
+        true
+    }
+
+    /// Access the dense spectral backend when this operator is powered by a
+    /// single eigendecomposition.
+    fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        None
     }
 }
 
@@ -3147,20 +3186,12 @@ pub fn reml_laml_evaluate(
 
     // --- Stochastic trace estimation decision ---
     //
-    // For large dense Hessians, exact tr(G_eps(H) H_k) costs O(p^2) per
-    // coordinate (eigendecomposition-based traces require AW products).
-    // Stochastic Hutchinson estimation reduces this to O(M*p) with M probe
-    // vectors (30-80), which is a substantial win when p > 500.
-    //
-    // Sparse Cholesky operators already have O(nnz) solve cost, so exact
-    // column-by-column traces are cheap -- stochastic estimation is skipped.
-    //
-    // The estimator computes tr(H^{-1} H_k) which approximates tr(G_eps(H) H_k)
-    // up to O(eps) -- negligible compared to the Monte Carlo tolerance (0.05)
-    // since eps = sqrt(machine_eps) * spectral_scale ~ 1.5e-8 * scale.
+    // Hutchinson traces based on H^{-1} are only valid for logdet-gradient
+    // terms on backends where the logdet kernel is exactly H^{-1}.
+    // Smooth spectral regularization uses G_eps(H) instead, so those backends
+    // must stay on the exact trace path.
     let total_p = hop.dim();
-    let use_stochastic_traces =
-        total_p > 500 && hop.prefers_stochastic_trace_estimation() && incl_logdet_h;
+    let use_stochastic_traces = can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h);
 
     // When using stochastic traces, pre-collect all H_k matrices (both rho and
     // ext coordinates) and batch them through a single StochasticTraceEstimator.
@@ -3599,10 +3630,14 @@ fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator
     let n = x_ref.nrows();
     let p = x_ref.ncols();
 
-    // Guard: Z = H⁻¹ Xᵀ is a p × n dense matrix. Refuse at biobank scale.
+    // Guard: the dense adjoint path effectively scales like O(n p²), so it is
+    // only appropriate for small corrected models.
     const ZC_MAX_DENSE_WORK: usize = 50_000_000;
-    if n.saturating_mul(p) > ZC_MAX_DENSE_WORK {
-        log::warn!("compute_adjoint_z_c: skipping (n={n}, p={p}) — too large for dense Z = H⁻¹Xᵀ");
+    let dense_work = n.saturating_mul(p).saturating_mul(p);
+    if dense_work > ZC_MAX_DENSE_WORK {
+        log::warn!(
+            "compute_adjoint_z_c: skipping (n={n}, p={p}, n*p^2={dense_work}) — too large for dense adjoint solve"
+        );
         return Array1::zeros(p);
     }
 
@@ -3647,9 +3682,10 @@ fn compute_fourth_derivative_trace(
 
     // Guard: building dense p×p Q matrix is O(n p²). Refuse at biobank scale.
     const FD_MAX_DENSE_WORK: usize = 50_000_000;
-    if n.saturating_mul(p) > FD_MAX_DENSE_WORK {
+    let dense_work = n.saturating_mul(p).saturating_mul(p);
+    if dense_work > FD_MAX_DENSE_WORK {
         log::warn!(
-            "compute_fourth_derivative_trace: skipping (n={n}, p={p}) — too large for dense Q assembly"
+            "compute_fourth_derivative_trace: skipping (n={n}, p={p}, n*p^2={dense_work}) — too large for dense Q assembly"
         );
         return Some(0.0);
     }
@@ -3801,6 +3837,18 @@ fn compute_base_h2_trace(
     }
 }
 
+#[inline]
+fn can_use_stochastic_logdet_hinv_kernel(
+    hop: &dyn HessianOperator,
+    total_p: usize,
+    incl_logdet_h: bool,
+) -> bool {
+    total_p > 500
+        && hop.prefers_stochastic_trace_estimation()
+        && hop.logdet_traces_match_hinv_kernel()
+        && incl_logdet_h
+}
+
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
 /// Uses the precomputed HessianOperator for all linear algebra.
@@ -3928,9 +3976,7 @@ fn compute_outer_hessian(
     // For non-Gaussian families, Ḣ_d = B_d + C[v_d] and the correction
     // is a dense p x p matrix, so we fall back to dense materialization.
     let use_stochastic_cross_traces = any_ext_implicit
-        && total_p > 500
-        && hop.prefers_stochastic_trace_estimation()
-        && incl_logdet_h
+        && can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h)
         && !effective_deriv.has_corrections();
 
     // Precompute ext mode responses and total Hessian drifts.
@@ -3980,7 +4026,10 @@ fn compute_outer_hessian(
     // When implicit operators are present and the problem is large, compute
     // the full (total x total) cross-trace matrix
     //   cross[d,e] = tr(H^{-1} Hd H^{-1} He)
-    // stochastically using the CORRECT estimator:
+    // stochastically. This path is only enabled on backends where the
+    // logdet-Hessian cross term is exactly -tr(H^{-1} Hd H^{-1} He).
+    //
+    // Estimator:
     //   u = H^{-1} z,  q_e = A_e z,  r_e = H^{-1} q_e,  estimate = u^T A_d r_e
     //
     // This avoids materializing the (p x p) Hessian drift matrices for
@@ -4036,13 +4085,32 @@ fn compute_outer_hessian(
         None
     };
 
+    let exact_logdet_cross_traces = if incl_logdet_h && stochastic_cross_traces.is_none() {
+        let mut all_h_matrices: Vec<&Array2<f64>> = Vec::with_capacity(k + ext_dim);
+        for matrix in &h_k_matrices {
+            all_h_matrices.push(matrix);
+        }
+        for matrix in &ext_h_matrices {
+            all_h_matrices.push(
+                matrix
+                    .as_ref()
+                    .expect("exact logdet cross traces require dense ext Hessian drifts"),
+            );
+        }
+        Some(hop.trace_logdet_hessian_crosses(&all_h_matrices))
+    } else {
+        None
+    };
+
     // ── ρ-ρ block ── (uses shared helpers for all trace computations)
 
     for kk in 0..k {
         for ll in kk..k {
             let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
 
-            let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
+            let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
+                exact[[kk, ll]]
+            } else if let Some(ref sct) = stochastic_cross_traces {
                 -sct[[kk, ll]]
             } else {
                 hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
@@ -4112,7 +4180,9 @@ fn compute_outer_hessian(
                 let a_ext = solution.ext_coords[ext_idx].a;
 
                 let (cross_trace, h2_trace) = if incl_logdet_h {
-                    let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
+                    let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
+                        exact[[rho_idx, k + ext_idx]]
+                    } else if let Some(ref sct) = stochastic_cross_traces {
                         -sct[[rho_idx, k + ext_idx]]
                     } else {
                         hop.trace_logdet_hessian_cross(
@@ -4192,7 +4262,9 @@ fn compute_outer_hessian(
                 let coord_j = &solution.ext_coords[jj];
 
                 let (cross_trace, h2_trace) = if incl_logdet_h {
-                    let cross_trace = if let Some(ref sct) = stochastic_cross_traces {
+                    let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
+                        exact[[k + ii, k + jj]]
+                    } else if let Some(ref sct) = stochastic_cross_traces {
                         -sct[[k + ii, k + jj]]
                     } else {
                         hop.trace_logdet_hessian_cross(
@@ -4297,12 +4369,21 @@ fn compute_outer_hessian(
 
 struct StoredFirstDrift {
     dense: Option<Array2<f64>>,
+    dense_rotated: Option<Array2<f64>>,
     operators: Vec<Arc<dyn HyperOperator>>,
 }
 
 impl StoredFirstDrift {
-    fn from_parts(dense: Option<Array2<f64>>, operators: Vec<Arc<dyn HyperOperator>>) -> Self {
-        Self { dense, operators }
+    fn from_parts(
+        dense: Option<Array2<f64>>,
+        dense_rotated: Option<Array2<f64>>,
+        operators: Vec<Arc<dyn HyperOperator>>,
+    ) -> Self {
+        Self {
+            dense,
+            dense_rotated,
+            operators,
+        }
     }
 
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
@@ -4320,6 +4401,7 @@ impl StoredFirstDrift {
         &self,
         alpha: f64,
         dense: &mut Array2<f64>,
+        dense_rotated: Option<&mut Array2<f64>>,
         ops: &mut Vec<(f64, Arc<dyn HyperOperator>)>,
     ) {
         if alpha == 0.0 {
@@ -4327,6 +4409,9 @@ impl StoredFirstDrift {
         }
         if let Some(matrix) = self.dense.as_ref() {
             dense.scaled_add(alpha, matrix);
+        }
+        if let (Some(target), Some(matrix)) = (dense_rotated, self.dense_rotated.as_ref()) {
+            target.scaled_add(alpha, matrix);
         }
         for op in &self.operators {
             ops.push((alpha, Arc::clone(op)));
@@ -4402,22 +4487,35 @@ struct UnifiedOuterHessianOperator {
 }
 
 impl UnifiedOuterHessianOperator {
-    fn combined_drift(&self, alpha: &Array1<f64>) -> (Array2<f64>, Option<WeightedHyperOperator>) {
+    fn combined_drift(
+        &self,
+        alpha: &Array1<f64>,
+    ) -> (
+        Array2<f64>,
+        Option<Array2<f64>>,
+        Option<WeightedHyperOperator>,
+    ) {
         let p = self.hop.dim();
         let mut dense = Array2::<f64>::zeros((p, p));
+        let mut dense_rotated = self
+            .hop
+            .as_dense_spectral()
+            .map(|_| Array2::<f64>::zeros((p, p)));
         let mut ops = Vec::new();
         for (idx, coord) in self.coords.iter().enumerate() {
             let weight = alpha[idx];
             if weight == 0.0 {
                 continue;
             }
-            coord.drift.accumulate(weight, &mut dense, &mut ops);
+            coord
+                .drift
+                .accumulate(weight, &mut dense, dense_rotated.as_mut(), &mut ops);
         }
         let operator = (!ops.is_empty()).then_some(WeightedHyperOperator {
             terms: ops,
             dim_hint: p,
         });
-        (dense, operator)
+        (dense, dense_rotated, operator)
     }
 
     fn pair_vector_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
@@ -4502,7 +4600,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             }
         }
         let m_alpha = self.hop.solve(&g_alpha);
-        let (alpha_dense, alpha_op) = self.combined_drift(alpha);
+        let (alpha_dense, alpha_dense_rotated, alpha_op) = self.combined_drift(alpha);
         let mut out = Array1::<f64>::zeros(self.coords.len());
 
         for idx in 0..self.coords.len() {
@@ -4519,6 +4617,12 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                 let mut value = if let Some(left_dense) = coord.drift.dense.as_ref() {
                     if alpha_dense.is_empty() {
                         0.0
+                    } else if let (Some(dense_hop), Some(left_rot), Some(alpha_rot)) = (
+                        self.hop.as_dense_spectral(),
+                        coord.drift.dense_rotated.as_ref(),
+                        alpha_dense_rotated.as_ref(),
+                    ) {
+                        dense_hop.trace_logdet_hessian_cross_rotated(left_rot, alpha_rot)
                     } else {
                         self.hop
                             .trace_logdet_hessian_cross(left_dense, &alpha_dense)
@@ -4645,11 +4749,15 @@ fn build_outer_hessian_operator(
             DriftDerivResult::Dense(matrix) => dense = Some(matrix),
             DriftDerivResult::Operator(op) => operators.push(op),
         }
+        let dense_rotated = match (hop.as_dense_spectral(), dense.as_ref()) {
+            (Some(dense_hop), Some(matrix)) => Some(dense_hop.rotate_to_eigenbasis(matrix)),
+            _ => None,
+        };
         coords.push(OuterHessianCoord {
             a: 0.5 * solution.beta.dot(&a_k_beta),
             g: a_k_beta,
             v: v_k,
-            drift: StoredFirstDrift::from_parts(dense, operators),
+            drift: StoredFirstDrift::from_parts(dense, dense_rotated, operators),
             ext_index: None,
             b_depends_on_beta: false,
         });
@@ -4678,7 +4786,11 @@ fn build_outer_hessian_operator(
                 DriftDerivResult::Operator(op) => operators.push(op),
             }
         }
-        let drift = StoredFirstDrift::from_parts(dense, operators);
+        let dense_rotated = match (hop.as_dense_spectral(), dense.as_ref()) {
+            (Some(dense_hop), Some(matrix)) => Some(dense_hop.rotate_to_eigenbasis(matrix)),
+            _ => None,
+        };
+        let drift = StoredFirstDrift::from_parts(dense, dense_rotated, operators);
         coords.push(OuterHessianCoord {
             a: coord.a,
             g: coord.g.clone(),
@@ -5901,6 +6013,61 @@ impl DenseSpectralOperator {
             n_dim: n,
         })
     }
+
+    #[inline]
+    fn rotate_to_eigenbasis(&self, matrix: &Array2<f64>) -> Array2<f64> {
+        self.eigenvectors.t().dot(matrix).dot(&self.eigenvectors)
+    }
+
+    #[inline]
+    fn trace_hinv_product_cross_rotated(&self, a_rot: &Array2<f64>, b_rot: &Array2<f64>) -> f64 {
+        let mut result = 0.0;
+        for a in 0..self.n_dim {
+            let inv_ra = 1.0 / self.reg_eigenvalues[a];
+            for b in 0..self.n_dim {
+                result += a_rot[[a, b]] * b_rot[[b, a]] * inv_ra / self.reg_eigenvalues[b];
+            }
+        }
+        result
+    }
+
+    #[inline]
+    fn trace_hinv_product_cross_dense(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let a_rot = self.rotate_to_eigenbasis(a);
+        let b_rot = self.rotate_to_eigenbasis(b);
+        self.trace_hinv_product_cross_rotated(&a_rot, &b_rot)
+    }
+
+    #[inline]
+    fn trace_logdet_hessian_cross_rotated(
+        &self,
+        h_i_rot: &Array2<f64>,
+        h_j_rot: &Array2<f64>,
+    ) -> f64 {
+        let four_eps_sq = 4.0 * self.epsilon * self.epsilon;
+        let sqrt_disc: Vec<f64> = self
+            .raw_eigenvalues
+            .iter()
+            .map(|&s| (s * s + four_eps_sq).sqrt())
+            .collect();
+
+        let mut result = 0.0;
+        for a in 0..self.n_dim {
+            let sigma_a = self.raw_eigenvalues[a];
+            let sqrt_a = sqrt_disc[a];
+            for b in 0..self.n_dim {
+                let gamma_ab = if a == b {
+                    -sigma_a / (sqrt_a * sqrt_a * sqrt_a)
+                } else {
+                    let sigma_b = self.raw_eigenvalues[b];
+                    let sqrt_b = sqrt_disc[b];
+                    -(sigma_a + sigma_b) / (sqrt_a * sqrt_b * (sqrt_a + sqrt_b))
+                };
+                result += gamma_ab * h_i_rot[[a, b]] * h_j_rot[[b, a]];
+            }
+        }
+        result
+    }
 }
 
 impl HessianOperator for DenseSpectralOperator {
@@ -5932,14 +6099,32 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        let ncols = rhs.ncols();
-        let mut result = Array2::zeros((self.n_dim, ncols));
-        for col in 0..ncols {
-            let rhs_col = rhs.column(col).to_owned();
-            let sol = self.solve(&rhs_col);
-            result.column_mut(col).assign(&sol);
+        let mut projected = self.eigenvectors.t().dot(rhs);
+        for j in 0..self.n_dim {
+            let scale = 1.0 / self.reg_eigenvalues[j];
+            projected.row_mut(j).mapv_inplace(|value| value * scale);
         }
-        result
+        self.eigenvectors.dot(&projected)
+    }
+
+    fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        self.trace_hinv_product_cross_dense(a, b)
+    }
+
+    fn trace_hinv_matrix_operator_cross(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
+        self.trace_hinv_product_cross_dense(matrix, &op.to_dense())
+    }
+
+    fn trace_hinv_operator_cross(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
+        self.trace_hinv_product_cross_dense(&left.to_dense(), &right.to_dense())
     }
 
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
@@ -6022,43 +6207,26 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
-        // Spectral divided-difference kernel:
-        // result = Σ_{a,b} Γ_{ab} (Ḣ'_i)_{ab} (Ḣ'_j)_{ba}
-        // where Ḣ'_i = Uᵀ Ḣ_i U (rotated to eigenbasis).
-        //
-        // Γ_{aa} = φ''(σ_a) = -σ_a / (σ_a² + 4ε²)^{3/2}
-        // Γ_{ab} = (φ'(σ_a) - φ'(σ_b)) / (σ_a - σ_b)   for a ≠ b
-        //        = -(σ_a + σ_b) / (√(σ_a²+4ε²) · √(σ_b²+4ε²) · (√(σ_a²+4ε²) + √(σ_b²+4ε²)))
-        let n = self.n_dim;
-        let four_eps_sq = 4.0 * self.epsilon * self.epsilon;
+        let hp_i = self.rotate_to_eigenbasis(h_i);
+        let hp_j = self.rotate_to_eigenbasis(h_j);
+        self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
+    }
 
-        // Rotate derivatives to eigenbasis: Ḣ'_i = Uᵀ Ḣ_i U
-        let hp_i = self.eigenvectors.t().dot(h_i).dot(&self.eigenvectors);
-        let hp_j = self.eigenvectors.t().dot(h_j).dot(&self.eigenvectors);
-
-        // Precompute √(σ_a² + 4ε²) for each eigenvalue.
-        let sqrt_disc: Vec<f64> = self
-            .raw_eigenvalues
+    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
+        let n = matrices.len();
+        let rotated = matrices
             .iter()
-            .map(|&s| (s * s + four_eps_sq).sqrt())
-            .collect();
-
-        let mut result = 0.0;
-        for a in 0..n {
-            for b in 0..n {
-                let gamma = if a == b {
-                    // φ''(σ_a) = -σ_a / (σ_a² + 4ε²)^{3/2}
-                    -self.raw_eigenvalues[a] / (sqrt_disc[a] * sqrt_disc[a] * sqrt_disc[a])
-                } else {
-                    // Γ_{ab} = -(σ_a + σ_b) / (√(σ_a²+4ε²) · √(σ_b²+4ε²) · (√(σ_a²+4ε²) + √(σ_b²+4ε²)))
-                    let sa = self.raw_eigenvalues[a];
-                    let sb = self.raw_eigenvalues[b];
-                    -(sa + sb) / (sqrt_disc[a] * sqrt_disc[b] * (sqrt_disc[a] + sqrt_disc[b]))
-                };
-                result += gamma * hp_i[[a, b]] * hp_j[[b, a]];
+            .map(|matrix| self.rotate_to_eigenbasis(matrix))
+            .collect::<Vec<_>>();
+        let mut out = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            for j in i..n {
+                let value = self.trace_logdet_hessian_cross_rotated(&rotated[i], &rotated[j]);
+                out[[i, j]] = value;
+                out[[j, i]] = value;
             }
         }
-        result
+        out
     }
 
     fn active_rank(&self) -> usize {
@@ -6073,6 +6241,14 @@ impl HessianOperator for DenseSpectralOperator {
 
     fn is_dense(&self) -> bool {
         true
+    }
+
+    fn logdet_traces_match_hinv_kernel(&self) -> bool {
+        false
+    }
+
+    fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        Some(self)
     }
 }
 
@@ -6461,6 +6637,10 @@ impl HessianOperator for BlockCoupledOperator {
         self.inner.trace_logdet_hessian_cross(h_i, h_j)
     }
 
+    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
+        self.inner.trace_logdet_hessian_crosses(matrices)
+    }
+
     fn trace_hinv_block_local_cross(
         &self,
         block: &Array2<f64>,
@@ -6480,6 +6660,26 @@ impl HessianOperator for BlockCoupledOperator {
         self.inner.solve_multi(rhs)
     }
 
+    fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        self.inner.trace_hinv_product_cross(a, b)
+    }
+
+    fn trace_hinv_matrix_operator_cross(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
+        self.inner.trace_hinv_matrix_operator_cross(matrix, op)
+    }
+
+    fn trace_hinv_operator_cross(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
+        self.inner.trace_hinv_operator_cross(left, right)
+    }
+
     fn active_rank(&self) -> usize {
         self.inner.active_rank()
     }
@@ -6490,6 +6690,14 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn is_dense(&self) -> bool {
         true
+    }
+
+    fn logdet_traces_match_hinv_kernel(&self) -> bool {
+        false
+    }
+
+    fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        Some(&self.inner)
     }
 }
 
@@ -7601,6 +7809,7 @@ fn rademacher_probe(p: usize, rng: &mut Xoshiro256SS) -> Array1<f64> {
 mod tests {
     use super::*;
     use crate::solver::estimate::DP_FLOOR;
+    use approx::assert_relative_eq;
     use ndarray::array;
 
     #[test]
@@ -7625,6 +7834,124 @@ mod tests {
         assert!((sol[1] - 0.2).abs() < 1e-12);
 
         assert_eq!(sol.len(), 2);
+    }
+
+    #[test]
+    fn test_dense_spectral_operator_solve_multi_matches_column_solves() {
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let rhs = array![[1.0, -1.0], [0.5, 2.0], [3.0, 0.25],];
+
+        let multi = op.solve_multi(&rhs);
+        for col in 0..rhs.ncols() {
+            let single = op.solve(&rhs.column(col).to_owned());
+            for row in 0..rhs.nrows() {
+                let err = (multi[[row, col]] - single[row]).abs();
+                assert!(
+                    err < 1e-12,
+                    "solve_multi mismatch at ({row}, {col}): multi={}, single={}",
+                    multi[[row, col]],
+                    single[row]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dense_spectral_operator_cross_trace_matches_column_solves() {
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let a = array![[1.0, 0.2, -0.1], [0.2, 2.0, 0.3], [-0.1, 0.3, 0.5],];
+        let b = array![[0.5, -0.4, 0.1], [-0.4, 1.5, 0.25], [0.1, 0.25, 0.75],];
+
+        let expected = (&op.solve_multi(&a).t() * &op.solve_multi(&b)).sum();
+        let exact = op.trace_hinv_product_cross(&a, &b);
+
+        assert_relative_eq!(exact, expected, epsilon = 1e-12, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn test_dense_spectral_operator_operator_cross_matches_dense_formula() {
+        let h = array![[5.0, 0.5, 0.25], [0.5, 3.5, 0.2], [0.25, 0.2, 2.5],];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let dense = array![[1.0, 0.1, -0.2], [0.1, 0.75, 0.3], [-0.2, 0.3, 1.25],];
+        let other = array![[0.6, -0.3, 0.15], [-0.3, 1.1, 0.05], [0.15, 0.05, 0.9],];
+        let other_op = DenseMatrixHyperOperator {
+            matrix: other.clone(),
+        };
+
+        let expected = op.trace_hinv_product_cross(&dense, &other);
+        let mixed = op.trace_hinv_matrix_operator_cross(&dense, &other_op);
+        let operator = op.trace_hinv_operator_cross(&other_op, &other_op);
+        let operator_expected = op.trace_hinv_product_cross(&other, &other);
+
+        assert_relative_eq!(mixed, expected, epsilon = 1e-12, max_relative = 1e-12);
+        assert_relative_eq!(
+            operator,
+            operator_expected,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+    }
+
+    #[test]
+    fn test_dense_spectral_operator_rotated_logdet_cross_matches_dense_path() {
+        let h = array![[4.0, 0.5, 0.2], [0.5, 2.5, 0.3], [0.2, 0.3, 1.75],];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let a = array![[0.8, 0.2, -0.1], [0.2, 1.4, 0.35], [-0.1, 0.35, 0.9],];
+        let b = array![[1.2, -0.25, 0.05], [-0.25, 0.7, 0.15], [0.05, 0.15, 0.6],];
+
+        let a_rot = op.rotate_to_eigenbasis(&a);
+        let b_rot = op.rotate_to_eigenbasis(&b);
+
+        let direct = op.trace_logdet_hessian_cross(&a, &b);
+        let rotated = op.trace_logdet_hessian_cross_rotated(&a_rot, &b_rot);
+
+        assert_relative_eq!(rotated, direct, epsilon = 1e-12, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_adjoint_z_c_guard_uses_quadratic_work() {
+        let n = 5_001usize;
+        let p = 100usize;
+        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::zeros((n, p)),
+        ));
+        let c_array = Array1::ones(n);
+        let ing = ScalarGlmIngredients {
+            c_array: &c_array,
+            d_array: None,
+            x: &x,
+        };
+        let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(p)).unwrap();
+
+        let z_c = compute_adjoint_z_c(&ing, &hop);
+        assert_eq!(z_c, Array1::<f64>::zeros(p));
+    }
+
+    #[test]
+    fn test_compute_fourth_derivative_trace_guard_uses_quadratic_work() {
+        let n = 5_001usize;
+        let p = 100usize;
+        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::zeros((n, p)),
+        ));
+        let c_array = Array1::ones(n);
+        let d_array = Array1::ones(n);
+        let ing = ScalarGlmIngredients {
+            c_array: &c_array,
+            d_array: Some(&d_array),
+            x: &x,
+        };
+        let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(p)).unwrap();
+
+        let trace = compute_fourth_derivative_trace(
+            &ing,
+            &Array1::<f64>::zeros(p),
+            &Array1::<f64>::zeros(p),
+            &hop,
+        );
+        assert_eq!(trace, Some(0.0));
     }
 
     #[test]
@@ -7930,6 +8257,67 @@ mod tests {
             exact2,
             rel_err2,
         );
+    }
+
+    #[test]
+    fn dense_spectral_logdet_traces_do_not_claim_hinv_kernel_equivalence() {
+        let h = array![[4.0, 1.0], [1.0, 3.0]];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        assert!(!op.logdet_traces_match_hinv_kernel());
+        assert!(!can_use_stochastic_logdet_hinv_kernel(&op, 1024, true));
+
+        let block = BlockCoupledOperator::from_joint_hessian(&h).unwrap();
+        assert!(!block.logdet_traces_match_hinv_kernel());
+        assert!(!can_use_stochastic_logdet_hinv_kernel(&block, 1024, true));
+    }
+
+    #[test]
+    fn dense_spectral_hinv_cross_matches_solve_contraction() {
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
+        let a = array![[1.0, 0.2, 0.1], [0.2, 0.5, 0.0], [0.1, 0.0, 0.3],];
+        let b = array![[0.3, 0.1, 0.0], [0.1, 0.8, 0.2], [0.0, 0.2, 0.6],];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let exact = op.trace_hinv_product_cross(&a, &b);
+        let solved_a = op.solve_multi(&a);
+        let solved_b = op.solve_multi(&b);
+        let reference = (&solved_a.t() * &solved_b).sum();
+
+        assert_relative_eq!(exact, reference, epsilon = 1e-10, max_relative = 1e-10);
+    }
+
+    #[test]
+    fn dense_spectral_batched_logdet_crosses_match_pairwise() {
+        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
+        let h1 = array![[1.0, 0.2, 0.1], [0.2, 0.5, 0.0], [0.1, 0.0, 0.3],];
+        let h2 = array![[0.3, 0.1, 0.0], [0.1, 0.8, 0.2], [0.0, 0.2, 0.6],];
+        let h3 = array![[0.7, 0.0, 0.2], [0.0, 0.4, 0.1], [0.2, 0.1, 0.9],];
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let mats = [&h1, &h2, &h3];
+        let batched = op.trace_logdet_hessian_crosses(&mats);
+
+        for i in 0..mats.len() {
+            for j in 0..mats.len() {
+                let pairwise = op.trace_logdet_hessian_cross(mats[i], mats[j]);
+                assert_relative_eq!(
+                    batched[[i, j]],
+                    pairwise,
+                    epsilon = 1e-10,
+                    max_relative = 1e-10
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_free_logdet_traces_keep_hinv_kernel_equivalence() {
+        let diag = array![4.0, 3.0, 2.0];
+        let op = MatrixFreeSpdOperator::new(diag.len(), diag.clone(), move |v| &diag * v).unwrap();
+        assert!(op.logdet_traces_match_hinv_kernel());
+        assert!(can_use_stochastic_logdet_hinv_kernel(&op, 1024, true));
+        assert!(!can_use_stochastic_logdet_hinv_kernel(&op, 128, true));
+        assert!(!can_use_stochastic_logdet_hinv_kernel(&op, 1024, false));
     }
 
     #[test]

@@ -247,7 +247,7 @@ if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
     if [[ "$OS" == "windows" ]]; then
          SOURCE_BIN=$(find "$TEMP_DIR" -type f -name "*.exe" | head -n 1)
     else
-         SOURCE_BIN=$(find "$TEMP_DIR" -type f -perm +111 ! -name "*.*" | head -n 1)
+         SOURCE_BIN=$(find "$TEMP_DIR" -type f -perm /111 ! -name "*.*" | head -n 1)
     fi
 fi
 

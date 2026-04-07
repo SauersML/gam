@@ -665,6 +665,25 @@ pub fn parse_linkwiggle_formulaspec(
     options: &BTreeMap<String, String>,
     raw: &str,
 ) -> Result<LinkWiggleFormulaSpec, String> {
+    let allowed = [
+        "degree",
+        "internal_knots",
+        "penalty_order",
+        "double_penalty",
+    ];
+    let unknown = options
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        let term_name = raw.split('(').next().unwrap_or("linkwiggle");
+        return Err(format!(
+            "{}() does not support option(s) {}: {raw}",
+            term_name,
+            unknown.join(", ")
+        ));
+    }
     let degree = option_usize(options, "degree").unwrap_or(3);
     if degree < 1 {
         return Err(format!("linkwiggle() requires degree >= 1: {raw}"));

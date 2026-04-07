@@ -212,9 +212,9 @@ def main():
         fit2_model = os.path.join(tmpdir, "bernoulli.json")
         ok, elapsed = run([
             "fit", enriched_csv,
-            "case ~ duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
+            "case ~ duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(internal_knots=8)",
             "--logslope-formula",
-            "duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
+            "duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(internal_knots=8)",
             "--z-column", "z",
             "--scale-dimensions",
             "--out", fit2_model,
@@ -226,11 +226,11 @@ def main():
         fit4_model = os.path.join(tmpdir, "survival.json")
         ok, elapsed = run([
             "fit", enriched_csv,
-            "Surv(age0, age1, event) ~ duchon(pc1, pc2, pc3, pc4, centers=20) + survmodel(spec=net, distribution=gaussian) + linkwiggle(knots=8) + timewiggle(knots=8)",
+            "Surv(age0, age1, event) ~ duchon(pc1, pc2, pc3, pc4, centers=20) + survmodel(spec=net, distribution=gaussian) + linkwiggle(internal_knots=8) + timewiggle(internal_knots=8)",
             "--survival-likelihood", "marginal-slope",
             "--baseline-target", "gompertz-makeham",
             "--logslope-formula",
-            "duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(knots=8)",
+            "duchon(pc1, pc2, pc3, pc4, centers=20) + linkwiggle(internal_knots=8)",
             "--z-column", "z",
             "--scale-dimensions",
             "--out", fit4_model,

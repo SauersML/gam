@@ -1198,22 +1198,26 @@ fn logit_posterior_meanwith_deriv_controlled(
         ));
     }
     match logit_posterior_meanwith_deriv_exact(mu, sigma) {
-        Ok(out) => {
-            // Safety-net drift check: the analytic backends are already
-            // validated within their regime, so we only override when the
-            // result is catastrophically wrong (not for sub-1e-6 precision
-            // differences).  GHQ itself has finite accuracy, so comparing
-            // at 5e-11 produces false positives that silently change the
-            // backend to QuadratureFallback.
-            let ghq = logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-            if integrated_mean_derivative_drift_exceeds(&out, &ghq, 1e-6, 1e-4, 1e-5, 1e-3) {
-                Ok(ghq)
-            } else {
-                Ok(out)
-            }
-        }
+        Ok(out) => Ok(out),
         Err(_) => Ok(logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma)),
     }
+}
+
+#[inline]
+fn logit_posterior_meanwith_deriv_pirls(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedMeanDerivative, EstimationError> {
+    if !(mu.is_finite() && sigma.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "logit integrated moments require finite mu and sigma".to_string(),
+        ));
+    }
+    Ok(match logit_posterior_meanwith_deriv_exact(mu, sigma) {
+        Ok(out) => out,
+        Err(_) => logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma),
+    })
 }
 
 #[inline]
@@ -2473,12 +2477,7 @@ pub fn integrated_inverse_link_jet(
                 |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
                 |x| component_point_jet(LinkComponent::Logit, x),
             )?;
-            let ghq = integrated_logit_jet_ghq(quadctx, mu, sigma);
-            if integrated_jet_drift_exceeds(&candidate, &ghq, 1e-5, 1e-3) {
-                Ok(ghq)
-            } else {
-                Ok(candidate)
-            }
+            Ok(candidate)
         }
         LinkFunction::CLogLog => {
             validate_latent_cloglog_inputs(mu, sigma)?;
@@ -2500,6 +2499,20 @@ pub fn integrated_inverse_link_jet(
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
     }
+}
+
+#[inline]
+pub fn integrated_logit_inverse_link_jet_pirls(
+    quadctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    integrate_logit_inverse_link_jet_from_scalar_backend(
+        mu,
+        sigma,
+        |m, s| logit_posterior_meanwith_deriv_pirls(quadctx, m, s),
+        |x| component_point_jet(LinkComponent::Logit, x),
+    )
 }
 
 #[inline]
@@ -2565,19 +2578,6 @@ fn integrated_mean_derivative_drift_exceeds(
             deriv_abs_tol,
             deriv_rel_tol,
         )
-}
-
-#[inline]
-fn integrated_jet_drift_exceeds(
-    candidate: &IntegratedInverseLinkJet,
-    reference: &IntegratedInverseLinkJet,
-    abs_tol: f64,
-    rel_tol: f64,
-) -> bool {
-    integrated_scalar_drift_exceeds(candidate.mean, reference.mean, abs_tol, rel_tol)
-        || integrated_scalar_drift_exceeds(candidate.d1, reference.d1, abs_tol, rel_tol)
-        || integrated_scalar_drift_exceeds(candidate.d2, reference.d2, abs_tol, rel_tol)
-        || integrated_scalar_drift_exceeds(candidate.d3, reference.d3, abs_tol, rel_tol)
 }
 
 #[inline]
@@ -4706,6 +4706,25 @@ mod tests {
     }
 
     #[test]
+    fn test_integrated_logit_pirls_jet_matches_general_dispatch() {
+        let ctx = QuadratureContext::new();
+        let mu = 1.1;
+        let sigma = 0.8;
+
+        let pirls =
+            integrated_logit_inverse_link_jet_pirls(&ctx, mu, sigma).expect("PIRLS logit jet");
+        let general = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma)
+            .expect("general logit jet");
+
+        assert_eq!(pirls.mode, IntegratedExpectationMode::ExactSpecialFunction);
+        assert_eq!(pirls.mode, general.mode);
+        assert_relative_eq!(pirls.mean, general.mean, epsilon = 1e-12);
+        assert_relative_eq!(pirls.d1, general.d1, epsilon = 1e-12);
+        assert_relative_eq!(pirls.d2, general.d2, epsilon = 1e-10);
+        assert_relative_eq!(pirls.d3, general.d3, epsilon = 1e-8);
+    }
+
+    #[test]
     fn test_integrated_cloglog_jet_matches_central_differences() {
         let ctx = QuadratureContext::new();
         let mu = 0.4;
@@ -5065,6 +5084,14 @@ mod tests {
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
         assert!(out.dmean_dmu >= 0.0);
+    }
+
+    #[test]
+    fn test_logit_controlled_path_keeps_exact_backend_in_moderate_regime() {
+        let ctx = QuadratureContext::new();
+        let out =
+            logit_posterior_meanwith_deriv_controlled(&ctx, 1.1, 0.8).expect("logit controlled");
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
     }
 
     #[test]

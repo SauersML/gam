@@ -79,12 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--main-linkwiggle-knots",
         type=int,
-        help="Optional main-formula linkwiggle(knots=K) for marginal-slope link deviation",
+        help="Optional main-formula linkwiggle(internal_knots=K) for marginal-slope link deviation",
     )
     parser.add_argument(
         "--score-warp-knots",
         type=int,
-        help="Optional logslope linkwiggle(knots=K) for marginal-slope score warp",
+        help="Optional logslope linkwiggle(internal_knots=K) for marginal-slope score warp",
     )
     return parser.parse_args()
 
@@ -126,7 +126,7 @@ def build_duchon_term(
 
 def maybe_add_linkwiggle(terms: list[str], knots: int | None) -> None:
     if knots is not None:
-        terms.append(f"linkwiggle(knots={knots})")
+        terms.append(f"linkwiggle(internal_knots={knots})")
 
 
 def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:

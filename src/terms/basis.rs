@@ -1994,6 +1994,13 @@ pub(crate) enum RadialScalarKind {
         dim: usize,
         coeffs: DuchonPartialFractionCoeffs,
     },
+    /// Pure Duchon kernel: a single intrinsic polyharmonic block.
+    PureDuchon {
+        block_order: usize,
+        p_order: usize,
+        s_order: usize,
+        dim: usize,
+    },
 }
 
 impl RadialScalarKind {
@@ -2001,7 +2008,8 @@ impl RadialScalarKind {
     fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
         match self {
             RadialScalarKind::Matern { length_scale, nu } => {
-                let (phi, q, t) = matern_aniso_radial_scalars(r, *length_scale, *nu)?;
+                let (phi, q, t, _, _) =
+                    matern_aniso_extended_radial_scalars(r, *length_scale, *nu)?;
                 Ok((phi, q, t))
             }
             RadialScalarKind::Duchon {
@@ -2014,6 +2022,13 @@ impl RadialScalarKind {
                 let jets = duchon_radial_jets(r, *length_scale, *p_order, *s_order, *dim, coeffs)?;
                 Ok((jets.phi, jets.q, jets.t))
             }
+            RadialScalarKind::PureDuchon {
+                block_order, dim, ..
+            } => {
+                let phi = polyharmonic_kernel(r, *block_order, *dim);
+                let (q, t, _, _) = duchon_polyharmonic_operator_block_jets(r, *block_order, *dim)?;
+                Ok((phi, q, t))
+            }
         }
     }
 
@@ -2022,6 +2037,12 @@ impl RadialScalarKind {
         match self {
             RadialScalarKind::Matern { .. } => 0.0,
             RadialScalarKind::Duchon {
+                p_order,
+                s_order,
+                dim,
+                ..
+            } => duchon_scaling_exponent(*p_order, *s_order, *dim) / *dim as f64,
+            RadialScalarKind::PureDuchon {
                 p_order,
                 s_order,
                 dim,
@@ -2172,6 +2193,10 @@ pub struct ImplicitDesignPsiDerivative {
 
     /// Isotropic scaling contribution per raw anisotropic psi axis.
     psi_scale_share: f64,
+
+    /// Optional exposed-axis to raw-axis linear combinations.
+    /// When present, axis `a` represents Σ_i coeff_i * raw_axis_i.
+    axis_combinations: Option<Vec<Vec<(usize, f64)>>>,
 }
 
 /// The rayon chunk size for parallel implicit matvec operations.
@@ -2224,11 +2249,22 @@ impl ImplicitDesignPsiDerivative {
             n_poly,
             n_axes,
             psi_scale_share: 0.0,
+            axis_combinations: None,
         }
     }
 
     fn with_psi_scale_share(mut self, psi_scale_share: f64) -> Self {
         self.psi_scale_share = psi_scale_share;
+        self
+    }
+
+    fn with_axis_combinations(mut self, axis_combinations: Vec<Vec<(usize, f64)>>) -> Self {
+        for combo in &axis_combinations {
+            for &(raw_axis, _) in combo {
+                assert!(raw_axis < self.n_axes);
+            }
+        }
+        self.axis_combinations = Some(axis_combinations);
         self
     }
 
@@ -2268,6 +2304,7 @@ impl ImplicitDesignPsiDerivative {
             n_poly,
             n_axes,
             psi_scale_share,
+            axis_combinations: None,
         }
     }
 
@@ -2305,6 +2342,7 @@ impl ImplicitDesignPsiDerivative {
             n_poly,
             n_axes: 1,
             psi_scale_share: 0.0,
+            axis_combinations: None,
         }
     }
 
@@ -2321,7 +2359,9 @@ impl ImplicitDesignPsiDerivative {
 
     /// Number of axes (D).
     pub fn n_axes(&self) -> usize {
-        self.n_axes
+        self.axis_combinations
+            .as_ref()
+            .map_or(self.n_axes, Vec::len)
     }
 
     /// Output dimension: total basis columns in the final space.
@@ -2644,8 +2684,35 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes());
         assert_eq!(v.len(), self.n);
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                let raw = self.streaming_accumulate_knot_vector(v, |phi, q, _, sb| {
+                    let s_combo = combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_first_kernel_value(phi, q, s_combo, combo_sum, c)
+                })?;
+                return Ok(self.project_and_pad(&raw));
+            }
+            let c = self.psi_scale_share;
+            let raw = self.accumulate_knot_vector(v, |idx| {
+                let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                Self::transformed_first_kernel_value(
+                    self.phi_values[idx],
+                    self.q_values[idx],
+                    s_combo,
+                    combo_sum,
+                    c,
+                )
+            });
+            return Ok(self.project_and_pad(&raw));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             let raw =
@@ -2668,9 +2735,80 @@ impl ImplicitDesignPsiDerivative {
     ///   result_i = Σ_j q_{ij} · s_{d,ij} · u_knot_j
     /// where u_knot = Z · u_smooth (unprojected back to knot space).
     pub fn forward_mul(&self, axis: usize, u: &ArrayView1<f64>) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes());
         assert_eq!(u.len(), self.p_out());
         let u_knot = self.unproject(u);
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                return self.streaming_forward_mul(&u_knot, |phi, q, _, sb| {
+                    let s_combo = combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_first_kernel_value(phi, q, s_combo, combo_sum, c)
+                });
+            }
+            let n = self.n;
+            let k = self.n_knots;
+            let c = self.psi_scale_share;
+            if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+                let mut result = Array1::<f64>::zeros(n);
+                let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+                let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                        let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                        let mut local = vec![0.0; end - start];
+                        for i in start..end {
+                            let base = i * k;
+                            let mut val = 0.0;
+                            for j in 0..k {
+                                let idx = base + j;
+                                let s_combo =
+                                    self.transformed_combo_axis_value_materialized(idx, combo);
+                                val += Self::transformed_first_kernel_value(
+                                    self.phi_values[idx],
+                                    self.q_values[idx],
+                                    s_combo,
+                                    combo_sum,
+                                    c,
+                                ) * u_knot[j];
+                            }
+                            local[i - start] = val;
+                        }
+                        (start, local)
+                    })
+                    .collect();
+                for (start, vals) in chunk_results {
+                    for (offset, &v) in vals.iter().enumerate() {
+                        result[start + offset] = v;
+                    }
+                }
+                return Ok(result);
+            }
+            let mut result = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let base = i * k;
+                let mut val = 0.0;
+                for j in 0..k {
+                    let idx = base + j;
+                    let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                    val += Self::transformed_first_kernel_value(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        s_combo,
+                        combo_sum,
+                        c,
+                    ) * u_knot[j];
+                }
+                result[i] = val;
+            }
+            return Ok(result);
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             return self.streaming_forward_mul(&u_knot, |phi, q, _, sb| q * sb[axis] + c * phi);
@@ -2733,8 +2871,40 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes());
         assert_eq!(v.len(), self.n);
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                let raw = self.streaming_accumulate_knot_vector(v, |phi, q, t, sb| {
+                    let s_combo = combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_second_kernel_value(
+                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, c,
+                    )
+                })?;
+                return Ok(self.project_and_pad(&raw));
+            }
+            let c = self.psi_scale_share;
+            let raw = self.accumulate_knot_vector(v, |idx| {
+                let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                Self::transformed_second_kernel_value(
+                    self.phi_values[idx],
+                    self.q_values[idx],
+                    self.t_values[idx],
+                    s_combo,
+                    combo_sum,
+                    s_combo,
+                    combo_sum,
+                    c,
+                )
+            });
+            return Ok(self.project_and_pad(&raw));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             let raw = self.streaming_accumulate_knot_vector(v, |phi, q, t, sb| {
@@ -2762,10 +2932,47 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
+        assert!(axis_d < self.n_axes());
+        assert!(axis_e < self.n_axes());
         assert_ne!(axis_d, axis_e);
         assert_eq!(v.len(), self.n);
+        if self.axis_combinations.is_some() {
+            let combo_d = self.transformed_axis_combination(axis_d);
+            let combo_e = self.transformed_axis_combination(axis_e);
+            let sum_d = Self::transformed_combo_sum(combo_d);
+            let sum_e = Self::transformed_combo_sum(combo_e);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                let raw = self.streaming_accumulate_knot_vector(v, |phi, q, t, sb| {
+                    let s_d = combo_d
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    let s_e = combo_e
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, c)
+                })?;
+                return Ok(self.project_and_pad(&raw));
+            }
+            let c = self.psi_scale_share;
+            let raw = self.accumulate_knot_vector(v, |idx| {
+                let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
+                let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
+                Self::transformed_second_kernel_value(
+                    self.phi_values[idx],
+                    self.q_values[idx],
+                    self.t_values[idx],
+                    s_d,
+                    sum_d,
+                    s_e,
+                    sum_e,
+                    c,
+                )
+            });
+            return Ok(self.project_and_pad(&raw));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             let raw = self.streaming_accumulate_knot_vector(v, |phi, q, t, sb| {
@@ -2792,9 +2999,67 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         u: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes());
         assert_eq!(u.len(), self.p_out());
         let u_knot = self.unproject(u);
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                return self.streaming_forward_mul(&u_knot, |phi, q, t, sb| {
+                    let s_combo = combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_second_kernel_value(
+                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, c,
+                    )
+                });
+            }
+            let n = self.n;
+            let k = self.n_knots;
+            let c = self.psi_scale_share;
+            let compute_row = |i: usize| -> f64 {
+                let base = i * k;
+                let mut val = 0.0;
+                for j in 0..k {
+                    let idx = base + j;
+                    let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                    val += Self::transformed_second_kernel_value(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_combo,
+                        combo_sum,
+                        s_combo,
+                        combo_sum,
+                        c,
+                    ) * u_knot[j];
+                }
+                val
+            };
+            if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+                let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
+                let mut result = Array1::<f64>::zeros(n);
+                let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                        let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                        let local: Vec<f64> = (start..end).map(compute_row).collect();
+                        (start, local)
+                    })
+                    .collect();
+                for (start, vals) in chunk_results {
+                    for (offset, &value) in vals.iter().enumerate() {
+                        result[start + offset] = value;
+                    }
+                }
+                return Ok(result);
+            }
+            return Ok(Array1::from_vec((0..n).map(compute_row).collect()));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             return self.streaming_forward_mul(&u_knot, |phi, q, t, sb| {
@@ -2853,11 +3118,74 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         u: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
+        assert!(axis_d < self.n_axes());
+        assert!(axis_e < self.n_axes());
         assert_ne!(axis_d, axis_e);
         assert_eq!(u.len(), self.p_out());
         let u_knot = self.unproject(u);
+        if self.axis_combinations.is_some() {
+            let combo_d = self.transformed_axis_combination(axis_d);
+            let combo_e = self.transformed_axis_combination(axis_e);
+            let sum_d = Self::transformed_combo_sum(combo_d);
+            let sum_e = Self::transformed_combo_sum(combo_e);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                return self.streaming_forward_mul(&u_knot, |phi, q, t, sb| {
+                    let s_d = combo_d
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    let s_e = combo_e
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, c)
+                });
+            }
+            let n = self.n;
+            let k = self.n_knots;
+            let c = self.psi_scale_share;
+            let compute_row = |i: usize| -> f64 {
+                let base = i * k;
+                let mut val = 0.0;
+                for j in 0..k {
+                    let idx = base + j;
+                    let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
+                    let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
+                    val += Self::transformed_second_kernel_value(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_d,
+                        sum_d,
+                        s_e,
+                        sum_e,
+                        c,
+                    ) * u_knot[j];
+                }
+                val
+            };
+            if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
+                let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
+                let mut result = Array1::<f64>::zeros(n);
+                let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * IMPLICIT_MATVEC_CHUNK_SIZE;
+                        let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(n);
+                        let local: Vec<f64> = (start..end).map(compute_row).collect();
+                        (start, local)
+                    })
+                    .collect();
+                for (start, vals) in chunk_results {
+                    for (offset, &value) in vals.iter().enumerate() {
+                        result[start + offset] = value;
+                    }
+                }
+                return Ok(result);
+            }
+            return Ok(Array1::from_vec((0..n).map(compute_row).collect()));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             return self.streaming_forward_mul(&u_knot, |phi, q, t, sb| {
@@ -2913,7 +3241,40 @@ impl ImplicitDesignPsiDerivative {
     /// This is used when the dense matrix is needed temporarily (e.g., for
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes());
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                return self.streaming_materialize(|phi, q, _, sb| {
+                    let s_combo = combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_first_kernel_value(phi, q, s_combo, combo_sum, c)
+                });
+            }
+            let n = self.n;
+            let k = self.n_knots;
+            let c = self.psi_scale_share;
+            let mut raw = Array2::<f64>::zeros((n, k));
+            for i in 0..n {
+                let base = i * k;
+                for j in 0..k {
+                    let idx = base + j;
+                    let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                    raw[[i, j]] = Self::transformed_first_kernel_value(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        s_combo,
+                        combo_sum,
+                        c,
+                    );
+                }
+            }
+            return Ok(self.project_matrix(raw));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             return self.streaming_materialize(|phi, q, _, sb| q * sb[axis] + c * phi);
@@ -2934,7 +3295,45 @@ impl ImplicitDesignPsiDerivative {
 
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes);
+        assert!(axis < self.n_axes());
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                return self.streaming_materialize(|phi, q, t, sb| {
+                    let s_combo = combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_second_kernel_value(
+                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, c,
+                    )
+                });
+            }
+            let n = self.n;
+            let k = self.n_knots;
+            let c = self.psi_scale_share;
+            let mut raw = Array2::<f64>::zeros((n, k));
+            for i in 0..n {
+                let base = i * k;
+                for j in 0..k {
+                    let idx = base + j;
+                    let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                    raw[[i, j]] = Self::transformed_second_kernel_value(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_combo,
+                        combo_sum,
+                        s_combo,
+                        combo_sum,
+                        c,
+                    );
+                }
+            }
+            return Ok(self.project_matrix(raw));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             return self.streaming_materialize(|phi, q, t, sb| {
@@ -2967,9 +3366,52 @@ impl ImplicitDesignPsiDerivative {
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Array2<f64>, BasisError> {
-        assert!(axis_d < self.n_axes);
-        assert!(axis_e < self.n_axes);
+        assert!(axis_d < self.n_axes());
+        assert!(axis_e < self.n_axes());
         assert_ne!(axis_d, axis_e);
+        if self.axis_combinations.is_some() {
+            let combo_d = self.transformed_axis_combination(axis_d);
+            let combo_e = self.transformed_axis_combination(axis_e);
+            let sum_d = Self::transformed_combo_sum(combo_d);
+            let sum_e = Self::transformed_combo_sum(combo_e);
+            if self.is_streaming() {
+                let c = self.psi_scale_share;
+                return self.streaming_materialize(|phi, q, t, sb| {
+                    let s_d = combo_d
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    let s_e = combo_e
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum();
+                    Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, c)
+                });
+            }
+            let n = self.n;
+            let k = self.n_knots;
+            let c = self.psi_scale_share;
+            let mut raw = Array2::<f64>::zeros((n, k));
+            for i in 0..n {
+                let base = i * k;
+                for j in 0..k {
+                    let idx = base + j;
+                    let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
+                    let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
+                    raw[[i, j]] = Self::transformed_second_kernel_value(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_d,
+                        sum_d,
+                        s_e,
+                        sum_e,
+                        c,
+                    );
+                }
+            }
+            return Ok(self.project_matrix(raw));
+        }
         if self.is_streaming() {
             let c = self.psi_scale_share;
             return self.streaming_materialize(|phi, q, t, sb| {
@@ -3019,6 +3461,55 @@ impl ImplicitDesignPsiDerivative {
             Some(zf) => fast_ab(&padded, zf),
             None => padded,
         }
+    }
+
+    fn transformed_axis_combination(&self, axis: usize) -> &[(usize, f64)] {
+        self.axis_combinations
+            .as_ref()
+            .expect("transformed axis combinations")
+            .get(axis)
+            .map(Vec::as_slice)
+            .expect("transformed axis index")
+    }
+
+    #[inline]
+    fn transformed_combo_sum(combo: &[(usize, f64)]) -> f64 {
+        combo.iter().map(|(_, coeff)| *coeff).sum()
+    }
+
+    #[inline]
+    fn transformed_combo_axis_value_materialized(&self, idx: usize, combo: &[(usize, f64)]) -> f64 {
+        combo
+            .iter()
+            .map(|(raw_axis, coeff)| coeff * self.axis_components[[idx, *raw_axis]])
+            .sum()
+    }
+
+    #[inline]
+    fn transformed_first_kernel_value(
+        phi: f64,
+        q: f64,
+        s_combo: f64,
+        coeff_sum: f64,
+        psi_scale_share: f64,
+    ) -> f64 {
+        q * s_combo + psi_scale_share * coeff_sum * phi
+    }
+
+    #[inline]
+    fn transformed_second_kernel_value(
+        phi: f64,
+        q: f64,
+        t: f64,
+        s_left: f64,
+        left_sum: f64,
+        s_right: f64,
+        right_sum: f64,
+        psi_scale_share: f64,
+    ) -> f64 {
+        t * s_left * s_right
+            + psi_scale_share * q * (right_sum * s_left + left_sum * s_right)
+            + psi_scale_share * psi_scale_share * left_sum * right_sum * phi
     }
 }
 
@@ -3702,7 +4193,10 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    let prefer_sparse_design = matches!(spec.identifiability, BSplineIdentifiability::None);
+    let prefer_sparse_design = matches!(
+        spec.identifiability,
+        BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
+    );
     let (design_sparse_opt, design_dense_opt, knots) = if prefer_sparse_design {
         match &spec.knotspec {
             BSplineKnotSpec::Generate {
@@ -3843,23 +4337,53 @@ pub fn build_bspline_basis_1d(
     let (design, transformed_candidates, identifiability_transform) = if let Some(sparse_basis) =
         design_sparse_opt
     {
-        let transformed_candidates = penalties_raw
-            .into_iter()
-            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&candidate.matrix)?,
-                    matrix: candidate.matrix,
-                    source: candidate.source,
-                    normalization_scale: candidate.normalization_scale,
-                    kronecker_factors: None,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        (
-            DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse_basis)),
-            transformed_candidates,
-            None,
-        )
+        match &spec.identifiability {
+            BSplineIdentifiability::None => {
+                let transformed_candidates = penalties_raw
+                    .into_iter()
+                    .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                        Ok(PenaltyCandidate {
+                            nullspace_dim_hint: estimate_penalty_nullity(&candidate.matrix)?,
+                            matrix: candidate.matrix,
+                            source: candidate.source,
+                            normalization_scale: candidate.normalization_scale,
+                            kronecker_factors: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse_basis)),
+                    transformed_candidates,
+                    None,
+                )
+            }
+            BSplineIdentifiability::WeightedSumToZero { weights } => {
+                let (constrained_basis, z) = apply_sum_to_zero_constraint_sparse(
+                    &sparse_basis,
+                    weights.as_ref().map(|w| w.view()),
+                )?;
+                let transformed_candidates = penalties_raw
+                    .into_iter()
+                    .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                        let zt_s = fast_atb(&z, &candidate.matrix);
+                        let matrix = fast_ab(&zt_s, &z);
+                        Ok(PenaltyCandidate {
+                            nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                            matrix,
+                            source: candidate.source,
+                            normalization_scale: candidate.normalization_scale,
+                            kronecker_factors: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(constrained_basis)),
+                    transformed_candidates,
+                    Some(z),
+                )
+            }
+            _ => unreachable!("sparse B-spline identifiability only supports sum-to-zero"),
+        }
     } else {
         let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
             design_dense_opt.expect("dense B-spline basis should be present"),
@@ -4753,6 +5277,7 @@ fn matern_kernel_radial_tripletwith_safe_ratio(
 ///   nu = 5/2:  s^4 / 3
 ///   nu = 7/2:  s^4 / 15
 ///   nu = 9/2:  s^4 / 35  (= 3 s^4 / 105)
+#[cfg(test)]
 fn matern_aniso_radial_scalars(
     r: f64,
     length_scale: f64,
@@ -5468,7 +5993,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
 /// `phi(r; kappa) = kappa^delta H(kappa r)`.
 fn build_duchon_operator_penalty_aniso_derivatives(
     centers: ArrayView2<'_, f64>,
-    length_scale: f64,
+    length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
@@ -5504,8 +6029,9 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    let kappa = 1.0 / length_scale.max(1e-300);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let coeffs = length_scale
+        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
+    let pure_block_order = pure_duchon_block_order(p_order, s_order);
 
     let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let z_cols = z_kernel.ncols();
@@ -5555,12 +6081,24 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
             // Get the Duchon radial jets, including the exact off-origin
             // derivatives of t = R²φ needed for D₁/D₂ anisotropic penalties.
-            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, d, &coeffs)?;
-            let phi = jets.phi;
-            let q = jets.q;
-            let t = jets.t;
-            let dt_dr = jets.t_r;
-            let d2t_dr2 = jets.t_rr;
+            let (phi, q, t, dt_dr, d2t_dr2) = if let Some(length_scale) = length_scale {
+                let jets = duchon_radial_jets(
+                    r,
+                    length_scale,
+                    p_order,
+                    s_order,
+                    d,
+                    coeffs
+                        .as_ref()
+                        .expect("hybrid Duchon partial-fraction coefficients"),
+                )?;
+                (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
+            } else {
+                let phi = polyharmonic_kernel(r, pure_block_order, d);
+                let (q, t, dt_dr, d2t_dr2) =
+                    duchon_polyharmonic_operator_block_jets(r, pure_block_order, d)?;
+                (phi, q, t, dt_dr, d2t_dr2)
+            };
 
             // Anisotropic Laplacian:
             //   Δ_x φ = Σ_b ∂²φ/∂x_b²
@@ -9278,7 +9816,8 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             for j in i..k {
                 let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
                 let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
-                let (_, q, t) = matern_aniso_radial_scalars(r, spec.length_scale, spec.nu)?;
+                let (_, q, t, _, _) =
+                    matern_aniso_extended_radial_scalars(r, spec.length_scale, spec.nu)?;
                 for a in 0..dim {
                     let d1 = q * s_vec[a];
                     let d2 = 2.0 * q * s_vec[a] + t * s_vec[a] * s_vec[a];
@@ -9320,8 +9859,8 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                     for j_idx in i..k {
                         let cj_v: Vec<f64> = (0..dim).map(|ax| centers[[j_idx, ax]]).collect();
                         let (r, s_vec) = aniso_distance_and_components(&ci_v, &cj_v, eta);
-                        let (_, _, t_val) =
-                            matern_aniso_radial_scalars(r, spec.length_scale, spec.nu)?;
+                        let (_, _, t_val, _, _) =
+                            matern_aniso_extended_radial_scalars(r, spec.length_scale, spec.nu)?;
                         let val = t_val * s_vec[a] * s_vec[b];
                         mat[[i, j_idx]] = val;
                         mat[[j_idx, i]] = val;
@@ -9458,70 +9997,100 @@ fn build_duchon_design_psi_aniso_derivatives(
     )
 }
 
-fn center_aniso_log_scales_basis(eta: &[f64]) -> Vec<f64> {
-    if eta.len() <= 1 {
-        return eta.to_vec();
+fn pure_duchon_axis_combinations(dim: usize) -> Vec<Vec<(usize, f64)>> {
+    if dim <= 1 {
+        return vec![vec![(0, 1.0)]];
     }
-    let mean = eta.iter().sum::<f64>() / eta.len() as f64;
-    eta.iter()
-        .map(|&value| {
-            let centered = value - mean;
-            if centered.abs() <= 1e-15 {
-                0.0
-            } else {
-                centered
-            }
-        })
+    let last = dim - 1;
+    (0..last)
+        .map(|axis| vec![(axis, 1.0), (last, -1.0)])
         .collect()
 }
 
-fn pure_duchon_eta_from_free(free_eta: &[f64], full_dim: usize) -> Vec<f64> {
-    if full_dim <= 1 {
-        return free_eta.to_vec();
+fn pure_duchon_reparameterize_penalty_axes(
+    per_axis: Vec<(Vec<Array2<f64>>, Vec<Array2<f64>>)>,
+    cross_terms: Vec<((usize, usize), Vec<Array2<f64>>)>,
+    dim: usize,
+) -> (
+    Vec<Vec<Array2<f64>>>,
+    Vec<Vec<Array2<f64>>>,
+    Vec<(usize, usize)>,
+    Vec<Vec<Array2<f64>>>,
+) {
+    let free_dim = dim.saturating_sub(1).max(1);
+    if dim <= 1 {
+        let mut per_axis_iter = per_axis.into_iter();
+        let (first, second_diag) = per_axis_iter.next().unwrap_or_default();
+        return (vec![first], vec![second_diag], Vec::new(), Vec::new());
     }
-    let mut eta = vec![0.0; full_dim];
-    for (axis, &value) in free_eta.iter().take(full_dim - 1).enumerate() {
-        eta[axis] = value;
-    }
-    eta[full_dim - 1] = -eta[..full_dim - 1].iter().sum::<f64>();
-    eta
-}
 
-fn perturb_duchon_pure_aniso(
-    spec: &DuchonBasisSpec,
-    free_eta: &[f64],
-    delta: &[(usize, f64)],
-) -> DuchonBasisSpec {
-    let mut next = spec.clone();
-    let mut perturbed = free_eta.to_vec();
-    for &(axis, step) in delta {
-        perturbed[axis] += step;
+    let last = dim - 1;
+    let raw_first: Vec<Vec<Array2<f64>>> =
+        per_axis.iter().map(|(first, _)| first.clone()).collect();
+    let raw_second_diag: Vec<Vec<Array2<f64>>> =
+        per_axis.iter().map(|(_, second)| second.clone()).collect();
+    let mut raw_cross: HashMap<(usize, usize), Vec<Array2<f64>>> = HashMap::new();
+    for ((axis_a, axis_b), penalties) in cross_terms {
+        raw_cross.insert((axis_a, axis_b), penalties);
     }
-    let eta = pure_duchon_eta_from_free(
-        &perturbed,
-        spec.aniso_log_scales.as_deref().map_or(0, |v| v.len()),
-    );
-    next.aniso_log_scales = Some(center_aniso_log_scales_basis(&eta));
-    next
-}
 
-fn fd_cross_axis_pairs(dim: usize) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::with_capacity(dim.saturating_mul(dim.saturating_sub(1)) / 2);
-    for a in 0..dim {
-        for b in (a + 1)..dim {
-            pairs.push((a, b));
+    let raw_second = |axis_a: usize, axis_b: usize| -> Vec<Array2<f64>> {
+        if axis_a == axis_b {
+            raw_second_diag[axis_a].clone()
+        } else {
+            let key = if axis_a < axis_b {
+                (axis_a, axis_b)
+            } else {
+                (axis_b, axis_a)
+            };
+            raw_cross
+                .get(&key)
+                .cloned()
+                .expect("pure Duchon raw cross-penalty derivative")
+        }
+    };
+
+    let mut penalties_first = Vec::with_capacity(free_dim);
+    let mut penalties_second_diag = Vec::with_capacity(free_dim);
+    for axis in 0..free_dim {
+        let first_axis = raw_first[axis]
+            .iter()
+            .zip(raw_first[last].iter())
+            .map(|(lhs, rhs)| lhs - rhs)
+            .collect();
+        penalties_first.push(first_axis);
+
+        let second_axis = raw_second(axis, axis)
+            .into_iter()
+            .zip(raw_second(axis, last).into_iter())
+            .zip(raw_second(last, last).into_iter())
+            .map(|((aa, al), ll)| aa - al.mapv(|value| 2.0 * value) + ll)
+            .collect();
+        penalties_second_diag.push(second_axis);
+    }
+
+    let mut penalties_cross_pairs = Vec::new();
+    let mut penalties_cross = Vec::new();
+    for axis_a in 0..free_dim {
+        for axis_b in (axis_a + 1)..free_dim {
+            let cross_axis = raw_second(axis_a, axis_b)
+                .into_iter()
+                .zip(raw_second(axis_a, last).into_iter())
+                .zip(raw_second(axis_b, last).into_iter())
+                .zip(raw_second(last, last).into_iter())
+                .map(|(((ab, al), bl), ll)| ab - al - bl + ll)
+                .collect();
+            penalties_cross_pairs.push((axis_a, axis_b));
+            penalties_cross.push(cross_axis);
         }
     }
-    pairs
-}
 
-fn basis_duchon_effective_aniso(metadata: &BasisMetadata) -> Option<Vec<f64>> {
-    match metadata {
-        BasisMetadata::Duchon {
-            aniso_log_scales, ..
-        } => aniso_log_scales.clone(),
-        _ => None,
-    }
+    (
+        penalties_first,
+        penalties_second_diag,
+        penalties_cross_pairs,
+        penalties_cross,
+    )
 }
 
 fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
@@ -9545,116 +10114,64 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
             "pure Duchon aniso derivative path requires length_scale=None".to_string(),
         ));
     }
-
     let mut workspace = BasisWorkspace::default();
-    let base = build_duchon_basiswithworkspace(data, spec, &mut workspace)?;
-    let base_design = base.design.to_dense();
-    let base_penalties = base.penalties.clone();
-    let effective_eta = basis_duchon_effective_aniso(&base.metadata)
-        .unwrap_or_else(|| center_aniso_log_scales_basis(raw_eta));
-    let free_eta = if dim > 1 {
-        effective_eta[..dim - 1].to_vec()
-    } else {
-        effective_eta.clone()
-    };
-    let free_dim = free_eta.len().max(1);
-    let base_spec = DuchonBasisSpec {
-        aniso_log_scales: Some(effective_eta),
-        ..spec.clone()
-    };
-    let eps = 2e-5_f64;
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let z_kernel =
+        kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
+    let identifiability_transform = frozen_spatial_identifiability_transform(
+        &spec.identifiability,
+        z_kernel.ncols(),
+        "Duchon",
+    )?;
+    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+    let p_final = identifiability_transform
+        .as_ref()
+        .map(|transform| transform.ncols())
+        .unwrap_or_else(|| z_kernel.ncols() + poly_cols);
+    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let s_order = spec.power;
+    let block_order = pure_duchon_block_order(p_order, s_order);
+    let mut design_result = build_aniso_design_psi_derivatives_shared(
+        data,
+        centers.view(),
+        raw_eta,
+        p_final,
+        Some(z_kernel),
+        identifiability_transform.clone(),
+        poly_cols,
+        RadialScalarKind::PureDuchon {
+            block_order,
+            p_order,
+            s_order,
+            dim,
+        },
+    )?;
 
-    let mut design_first = Vec::with_capacity(free_dim);
-    let mut design_second_diag = Vec::with_capacity(free_dim);
-    let mut penalties_first = Vec::with_capacity(free_dim);
-    let mut penalties_second_diag = Vec::with_capacity(free_dim);
-
-    for axis in 0..free_dim {
-        let plus_spec = perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis, eps)]);
-        let minus_spec = perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis, -eps)]);
-        let plus = build_duchon_basiswithworkspace(data, &plus_spec, &mut workspace)?;
-        let minus = build_duchon_basiswithworkspace(data, &minus_spec, &mut workspace)?;
-        let plus_design = plus.design.to_dense();
-        let minus_design = minus.design.to_dense();
-        design_first.push((&plus_design - &minus_design) / (2.0 * eps));
-        design_second_diag
-            .push((&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps));
-
-        let mut first_components = Vec::with_capacity(base_penalties.len());
-        let mut second_components = Vec::with_capacity(base_penalties.len());
-        for penalty_idx in 0..base_penalties.len() {
-            first_components
-                .push((&plus.penalties[penalty_idx] - &minus.penalties[penalty_idx]) / (2.0 * eps));
-            second_components.push(
-                (&plus.penalties[penalty_idx] - &(base_penalties[penalty_idx].clone() * 2.0)
-                    + &minus.penalties[penalty_idx])
-                    / (eps * eps),
-            );
-        }
-        penalties_first.push(first_components);
-        penalties_second_diag.push(second_components);
+    let axis_combinations = pure_duchon_axis_combinations(dim);
+    if let Some(op) = design_result.implicit_operator.take() {
+        design_result.implicit_operator = Some(op.with_axis_combinations(axis_combinations));
     }
+    design_result.design_first.clear();
+    design_result.design_second_diag.clear();
+    design_result.design_second_cross.clear();
+    design_result.design_second_cross_pairs.clear();
 
-    let mut design_second_cross = Vec::new();
-    let mut design_second_cross_pairs = Vec::new();
-    let mut penalties_cross = Vec::new();
-    let mut penalties_cross_pairs = Vec::new();
-    for (axis_a, axis_b) in fd_cross_axis_pairs(free_dim) {
-        let plus_plus = build_duchon_basiswithworkspace(
-            data,
-            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, eps), (axis_b, eps)]),
-            &mut workspace,
-        )?;
-        let plus_minus = build_duchon_basiswithworkspace(
-            data,
-            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, eps), (axis_b, -eps)]),
-            &mut workspace,
-        )?;
-        let minus_plus = build_duchon_basiswithworkspace(
-            data,
-            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, -eps), (axis_b, eps)]),
-            &mut workspace,
-        )?;
-        let minus_minus = build_duchon_basiswithworkspace(
-            data,
-            &perturb_duchon_pure_aniso(&base_spec, &free_eta, &[(axis_a, -eps), (axis_b, -eps)]),
-            &mut workspace,
-        )?;
-
-        design_second_cross.push(
-            (&plus_plus.design.to_dense()
-                - &plus_minus.design.to_dense()
-                - &minus_plus.design.to_dense()
-                + &minus_minus.design.to_dense())
-                / (4.0 * eps * eps),
-        );
-        design_second_cross_pairs.push((axis_a, axis_b));
-
-        let mut cross_components = Vec::with_capacity(base_penalties.len());
-        for penalty_idx in 0..base_penalties.len() {
-            cross_components.push(
-                (&plus_plus.penalties[penalty_idx]
-                    - &plus_minus.penalties[penalty_idx]
-                    - &minus_plus.penalties[penalty_idx]
-                    + &minus_minus.penalties[penalty_idx])
-                    / (4.0 * eps * eps),
-            );
-        }
-        penalties_cross.push(cross_components);
-        penalties_cross_pairs.push((axis_a, axis_b));
-    }
-
-    Ok(AnisoBasisPsiDerivatives {
-        design_first,
-        design_second_diag,
-        design_second_cross,
-        design_second_cross_pairs,
-        penalties_first,
-        penalties_second_diag,
-        penalties_cross,
-        penalties_cross_pairs,
-        implicit_operator: None,
-    })
+    let (per_axis, cross_terms) = build_duchon_operator_penalty_aniso_derivatives(
+        centers.view(),
+        None,
+        spec.power,
+        spec.nullspace_order,
+        raw_eta,
+        identifiability_transform.as_ref(),
+        &mut workspace,
+    )?;
+    let (penalties_first, penalties_second_diag, penalties_cross_pairs, penalties_cross) =
+        pure_duchon_reparameterize_penalty_axes(per_axis, cross_terms, dim);
+    design_result.penalties_first = penalties_first;
+    design_result.penalties_second_diag = penalties_second_diag;
+    design_result.penalties_cross_pairs = penalties_cross_pairs;
+    design_result.penalties_cross = penalties_cross;
+    Ok(design_result)
 }
 
 /// Build per-axis ψ_a derivatives for anisotropic Duchon terms, including
@@ -9700,7 +10217,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
     // Gram product rule, replacing the former fractional approximation.
     let (per_axis, cross_terms) = build_duchon_operator_penalty_aniso_derivatives(
         centers.view(),
-        length_scale,
+        Some(length_scale),
         spec.power,
         spec.nullspace_order,
         eta,
@@ -12185,6 +12702,121 @@ pub fn apply_sum_to_zero_constraint(
     Ok((constrained, z))
 }
 
+pub fn apply_sum_to_zero_constraint_sparse(
+    basis_matrix: &SparseColMat<usize, f64>,
+    weights: Option<ArrayView1<f64>>,
+) -> Result<(SparseColMat<usize, f64>, Array2<f64>), BasisError> {
+    let n = basis_matrix.nrows();
+    let k = basis_matrix.ncols();
+    if k < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
+    }
+
+    let constraint_weights = match weights {
+        Some(w) => {
+            if w.len() != n {
+                return Err(BasisError::WeightsDimensionMismatch {
+                    expected: n,
+                    found: w.len(),
+                });
+            }
+            w.to_owned()
+        }
+        None => Array1::<f64>::ones(n),
+    };
+
+    let mut c = Array1::<f64>::zeros(k);
+    let (symbolic, values) = basis_matrix.parts();
+    let col_ptr = symbolic.col_ptr();
+    let row_idx = symbolic.row_idx();
+    for col in 0..k {
+        let mut sum = 0.0;
+        for idx in col_ptr[col]..col_ptr[col + 1] {
+            sum += values[idx] * constraint_weights[row_idx[idx]];
+        }
+        c[col] = sum;
+    }
+
+    let (pivot, pivot_abs) = c
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| (idx, value.abs()))
+        .max_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
+        .expect("non-empty constraint vector");
+    if pivot_abs <= 1e-12 {
+        return Ok((basis_matrix.clone(), Array2::eye(k)));
+    }
+
+    let pivot_value = c[pivot];
+    let pivot_start = col_ptr[pivot];
+    let pivot_end = col_ptr[pivot + 1];
+    let pivot_rows = &row_idx[pivot_start..pivot_end];
+    let pivot_vals = &values[pivot_start..pivot_end];
+
+    let mut z = Array2::<f64>::zeros((k, k - 1));
+    let mut triplets: Vec<Triplet<usize, usize, f64>> =
+        Vec::with_capacity(values.len() + (k - 1) * pivot_rows.len());
+
+    let mut out_col = 0usize;
+    for src_col in 0..k {
+        if src_col == pivot {
+            continue;
+        }
+        z[[src_col, out_col]] = 1.0;
+        let alpha = -c[src_col] / pivot_value;
+        z[[pivot, out_col]] = alpha;
+
+        let src_start = col_ptr[src_col];
+        let src_end = col_ptr[src_col + 1];
+        let src_rows = &row_idx[src_start..src_end];
+        let src_vals = &values[src_start..src_end];
+
+        let mut src_pos = 0usize;
+        let mut pivot_pos = 0usize;
+        while src_pos < src_rows.len() || pivot_pos < pivot_rows.len() {
+            let (row, value) = match (src_rows.get(src_pos), pivot_rows.get(pivot_pos)) {
+                (Some(&src_row), Some(&pivot_row)) if src_row == pivot_row => {
+                    let value = src_vals[src_pos] + alpha * pivot_vals[pivot_pos];
+                    src_pos += 1;
+                    pivot_pos += 1;
+                    (src_row, value)
+                }
+                (Some(&src_row), Some(&pivot_row)) if src_row < pivot_row => {
+                    let value = src_vals[src_pos];
+                    src_pos += 1;
+                    (src_row, value)
+                }
+                (Some(&src_row), Some(&pivot_row)) => {
+                    let value = alpha * pivot_vals[pivot_pos];
+                    pivot_pos += 1;
+                    debug_assert!(src_row > pivot_row);
+                    (pivot_row, value)
+                }
+                (Some(&src_row), None) => {
+                    let value = src_vals[src_pos];
+                    src_pos += 1;
+                    (src_row, value)
+                }
+                (None, Some(&pivot_row)) => {
+                    let value = alpha * pivot_vals[pivot_pos];
+                    pivot_pos += 1;
+                    (pivot_row, value)
+                }
+                (None, None) => unreachable!("merge loop guards ensure one side remains"),
+            };
+            if value.abs() > 1e-12 {
+                triplets.push(Triplet::new(row, out_col, value));
+            }
+        }
+        out_col += 1;
+    }
+
+    let constrained = SparseColMat::try_new_from_triplets(n, k - 1, &triplets).map_err(|_| {
+        BasisError::SparseCreation("failed to build constrained sparse basis".into())
+    })?;
+    Ok((constrained, z))
+}
+
 /// Reparameterizes a basis matrix so its columns are orthogonal (with optional weights)
 /// to a supplied constraint matrix.
 ///
@@ -14552,6 +15184,24 @@ mod tests {
     }
 
     #[test]
+    fn test_build_bspline_basis_1d_default_identifiability_prefers_sparse_design() {
+        let x = Array::linspace(0.0, 1.0, 32);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(6),
+                placement: BSplineKnotPlacement::Quantile,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::default(),
+        };
+
+        let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
+        assert!(matches!(built.design, DesignMatrix::Sparse(_)));
+    }
+
+    #[test]
     fn test_build_bspline_basis_1d_quantile_rejects_missing_interior_support() {
         let x = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let spec = BSplineBasisSpec {
@@ -14624,6 +15274,60 @@ mod tests {
             assert!(
                 col_sum.abs() < 1e-8,
                 "default weighted-sum-to-zero failed for column {j}: {col_sum}"
+            );
+        }
+
+        let (raw_basis, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            spec.degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let z = match &built.metadata {
+            BasisMetadata::BSpline1D {
+                identifiability_transform: Some(z),
+                ..
+            } => z,
+            _ => panic!("expected frozen B-spline identifiability transform"),
+        };
+        let expected = raw_basis.dot(z);
+        assert_eq!(built_design.dim(), expected.dim());
+        for i in 0..built_design.nrows() {
+            for j in 0..built_design.ncols() {
+                assert_abs_diff_eq!(built_design[[i, j]], expected[[i, j]], epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bspline_identifiability_weighted_sum_tozero_respects_weights_with_sparse_design() {
+        let x = Array::linspace(0.0, 1.0, 30);
+        let weights = Array1::from_iter((0..x.len()).map(|idx| 1.0 + idx as f64 / 10.0));
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 4,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::WeightedSumToZero {
+                weights: Some(weights.clone()),
+            },
+        };
+
+        let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        assert!(matches!(built.design, DesignMatrix::Sparse(_)));
+        let built_design = built.design.to_dense();
+        for j in 0..built_design.ncols() {
+            let weighted_sum = built_design.column(j).dot(&weights);
+            assert!(
+                weighted_sum.abs() < 1e-8,
+                "weighted sum-to-zero failed for column {j}: {weighted_sum}"
             );
         }
     }
@@ -17560,6 +18264,43 @@ mod tests {
                 assert_eq!(penalty.ncols(), expected_cols);
             }
         }
+    }
+
+    #[test]
+    fn test_pure_duchon_aniso_derivatives_use_contrast_operator_axes() {
+        let data = array![
+            [0.0, 0.1, 0.2],
+            [0.3, 0.4, 0.5],
+            [0.6, 0.2, 0.8],
+            [0.9, 0.7, 0.1],
+            [0.2, 0.8, 0.6],
+        ];
+        let centers = data.slice(s![0..4, ..]).to_owned();
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: Some(vec![0.2, -0.1, -0.1]),
+        };
+
+        let basis = build_duchon_basis(data.view(), &spec).expect("pure Duchon basis");
+        let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
+            .expect("pure Duchon anisotropic derivatives");
+
+        assert!(derivs.design_first.is_empty());
+        assert!(derivs.design_second_diag.is_empty());
+        let op = derivs
+            .implicit_operator
+            .as_ref()
+            .expect("pure Duchon should expose an operator-backed anisotropic derivative path");
+        assert_eq!(op.n_axes(), 2);
+        assert_eq!(op.p_out(), basis.design.ncols());
+        assert_eq!(derivs.penalties_first.len(), 2);
+        assert_eq!(derivs.penalties_second_diag.len(), 2);
+        assert_eq!(derivs.penalties_cross_pairs, vec![(0, 1)]);
+        assert_eq!(derivs.penalties_cross.len(), 1);
     }
 
     #[test]

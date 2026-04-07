@@ -122,8 +122,8 @@ Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global 
 | Syntax | Effect |
 | --- | --- |
 | `link(type=logit)` | Set link function |
-| `linkwiggle(knots=10)` | Spline deviation from the base link |
-| `timewiggle(knots=8)` | Spline deviation from the time basis (survival) |
+| `linkwiggle(internal_knots=10)` | Spline deviation from the base link |
+| `timewiggle(internal_knots=8)` | Spline deviation from the time basis (survival) |
 | `survmodel(spec=net, distribution=gaussian)` | Survival model configuration |
 
 ### Auto-detection

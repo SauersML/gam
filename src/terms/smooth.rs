@@ -43,6 +43,7 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState,
 };
+use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -662,9 +663,12 @@ impl KroneckerPenaltySystem {
 
 #[derive(Clone, Debug)]
 pub struct TermCollectionDesign {
-    /// The full design matrix.  When random effects are present this is an
-    /// operator-based `BlockDesignOperator` wrapping a dense core and O(n)
-    /// random-effect operators; otherwise a plain `Dense` matrix.
+    /// The full design matrix.
+    ///
+    /// Prefer a true sparse matrix when every block is sparse-compatible and
+    /// the assembled density stays low enough for the sparse-native PIRLS path.
+    /// Otherwise keep the lazy block operator so dense/operator-backed terms
+    /// avoid eager materialization.
     pub design: DesignMatrix,
     pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
@@ -1323,6 +1327,123 @@ struct RandomEffectBlock {
     group_ids: Vec<Option<usize>>,
     num_groups: usize,
     kept_levels: Vec<u64>,
+}
+
+const BLOCK_SPARSE_ZERO_EPS: f64 = 1e-12;
+const BLOCK_SPARSE_MAX_DENSITY: f64 = 0.20;
+
+fn sparse_compatible_block_nnz(block: &DesignBlock) -> Option<usize> {
+    match block {
+        DesignBlock::Intercept(n) => Some(*n),
+        DesignBlock::RandomEffect(op) => {
+            Some(op.group_ids.iter().filter(|gid| gid.is_some()).count())
+        }
+        DesignBlock::Sparse(sparse) => Some(sparse.val().len()),
+        DesignBlock::Dense(dense) => dense.as_dense_ref().map(|matrix| {
+            matrix
+                .iter()
+                .filter(|&&value| value.abs() > BLOCK_SPARSE_ZERO_EPS)
+                .count()
+        }),
+    }
+}
+
+fn try_build_sparse_design_from_blocks(
+    blocks: &[DesignBlock],
+) -> Result<Option<DesignMatrix>, BasisError> {
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+    let nrows = blocks[0].nrows();
+    let ncols: usize = blocks.iter().map(DesignBlock::ncols).sum();
+    if nrows == 0 || ncols == 0 || ncols <= 32 {
+        return Ok(None);
+    }
+
+    let total_cells = nrows.saturating_mul(ncols);
+    let sparse_nnz_limit = ((total_cells as f64) * BLOCK_SPARSE_MAX_DENSITY).floor() as usize;
+    let mut nnz = 0usize;
+    for block in blocks {
+        let block_nnz = if let Some(block_nnz) = sparse_compatible_block_nnz(block) {
+            block_nnz
+        } else {
+            return Ok(None);
+        };
+        nnz = nnz.saturating_add(block_nnz);
+        if nnz > sparse_nnz_limit {
+            return Ok(None);
+        }
+    }
+
+    let mut triplets = Vec::<Triplet<usize, usize, f64>>::with_capacity(nnz);
+    let mut col_offset = 0usize;
+    for block in blocks {
+        match block {
+            DesignBlock::Intercept(n) => {
+                for row in 0..*n {
+                    triplets.push(Triplet::new(row, col_offset, 1.0));
+                }
+            }
+            DesignBlock::RandomEffect(op) => {
+                for (row, group_id) in op.group_ids.iter().enumerate() {
+                    if let Some(group) = group_id {
+                        triplets.push(Triplet::new(row, col_offset + group, 1.0));
+                    }
+                }
+            }
+            DesignBlock::Sparse(sparse) => {
+                let (symbolic, values) = sparse.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..sparse.ncols() {
+                    for idx in col_ptr[col]..col_ptr[col + 1] {
+                        let value = values[idx];
+                        if value.abs() > BLOCK_SPARSE_ZERO_EPS {
+                            triplets.push(Triplet::new(row_idx[idx], col_offset + col, value));
+                        }
+                    }
+                }
+            }
+            DesignBlock::Dense(dense) => {
+                let matrix = dense.as_dense_ref().ok_or_else(|| {
+                    BasisError::InvalidInput(
+                        "sparse-compatible block assembly requires materialized dense blocks"
+                            .to_string(),
+                    )
+                })?;
+                for row in 0..matrix.nrows() {
+                    for col in 0..matrix.ncols() {
+                        let value = matrix[[row, col]];
+                        if value.abs() > BLOCK_SPARSE_ZERO_EPS {
+                            triplets.push(Triplet::new(row, col_offset + col, value));
+                        }
+                    }
+                }
+            }
+        }
+        col_offset += block.ncols();
+    }
+
+    let sparse = SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
+        BasisError::SparseCreation("failed to assemble sparse term-collection design".to_string())
+    })?;
+    Ok(Some(DesignMatrix::Sparse(
+        crate::matrix::SparseDesignMatrix::new(sparse),
+    )))
+}
+
+fn assemble_term_collection_design_matrix(
+    blocks: Vec<DesignBlock>,
+) -> Result<DesignMatrix, BasisError> {
+    if let Some(sparse) = try_build_sparse_design_from_blocks(&blocks)? {
+        return Ok(sparse);
+    }
+    let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
+        BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
+    })?;
+    Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        Arc::new(block_op),
+    )))
 }
 
 /// Compute per-column standard deviations for multivariate spatial inputs (d > 1).
@@ -3141,10 +3262,7 @@ fn build_term_collection_design_inner(
         }
     }
 
-    let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
-        BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
-    })?;
-    let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(block_op)));
+    let design = assemble_term_collection_design_matrix(blocks)?;
 
     let mut penalties = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims = Vec::<usize>::new();
@@ -5581,6 +5699,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
     let analytic_outer_hessian_available =
         crate::custom_family::joint_exact_analytic_outer_hessian_available()
+            && crate::custom_family::exact_outer_hessian_problem_scale_allows(
+                std::slice::from_ref(&blockspec),
+            )
             && base_family
                 .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
                 .has_hessian()
@@ -8680,6 +8801,17 @@ fn evaluate_joint_reml_efs_at_theta(
     )
 }
 
+fn exact_joint_spatial_outer_hessian_available(
+    family: LikelihoodFamily,
+    design: &TermCollectionDesign,
+) -> bool {
+    family.link_function() == crate::types::LinkFunction::Identity
+        || crate::estimate::reml::exact_outer_hessian_problem_scale_allows(
+            design.design.nrows(),
+            design.design.ncols(),
+        )
+}
+
 fn smooth_term_penalty_index(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
@@ -9611,6 +9743,8 @@ fn try_exact_joint_spatial_aniso_optimization(
 
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
+    let analytic_outer_hessian_available =
+        exact_joint_spatial_outer_hessian_available(family, baseline_design);
 
     log::trace!(
         "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
@@ -9635,6 +9769,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             &mut self,
             theta: &Array1<f64>,
             order: OuterEvalOrder,
+            analytic_outer_hessian_available: bool,
         ) -> Result<
             (
                 f64,
@@ -9643,11 +9778,10 @@ fn try_exact_joint_spatial_aniso_optimization(
             ),
             EstimationError,
         > {
+            let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
+                && analytic_outer_hessian_available;
             if let Some(eval) = self.cache.memoized_eval(theta) {
-                let cached_satisfies_order = match order {
-                    OuterEvalOrder::ValueAndGradient => true,
-                    OuterEvalOrder::ValueGradientHessian => eval.2.is_analytic(),
-                };
+                let cached_satisfies_order = !allow_second_order || eval.2.is_analytic();
                 if cached_satisfies_order {
                     return Ok(eval);
                 }
@@ -9674,7 +9808,11 @@ fn try_exact_joint_spatial_aniso_optimization(
                 self.rho_dim,
                 hyper_dirs,
                 None,
-                order,
+                if allow_second_order {
+                    order
+                } else {
+                    OuterEvalOrder::ValueAndGradient
+                },
             );
             if let Ok(ref value) = eval {
                 self.cache.store_eval(value.clone());
@@ -9716,7 +9854,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
             }
-            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient) {
+            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient, false) {
                 Ok((cost, _, _)) => cost,
                 Err(_) => f64::INFINITY,
             }
@@ -9768,7 +9906,11 @@ fn try_exact_joint_spatial_aniso_optimization(
         psi_dim,
         theta_dim,
         Derivative::Analytic,
-        Derivative::Analytic,
+        if analytic_outer_hessian_available {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        },
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
@@ -9779,7 +9921,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                       theta: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        match ctx.eval_full(theta, order) {
+        match ctx.eval_full(theta, order, analytic_outer_hessian_available) {
             Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
                 Ok(OuterEval {
@@ -9800,7 +9942,15 @@ fn try_exact_joint_spatial_aniso_optimization(
             Ok(cost)
         },
         |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
-            eval_outer(ctx, theta, OuterEvalOrder::ValueGradientHessian)
+            eval_outer(
+                ctx,
+                theta,
+                if analytic_outer_hessian_available {
+                    OuterEvalOrder::ValueGradientHessian
+                } else {
+                    OuterEvalOrder::ValueAndGradient
+                },
+            )
         },
         |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
             eval_outer(ctx, theta, order)
@@ -9864,6 +10014,8 @@ fn try_exact_joint_spatial_isotropic_optimization(
 
     let theta_dim = theta0.len();
     let kappa_dim = theta_dim - rho_dim;
+    let analytic_outer_hessian_available =
+        exact_joint_spatial_outer_hessian_available(family, baseline_design);
 
     log::trace!(
         "[spatial-iso-joint] starting analytic optimization: rho_dim={}, kappa_dim={}, dims_per_term={:?}",
@@ -9886,6 +10038,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             &mut self,
             theta: &Array1<f64>,
             order: OuterEvalOrder,
+            analytic_outer_hessian_available: bool,
         ) -> Result<
             (
                 f64,
@@ -9894,11 +10047,10 @@ fn try_exact_joint_spatial_isotropic_optimization(
             ),
             EstimationError,
         > {
+            let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
+                && analytic_outer_hessian_available;
             if let Some(eval) = self.cache.memoized_eval(theta) {
-                let cached_satisfies_order = match order {
-                    OuterEvalOrder::ValueAndGradient => true,
-                    OuterEvalOrder::ValueGradientHessian => eval.2.is_analytic(),
-                };
+                let cached_satisfies_order = !allow_second_order || eval.2.is_analytic();
                 if cached_satisfies_order {
                     return Ok(eval);
                 }
@@ -9925,7 +10077,11 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 self.rho_dim,
                 hyper_dirs,
                 None,
-                order,
+                if allow_second_order {
+                    order
+                } else {
+                    OuterEvalOrder::ValueAndGradient
+                },
             );
             if let Ok(ref value) = eval {
                 self.cache.store_eval(value.clone());
@@ -9967,7 +10123,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
             }
-            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient) {
+            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient, false) {
                 Ok((cost, _, _)) => cost,
                 Err(_) => f64::INFINITY,
             }
@@ -10019,7 +10175,11 @@ fn try_exact_joint_spatial_isotropic_optimization(
         kappa_dim,
         theta_dim,
         Derivative::Analytic,
-        Derivative::Analytic,
+        if analytic_outer_hessian_available {
+            Derivative::Analytic
+        } else {
+            Derivative::Unavailable
+        },
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
@@ -10030,7 +10190,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                       theta: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        match ctx.eval_full(theta, order) {
+        match ctx.eval_full(theta, order, analytic_outer_hessian_available) {
             Ok((cost, grad, hess)) => {
                 ctx.track_best(theta, cost);
                 Ok(OuterEval {
@@ -10051,7 +10211,15 @@ fn try_exact_joint_spatial_isotropic_optimization(
             Ok(cost)
         },
         |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
-            eval_outer(ctx, theta, OuterEvalOrder::ValueGradientHessian)
+            eval_outer(
+                ctx,
+                theta,
+                if analytic_outer_hessian_available {
+                    OuterEvalOrder::ValueGradientHessian
+                } else {
+                    OuterEvalOrder::ValueAndGradient
+                },
+            )
         },
         |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
             eval_outer(ctx, theta, order)
@@ -10948,10 +11116,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         for term_design in &self.design.smooth.term_designs {
             blocks.push(DesignBlock::from(term_design));
         }
-        let block_op = BlockDesignOperator::new(blocks)
-            .map_err(|e| format!("failed to refresh block design operator: {e}"))?;
-        self.design.design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(block_op)));
+        self.design.design = assemble_term_collection_design_matrix(blocks)
+            .map_err(|e| format!("failed to refresh term-collection design: {e}"))?;
         Ok(())
     }
 }
@@ -12496,6 +12662,50 @@ mod tests {
     }
 
     #[test]
+    fn term_collection_design_keeps_linear_plus_bspline_sparse() {
+        let n = 96usize;
+        let x = Array1::linspace(0.0, 1.0, n);
+        let mut data = Array2::<f64>::zeros((n, 1));
+        data.column_mut(0).assign(&x);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "x".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "s_x".to_string(),
+                basis: SmoothBasisSpec::BSpline1D {
+                    feature_col: 0,
+                    spec: BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (0.0, 1.0),
+                            num_internal_knots: 24,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design =
+            build_term_collection_design(data.view(), &spec).expect("term collection design");
+        assert!(
+            matches!(design.design, DesignMatrix::Sparse(_)),
+            "expected sparse full design, got {:?}",
+            design.design
+        );
+    }
+
+    #[test]
     fn spatial_smooth_columns_do_not_duplicate_global_intercept() {
         let data = array![
             [0.0, 0.0],
@@ -13886,6 +14096,37 @@ mod tests {
                 _ => panic!("expected Matérn term"),
             }
         }
+    }
+
+    #[test]
+    fn exact_joint_spatial_outer_hessian_gate_disables_large_non_gaussian_designs() {
+        let n = 5_001usize;
+        let p = 100usize;
+        let data = Array2::<f64>::zeros((n, p));
+        let spec = TermCollectionSpec {
+            linear_terms: (0..p)
+                .map(|j| LinearTermSpec {
+                    name: format!("x{j}"),
+                    feature_col: j,
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                })
+                .collect(),
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+
+        assert!(!exact_joint_spatial_outer_hessian_available(
+            LikelihoodFamily::BinomialLogit,
+            &design,
+        ));
+        assert!(exact_joint_spatial_outer_hessian_available(
+            LikelihoodFamily::GaussianIdentity,
+            &design,
+        ));
     }
 
     #[test]
