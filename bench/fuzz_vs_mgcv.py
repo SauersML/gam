@@ -61,8 +61,8 @@ from run_suite import (
 ROOT = Path(__file__).resolve().parent.parent
 RUST_BINARY = ROOT / "target" / "release" / "gam"
 RESULTS_FILE = Path(__file__).resolve().parent / "fuzz_results.jsonl"
-R_TIMEOUT = 180
-RUST_TIMEOUT = 180
+DEFAULT_R_TIMEOUT = 180
+DEFAULT_RUST_TIMEOUT = 180
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SMOOTH FUNCTION LIBRARY — 35+ functions
@@ -552,6 +552,26 @@ class FuzzScenario:
         return f"s{self.seed}_{self.family}_{self.model_type}_{self.basis_type}"
 
 
+def estimate_scenario_cost(sc: FuzzScenario) -> float:
+    cost = float(max(sc.n_obs, 1) * max(sc.n_smooths, 1) * max(sc.knots, 1))
+    if sc.family == "binomial":
+        cost *= 2.0
+    if sc.model_type == "gamlss":
+        cost *= 1.8
+    cost *= {
+        "ps": 1.6,
+        "tps": 3.2,
+        "duchon": 1.2,
+    }[sc.basis_type]
+    if sc.double_penalty:
+        cost *= 1.15
+    if sc.signal_structure in {"surface_2d", "stacked", "regime"}:
+        cost *= 1.2
+    if sc.noise_kind in {"heteroscedastic", "periodic_het", "lognormal", "sparse_outlier"}:
+        cost *= 1.15
+    return cost
+
+
 def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> FuzzScenario:
     rng = np.random.RandomState(seed)
     choice = lambda lst: lst[rng.randint(0, len(lst))]
@@ -721,7 +741,7 @@ def mgcv_sigma_formula(cols, sc):
 # RUNNERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_rust(sc, train_df, test_df, cols, tmpdir):
+def run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout):
     train_csv = os.path.join(tmpdir, "train.csv")
     test_csv = os.path.join(tmpdir, "test.csv")
     model_json = os.path.join(tmpdir, "model.json")
@@ -736,14 +756,14 @@ def run_rust(sc, train_df, test_df, cols, tmpdir):
     try:
         fit_cmd = build_rust_fit_cmd(sc, train_csv, model_json, cols)
 
-        r = subprocess.run(fit_cmd, capture_output=True, text=True, timeout=RUST_TIMEOUT)
+        r = subprocess.run(fit_cmd, capture_output=True, text=True, timeout=rust_timeout)
         if r.returncode != 0:
             return {"error": f"fit rc={r.returncode}", "stderr": r.stderr,
                     "stdout": r.stdout, "cmd": " ".join(fit_cmd), "time": time.time()-t0}
 
         r = subprocess.run(
             [str(RUST_BINARY), "predict", model_json, test_csv, "--out", pred_csv],
-            capture_output=True, text=True, timeout=RUST_TIMEOUT,
+            capture_output=True, text=True, timeout=rust_timeout,
         )
         if r.returncode != 0:
             return {"error": f"predict rc={r.returncode}", "stderr": r.stderr,
@@ -769,12 +789,12 @@ def run_rust(sc, train_df, test_df, cols, tmpdir):
         return metrics
 
     except subprocess.TimeoutExpired:
-        return {"error": "timeout", "time": RUST_TIMEOUT}
+        return {"error": "timeout", "time": rust_timeout}
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
 
-def run_mgcv(sc, train_df, test_df, cols, tmpdir):
+def run_mgcv(sc, train_df, test_df, cols, tmpdir, r_timeout):
     train_csv = os.path.join(tmpdir, "mgcv_train.csv")
     test_csv = os.path.join(tmpdir, "mgcv_test.csv")
     out_json = os.path.join(tmpdir, "mgcv_out.json")
@@ -871,7 +891,7 @@ tryCatch({{
 
     t0 = time.time()
     try:
-        r = subprocess.run(["Rscript", script_path], capture_output=True, text=True, timeout=R_TIMEOUT)
+        r = subprocess.run(["Rscript", script_path], capture_output=True, text=True, timeout=r_timeout)
         elapsed = time.time() - t0
 
         if not os.path.exists(out_json):
@@ -891,7 +911,7 @@ tryCatch({{
         return result
 
     except subprocess.TimeoutExpired:
-        return {"error": "timeout", "time": R_TIMEOUT}
+        return {"error": "timeout", "time": r_timeout}
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
@@ -938,11 +958,11 @@ class FuzzResult:
             self.primary_gap = mv + 1.0  # rust failed
 
 
-def run_trial(sc):
+def run_trial(sc, rust_timeout, r_timeout):
     train_df, test_df, cols = generate_data(sc)
     with tempfile.TemporaryDirectory(prefix="gam_fuzz_") as tmpdir:
-        rust_out = run_rust(sc, train_df, test_df, cols, tmpdir)
-        mgcv_out = run_mgcv(sc, train_df, test_df, cols, tmpdir)
+        rust_out = run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout)
+        mgcv_out = run_mgcv(sc, train_df, test_df, cols, tmpdir, r_timeout)
     result = FuzzResult(scenario=asdict(sc), rust=rust_out, mgcv=mgcv_out)
     result.compute_gap()
     return result
@@ -1033,6 +1053,9 @@ def main():
     parser.add_argument("--family", type=str, default=None, choices=["gaussian", "binomial"])
     parser.add_argument("--model-type", type=str, default=None, choices=["gam", "gamlss"])
     parser.add_argument("--basis", type=str, default=None, choices=["ps", "tps", "duchon"])
+    parser.add_argument("--rust-timeout", type=int, default=DEFAULT_RUST_TIMEOUT)
+    parser.add_argument("--r-timeout", type=int, default=DEFAULT_R_TIMEOUT)
+    parser.add_argument("--max-total-seconds", type=int, default=None)
     args = parser.parse_args()
 
     if not RUST_BINARY.exists():
@@ -1070,6 +1093,9 @@ def main():
     print(f"  Signal structures: {len(SIGNAL_BUILDERS)}")
     print(f"  Sigma functions:   {len(SIGMA_FN)}")
     print(f"  Filters: family={args.family or 'all'} model={args.model_type or 'all'} basis={args.basis or 'all'}")
+    print(f"  Rust timeout:      {args.rust_timeout}s")
+    print(f"  R timeout:         {args.r_timeout}s")
+    print(f"  Time budget:       {args.max_total_seconds}s" if args.max_total_seconds else "  Time budget:       none")
     print(f"  Results: {RESULTS_FILE}\n")
 
     # Pre-generate all scenarios so we can sort by estimated cost
@@ -1083,12 +1109,22 @@ def main():
                 sc.n_smooths = 2
                 sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
         scenarios.append(sc)
-    scenarios.sort(key=lambda s: (s.n_obs * s.n_smooths * s.knots))
+    scenarios.sort(key=estimate_scenario_cost)
 
+    started_at = time.time()
     with open(RESULTS_FILE, "a") as out_f:
         for i, sc in enumerate(scenarios):
+            if args.max_total_seconds is not None:
+                elapsed = time.time() - started_at
+                if elapsed >= args.max_total_seconds:
+                    print(
+                        f"\nReached wall-clock budget after {i} completed trial(s) "
+                        f"({elapsed:.1f}s >= {args.max_total_seconds}s). Stopping early.",
+                        flush=True,
+                    )
+                    break
             seed = sc.seed
-            result = run_trial(sc)
+            result = run_trial(sc, args.rust_timeout, args.r_timeout)
 
             results.append(result)
             out_f.write(json.dumps({"scenario": result.scenario, "rust": result.rust,
