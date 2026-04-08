@@ -14,6 +14,10 @@ ignored = ["grep", "walkdir"]
 [lib]
 path = "src/lib.rs"
 
+[workspace]
+members = ["crates/gam-pyffi"]
+resolver = "3"
+
 [lints.rust]
 warnings = "deny"
 
@@ -53,10 +57,6 @@ default-features = false
 num-dual = "0.13.6"
 autodiff = "0.7.0"
 ad_trait = "0.2.2"
-
-[build-dependencies]
-walkdir = "2.5.0"
-grep = "0.4.1"
 
 [[bin]]
 name = "gam"

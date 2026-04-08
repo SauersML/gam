@@ -12,8 +12,8 @@ use crate::basis::{
     build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
     build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
-    default_num_centers, estimate_penalty_nullity, filter_active_penalty_candidates,
-    orthogonality_transform_for_design, select_centers_by_strategy,
+    estimate_penalty_nullity, filter_active_penalty_candidates, orthogonality_transform_for_design,
+    select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -792,7 +792,7 @@ struct LinearFitConditioning {
     columns: Vec<LinearColumnConditioning>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SpatialPsiDerivative {
     // These are derivatives with respect to psi = log(kappa), not log(length_scale).
     pub penalty_index: usize,
@@ -807,12 +807,14 @@ pub(crate) struct SpatialPsiDerivative {
     /// Pre-computed cross-derivative design matrices for other axes
     /// in the same aniso group: Vec of (axis_offset_in_group, matrix).
     pub aniso_cross_designs: Option<Vec<(usize, Array2<f64>)>>,
-    /// Pre-computed cross-penalty second derivatives ∂²S_m/∂ψ_a∂ψ_b for axes
-    /// in the same aniso group. Each entry is (b_axis, Vec<Array2<f64>>),
-    /// where b_axis is the axis offset within the group and the Vec has one
-    /// matrix per active penalty. Only stored for pairs where this entry's
-    /// axis a < b_axis (upper triangle); the symmetric pair is the transpose.
-    pub aniso_cross_penalties: Option<Vec<(usize, Vec<Array2<f64>>)>>,
+    /// On-demand cross-penalty second derivatives ∂²S_m/∂ψ_a∂ψ_b for axes in
+    /// the same anisotropy group. The input is the other axis offset in the
+    /// group, and the output is one local penalty matrix per active penalty.
+    pub aniso_cross_penalty_provider: Option<
+        std::sync::Arc<
+            dyn Fn(usize) -> Result<Vec<Array2<f64>>, EstimationError> + Send + Sync + 'static,
+        >,
+    >,
     /// Optional implicit design-derivative operator (shared across all axes
     /// in the same aniso group). When present, `x_psi_local` and
     /// `x_psi_psi_local` may be zero-sized, and design-derivative matvecs
@@ -1511,6 +1513,7 @@ struct JointSpatialCenterGroupKey {
     feature_cols: Vec<usize>,
     strategy_kind: CenterStrategyKind,
     strategy_aux: usize,
+    requested_num_centers: usize,
     input_scale_bits: Option<Vec<u64>>,
 }
 
@@ -1562,6 +1565,7 @@ fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCenterGro
         feature_cols: feature_cols.clone(),
         strategy_kind,
         strategy_aux,
+        requested_num_centers: center_strategy_num_centers(strategy)?,
         input_scale_bits: input_scales
             .map(|values| values.iter().map(|value| value.to_bits()).collect()),
     })
@@ -1678,7 +1682,6 @@ fn plan_joint_spatial_centers_for_term_blocks(
         if members.len() < 2 {
             continue;
         }
-        let budget = default_num_centers(n, group_key.feature_cols.len());
         let min_required = members
             .iter()
             .map(|&(block_idx, term_idx)| {
@@ -1686,8 +1689,8 @@ fn plan_joint_spatial_centers_for_term_blocks(
             })
             .max()
             .unwrap_or(1);
-        let joint_centers = budget
-            .div_ceil(members.len())
+        let joint_centers = group_key
+            .requested_num_centers
             .max(min_required)
             .min(n.max(1));
         let (first_block_idx, first_term_idx) = members[0];
@@ -1702,11 +1705,11 @@ fn plan_joint_spatial_centers_for_term_blocks(
         let joint_strategy = center_strategy_with_num_centers(strategy, joint_centers)?;
         let shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
         log::info!(
-            "sharing {} spatial centers across {} smooth terms over columns {:?} (joint budget from {} centers)",
+            "sharing {} spatial centers across {} smooth terms over columns {:?} (requested {} centers)",
             shared_centers.nrows(),
             members.len(),
             group_key.feature_cols,
-            budget,
+            group_key.requested_num_centers,
         );
         for (block_idx, term_idx) in members {
             set_spatial_term_centers(
@@ -8827,11 +8830,12 @@ fn exact_joint_spatial_outer_hessian_available(
     design: &TermCollectionDesign,
 ) -> bool {
     let sparse_design = design.design.as_sparse().is_some();
-    (family.link_function() == crate::types::LinkFunction::Identity || sparse_design)
-        && crate::estimate::reml::exact_outer_hessian_problem_scale_allows(
-            design.design.nrows(),
-            design.design.ncols(),
-        )
+    family.link_function() == crate::types::LinkFunction::Identity
+        || (sparse_design
+            && crate::estimate::reml::exact_outer_hessian_problem_scale_allows(
+                design.design.nrows(),
+                design.design.ncols(),
+            ))
 }
 
 fn dense_joint_exact_design_prefers_gradient_only(design: &TermCollectionDesign) -> bool {
@@ -8842,6 +8846,106 @@ fn dense_joint_exact_designs_prefer_gradient_only(designs: &[TermCollectionDesig
     designs
         .iter()
         .any(dense_joint_exact_design_prefers_gradient_only)
+}
+
+fn spatial_tau_tau_hessian_policy(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+    spatial_terms: &[usize],
+) -> Result<Option<crate::estimate::reml::TauTauHessianPolicy>, EstimationError> {
+    Ok(
+        try_build_spatial_log_kappa_hyper_dirs(data, spec, design, spatial_terms)?.map(
+            |hyper_dirs| {
+                crate::estimate::reml::exact_tau_tau_hessian_policy(
+                    design.design.nrows(),
+                    design.design.ncols(),
+                    &hyper_dirs,
+                )
+            },
+        ),
+    )
+}
+
+fn aggregate_tau_tau_hessian_policy(
+    policies: impl IntoIterator<Item = crate::estimate::reml::TauTauHessianPolicy>,
+) -> Option<crate::estimate::reml::TauTauHessianPolicy> {
+    let mut iter = policies.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |mut acc, policy| {
+        acc.any_has_implicit |= policy.any_has_implicit;
+        acc.implicit_multidim_duchon |= policy.implicit_multidim_duchon;
+        acc.firth_pair_terms_unavailable |= policy.firth_pair_terms_unavailable;
+        acc.estimated_dense_tau_cache_bytes = acc
+            .estimated_dense_tau_cache_bytes
+            .saturating_add(policy.estimated_dense_tau_cache_bytes);
+        acc.gradient_plan.dense_x_bytes = acc
+            .gradient_plan
+            .dense_x_bytes
+            .saturating_add(policy.gradient_plan.dense_x_bytes);
+        acc.gradient_plan.first_order_tau_bytes = acc
+            .gradient_plan
+            .first_order_tau_bytes
+            .saturating_add(policy.gradient_plan.first_order_tau_bytes);
+        acc.gradient_plan.second_order_tau_bytes = acc
+            .gradient_plan
+            .second_order_tau_bytes
+            .saturating_add(policy.gradient_plan.second_order_tau_bytes);
+        acc.gradient_plan.penalty_first_bytes = acc
+            .gradient_plan
+            .penalty_first_bytes
+            .saturating_add(policy.gradient_plan.penalty_first_bytes);
+        acc.gradient_plan.penalty_pair_bytes = acc
+            .gradient_plan
+            .penalty_pair_bytes
+            .saturating_add(policy.gradient_plan.penalty_pair_bytes);
+        acc.gradient_plan.rho_tau_penalty_bytes = acc
+            .gradient_plan
+            .rho_tau_penalty_bytes
+            .saturating_add(policy.gradient_plan.rho_tau_penalty_bytes);
+        acc.gradient_plan.vector_cache_bytes = acc
+            .gradient_plan
+            .vector_cache_bytes
+            .saturating_add(policy.gradient_plan.vector_cache_bytes);
+        acc.gradient_plan.weighted_scratch_bytes = acc
+            .gradient_plan
+            .weighted_scratch_bytes
+            .saturating_add(policy.gradient_plan.weighted_scratch_bytes);
+        acc.hessian_plan.dense_x_bytes = acc
+            .hessian_plan
+            .dense_x_bytes
+            .saturating_add(policy.hessian_plan.dense_x_bytes);
+        acc.hessian_plan.first_order_tau_bytes = acc
+            .hessian_plan
+            .first_order_tau_bytes
+            .saturating_add(policy.hessian_plan.first_order_tau_bytes);
+        acc.hessian_plan.second_order_tau_bytes = acc
+            .hessian_plan
+            .second_order_tau_bytes
+            .saturating_add(policy.hessian_plan.second_order_tau_bytes);
+        acc.hessian_plan.penalty_first_bytes = acc
+            .hessian_plan
+            .penalty_first_bytes
+            .saturating_add(policy.hessian_plan.penalty_first_bytes);
+        acc.hessian_plan.penalty_pair_bytes = acc
+            .hessian_plan
+            .penalty_pair_bytes
+            .saturating_add(policy.hessian_plan.penalty_pair_bytes);
+        acc.hessian_plan.rho_tau_penalty_bytes = acc
+            .hessian_plan
+            .rho_tau_penalty_bytes
+            .saturating_add(policy.hessian_plan.rho_tau_penalty_bytes);
+        acc.hessian_plan.vector_cache_bytes = acc
+            .hessian_plan
+            .vector_cache_bytes
+            .saturating_add(policy.hessian_plan.vector_cache_bytes);
+        acc.hessian_plan.weighted_scratch_bytes = acc
+            .hessian_plan
+            .weighted_scratch_bytes
+            .saturating_add(policy.hessian_plan.weighted_scratch_bytes);
+        acc.budget_bytes = acc.budget_bytes.min(policy.budget_bytes);
+        acc
+    }))
 }
 
 fn smooth_term_penalty_index(
@@ -8919,7 +9023,7 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
         s_psi_psi_components_local,
         aniso_group_id: None,
         aniso_cross_designs: None,
-        aniso_cross_penalties: None,
+        aniso_cross_penalty_provider: None,
         implicit_operator,
         implicit_axis: 0,
     }))
@@ -9027,6 +9131,9 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         ..(smooth_start + smooth_term.coeff_range.end);
     let num_penalties = aniso_result.penalties_first[0].len();
     let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
+    let penalties_cross_pairs = std::sync::Arc::new(aniso_result.penalties_cross_pairs.clone());
+    let penalties_cross = std::sync::Arc::new(aniso_result.penalties_cross);
+    let penalties_cross_provider = aniso_result.penalties_cross_provider.clone();
 
     // Dense first/diagonal-second matrices may be present even when the shared
     // operator is available. The operator remains the canonical source for
@@ -9084,23 +9191,38 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         } else {
             Vec::new()
         };
-        // Build cross-penalty entries for this axis a.
-        // For each pair (a, b) with a < b in penalties_cross_pairs, store it
-        // under axis a with key b. For pairs (c, a) with c < a, store it
-        // under axis a with key c (the penalty is symmetric).
-        let mut cross_penalties = Vec::new();
-        for (cp_idx, &(pa, pb)) in aniso_result.penalties_cross_pairs.iter().enumerate() {
-            if pa == a {
-                cross_penalties.push((pb, aniso_result.penalties_cross[cp_idx].clone()));
-            } else if pb == a {
-                // Symmetric: ∂²S/∂ψ_b∂ψ_a = ∂²S/∂ψ_a∂ψ_b (penalty matrices are symmetric)
-                cross_penalties.push((pa, aniso_result.penalties_cross[cp_idx].clone()));
-            }
-        }
-        let cross_penalties_opt = if cross_penalties.is_empty() {
-            None
+        let cross_penalty_provider = if d > 1 {
+            let penalties_cross_pairs = std::sync::Arc::clone(&penalties_cross_pairs);
+            let penalties_cross = std::sync::Arc::clone(&penalties_cross);
+            let penalties_cross_provider = penalties_cross_provider.clone();
+            Some(std::sync::Arc::new(
+                move |b_axis: usize| -> Result<Vec<Array2<f64>>, EstimationError> {
+                    if b_axis == a {
+                        return Ok(Vec::new());
+                    }
+                    let (axis_lo, axis_hi) = if a < b_axis { (a, b_axis) } else { (b_axis, a) };
+                    if let Some(provider) = penalties_cross_provider.as_ref() {
+                        provider
+                            .evaluate(axis_lo, axis_hi)
+                            .map_err(EstimationError::from)
+                    } else if let Some(cross_idx) = penalties_cross_pairs
+                        .iter()
+                        .position(|&(pa, pb)| pa == axis_lo && pb == axis_hi)
+                    {
+                        Ok(penalties_cross[cross_idx].clone())
+                    } else {
+                        Ok(Vec::new())
+                    }
+                },
+            )
+                as std::sync::Arc<
+                    dyn Fn(usize) -> Result<Vec<Array2<f64>>, EstimationError>
+                        + Send
+                        + Sync
+                        + 'static,
+                >)
         } else {
-            Some(cross_penalties)
+            None
         };
 
         entries.push(SpatialPsiDerivative {
@@ -9118,7 +9240,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             } else {
                 Some(cross_designs)
             },
-            aniso_cross_penalties: cross_penalties_opt,
+            aniso_cross_penalty_provider: cross_penalty_provider,
             implicit_operator: implicit_op_arc.clone(),
             implicit_axis: a,
         });
@@ -9399,33 +9521,86 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
-        // Cross penalty second derivatives (∂²S/∂ψ_a∂ψ_b, a≠b).
-        if let Some(ref cross_penalties) = info.aniso_cross_penalties {
-            if let Some(gid) = info.aniso_group_id {
-                let base = info_list
+        let mut penaltysecond_partner_indices: Option<Vec<usize>> = None;
+        let penaltysecond_component_provider = if let (Some(provider), Some(gid)) = (
+            info.aniso_cross_penalty_provider.clone(),
+            info.aniso_group_id,
+        ) {
+            let group_indices = info_list
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, entry)| (entry.aniso_group_id == Some(gid)).then_some(idx))
+                .collect::<Vec<_>>();
+            let axis_in_group =
+                group_indices
                     .iter()
-                    .position(|e| e.aniso_group_id == Some(gid))
-                    .unwrap_or(i);
-                for &(b_axis, ref cross_pens) in cross_penalties {
-                    let j = base + b_axis;
-                    if j < log_kappa_dim {
-                        let cross_components = info
-                            .penalty_indices
+                    .position(|&idx| idx == i)
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "missing spatial hyper axis {} in anisotropy group {}",
+                            i, gid
+                        ))
+                    })?;
+            let penalty_indices = info.penalty_indices.clone();
+            let global_range = info.global_range.clone();
+            let total_p = info.total_p;
+            penaltysecond_partner_indices = Some(
+                group_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| idx != i)
+                    .collect(),
+            );
+            Some(std::sync::Arc::new(
+                move |j: usize| -> Result<
+                    Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
+                    EstimationError,
+                > {
+                    let Some(other_axis_in_group) = group_indices.iter().position(|&idx| idx == j)
+                    else {
+                        return Ok(None);
+                    };
+                    if other_axis_in_group == axis_in_group {
+                        return Ok(None);
+                    }
+                    let cross_pens = provider(other_axis_in_group)?;
+                    if cross_pens.is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        penalty_indices
                             .iter()
                             .copied()
-                            .zip(cross_pens.iter().map(|local| {
+                            .zip(cross_pens.into_iter().map(|local| {
                                 crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                                    local.clone(),
-                                    info.global_range.clone(),
-                                    info.total_p,
+                                    local,
+                                    global_range.clone(),
+                                    total_p,
                                 )
                             }))
-                            .collect::<Vec<_>>();
-                        ssecond_components[j] = Some(cross_components);
-                    }
-                }
-            }
-        }
+                            .map(|(penalty_index, matrix)| {
+                                crate::estimate::reml::PenaltyDerivativeComponent {
+                                    penalty_index,
+                                    matrix,
+                                }
+                            })
+                            .collect(),
+                    ))
+                },
+            )
+                as std::sync::Arc<
+                    dyn Fn(
+                            usize,
+                        ) -> Result<
+                            Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
+                            EstimationError,
+                        > + Send
+                        + Sync
+                        + 'static,
+                >)
+        } else {
+            None
+        };
         // First derivative: use implicit operator when available to avoid
         // storing dense (n x p) matrices for all D axes simultaneously.
         let x_first_hyper = if let Some(ref op) = info.implicit_operator {
@@ -9442,15 +9617,20 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                 info.total_p,
             )
         };
-        hyper_dirs.push(
-            DirectionalHyperParam::new_compact(
-                x_first_hyper,
-                s_components,
-                Some(xsecond),
-                Some(ssecond_components),
-            )?
-            .not_penalty_like(),
-        );
+        let mut dir = DirectionalHyperParam::new_compact(
+            x_first_hyper,
+            s_components,
+            Some(xsecond),
+            Some(ssecond_components),
+        )?
+        .not_penalty_like();
+        if let Some(provider) = penaltysecond_component_provider {
+            dir = dir.with_penaltysecond_component_provider(provider);
+        }
+        if let Some(partner_indices) = penaltysecond_partner_indices {
+            dir = dir.with_penaltysecond_partner_indices(partner_indices);
+        }
+        hyper_dirs.push(dir);
     }
     Ok(hyper_dirs)
 }
@@ -9777,11 +9957,30 @@ fn try_exact_joint_spatial_aniso_optimization(
     let psi_dim = theta_dim - rho_dim;
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
+    let tau_tau_policy = if analytic_outer_hessian_available {
+        spatial_tau_tau_hessian_policy(data, resolvedspec, baseline_design, spatial_terms)?
+    } else {
+        None
+    };
+    let dense_design_prefers_gradient_only =
+        dense_joint_exact_design_prefers_gradient_only(baseline_design);
+    let tau_tau_prefers_gradient_only = tau_tau_policy
+        .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
     let prefer_gradient_only = analytic_outer_hessian_available
-        && dense_joint_exact_design_prefers_gradient_only(baseline_design);
-    if prefer_gradient_only {
+        && (dense_design_prefers_gradient_only || tau_tau_prefers_gradient_only);
+    if dense_design_prefers_gradient_only {
         log::info!(
             "[OUTER] aniso-psi joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    } else if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
+        log::info!(
+            "[OUTER] aniso-psi joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
+            policy.any_has_implicit,
+            policy.implicit_multidim_duchon,
+            policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
+            policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+            policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+            policy.budget_bytes as f64 / (1024.0 * 1024.0),
         );
     }
 
@@ -10056,11 +10255,30 @@ fn try_exact_joint_spatial_isotropic_optimization(
     let kappa_dim = theta_dim - rho_dim;
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(family, baseline_design);
+    let tau_tau_policy = if analytic_outer_hessian_available {
+        spatial_tau_tau_hessian_policy(data, resolvedspec, baseline_design, spatial_terms)?
+    } else {
+        None
+    };
+    let dense_design_prefers_gradient_only =
+        dense_joint_exact_design_prefers_gradient_only(baseline_design);
+    let tau_tau_prefers_gradient_only = tau_tau_policy
+        .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
     let prefer_gradient_only = analytic_outer_hessian_available
-        && dense_joint_exact_design_prefers_gradient_only(baseline_design);
-    if prefer_gradient_only {
+        && (dense_design_prefers_gradient_only || tau_tau_prefers_gradient_only);
+    if dense_design_prefers_gradient_only {
         log::info!(
             "[OUTER] iso-kappa joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    } else if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
+        log::info!(
+            "[OUTER] iso-kappa joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
+            policy.any_has_implicit,
+            policy.implicit_multidim_duchon,
+            policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
+            policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+            policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+            policy.budget_bytes as f64 / (1024.0 * 1024.0),
         );
     }
 
@@ -11662,11 +11880,39 @@ where
         )
     })?;
     let analytic_outer_hessian_available = analytic_joint_hessian_available;
+    let tau_tau_policy = if analytic_outer_hessian_available {
+        let per_block_policy = best_specs
+            .iter()
+            .zip(boot_designs.iter())
+            .zip(block_term_indices.iter())
+            .map(|((spec, design), terms)| {
+                spatial_tau_tau_hessian_policy(data, spec, design, terms)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        aggregate_tau_tau_hessian_policy(per_block_policy.into_iter().flatten())
+    } else {
+        None
+    };
+    let dense_design_prefers_gradient_only =
+        dense_joint_exact_designs_prefer_gradient_only(&boot_designs);
+    let tau_tau_prefers_gradient_only = tau_tau_policy
+        .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
     let prefer_gradient_only = analytic_outer_hessian_available
-        && dense_joint_exact_designs_prefer_gradient_only(&boot_designs);
-    if prefer_gradient_only {
+        && (dense_design_prefers_gradient_only || tau_tau_prefers_gradient_only);
+    if dense_design_prefers_gradient_only {
         log::info!(
             "[OUTER] n-block exact-joint spatial: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
+        );
+    } else if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
+        log::info!(
+            "[OUTER] n-block exact-joint spatial: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
+            policy.any_has_implicit,
+            policy.implicit_multidim_duchon,
+            policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
+            policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+            policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+            policy.budget_bytes as f64 / (1024.0 * 1024.0),
         );
     }
 
@@ -14284,7 +14530,7 @@ mod tests {
 
         assert_eq!(marginal_centers, logslope_centers);
         assert_eq!(marginal_centers.ncols(), 2);
-        assert!(marginal_centers.nrows() < separate_marginal_centers.nrows());
+        assert_eq!(marginal_centers.nrows(), separate_marginal_centers.nrows());
     }
 
     #[test]

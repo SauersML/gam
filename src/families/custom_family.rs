@@ -1690,6 +1690,166 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
     }
 }
 
+struct EmbeddedImplicitPsiDerivativeOperator {
+    base: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    total_p: usize,
+    global_range: Range<usize>,
+}
+
+impl EmbeddedImplicitPsiDerivativeOperator {
+    fn new(
+        base: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        global_range: Range<usize>,
+        total_p: usize,
+    ) -> Result<Self, String> {
+        if base.p_out() != global_range.len() {
+            return Err(format!(
+                "embedded implicit psi operator width mismatch: got {}, expected {}",
+                base.p_out(),
+                global_range.len()
+            ));
+        }
+        if global_range.end > total_p {
+            return Err(format!(
+                "embedded implicit psi operator range {}..{} exceeds total width {total_p}",
+                global_range.start, global_range.end
+            ));
+        }
+        Ok(Self {
+            base,
+            total_p,
+            global_range,
+        })
+    }
+
+    fn embed_vector(&self, local: Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.total_p);
+        out.slice_mut(ndarray::s![self.global_range.clone()])
+            .assign(&local);
+        out
+    }
+
+    fn local_coeffs(
+        &self,
+        u: &ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        if u.len() != self.total_p {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "{context} expected coefficient length {}, got {}",
+                self.total_p,
+                u.len()
+            )));
+        }
+        Ok(u.slice(ndarray::s![self.global_range.clone()]).to_owned())
+    }
+}
+
+impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn n_data(&self) -> usize {
+        self.base.n_data()
+    }
+
+    fn p_out(&self) -> usize {
+        self.total_p
+    }
+
+    fn transpose_mul(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        Ok(self.embed_vector(self.base.transpose_mul(axis, v)?))
+    }
+
+    fn forward_mul(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let local = self.local_coeffs(u, "embedded implicit psi forward_mul")?;
+        self.base.forward_mul(axis, &local.view())
+    }
+
+    fn transpose_mul_second_diag(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        Ok(self.embed_vector(self.base.transpose_mul_second_diag(axis, v)?))
+    }
+
+    fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        Ok(self.embed_vector(self.base.transpose_mul_second_cross(axis_d, axis_e, v)?))
+    }
+
+    fn forward_mul_second_diag(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let local = self.local_coeffs(u, "embedded implicit psi forward_mul_second_diag")?;
+        self.base.forward_mul_second_diag(axis, &local.view())
+    }
+
+    fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let local = self.local_coeffs(u, "embedded implicit psi forward_mul_second_cross")?;
+        self.base
+            .forward_mul_second_cross(axis_d, axis_e, &local.view())
+    }
+
+    fn materialize_first(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(EmbeddedColumnBlock::new(
+            &self.base.materialize_first(axis)?,
+            self.global_range.clone(),
+            self.total_p,
+        )
+        .materialize())
+    }
+
+    fn materialize_second_diag(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(EmbeddedColumnBlock::new(
+            &self.base.materialize_second_diag(axis)?,
+            self.global_range.clone(),
+            self.total_p,
+        )
+        .materialize())
+    }
+
+    fn materialize_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(EmbeddedColumnBlock::new(
+            &self.base.materialize_second_cross(axis_d, axis_e)?,
+            self.global_range.clone(),
+            self.total_p,
+        )
+        .materialize())
+    }
+}
+
 fn rowwise_kronecker_dense(base: &Array2<f64>, time_basis: &Array2<f64>) -> Array2<f64> {
     assert_eq!(base.nrows(), time_basis.nrows());
     let n = base.nrows();
@@ -2249,8 +2409,13 @@ pub(crate) fn build_rowwise_kronecker_psi_operator(
 
 pub(crate) fn wrap_spatial_implicit_psi_operator(
     op: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+    global_range: Range<usize>,
+    total_p: usize,
 ) -> Arc<dyn CustomFamilyPsiDerivativeOperator> {
-    op
+    Arc::new(
+        EmbeddedImplicitPsiDerivativeOperator::new(op, global_range, total_p)
+            .expect("spatial implicit psi operator should embed into full coefficient space"),
+    )
 }
 
 const CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD: usize = 1_000_000_000; // 1 GB
@@ -2285,10 +2450,13 @@ pub(crate) fn build_block_spatial_psi_derivatives(
         .into_iter()
         .enumerate()
         .map(|(psi_idx, info)| {
-            let implicit_operator = info
-                .implicit_operator
-                .as_ref()
-                .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
+            let implicit_operator = info.implicit_operator.as_ref().map(|op| {
+                wrap_spatial_implicit_psi_operator(
+                    Arc::clone(op),
+                    info.global_range.clone(),
+                    info.total_p,
+                )
+            });
             let dense_operator = if implicit_operator.is_none() && !info.x_psi_local.is_empty() {
                 Some(build_embedded_dense_psi_operator(
                     &info.x_psi_local,
@@ -2362,17 +2530,24 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                         .map(|local| embed_penalty(local)),
                 )
                 .collect();
-            if let (Some(gid), Some(cross_penalties)) =
-                (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
-            {
-                for (axis_j, local_components) in cross_penalties {
-                    if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                        s_psi_psi_comp_rows[global_j] = penalty_indices
-                            .iter()
-                            .copied()
-                            .zip(local_components.iter().map(|local| embed_penalty(local)))
-                            .collect();
+            if let (Some(gid), Some(cross_penalty_provider)) = (
+                info.aniso_group_id,
+                info.aniso_cross_penalty_provider.as_ref(),
+            ) {
+                for ((group_id, axis_j), global_j) in &axis_lookup {
+                    if *group_id != gid || *axis_j == info.implicit_axis {
+                        continue;
                     }
+                    let local_components =
+                        cross_penalty_provider(*axis_j).map_err(|err| err.to_string())?;
+                    if local_components.is_empty() {
+                        continue;
+                    }
+                    s_psi_psi_comp_rows[*global_j] = penalty_indices
+                        .iter()
+                        .copied()
+                        .zip(local_components.iter().map(embed_penalty))
+                        .collect();
                 }
             }
             Ok(CustomFamilyBlockPsiDerivative {
@@ -8156,7 +8331,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let family_arc = Arc::clone(&family_arc);
         let psi_workspace = psi_workspace.clone();
-        let total = total;
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
             let cache_i = &psi_penalty_cache[psi_i];
@@ -8258,7 +8432,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let rho_penalty_cache = Arc::clone(&rho_penalty_cache);
         let s_logdet_block_cache = Arc::clone(&s_logdet_block_cache);
-        let total = total;
 
         Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
             let rho_cache = &rho_penalty_cache[rho_k];
@@ -10857,7 +11030,7 @@ mod tests {
     }
 
     #[test]
-    fn build_block_spatial_psi_derivatives_reproduces_3d_aniso_radial_eval_failure() {
+    fn build_block_spatial_psi_derivatives_supports_3d_aniso_matern() {
         let n = 24usize;
         let mut data = Array2::<f64>::zeros((n, 3));
         for i in 0..n {
@@ -10894,20 +11067,12 @@ mod tests {
             .expect("freeze spatial term spec");
         let resolved_design = build_term_collection_design(data.view(), &resolvedspec)
             .expect("rebuild frozen spatial design");
-        let err = match build_block_spatial_psi_derivatives(
-            data.view(),
-            &resolvedspec,
-            &resolved_design,
-        ) {
-            Ok(_) => panic!(
-                "3D anisotropic Matern setup should reproduce the lower-level radial evaluation failure"
-            ),
-            Err(err) => err,
-        };
-        assert!(
-            err.contains("radial scalar evaluation failed during aniso derivative construction"),
-            "unexpected error: {err}"
-        );
+        let derivs =
+            build_block_spatial_psi_derivatives(data.view(), &resolvedspec, &resolved_design)
+                .expect("3D anisotropic Matern psi derivatives should build")
+                .expect("3D anisotropic Matern psi derivatives should be present");
+        assert_eq!(derivs.len(), 3);
+        assert!(derivs.iter().all(|deriv| deriv.implicit_operator.is_some()));
     }
 
     impl CustomFamily for OneBlockIdentityFamily {

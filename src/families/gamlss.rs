@@ -357,7 +357,6 @@ impl ParameterBlockInput {
             design: self.design,
             offset: self.offset,
             penalties: {
-                let p = p;
                 self.penalties
                     .into_iter()
                     .map(|spec| match spec {

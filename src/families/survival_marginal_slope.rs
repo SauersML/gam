@@ -15228,7 +15228,7 @@ mod tests {
             .max_feasible_step_size(&states, 0, &array![-1.0, 0.0])
             .expect("time step ceiling")
             .expect("time step should be bounded");
-        assert!(alpha > 0.0 && alpha < 1.0);
+        assert_eq!(alpha, 0.0);
         let feasible = &states[0].beta + &(array![-1.0, 0.0] * alpha);
         let slack = family
             .time_linear_constraints

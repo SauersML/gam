@@ -882,7 +882,7 @@ use crate::families::survival_construction::{
     initial_survival_baseline_config_for_fit, normalize_survival_time_pair,
     optimize_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
     parse_survival_time_basis_config, require_structural_survival_time_basis,
-    resolve_survival_time_anchor_value,
+    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
@@ -1387,7 +1387,7 @@ fn materialize_standard<'a>(
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        compute_inference: !matches!(family, crate::types::LikelihoodFamily::GaussianIdentity),
+        compute_inference: true,
         max_iter: 200,
         tol: 1e-7,
         nullspace_dims: vec![],
@@ -1538,7 +1538,14 @@ fn materialize_survival<'a>(
     if survival_mode != SurvivalLikelihoodMode::Weibull && effective_timewiggle.is_none() {
         require_structural_survival_time_basis(&time_build.basisname, "workflow survival fitting")?;
     }
-    let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
+    let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_cfg)?;
     center_survival_time_designs_at_anchor(
         &mut time_build.x_entry_time,
         &mut time_build.x_exit_time,

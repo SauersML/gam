@@ -26,10 +26,56 @@ const EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
 const EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM: usize = 32;
 const EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK: usize = 4_000_000;
 const EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK: usize = 50_000_000;
+const EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const FIRTH_MAX_OBSERVATIONS: usize = 20_000;
 const FIRTH_MAX_COEFFICIENTS: usize = 256;
 const FIRTH_MAX_LINEAR_WORK: usize = 2_000_000;
 const FIRTH_MAX_QUADRATIC_WORK: usize = 100_000_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TauTauPlanEstimate {
+    pub(crate) dense_x_bytes: usize,
+    pub(crate) first_order_tau_bytes: usize,
+    pub(crate) second_order_tau_bytes: usize,
+    pub(crate) penalty_first_bytes: usize,
+    pub(crate) penalty_pair_bytes: usize,
+    pub(crate) rho_tau_penalty_bytes: usize,
+    pub(crate) vector_cache_bytes: usize,
+    pub(crate) weighted_scratch_bytes: usize,
+}
+
+impl TauTauPlanEstimate {
+    pub(crate) fn total_bytes(self) -> usize {
+        self.dense_x_bytes
+            .saturating_add(self.first_order_tau_bytes)
+            .saturating_add(self.second_order_tau_bytes)
+            .saturating_add(self.penalty_first_bytes)
+            .saturating_add(self.penalty_pair_bytes)
+            .saturating_add(self.rho_tau_penalty_bytes)
+            .saturating_add(self.vector_cache_bytes)
+            .saturating_add(self.weighted_scratch_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TauTauHessianPolicy {
+    pub(crate) any_has_implicit: bool,
+    pub(crate) implicit_multidim_duchon: bool,
+    pub(crate) estimated_dense_tau_cache_bytes: usize,
+    pub(crate) gradient_plan: TauTauPlanEstimate,
+    pub(crate) hessian_plan: TauTauPlanEstimate,
+    pub(crate) budget_bytes: usize,
+    pub(crate) firth_pair_terms_unavailable: bool,
+}
+
+impl TauTauHessianPolicy {
+    pub(crate) fn prefer_gradient_only(self) -> bool {
+        self.implicit_multidim_duchon
+            || self.estimated_dense_tau_cache_bytes > self.budget_bytes
+            || self.hessian_plan.total_bytes() > self.budget_bytes
+            || self.firth_pair_terms_unavailable
+    }
+}
 
 pub(crate) fn exact_outer_hessian_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
     let linear_work = n_obs.saturating_mul(p_coeff);
@@ -38,6 +84,120 @@ pub(crate) fn exact_outer_hessian_problem_scale_allows(n_obs: usize, p_coeff: us
         && p_coeff >= EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM)
         || linear_work > EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK
         || quadratic_work > EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK)
+}
+
+pub(crate) fn exact_tau_tau_hessian_policy(
+    n_obs: usize,
+    p_coeff: usize,
+    hyper_dirs: &[DirectionalHyperParam],
+) -> TauTauHessianPolicy {
+    exact_tau_tau_hessian_policy_with_firth(n_obs, p_coeff, hyper_dirs, false)
+}
+
+pub(crate) fn exact_tau_tau_hessian_policy_with_firth(
+    n_obs: usize,
+    p_coeff: usize,
+    hyper_dirs: &[DirectionalHyperParam],
+    firth_pair_terms_unavailable: bool,
+) -> TauTauHessianPolicy {
+    let f64_bytes = std::mem::size_of::<f64>();
+    let dense_matrix_bytes =
+        |rows: usize, cols: usize| -> usize { rows.saturating_mul(cols).saturating_mul(f64_bytes) };
+    let dense_design_bytes = dense_matrix_bytes(n_obs, p_coeff);
+    let dense_penalty_bytes = dense_matrix_bytes(p_coeff, p_coeff);
+    let psi_dim = hyper_dirs.len();
+    let implicit_n_axes = hyper_dirs
+        .iter()
+        .find_map(DirectionalHyperParam::implicit_first_axis_info)
+        .map(|(op, _)| op.n_axes())
+        .unwrap_or(0);
+    let gradient_uses_implicit_design = hyper_dirs
+        .iter()
+        .any(DirectionalHyperParam::has_implicit_operator)
+        && crate::terms::basis::should_use_implicit_operators(n_obs, p_coeff, implicit_n_axes);
+    let dense_first_order_count = hyper_dirs
+        .iter()
+        .filter(|dir| !dir.has_implicit_operator())
+        .count();
+    let first_penalty_component_count = hyper_dirs
+        .iter()
+        .map(DirectionalHyperParam::penalty_first_component_count)
+        .sum::<usize>();
+
+    let mut dense_second_order_count = 0usize;
+    let mut penalty_pair_count = 0usize;
+    for i in 0..psi_dim {
+        for j in i..psi_dim {
+            if hyper_dirs[i]
+                .x_tau_tau_entry_at(j)
+                .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
+                .is_some_and(|entry| !entry.uses_implicit_storage())
+            {
+                dense_second_order_count += if i == j { 1 } else { 2 };
+            }
+            if hyper_dirs[i].has_penaltysecond_pair_at(j)
+                || hyper_dirs[j].has_penaltysecond_pair_at(i)
+            {
+                penalty_pair_count += if i == j { 1 } else { 2 };
+            }
+        }
+    }
+
+    let gradient_dense_first_order_count = if gradient_uses_implicit_design {
+        dense_first_order_count
+    } else {
+        psi_dim
+    };
+    let gradient_needs_dense_x =
+        firth_pair_terms_unavailable || gradient_dense_first_order_count > 0;
+    let gradient_plan = TauTauPlanEstimate {
+        dense_x_bytes: if gradient_needs_dense_x {
+            dense_design_bytes
+        } else {
+            0
+        },
+        first_order_tau_bytes: if gradient_dense_first_order_count > 0 {
+            dense_design_bytes
+        } else {
+            0
+        },
+        second_order_tau_bytes: 0,
+        penalty_first_bytes: psi_dim.saturating_mul(dense_penalty_bytes),
+        penalty_pair_bytes: 0,
+        rho_tau_penalty_bytes: 0,
+        vector_cache_bytes: n_obs.saturating_mul(f64_bytes),
+        weighted_scratch_bytes: dense_penalty_bytes,
+    };
+    let hessian_plan = TauTauPlanEstimate {
+        dense_x_bytes: if psi_dim > 0 { dense_design_bytes } else { 0 },
+        first_order_tau_bytes: dense_first_order_count.saturating_mul(dense_design_bytes),
+        second_order_tau_bytes: dense_second_order_count.saturating_mul(dense_design_bytes),
+        penalty_first_bytes: psi_dim.saturating_mul(dense_penalty_bytes),
+        penalty_pair_bytes: penalty_pair_count.saturating_mul(dense_penalty_bytes),
+        rho_tau_penalty_bytes: first_penalty_component_count
+            .saturating_mul(2)
+            .saturating_mul(dense_penalty_bytes),
+        vector_cache_bytes: psi_dim.saturating_mul(n_obs).saturating_mul(f64_bytes),
+        weighted_scratch_bytes: dense_penalty_bytes,
+    };
+    let any_has_implicit = hyper_dirs
+        .iter()
+        .any(DirectionalHyperParam::has_implicit_operator);
+    let implicit_multidim_duchon = hyper_dirs
+        .iter()
+        .any(DirectionalHyperParam::has_implicit_multidim_duchon);
+    let estimated_dense_tau_cache_bytes = hessian_plan
+        .first_order_tau_bytes
+        .saturating_add(hessian_plan.second_order_tau_bytes);
+    TauTauHessianPolicy {
+        any_has_implicit,
+        implicit_multidim_duchon,
+        estimated_dense_tau_cache_bytes,
+        gradient_plan,
+        hessian_plan,
+        budget_bytes: EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES,
+        firth_pair_terms_unavailable: firth_pair_terms_unavailable && !hyper_dirs.is_empty(),
+    }
 }
 
 pub(crate) fn firth_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
@@ -59,7 +219,7 @@ mod tests {
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::pirls::PirlsCoordinateFrame;
     use crate::solver::outer_strategy::{HessianResult, OuterEval, OuterEvalOrder};
-    use crate::terms::basis::ImplicitDesignPsiDerivative;
+    use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::GlmLikelihoodSpec;
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
@@ -70,6 +230,105 @@ mod tests {
         assert!(super::firth_problem_scale_allows(2_000, 200));
         assert!(!super::firth_problem_scale_allows(4_800, 241));
         assert!(!super::firth_problem_scale_allows(4_800, 433));
+    }
+
+    #[test]
+    fn tau_tau_hessian_policy_prefers_gradient_only_for_implicit_tau() {
+        let operator = ImplicitDesignPsiDerivative::new(
+            array![1.0, 2.0, 3.0, 4.0],
+            array![0.5, -1.0, 1.5, 2.0],
+            array![0.1, 0.2, 0.3, 0.4],
+            array![[1.0, 0.2], [0.5, 0.1], [1.5, 0.3], [2.0, 0.4]],
+            None,
+            None,
+            2,
+            2,
+            1,
+            2,
+        );
+        let dir = DirectionalHyperParam::new_compact(
+            HyperDesignDerivative::from_implicit(
+                Arc::new(operator),
+                ImplicitDerivLevel::First(0),
+                1..4,
+                5,
+            ),
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("implicit directional hyperparam");
+        let policy = super::exact_tau_tau_hessian_policy(10, 5, &[dir]);
+        assert!(policy.any_has_implicit);
+        assert_eq!(
+            policy.gradient_plan.dense_x_bytes,
+            10 * 5 * std::mem::size_of::<f64>()
+        );
+        assert!(!policy.prefer_gradient_only());
+    }
+
+    #[test]
+    fn tau_tau_hessian_policy_prefers_gradient_only_for_implicit_multidim_duchon() {
+        let operator = ImplicitDesignPsiDerivative::new_streaming(
+            array![[0.0, 0.0], [1.0, 0.2]],
+            array![[0.0, 0.0], [1.0, 1.0]],
+            vec![0.0, 0.0],
+            RadialScalarKind::PureDuchon {
+                block_order: 1,
+                p_order: 0,
+                s_order: 0,
+                dim: 2,
+            },
+            None,
+            None,
+            0,
+        );
+        let dir = DirectionalHyperParam::new_compact(
+            HyperDesignDerivative::from_implicit(
+                Arc::new(operator),
+                ImplicitDerivLevel::First(0),
+                0..2,
+                2,
+            ),
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("implicit duchon directional hyperparam");
+        let policy = super::exact_tau_tau_hessian_policy(10, 5, &[dir]);
+        assert!(policy.any_has_implicit);
+        assert!(policy.implicit_multidim_duchon);
+        assert!(policy.prefer_gradient_only());
+    }
+
+    #[test]
+    fn tau_tau_hessian_policy_prefers_gradient_only_when_cache_budget_is_exceeded() {
+        let dir = DirectionalHyperParam::new_compact(
+            HyperDesignDerivative::from(Array2::<f64>::zeros((2, 2))),
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("dense directional hyperparam");
+        let policy = super::exact_tau_tau_hessian_policy(320_000, 71, &[dir; 16]);
+        assert!(!policy.any_has_implicit);
+        assert!(policy.hessian_plan.total_bytes() > policy.budget_bytes);
+        assert!(policy.hessian_plan.total_bytes() > policy.gradient_plan.total_bytes());
+        assert!(policy.prefer_gradient_only());
+    }
+
+    #[test]
+    fn tau_tau_hessian_policy_prefers_gradient_only_for_firth_pair_gap() {
+        let dir = DirectionalHyperParam::new_compact(
+            HyperDesignDerivative::from(Array2::<f64>::zeros((2, 2))),
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("dense directional hyperparam");
+        let policy = super::exact_tau_tau_hessian_policy_with_firth(10, 5, &[dir], true);
+        assert!(policy.firth_pair_terms_unavailable);
+        assert!(policy.prefer_gradient_only());
     }
 
     fn build_logit_state<'a>(
@@ -2399,6 +2658,15 @@ pub(crate) struct DirectionalHyperParam {
     // Pairwise second derivatives are stored in the same canonical base-penalty
     // decomposition as the first derivatives.
     penaltysecond_components: Option<Vec<Option<Vec<PenaltyDerivativeComponent>>>>,
+    penaltysecond_component_provider: Option<
+        std::sync::Arc<
+            dyn Fn(usize) -> Result<Option<Vec<PenaltyDerivativeComponent>>, EstimationError>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
+    penaltysecond_partner_indices: Option<std::sync::Arc<[usize]>>,
     /// Whether this coordinate is penalty-like (B_i = ∂H/∂τ_i is PSD).
     /// True for τ (penalty scaling) coordinates; false for ψ (design-moving,
     /// anisotropic length-scale) coordinates. Controls EFS eligibility.
@@ -2489,6 +2757,8 @@ impl DirectionalHyperParam {
             penalty_first_components,
             x_tau_tau_original,
             penaltysecond_components,
+            penaltysecond_component_provider: None,
+            penaltysecond_partner_indices: None,
             is_penalty_like: true, // default: τ coords are penalty-like
         })
     }
@@ -2497,6 +2767,24 @@ impl DirectionalHyperParam {
     /// EFS will skip it; use Newton/BFGS for these coordinates.
     pub(crate) fn not_penalty_like(mut self) -> Self {
         self.is_penalty_like = false;
+        self
+    }
+
+    pub(crate) fn with_penaltysecond_component_provider(
+        mut self,
+        provider: std::sync::Arc<
+            dyn Fn(usize) -> Result<Option<Vec<PenaltyDerivativeComponent>>, EstimationError>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    ) -> Self {
+        self.penaltysecond_component_provider = Some(provider);
+        self
+    }
+
+    pub(crate) fn with_penaltysecond_partner_indices(mut self, partners: Vec<usize>) -> Self {
+        self.penaltysecond_partner_indices = Some(std::sync::Arc::from(partners));
         self
     }
 
@@ -2544,6 +2832,11 @@ impl DirectionalHyperParam {
     /// first-derivative level.
     pub(crate) fn has_implicit_operator(&self) -> bool {
         self.x_tau_original.implicit_first_axis_info().is_some()
+    }
+
+    pub(crate) fn has_implicit_multidim_duchon(&self) -> bool {
+        self.implicit_first_axis_info()
+            .is_some_and(|(op, _)| op.n_axes() > 1 && op.is_duchon_family())
     }
 
     /// Extract the implicit design derivative operator and axis, if available.
@@ -2594,17 +2887,40 @@ impl DirectionalHyperParam {
     pub(crate) fn penaltysecond_components_for(
         &self,
         j: usize,
-    ) -> Option<&[PenaltyDerivativeComponent]> {
-        self.penaltysecond_components
+    ) -> Result<Option<Vec<PenaltyDerivativeComponent>>, EstimationError> {
+        if let Some(components) = self
+            .penaltysecond_components
             .as_ref()
             .and_then(|rows| rows.get(j))
-            .and_then(|row| row.as_deref())
+            .and_then(|row| row.clone())
+        {
+            return Ok(Some(components));
+        }
+        if let Some(provider) = self.penaltysecond_component_provider.as_ref() {
+            return provider(j);
+        }
+        Ok(None)
     }
 
     pub(crate) fn penaltysecond_componentrows(
         &self,
     ) -> Option<&[Option<Vec<PenaltyDerivativeComponent>>]> {
         self.penaltysecond_components.as_deref()
+    }
+
+    pub(crate) fn penalty_first_component_count(&self) -> usize {
+        self.penalty_first_components.len()
+    }
+
+    pub(crate) fn has_penaltysecond_pair_at(&self, j: usize) -> bool {
+        self.penaltysecond_components
+            .as_ref()
+            .and_then(|rows| rows.get(j))
+            .is_some_and(Option::is_some)
+            || self
+                .penaltysecond_partner_indices
+                .as_ref()
+                .is_some_and(|partners| partners.contains(&j))
     }
 }
 

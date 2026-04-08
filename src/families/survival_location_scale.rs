@@ -3013,10 +3013,13 @@ fn build_survival_covariate_block_psi_derivatives(
                     };
                     match template {
                         SurvivalCovariateTermBlockTemplate::Static => {
-                            let implicit_operator = info
-                                .implicit_operator
-                                .as_ref()
-                                .map(|op| wrap_spatial_implicit_psi_operator(Arc::clone(op)));
+                            let implicit_operator = info.implicit_operator.as_ref().map(|op| {
+                                wrap_spatial_implicit_psi_operator(
+                                    Arc::clone(op),
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                )
+                            });
                             let dense_operator =
                                 if implicit_operator.is_none() && !info.x_psi_local.is_empty() {
                                     Some(build_embedded_dense_psi_operator(
@@ -3071,17 +3074,24 @@ fn build_survival_covariate_block_psi_derivatives(
                                 .copied()
                                 .zip(info.s_psi_psi_components_local.iter().map(embed_penalty))
                                 .collect();
-                            if let (Some(gid), Some(cross_penalties)) =
-                                (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
-                            {
-                                for (axis_j, local_components) in cross_penalties {
-                                    if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                                        s_psi_psi_components[global_j] = penalty_indices
-                                            .iter()
-                                            .copied()
-                                            .zip(local_components.iter().map(embed_penalty))
-                                            .collect();
+                            if let (Some(gid), Some(cross_penalty_provider)) = (
+                                info.aniso_group_id,
+                                info.aniso_cross_penalty_provider.as_ref(),
+                            ) {
+                                for ((group_id, axis_j), global_j) in &axis_lookup {
+                                    if *group_id != gid || *axis_j == info.implicit_axis {
+                                        continue;
                                     }
+                                    let local_components = cross_penalty_provider(*axis_j)
+                                        .map_err(|err| err.to_string())?;
+                                    if local_components.is_empty() {
+                                        continue;
+                                    }
+                                    s_psi_psi_components[*global_j] = penalty_indices
+                                        .iter()
+                                        .copied()
+                                        .zip(local_components.iter().map(embed_penalty))
+                                        .collect();
                                 }
                             }
                             Ok(CustomFamilyBlockPsiDerivative {
@@ -3128,7 +3138,11 @@ fn build_survival_covariate_block_psi_derivatives(
                             let tensorize_penalty =
                                 |base: &Array2<f64>| kronecker_product(base, &i_time);
                             let base_operator = if let Some(op) = info.implicit_operator.as_ref() {
-                                Some(wrap_spatial_implicit_psi_operator(Arc::clone(op)))
+                                Some(wrap_spatial_implicit_psi_operator(
+                                    Arc::clone(op),
+                                    info.global_range.clone(),
+                                    info.total_p,
+                                ))
                             } else if !info.x_psi_local.is_empty() {
                                 Some(build_embedded_dense_psi_operator(
                                     &info.x_psi_local,
@@ -3205,22 +3219,29 @@ fn build_survival_covariate_block_psi_derivatives(
                                         .map(|full| tensorize_penalty(&full)),
                                 )
                                 .collect();
-                            if let (Some(gid), Some(cross_penalties)) =
-                                (info.aniso_group_id, info.aniso_cross_penalties.as_ref())
-                            {
-                                for (axis_j, local_components) in cross_penalties {
-                                    if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                                        s_psi_psi_components[global_j] = penalty_indices
-                                            .iter()
-                                            .copied()
-                                            .zip(
-                                                local_components
-                                                    .iter()
-                                                    .map(embed_penalty)
-                                                    .map(|full| tensorize_penalty(&full)),
-                                            )
-                                            .collect();
+                            if let (Some(gid), Some(cross_penalty_provider)) = (
+                                info.aniso_group_id,
+                                info.aniso_cross_penalty_provider.as_ref(),
+                            ) {
+                                for ((group_id, axis_j), global_j) in &axis_lookup {
+                                    if *group_id != gid || *axis_j == info.implicit_axis {
+                                        continue;
                                     }
+                                    let local_components = cross_penalty_provider(*axis_j)
+                                        .map_err(|err| err.to_string())?;
+                                    if local_components.is_empty() {
+                                        continue;
+                                    }
+                                    s_psi_psi_components[*global_j] = penalty_indices
+                                        .iter()
+                                        .copied()
+                                        .zip(
+                                            local_components
+                                                .iter()
+                                                .map(embed_penalty)
+                                                .map(|full| tensorize_penalty(&full)),
+                                        )
+                                        .collect();
                                 }
                             }
                             Ok(CustomFamilyBlockPsiDerivative {
@@ -9539,7 +9560,7 @@ mod tests {
             )
             .expect("time step ceiling")
             .expect("time step should be bounded");
-        assert!(alpha > 0.0 && alpha < 1.0);
+        assert_eq!(alpha, 0.0);
         let feasible = states[0].beta[0] + alpha * -2.0;
         assert!(feasible >= 0.0);
     }

@@ -1,0 +1,17 @@
+[package]
+name = "gam-pyffi"
+version = "0.1.15"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[lib]
+name = "gam_pyffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+gam = { path = "../.." }
+pyo3 = { version = "0.28.0", features = ["abi3-py310", "extension-module"] }
+csv = "1.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

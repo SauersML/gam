@@ -757,32 +757,6 @@ impl PenaltyPseudologdet {
 
         lambda_k * (linear - quad)
     }
-
-    /// Block-local variant of `rho_tau_hessian_component()` for canonical penalties.
-    pub fn rho_tau_hessian_component_block_local(
-        &self,
-        penalty: &crate::construction::CanonicalPenalty,
-        lambda_k: f64,
-        s_tau_i: &Array2<f64>,
-        ds_k_dtau_i: Option<&Array2<f64>>,
-    ) -> f64 {
-        if self.rank == 0 {
-            return 0.0;
-        }
-
-        let s_pinv = self.pseudo_inverse_dense();
-        let mut s_k = Array2::<f64>::zeros(s_pinv.raw_dim());
-        penalty.accumulate_weighted(&mut s_k, 1.0);
-        let quad = Self::trace_dense_product(&s_pinv.dot(&s_k).dot(&s_pinv), s_tau_i);
-
-        let linear = if let Some(dsk) = ds_k_dtau_i {
-            Self::trace_dense_product(&s_pinv, dsk)
-        } else {
-            0.0
-        };
-
-        lambda_k * (linear - quad)
-    }
 }
 
 #[cfg(test)]

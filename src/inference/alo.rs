@@ -1232,7 +1232,7 @@ mod tests {
         let block_designs = vec![x.clone()];
         let block_weights = vec![Array2::from_elem((1, 1), 0.0)]; // singular
         let scores = vec![Array1::from_vec(vec![1.0])];
-        let eta_hat = vec![Array1::from_vec(vec![3.14])];
+        let eta_hat = vec![Array1::from_vec(vec![std::f64::consts::PI])];
 
         let input = MultiBlockAloInput {
             n_obs: n,
@@ -1245,7 +1245,7 @@ mod tests {
         };
         let result = compute_multiblock_alo(&input).unwrap();
         // Δη = A_i * s_i = 1.25 * 1.0 = 1.25
-        let expected = 3.14 + 1.25;
+        let expected = std::f64::consts::PI + 1.25;
         assert!(
             (result.eta_tilde[0][0] - expected).abs() < 1e-12,
             "expected {}, got {}",

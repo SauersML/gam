@@ -6065,6 +6065,30 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
+    fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
+        let rank = factor.ncols();
+        let mut op_factor = Array2::<f64>::zeros((self.n_dim, rank));
+        for col in 0..rank {
+            let v = factor.column(col).to_owned();
+            let bv = op.mul_vec(&v);
+            debug_assert_eq!(bv.len(), self.n_dim);
+            op_factor.column_mut(col).assign(&bv);
+        }
+        factor.t().dot(&op_factor)
+    }
+
+    #[inline]
+    fn trace_projected_cross(&self, left: &Array2<f64>, right: &Array2<f64>) -> f64 {
+        let mut result = 0.0;
+        for a in 0..left.nrows() {
+            for b in 0..left.ncols() {
+                result += left[[a, b]] * right[[b, a]];
+            }
+        }
+        result
+    }
+
+    #[inline]
     fn trace_logdet_hessian_cross_rotated(
         &self,
         h_i_rot: &Array2<f64>,
@@ -6121,12 +6145,19 @@ impl HessianOperator for DenseSpectralOperator {
         self.trace_hinv_product_cross_dense(a, b)
     }
 
+    fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        let projected = self.projected_operator(&self.w_factor, op);
+        projected.diag().sum()
+    }
+
     fn trace_hinv_matrix_operator_cross(
         &self,
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
-        self.trace_hinv_product_cross_dense(matrix, &op.to_dense())
+        let left = self.w_factor.t().dot(matrix).dot(&self.w_factor);
+        let right = self.projected_operator(&self.w_factor, op);
+        self.trace_projected_cross(&left, &right)
     }
 
     fn trace_hinv_operator_cross(
@@ -6134,7 +6165,9 @@ impl HessianOperator for DenseSpectralOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        self.trace_hinv_product_cross_dense(&left.to_dense(), &right.to_dense())
+        let left_proj = self.projected_operator(&self.w_factor, left);
+        let right_proj = self.projected_operator(&self.w_factor, right);
+        self.trace_projected_cross(&left_proj, &right_proj)
     }
 
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
@@ -6213,7 +6246,8 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        self.trace_logdet_gradient(&op.to_dense())
+        let projected = self.projected_operator(&self.g_factor, op);
+        projected.diag().sum()
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {

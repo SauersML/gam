@@ -81,6 +81,10 @@ rust_digest.txt
 .venv-biobank/
 .venv*/
 .pytest_cache/
+.maturin/
+dist/
+python/gam/_rust.abi3.so
+python/gam/*.dSYM/
 
 # Lean/Lake build artifacts
 .lake/
