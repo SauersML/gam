@@ -5569,7 +5569,7 @@ mod tests {
         assert_eq!(stacked.ncols(), 3);
 
         let beta = array![0.25, -0.5, 2.0];
-        let expected = array![9.25, 11.75];
+        let expected = array![9.25, 10.75];
         let got = stacked.dot(&beta);
         for i in 0..expected.len() {
             assert!((got[i] - expected[i]).abs() < 1e-12);

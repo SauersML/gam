@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "gam"
+version = "0.1.15"
+description = "Formula-first Python bindings for the gam Rust engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SauersML" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+numpy = ["numpy>=1.26"]
+pandas = ["pandas>=2.0", "pyarrow>=14"]
+plot = ["matplotlib>=3.8"]
+sklearn = ["scikit-learn>=1.4", "numpy>=1.26"]
+all = [
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.4",
+]
+
+[tool.maturin]
+manifest-path = "crates/gam-pyffi/Cargo.toml"
+module-name = "gam._rust"
+python-source = "python"

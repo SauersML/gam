@@ -7,6 +7,7 @@ include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
 pub mod families;
 pub mod inference;
 pub mod linalg;
+pub mod report;
 pub mod solver;
 mod span;
 pub mod terms;

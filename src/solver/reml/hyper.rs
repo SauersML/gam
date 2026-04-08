@@ -47,6 +47,36 @@ enum TauTauDesignTerm {
     Implicit(HyperDesignDerivative),
 }
 
+#[derive(Clone)]
+enum TauDesignTerm {
+    Dense(Array2<f64>),
+    Implicit(HyperDesignDerivative),
+}
+
+#[derive(Clone)]
+enum TauPairBasis {
+    Original,
+    Transformed {
+        qs: std::sync::Arc<Array2<f64>>,
+        free_basis_opt: std::sync::Arc<Option<Array2<f64>>>,
+    },
+}
+
+struct TauTauPairHyperOperator {
+    x_tau_i: TauDesignTerm,
+    x_tau_j: TauDesignTerm,
+    x_tau_tau: Option<TauTauDesignTerm>,
+    x_design: std::sync::Arc<DesignMatrix>,
+    basis: TauPairBasis,
+    w_diag: std::sync::Arc<Array1<f64>>,
+    c_x_tau_i_beta: Option<Array1<f64>>,
+    c_x_tau_j_beta: Option<Array1<f64>>,
+    d_cross: Option<Array1<f64>>,
+    c_xij_beta: Option<Array1<f64>>,
+    s_tau_tau: Option<Array2<f64>>,
+    p: usize,
+}
+
 fn build_active_design_matrix(
     x_transformed: &DesignMatrix,
     free_basis_opt: Option<&Array2<f64>>,
@@ -65,23 +95,165 @@ fn build_active_design_matrix(
     }
 }
 
+impl super::unified::HyperOperator for TauTauPairHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+
+        let x_v = self.x_design.dot(v);
+        let mut out = Array1::<f64>::zeros(self.p);
+
+        let tau_forward = |term: &TauDesignTerm, u: &Array1<f64>| -> Array1<f64> {
+            match term {
+                TauDesignTerm::Dense(dense) => dense.dot(u),
+                TauDesignTerm::Implicit(deriv) => match &self.basis {
+                    TauPairBasis::Original => deriv
+                        .forward_mul_original(u)
+                        .expect("tau pair operator original forward product should be shape-consistent"),
+                    TauPairBasis::Transformed { qs, free_basis_opt } => deriv
+                        .transformed_forward_mul(qs.as_ref(), free_basis_opt.as_ref().as_ref(), u)
+                        .expect("tau pair operator transformed forward product should be shape-consistent"),
+                },
+            }
+        };
+        let tau_transpose = |term: &TauDesignTerm, y: &Array1<f64>| -> Array1<f64> {
+            match term {
+                TauDesignTerm::Dense(dense) => dense.t().dot(y),
+                TauDesignTerm::Implicit(deriv) => match &self.basis {
+                    TauPairBasis::Original => deriv
+                        .transpose_mul_original(y)
+                        .expect("tau pair operator original transpose product should be shape-consistent"),
+                    TauPairBasis::Transformed { qs, free_basis_opt } => deriv
+                        .transformed_transpose_mul(
+                            qs.as_ref(),
+                            free_basis_opt.as_ref().as_ref(),
+                            y,
+                        )
+                        .expect("tau pair operator transformed transpose product should be shape-consistent"),
+                },
+            }
+        };
+        let tau_tau_forward = |term: &TauTauDesignTerm, u: &Array1<f64>| -> Array1<f64> {
+            match term {
+                TauTauDesignTerm::Dense(dense) => dense.dot(u),
+                TauTauDesignTerm::Implicit(deriv) => match &self.basis {
+                    TauPairBasis::Original => deriv
+                        .forward_mul_original(u)
+                        .expect("tau-tau pair operator original forward product should be shape-consistent"),
+                    TauPairBasis::Transformed { qs, free_basis_opt } => deriv
+                        .transformed_forward_mul(qs.as_ref(), free_basis_opt.as_ref().as_ref(), u)
+                        .expect("tau-tau pair operator transformed forward product should be shape-consistent"),
+                },
+            }
+        };
+        let tau_tau_transpose = |term: &TauTauDesignTerm, y: &Array1<f64>| -> Array1<f64> {
+            match term {
+                TauTauDesignTerm::Dense(dense) => dense.t().dot(y),
+                TauTauDesignTerm::Implicit(deriv) => match &self.basis {
+                    TauPairBasis::Original => deriv
+                        .transpose_mul_original(y)
+                        .expect("tau-tau pair operator original transpose product should be shape-consistent"),
+                    TauPairBasis::Transformed { qs, free_basis_opt } => deriv
+                        .transformed_transpose_mul(
+                            qs.as_ref(),
+                            free_basis_opt.as_ref().as_ref(),
+                            y,
+                        )
+                        .expect("tau-tau pair operator transformed transpose product should be shape-consistent"),
+                },
+            }
+        };
+
+        let x_tau_i_v = tau_forward(&self.x_tau_i, v);
+        let x_tau_j_v = tau_forward(&self.x_tau_j, v);
+        let w_x_tau_i_v = &*self.w_diag * &x_tau_i_v;
+        let w_x_tau_j_v = &*self.w_diag * &x_tau_j_v;
+
+        if let Some(x_tau_tau) = self.x_tau_tau.as_ref() {
+            let w_x_v = &*self.w_diag * &x_v;
+            out += &tau_tau_transpose(x_tau_tau, &w_x_v);
+
+            let x_tau_tau_v = tau_tau_forward(x_tau_tau, v);
+            out += &self
+                .x_design
+                .transpose_vector_multiply(&(&*self.w_diag * &x_tau_tau_v));
+        }
+
+        out += &tau_transpose(&self.x_tau_i, &w_x_tau_j_v);
+        out += &tau_transpose(&self.x_tau_j, &w_x_tau_i_v);
+
+        if let Some(c_x_tau_i_beta) = self.c_x_tau_i_beta.as_ref() {
+            out += &tau_transpose(&self.x_tau_j, &(c_x_tau_i_beta * &x_v));
+            out += &self
+                .x_design
+                .transpose_vector_multiply(&(c_x_tau_i_beta * &x_tau_j_v));
+        }
+
+        if let Some(c_x_tau_j_beta) = self.c_x_tau_j_beta.as_ref() {
+            out += &tau_transpose(&self.x_tau_i, &(c_x_tau_j_beta * &x_v));
+            out += &self
+                .x_design
+                .transpose_vector_multiply(&(c_x_tau_j_beta * &x_tau_i_v));
+        }
+
+        if let Some(d_cross) = self.d_cross.as_ref() {
+            out += &self.x_design.transpose_vector_multiply(&(d_cross * &x_v));
+        }
+
+        if let Some(c_xij_beta) = self.c_xij_beta.as_ref() {
+            out += &self
+                .x_design
+                .transpose_vector_multiply(&(c_xij_beta * &x_v));
+        }
+
+        if let Some(s_tau_tau) = self.s_tau_tau.as_ref() {
+            out += &s_tau_tau.dot(v);
+        }
+
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.p, self.p));
+        let mut basis = Array1::<f64>::zeros(self.p);
+        for j in 0..self.p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        matches!(&self.x_tau_i, TauDesignTerm::Implicit(_))
+            || matches!(&self.x_tau_j, TauDesignTerm::Implicit(_))
+            || self
+                .x_tau_tau
+                .as_ref()
+                .is_some_and(|term| matches!(term, TauTauDesignTerm::Implicit(_)))
+    }
+}
+
 impl<'a> RemlState<'a> {
     fn get_pairwisesecond_penalty_components(
         hyper_dirs: &[DirectionalHyperParam],
         i: usize,
         j: usize,
-    ) -> Vec<PenaltyDerivativeComponent> {
+    ) -> Result<Vec<PenaltyDerivativeComponent>, EstimationError> {
         if let Some(components) = hyper_dirs
             .get(i)
-            .and_then(|dir| dir.penaltysecond_components_for(j))
+            .map(|dir| dir.penaltysecond_components_for(j))
+            .transpose()?
+            .flatten()
         {
-            return components.to_vec();
+            return Ok(components);
         }
-        hyper_dirs
+        Ok(hyper_dirs
             .get(j)
-            .and_then(|dir| dir.penaltysecond_components_for(i))
-            .map(|components| components.to_vec())
-            .unwrap_or_default()
+            .map(|dir| dir.penaltysecond_components_for(i))
+            .transpose()?
+            .flatten()
+            .unwrap_or_default())
     }
 
     pub(crate) fn validate_penalty_component_shapes(
@@ -124,58 +296,509 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn weighted_cross_from_design_derivative(
-        deriv: &HyperDesignDerivative,
+    fn tau_design_forward_mul(
+        term: &TauDesignTerm,
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
-        x_dense: &Array2<f64>,
-        weights: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        let p = x_dense.ncols();
-        let n = x_dense.nrows();
-        if weights.len() != n {
-            return Err(EstimationError::InvalidInput(format!(
-                "weighted_cross_from_design_derivative weight length mismatch: got {}, expected {}",
-                weights.len(),
-                n
-            )));
-        }
-
-        let mut weighted_x = x_dense.clone();
-        for (mut row, &weight) in weighted_x.outer_iter_mut().zip(weights.iter()) {
-            row *= weight;
-        }
-
-        match &deriv.storage {
-            DerivativeMatrixStorage::Dense(dense) => Ok(dense.t().dot(&weighted_x)),
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                if embedded.total_dim != qs.nrows() {
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match term {
+            TauDesignTerm::Dense(dense) => {
+                if dense.ncols() != u.len() {
                     return Err(EstimationError::InvalidInput(format!(
-                        "embedded hyper design derivative width mismatch: total_cols={}, qs rows={}",
-                        embedded.total_dim,
-                        qs.nrows()
+                        "dense tau design forward_mul width mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        u.len()
                     )));
                 }
-                let pulled = embedded.local.t().dot(&weighted_x);
-                let qs_local = qs.slice(s![embedded.global_range.clone(), ..]).to_owned();
-                let mut out = qs_local.t().dot(&pulled);
-                if let Some(z) = free_basis_opt {
-                    out = z.t().dot(&out);
-                }
-                Ok(out)
+                Ok(dense.dot(u))
             }
-            DerivativeMatrixStorage::Implicit(_) => {
-                let transformed = deriv.transformed(qs, free_basis_opt)?;
-                if transformed.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "weighted_cross_from_design_derivative transformed width mismatch: got {}, expected {}",
-                        transformed.ncols(),
-                        p
-                    )));
-                }
-                Ok(transformed.t().dot(&weighted_x))
+            TauDesignTerm::Implicit(deriv) => deriv.transformed_forward_mul(qs, free_basis_opt, u),
+        }
+    }
+
+    fn tau_design_forward_mul_in_basis(
+        term: &TauDesignTerm,
+        basis: &TauPairBasis,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match basis {
+            TauPairBasis::Original => Self::tau_design_forward_mul_original(term, u),
+            TauPairBasis::Transformed { qs, free_basis_opt } => {
+                Self::tau_design_forward_mul(term, qs.as_ref(), free_basis_opt.as_ref().as_ref(), u)
             }
         }
+    }
+
+    fn tau_design_forward_mul_original(
+        term: &TauDesignTerm,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match term {
+            TauDesignTerm::Dense(dense) => {
+                if dense.ncols() != u.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense tau design original forward_mul width mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        u.len()
+                    )));
+                }
+                Ok(dense.dot(u))
+            }
+            TauDesignTerm::Implicit(deriv) => deriv.forward_mul_original(u),
+        }
+    }
+
+    fn tau_design_transpose_mul(
+        term: &TauDesignTerm,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match term {
+            TauDesignTerm::Dense(dense) => {
+                if dense.nrows() != v.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense tau design transpose_mul height mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        v.len()
+                    )));
+                }
+                Ok(dense.t().dot(v))
+            }
+            TauDesignTerm::Implicit(deriv) => {
+                deriv.transformed_transpose_mul(qs, free_basis_opt, v)
+            }
+        }
+    }
+
+    fn tau_design_transpose_mul_in_basis(
+        term: &TauDesignTerm,
+        basis: &TauPairBasis,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match basis {
+            TauPairBasis::Original => Self::tau_design_transpose_mul_original(term, v),
+            TauPairBasis::Transformed { qs, free_basis_opt } => Self::tau_design_transpose_mul(
+                term,
+                qs.as_ref(),
+                free_basis_opt.as_ref().as_ref(),
+                v,
+            ),
+        }
+    }
+
+    fn tau_design_transpose_mul_original(
+        term: &TauDesignTerm,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match term {
+            TauDesignTerm::Dense(dense) => {
+                if dense.nrows() != v.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense tau design original transpose_mul height mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        v.len()
+                    )));
+                }
+                Ok(dense.t().dot(v))
+            }
+            TauDesignTerm::Implicit(deriv) => deriv.transpose_mul_original(v),
+        }
+    }
+
+    fn tau_tau_design_forward_mul_in_basis(
+        term: &TauTauDesignTerm,
+        basis: &TauPairBasis,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match term {
+            TauTauDesignTerm::Dense(dense) => {
+                if dense.ncols() != u.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense tau-tau design forward_mul width mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        u.len()
+                    )));
+                }
+                Ok(dense.dot(u))
+            }
+            TauTauDesignTerm::Implicit(deriv) => match basis {
+                TauPairBasis::Original => deriv.forward_mul_original(u),
+                TauPairBasis::Transformed { qs, free_basis_opt } => {
+                    deriv.transformed_forward_mul(qs.as_ref(), free_basis_opt.as_ref().as_ref(), u)
+                }
+            },
+        }
+    }
+
+    fn tau_tau_design_transpose_mul_in_basis(
+        term: &TauTauDesignTerm,
+        basis: &TauPairBasis,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        match term {
+            TauTauDesignTerm::Dense(dense) => {
+                if dense.nrows() != v.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "dense tau-tau design transpose_mul height mismatch: matrix={}x{}, vector={}",
+                        dense.nrows(),
+                        dense.ncols(),
+                        v.len()
+                    )));
+                }
+                Ok(dense.t().dot(v))
+            }
+            TauTauDesignTerm::Implicit(deriv) => match basis {
+                TauPairBasis::Original => deriv.transpose_mul_original(v),
+                TauPairBasis::Transformed { qs, free_basis_opt } => deriv
+                    .transformed_transpose_mul(qs.as_ref(), free_basis_opt.as_ref().as_ref(), v),
+            },
+        }
+    }
+
+    fn build_tau_penalty_derivative_data<F>(
+        rho: &Array1<f64>,
+        p_dim: usize,
+        hyper_dirs: &[DirectionalHyperParam],
+        penalty_components_per_dir: &[Vec<PenaltyDerivativeComponent>],
+        pairwise_second_components: F,
+    ) -> Result<
+        (
+            Vec<Array2<f64>>,
+            Vec<Vec<Option<Array2<f64>>>>,
+            Vec<Vec<Option<Array2<f64>>>>,
+            Vec<Vec<Option<Array2<f64>>>>,
+        ),
+        EstimationError,
+    >
+    where
+        F: Fn(usize, usize) -> Result<Vec<PenaltyDerivativeComponent>, EstimationError>,
+    {
+        let psi_dim = hyper_dirs.len();
+        let k_count = rho.len();
+
+        let s_tau_list: Vec<Array2<f64>> = penalty_components_per_dir
+            .iter()
+            .map(|components| {
+                Self::validate_penalty_component_shapes(components, p_dim, "S_tau")?;
+                components.iter().try_fold(
+                    Array2::<f64>::zeros((p_dim, p_dim)),
+                    |mut acc, component| {
+                        if component.penalty_index >= k_count {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "penalty_index {} out of bounds for rho dimension {}",
+                                component.penalty_index, k_count
+                            )));
+                        }
+                        component
+                            .matrix
+                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                        Ok(acc)
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
+        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
+            vec![vec![None; k_count]; psi_dim];
+        for (j, components) in penalty_components_per_dir.iter().enumerate() {
+            for component in components {
+                let k = component.penalty_index;
+                if k < k_count {
+                    a_k_tau_j_mats[j][k] = Some(component.matrix.scaled_materialize(rho[k].exp()));
+                    ds_k_dtau_j_mats[j][k] = Some(component.matrix.scaled_materialize(1.0));
+                }
+            }
+        }
+
+        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
+        for i in 0..psi_dim {
+            for j in i..psi_dim {
+                let second_components = pairwise_second_components(i, j)?;
+                if second_components.is_empty() {
+                    continue;
+                }
+                Self::validate_penalty_component_shapes(&second_components, p_dim, "S_tau_tau")?;
+                let total = second_components.iter().try_fold(
+                    Array2::<f64>::zeros((p_dim, p_dim)),
+                    |mut acc, component| {
+                        if component.penalty_index >= k_count {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "penalty_index {} out of bounds for rho dimension {}",
+                                component.penalty_index, k_count
+                            )));
+                        }
+                        component
+                            .matrix
+                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                        Ok(acc)
+                    },
+                )?;
+                s_tau_tau[i][j] = Some(total.clone());
+                if i != j {
+                    s_tau_tau[j][i] = Some(total);
+                }
+            }
+        }
+
+        Ok((s_tau_list, s_tau_tau, a_k_tau_j_mats, ds_k_dtau_j_mats))
+    }
+
+    fn build_tau_design_data_in_basis(
+        hyper_dirs: &[DirectionalHyperParam],
+        basis: &TauPairBasis,
+        beta_eval: &Array1<f64>,
+    ) -> Result<
+        (
+            Vec<TauDesignTerm>,
+            Vec<Array1<f64>>,
+            Vec<Vec<Option<TauTauDesignTerm>>>,
+        ),
+        EstimationError,
+    > {
+        let psi_dim = hyper_dirs.len();
+        let x_tau_terms: Vec<TauDesignTerm> = hyper_dirs
+            .iter()
+            .map(|dir| {
+                if dir.has_implicit_operator() {
+                    Ok(TauDesignTerm::Implicit(dir.x_tau_original.clone()))
+                } else {
+                    match basis {
+                        TauPairBasis::Original => Ok(TauDesignTerm::Dense(dir.x_tau_dense())),
+                        TauPairBasis::Transformed { qs, free_basis_opt } => {
+                            Ok(TauDesignTerm::Dense(dir.transformed_x_tau(
+                                qs.as_ref(),
+                                free_basis_opt.as_ref().as_ref(),
+                            )?))
+                        }
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, EstimationError>>()?;
+        let x_tau_beta_list = x_tau_terms
+            .iter()
+            .map(|x_tau| Self::tau_design_forward_mul_in_basis(x_tau, basis, beta_eval))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut x_tau_tau: Vec<Vec<Option<TauTauDesignTerm>>> = vec![vec![None; psi_dim]; psi_dim];
+        for i in 0..psi_dim {
+            for j in i..psi_dim {
+                let xij = hyper_dirs[i]
+                    .x_tau_tau_entry_at(j)
+                    .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
+                    .map(|entry| {
+                        if entry.uses_implicit_storage() {
+                            Ok::<TauTauDesignTerm, EstimationError>(TauTauDesignTerm::Implicit(
+                                entry,
+                            ))
+                        } else {
+                            match basis {
+                                TauPairBasis::Original => Ok::<TauTauDesignTerm, EstimationError>(
+                                    TauTauDesignTerm::Dense(entry.materialize()),
+                                ),
+                                TauPairBasis::Transformed { qs, free_basis_opt } => {
+                                    Ok::<TauTauDesignTerm, EstimationError>(
+                                        TauTauDesignTerm::Dense(entry.transformed(
+                                            qs.as_ref(),
+                                            free_basis_opt.as_ref().as_ref(),
+                                        )?),
+                                    )
+                                }
+                            }
+                        }
+                    })
+                    .transpose()?;
+                if xij.is_some() {
+                    x_tau_tau[j][i] = xij.clone();
+                }
+                x_tau_tau[i][j] = xij;
+            }
+        }
+
+        Ok((x_tau_terms, x_tau_beta_list, x_tau_tau))
+    }
+
+    fn canonical_penalty_matrices(
+        penalties: &[crate::construction::CanonicalPenalty],
+    ) -> Vec<Array2<f64>> {
+        penalties
+            .iter()
+            .map(|cp| {
+                let r = cp.full_width_root();
+                r.t().dot(&r)
+            })
+            .collect()
+    }
+
+    fn build_tau_tau_pair_callback(
+        basis: TauPairBasis,
+        pld: std::sync::Arc<super::penalty_logdet::PenaltyPseudologdet>,
+        s_tau_list: std::sync::Arc<Vec<Array2<f64>>>,
+        s_tau_tau: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
+        beta_eval: std::sync::Arc<Array1<f64>>,
+        x_design: std::sync::Arc<DesignMatrix>,
+        x_tau_terms: std::sync::Arc<Vec<TauDesignTerm>>,
+        x_tau_beta_list: std::sync::Arc<Vec<Array1<f64>>>,
+        x_tau_tau: std::sync::Arc<Vec<Vec<Option<TauTauDesignTerm>>>>,
+        u: std::sync::Arc<Array1<f64>>,
+        w_diag: std::sync::Arc<Array1<f64>>,
+        c_array: std::sync::Arc<Array1<f64>>,
+        d_array: std::sync::Arc<Array1<f64>>,
+        p_dim: usize,
+        is_gaussian_identity: bool,
+    ) -> Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> {
+        Box::new(
+            move |i: usize, j: usize| -> super::unified::HyperCoordPair {
+                let ld_s_ij = pld.tau_hessian_component(
+                    &s_tau_list[i],
+                    &s_tau_list[j],
+                    s_tau_tau[i][j].as_ref().map(|m| m as &Array2<f64>),
+                );
+
+                let x_tau_i_beta = &x_tau_beta_list[i];
+                let x_tau_j_beta = &x_tau_beta_list[j];
+                let w_x_tau_j_beta = w_diag.as_ref() * x_tau_j_beta;
+                let a_ij_likelihood = x_tau_i_beta.dot(&w_x_tau_j_beta);
+                let x_tau_tau_beta = match x_tau_tau[i][j].as_ref() {
+                    Some(term) => {
+                        Self::tau_tau_design_forward_mul_in_basis(term, &basis, beta_eval.as_ref())
+                            .expect("valid X_tau_tau beta product")
+                    }
+                    None => Array1::<f64>::zeros(u.len()),
+                };
+                let a_ij_design2 = if x_tau_tau[i][j].is_some() {
+                    -u.dot(&x_tau_tau_beta)
+                } else {
+                    0.0
+                };
+                let a_ij_penalty = 0.5
+                    * s_tau_tau[i][j]
+                        .as_ref()
+                        .map(|s_ij| beta_eval.dot(&s_ij.dot(beta_eval.as_ref())))
+                        .unwrap_or(0.0);
+                let a_ij = a_ij_likelihood + a_ij_design2 + a_ij_penalty;
+
+                let x_tau_i = &x_tau_terms[i];
+                let x_tau_j = &x_tau_terms[j];
+                let term1 = match x_tau_tau[i][j].as_ref() {
+                    Some(term) => {
+                        Self::tau_tau_design_transpose_mul_in_basis(term, &basis, u.as_ref())
+                            .expect("valid X_tau_tau^T u product")
+                    }
+                    None => Array1::<f64>::zeros(p_dim),
+                };
+                let term2 = Self::tau_design_transpose_mul_in_basis(
+                    x_tau_j,
+                    &basis,
+                    &(w_diag.as_ref() * x_tau_i_beta),
+                )
+                .expect("valid X_tau_j^T W X_tau_i beta product");
+                let term3 =
+                    Self::tau_design_transpose_mul_in_basis(x_tau_i, &basis, &w_x_tau_j_beta)
+                        .expect("valid X_tau_i^T W X_tau_j beta product");
+                let c_x_tau_i_beta = c_array.as_ref() * x_tau_i_beta;
+                let term4 = x_design.transpose_vector_multiply(&(&c_x_tau_i_beta * x_tau_j_beta));
+                let term5 = if x_tau_tau[i][j].is_some() {
+                    x_design.transpose_vector_multiply(&(w_diag.as_ref() * &x_tau_tau_beta))
+                } else {
+                    Array1::<f64>::zeros(p_dim)
+                };
+                let term6 = s_tau_tau[i][j]
+                    .as_ref()
+                    .map(|s_ij| s_ij.dot(beta_eval.as_ref()))
+                    .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
+                let g_ij = term1 - &term2 - &term3 - &term4 - &term5 - &term6;
+
+                let c_x_tau_j_beta =
+                    (!is_gaussian_identity).then(|| c_array.as_ref() * x_tau_j_beta);
+                let d_cross = (!is_gaussian_identity)
+                    .then(|| d_array.as_ref() * &(x_tau_i_beta * x_tau_j_beta));
+                let c_xij_beta = if !is_gaussian_identity && x_tau_tau[i][j].is_some() {
+                    Some(c_array.as_ref() * &x_tau_tau_beta)
+                } else {
+                    None
+                };
+                let b_operator: Box<dyn super::unified::HyperOperator> =
+                    Box::new(TauTauPairHyperOperator {
+                        x_tau_i: x_tau_i.clone(),
+                        x_tau_j: x_tau_j.clone(),
+                        x_tau_tau: x_tau_tau[i][j].clone(),
+                        x_design: std::sync::Arc::clone(&x_design),
+                        basis: basis.clone(),
+                        w_diag: std::sync::Arc::clone(&w_diag),
+                        c_x_tau_i_beta: (!is_gaussian_identity).then_some(c_x_tau_i_beta.clone()),
+                        c_x_tau_j_beta,
+                        d_cross,
+                        c_xij_beta,
+                        s_tau_tau: s_tau_tau[i][j].clone(),
+                        p: p_dim,
+                    });
+
+                super::unified::HyperCoordPair {
+                    a: a_ij,
+                    g: g_ij,
+                    b_mat: Array2::<f64>::zeros((0, 0)),
+                    b_operator: Some(b_operator),
+                    ld_s: ld_s_ij,
+                }
+            },
+        )
+    }
+
+    fn build_rho_tau_pair_callback(
+        pld: std::sync::Arc<super::penalty_logdet::PenaltyPseudologdet>,
+        s_k_unscaled: std::sync::Arc<Vec<Array2<f64>>>,
+        s_tau_list: std::sync::Arc<Vec<Array2<f64>>>,
+        ds_k_dtau_j_mats: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
+        lambdas: std::sync::Arc<Array1<f64>>,
+        a_k_tau_j_mats: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
+        beta_eval: std::sync::Arc<Array1<f64>>,
+        p_dim: usize,
+    ) -> Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> {
+        Box::new(
+            move |k: usize, j: usize| -> super::unified::HyperCoordPair {
+                let s_tau_j = s_tau_list.get(j);
+                let a_k_tau_j = a_k_tau_j_mats
+                    .get(j)
+                    .and_then(|row| row.get(k))
+                    .and_then(|entry| entry.as_ref());
+                let ds_k_dtau_j = ds_k_dtau_j_mats
+                    .get(j)
+                    .and_then(|row| row.get(k))
+                    .and_then(|entry| entry.as_ref());
+                let ld_s_kj = match (s_k_unscaled.get(k), lambdas.get(k), s_tau_j) {
+                    (Some(s_k), Some(&lambda_k), Some(s_tau_j)) => {
+                        pld.rho_tau_hessian_component(s_k, lambda_k, s_tau_j, ds_k_dtau_j)
+                    }
+                    _ => 0.0,
+                };
+                let a_kj = 0.5
+                    * a_k_tau_j
+                        .map(|a_kt| beta_eval.dot(&a_kt.dot(beta_eval.as_ref())))
+                        .unwrap_or(0.0);
+                let g_kj = a_k_tau_j
+                    .map(|a_kt| -(a_kt.dot(beta_eval.as_ref())))
+                    .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
+                let b_kj = a_k_tau_j
+                    .cloned()
+                    .unwrap_or_else(|| Array2::<f64>::zeros((p_dim, p_dim)));
+
+                super::unified::HyperCoordPair {
+                    a: a_kj,
+                    g: g_kj,
+                    b_mat: b_kj,
+                    b_operator: None,
+                    ld_s: ld_s_kj,
+                }
+            },
+        )
     }
 
     pub(crate) fn compute_joint_hyper_eval_with_order(
@@ -196,7 +819,41 @@ impl<'a> RemlState<'a> {
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
         if !hyper_dirs.is_empty() {
-            let eval_mode = match order {
+            let requested_hessian = matches!(
+                order,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+            );
+            let firth_pair_terms_unavailable = self.config.firth_bias_reduction
+                && matches!(self.config.link_function(), LinkFunction::Logit);
+            let tau_tau_policy = super::exact_tau_tau_hessian_policy_with_firth(
+                self.x().nrows(),
+                self.x().ncols(),
+                hyper_dirs,
+                firth_pair_terms_unavailable,
+            );
+            let downgrade_exact_tau_tau =
+                requested_hessian && tau_tau_policy.prefer_gradient_only();
+            if downgrade_exact_tau_tau {
+                log::warn!(
+                    "[OUTER] disabling exact tau Hessian; using gradient-only outer eval \
+                     (n={}, p={}, psi_dim={}, implicit_tau={}, implicit_multidim_duchon={}, firth_pair_gap={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
+                    self.x().nrows(),
+                    self.x().ncols(),
+                    hyper_dirs.len(),
+                    tau_tau_policy.any_has_implicit,
+                    tau_tau_policy.implicit_multidim_duchon,
+                    tau_tau_policy.firth_pair_terms_unavailable,
+                    tau_tau_policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
+                    tau_tau_policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+                    tau_tau_policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+                    tau_tau_policy.budget_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+            let eval_mode = match if downgrade_exact_tau_tau {
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient
+            } else {
+                order
+            } {
                 crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => {
                     super::unified::EvalMode::ValueAndGradient
                 }
@@ -219,10 +876,7 @@ impl<'a> RemlState<'a> {
             Ok((
                 cost,
                 grad,
-                if matches!(
-                    order,
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
-                ) {
+                if requested_hessian && !downgrade_exact_tau_tau {
                     result.hessian
                 } else {
                     crate::solver::outer_strategy::HessianResult::Unavailable
@@ -490,9 +1144,13 @@ impl<'a> RemlState<'a> {
         let mut coords = Vec::with_capacity(psi_dim);
 
         for j in 0..psi_dim {
-            // --- X_{τ_j} and S_{τ_j} in transformed coordinates ---
-            let x_tau_j =
-                hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?;
+            let implicit_first = if use_implicit {
+                hyper_dirs[j].implicit_first_axis_info()
+            } else {
+                None
+            };
+            let implicit_tau_available = hyper_dirs[j].has_implicit_operator();
+            let mut x_tau_j_dense: Option<Array2<f64>> = None;
             let penalty_components_j = Self::transform_penalty_components(
                 hyper_dirs[j].penalty_first_components(),
                 &reparam_result.qs,
@@ -517,14 +1175,29 @@ impl<'a> RemlState<'a> {
 
             // --- a_j: fixed-β cost derivative (envelope term) ---
             // a_j = −u^T (X_{τ_j} β̂) + 0.5 β̂^T S_{τ_j} β̂  [+ Φ_{τ_j}|_β for Firth]
-            let x_tau_beta_j = x_tau_j.dot(&beta_eval);
+            let x_tau_beta_j = if implicit_tau_available {
+                hyper_dirs[j].x_tau_original.transformed_forward_mul(
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                    &beta_eval,
+                )?
+            } else {
+                x_tau_j_dense
+                    .get_or_insert(
+                        hyper_dirs[j]
+                            .transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
+                    )
+                    .dot(&beta_eval)
+            };
             let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
             // Firth partial: Φ_{τ_j}|_β = 0.5 tr(I_r^{-1} I_{r,τ_j}).
             let mut firth_tau_kernel_j: Option<FirthTauPartialKernel> = None;
             if let Some(op) = firth_op.as_ref() {
+                let x_tau_j = x_tau_j_dense.get_or_insert(
+                    hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
+                );
                 let need_kernel = x_tau_j.iter().any(|v| *v != 0.0);
-                let tau_bundle =
-                    Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, need_kernel);
+                let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, need_kernel);
                 a_j += tau_bundle.phi_tau_partial;
                 if need_kernel {
                     firth_tau_kernel_j = Some(tau_bundle.tau_kernel.expect(
@@ -544,9 +1217,27 @@ impl<'a> RemlState<'a> {
                     .t()
                     .dot(&weighted_x_tau_beta_j)
             };
-            let mut g_j = x_tau_j.t().dot(&u) - xt_weighted_x_tau_beta_j - s_tau_j.dot(&beta_eval);
+            let x_tau_t_u = if implicit_tau_available {
+                hyper_dirs[j].x_tau_original.transformed_transpose_mul(
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                    &u,
+                )?
+            } else {
+                x_tau_j_dense
+                    .get_or_insert(
+                        hyper_dirs[j]
+                            .transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
+                    )
+                    .t()
+                    .dot(&u)
+            };
+            let mut g_j = x_tau_t_u - xt_weighted_x_tau_beta_j - s_tau_j.dot(&beta_eval);
             if let Some(op) = firth_op.as_ref() {
-                let tau_bundle = Self::firth_exact_tau_kernel(op, &x_tau_j, &beta_eval, false);
+                let x_tau_j = x_tau_j_dense.get_or_insert(
+                    hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
+                );
+                let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, false);
                 g_j -= &tau_bundle.gphi_tau;
             }
 
@@ -569,7 +1260,7 @@ impl<'a> RemlState<'a> {
             // negligibly to the stochastic trace estimate.
             let b_operator: Option<std::sync::Arc<dyn super::unified::HyperOperator>> =
                 if use_implicit {
-                    if let Some((implicit_deriv, axis)) = hyper_dirs[j].implicit_first_axis_info() {
+                    if let Some((implicit_deriv, axis)) = implicit_first {
                         Some(std::sync::Arc::new(super::unified::ImplicitHyperOperator {
                             implicit_deriv,
                             axis,
@@ -591,9 +1282,12 @@ impl<'a> RemlState<'a> {
             let dense_b = if b_operator.is_some() {
                 None
             } else {
+                let x_tau_j = x_tau_j_dense.get_or_insert(
+                    hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
+                );
                 let x_dense = x_dense.expect("dense X should exist when materializing hyper drift");
-                let mut b_j = Self::weighted_cross(&x_tau_j, x_dense, w_diag);
-                b_j += &Self::weighted_cross(x_dense, &x_tau_j, w_diag);
+                let mut b_j = Self::weighted_cross(x_tau_j, x_dense, w_diag);
+                b_j += &Self::weighted_cross(x_dense, x_tau_j, w_diag);
                 b_j += &s_tau_j;
 
                 if !is_gaussian_identity {
@@ -612,7 +1306,7 @@ impl<'a> RemlState<'a> {
                     if let Some(kernel) = firth_tau_kernel_j.as_ref() {
                         let eye = Array2::<f64>::eye(p_dim);
                         let hphi_tau_partial =
-                            Self::firth_hphi_tau_partial_apply(op, &x_tau_j, kernel, &eye);
+                            Self::firth_hphi_tau_partial_apply(op, x_tau_j, kernel, &eye);
                         b_j -= &hphi_tau_partial;
                     }
                 }
@@ -806,10 +1500,9 @@ impl<'a> RemlState<'a> {
 
     /// Sparse-exact τ×τ and ρ×τ pair callbacks in original coordinates.
     ///
-    /// This path prioritizes correctness and consistent basis alignment with the
-    /// sparse Cholesky operator. It densifies the design only for second-order
-    /// pair assembly, which is acceptable because pair callbacks are used only
-    /// when the caller requests the full outer Hessian.
+    /// This path keeps first- and second-order design derivatives operator-backed
+    /// when possible and returns operator-backed τ×τ Hessian drifts to avoid
+    /// caching dense `X_τj` blocks across anisotropy directions.
     pub(crate) fn build_tau_pair_callbacks_original_basis(
         &self,
         rho: &Array1<f64>,
@@ -825,8 +1518,6 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_eval = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta_eval.len();
-        let psi_dim = hyper_dirs.len();
-        let k_count = rho.len();
         let lambdas = rho.mapv(f64::exp);
 
         if p_dim == 0 {
@@ -847,73 +1538,33 @@ impl<'a> RemlState<'a> {
             return Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)));
         }
 
-        let s_tau_list: Vec<Array2<f64>> = hyper_dirs
+        let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
             .iter()
-            .map(|dir| dir.penalty_total_at(rho, p_dim))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
-        for i in 0..psi_dim {
-            for j in 0..psi_dim {
-                let second_components =
-                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
-                if second_components.is_empty() {
-                    continue;
-                }
-                Self::validate_penalty_component_shapes(&second_components, p_dim, "S_tau_tau")?;
-                let total = second_components.iter().try_fold(
-                    Array2::<f64>::zeros((p_dim, p_dim)),
-                    |mut acc, component| {
-                        if component.penalty_index >= rho.len() {
-                            return Err(EstimationError::InvalidInput(format!(
-                                "penalty_index {} out of bounds for rho dimension {}",
-                                component.penalty_index,
-                                rho.len()
-                            )));
-                        }
-                        component
-                            .matrix
-                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
-                        Ok(acc)
-                    },
-                )?;
-                s_tau_tau[i][j] = Some(total);
-            }
-        }
+            .map(|dir| dir.penalty_first_components().to_vec())
+            .collect();
+        let (s_tau_list, s_tau_tau, a_k_tau_j_mats, ds_k_dtau_j_mats) =
+            Self::build_tau_penalty_derivative_data(
+                rho,
+                p_dim,
+                hyper_dirs,
+                &penalty_components_per_dir,
+                |i, j| Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j),
+            )?;
 
         // Use block-factored penalty logdet when penalties are disjoint.
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
             &self.canonical_penalties,
             &lambdas.as_slice().unwrap_or(&[]),
-            0.0,
+            bundle.ridge_passport.penalty_logdet_ridge(),
             p_dim,
         )
         .map_err(EstimationError::InvalidInput)?;
 
-        let x_dense = self
-            .x()
-            .try_to_dense_arc("sparse exact tau pair callbacks require dense design")
-            .map_err(EstimationError::InvalidInput)?;
-        let x_dense: Array2<f64> = x_dense.as_ref().clone();
-        let x_tau_list: Vec<Array2<f64>> = hyper_dirs.iter().map(|dir| dir.x_tau_dense()).collect();
-        let x_tau_beta_list: Vec<Array1<f64>> = x_tau_list
-            .iter()
-            .map(|x_tau| x_tau.dot(&beta_eval))
-            .collect();
+        let x_design = std::sync::Arc::new(self.x().clone());
 
-        let mut x_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
-        for i in 0..psi_dim {
-            for j in i..psi_dim {
-                let xij = hyper_dirs[i]
-                    .x_tau_tau_entry_at(j)
-                    .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
-                    .map(|entry| entry.materialize());
-                if xij.is_some() {
-                    x_tau_tau[j][i] = xij.clone();
-                }
-                x_tau_tau[i][j] = xij;
-            }
-        }
+        let basis = TauPairBasis::Original;
+        let (x_tau_terms, x_tau_beta_list, x_tau_tau) =
+            Self::build_tau_design_data_in_basis(hyper_dirs, &basis, &beta_eval)?;
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
@@ -922,194 +1573,53 @@ impl<'a> RemlState<'a> {
         let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
-        let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
-            .iter()
-            .map(|dir| dir.penalty_first_components().to_vec())
-            .collect();
-        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
-        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
-            vec![vec![None; k_count]; psi_dim];
-        for j in 0..psi_dim {
-            for component in &penalty_components_per_dir[j] {
-                let k = component.penalty_index;
-                if k < k_count {
-                    a_k_tau_j_mats[j][k] = Some(component.matrix.scaled_materialize(lambdas[k]));
-                    ds_k_dtau_j_mats[j][k] = Some(component.matrix.scaled_materialize(1.0));
-                }
-            }
-        }
-
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
         let pld = std::sync::Arc::new(pld);
+        let s_k_unscaled =
+            std::sync::Arc::new(Self::canonical_penalty_matrices(&self.canonical_penalties));
         let beta_eval = std::sync::Arc::new(beta_eval);
-        let x_dense = std::sync::Arc::new(x_dense);
-        let x_tau_list = std::sync::Arc::new(x_tau_list);
+        let x_tau_terms = std::sync::Arc::new(x_tau_terms);
         let x_tau_beta_list = std::sync::Arc::new(x_tau_beta_list);
         let x_tau_tau = std::sync::Arc::new(x_tau_tau);
         let u = std::sync::Arc::new(u);
         let w_diag = std::sync::Arc::new(w_diag);
         let c_array = std::sync::Arc::new(c_array);
         let d_array = std::sync::Arc::new(d_array);
+        let lambdas = std::sync::Arc::new(lambdas);
         let a_k_tau_j_mats = std::sync::Arc::new(a_k_tau_j_mats);
         let ds_k_dtau_j_mats = std::sync::Arc::new(ds_k_dtau_j_mats);
         let s_tau_list = std::sync::Arc::new(s_tau_list);
 
-        let s_tau_tau_tt = std::sync::Arc::clone(&s_tau_tau);
-        let pld_tt = std::sync::Arc::clone(&pld);
-        let s_tau_list_tt = std::sync::Arc::clone(&s_tau_list);
-        let beta_tt = std::sync::Arc::clone(&beta_eval);
-        let x_dense_tt = std::sync::Arc::clone(&x_dense);
-        let x_tau_list_tt = std::sync::Arc::clone(&x_tau_list);
-        let x_tau_beta_tt = std::sync::Arc::clone(&x_tau_beta_list);
-        let x_tau_tau_tt = std::sync::Arc::clone(&x_tau_tau);
-        let u_tt = std::sync::Arc::clone(&u);
-        let w_tt = std::sync::Arc::clone(&w_diag);
-        let c_tt = std::sync::Arc::clone(&c_array);
-        let d_tt = std::sync::Arc::clone(&d_array);
-        let p_dim_tt = p_dim;
-        let is_gaussian_tt = is_gaussian_identity;
+        let tau_tau_pair_fn = Self::build_tau_tau_pair_callback(
+            basis,
+            std::sync::Arc::clone(&pld),
+            std::sync::Arc::clone(&s_tau_list),
+            std::sync::Arc::clone(&s_tau_tau),
+            std::sync::Arc::clone(&beta_eval),
+            std::sync::Arc::clone(&x_design),
+            std::sync::Arc::clone(&x_tau_terms),
+            std::sync::Arc::clone(&x_tau_beta_list),
+            std::sync::Arc::clone(&x_tau_tau),
+            std::sync::Arc::clone(&u),
+            std::sync::Arc::clone(&w_diag),
+            std::sync::Arc::clone(&c_array),
+            std::sync::Arc::clone(&d_array),
+            p_dim,
+            is_gaussian_identity,
+        );
 
-        let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
-            let ld_s_ij = pld_tt.tau_hessian_component(
-                &s_tau_list_tt[i],
-                &s_tau_list_tt[j],
-                s_tau_tau_tt[i][j].as_ref().map(|m| m as &Array2<f64>),
-            );
+        let rho_tau_pair_fn = Self::build_rho_tau_pair_callback(
+            std::sync::Arc::clone(&pld),
+            std::sync::Arc::clone(&s_k_unscaled),
+            std::sync::Arc::clone(&s_tau_list),
+            std::sync::Arc::clone(&ds_k_dtau_j_mats),
+            std::sync::Arc::clone(&lambdas),
+            std::sync::Arc::clone(&a_k_tau_j_mats),
+            std::sync::Arc::clone(&beta_eval),
+            p_dim,
+        );
 
-            let x_tau_i_beta = &x_tau_beta_tt[i];
-            let x_tau_j_beta = &x_tau_beta_tt[j];
-            let w_x_tau_j_beta = w_tt.as_ref() * x_tau_j_beta;
-            let a_ij_likelihood = x_tau_i_beta.dot(&w_x_tau_j_beta);
-            let x_tau_tau_beta = x_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|xij| xij.dot(beta_tt.as_ref()))
-                .unwrap_or_else(|| Array1::<f64>::zeros(u_tt.len()));
-            let a_ij_design2 = if x_tau_tau_tt[i][j].is_some() {
-                -u_tt.dot(&x_tau_tau_beta)
-            } else {
-                0.0
-            };
-            let a_ij_penalty = 0.5
-                * s_tau_tau_tt[i][j]
-                    .as_ref()
-                    .map(|s_ij| beta_tt.dot(&s_ij.dot(beta_tt.as_ref())))
-                    .unwrap_or(0.0);
-            let a_ij = a_ij_likelihood + a_ij_design2 + a_ij_penalty;
-
-            let x_tau_i = &x_tau_list_tt[i];
-            let x_tau_j = &x_tau_list_tt[j];
-            let term1 = x_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|xij| xij.t().dot(u_tt.as_ref()))
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
-            let term2 = x_tau_j.t().dot(&(w_tt.as_ref() * x_tau_i_beta));
-            let term3 = x_tau_i.t().dot(&w_x_tau_j_beta);
-            let c_x_tau_i_beta = c_tt.as_ref() * x_tau_i_beta;
-            let term4 = x_dense_tt.t().dot(&(&c_x_tau_i_beta * x_tau_j_beta));
-            let term5 = if x_tau_tau_tt[i][j].is_some() {
-                x_dense_tt.t().dot(&(w_tt.as_ref() * &x_tau_tau_beta))
-            } else {
-                Array1::<f64>::zeros(p_dim_tt)
-            };
-            let term6 = s_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|s_ij| s_ij.dot(beta_tt.as_ref()))
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
-            let g_ij = term1 - &term2 - &term3 - &term4 - &term5 - &term6;
-
-            let mut b_ij = Array2::<f64>::zeros((p_dim_tt, p_dim_tt));
-            if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
-                let cross = Self::weighted_cross(xij, x_dense_tt.as_ref(), w_tt.as_ref());
-                b_ij += &cross;
-                b_ij += &cross.t().to_owned();
-            }
-            b_ij += &Self::weighted_cross(x_tau_i, x_tau_j, w_tt.as_ref());
-            b_ij += &Self::weighted_cross(x_tau_j, x_tau_i, w_tt.as_ref());
-
-            if !is_gaussian_tt {
-                b_ij += &Self::weighted_cross(x_tau_j, x_dense_tt.as_ref(), &c_x_tau_i_beta);
-                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_j, &c_x_tau_i_beta);
-
-                let c_x_tau_j_beta = c_tt.as_ref() * x_tau_j_beta;
-                b_ij += &Self::weighted_cross(x_tau_i, x_dense_tt.as_ref(), &c_x_tau_j_beta);
-                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_i, &c_x_tau_j_beta);
-
-                let d_cross = d_tt.as_ref() * &(x_tau_i_beta * x_tau_j_beta);
-                let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                b_ij += &Self::xt_diag_x_dense_into(
-                    x_dense_tt.as_ref(),
-                    &d_cross,
-                    &mut weighted_scratch,
-                );
-
-                if x_tau_tau_tt[i][j].is_some() {
-                    let c_xij_beta = c_tt.as_ref() * &x_tau_tau_beta;
-                    b_ij += &Self::xt_diag_x_dense_into(
-                        x_dense_tt.as_ref(),
-                        &c_xij_beta,
-                        &mut weighted_scratch,
-                    );
-                }
-            }
-
-            if let Some(s_ij) = s_tau_tau_tt[i][j].as_ref() {
-                b_ij += s_ij;
-            }
-
-            super::unified::HyperCoordPair {
-                a: a_ij,
-                g: g_ij,
-                b_mat: b_ij,
-                b_operator: None,
-                ld_s: ld_s_ij,
-            }
-        };
-
-        let pld_rt = std::sync::Arc::clone(&pld);
-        let canonical_penalties_rt = std::sync::Arc::new(self.canonical_penalties.as_ref().clone());
-        let s_tau_list_rt = std::sync::Arc::clone(&s_tau_list);
-        let ds_k_dtau_j_rt = std::sync::Arc::clone(&ds_k_dtau_j_mats);
-        let lambdas_rt = lambdas.clone();
-        let a_k_tau_j_rt = std::sync::Arc::clone(&a_k_tau_j_mats);
-        let beta_rt = std::sync::Arc::clone(&beta_eval);
-        let p_dim_rt = p_dim;
-
-        let rho_tau_pair_fn = move |k: usize, j: usize| -> super::unified::HyperCoordPair {
-            let ld_s_kj = if k < canonical_penalties_rt.len() {
-                pld_rt.rho_tau_hessian_component_block_local(
-                    &canonical_penalties_rt[k],
-                    lambdas_rt[k],
-                    &s_tau_list_rt[j],
-                    ds_k_dtau_j_rt[j][k].as_ref().map(|m| m as &Array2<f64>),
-                )
-            } else {
-                0.0
-            };
-
-            let a_kj = 0.5
-                * a_k_tau_j_rt[j][k]
-                    .as_ref()
-                    .map(|a_kt| beta_rt.dot(&a_kt.dot(beta_rt.as_ref())))
-                    .unwrap_or(0.0);
-            let g_kj = a_k_tau_j_rt[j][k]
-                .as_ref()
-                .map(|a_kt| -(a_kt.dot(beta_rt.as_ref())))
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_rt));
-            let b_kj = a_k_tau_j_rt[j][k]
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| Array2::<f64>::zeros((p_dim_rt, p_dim_rt)));
-
-            super::unified::HyperCoordPair {
-                a: a_kj,
-                g: g_kj,
-                b_mat: b_kj,
-                b_operator: None,
-                ld_s: ld_s_kj,
-            }
-        };
-
-        Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)))
+        Ok((tau_tau_pair_fn, rho_tau_pair_fn))
     }
 
     pub(crate) fn build_tau_pair_callbacks_sparse_exact(
@@ -1176,68 +1686,32 @@ impl<'a> RemlState<'a> {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
         }
         let p_dim = beta_eval.len();
-        let psi_dim = hyper_dirs.len();
-        let k_count = rho.len();
         let lambdas = rho.mapv(f64::exp);
 
-        // Pre-transform first-order penalty components for each τ direction.
-        let s_tau_list: Vec<Array2<f64>> = hyper_dirs
+        let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
             .iter()
             .map(|dir| {
-                let components = Self::transform_penalty_components(
+                Self::transform_penalty_components(
                     dir.penalty_first_components(),
                     &reparam_result.qs,
                     free_basis_opt.as_ref(),
-                );
-                components
-                    .iter()
-                    .try_fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
-                        if c.penalty_index >= rho.len() {
-                            return Err(EstimationError::InvalidInput(format!(
-                                "penalty_index {} out of bounds for rho dimension {} in build_tau_pair_callbacks (first-order)",
-                                c.penalty_index,
-                                rho.len()
-                            )));
-                        }
-                        c.matrix
-                            .scaled_add_to(&mut acc, rho[c.penalty_index].exp())?;
-                        Ok(acc)
-                    })
+                )
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Pre-compute second-order penalty matrices S_{τ_i τ_j} for all pairs.
-        let mut s_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; psi_dim]; psi_dim];
-        for i in 0..psi_dim {
-            for j in 0..psi_dim {
-                let second_components =
-                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
-                if second_components.is_empty() {
-                    continue;
-                }
-                let transformed = Self::transform_penalty_components(
-                    &second_components,
-                    &reparam_result.qs,
-                    free_basis_opt.as_ref(),
-                );
-                let total =
-                    transformed
-                        .iter()
-                        .try_fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, c| {
-                            if c.penalty_index >= rho.len() {
-                                return Err(EstimationError::InvalidInput(format!(
-                                    "penalty_index {} out of bounds for rho dimension {} in build_tau_pair_callbacks (second-order)",
-                                    c.penalty_index,
-                                    rho.len()
-                                )));
-                            }
-                            c.matrix
-                                .scaled_add_to(&mut acc, rho[c.penalty_index].exp())?;
-                            Ok(acc)
-                        })?;
-                s_tau_tau[i][j] = Some(total);
-            }
-        }
+            .collect();
+        let (s_tau_list, s_tau_tau, a_k_tau_j_mats, ds_k_dtau_j_mats) =
+            Self::build_tau_penalty_derivative_data(
+                rho,
+                p_dim,
+                hyper_dirs,
+                &penalty_components_per_dir,
+                |i, j| {
+                    Ok(Self::transform_penalty_components(
+                        &Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j)?,
+                        &reparam_result.qs,
+                        free_basis_opt.as_ref(),
+                    ))
+                },
+            )?;
 
         // ── Build PenaltyPseudologdet for ld_s pair computations ──
         //
@@ -1260,83 +1734,29 @@ impl<'a> RemlState<'a> {
             } else {
                 reparam_result.canonical_transformed.clone()
             };
-        let mut s_eval = Array2::<f64>::zeros((p_dim, p_dim));
-        for (k, cp) in ct_eval.iter().enumerate() {
-            cp.accumulate_weighted(&mut s_eval, lambdas[k]);
-        }
-        let pld = super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_eval)
-            .map_err(EstimationError::InvalidInput)?;
+        let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+            &ct_eval,
+            &lambdas.as_slice().unwrap_or(&[]),
+            bundle.ridge_passport.penalty_logdet_ridge(),
+            p_dim,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let s_k_unscaled = Self::canonical_penalty_matrices(&ct_eval);
 
-        // Unscaled penalty component matrices S_k = R_k^T R_k for ρ-τ pairs.
-        let s_k_unscaled: Vec<Array2<f64>> = ct_eval
-            .iter()
-            .map(|cp| {
-                let r = cp.full_width_root();
-                r.t().dot(&r)
-            })
-            .collect();
-
-        // Pre-compute transformed design matrices X_{τ_j} for each τ direction.
-        let x_dense_arc = pirls_result
-            .x_transformed
-            .try_to_dense_arc("build_tau_pair_callbacks requires dense transformed design")
-            .map_err(EstimationError::InvalidInput)?;
-        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
-            DenseRightProductView::new(x_dense_arc.as_ref())
-                .with_factor(z)
-                .materialize()
-        });
-        let x_dense: Array2<f64> = x_dense_owned
-            .as_ref()
-            .unwrap_or_else(|| x_dense_arc.as_ref())
-            .clone();
-
-        let x_tau_list: Vec<Array2<f64>> = hyper_dirs
-            .iter()
-            .map(|dir| {
-                dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())
-                    .expect("valid transformed X_tau in build_tau_pair_callbacks")
-            })
-            .collect();
-
-        // Pre-compute X_{τ_i β̂} for each τ direction.
-        let x_tau_beta_list: Vec<Array1<f64>> = x_tau_list
-            .iter()
-            .map(|x_tau| x_tau.dot(&beta_eval))
-            .collect();
+        let x_design = std::sync::Arc::new(
+            build_active_design_matrix(&pirls_result.x_transformed, free_basis_opt.as_ref())
+                .map_err(EstimationError::InvalidInput)?,
+        );
 
         let qs_eval = std::sync::Arc::new(reparam_result.qs.clone());
         let free_basis_eval: std::sync::Arc<Option<Array2<f64>>> =
             std::sync::Arc::new(free_basis_opt.clone());
-
-        // Pre-compute second-order design terms for all pairs.
-        // Dense derivatives are transformed eagerly. Implicit derivatives keep
-        // the original operator-backed representation and are evaluated through
-        // transformed forward/transpose products inside the pair callback.
-        let mut x_tau_tau: Vec<Vec<Option<TauTauDesignTerm>>> = vec![vec![None; psi_dim]; psi_dim];
-        for i in 0..psi_dim {
-            for j in i..psi_dim {
-                let xij =
-                    hyper_dirs[i]
-                        .x_tau_tau_entry_at(j)
-                        .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
-                        .map(|entry| {
-                            if entry.uses_implicit_storage() {
-                                TauTauDesignTerm::Implicit(entry)
-                            } else {
-                                TauTauDesignTerm::Dense(
-                            entry
-                                .transformed(&reparam_result.qs, free_basis_opt.as_ref())
-                                .expect("valid transformed X_tau_tau in build_tau_pair_callbacks"),
-                        )
-                            }
-                        });
-                if xij.is_some() {
-                    x_tau_tau[j][i] = xij.clone();
-                }
-                x_tau_tau[i][j] = xij;
-            }
-        }
+        let basis = TauPairBasis::Transformed {
+            qs: Arc::clone(&qs_eval),
+            free_basis_opt: Arc::clone(&free_basis_eval),
+        };
+        let (x_tau_terms, x_tau_beta_list, x_tau_tau) =
+            Self::build_tau_design_data_in_basis(hyper_dirs, &basis, &beta_eval)?;
 
         // Working residual u = w ⊙ (z − η̂).
         let u = &pirls_result.solveweights
@@ -1346,339 +1766,54 @@ impl<'a> RemlState<'a> {
         let d_array = pirls_result.solve_d_array.clone();
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
 
-        // Pre-compute per-penalty-index components of S_{τ_j} for ρ-τ cross
-        // derivative A_{k,τ_j} = λ_k (dS_k/dτ_j).
-        // For each τ direction j and penalty index k, store the transformed
-        // penalty derivative matrix (unscaled by λ_k).
-        let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
-            .iter()
-            .map(|dir| {
-                Self::transform_penalty_components(
-                    dir.penalty_first_components(),
-                    &reparam_result.qs,
-                    free_basis_opt.as_ref(),
-                )
-            })
-            .collect();
-
-        // Build A_{k,τ_j} = λ_k * (component of S_{τ_j} at penalty k).
-        // Stored as a_k_tau_j[j][k]: Option<Array2<f64>>.
-        let mut a_k_tau_j_mats: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; k_count]; psi_dim];
-        let mut ds_k_dtau_j_mats: Vec<Vec<Option<Array2<f64>>>> =
-            vec![vec![None; k_count]; psi_dim];
-        for j in 0..psi_dim {
-            for component in &penalty_components_per_dir[j] {
-                let k = component.penalty_index;
-                if k < k_count {
-                    a_k_tau_j_mats[j][k] = Some(component.matrix.scaled_materialize(lambdas[k]));
-                    ds_k_dtau_j_mats[j][k] = Some(component.matrix.scaled_materialize(1.0));
-                }
-            }
-        }
-
         // Capture into Arc for shared ownership in closures.
         let s_tau_tau = Arc::new(s_tau_tau);
         let pld = Arc::new(pld);
         let s_k_unscaled = Arc::new(s_k_unscaled);
         let s_tau_list = Arc::new(s_tau_list);
         let beta_eval = Arc::new(beta_eval);
-        let x_dense = Arc::new(x_dense);
-        let x_tau_list = Arc::new(x_tau_list);
+        let x_tau_terms = Arc::new(x_tau_terms);
         let x_tau_beta_list = Arc::new(x_tau_beta_list);
         let x_tau_tau = Arc::new(x_tau_tau);
-        let qs_eval_tt = Arc::clone(&qs_eval);
-        let free_basis_tt = Arc::clone(&free_basis_eval);
         let u = Arc::new(u);
         let w_diag = Arc::new(w_diag);
         let c_array = Arc::new(c_array);
         let d_array = Arc::new(d_array);
+        let lambdas = Arc::new(lambdas);
         let a_k_tau_j_mats = Arc::new(a_k_tau_j_mats);
         let ds_k_dtau_j_mats = Arc::new(ds_k_dtau_j_mats);
 
         // ─── τ×τ pair callback ───────────────────────────────────────────
-        let s_tau_tau_tt = Arc::clone(&s_tau_tau);
-        let pld_tt = Arc::clone(&pld);
-        let s_tau_list_tt = Arc::clone(&s_tau_list);
-        let beta_tt = Arc::clone(&beta_eval);
-        let x_dense_tt = Arc::clone(&x_dense);
-        let x_tau_list_tt = Arc::clone(&x_tau_list);
-        let x_tau_beta_tt = Arc::clone(&x_tau_beta_list);
-        let x_tau_tau_tt = Arc::clone(&x_tau_tau);
-        let u_tt = Arc::clone(&u);
-        let w_tt = Arc::clone(&w_diag);
-        let c_tt = Arc::clone(&c_array);
-        let d_tt = Arc::clone(&d_array);
-        let p_dim_tt = p_dim;
-        let is_gaussian_tt = is_gaussian_identity;
+        let tau_tau_pair_fn = Self::build_tau_tau_pair_callback(
+            basis,
+            Arc::clone(&pld),
+            Arc::clone(&s_tau_list),
+            Arc::clone(&s_tau_tau),
+            Arc::clone(&beta_eval),
+            Arc::clone(&x_design),
+            Arc::clone(&x_tau_terms),
+            Arc::clone(&x_tau_beta_list),
+            Arc::clone(&x_tau_tau),
+            Arc::clone(&u),
+            Arc::clone(&w_diag),
+            Arc::clone(&c_array),
+            Arc::clone(&d_array),
+            p_dim,
+            is_gaussian_identity,
+        );
 
-        let tau_tau_pair_fn = move |i: usize, j: usize| -> super::unified::HyperCoordPair {
-            let ld_s_ij = pld_tt.tau_hessian_component(
-                &s_tau_list_tt[i],
-                &s_tau_list_tt[j],
-                s_tau_tau_tt[i][j].as_ref().map(|m| m as &Array2<f64>),
-            );
+        let rho_tau_pair_fn = Self::build_rho_tau_pair_callback(
+            Arc::clone(&pld),
+            Arc::clone(&s_k_unscaled),
+            Arc::clone(&s_tau_list),
+            Arc::clone(&ds_k_dtau_j_mats),
+            Arc::clone(&lambdas),
+            Arc::clone(&a_k_tau_j_mats),
+            Arc::clone(&beta_eval),
+            p_dim,
+        );
 
-            // a_ij — fixed-β second-order cost derivative.
-            //
-            // ∂²F/∂τ_i ∂τ_j|_β where F = -ℓ + 0.5 β^T S β.
-            //
-            // Likelihood part: (X_{τ_i} β̂)^T W (X_{τ_j} β̂)
-            //   This arises from -ℓ''(η)[η_{τ_i}, η_{τ_j}] at fixed β,
-            //   where ℓ''(η) = -W (working weights).
-            //
-            // Second-design part: -u^T(X_{τ_i τ_j} β̂)
-            //   From -ℓ'(η)^T η_{τ_i τ_j} where ℓ'(η) = u.
-            //
-            // Penalty part: 0.5 β̂^T S_{τ_i τ_j} β̂.
-            let x_tau_i_beta = &x_tau_beta_tt[i];
-            let x_tau_j_beta = &x_tau_beta_tt[j];
-            let w_x_tau_j_beta = w_tt.as_ref() * x_tau_j_beta;
-            let a_ij_likelihood = x_tau_i_beta.dot(&w_x_tau_j_beta);
-            let x_tau_tau_beta = match x_tau_tau_tt[i][j].as_ref() {
-                Some(TauTauDesignTerm::Dense(xij)) => xij.dot(beta_tt.as_ref()),
-                Some(TauTauDesignTerm::Implicit(deriv)) => deriv
-                    .transformed_forward_mul(
-                        qs_eval_tt.as_ref(),
-                        free_basis_tt.as_ref().as_ref(),
-                        beta_tt.as_ref(),
-                    )
-                    .expect("valid transformed implicit X_tau_tau beta product"),
-                None => Array1::<f64>::zeros(u_tt.len()),
-            };
-            let a_ij_design2 = if x_tau_tau_tt[i][j].is_some() {
-                -u_tt.dot(&x_tau_tau_beta)
-            } else {
-                0.0
-            };
-            let a_ij_penalty = 0.5
-                * s_tau_tau_tt[i][j]
-                    .as_ref()
-                    .map(|s_ij| beta_tt.dot(&s_ij.dot(beta_tt.as_ref())))
-                    .unwrap_or(0.0);
-            let a_ij = a_ij_likelihood + a_ij_design2 + a_ij_penalty;
-
-            // g_ij — fixed-β second-order score vector.
-            //
-            // ∂²/∂τ_i ∂τ_j [X^T u − S β]|_β (the score ∇_β ℓ_p).
-            //
-            // Derivation by differentiating g_j = X_{τ_j}^T u − X^T W(X_{τ_j} β̂)
-            //   − S_{τ_j} β̂ w.r.t. τ_i at fixed β:
-            //
-            //   term1: X_{τ_i τ_j}^T u  (second design on score)
-            //   term2: -X_{τ_j}^T diag(w)(X_{τ_i} β̂)  (u drift from η_{τ_i})
-            //   term3: -X_{τ_i}^T W(X_{τ_j} β̂)  (design drift from X_{τ_i})
-            //   term4: -X^T diag(c ⊙ X_{τ_i} β̂)(X_{τ_j} β̂)  (weight drift)
-            //   term5: -X^T W(X_{τ_i τ_j} β̂)  (second design on Hessian-score)
-            //   term6: -S_{τ_i τ_j} β̂  (second penalty)
-            let x_tau_i = &x_tau_list_tt[i];
-            let x_tau_j = &x_tau_list_tt[j];
-
-            // term1: X_{τ_i τ_j}^T u
-            let term1 = match x_tau_tau_tt[i][j].as_ref() {
-                Some(TauTauDesignTerm::Dense(xij)) => xij.t().dot(u_tt.as_ref()),
-                Some(TauTauDesignTerm::Implicit(deriv)) => deriv
-                    .transformed_transpose_mul(
-                        qs_eval_tt.as_ref(),
-                        free_basis_tt.as_ref().as_ref(),
-                        u_tt.as_ref(),
-                    )
-                    .expect("valid transformed implicit X_tau_tau^T u product"),
-                None => Array1::<f64>::zeros(p_dim_tt),
-            };
-
-            // term2: -X_{τ_j}^T diag(w)(X_{τ_i} β̂)
-            let term2 = x_tau_j.t().dot(&(w_tt.as_ref() * x_tau_i_beta));
-
-            // term3: -X_{τ_i}^T W(X_{τ_j} β̂)
-            let term3 = x_tau_i.t().dot(&w_x_tau_j_beta);
-
-            // term4: -X^T diag(c ⊙ X_{τ_i} β̂)(X_{τ_j} β̂)
-            let c_x_tau_i_beta = c_tt.as_ref() * x_tau_i_beta;
-            let term4 = x_dense_tt.t().dot(&(&c_x_tau_i_beta * x_tau_j_beta));
-
-            // term5: -X^T W(X_{τ_i τ_j} β̂)
-            let term5 = if x_tau_tau_tt[i][j].is_some() {
-                x_dense_tt.t().dot(&(w_tt.as_ref() * &x_tau_tau_beta))
-            } else {
-                Array1::<f64>::zeros(p_dim_tt)
-            };
-
-            // term6: -S_{τ_i τ_j} β̂
-            let term6 = s_tau_tau_tt[i][j]
-                .as_ref()
-                .map(|s_ij| s_ij.dot(beta_tt.as_ref()))
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_tt));
-
-            let g_ij = term1 - &term2 - &term3 - &term4 - &term5 - &term6;
-
-            // B_ij — fixed-β second-order Hessian drift.
-            //
-            // ∂²H/∂τ_i ∂τ_j|_β where H = X^T W X + S.
-            //
-            // Components (all at fixed β, with η_{τ_i}|_β = X_{τ_i} β̂):
-            //
-            //   (a) X_{τ_i τ_j}^T W X + X^T W X_{τ_i τ_j}   [second-design]
-            //   (b) X_{τ_i}^T W X_{τ_j} + X_{τ_j}^T W X_{τ_i}  [cross-design]
-            //   (c) X_{τ_j}^T diag(c ⊙ X_{τ_i} β̂) X
-            //       + X^T diag(c ⊙ X_{τ_i} β̂) X_{τ_j}  [weight drift × design_j]
-            //   (d) X_{τ_i}^T diag(c ⊙ X_{τ_j} β̂) X
-            //       + X^T diag(c ⊙ X_{τ_j} β̂) X_{τ_i}  [weight drift × design_i]
-            //   (e) X^T diag(d ⊙ (X_{τ_i} β̂) ⊙ (X_{τ_j} β̂)) X  [curvature]
-            //   (f) X^T diag(c ⊙ X_{τ_i τ_j} β̂) X  [second-design weight]
-            //   (g) S_{τ_i τ_j}  [penalty]
-            let mut b_ij = Array2::<f64>::zeros((p_dim_tt, p_dim_tt));
-
-            // (a) second-design terms
-            if let Some(xij) = x_tau_tau_tt[i][j].as_ref() {
-                let cross = match xij {
-                    TauTauDesignTerm::Dense(xij) => {
-                        Self::weighted_cross(xij, x_dense_tt.as_ref(), w_tt.as_ref())
-                    }
-                    TauTauDesignTerm::Implicit(deriv) => {
-                        Self::weighted_cross_from_design_derivative(
-                            deriv,
-                            qs_eval_tt.as_ref(),
-                            free_basis_tt.as_ref().as_ref(),
-                            x_dense_tt.as_ref(),
-                            w_tt.as_ref(),
-                        )
-                        .expect("valid transformed implicit weighted cross")
-                    }
-                };
-                b_ij += &cross;
-                b_ij += &cross.t().to_owned();
-            }
-
-            // (b) cross-design terms
-            b_ij += &Self::weighted_cross(x_tau_i, x_tau_j, w_tt.as_ref());
-            b_ij += &Self::weighted_cross(x_tau_j, x_tau_i, w_tt.as_ref());
-
-            if !is_gaussian_tt {
-                // (c) weight drift × design_j
-                b_ij += &Self::weighted_cross(x_tau_j, x_dense_tt.as_ref(), &c_x_tau_i_beta);
-                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_j, &c_x_tau_i_beta);
-
-                // (d) weight drift × design_i
-                let c_x_tau_j_beta = c_tt.as_ref() * x_tau_j_beta;
-                b_ij += &Self::weighted_cross(x_tau_i, x_dense_tt.as_ref(), &c_x_tau_j_beta);
-                b_ij += &Self::weighted_cross(x_dense_tt.as_ref(), x_tau_i, &c_x_tau_j_beta);
-
-                // (e) curvature: X^T diag(d ⊙ (X_{τ_i} β̂) ⊙ (X_{τ_j} β̂)) X
-                let d_cross = d_tt.as_ref() * &(x_tau_i_beta * x_tau_j_beta);
-                let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                b_ij += &Self::xt_diag_x_dense_into(
-                    x_dense_tt.as_ref(),
-                    &d_cross,
-                    &mut weighted_scratch,
-                );
-
-                // (f) second-design weight: X^T diag(c ⊙ X_{τ_i τ_j} β̂) X
-                if x_tau_tau_tt[i][j].is_some() {
-                    let c_xij_beta = c_tt.as_ref() * &x_tau_tau_beta;
-                    b_ij += &Self::xt_diag_x_dense_into(
-                        x_dense_tt.as_ref(),
-                        &c_xij_beta,
-                        &mut weighted_scratch,
-                    );
-                }
-            }
-
-            // (g) penalty
-            if let Some(s_ij) = s_tau_tau_tt[i][j].as_ref() {
-                b_ij += s_ij;
-            }
-
-            super::unified::HyperCoordPair {
-                a: a_ij,
-                g: g_ij,
-                b_mat: b_ij,
-                b_operator: None,
-                ld_s: ld_s_ij,
-            }
-        };
-
-        // ─── ρ×τ pair callback ───────────────────────────────────────────
-        let pld_rt = Arc::clone(&pld);
-        let s_k_unscaled_rt = Arc::clone(&s_k_unscaled);
-        let s_tau_list_rt = Arc::clone(&s_tau_list);
-        let ds_k_dtau_j_rt = Arc::clone(&ds_k_dtau_j_mats);
-        let lambdas_rt = lambdas.clone();
-        let a_k_tau_j_rt = Arc::clone(&a_k_tau_j_mats);
-        let beta_rt = Arc::clone(&beta_eval);
-        let p_dim_rt = p_dim;
-
-        let rho_tau_pair_fn = move |k: usize, j: usize| -> super::unified::HyperCoordPair {
-            // ld_s_{k,τ_j}: second derivative of log|S|₊ w.r.t. ρ_k, τ_j.
-            //
-            // Uses PenaltyPseudologdet::rho_tau_hessian_component for the
-            // canonical formula:
-            //   ∂²_{ρ_k, τ_j} L = λ_k [tr(S⁺ dS_k/dτ_j) − tr(S⁺ S_k S⁺ S_{τ_j})]
-            let ld_s_kj = if k < s_k_unscaled_rt.len() {
-                pld_rt.rho_tau_hessian_component(
-                    &s_k_unscaled_rt[k],
-                    lambdas_rt[k],
-                    &s_tau_list_rt[j],
-                    ds_k_dtau_j_rt[j][k].as_ref().map(|m| m as &Array2<f64>),
-                )
-            } else {
-                0.0
-            };
-
-            // a_kj — fixed-β mixed cost derivative.
-            //
-            // ∂²F/∂ρ_k ∂τ_j|_β = 0.5 β̂^T A_{k,τ_j} β̂.
-            //
-            // The ∂F/∂ρ_k|_β = 0.5 β̂^T A_k β̂ term, when differentiated
-            // w.r.t. τ_j at fixed β, gives 0.5 β̂^T A_{k,τ_j} β̂ from the
-            // penalty change. The likelihood doesn't directly depend on ρ_k
-            // at fixed β, so there is no likelihood cross term.
-            let a_kj = 0.5
-                * a_k_tau_j_rt[j][k]
-                    .as_ref()
-                    .map(|a_kt| beta_rt.dot(&a_kt.dot(beta_rt.as_ref())))
-                    .unwrap_or(0.0);
-
-            // g_kj — fixed-β mixed score vector.
-            //
-            // ∂²/∂ρ_k ∂τ_j [∇_β(ℓ_p)]|_β.
-            //
-            // The first-order ρ score is g_k = -A_k β̂. Differentiating w.r.t.
-            // τ_j at fixed β gives -A_{k,τ_j} β̂ (since A_k doesn't depend on
-            // τ, but A_{k,τ_j} is the cross derivative of the penalty).
-            let g_kj = a_k_tau_j_rt[j][k]
-                .as_ref()
-                .map(|a_kt| -(a_kt.dot(beta_rt.as_ref())))
-                .unwrap_or_else(|| Array1::<f64>::zeros(p_dim_rt));
-
-            // B_kj — fixed-β mixed Hessian drift.
-            //
-            // ∂²H/∂ρ_k ∂τ_j|_β.
-            //
-            // The ρ_k Hessian drift is B_k = A_k (β-independent for the
-            // penalty term). For non-Gaussian families, B_k also includes
-            // X^T diag(c ⊙ X B_k^{IFT}) X, but that term depends on the
-            // IFT solve B_k^{IFT} = H^{-1}(-A_k β̂) and is therefore NOT
-            // a fixed-β object — it is handled by the unified evaluator
-            // via the drift derivative callback.
-            //
-            // The fixed-β part is simply A_{k,τ_j} = λ_k (dS_k/dτ_j),
-            // since A_k itself does not depend on τ (the penalty matrices
-            // R_k^T R_k are τ-independent in the canonical decomposition).
-            let b_kj = a_k_tau_j_rt[j][k]
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| Array2::<f64>::zeros((p_dim_rt, p_dim_rt)));
-
-            super::unified::HyperCoordPair {
-                a: a_kj,
-                g: g_kj,
-                b_mat: b_kj,
-                b_operator: None,
-                ld_s: ld_s_kj,
-            }
-        };
-
-        Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)))
+        Ok((tau_tau_pair_fn, rho_tau_pair_fn))
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

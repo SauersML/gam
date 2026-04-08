@@ -86,7 +86,7 @@ pub struct SmoothPlotData {
 }
 
 /// Write the report HTML to the output path, returning the path written.
-pub(crate) fn write_report(
+pub fn write_report(
     input: &ReportInput,
     out: Option<&Path>,
     model_path: &Path,
@@ -104,7 +104,7 @@ pub(crate) fn write_report(
     Ok(out)
 }
 
-fn render_html(input: &ReportInput) -> Result<String, String> {
+pub fn render_html(input: &ReportInput) -> Result<String, String> {
     let json = |v: &[f64]| serde_json::to_string(v).map_err(|e| e.to_string());
 
     let mut scripts = Vec::new();

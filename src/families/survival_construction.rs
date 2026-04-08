@@ -1084,6 +1084,41 @@ pub fn build_survival_time_basis(
     }
 }
 
+pub fn resolved_survival_time_basis_config_from_build(
+    basisname: &str,
+    degree: Option<usize>,
+    knots: Option<&Vec<f64>>,
+    keep_cols: Option<&Vec<usize>>,
+    smooth_lambda: Option<f64>,
+) -> Result<SurvivalTimeBasisConfig, String> {
+    match basisname {
+        "none" => Ok(SurvivalTimeBasisConfig::None),
+        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
+        "bspline" => Ok(SurvivalTimeBasisConfig::BSpline {
+            degree: degree.ok_or_else(|| "survival bspline basis is missing degree".to_string())?,
+            knots: Array1::from_vec(
+                knots
+                    .cloned()
+                    .ok_or_else(|| "survival bspline basis is missing knots".to_string())?,
+            ),
+            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
+        }),
+        "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
+            degree: degree.ok_or_else(|| "survival ispline basis is missing degree".to_string())?,
+            knots: Array1::from_vec(
+                knots
+                    .cloned()
+                    .ok_or_else(|| "survival ispline basis is missing knots".to_string())?,
+            ),
+            keep_cols: keep_cols
+                .cloned()
+                .ok_or_else(|| "survival ispline basis is missing keep_cols".to_string())?,
+            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
+        }),
+        other => Err(format!("unsupported survival time basis '{other}'")),
+    }
+}
+
 pub fn resolve_survival_time_anchor_value(
     age_entry: &Array1<f64>,
     time_anchor: Option<f64>,

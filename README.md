@@ -36,6 +36,52 @@ cargo build --release
 
 The binary is at `./target/release/gam`. Add it to your `PATH` or use the full path in the examples below.
 
+### Python package
+
+The repo now includes a mixed Rust/Python package built around PyO3 and maturin.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install maturin
+maturin develop --manifest-path crates/gam-pyffi/Cargo.toml
+python3 -c "import gam; print(gam.build_info())"
+```
+
+Formula-first usage:
+
+```python
+import gam
+
+train = [
+    {"y": 1.0, "x": 0.0},
+    {"y": 2.0, "x": 1.0},
+    {"y": 3.0, "x": 2.0},
+]
+
+model = gam.fit(train, "y ~ x")
+pred = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
+summary = model.summary()
+check = model.check([{"x": 1.5}])
+diagnostics = model.diagnose(train)
+gam.validate_formula(train, "y ~ x")
+model.plot(train, kind="prediction")
+html = model.report()
+model.save("linear.gam")
+```
+
+scikit-learn usage:
+
+```python
+from gam.sklearn import GAMRegressor
+
+est = GAMRegressor(formula="y ~ x")
+est.fit(train)
+pred = est.predict([{"x": 1.5}, {"x": 2.5}])
+```
+
+The native extension is `gam._rust`, while the public Python API lives under `python/gam`.
+
 ## Quick start
 
 ```bash
@@ -69,6 +115,10 @@ gam generate model.json data.csv --n-draws 5 --out synthetic.csv
 `train` is an alias for `fit`. `simulate` is an alias for `generate`.
 
 Run `gam <command> --help` for full options.
+
+## Design notes
+
+- [Python API v1 contract](docs/rfcs/0001-python-api-v1.md): freezes the intended formula-first Python surface before any PyO3 binding work.
 
 ## Formula language
 

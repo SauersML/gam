@@ -79,7 +79,8 @@ use gam::survival_construction::{
     evaluate_survival_time_basis_row, normalize_survival_time_pair, parse_survival_baseline_config,
     parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    survival_baseline_targetname, survival_likelihood_modename,
+    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
+    survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -3162,6 +3163,13 @@ fn run_predict_survival(
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
+    let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale
@@ -3172,7 +3180,7 @@ fn run_predict_survival(
         let time_anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
-        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
+        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_cfg)?;
         center_survival_time_designs_at_anchor(
             &mut time_build.x_entry_time,
             &mut time_build.x_exit_time,
@@ -3810,41 +3818,6 @@ fn build_survival_feasible_initial_beta(
         }
     }
     beta
-}
-
-fn resolved_survival_time_basis_config_from_build(
-    basisname: &str,
-    degree: Option<usize>,
-    knots: Option<&Vec<f64>>,
-    keep_cols: Option<&Vec<usize>>,
-    smooth_lambda: Option<f64>,
-) -> Result<SurvivalTimeBasisConfig, String> {
-    match basisname {
-        "none" => Ok(SurvivalTimeBasisConfig::None),
-        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
-        "bspline" => Ok(SurvivalTimeBasisConfig::BSpline {
-            degree: degree.ok_or_else(|| "survival bspline basis is missing degree".to_string())?,
-            knots: Array1::from_vec(
-                knots
-                    .cloned()
-                    .ok_or_else(|| "survival bspline basis is missing knots".to_string())?,
-            ),
-            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
-        }),
-        "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
-            degree: degree.ok_or_else(|| "survival ispline basis is missing degree".to_string())?,
-            knots: Array1::from_vec(
-                knots
-                    .cloned()
-                    .ok_or_else(|| "survival ispline basis is missing knots".to_string())?,
-            ),
-            keep_cols: keep_cols
-                .cloned()
-                .ok_or_else(|| "survival ispline basis is missing keep_cols".to_string())?,
-            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
-        }),
-        other => Err(format!("unsupported survival time basis '{other}'")),
-    }
 }
 
 fn add_survival_time_derivative_guard_offset(
@@ -6268,11 +6241,18 @@ fn run_sample_survival(
     }
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
+    let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
         let time_anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
-        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &time_cfg)?;
+        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_cfg)?;
         center_survival_time_designs_at_anchor(
             &mut time_build.x_entry_time,
             &mut time_build.x_exit_time,
