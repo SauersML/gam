@@ -303,14 +303,18 @@ mod tests {
 
     #[test]
     fn tau_tau_hessian_policy_prefers_gradient_only_when_cache_budget_is_exceeded() {
-        let dir = DirectionalHyperParam::new_compact(
-            HyperDesignDerivative::from(Array2::<f64>::zeros((2, 2))),
-            Vec::new(),
-            None,
-            None,
-        )
-        .expect("dense directional hyperparam");
-        let policy = super::exact_tau_tau_hessian_policy(320_000, 71, &[dir; 16]);
+        let dirs = (0..16)
+            .map(|_| {
+                DirectionalHyperParam::new_compact(
+                    HyperDesignDerivative::from(Array2::<f64>::zeros((2, 2))),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .expect("dense directional hyperparam")
+            })
+            .collect::<Vec<_>>();
+        let policy = super::exact_tau_tau_hessian_policy(320_000, 71, &dirs);
         assert!(!policy.any_has_implicit);
         assert!(policy.hessian_plan.total_bytes() > policy.budget_bytes);
         assert!(policy.hessian_plan.total_bytes() > policy.gradient_plan.total_bytes());

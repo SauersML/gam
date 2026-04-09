@@ -9132,7 +9132,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     let num_penalties = aniso_result.penalties_first[0].len();
     let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
     let penalties_cross_pairs = std::sync::Arc::new(aniso_result.penalties_cross_pairs.clone());
-    let penalties_cross = std::sync::Arc::new(aniso_result.penalties_cross);
     let penalties_cross_provider = aniso_result.penalties_cross_provider.clone();
 
     // Dense first/diagonal-second matrices may be present even when the shared
@@ -9193,7 +9192,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         };
         let cross_penalty_provider = if d > 1 {
             let penalties_cross_pairs = std::sync::Arc::clone(&penalties_cross_pairs);
-            let penalties_cross = std::sync::Arc::clone(&penalties_cross);
             let penalties_cross_provider = penalties_cross_provider.clone();
             Some(std::sync::Arc::new(
                 move |b_axis: usize| -> Result<Vec<Array2<f64>>, EstimationError> {
@@ -9205,11 +9203,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                         provider
                             .evaluate(axis_lo, axis_hi)
                             .map_err(EstimationError::from)
-                    } else if let Some(cross_idx) = penalties_cross_pairs
+                    } else if penalties_cross_pairs
                         .iter()
-                        .position(|&(pa, pb)| pa == axis_lo && pb == axis_hi)
+                        .any(|&(pa, pb)| pa == axis_lo && pb == axis_hi)
                     {
-                        Ok(penalties_cross[cross_idx].clone())
+                        Ok(Vec::new())
                     } else {
                         Ok(Vec::new())
                     }

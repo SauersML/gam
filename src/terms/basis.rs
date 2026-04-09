@@ -1781,17 +1781,12 @@ pub struct AnisoBasisPsiDerivatives {
     pub penalties_first: Vec<Vec<Array2<f64>>>,
     /// d x num_penalties: d2S_m/d psi_a^2 for each axis a and penalty m.
     pub penalties_second_diag: Vec<Vec<Array2<f64>>>,
-    /// Cross-penalty second derivatives ∂²S_m/∂ψ_a∂ψ_b for a < b.
-    /// Indexed as penalties_cross[(a,b)] where (a,b) pairs are stored in
-    /// `penalties_cross_pairs`. Each entry is a Vec<Array2<f64>> of length
-    /// num_active_penalties, paralleling penalties_first[a].
-    pub penalties_cross: Vec<Vec<Array2<f64>>>,
-    /// The (a, b) axis pairs corresponding to each entry in penalties_cross.
-    /// Only the upper triangle (a < b) is stored.
+    /// The (a, b) axis pairs supported by the on-demand cross-penalty
+    /// provider. Only the upper triangle (a < b) is stored.
     pub penalties_cross_pairs: Vec<(usize, usize)>,
-    /// Optional on-demand cross-penalty second-derivative provider.
-    /// When present, callers should prefer this over `penalties_cross` so
-    /// cross-axis penalty seconds can be computed one pair at a time.
+    /// On-demand cross-penalty second-derivative provider. Exact anisotropic
+    /// cross-axis penalty seconds are streamed one pair at a time rather than
+    /// stored as a dense upper triangle of blocks.
     pub penalties_cross_provider: Option<AnisoPenaltyCrossProvider>,
     /// Shared operator-backed representation of the anisotropic kernel-side
     /// design derivatives. When `design_first` / `design_second_diag` are empty,
@@ -3589,7 +3584,6 @@ fn build_aniso_design_psi_derivatives_shared(
             design_second_cross_pairs: Vec::new(),
             penalties_first: vec![Vec::new(); dim],
             penalties_second_diag: vec![Vec::new(); dim],
-            penalties_cross: Vec::new(),
             penalties_cross_pairs: Vec::new(),
             penalties_cross_provider: None,
             implicit_operator: Some(op),
@@ -3684,7 +3678,6 @@ fn build_aniso_design_psi_derivatives_shared(
         design_second_cross_pairs: Vec::new(),
         penalties_first: vec![Vec::new(); dim],
         penalties_second_diag: vec![Vec::new(); dim],
-        penalties_cross: Vec::new(),
         penalties_cross_pairs: Vec::new(),
         penalties_cross_provider: None,
         implicit_operator: Some(op),
@@ -10046,7 +10039,6 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let penaltyinfo = base.penaltyinfo.clone();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
-        result.penalties_cross.clear();
         result.penalties_cross_provider = Some(AnisoPenaltyCrossProvider::new(
             move |axis_a: usize, axis_b: usize| {
                 let (a, b) = if axis_a < axis_b {
@@ -10105,7 +10097,6 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             result.penalties_second_diag.push(pen_second);
         }
         result.penalties_cross_pairs = cross_pairs;
-        result.penalties_cross.clear();
         result.penalties_cross_provider = Some(cross_provider);
     }
 
@@ -10353,7 +10344,6 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     design_result.penalties_first = penalties_first;
     design_result.penalties_second_diag = penalties_second_diag;
     design_result.penalties_cross_pairs = penalties_cross_pairs;
-    design_result.penalties_cross.clear();
     design_result.penalties_cross_provider = penalties_cross_provider;
     Ok(design_result)
 }
@@ -10416,7 +10406,6 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         result.penalties_second_diag.push(pen_second);
     }
     result.penalties_cross_pairs = cross_pairs;
-    result.penalties_cross.clear();
     result.penalties_cross_provider = Some(cross_provider);
 
     Ok(result)
@@ -18369,7 +18358,6 @@ mod tests {
         let expected_cols = basis.design.ncols();
 
         assert_eq!(derivs.penalties_cross_pairs, vec![(0, 1)]);
-        assert!(derivs.penalties_cross.is_empty());
         let cross_penalties = derivs
             .penalties_cross_provider
             .as_ref()

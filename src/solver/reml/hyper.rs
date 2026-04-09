@@ -296,6 +296,45 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
+    fn ensure_transformed_x_tau_dense<'b>(
+        slot: &'b mut Option<Array2<f64>>,
+        dir: &DirectionalHyperParam,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<&'b Array2<f64>, EstimationError> {
+        Ok(slot.get_or_insert(dir.transformed_x_tau(qs, free_basis_opt)?))
+    }
+
+    fn ensure_exact_tau_tau_callbacks_allowed(
+        &self,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<(), EstimationError> {
+        let firth_pair_terms_unavailable = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let policy = super::exact_tau_tau_hessian_policy_with_firth(
+            self.x().nrows(),
+            self.x().ncols(),
+            hyper_dirs,
+            firth_pair_terms_unavailable,
+        );
+        if policy.prefer_gradient_only() {
+            return Err(EstimationError::InvalidInput(format!(
+                "exact tau-tau callbacks are disabled for this outer evaluation plan \
+                 (n={}, p={}, psi_dim={}, implicit_tau={}, implicit_multidim_duchon={}, \
+                 dense_tau_cache={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
+                self.x().nrows(),
+                self.x().ncols(),
+                hyper_dirs.len(),
+                policy.any_has_implicit,
+                policy.implicit_multidim_duchon,
+                policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
+                policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
+                policy.budget_bytes as f64 / (1024.0 * 1024.0),
+            )));
+        }
+        Ok(())
+    }
+
     fn tau_design_forward_mul(
         term: &TauDesignTerm,
         qs: &Array2<f64>,
@@ -1182,20 +1221,24 @@ impl<'a> RemlState<'a> {
                     &beta_eval,
                 )?
             } else {
-                x_tau_j_dense
-                    .get_or_insert(
-                        hyper_dirs[j]
-                            .transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
-                    )
-                    .dot(&beta_eval)
+                Self::ensure_transformed_x_tau_dense(
+                    &mut x_tau_j_dense,
+                    &hyper_dirs[j],
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )?
+                .dot(&beta_eval)
             };
             let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
             // Firth partial: Φ_{τ_j}|_β = 0.5 tr(I_r^{-1} I_{r,τ_j}).
             let mut firth_tau_kernel_j: Option<FirthTauPartialKernel> = None;
             if let Some(op) = firth_op.as_ref() {
-                let x_tau_j = x_tau_j_dense.get_or_insert(
-                    hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
-                );
+                let x_tau_j = Self::ensure_transformed_x_tau_dense(
+                    &mut x_tau_j_dense,
+                    &hyper_dirs[j],
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )?;
                 let need_kernel = x_tau_j.iter().any(|v| *v != 0.0);
                 let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, need_kernel);
                 a_j += tau_bundle.phi_tau_partial;
@@ -1224,19 +1267,23 @@ impl<'a> RemlState<'a> {
                     &u,
                 )?
             } else {
-                x_tau_j_dense
-                    .get_or_insert(
-                        hyper_dirs[j]
-                            .transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
-                    )
-                    .t()
-                    .dot(&u)
+                Self::ensure_transformed_x_tau_dense(
+                    &mut x_tau_j_dense,
+                    &hyper_dirs[j],
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )?
+                .t()
+                .dot(&u)
             };
             let mut g_j = x_tau_t_u - xt_weighted_x_tau_beta_j - s_tau_j.dot(&beta_eval);
             if let Some(op) = firth_op.as_ref() {
-                let x_tau_j = x_tau_j_dense.get_or_insert(
-                    hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
-                );
+                let x_tau_j = Self::ensure_transformed_x_tau_dense(
+                    &mut x_tau_j_dense,
+                    &hyper_dirs[j],
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )?;
                 let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, false);
                 g_j -= &tau_bundle.gphi_tau;
             }
@@ -1282,9 +1329,12 @@ impl<'a> RemlState<'a> {
             let dense_b = if b_operator.is_some() {
                 None
             } else {
-                let x_tau_j = x_tau_j_dense.get_or_insert(
-                    hyper_dirs[j].transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref())?,
-                );
+                let x_tau_j = Self::ensure_transformed_x_tau_dense(
+                    &mut x_tau_j_dense,
+                    &hyper_dirs[j],
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )?;
                 let x_dense = x_dense.expect("dense X should exist when materializing hyper drift");
                 let mut b_j = Self::weighted_cross(x_tau_j, x_dense, w_diag);
                 b_j += &Self::weighted_cross(x_dense, x_tau_j, w_diag);
@@ -1515,6 +1565,7 @@ impl<'a> RemlState<'a> {
         ),
         EstimationError,
     > {
+        self.ensure_exact_tau_tau_callbacks_allowed(hyper_dirs)?;
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_eval = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta_eval.len();
@@ -1677,6 +1728,7 @@ impl<'a> RemlState<'a> {
         ),
         EstimationError,
     > {
+        self.ensure_exact_tau_tau_callbacks_allowed(hyper_dirs)?;
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
