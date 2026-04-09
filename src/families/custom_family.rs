@@ -10938,95 +10938,67 @@ mod tests {
         let s_cross_01 = derivs[0]
             .s_psi_psi_components
             .as_ref()
-            .expect("psi0 penalty second-derivative rows")[1][0]
-            .1
+            .expect("psi0 penalty second-derivative rows")[1]
             .clone();
         let s_cross_10 = derivs[1]
             .s_psi_psi_components
             .as_ref()
-            .expect("psi1 penalty second-derivative rows")[0][0]
-            .1
+            .expect("psi1 penalty second-derivative rows")[0]
             .clone();
-        assert_eq!(
-            s_cross_01.dim(),
-            (
-                resolved_design.design.ncols(),
-                resolved_design.design.ncols()
-            )
-        );
-        assert_eq!(
-            s_cross_10.dim(),
-            (
-                resolved_design.design.ncols(),
-                resolved_design.design.ncols()
-            )
-        );
         let cross_penalties_01 = info_list[0]
-            .aniso_cross_penalties
+            .aniso_cross_penalty_provider
             .as_ref()
-            .expect("psi0 cross penalties");
+            .expect("psi0 cross penalty provider")(1)
+        .expect("psi0->psi1 cross penalties");
         let cross_penalties_10 = info_list[1]
-            .aniso_cross_penalties
+            .aniso_cross_penalty_provider
             .as_ref()
-            .expect("psi1 cross penalties");
-        assert_eq!(
-            cross_penalties_01[0].0, 1,
-            "psi0 should point at psi1 cross penalties"
-        );
-        assert_eq!(
-            cross_penalties_10[0].0, 0,
-            "psi1 should point at psi0 cross penalties"
-        );
-        let expected_s_cross_01 = cross_penalties_01[0]
-            .1
+            .expect("psi1 cross penalty provider")(0)
+        .expect("psi1->psi0 cross penalties");
+        assert_eq!(s_cross_01.len(), cross_penalties_01.len());
+        assert_eq!(s_cross_10.len(), cross_penalties_10.len());
+        for (((penalty_idx, actual), expected_local), expected_idx) in s_cross_01
             .iter()
-            .map(|local| {
-                EmbeddedSquareBlock::new(
-                    local,
-                    info_list[0].global_range.clone(),
-                    info_list[0].total_p,
-                )
-                .materialize()
-            })
-            .fold(
-                Array2::<f64>::zeros((
-                    resolved_design.design.ncols(),
-                    resolved_design.design.ncols(),
-                )),
-                |acc, matrix| acc + matrix,
+            .zip(cross_penalties_01.iter())
+            .zip(info_list[0].penalty_indices.iter())
+        {
+            assert_eq!(*penalty_idx, *expected_idx);
+            let expected = EmbeddedSquareBlock::new(
+                expected_local,
+                info_list[0].global_range.clone(),
+                info_list[0].total_p,
+            )
+            .materialize();
+            assert_eq!(actual.dim(), expected.dim());
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+                "generic psi builder should embed each psi0->psi1 cross penalty component into the off-diagonal row"
             );
-        let expected_s_cross_10 = cross_penalties_10[0]
-            .1
+        }
+        for (((penalty_idx, actual), expected_local), expected_idx) in s_cross_10
             .iter()
-            .map(|local| {
-                EmbeddedSquareBlock::new(
-                    local,
-                    info_list[1].global_range.clone(),
-                    info_list[1].total_p,
-                )
-                .materialize()
-            })
-            .fold(
-                Array2::<f64>::zeros((
-                    resolved_design.design.ncols(),
-                    resolved_design.design.ncols(),
-                )),
-                |acc, matrix| acc + matrix,
+            .zip(cross_penalties_10.iter())
+            .zip(info_list[1].penalty_indices.iter())
+        {
+            assert_eq!(*penalty_idx, *expected_idx);
+            let expected = EmbeddedSquareBlock::new(
+                expected_local,
+                info_list[1].global_range.clone(),
+                info_list[1].total_p,
+            )
+            .materialize();
+            assert_eq!(actual.dim(), expected.dim());
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+                "generic psi builder should embed each psi1->psi0 cross penalty component into the symmetric off-diagonal row"
             );
-        assert!(
-            s_cross_01
-                .iter()
-                .zip(expected_s_cross_01.iter())
-                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
-            "generic psi builder should embed the psi0->psi1 cross penalties into the off-diagonal row"
-        );
-        assert!(
-            s_cross_10
-                .iter()
-                .zip(expected_s_cross_10.iter())
-                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
-            "generic psi builder should embed the psi1->psi0 cross penalties into the symmetric off-diagonal row"
-        );
+        }
     }
 
     #[test]
