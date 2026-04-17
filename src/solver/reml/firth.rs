@@ -1422,6 +1422,9 @@ impl FirthDenseOperator {
     /// (to realize the 9-term D² expansion) and therefore owns both
     /// `x_tau_{i,j}_reduced` and their η̇_i / η̇_j.
     ///
+    /// Allow(dead_code): scaffold until pair-callback threading wires the
+    /// operator into `HyperCoordPair::b_operator` additively.
+    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_prepare_from_partials(
         &self,
         x_tau_i_reduced: Array2<f64>,
@@ -1461,6 +1464,9 @@ impl FirthDenseOperator {
     /// τ-drift designs and the prepared kernel, and receives the fixed-β
     /// second-τ Firth drift as a dense p×m action.  Matrix-free in n.
     ///
+    /// Allow(dead_code): scaffold until pair-callback threading wires the
+    /// operator into `HyperCoordPair::b_operator` additively.
+    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_apply(
         &self,
         x_tau_i: &Array2<f64>,
@@ -2059,6 +2065,7 @@ impl FirthDenseOperator {
     /// This mirrors the body of `apply_mtau_to_matrix` but accepts the
     /// x_tau/dot_k pieces directly, letting Primitive A reuse the same
     /// matrix-free Ṗ_τ applies without owning a `FirthTauPartialKernel`.
+    #[allow(dead_code)]
     fn apply_mtau_from_reduced(
         &self,
         x_tau_reduced: &Array2<f64>,
@@ -2104,6 +2111,7 @@ impl FirthDenseOperator {
     ///
     /// with S := row-wise reducedweighted Gram.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn apply_p_ddot_ij(
         &self,
         x_r: &Array2<f64>,
@@ -2594,6 +2602,8 @@ mod tests {
             assert!((op.w1[i] - w1fd).abs() < 2e-7);
             assert!((op.w2[i] - w2fd).abs() < 2e-5);
             assert!((op.w3[i] - w3fd).abs() < 4e-4);
+            println!("row {i}: z={z:.6} op.w4={} w4fd={} diff={}",
+                op.w4[i], w4fd, (op.w4[i] - w4fd).abs());
             assert!((op.w4[i] - w4fd).abs() < 2e-3);
         }
     }
