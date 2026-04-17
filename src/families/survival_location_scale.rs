@@ -6062,11 +6062,35 @@ impl SurvivalLocationScaleFamily {
             }
         };
 
+        // Time-time directional derivative of the joint Hessian.
+        //
+        // Stored H equals -∂²ℓ/∂β². The time-time base is
+        //
+        //   H_tt = X_entry'·diag(-h_time_h0)·X_entry
+        //        + X_exit' ·diag(-h_time_h1)·X_exit
+        //        + X_deriv'·diag(+h_time_d )·X_deriv
+        //
+        //   h_time_h0 = w·r'(u0)        (= ∂²ℓ/∂h0²)
+        //   h_time_h1 = w·event_mix    (= ∂²ℓ/∂h1²)
+        //   h_time_d  = -w·d·d2_log_g  (already sign-flipped)
+        //
+        // Differentiating along Δβ (with Δu0 = Δh0 + Δq_entry,
+        // Δu1 = Δh1 + Δq_exit, g depending on β_t only through d_raw):
+        //
+        //   dH_tt = X_entry'·diag(-d_h_h0·Δu0)·X_entry
+        //         + X_exit' ·diag(-d_h_h1·Δu1)·X_exit
+        //         + X_deriv'·diag(+d_h_d ·Δd )·X_deriv
+        //
+        // where d_h_h0 = w·r''(u0), d_h_h1 = w·event_mix₃,
+        //       d_h_d  = -w·d·d3_log_g. The negative sign on the entry/exit
+        // contributions comes from differentiating `-h_time_h0` and
+        // `-h_time_h1` in the base assembly; the deriv term already
+        // carries the negation inside `h_time_d` so it flows positive.
         let dh_h0 = &q.d_h_h0 * &(&delta_h0 + &entry_deltas.delta_q);
         let dh_h1 = &q.d_h_h1 * &(&delta_h1 + &delta_q_exit);
         let dh_d = &q.d_h_d * &delta_d;
-        let d_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &dh_h0)
-            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &dh_h1)
+        let d_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&dh_h0))
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&dh_h1))
             + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &dh_d);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
 
