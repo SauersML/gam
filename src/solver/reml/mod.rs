@@ -536,6 +536,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn dbg_vtau_summand_breakdown() {
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.2, 0.3],
+            [1.0, -0.8, -0.4],
+            [1.0, -0.3, 0.7],
+            [1.0, 0.1, -0.9],
+            [1.0, 0.5, 0.2],
+            [1.0, 0.9, -0.1],
+            [1.0, 1.3, 0.8],
+            [1.0, 1.7, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
+        let x_tau = Array2::<f64>::zeros(x.raw_dim());
+        let s_tau = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15],];
+        let rho = array![0.0];
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            1e-14,
+            false,
+        );
+
+        let h = 2e-5;
+        let x_plus = &x + &(x_tau.mapv(|v| h * v));
+        let x_minus = &x - &(x_tau.mapv(|v| h * v));
+        let s_plus = &s0 + &(s_tau.mapv(|v| h * v));
+        let s_minus = &s0 - &(s_tau.mapv(|v| h * v));
+
+        let state_plus_full = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
+        let state_minus_full = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
+        unsafe { std::env::set_var("GAM_DBG_COST", "+"); }
+        let v_cost_plus = state_plus_full.compute_cost(&rho).expect("cost+");
+        eprintln!("[POST-COMPUTE-COST +] v_cost_plus={:.12e}", v_cost_plus);
+        unsafe { std::env::set_var("GAM_DBG_COST", "-"); }
+        let v_cost_minus = state_minus_full.compute_cost(&rho).expect("cost-");
+        eprintln!("[POST-COMPUTE-COST -] v_cost_minus={:.12e}", v_cost_minus);
+        unsafe { std::env::remove_var("GAM_DBG_COST"); }
+        let v_fd_cost = (v_cost_plus - v_cost_minus) / (2.0 * h);
+        eprintln!("[VTAU-FD] v_fd_cost={:.12e}", v_fd_cost);
+    }
+
+    #[test]
     fn directional_hyper_identities_match_finite_differences_logit() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
