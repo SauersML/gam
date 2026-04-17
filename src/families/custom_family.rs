@@ -5999,10 +5999,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     Ok(bounds) => bounds,
                     Err(_) => break,
                 };
+                // Newton IRLS step in absolute-β space:
+                //
+                //   β_new = H_pen⁻¹ (H_L β + ∇ℓ)
+                //
+                // where H_pen = H_L + S, derived from Newton's update
+                //   β_new = β + H_pen⁻¹(∇ℓ − Sβ)
+                //         = H_pen⁻¹(H_pen β + ∇ℓ − Sβ)
+                //         = H_pen⁻¹(H_L β + ∇ℓ).
+                //
+                // The QP `min 0.5 β' H_pen β − rhs_beta' β` has unconstrained
+                // optimum β = H_pen⁻¹ rhs_beta, so rhs_beta = H_pen β + (∇ℓ − Sβ)
+                // gives the correct Newton update. Passing raw grad_joint (=∇ℓ)
+                // would collapse to β = H_pen⁻¹ ∇ℓ, which at the true optimum
+                // (∇ℓ = Sβ̂) gives H_pen⁻¹ Sβ̂ ≠ β̂ — wrong fixed point.
+                let penalty_beta_joint = apply_joint_block_penalty(
+                    &ranges,
+                    &s_lambdas,
+                    &beta_joint,
+                    joint_mode_diagonal_ridge,
+                );
+                let rhs_step = &grad_joint - &penalty_beta_joint;
+                let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                 let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
                     solve_quadratic_with_simple_lower_bounds(
                         &lhs,
-                        &grad_joint,
+                        &rhs_beta,
                         &beta_joint,
                         bounds,
                         warm_joint_active.as_deref(),
@@ -6010,7 +6032,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     solve_quadratic_with_linear_constraints(
                         &lhs,
-                        &grad_joint,
+                        &rhs_beta,
                         &beta_joint,
                         constraints,
                         warm_joint_active.as_deref(),
@@ -6236,7 +6258,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
             )?;
-            if std::env::var("GAM_DBG_OUTER").is_ok() && (cycle < 3 || cycle >= inner_max_cycles - 3) {
+            if std::env::var("GAM_DBG_OUTER").is_ok() {
                 eprintln!(
                     "[DBG-INNER] cycle={} residual={:.6e} step_inf={:.6e} obj={:.12e}",
                     cycle, residual, step_inf, lastobjective
@@ -6609,11 +6631,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // to optimum, so step sizes should be small and line search should
         // accept full steps quickly.
         const POLISH_MAX_ITER: usize = 16;
-        for _ in 0..POLISH_MAX_ITER {
+        for _polish_iter in 0..POLISH_MAX_ITER {
             // Re-evaluate at current β to get the joint gradient and Hessian.
             refresh_all_block_etas(family, specs, &mut states)?;
-            let eval_joint = match family.exact_newton_joint_gradient_evaluation(&states, specs)? {
-                Some(ev) => ev,
+            let eval_for_polish = family.evaluate(&states)?;
+            let grad_full = match exact_newton_joint_gradient_from_eval(&eval_for_polish, specs)? {
+                Some(g) => g,
                 None => break,
             };
             let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
@@ -6646,31 +6669,115 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &beta_joint,
                 joint_mode_diagonal_ridge,
             );
-            let rhs = &eval_joint.gradient - &penalty_beta;
-            let res_inf = rhs.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-            if std::env::var("GAM_DBG_OUTER").is_ok() {
-                eprintln!("[DBG-POLISH] res_inf={:.6e}", res_inf);
+            let rhs = &grad_full - &penalty_beta;
+
+            // Respect constraints that block line search on the boundary.
+            // Gauss-Seidel blockwise leaves the joint KKT residual at a floor
+            // around |λ_k S_k β̂| for boundary-active components. The residual
+            // magnitude on FREE components is a better measure of whether we
+            // should keep polishing: if β_i is clipped at the boundary and
+            // KKT multiplier μ_i > 0, then rhs[i] is the multiplier, not a
+            // free-space gradient violation.
+            let block_constraints_now =
+                collect_block_linear_constraints(family, &states, specs)?;
+            let joint_constraints_now = assemble_joint_linear_constraints(
+                &block_constraints_now,
+                &ranges_joint,
+                total_p_joint,
+            )?;
+            let mut active_mask: Vec<bool> = vec![false; total_p_joint];
+            if let Some(ref constraints) = joint_constraints_now
+                && let Ok(Some(bounds)) =
+                    extract_simple_lower_bounds(constraints, total_p_joint)
+            {
+                for (idx, (bound, beta_val)) in
+                    bounds.lower_bounds.iter().zip(beta_joint.iter()).enumerate()
+                {
+                    if *bound > f64::NEG_INFINITY && (*beta_val - *bound).abs() < 1e-12 {
+                        active_mask[idx] = true;
+                    }
+                }
             }
-            if res_inf <= inner_tol {
+            let res_inf_free = rhs
+                .iter()
+                .zip(active_mask.iter())
+                .filter(|(_, active)| !**active)
+                .map(|(v, _)| v.abs())
+                .fold(0.0_f64, f64::max);
+            if std::env::var("GAM_DBG_OUTER").is_ok() {
+                let res_inf_total = rhs.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+                eprintln!(
+                    "[DBG-POLISH] res_inf_total={:.6e} res_inf_free={:.6e} active_count={}",
+                    res_inf_total,
+                    res_inf_free,
+                    active_mask.iter().filter(|a| **a).count()
+                );
+            }
+            if res_inf_free <= inner_tol {
                 converged = true;
                 break;
             }
 
-            let solver = crate::linalg::utils::StableSolver::new("joint polish");
-            let Some(delta) = solver.solvevectorwithridge_retries(
-                &h_dense,
-                &rhs,
-                JOINT_TRACE_STABILITY_RIDGE,
-            ) else {
-                break;
+            // Solve constrained Newton system if simple bounds are present,
+            // else unconstrained.
+            let delta = if let Some(ref constraints) = joint_constraints_now {
+                let warm = flatten_joint_active_set(&cached_active_sets, &block_constraints_now);
+                let lower_bounds_opt =
+                    extract_simple_lower_bounds(constraints, total_p_joint).ok().flatten();
+                if let Some(bounds) = lower_bounds_opt.as_ref() {
+                    match solve_quadratic_with_simple_lower_bounds(
+                        &h_dense,
+                        &rhs,
+                        &beta_joint,
+                        bounds,
+                        warm.as_deref(),
+                    ) {
+                        Ok((beta_new, _active)) => &beta_new - &beta_joint,
+                        Err(_) => break,
+                    }
+                } else {
+                    match solve_quadratic_with_linear_constraints(
+                        &h_dense,
+                        &rhs,
+                        &beta_joint,
+                        constraints,
+                        warm.as_deref(),
+                    ) {
+                        Ok((beta_new, _active)) => &beta_new - &beta_joint,
+                        Err(_) => break,
+                    }
+                }
+            } else {
+                let solver = crate::linalg::utils::StableSolver::new("joint polish");
+                match solver.solvevectorwithridge_retries(
+                    &h_dense,
+                    &rhs,
+                    JOINT_TRACE_STABILITY_RIDGE,
+                ) {
+                    Some(d) => d,
+                    None => break,
+                }
             };
             if !delta.iter().all(|v| v.is_finite()) {
+                break;
+            }
+            let step_inf_polish = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            if std::env::var("GAM_DBG_OUTER").is_ok() {
+                eprintln!(
+                    "[DBG-POLISH-STEP] step_inf={:.6e} delta_first10={:?}",
+                    step_inf_polish,
+                    delta.iter().take(10).copied().collect::<Vec<_>>()
+                );
+            }
+            if step_inf_polish <= inner_tol {
+                // No movement available — treat as converged.
+                converged = true;
                 break;
             }
 
             // Damped line search with projection.
             let old_states: Vec<ParameterBlockState> = states.clone();
-            let old_obj = -cached_eval.log_likelihood + current_penalty;
+            let old_obj = -eval_for_polish.log_likelihood + current_penalty;
             let mut accepted_polish = false;
             for bt in 0..10 {
                 let alpha = 0.5f64.powi(bt);
@@ -6696,21 +6803,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
                 let trial_obj = -trial_ll + trial_penalty;
-                if std::env::var("GAM_DBG_OUTER").is_ok() {
-                    eprintln!(
-                        "[DBG-POLISH-LS] alpha={:.6e} trial_obj={:.12e} old_obj={:.12e}",
-                        alpha, trial_obj, old_obj
-                    );
-                }
                 if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
                     current_penalty = trial_penalty;
                     cached_eval = family.evaluate(&states)?;
                     accepted_polish = true;
                     break;
                 }
-            }
-            if std::env::var("GAM_DBG_OUTER").is_ok() {
-                eprintln!("[DBG-POLISH] accepted_polish={}", accepted_polish);
             }
             if !accepted_polish {
                 // Restore and stop polishing.
