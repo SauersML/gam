@@ -3060,6 +3060,7 @@ pub(crate) struct FirthTauExactKernel {
 /// - η̈_{ij}  = X_{τ_iτ_j} β               (n-vector; None ↔ τ-linear design)
 /// - x_tau_tau_reduced: optional reduced-basis X_{τ_iτ_j} design (None when
 ///                     τ-linear in design).
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct FirthTauTauPartialKernel {
     pub(super) tau_i: FirthTauPartialKernel,
