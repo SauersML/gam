@@ -2873,6 +2873,7 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
+    #[allow(dead_code)] // retired; kept temporarily alongside legacy linear-operator scaffolds
     fn sigma_scale_factor(&self) -> Option<f64> {
         let sigma = self.gaussian_frailty_sd?;
         if !sigma.is_finite() || sigma <= 0.0 {
