@@ -3058,8 +3058,6 @@ pub(crate) struct FirthTauExactKernel {
 /// into Primitive A (`hphi_tau_tau_partial_apply`) for the operator-
 /// valued Hessian 2nd drift without recomputing shared reduced Grams.
 ///
-/// Allow(dead_code): scaffold until pair-callback threading wires the
-/// scalar / p-vector additive contributions into `HyperCoordPair::{a,g}`.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct FirthTauTauExactKernel {
@@ -3076,12 +3074,10 @@ pub(crate) struct FirthTauTauExactKernel {
 /// are filled in by 13b; kept with a neutral internal shape so downstream
 /// pair callbacks can hold the kernel across the pair dispatch.
 ///
-/// Wired in by the Primitive A FD test and Task #20 pair-callback
-/// integration.
-///
-/// Allow(dead_code): scaffold until pair-callback threading wires the
-/// operator into `HyperCoordPair::b_operator` additively.
-#[allow(dead_code)]
+/// Wired into the pair-callback's `b_operator` via
+/// `FirthAugmentedPairHyperOperator`, and produced by both
+/// `hphi_tau_tau_partial_prepare_from_partials` and
+/// `exact_tau_tau_kernel` (the scalar/p-vector companion).
 #[derive(Clone, Default)]
 pub(crate) struct FirthTauTauPartialKernel {
     pub(super) x_tau_i_reduced: Array2<f64>,
