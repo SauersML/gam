@@ -3081,6 +3081,24 @@ pub fn reml_laml_evaluate(
             if *include_logdet_s {
                 cost -= 0.5 * log_det_s;
             }
+            if let Ok(tag) = std::env::var("GAM_DBG_COST") {
+                let firth_val = solution
+                    .firth
+                    .as_ref()
+                    .map_or(0.0, ExactJeffreysTerm::value);
+                eprintln!(
+                    "[DBG-COST {}] ll={:.12e} pen_quad={:.12e} logdet_h_raw={:.12e} hlogdet_corr={:.12e} logdet_s={:.12e} tk={:.12e} firth={:.12e} cost={:.12e}",
+                    tag,
+                    solution.log_likelihood,
+                    solution.penalty_quadratic,
+                    hop.logdet(),
+                    solution.hessian_logdet_correction,
+                    log_det_s,
+                    solution.tk_correction,
+                    firth_val,
+                    cost,
+                );
+            }
             (cost, *phi, 0.0)
         }
     };
@@ -3173,12 +3191,39 @@ pub fn reml_laml_evaluate(
     } else {
         None
     };
+    if std::env::var("GAM_DBG_OUTER").is_ok() {
+        if let Some(ref v_ks) = rho_v_ks {
+            for (idx, v_k) in v_ks.iter().enumerate() {
+                eprintln!(
+                    "[DBG-VK] idx={} a_k_beta_first10={:?} v_k_first10={:?}",
+                    idx,
+                    rho_curvature_a_k_betas[idx]
+                        .iter()
+                        .take(10)
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    v_k.iter().take(10).copied().collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
     let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
         rho_v_ks
             .as_ref()
             .expect("rho mode responses required for Hessian corrections")
             .iter()
-            .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
+            .map(|v_k| {
+                let corr = effective_deriv.hessian_derivative_correction_result(v_k)?;
+                if std::env::var("GAM_DBG_OUTER").is_ok() {
+                    if let Some(ref c) = corr {
+                        let trace_hinv = c.trace_logdet(hop);
+                        eprintln!("[DBG-CORR] trace_hinv_corr={:.6e}", trace_hinv);
+                    } else {
+                        eprintln!("[DBG-CORR] corr=None");
+                    }
+                }
+                Ok::<Option<DriftDerivResult>, String>(corr)
+            })
             .collect::<Result<Vec<_>, _>>()?
     } else {
         (0..k).map(|_| None).collect()
@@ -3377,6 +3422,19 @@ pub fn reml_laml_evaluate(
             incl_logdet_h,
             incl_logdet_s,
         );
+        if std::env::var("GAM_DBG_OUTER").is_ok() {
+            eprintln!(
+                "[DBG-GRAD] idx={} a_i={:.12e} trace_logdet={:.12e} ld_s={:.12e} grad={:.12e} rho_corr_some={} incl_h={} incl_s={}",
+                idx,
+                a_i,
+                trace_logdet_i,
+                solution.penalty_logdet.first[idx],
+                grad[idx],
+                rho_corrections[idx].is_some(),
+                incl_logdet_h,
+                incl_logdet_s,
+            );
+        }
     }
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
@@ -3400,6 +3458,8 @@ pub fn reml_laml_evaluate(
         let v_i = hop.solve(&coord.g);
 
         // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
+        let mut dbg_base_trace = 0.0;
+        let mut dbg_corr_trace = 0.0;
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -3413,16 +3473,24 @@ pub fn reml_laml_evaluate(
             };
             if let Some(corr) = correction.as_ref() {
                 let base = coord.drift.materialize();
-                hop.trace_logdet_gradient(&base) + corr.trace_logdet(hop)
+                let bt = hop.trace_logdet_gradient(&base);
+                let ct = corr.trace_logdet(hop);
+                dbg_base_trace = bt;
+                dbg_corr_trace = ct;
+                bt + ct
             } else if let Some(op) = coord
                 .drift
                 .operator_ref()
                 .filter(|_| coord.drift.uses_operator_fast_path())
             {
-                hop.trace_logdet_operator(op)
+                let t = hop.trace_logdet_operator(op);
+                dbg_base_trace = t;
+                t
             } else {
                 let h_i = coord.drift.materialize();
-                hop.trace_logdet_h_k(&h_i, None)
+                let t = hop.trace_logdet_h_k(&h_i, None);
+                dbg_base_trace = t;
+                t
             }
         };
 
@@ -3436,6 +3504,20 @@ pub fn reml_laml_evaluate(
             incl_logdet_h,
             incl_logdet_s,
         );
+
+        if let Ok(tag) = std::env::var("GAM_DEBUG_VTAU") {
+            eprintln!(
+                "[V_tau tag={} ext_idx={}] a={:.12e} ld_s={:.12e} base_trace={:.12e} corr_trace={:.12e} total_trace={:.12e} grad={:.12e}",
+                tag,
+                ext_idx,
+                coord.a,
+                coord.ld_s,
+                dbg_base_trace,
+                dbg_corr_trace,
+                trace_logdet_i,
+                grad[grad_idx],
+            );
+        }
     }
 
     // Add correction gradients (ρ-only).
