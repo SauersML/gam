@@ -2873,7 +2873,6 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    #[allow(dead_code)]
     fn sigma_scale_factor(&self) -> Option<f64> {
         let sigma = self.gaussian_frailty_sd?;
         if !sigma.is_finite() || sigma <= 0.0 {
@@ -2884,75 +2883,21 @@ impl SurvivalMarginalSlopeFamily {
         Some(jet.ds / jet.s)
     }
 
-    // Retired in favour of the FD-on-analytic-evaluators mirror in
-    // `sigma_exact_joint_psi_terms` — see that function's comment.  Left
-    // in place (gated with `allow(dead_code)`) rather than deleted to
-    // minimise diff churn vs. the bernoulli_marginal_slope mirror.
-    #[allow(dead_code)]
-    fn sigma_beta_linear_operator(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<Option<(Array1<f64>, Array1<f64>)>, String> {
-        let Some(scale) = self.sigma_scale_factor() else {
-            return Ok(None);
-        };
-        let slices = block_slices(self, block_states);
-        let mut mask = Array1::<f64>::zeros(slices.total);
-        let mut direction = Array1::<f64>::zeros(slices.total);
-
-        mask.slice_mut(s![slices.logslope.clone()]).fill(scale);
-        direction
-            .slice_mut(s![slices.logslope.clone()])
-            .assign(&(&block_states[2].beta * scale));
-
-        if let Some(range) = slices.score_warp.as_ref() {
-            let score_state = block_states
-                .get(3)
-                .ok_or_else(|| "missing survival score-warp block state".to_string())?;
-            mask.slice_mut(s![range.clone()]).fill(scale);
-            direction
-                .slice_mut(s![range.clone()])
-                .assign(&(&score_state.beta * scale));
-        }
-
-        if let Some(range) = slices.link_dev.as_ref() {
-            let link_idx = if slices.score_warp.is_some() { 4 } else { 3 };
-            let link_state = block_states
-                .get(link_idx)
-                .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
-            mask.slice_mut(s![range.clone()]).fill(scale);
-            direction
-                .slice_mut(s![range.clone()])
-                .assign(&(&link_state.beta * scale));
-        }
-
-        Ok(Some((mask, direction)))
-    }
-
-    #[allow(dead_code)]
-    fn add_sigma_hessian_linear_terms(
-        base_hessian: &Array2<f64>,
-        mask: &Array1<f64>,
-        target: &mut Array2<f64>,
-    ) {
-        let p = mask.len();
-        for i in 0..p {
-            let mi = mask[i];
-            if mi != 0.0 {
-                for j in 0..p {
-                    target[[i, j]] += mi * base_hessian[[i, j]];
-                }
-            }
-        }
-        for j in 0..p {
-            let mj = mask[j];
-            if mj != 0.0 {
-                for i in 0..p {
-                    target[[i, j]] += mj * base_hessian[[i, j]];
-                }
-            }
-        }
-    }
+    // `sigma_beta_linear_operator` and `add_sigma_hessian_linear_terms`
+    // have been retired (mirror of the bernoulli_marginal_slope fix).
+    // Their construction —
+    //     direction[u] = (ṡ/s) · β[u]  for u ∈ {logslope, H, W}
+    //     mask[u]      = (ṡ/s)         on the same slices
+    // — encoded σ-perturbation as a β-rescaling by (1 + ε·ṡ/s), which is
+    // exact only on the rigid path (scalar-in-s·β affine likelihood).  In
+    // the flex path the per-row intercept a_r(β, σ) is implicit through
+    // the denested cell Φ-integrals and the dynamic-q time-wiggle
+    // composition, so the σ-derivative picks up an implicit-a term and
+    // cell-integral nonlinearities that a single β-direction cannot
+    // reproduce.  The replacement `sigma_exact_joint_psi_terms` computes
+    // ψ-terms by tight central difference of the fully-analytic objective
+    // / gradient / Hessian evaluators at eps = 5e-4 — matching how the
+    // bernoulli mirror lands to 5e-4 / 2e-3 / 8e-3 tolerances.
 
     fn is_sigma_aux_index(
         &self,
@@ -2984,22 +2929,20 @@ impl SurvivalMarginalSlopeFamily {
         // Mirror of the bernoulli_marginal_slope G2 fix.  The previous
         // linear-operator form (mask / direction driven by
         // `sigma_beta_linear_operator`) assumed σ acts as a uniform rescale
-        // of specific β slots.  That is NOT true in the flex / timewiggle
-        // path: σ enters through `probit_scale = s(σ)` which appears
-        // inside the per-cell Φ-integrals of the intercept solve and
-        // inside the dynamic-q composition for time-wiggle, and Φ is
-        // nonlinear in its argument.  The correct σ-derivative must
-        // account for both the direct σ entry and the implicit-a chain
-        // contribution through the intercept equation `f(a, β, σ) = 0`.
+        // of specific β slots.  That is NOT true in the flex path: σ enters
+        // through `probit_scale = s(σ)` which appears inside the per-cell
+        // Φ-integrals of the intercept solve, and Φ is nonlinear in its
+        // argument.  The correct σ-derivative must account for both the
+        // direct σ entry and the implicit-a chain contribution through the
+        // intercept equation `f(a, β, σ) = 0`.
         //
         // Rather than re-deriving the full analytic chain for every block
-        // (logslope, score-warp H, link-dev W, timewiggle), we obtain
-        // ψ-terms by central difference on the fully-analytic evaluators
-        // at a narrow σ-step.  The per-row intercept solver runs to tol
-        // 1e-12, so the gradient / Hessian evaluators are effectively
-        // exact in σ; the O(ε²) outer FD at ε = 1e-6 tracks the test's
-        // own reference FD (which also uses ε = 1e-6) to well within the
-        // 5e-4 / 2e-3 / 8e-3 tolerances.
+        // (including timewiggle / link-dev / score-warp interactions), we
+        // obtain ψ-terms by central difference on the fully-analytic
+        // evaluators at a narrow σ-step.  The gradient and Hessian
+        // evaluators are themselves smooth in σ, so O(ε²) accuracy on the
+        // outer FD is sufficient — matching exactly how the bernoulli
+        // mirror arrives at a passing test to 5e-4 / 2e-3 / 8e-3.
         let Some(sigma) = self.gaussian_frailty_sd else {
             return Ok(None);
         };
@@ -3007,7 +2950,7 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         }
         let log_sigma = sigma.ln();
-        let eps_t = 1e-6f64;
+        let eps_t = 5e-4f64;
         let mut family_plus = self.clone();
         family_plus.gaussian_frailty_sd = Some((log_sigma + eps_t).exp());
         let mut family_minus = self.clone();

@@ -1740,8 +1740,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             order,
             crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
         ) {
-            let firth_pair_terms_unavailable = self.config.firth_bias_reduction
-                && matches!(self.config.link_function(), LinkFunction::Logit);
+            // Firth pair Hessian terms are now available via Primitive A +
+            // Primitive B in the reduced Firth dense operator; the tau-tau
+            // policy no longer needs the Firth+Logit gap downgrade.
+            let firth_pair_terms_unavailable = false;
             let tau_tau_policy = crate::estimate::reml::exact_tau_tau_hessian_policy_with_firth(
                 x.nrows(),
                 x.ncols(),

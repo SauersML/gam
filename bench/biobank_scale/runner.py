@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,20 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
+
+
+def _env_int_optional(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+_CMD_TIMEOUT_SEC = _env_int_optional("BENCH_CMD_TIMEOUT_SEC")
 MAX_SURVIVAL_GRID_POINTS = 256
 SURVIVAL_ENTRY_COLUMN = "__entry"
 SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale"}
@@ -586,11 +601,32 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
     t_out.start()
     t_err.start()
     t_hb.start()
-    rc = proc.wait()
+    timed_out = False
+    try:
+        if _CMD_TIMEOUT_SEC is not None:
+            rc = proc.wait(timeout=float(_CMD_TIMEOUT_SEC))
+        else:
+            rc = proc.wait()
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.terminate()
+            proc.wait(timeout=10.0)
+        except Exception:
+            proc.kill()
+            proc.wait()
+        rc = 124
     stop_event.set()
     t_out.join()
     t_err.join()
     t_hb.join(timeout=1.0)
+    if timed_out:
+        msg = (
+            f"[HEARTBEAT] command-timeout rc=124 timeout_sec={_CMD_TIMEOUT_SEC} "
+            f"pid={proc.pid} cmd='{preview}'"
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise TimeoutError(msg)
     return rc, "".join(out_buf), "".join(err_buf)
 
 
@@ -599,6 +635,12 @@ def tool_exists(name: str) -> bool:
 
 
 def load_or_build_rust_binary() -> Path:
+    override = os.environ.get("GAM_RUST_BINARY")
+    if override:
+        override_path = Path(override)
+        if override_path.exists():
+            return override_path
+        raise RuntimeError(f"GAM_RUST_BINARY points to missing file: {override_path}")
     prebuilt = ROOT / "target" / "release" / "gam"
     if prebuilt.exists():
         return prebuilt

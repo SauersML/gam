@@ -7917,93 +7917,90 @@ fn normalize_outer_eval_error_detail(error: &str) -> &str {
         .unwrap_or(error)
 }
 
-/// Evaluate the joint outer hyper surface for the *currently realized* custom-family state.
-///
-/// The caller has already applied the current spatial coordinates `psi` when
-/// constructing:
-///
-/// - `family`
-/// - `specs`
-/// - `derivative_blocks`
-///
-/// so the explicit input here is still only the smoothing vector `rho_current`.
-/// Mathematically, however, the surface being differentiated is the full joint
-/// profiled/Laplace objective in
-///
-///   theta = [rho, psi].
-///
-/// The exact outer calculus is unified across all hypercoordinates:
-///
-///   J(theta)
-///   = V(beta^(theta), theta)
-///     + 0.5 log|H(beta^(theta), theta)|
-///     - 0.5 log|S(theta)|_+,
-///
-/// with stationarity and joint curvature
-///
-///   F(beta, theta) := V_beta(beta, theta) = 0,
-///   H(beta, theta) := V_beta_beta(beta, theta).
-///
-/// For each theta_i we need the fixed-beta objects
-///
-///   V_i, g_i := F_i, H_i,
-///
-/// and for each pair (i, j)
-///
-///   V_ij, g_ij, H_ij,
-///
-/// together with the beta-curvature contractions
-///
-///   D_beta H[u], D_beta^2 H[u, v], T_i[u] := D_beta H_i[u].
-///
-/// These determine the exact joint mode responses
-///
-///   beta_i  = -H^{-1} g_i,
-///   beta_ij = -H^{-1}(g_ij + H_i beta_j + H_j beta_i + D_beta H[beta_i] beta_j),
-///
-/// and the total Hessian drifts
-///
-///   dot H_i
-///   = H_i + D_beta H[beta_i],
-///
-///   ddot H_ij
-///   = H_ij
-///     + T_i[beta_j]
-///     + T_j[beta_i]
-///     + D_beta H[beta_ij]
-///     + D_beta^2 H[beta_i, beta_j].
-///
-/// Therefore the exact joint outer derivatives are
-///
-///   J_i
-///   = V_i
-///     + 0.5 tr(H^{-1} dot H_i)
-///     - 0.5 partial_i log|S(theta)|_+,
-///
-///   J_ij
-///   = (V_ij - g_i^T H^{-1} g_j)
-///     + 0.5 [ tr(H^{-1} ddot H_ij)
-///             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
-///     - 0.5 partial^2_{ij} log|S(theta)|_+.
-///
-/// In this unified view rho and psi differ only in the likelihood-side
-/// fixed-beta derivative objects contributed by the family. The generic exact
-/// assembler always adds realized penalty motion through `S(theta)` for every
-/// hypercoordinate:
-///
-/// - `rho` coordinates usually have zero likelihood-side objects and pick up
-///   their fixed-beta derivatives entirely from `S_rho` / `S_{rho rho}`
-/// - `psi` coordinates contribute likelihood-side objects from the family's
-///   joint exact psi hooks and may also pick up extra penalty terms through
-///   `S_psi`, `S_{rho psi}`, and `S_{psi psi}` when realized penalties move
-///   with `psi`
-///
-/// The implementation below follows this unified calculus directly. Once a
-/// family supplies the joint fixed-beta psi objects and the mixed
-/// `D_beta H_psi[u]` contraction, exact joint hyper evaluation treats `rho`
-/// and `psi` identically and returns the full profiled/Laplace Hessian over
-/// `theta = [rho, psi]`.
-
+// ═══════════════════════════════════════════════════════════════════════════
+//  Section: joint outer hyper surface — unified calculus for [rho, psi]
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The callers have already applied the current spatial coordinates `psi` when
+// constructing `family`, `specs`, and `derivative_blocks`, so the explicit
+// input into the section below is still only the smoothing vector
+// `rho_current`. Mathematically, however, the surface being differentiated
+// is the full joint profiled/Laplace objective in
+//
+//     theta = [rho, psi].
+//
+// The exact outer calculus is unified across all hypercoordinates:
+//
+//     J(theta)
+//     = V(beta^(theta), theta)
+//       + 0.5 log|H(beta^(theta), theta)|
+//       - 0.5 log|S(theta)|_+,
+//
+// with stationarity and joint curvature
+//
+//     F(beta, theta) := V_beta(beta, theta) = 0,
+//     H(beta, theta) := V_beta_beta(beta, theta).
+//
+// For each theta_i we need the fixed-beta objects
+//
+//     V_i, g_i := F_i, H_i,
+//
+// and for each pair (i, j)
+//
+//     V_ij, g_ij, H_ij,
+//
+// together with the beta-curvature contractions
+//
+//     D_beta H[u], D_beta^2 H[u, v], T_i[u] := D_beta H_i[u].
+//
+// These determine the exact joint mode responses
+//
+//     beta_i  = -H^{-1} g_i,
+//     beta_ij = -H^{-1}(g_ij + H_i beta_j + H_j beta_i + D_beta H[beta_i] beta_j),
+//
+// and the total Hessian drifts
+//
+//     dot H_i
+//     = H_i + D_beta H[beta_i],
+//
+//     ddot H_ij
+//     = H_ij
+//       + T_i[beta_j]
+//       + T_j[beta_i]
+//       + D_beta H[beta_ij]
+//       + D_beta^2 H[beta_i, beta_j].
+//
+// Therefore the exact joint outer derivatives are
+//
+//     J_i
+//     = V_i
+//       + 0.5 tr(H^{-1} dot H_i)
+//       - 0.5 partial_i log|S(theta)|_+,
+//
+//     J_ij
+//     = (V_ij - g_i^T H^{-1} g_j)
+//       + 0.5 [ tr(H^{-1} ddot H_ij)
+//               - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
+//       - 0.5 partial^2_{ij} log|S(theta)|_+.
+//
+// In this unified view rho and psi differ only in the likelihood-side
+// fixed-beta derivative objects contributed by the family. The generic exact
+// assembler always adds realized penalty motion through `S(theta)` for every
+// hypercoordinate:
+//
+// - `rho` coordinates usually have zero likelihood-side objects and pick up
+//   their fixed-beta derivatives entirely from `S_rho` / `S_{rho rho}`
+// - `psi` coordinates contribute likelihood-side objects from the family's
+//   joint exact psi hooks and may also pick up extra penalty terms through
+//   `S_psi`, `S_{rho psi}`, and `S_{psi psi}` when realized penalties move
+//   with `psi`
+//
+// The implementation below follows this unified calculus directly. Once a
+// family supplies the joint fixed-beta psi objects and the mixed
+// `D_beta H_psi[u]` contraction, exact joint hyper evaluation treats `rho`
+// and `psi` identically and returns the full profiled/Laplace Hessian over
+// `theta = [rho, psi]`.
+//
 // ═══════════════════════════════════════════════════════════════════════════
 //  Unified HyperCoord builders for ψ coordinates
 // ═══════════════════════════════════════════════════════════════════════════

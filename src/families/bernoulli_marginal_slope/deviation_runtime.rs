@@ -182,7 +182,14 @@ impl DeviationRuntime {
                 }
                 continue;
             }
-            let span_idx = self.span_index_for(value)?;
+            let mut span_idx = self.span_index_for(value)?;
+            // Bias to the LEFT-hand span at internal breakpoints so the
+            // design / first / second-derivative outputs match
+            // local_cubic_on_span(k) evaluated at its right endpoint; the
+            // piecewise basis is C¹ but not C² across interior breaks.
+            if span_idx > 0 && value == self.endpoint_points[span_idx] {
+                span_idx -= 1;
+            }
             let left = self.endpoint_points[span_idx];
             let t = value - left;
             for basis_idx in 0..self.basis_dim {
