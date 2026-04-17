@@ -234,6 +234,63 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
     }
 }
 
+/// Augments a pair `HyperOperator` with the fixed-β Firth (Jeffreys) pair
+/// Hessian-drift action `Hφ_{τ_iτ_j}|β · v` via Primitive A.
+///
+/// Additive on top of the base `TauTauPairHyperOperator`.  Active only for
+/// Firth + Logit when both τ_i, τ_j designs are dense; caller supplies the
+/// dense X_{τ_i}, X_{τ_j}, optional X_{τ_iτ_j}, the prepared pair kernel,
+/// and an `Arc` to the Firth operator.  The sign convention mirrors the
+/// single-τ wiring at `build_tau_hyper_coords` (B_j += −Hφ_τ_j|β for the
+/// diagonal; here we apply the same sign to the pair drift).
+struct FirthAugmentedPairHyperOperator {
+    base: Box<dyn super::unified::HyperOperator>,
+    firth_op: std::sync::Arc<super::FirthDenseOperator>,
+    pair_kernel: super::FirthTauTauPartialKernel,
+    x_tau_i_dense: Array2<f64>,
+    x_tau_j_dense: Array2<f64>,
+    x_tau_tau_dense: Option<Array2<f64>>,
+    p: usize,
+}
+
+impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+        let base = self.base.mul_vec(v);
+        //  Primitive A returns a p×m matrix; wrap v as a p×1 rhs, then read
+        //  off its single column.
+        let rhs = v.view().insert_axis(Axis(1)).to_owned();
+        let firth_out = self.firth_op.hphi_tau_tau_partial_apply(
+            &self.x_tau_i_dense,
+            &self.x_tau_j_dense,
+            &self.pair_kernel,
+            &rhs,
+        );
+        //  Sign convention: single-τ wiring subtracts Hφ_τ_j|β from B_j
+        //  (see `build_tau_hyper_coords`: `b_j -= &hphi_tau_partial`).
+        //  The pair operator represents the second drift ∂²H/∂τ_i∂τ_j, with
+        //  the same sign inherited from differentiating `B_j = … − Hφ_τ_j|β`
+        //  along τ_i.  So we SUBTRACT Primitive A here as well.
+        base - firth_out.column(0).to_owned()
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.p, self.p));
+        let mut basis = Array1::<f64>::zeros(self.p);
+        for j in 0..self.p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        self.base.is_implicit()
+    }
+}
+
 impl<'a> RemlState<'a> {
     fn get_pairwisesecond_penalty_components(
         hyper_dirs: &[DirectionalHyperParam],
