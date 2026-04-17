@@ -6236,6 +6236,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
             )?;
+            if std::env::var("GAM_DBG_OUTER").is_ok() && (cycle < 3 || cycle >= inner_max_cycles - 3) {
+                eprintln!(
+                    "[DBG-INNER] cycle={} residual={:.6e} step_inf={:.6e} obj={:.12e}",
+                    cycle, residual, step_inf, lastobjective
+                );
+            }
             if residual <= inner_tol && step_inf <= inner_tol {
                 converged = true;
                 break;
@@ -6529,12 +6535,173 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             true
         };
+        if std::env::var("GAM_DBG_OUTER").is_ok()
+            && (cycle < 3 || cycle >= inner_max_cycles.saturating_sub(3))
+        {
+            let joint_res = if has_joint_exacthessian && specs.len() >= 2 {
+                exact_newton_joint_stationarity_inf_norm(
+                    &cached_eval,
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                )?
+            } else {
+                None
+            };
+            eprintln!(
+                "[DBG-BLOCK] cycle={} max_beta_step={:.6e} obj_change={:.6e} obj={:.12e} joint_res={:?} joint_ok={}",
+                cycle, max_beta_step, objective_change, lastobjective, joint_res, exact_joint_stationarity_ok
+            );
+        }
         if max_beta_step <= inner_tol
             && objective_change <= objective_tol
             && exact_joint_stationarity_ok
         {
             converged = true;
             break;
+        }
+    }
+
+    // ── Polishing joint Newton step ──
+    //
+    // For block-coupled multi-block families (e.g. GAMLSS wiggle), Gauss-Seidel
+    // blockwise iteration can reach step_inf < inner_tol while the joint KKT
+    // residual (||Sβ − grad_ℓ||_∞) remains at ~10× inner_tol. This is because
+    // each block is solved conditionally on other blocks' current values —
+    // block-conditional stationarity does not imply joint stationarity when
+    // the likelihood couples blocks off-diagonally.
+    //
+    // Once blockwise has placed β near the true joint optimum, a single (or
+    // a few) damped joint Newton steps can tighten the joint residual to the
+    // floor set by β magnitudes. This polishing phase is essential for the
+    // outer REML gradient formula (which assumes exact β̂ stationarity); a
+    // non-converged β̂ produces large envelope-theorem violations that show
+    // up as FD-vs-analytic gradient mismatches.
+    if use_joint_newton && !converged {
+        let ranges_joint: Vec<(usize, usize)> = {
+            let mut offset = 0;
+            specs
+                .iter()
+                .map(|s| {
+                    let start = offset;
+                    offset += s.design.ncols();
+                    (start, offset)
+                })
+                .collect()
+        };
+        let total_p_joint: usize = ranges_joint.last().map_or(0, |r| r.1);
+        let joint_mode_diagonal_ridge =
+            if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
+                ridge
+            } else {
+                0.0
+            };
+        let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+
+        // Allow up to a few polishing steps. The blockwise endpoint is close
+        // to optimum, so step sizes should be small and line search should
+        // accept full steps quickly.
+        const POLISH_MAX_ITER: usize = 16;
+        for _ in 0..POLISH_MAX_ITER {
+            // Re-evaluate at current β to get the joint gradient and Hessian.
+            refresh_all_block_etas(family, specs, &mut states)?;
+            let eval_joint = match family.exact_newton_joint_gradient_evaluation(&states, specs)? {
+                Some(ev) => ev,
+                None => break,
+            };
+            let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
+            let Some(h_joint) = h_joint_opt else { break };
+            let mut h_dense = match symmetrized_square_matrix(
+                h_joint,
+                total_p_joint,
+                "joint polish Hessian shape mismatch",
+            ) {
+                Ok(matrix) => matrix,
+                Err(_) => break,
+            };
+            add_joint_penalty_to_matrix(
+                &mut h_dense,
+                &ranges_joint,
+                &s_lambdas,
+                trace_diagonal_ridge,
+            );
+
+            let mut beta_joint = Array1::<f64>::zeros(total_p_joint);
+            for b in 0..specs.len() {
+                let (start, end) = ranges_joint[b];
+                beta_joint
+                    .slice_mut(ndarray::s![start..end])
+                    .assign(&states[b].beta);
+            }
+            let penalty_beta = apply_joint_block_penalty(
+                &ranges_joint,
+                &s_lambdas,
+                &beta_joint,
+                joint_mode_diagonal_ridge,
+            );
+            let rhs = &eval_joint.gradient - &penalty_beta;
+            let res_inf = rhs.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            if res_inf <= inner_tol {
+                converged = true;
+                break;
+            }
+
+            let solver = crate::linalg::utils::StableSolver::new("joint polish");
+            let Some(delta) = solver.solvevectorwithridge_retries(
+                &h_dense,
+                &rhs,
+                JOINT_TRACE_STABILITY_RIDGE,
+            ) else {
+                break;
+            };
+            if !delta.iter().all(|v| v.is_finite()) {
+                break;
+            }
+
+            // Damped line search with projection.
+            let old_states: Vec<ParameterBlockState> = states.clone();
+            let old_obj = -cached_eval.log_likelihood + current_penalty;
+            let mut accepted_polish = false;
+            for bt in 0..10 {
+                let alpha = 0.5f64.powi(bt);
+                for b in 0..specs.len() {
+                    let (start, end) = ranges_joint[b];
+                    let mut trial_beta = old_states[b].beta.clone();
+                    trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
+                    let projected =
+                        family.post_update_block_beta(&old_states, b, &specs[b], trial_beta)?;
+                    states[b].beta.assign(&projected);
+                }
+                refresh_all_block_etas(family, specs, &mut states)?;
+                let trial_ll = match family.log_likelihood_only(&states) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        for (b, s) in old_states.iter().enumerate() {
+                            states[b] = s.clone();
+                        }
+                        refresh_all_block_etas(family, specs, &mut states)?;
+                        continue;
+                    }
+                };
+                let trial_penalty =
+                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                let trial_obj = -trial_ll + trial_penalty;
+                if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
+                    current_penalty = trial_penalty;
+                    cached_eval = family.evaluate(&states)?;
+                    accepted_polish = true;
+                    break;
+                }
+            }
+            if !accepted_polish {
+                // Restore and stop polishing.
+                for (b, s) in old_states.iter().enumerate() {
+                    states[b] = s.clone();
+                }
+                refresh_all_block_etas(family, specs, &mut states)?;
+                break;
+            }
         }
     }
 
@@ -8669,6 +8836,27 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+
+    // === TEMP INSTRUMENT ===
+    if std::env::var("GAM_DBG_OUTER").is_ok() {
+        let beta_all: Vec<f64> = inner
+            .block_states
+            .iter()
+            .flat_map(|s| s.beta.iter().copied())
+            .collect();
+        eprintln!(
+            "[DBG] rho={:?} converged={} cycles={} inner_max_cycles={} inner_tol={} ll={:.12e} penalty={:.12e} beta={:?}",
+            rho_current.as_slice().unwrap(),
+            inner.converged,
+            inner.cycles,
+            options.inner_max_cycles,
+            options.inner_tol,
+            inner.log_likelihood,
+            inner.penalty_value,
+            beta_all,
+        );
+    }
+    // === END TEMP ===
 
     // ── Try to obtain a joint Hessian and route through the unified evaluator ──
     //
