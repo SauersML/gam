@@ -3047,35 +3047,79 @@ pub(crate) struct FirthTauExactKernel {
     tau_kernel: Option<FirthTauPartialKernel>,
 }
 
-/// Pair-level τ_i × τ_j reduced kernel carrying every reusable intermediate
-/// needed by `hphi_tau_tau_partial_apply` (Primitive A).  All objects are
-/// evaluated at fixed β.
+/// Pair-level (τ_i × τ_j) exact Firth bundle at fixed β.
 ///
-/// Concretely, we pack the two single-τ kernels (i and j) plus:
-/// - Ï_{r,ij} = ∂²_{τ_iτ_j} I_r          (reduced r × r Fisher 2nd deriv)
-/// - K̈_{r,ij} = ∂²_{τ_iτ_j} K_r          (= −K_r Ï_{r,ij} K_r
-///                                         + K_r İ_i K_r İ_j K_r
-///                                         + K_r İ_j K_r İ_i K_r)
-/// - ḧ_{ij}   = ∂²_{τ_iτ_j} diag(M)       (n-vector)
-/// - η̈_{ij}  = X_{τ_iτ_j} β               (n-vector; None ↔ τ-linear design)
-/// - x_tau_tau_reduced: optional reduced-basis X_{τ_iτ_j} design (None when
-///                     τ-linear in design).
-#[allow(dead_code)]
+/// Mirrors `FirthTauExactKernel` but for the 2nd-order cross
+/// derivatives:
+///   Phi_{τ_i τ_j}|β  (scalar, `phi_tau_tau_partial`)
+///   (gphi)_{τ_i τ_j}|β (p-vector, `gphi_tau_tau`)
+///
+/// Carries an optional `tau_tau_kernel` so pair callbacks can chain
+/// into Primitive A (`hphi_tau_tau_partial_apply`) for the operator-
+/// valued Hessian 2nd drift without recomputing shared reduced Grams.
 #[derive(Clone)]
+pub(crate) struct FirthTauTauExactKernel {
+    pub(super) phi_tau_tau_partial: f64,
+    pub(super) gphi_tau_tau: Array1<f64>,
+    pub(super) tau_tau_kernel: Option<FirthTauTauPartialKernel>,
+}
+
+/// Prepared state for `∂²H_φ/∂τ_i ∂τ_j |_β` (Primitive A).
+///
+/// Carries both τ-direction reduced designs, their η̇ vectors, and the
+/// reduced-coordinate drifts (İ, K̇, ḣ) for i and j so the apply step can
+/// form M̈_{ij}, K̈_{ij}, ḧ_{ij}, Γ̈_{ij}, and B̈_{ij} matrix-free.  Fields
+/// are filled in by 13b; kept with a neutral internal shape so downstream
+/// pair callbacks can hold the kernel across the pair dispatch.
+///
+/// Wired in by the Primitive A FD test and Task #20 pair-callback
+/// integration.
+#[derive(Clone, Default)]
 pub(crate) struct FirthTauTauPartialKernel {
-    pub(super) tau_i: FirthTauPartialKernel,
-    pub(super) tau_j: FirthTauPartialKernel,
-    pub(super) deta_i: Array1<f64>,
-    pub(super) deta_j: Array1<f64>,
-    pub(super) dot_i_i_reduced: Array2<f64>,
-    pub(super) dot_i_j_reduced: Array2<f64>,
-    pub(super) ddot_i_ij_reduced: Array2<f64>,
-    pub(super) ddot_k_ij_reduced: Array2<f64>,
-    pub(super) dot_h_i: Array1<f64>,
-    pub(super) dot_h_j: Array1<f64>,
-    pub(super) ddot_h_ij: Array1<f64>,
+    pub(super) x_tau_i_reduced: Array2<f64>,
+    pub(super) x_tau_j_reduced: Array2<f64>,
+    pub(super) deta_i_partial: Array1<f64>,
+    pub(super) deta_j_partial: Array1<f64>,
+    pub(super) dot_h_i_partial: Array1<f64>,
+    pub(super) dot_h_j_partial: Array1<f64>,
+    pub(super) dot_k_i_reduced: Array2<f64>,
+    pub(super) dot_k_j_reduced: Array2<f64>,
+    pub(super) dot_i_i_partial: Array2<f64>,
+    pub(super) dot_i_j_partial: Array2<f64>,
     pub(super) x_tau_tau_reduced: Option<Array2<f64>>,
-    pub(super) deta_ij: Option<Array1<f64>>,
+    pub(super) deta_ij_partial: Option<Array1<f64>>,
+}
+
+/// Prepared state for `D_β((H_φ)_τ|_β)[v]` (Primitive B).
+///
+/// Carries the τ-kernel pieces (x_tau_reduced, İ, K̇, ḣ, w-chain), the
+/// β-direction reduced quantities (δη_v, I'_v, A_v, dh_v, w-chain
+/// derivatives), and the mixed β-τ pieces (D_β(İ_τ)[v], D_β(K̇_τ)[v],
+/// D_β(ḣ_τ)[v], δη_{τ,v}) so the apply step collapses to the 9-term
+/// β-τ expansion without recomputing shared reduced Grams.  Fields are
+/// filled in by 13c.
+///
+/// Allow(dead_code): scaffold until 13c populates the fields inside
+/// `d_beta_hphi_tau_partial_prepare_from_partials` and 13d wires the
+/// kernel into the `fixed_drift_deriv` closure in
+/// `build_tau_hyper_coords`.
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+pub(crate) struct FirthTauBetaPartialKernel {
+    pub(super) x_tau_reduced: Array2<f64>,
+    pub(super) deta_partial: Array1<f64>,
+    pub(super) dot_h_partial: Array1<f64>,
+    pub(super) dot_i_partial: Array2<f64>,
+    pub(super) dot_k_reduced: Array2<f64>,
+    pub(super) deta_v: Array1<f64>,
+    pub(super) deta_tau_v: Array1<f64>,
+    pub(super) g_v_reduced: Array2<f64>,
+    pub(super) a_v_reduced: Array2<f64>,
+    pub(super) dh_v: Array1<f64>,
+    pub(super) b_vvec: Array1<f64>,
+    pub(super) d_beta_dot_i: Array2<f64>,
+    pub(super) d_beta_dot_k: Array2<f64>,
+    pub(super) d_beta_dot_h: Array1<f64>,
 }
 
 /// Holds the state for the outer REML optimization and supplies cost and

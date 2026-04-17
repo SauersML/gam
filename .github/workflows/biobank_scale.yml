@@ -90,12 +90,45 @@ jobs:
           path: bench/biobank_scale/prepared
           if-no-files-found: error
 
-  benchmark:
+  bootstrap-runtime:
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build gam binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --bin gam
+          ls -l target/release/gam
+
+      - name: Upload gam binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: biobank-scale-gam-binary
+          path: target/release/gam
+          if-no-files-found: error
+
+  benchmark:
+    needs:
+      - prepare
+      - bootstrap-runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      BENCH_CMD_TIMEOUT_SEC: "2400"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -109,12 +142,6 @@ jobs:
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: "4.4.3"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
 
       - name: Install Python packages
         shell: bash
@@ -135,8 +162,25 @@ jobs:
           name: biobank-scale-prepared
           path: bench/biobank_scale/prepared
 
+      - name: Download prebuilt gam binary
+        uses: actions/download-artifact@v4
+        with:
+          name: biobank-scale-gam-binary
+          path: bench/biobank_scale/bin
+
+      - name: Stage gam binary into target/release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          cp bench/biobank_scale/bin/gam target/release/gam
+          chmod +x target/release/gam
+          ls -l target/release/gam
+
       - name: Run benchmark method
         shell: bash
+        env:
+          GAM_RUST_BINARY: ${{ github.workspace }}/target/release/gam
         run: |
           set -euo pipefail
           mkdir -p bench/biobank_scale/results bench/biobank_scale/runs/${{ matrix.name }}

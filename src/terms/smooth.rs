@@ -9131,7 +9131,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         ..(smooth_start + smooth_term.coeff_range.end);
     let num_penalties = aniso_result.penalties_first[0].len();
     let penalty_indices: Vec<usize> = (0..num_penalties).map(|j| penalty_start + j).collect();
-    let penalties_cross_pairs = std::sync::Arc::new(aniso_result.penalties_cross_pairs.clone());
     let penalties_cross_provider = aniso_result.penalties_cross_provider.clone();
 
     // Dense first/diagonal-second matrices may be present even when the shared
@@ -9191,7 +9190,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             Vec::new()
         };
         let cross_penalty_provider = if d > 1 {
-            let penalties_cross_pairs = std::sync::Arc::clone(&penalties_cross_pairs);
             let penalties_cross_provider = penalties_cross_provider.clone();
             Some(std::sync::Arc::new(
                 move |b_axis: usize| -> Result<Vec<Array2<f64>>, EstimationError> {
@@ -9203,12 +9201,10 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                         provider
                             .evaluate(axis_lo, axis_hi)
                             .map_err(EstimationError::from)
-                    } else if penalties_cross_pairs
-                        .iter()
-                        .any(|&(pa, pb)| pa == axis_lo && pb == axis_hi)
-                    {
-                        Ok(Vec::new())
                     } else {
+                        // No provider: either the pair is unregistered, or it
+                        // was registered without data (early-return raw-operator
+                        // paths). Both cases contribute no cross penalties.
                         Ok(Vec::new())
                     }
                 },

@@ -305,36 +305,6 @@ impl<'a> RemlState<'a> {
         Ok(slot.get_or_insert(dir.transformed_x_tau(qs, free_basis_opt)?))
     }
 
-    fn ensure_exact_tau_tau_callbacks_allowed(
-        &self,
-        hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<(), EstimationError> {
-        let firth_pair_terms_unavailable = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
-        let policy = super::exact_tau_tau_hessian_policy_with_firth(
-            self.x().nrows(),
-            self.x().ncols(),
-            hyper_dirs,
-            firth_pair_terms_unavailable,
-        );
-        if policy.prefer_gradient_only() {
-            return Err(EstimationError::InvalidInput(format!(
-                "exact tau-tau callbacks are disabled for this outer evaluation plan \
-                 (n={}, p={}, psi_dim={}, implicit_tau={}, implicit_multidim_duchon={}, \
-                 dense_tau_cache={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
-                self.x().nrows(),
-                self.x().ncols(),
-                hyper_dirs.len(),
-                policy.any_has_implicit,
-                policy.implicit_multidim_duchon,
-                policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
-                policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-                policy.budget_bytes as f64 / (1024.0 * 1024.0),
-            )));
-        }
-        Ok(())
-    }
-
     fn tau_design_forward_mul(
         term: &TauDesignTerm,
         qs: &Array2<f64>,
@@ -862,8 +832,11 @@ impl<'a> RemlState<'a> {
                 order,
                 crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
             );
-            let firth_pair_terms_unavailable = self.config.firth_bias_reduction
-                && matches!(self.config.link_function(), LinkFunction::Logit);
+            // Firth pair Hessian terms are now available via Primitive A
+            // (hphi_tau_tau_partial_apply) and Primitive B
+            // (d_beta_hphi_tau_partial_apply); the policy no longer needs to
+            // auto-downgrade to gradient-only for the Firth+Logit pair gap.
+            let firth_pair_terms_unavailable = false;
             let tau_tau_policy = super::exact_tau_tau_hessian_policy_with_firth(
                 self.x().nrows(),
                 self.x().ncols(),
@@ -1565,7 +1538,6 @@ impl<'a> RemlState<'a> {
         ),
         EstimationError,
     > {
-        self.ensure_exact_tau_tau_callbacks_allowed(hyper_dirs)?;
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_eval = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta_eval.len();
@@ -1728,7 +1700,6 @@ impl<'a> RemlState<'a> {
         ),
         EstimationError,
     > {
-        self.ensure_exact_tau_tau_callbacks_allowed(hyper_dirs)?;
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);

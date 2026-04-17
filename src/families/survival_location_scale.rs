@@ -1385,11 +1385,67 @@ impl SurvivalLocationScaleFamily {
                 alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
             }
         }
-        if alpha >= 1.0 {
-            Ok(Some(1.0))
+        // Apply the 0.995 buffer to the structural coefficient lower-bound
+        // throttle before considering the derivative-guard gate.  Lower-bound
+        // throttling is a smooth policy: approach the bound, re-solve on the
+        // active face.  The derivative-guard policy below is different.
+        let coefficient_alpha = if alpha >= 1.0 {
+            1.0
         } else {
-            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+            (0.995 * alpha).clamp(0.0, 1.0)
+        };
+        // Per-row derivative-guard gate: x_time_deriv·beta must stay at or
+        // above derivative_guard along the path.  Derivation of the binary
+        // gate policy versus a throttle:
+        //
+        //   Let g_r(α) = x_time_deriv[r,:]·(beta + α·delta) for row r.
+        //   Feasibility requires g_r(α) ≥ derivative_guard for every row.
+        //   With `drift_r = x_time_deriv[r,:]·delta < 0`, the maximal α that
+        //   keeps g_r at exactly the guard is
+        //       α*_r = (current_r − guard) / (−drift_r)          [slack / |drift|]
+        //   The smallest α*_r across rows is the per-row throttle used for
+        //   structural *coefficient* lower bounds above.
+        //
+        //   For the derivative guard the throttle policy is WRONG.  The
+        //   guard is a structural positivity requirement on the hazard
+        //   derivative, not a soft lower bound on a coefficient.  A throttled
+        //   step ending at g_r = 0.995·(guard+drift·α*) leaves the solver on
+        //   the guard boundary where any rounding error pushes it below, and
+        //   numerical differentiation / Newton steps taken from that state
+        //   become unstable.  The correct semantic is:
+        //       if the FULL step (α = 1) would violate the guard anywhere,
+        //       reject the step (α = 0) and let the outer solver pick a
+        //       non-violating direction.  Otherwise the guard is inactive.
+        //
+        //   This is exactly the "binary gate" interpretation the
+        //   time_block_feasible_step_stays_inside_derivative_guard test
+        //   encodes: beta = [0.1], delta = [-2.0], guard = 1e-8, x_deriv rows
+        //   all = 1.  current = 0.1, drift = -2.0, so α*_r = 0.05 and the
+        //   throttle would return 0.995·0.05 = 0.04975.  The test asserts
+        //   α = 0.0 exactly — gate semantic.
+        //
+        //   Implementation: compute the guard's predicate at α = 1.
+        //   If any row has g_r(1) = current_r + drift_r < guard, return 0.
+        let deriv = self.x_time_deriv.as_ref();
+        if deriv.ncols() == beta.len() {
+            let guard = self.derivative_guard;
+            for row in 0..deriv.nrows() {
+                let row_view = deriv.row(row);
+                let current = row_view.dot(beta);
+                let drift = row_view.dot(delta);
+                let slack = current - guard;
+                if slack < -1e-10 {
+                    return Err(format!(
+                        "survival location-scale current time derivative violates guard at row {row}: slack={slack:.3e}"
+                    ));
+                }
+                // Full-step value of g_r at α = 1; if below the guard, gate closes.
+                if current + drift < guard {
+                    return Ok(Some(0.0));
+                }
+            }
         }
+        Ok(Some(coefficient_alpha))
     }
 
     fn max_feasible_link_wiggle_step(
@@ -6062,32 +6118,42 @@ impl SurvivalLocationScaleFamily {
             }
         };
 
-        // Time-time directional derivative of the joint Hessian.
+        // Time-time directional derivative of the joint Hessian block.
         //
-        // Stored H equals -∂²ℓ/∂β². The time-time base is
+        // The stored joint "Hessian" H equals -∂²ℓ/∂β². The time-time
+        // diagonal base assembly (assemble_joint_hessian_from_quantities)
+        // is
         //
         //   H_tt = X_entry'·diag(-h_time_h0)·X_entry
         //        + X_exit' ·diag(-h_time_h1)·X_exit
-        //        + X_deriv'·diag(+h_time_d )·X_deriv
+        //        + X_deriv'·diag(+h_time_d)·X_deriv
         //
-        //   h_time_h0 = w·r'(u0)        (= ∂²ℓ/∂h0²)
-        //   h_time_h1 = w·event_mix    (= ∂²ℓ/∂h1²)
-        //   h_time_d  = -w·d·d2_log_g  (already sign-flipped)
+        // with h_time_h0 = w·r'(u0)     (= ∂²ℓ/∂h0²),
+        //      h_time_h1 = w·event_mix  (= ∂²ℓ/∂h1²),
+        //      h_time_d  = -w·d·(d2logg) (= -∂²ℓ/∂d_raw²).
         //
-        // Differentiating along Δβ (with Δu0 = Δh0 + Δq_entry,
-        // Δu1 = Δh1 + Δq_exit, g depending on β_t only through d_raw):
+        // Differentiating H_tt along Δβ_t (with Δh0 = X_entry·Δβ_t,
+        // Δh1 = X_exit·Δβ_t, Δd = X_deriv·Δβ_t, and q0/q1 invariant in
+        // a pure time direction) gives
         //
-        //   dH_tt = X_entry'·diag(-d_h_h0·Δu0)·X_entry
-        //         + X_exit' ·diag(-d_h_h1·Δu1)·X_exit
+        //   dH_tt = X_entry'·diag(-w·r''(u0)·Δh0)·X_entry
+        //         + X_exit' ·diag(-w·r'''-mixed·Δh1)·X_exit
+        //         + X_deriv'·diag(+d_h_d·Δd)·X_deriv
+        //         = X_entry'·diag(-d_h_h0·Δh0)·X_entry
+        //         + X_exit' ·diag(-d_h_h1·Δh1)·X_exit
         //         + X_deriv'·diag(+d_h_d ·Δd )·X_deriv
         //
-        // where d_h_h0 = w·r''(u0), d_h_h1 = w·event_mix₃,
-        //       d_h_d  = -w·d·d3_log_g. The negative sign on the entry/exit
-        // contributions comes from differentiating `-h_time_h0` and
-        // `-h_time_h1` in the base assembly; the deriv term already
-        // carries the negation inside `h_time_d` so it flows positive.
-        let dh_h0 = &q.d_h_h0 * &(&delta_h0 + &entry_deltas.delta_q);
-        let dh_h1 = &q.d_h_h1 * &(&delta_h1 + &delta_q_exit);
+        // For non-time directions (Δβ_t = 0) the inner variables Δh0/Δh1/Δd
+        // vanish but u0/u1 still shift through q0/q1. Chain rule:
+        //   Δu0 = Δh0 + Δq_entry   (for pure time direction: Δq_entry = 0)
+        //   Δu1 = Δh1 + Δq_exit
+        // so the general form tracks Δu0 = Δh0 + entry_deltas.delta_q and
+        // Δu1 = Δh1 + delta_q_exit. (No q-dependence on d_raw ⇒ Δd alone
+        // drives the deriv-side weight derivative.)
+        let du0 = &delta_h0 + &entry_deltas.delta_q;
+        let du1 = &delta_h1 + &delta_q_exit;
+        let dh_h0 = &q.d_h_h0 * &du0;
+        let dh_h1 = &q.d_h_h1 * &du1;
         let dh_d = &q.d_h_d * &delta_d;
         let d_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&dh_h0))
             + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&dh_h1))
