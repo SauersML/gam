@@ -576,7 +576,7 @@ impl FirthDenseOperator {
     }
 
     #[inline]
-    fn reduce_explicit_design(&self, x: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn reduce_explicit_design(&self, x: &Array2<f64>) -> Array2<f64> {
         let mut reduced = fast_ab(x, &self.q_basis);
         if let Some(scale) = self.observation_weight_sqrt.as_ref() {
             reduced = RemlState::row_scale(&reduced, scale);
@@ -863,7 +863,7 @@ impl FirthDenseOperator {
         Self::rowwise_dot(&am, b)
     }
 
-    fn dot_i_and_h_from_reduced(
+    pub(crate) fn dot_i_and_h_from_reduced(
         &self,
         x_tau_reduced: &Array2<f64>,
         deta: &Array1<f64>,
@@ -961,7 +961,7 @@ impl FirthDenseOperator {
         }
     }
 
-    fn hphi_tau_partial_prepare_from_partials(
+    pub(crate) fn hphi_tau_partial_prepare_from_partials(
         &self,
         x_tau_reduced: Array2<f64>,
         deta_partial: &Array1<f64>,
@@ -1083,349 +1083,388 @@ impl FirthDenseOperator {
         0.5 * (x_tau.t().dot(&rv) + self.x_dense.t().dot(&rv_tau))
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  PRIMITIVE A — pair τ_i × τ_j Firth drift.
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Pair-term primitives for the Firth outer Hessian (Task #13a / #17)
+    // ═════════════════════════════════════════════════════════════════════════
     //
-    //  Purpose.  Evaluate `Hφ_{τ_iτ_j}|β · V` for a p×m test-vector block V,
-    //  where Hφ = ∇²_β Φ and Φ is the Jeffreys log-determinant
-    //  `0.5 log|I_r|`.  Matrix-free in n.
+    // The REML outer Hessian at a ψ=(ρ,τ) pair needs two Firth contributions
+    // that are NOT covered by the existing single-τ primitives:
     //
-    //  Derivation (chain-rule extension of the single-τ primitive
-    //  `hphi_tau_partial_apply`).  Let, at fixed β and current X:
-    //     η_V   = X · V          (n×m)          η_{V,α} = X_α · V
-    //     η̇_α  = X_α · β                       η̈_{ij} = X_{ij} · β
-    //     w1..w4 = logistic weight η-jets
-    //     h     = diag(X_r K_r X_rᵀ)            ḣ_α = ∂_α h
-    //     qv    = w1 ⊙ η_V                     ẇ1_α = w2 ⊙ η̇_α
-    //     m_qv  = (M ⊙ M) · qv = P̄ · qv       Ṁ_α = 2(M ⊙ M_α)
-    //  and the single-τ Firth-Hessian drift body reads
-    //     Hφ_{τ_j}|β · V = 0.5 [X_{τ_j}ᵀ · r_V + Xᵀ · r_{V,τ_j}]
-    //  with
-    //     r_V       = (w2 ⊙ η_V) ⊙ h − m_qv ⊙ w1
-    //     r_{V,τ_j} = (ẇ2_j ⊙ η_V + w2 ⊙ η_{V,τ_j}) ⊙ h
-    //                + (w2 ⊙ η_V) ⊙ ḣ_j
-    //                − (m_qv ⊙ ẇ1_j + m_qv_{τ_j} ⊙ w1)
+    //   A.  the pure τ×τ second partial of H_φ at fixed β (pair drift inside
+    //       the fixed-β second-derivative trace of B_i,j used by
+    //       build_tau_tau_pair_callback).  This is the Firth analog of the
+    //       penalty-logdet pair term in the outer-derivative cookbook.
     //
-    //  Taking ∂_{τ_i} at fixed β (Schwarz-symmetric by construction in Φ):
-    //     Hφ_{τ_iτ_j}|β · V
-    //       = 0.5 [
-    //             X_{τ_iτ_j}ᵀ · r_V                  (outer A — zero if X_{ij}=None)
-    //           + X_{τ_j}ᵀ · ∂_{τ_i} r_V             (outer B)
-    //           + X_{τ_i}ᵀ · r_{V,τ_j}               (outer C)
-    //           + Xᵀ · ∂_{τ_i} r_{V,τ_j}             (outer D)
-    //         ]
+    //   B.  the β-derivative of (H_φ)_τ|_β in direction v.  This is the
+    //       fixed-drift-derivative M_i[v] = D_β B_i[v] that
+    //       compute_drift_deriv_traces uses through the fixed_drift_deriv
+    //       callback in build_tau_hyper_coords.  It is currently always None
+    //       in the Firth+Logit path, which is what makes the outer Hessian
+    //       approximate for Firth-reweighted models.
     //
-    //  The two inner τ_i-derivatives expand mechanically:
+    // Both primitives operate in the reduced identifiable subspace (X_r, K_r,
+    // S_r, Z=X_r) of the dense Firth operator and are matrix-free in n.  They
+    // do NOT introduce any dense n×n or p×p×p object; every contraction is
+    // routed through reduced-space Hadamard-Gram applies and rowwise
+    // bilinear forms, in the same spirit as hphi_tau_partial_apply and
+    // hphisecond_direction_apply.
     //
-    //  ∂_{τ_i} r_V
-    //    = ((w3 ⊙ η̇_i) ⊙ η_V + w2 ⊙ η_{V,τ_i}) ⊙ h
-    //    + (w2 ⊙ η_V) ⊙ ḣ_i
-    //    − [ (Ṁ_i · qv + P̄ · ∂_i qv) ⊙ w1 + m_qv ⊙ (w2 ⊙ η̇_i) ]
-    //    with ∂_i qv = (w2 ⊙ η̇_i) ⊙ η_V + w1 ⊙ η_{V,τ_i}.
+    // Both are exact in the smooth-regime operating point assumed by this
+    // module: X SPD-full-rank on its identifiable subspace, Q held fixed
+    // within one outer REML step (active-subspace drift enters only between
+    // outer iterates), w_i(η) > 0 strictly positive, and β is at the P-IRLS
+    // solution for the current ψ so β_τ is supplied by the unified evaluator
+    // via the IFT solve.
     //
-    //  ∂_{τ_i} r_{V,τ_j} — a sum of four ∂_i pieces on the four r_{V,τ_j}
-    //  additive terms:
-    //  (1) ∂_i[(ẇ2_j ⊙ η_V) ⊙ h]
-    //      = ((w4·η̇_i·η̇_j + w3·η̈_ij) ⊙ η_V + ẇ2_j ⊙ η_{V,τ_i}) ⊙ h
-    //      + (ẇ2_j ⊙ η_V) ⊙ ḣ_i
-    //  (2) ∂_i[(w2 ⊙ η_{V,τ_j}) ⊙ h]
-    //      = ((w3 ⊙ η̇_i) ⊙ η_{V,τ_j} + w2 ⊙ η_{V,τ_iτ_j}) ⊙ h
-    //      + (w2 ⊙ η_{V,τ_j}) ⊙ ḣ_i
-    //  (3) ∂_i[(w2 ⊙ η_V) ⊙ ḣ_j]
-    //      = ((w3 ⊙ η̇_i) ⊙ η_V + w2 ⊙ η_{V,τ_i}) ⊙ ḣ_j
-    //      + (w2 ⊙ η_V) ⊙ ḧ_{ij}
-    //  (4) ∂_i[m_qv ⊙ ẇ1_j + m_qv_{τ_j} ⊙ w1]
-    //      = (Ṁ_i · qv + P̄ · ∂_i qv) ⊙ ẇ1_j
-    //      + m_qv ⊙ (w3·η̇_i·η̇_j + w2·η̈_ij)
-    //      + ( M̈_{ij}·qv + Ṁ_j·∂_i qv + Ṁ_i·qv_{τ_j} + P̄·∂_i qv_{τ_j} ) ⊙ w1
-    //      + m_qv_{τ_j} ⊙ (w2 ⊙ η̇_i)
-    //  with ∂_i qv_{τ_j}
-    //      = (w3·η̇_i·η̇_j + w2·η̈_ij) ⊙ η_V
-    //      + ẇ1_j ⊙ η_{V,τ_i} + ẇ1_i ⊙ η_{V,τ_j}
-    //      + w1 ⊙ η_{V,τ_iτ_j}
+    // Symbol conventions shared with the existing operator code:
+    //   X_r   := X Q            (reduced identifiable design)
+    //   W     := diag(w(η))     (Fisher weights), w', w'', w''', w''''
+    //   I_r   := X_rᵀ W X_r,  K_r := I_r^{-1},  S_r := X_rᵀ X_r
+    //   M     := X_r K_r X_rᵀ,  P := M ⊙ M,  B := diag(w') X
+    //   h     := diag(M)
+    //   X_i   := ∂X/∂τ_i,  X_{r,i} := X_i Q,  η̇_i := X_i β,  etc.
+    //   δη_v  := X v           (β-direction v),  δη_{τ,v} := X_τ v
     //
-    //  The M̈_{ij} apply reuses the same Hadamard-Gram machinery as
-    //  apply_mtau_to_matrix, specialized to the second-derivative pattern:
-    //     M̈_{ij} · v = 2 (M_τ_i ⊙ M_τ_j) · v  +  2 (M ⊙ M_{τ_iτ_j}) · v
-    //  with
-    //     M_α          = X_{r,α} K X_rᵀ + X_r K X_{r,α}ᵀ + X_r K̇_α X_rᵀ,
-    //     M_{τ_iτ_j}   = X_{r,ij} K X_rᵀ + X_r K X_{r,ij}ᵀ + X_{r,i} K X_{r,j}ᵀ
-    //                   + X_{r,j} K X_{r,i}ᵀ + X_{r,i} K̇_j X_rᵀ
-    //                   + X_r K̇_j X_{r,i}ᵀ + X_{r,j} K̇_i X_rᵀ
-    //                   + X_r K̇_i X_{r,j}ᵀ + X_r K̈_{ij} X_rᵀ.
-    //  ═══════════════════════════════════════════════════════════════════
+    // H_φ structural form (reduced form of ∇²_β Φ_F):
+    //   H_φ  =  ½ [ Xᵀ diag(w'' ⊙ h) X  −  Bᵀ P B ]
+    // where the first term arises from differentiating the Jeffreys gradient
+    // ½ Xᵀ (w' ⊙ h) once more in β, and the second collects the IFT-mediated
+    // β-derivative of h = diag(X_r K_r X_rᵀ) through K_r = I_r^{-1}.  This is
+    // the same form the existing hphi_direction code implements in directional
+    // form (cf. firth.rs hphi_direction / hphisecond_direction_apply, the
+    // 9-term D²J₂ expansion with J₂ = BᵀPB).
+    //
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Primitive A — ∂²H_φ/∂τ_i ∂τ_j |_β
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // WHAT IT COMPUTES
+    //   Given a pair of τ-drift designs (X_τ_i, X_τ_j) and optional second
+    //   design derivative X_{τ_i τ_j}, evaluates
+    //
+    //     ∂²H_φ/∂τ_i ∂τ_j |_β  =  ½ [ ∂²(Xᵀ Γ X)/∂τ_i ∂τ_j
+    //                                − ∂²(Bᵀ P B)/∂τ_i ∂τ_j ],
+    //   with Γ := diag(w'' ⊙ h).  Acts on a p×m rhs and returns a p×m block
+    //   (exact same contract as hphi_tau_partial_apply, but for the *second*
+    //   mixed τ-derivative at fixed β).
+    //
+    // WHY (REML callsite)
+    //   In the outer Hessian entry Ḧ_{i,j} for τ×τ pair (i,j), the fixed-β
+    //   second drift of B_i is exactly this primitive (with the Firth sign:
+    //   B_i = −(H_φ)_τ_i|_β + other likelihood pieces, so ∂²B_i/∂τ_j|_β
+    //   contributes −∂²H_φ/∂τ_i∂τ_j|_β to the outer Hessian trace).  The
+    //   existing Firth pair callback at build_tau_tau_pair_callback currently
+    //   carries zero for this Firth contribution; wiring this primitive into
+    //   the TauTauPairHyperOperator is the remaining step to make the τ×τ
+    //   outer Hessian exact in the Firth-reweighted Logit path.
+    //
+    // DERIVATION (full chain-rule expansion, at fixed β)
+    //
+    //   Building blocks at fixed β (single-τ):
+    //     İ_i      := ∂I_r/∂τ_i |_β
+    //                = X_{r,i}ᵀ W X_r + X_rᵀ W X_{r,i} + X_rᵀ Ẇ_i X_r,
+    //       Ẇ_i    := diag(w' ⊙ η̇_i),   η̇_i := X_i β.
+    //     K̇_i      := ∂K_r/∂τ_i = −K_r İ_i K_r.
+    //     ḣ_i      := ∂h/∂τ_i |_β
+    //                = 2·diag(X_{r,i} K_r X_rᵀ) + diag(X_r K̇_i X_rᵀ).
+    //     Ṁ_i      := ∂M/∂τ_i |_β
+    //                = X_{r,i} K_r X_rᵀ + X_r K̇_i X_rᵀ + X_r K_r X_{r,i}ᵀ.
+    //     Ḃ_i      := ∂B/∂τ_i |_β
+    //                = diag(w'' ⊙ η̇_i) X + diag(w') X_i.
+    //     Ṗ_i      := ∂P/∂τ_i = 2 (M ⊙ Ṁ_i).
+    //     Γ̇_i     := ∂Γ/∂τ_i |_β = diag(w''' ⊙ η̇_i ⊙ h + w'' ⊙ ḣ_i).
+    //
+    //   Second-order building blocks:
+    //     η̈_{ij}  := X_{ij} β                   (0 for design linear in τ)
+    //     Ẅ_{ij} := diag(w'' ⊙ η̇_i ⊙ η̇_j
+    //                     + w' ⊙ η̈_{ij})
+    //
+    //     Ï_{ij}   := ∂²I_r/∂τ_i ∂τ_j |_β
+    //                = X_{r,ij}ᵀ W X_r  +  X_rᵀ W X_{r,ij}
+    //                 + X_{r,i}ᵀ W X_{r,j}  +  X_{r,j}ᵀ W X_{r,i}
+    //                 + X_{r,i}ᵀ Ẇ_j X_r  +  X_rᵀ Ẇ_j X_{r,i}
+    //                 + X_{r,j}ᵀ Ẇ_i X_r  +  X_rᵀ Ẇ_i X_{r,j}
+    //                 + X_rᵀ Ẅ_{ij} X_r.
+    //
+    //     K̈_{ij}  := ∂²K_r/∂τ_i ∂τ_j
+    //                = −K_r Ï_{ij} K_r
+    //                  + K_r İ_i K_r İ_j K_r
+    //                  + K_r İ_j K_r İ_i K_r.
+    //
+    //     M̈_{ij}  := X_{r,ij} K_r X_rᵀ + X_r K_r X_{r,ij}ᵀ
+    //                 + X_{r,i} K̇_j X_rᵀ + X_r K̇_j X_{r,i}ᵀ
+    //                 + X_{r,j} K̇_i X_rᵀ + X_r K̇_i X_{r,j}ᵀ
+    //                 + X_{r,i} K_r X_{r,j}ᵀ + X_{r,j} K_r X_{r,i}ᵀ
+    //                 + X_r K̈_{ij} X_rᵀ.
+    //
+    //     P̈_{ij}  := ∂²P/∂τ_i ∂τ_j
+    //                = 2 (Ṁ_i ⊙ Ṁ_j) + 2 (Ṁ_j ⊙ Ṁ_i) + 2 (M ⊙ M̈_{ij})
+    //                = 4 (Ṁ_i ⊙ Ṁ_j) + 2 (M ⊙ M̈_{ij}).
+    //
+    //     ḧ_{ij}  := ∂²h/∂τ_i ∂τ_j |_β
+    //                = 2·diag(X_{r,ij} K_r X_rᵀ)
+    //                 + diag(X_r K̈_{ij} X_rᵀ)
+    //                 + 2·diag(X_{r,i} K̇_j X_rᵀ)
+    //                 + 2·diag(X_{r,j} K̇_i X_rᵀ)
+    //                 + 2·diag(X_{r,i} K_r X_{r,j}ᵀ).
+    //
+    //     B̈_{ij}  := ∂²B/∂τ_i ∂τ_j |_β
+    //                = diag(w''' ⊙ η̇_i ⊙ η̇_j + w'' ⊙ η̈_{ij}) X
+    //                 + diag(w'' ⊙ η̇_i) X_j
+    //                 + diag(w'' ⊙ η̇_j) X_i
+    //                 + diag(w') X_{ij}.
+    //
+    //     Γ̈_{ij} := ∂²Γ/∂τ_i ∂τ_j |_β
+    //                = diag( w'''' ⊙ η̇_i ⊙ η̇_j ⊙ h
+    //                       + w''' ⊙ η̈_{ij} ⊙ h
+    //                       + w''' ⊙ η̇_i ⊙ ḣ_j
+    //                       + w''' ⊙ η̇_j ⊙ ḣ_i
+    //                       + w'' ⊙ ḧ_{ij} ).
+    //
+    //   Diagonal-term expansion (the Xᵀ Γ X branch):
+    //
+    //     ∂²(Xᵀ Γ X)/∂τ_i ∂τ_j  =
+    //         X_{ij}ᵀ Γ X  + Xᵀ Γ X_{ij}
+    //       + X_iᵀ Γ X_j  + X_jᵀ Γ X_i
+    //       + X_iᵀ Γ̇_j X  + Xᵀ Γ̇_j X_i
+    //       + X_jᵀ Γ̇_i X  + Xᵀ Γ̇_i X_j
+    //       + Xᵀ Γ̈_{ij} X.
+    //
+    //   9-term expansion for the BᵀPB branch (structurally identical to
+    //   the existing β×β D²J₂[u,v] at firth.rs:~820-830 with (u,v)
+    //   substituted by (τ_i, τ_j) and the appropriate Ḃ, B̈, Ṗ, P̈):
+    //
+    //     D²(BᵀPB)[τ_i,τ_j]  =
+    //         B̈_{ij}ᵀ  P    B      +  Bᵀ       P    B̈_{ij}
+    //       + Ḃ_iᵀ    P    Ḃ_j   +  Ḃ_jᵀ    P    Ḃ_i
+    //       + Ḃ_iᵀ    Ṗ_j  B      +  Bᵀ       Ṗ_j  Ḃ_i
+    //       + Ḃ_jᵀ    Ṗ_i  B      +  Bᵀ       Ṗ_i  Ḃ_j
+    //       + Bᵀ       P̈_{ij} B.
+    //
+    //   Combining,
+    //
+    //     ∂²H_φ/∂τ_i ∂τ_j |_β  =  ½ [
+    //         ∂²(Xᵀ Γ X)/∂τ_i ∂τ_j  −  D²(BᵀPB)[τ_i, τ_j]
+    //     ].
+    //
+    // IMPLEMENTATION SKETCH (for 13b)
+    //   • Build per-direction reduced quantities for τ_i and τ_j:
+    //       (x_tau_reduced, η̇, İ, K̇, Ṁ operator pieces, ḣ, b_uvec = w''⊙η̇).
+    //     The existing `dot_i_and_h_from_reduced` yields İ and ḣ already;
+    //     the per-direction "A_u" analog is A_τ = K_r İ K_r, matching the
+    //     FirthDirection form used by hphisecond_direction_apply.
+    //   • Use apply_hadamard_gram_to_matrix with
+    //       (A_left, A_right) ∈ { (K_r, K_r), (K_r, A_τ_i), (K_r, A_τ_j),
+    //                             (A_τ_i, A_τ_j) }
+    //     to realize P-products, Ṗ_τ-products, and the (Ṁ_i ⊙ Ṁ_j) piece of
+    //     P̈_{ij} without forming any n×n dense intermediate.
+    //   • The pure-second piece `X_r K̈_{ij} X_rᵀ` decomposes into three
+    //     reduced triple products (K_r Ï_{ij} K_r, K_r İ_i K_r İ_j K_r, and
+    //     its transpose).  All are size-r×r in reduced coordinates.
+    //   • For design-linear-in-τ smooths, X_{ij}=0 and η̈_{ij}=0, which
+    //     prunes many sub-terms; callers who have X_{τ_i τ_j} available
+    //     should pass it so the primitive remains exact on curved designs.
+    //
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Primitive B — D_β((H_φ)_τ|_β)[v]
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // WHAT IT COMPUTES
+    //   Given a single τ-drift design X_τ, the β-fixed Firth partial
+    //   (H_φ)_τ|_β encoded by FirthTauPartialKernel, and a β-direction
+    //   vector v (of length p), returns the β-derivative of (H_φ)_τ|_β
+    //   applied to an rhs block (so output is p×m, matching the pair's
+    //   fixed_drift_deriv callback signature DriftDerivResult).  In
+    //   symbols:
+    //
+    //     D_β((H_φ)_τ|_β)[v]  =  ½ [ D_β{(∂(XᵀΓX)/∂τ)|_β}[v]
+    //                                 −  D_β{(∂(BᵀPB)/∂τ)|_β}[v] ].
+    //
+    // WHY (REML callsite)
+    //   In the exact outer Hessian assembly (compute_drift_deriv_traces in
+    //   unified.rs), the Ḧ_{ij} entry picks up
+    //     tr(G_ε · D_β B_i[v_j])  +  tr(G_ε · D_β B_j[v_i]).
+    //   For τ coordinates in the Firth+Logit path, B_τ = (penalty / design
+    //   pieces) − (H_φ)_τ|_β, so the Firth share of D_β B_τ[v] is
+    //     − D_β((H_φ)_τ|_β)[v].
+    //   Hooking this primitive up through a FixedDriftDerivFn (returning
+    //   DriftDerivResult::Dense of this p×p β-v action) is exactly what
+    //   lets build_tau_hyper_coords pass a non-None fixed_drift_deriv
+    //   closure into the unified evaluator, closing the approximation gap
+    //   that firth_pair_terms_unavailable currently tracks.
+    //
+    // DERIVATION (β-derivative of each τ-partial term in direction v)
+    //
+    //   β enters only through η=Xβ, so designs X, X_τ, Q, X_r are all
+    //   β-independent; D_β acts on w(η) and its derivatives, on I_r, K_r,
+    //   M, h, and on η̇_τ = X_τ β.
+    //
+    //   Primary β-derivative building blocks (matches FirthDirection with
+    //   deta := δη_v = X v):
+    //     I'_v  := D_β I_r[v] = X_rᵀ diag(w' ⊙ δη_v) X_r      (g_u_reduced)
+    //     A_v   := D_β K_r[v] = −K_r I'_v K_r                  (a_u_reduced)
+    //     dh_v  := D_β h[v]    = −diag(X_r K_r I'_v K_r X_rᵀ)
+    //                          = diag(X_r A_v X_rᵀ)            (dh)
+    //     (w')_v  := D_β w'[v]  = w''  ⊙ δη_v
+    //     (w'')_v := D_β w''[v] = w''' ⊙ δη_v
+    //     (w''')_v:= D_β w'''[v]= w''''⊙ δη_v
+    //     δη_{τ,v} := D_β(η̇_τ)[v] = X_τ v
+    //
+    //   Mixed τ-β pieces:
+    //     D_β(İ_τ)[v]
+    //       = X_{r,τ}ᵀ diag(w'' ⊙ δη_v) X_r
+    //        + X_rᵀ diag(w'' ⊙ δη_v) X_{r,τ}
+    //        + X_rᵀ diag(w'' ⊙ η̇_τ ⊙ δη_v
+    //                     + w' ⊙ δη_{τ,v}) X_r.
+    //     D_β(K̇_τ)[v]
+    //       = −( A_v İ_τ K_r  +  K_r D_β(İ_τ)[v] K_r
+    //             +  K_r İ_τ A_v ).
+    //     D_β(Ṁ_τ)[v]
+    //       = X_{r,τ} A_v X_rᵀ
+    //        + X_r D_β(K̇_τ)[v] X_rᵀ
+    //        + X_r A_v X_{r,τ}ᵀ.
+    //     D_β(ḣ_τ)[v]
+    //       = 2·diag(X_{r,τ} A_v X_rᵀ)
+    //        + diag(X_r D_β(K̇_τ)[v] X_rᵀ).
+    //
+    //   Diagonal-term β-derivative ( (X_τᵀΓX + XᵀΓX_τ + XᵀΓ̇_τ X) branch ):
+    //     D_β(X_τᵀ Γ X + Xᵀ Γ X_τ)[v]
+    //       = X_τᵀ Γ_v X + Xᵀ Γ_v X_τ,
+    //       Γ_v  := D_β Γ[v] = diag((w'')_v ⊙ h + w'' ⊙ dh_v)
+    //                        = diag(w''' ⊙ δη_v ⊙ h + w'' ⊙ dh_v).
+    //     D_β(Xᵀ Γ̇_τ X)[v]
+    //       = Xᵀ Γ̇_{τ,v} X,
+    //       Γ̇_{τ,v}
+    //        := D_β Γ̇_τ[v]
+    //         = diag( (w''')_v ⊙ η̇_τ ⊙ h
+    //                 + w''' ⊙ δη_{τ,v} ⊙ h
+    //                 + w''' ⊙ η̇_τ ⊙ dh_v
+    //                 + (w'')_v ⊙ ḣ_τ
+    //                 + w'' ⊙ D_β(ḣ_τ)[v] )
+    //         = diag( w'''' ⊙ η̇_τ ⊙ δη_v ⊙ h
+    //                 + w''' ⊙ δη_{τ,v} ⊙ h
+    //                 + w''' ⊙ η̇_τ ⊙ dh_v
+    //                 + w''' ⊙ δη_v ⊙ ḣ_τ
+    //                 + w'' ⊙ D_β(ḣ_τ)[v] ).
+    //
+    //   Cross-coupling τ-β pieces for B:
+    //     B_v  := D_β B[v]   = diag(w'' ⊙ δη_v) X               (b_uvec)
+    //     B_τ  := ∂B/∂τ|_β   = diag(w'' ⊙ η̇_τ) X
+    //                         + diag(w') X_τ.
+    //     B_{τ,v}
+    //         := D_β B_τ[v]  = diag( w''' ⊙ η̇_τ ⊙ δη_v
+    //                                 + w'' ⊙ δη_{τ,v} ) X
+    //                         + diag(w'' ⊙ δη_v) X_τ.
+    //
+    //   BᵀPB branch — 9 terms, obtained by applying the product rule to
+    //   ∂(BᵀPB)/∂τ = Ḃ_τᵀ P B + Bᵀ Ṗ_τ B + Bᵀ P Ḃ_τ and then taking
+    //   D_β(·)[v] of each factor:
+    //
+    //     D_β(Ḃ_τᵀ P B)[v]   = B_{τ,v}ᵀ P B + Ḃ_τᵀ P_v B + Ḃ_τᵀ P B_v,
+    //     D_β(Bᵀ Ṗ_τ B)[v]   = B_vᵀ Ṗ_τ B  + Bᵀ P_{τ,v} B + Bᵀ Ṗ_τ B_v,
+    //     D_β(Bᵀ P Ḃ_τ)[v]   = B_vᵀ P Ḃ_τ + Bᵀ P_v Ḃ_τ + Bᵀ P B_{τ,v}.
+    //
+    //   Here Ḃ_τ = B_τ above, and
+    //     P_v := D_β P[v]         = 2 (M ⊙ M_v),   M_v = X_r A_v X_rᵀ.
+    //     Ṗ_τ := ∂P/∂τ|_β         = 2 (M ⊙ M_τ),
+    //       M_τ = X_{r,τ} K_r X_rᵀ + X_r K̇_τ X_rᵀ + X_r K_r X_{r,τ}ᵀ.
+    //     P_{τ,v} := D_β(Ṗ_τ)[v]  = 2 (M_v ⊙ M_τ) + 2 (M ⊙ M_{τ,v}),
+    //       M_{τ,v} = X_{r,τ} A_v X_rᵀ + X_r D_β(K̇_τ)[v] X_rᵀ + X_r A_v X_{r,τ}ᵀ.
+    //
+    //   Final primitive:
+    //
+    //     D_β((H_φ)_τ|_β)[v]  =  ½ [
+    //           X_τᵀ Γ_v X  + Xᵀ Γ_v X_τ  + Xᵀ Γ̇_{τ,v} X
+    //         −  (9-term BᵀPB β-τ expansion above)
+    //     ].
+    //
+    //   Applied to an rhs block `R ∈ ℝ^{p × m}`, each Xᵀ(…) X R collapses
+    //   to n-length row scalings of (X R) followed by Xᵀ; each Bᵀ P B
+    //   variant uses apply_hadamard_gram_to_matrix with the correct
+    //   (A_left, A_right) ∈ { (K_r, K_r), (K_r, A_v), (K_r, K̇_τ),
+    //     (K_r, D_β(K̇_τ)[v]), (A_v, K̇_τ), (K_r, K̇_τ) } to realize
+    //   P, P_v, Ṗ_τ, P_{τ,v} actions.  All operators are r×r in reduced
+    //   coordinates, matching the existing apply cost profile.
+    //
+    // IMPLEMENTATION SKETCH (for 13c)
+    //   • Build `FirthDirection` from deta = X v (reuses existing
+    //     direction_from_deta, giving I'_v, A_v, dh_v, b_uvec).
+    //   • Build β-derivatives of the τ-specific fields of
+    //     FirthTauPartialKernel (dotw1, dotw2, dot_h_partial, dot_k_reduced,
+    //     and the implicit M_τ reduced-coords operator).  These become a
+    //     new FirthTauBetaPartialKernel attached to the prepared state.
+    //   • The apply step is then algebraically identical to
+    //     hphi_tau_partial_apply but with every W-tensor weight replaced by
+    //     its β-derivative in v, and every (M, K_r)-Gram replaced by the
+    //     appropriate β-derivative Gram above.  The structure is regular
+    //     enough that a single helper, shared with Primitive A, can absorb
+    //     both pair dispatches.
+    //
+    // NOTE ON DESIGN-LINEAR SMOOTHS
+    //   For the common case of design-linear-in-τ smooths (scale-moving
+    //   anisotropic bases), X_i and X_τ are constant in τ, so X_{ij}=0 and
+    //   η̈_{ij}=0.  The primitives collapse to their W-reweighted cores but
+    //   remain matrix-free; no special fast path is needed because the
+    //   zeroed terms simply drop out of the Hadamard-Gram assembly.
+    //
+    // ═════════════════════════════════════════════════════════════════════════
 
-    /// Build the reduced-basis pair-kernel used by `hphi_tau_tau_partial_apply`.
+    /// Primitive A — prepare step: assemble the τ_i × τ_j reduced kernel.
     ///
-    /// Takes the two per-direction partial outputs from
-    /// `dot_i_and_h_from_reduced` (for τ_i and τ_j), plus an optional
-    /// second-design reduced drift `x_tau_tau_reduced` (`None` when the
-    /// design is τ-linear, so X_{τ_iτ_j} ≡ 0) and its η̈_{ij} product.
+    /// Consumes the per-direction partial quantities produced by
+    /// `dot_i_and_h_from_reduced` for τ_i and τ_j (plus an optional second
+    /// design derivative X_{τ_i τ_j}), and returns a cached kernel carrying
+    /// the M̈_{ij}, K̈_{ij}, ḧ_{ij}, Γ̈_{ij}, and B̈_{ij}-related reduced
+    /// coordinates needed by `hphi_tau_tau_partial_apply`.
     ///
-    /// The returned kernel packages every reusable piece so that `apply`
-    /// never recomputes shared Grams.
-    #[allow(dead_code)]
+    /// This signature mirrors `hphi_tau_partial_prepare_from_partials` for
+    /// consistency; the pair version needs both directions simultaneously
+    /// (to realize the 9-term D² expansion) and therefore owns both
+    /// `x_tau_{i,j}_reduced` and their η̇_i / η̇_j.
+    ///
     pub(crate) fn hphi_tau_tau_partial_prepare_from_partials(
         &self,
         x_tau_i_reduced: Array2<f64>,
         x_tau_j_reduced: Array2<f64>,
-        deta_i: Array1<f64>,
-        deta_j: Array1<f64>,
-        dot_i_i_reduced: Array2<f64>,
-        dot_i_j_reduced: Array2<f64>,
-        dot_h_i: Array1<f64>,
-        dot_h_j: Array1<f64>,
+        deta_i_partial: &Array1<f64>,
+        deta_j_partial: &Array1<f64>,
+        dot_h_i_partial: Array1<f64>,
+        dot_h_j_partial: Array1<f64>,
+        dot_i_i_partial: Array2<f64>,
+        dot_i_j_partial: Array2<f64>,
         x_tau_tau_reduced: Option<Array2<f64>>,
-        deta_ij: Option<Array1<f64>>,
+        deta_ij_partial: Option<Array1<f64>>,
     ) -> FirthTauTauPartialKernel {
-        //  Build the single-τ kernels first — these are the same as the ones
-        //  consumed by the single-τ primitive, sharing its FD-verified
-        //  structure.
-        let k = &self.k_reduced;
-        let dot_k_i = -k.dot(&dot_i_i_reduced).dot(k);
-        let dot_k_j = -k.dot(&dot_i_j_reduced).dot(k);
-        let dotw1_i = &self.w2 * &deta_i;
-        let dotw1_j = &self.w2 * &deta_j;
-        let dotw2_i = &self.w3 * &deta_i;
-        let dotw2_j = &self.w3 * &deta_j;
-        let tau_i = FirthTauPartialKernel {
-            dotw1: dotw1_i.clone(),
-            dotw2: dotw2_i.clone(),
-            dot_h_partial: dot_h_i.clone(),
-            x_tau_reduced: x_tau_i_reduced.clone(),
-            dot_k_reduced: dot_k_i.clone(),
-        };
-        let tau_j = FirthTauPartialKernel {
-            dotw1: dotw1_j.clone(),
-            dotw2: dotw2_j.clone(),
-            dot_h_partial: dot_h_j.clone(),
-            x_tau_reduced: x_tau_j_reduced.clone(),
-            dot_k_reduced: dot_k_j.clone(),
-        };
-
-        //  Ï_{r,ij} — 9-term reduced Fisher cross second derivative.
-        //    Ï_ij = X_{r,ij}ᵀ W X_r + X_rᵀ W X_{r,ij}
-        //          + X_{r,i}ᵀ W X_{r,j} + X_{r,j}ᵀ W X_{r,i}
-        //          + X_{r,i}ᵀ Ẇ_j X_r + X_rᵀ Ẇ_j X_{r,i}
-        //          + X_{r,j}ᵀ Ẇ_i X_r + X_rᵀ Ẇ_i X_{r,j}
-        //          + X_rᵀ Ẅ_{ij} X_r
-        //  with Ẇ_α = diag(w' ⊙ η̇_α) and
-        //       Ẅ_{ij} = diag(w'' ⊙ η̇_i ⊙ η̇_j  +  w' ⊙ η̈_{ij}).
-        let zeros_n = Array1::<f64>::zeros(self.x_dense.nrows());
-        let deta_ij_ref: &Array1<f64> = deta_ij.as_ref().unwrap_or(&zeros_n);
-        let dw_i = &self.w1 * &deta_i;
-        let dw_j = &self.w1 * &deta_j;
-        let ddw_ij = &(&self.w2 * &(&deta_i * &deta_j)) + &(&self.w1 * deta_ij_ref);
-        let x_r = &self.x_reduced;
-        let mut ddot_i_ij = Array2::<f64>::zeros(k.raw_dim());
-        if let Some(x_rij) = x_tau_tau_reduced.as_ref() {
-            ddot_i_ij = ddot_i_ij + RemlState::weighted_cross(x_rij, x_r, &self.w);
-            ddot_i_ij = ddot_i_ij + RemlState::weighted_cross(x_r, x_rij, &self.w);
-        }
-        ddot_i_ij =
-            ddot_i_ij + RemlState::weighted_cross(&x_tau_i_reduced, &x_tau_j_reduced, &self.w);
-        ddot_i_ij =
-            ddot_i_ij + RemlState::weighted_cross(&x_tau_j_reduced, &x_tau_i_reduced, &self.w);
-        ddot_i_ij = ddot_i_ij + RemlState::weighted_cross(&x_tau_i_reduced, x_r, &dw_j);
-        ddot_i_ij = ddot_i_ij + RemlState::weighted_cross(x_r, &x_tau_i_reduced, &dw_j);
-        ddot_i_ij = ddot_i_ij + RemlState::weighted_cross(&x_tau_j_reduced, x_r, &dw_i);
-        ddot_i_ij = ddot_i_ij + RemlState::weighted_cross(x_r, &x_tau_j_reduced, &dw_i);
-        ddot_i_ij = ddot_i_ij + crate::faer_ndarray::fast_xt_diag_x(x_r, &ddw_ij);
-
-        //  K̈_{r,ij} = −K Ï_ij K  +  K İ_i K İ_j K  +  K İ_j K İ_i K
-        //  Using K İ_α K = −K̇_α (already cached in dot_k_α):
-        //     K İ_i K İ_j K = (−K̇_i) İ_j K = −dot_k_i · dot_i_j · K
-        //  so K İ_i K İ_j K + K İ_j K İ_i K = −dot_k_i·dot_i_j·K − dot_k_j·dot_i_i·K.
-        let ddot_k_ij: Array2<f64> = -k.dot(&ddot_i_ij).dot(k)
-            + (-&dot_k_i).dot(&dot_i_j_reduced).dot(k)
-            + (-&dot_k_j).dot(&dot_i_i_reduced).dot(k);
-
-        //  ḧ_{ij} = ∂²_{τ_iτ_j} diag(M)
-        //         = 2 diag(X_{r,ij} K X_rᵀ)
-        //         + diag(X_r K̈_{ij} X_rᵀ)
-        //         + 2 diag(X_{r,i} K̇_j X_rᵀ)
-        //         + 2 diag(X_{r,j} K̇_i X_rᵀ)
-        //         + 2 diag(X_{r,i} K X_{r,j}ᵀ)
-        let n = self.x_dense.nrows();
-        let mut ddot_h_ij = Array1::<f64>::zeros(n);
-        if let Some(x_rij) = x_tau_tau_reduced.as_ref() {
-            let rij_k = x_rij.dot(k);
-            ddot_h_ij = ddot_h_ij + 2.0 * Self::rowwise_dot(&rij_k, x_r);
-        }
-        let xr_kddot = x_r.dot(&ddot_k_ij);
-        ddot_h_ij = ddot_h_ij + Self::rowwise_dot(&xr_kddot, x_r);
-        let ri_kdot_j = x_tau_i_reduced.dot(&dot_k_j);
-        ddot_h_ij = ddot_h_ij + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
-        let rj_kdot_i = x_tau_j_reduced.dot(&dot_k_i);
-        ddot_h_ij = ddot_h_ij + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
-        let ri_k = x_tau_i_reduced.dot(k);
-        ddot_h_ij = ddot_h_ij + 2.0 * Self::rowwise_dot(&ri_k, &x_tau_j_reduced);
-
+        // K̇_i = -K_r İ_i K_r;  K̇_j = -K_r İ_j K_r.
+        let dot_k_i_reduced = -self.k_reduced.dot(&dot_i_i_partial).dot(&self.k_reduced);
+        let dot_k_j_reduced = -self.k_reduced.dot(&dot_i_j_partial).dot(&self.k_reduced);
         FirthTauTauPartialKernel {
-            tau_i,
-            tau_j,
-            deta_i,
-            deta_j,
-            dot_i_i_reduced,
-            dot_i_j_reduced,
-            ddot_i_ij_reduced: ddot_i_ij,
-            ddot_k_ij_reduced: ddot_k_ij,
-            dot_h_i,
-            dot_h_j,
-            ddot_h_ij,
+            x_tau_i_reduced,
+            x_tau_j_reduced,
+            deta_i_partial: deta_i_partial.clone(),
+            deta_j_partial: deta_j_partial.clone(),
+            dot_h_i_partial,
+            dot_h_j_partial,
+            dot_k_i_reduced,
+            dot_k_j_reduced,
+            dot_i_i_partial,
+            dot_i_j_partial,
             x_tau_tau_reduced,
-            deta_ij,
+            deta_ij_partial,
         }
     }
 
-    /// Apply M̈_{ij} to each column of `mat`.
+    /// Primitive A — apply step: evaluate ∂²H_φ/∂τ_i ∂τ_j |_β against a p×m
+    /// rhs block, returning a p×m block.
     ///
-    /// M̈_{ij} · v = 2 (M ⊙ M_{τ_iτ_j}) · v  +  2 (M_i ⊙ M_j) · v.
+    /// Contract mirrors `hphi_tau_partial_apply`: the caller passes the two
+    /// τ-drift designs and the prepared kernel, and receives the fixed-β
+    /// second-τ Firth drift as a dense p×m action.  Matrix-free in n.
     ///
-    /// Both components expand into a sum of Hadamard-Gram applies with the
-    /// reduced-basis pairs  (A_left, A_right)  chosen from
-    ///   {(K, K), (K, K̇_i), (K, K̇_j), (K̇_i, K̇_j), ...}
-    /// plus rowwise-bilinear evaluations analogous to
-    /// `apply_mtau_to_matrix` for the X_{r,α} tails.
-    ///
-    /// The general trick is the identity
-    ///   (YAWᵀ ⊙ ZB Zᵀ) · v
-    ///     = rowwise_bilinear(Y,  A · (Wᵀ diag(v) Z) · B, Z)
-    /// when Y, W, Z are reduced-basis matrices and A, B are r×r symmetric.
-    #[allow(dead_code)]
-    fn apply_p_ddot_ij_to_matrix(
-        &self,
-        kernel: &FirthTauTauPartialKernel,
-        mat: &Array2<f64>,
-    ) -> Array2<f64> {
-        let n = self.x_dense.nrows();
-        let m = mat.ncols();
-        if mat.nrows() != n || m == 0 {
-            return Array2::<f64>::zeros(mat.raw_dim());
-        }
-        let x_r = &self.x_reduced;
-        let k = &self.k_reduced;
-        let x_ri = &kernel.tau_i.x_tau_reduced;
-        let x_rj = &kernel.tau_j.x_tau_reduced;
-        let dot_k_i = &kernel.tau_i.dot_k_reduced;
-        let dot_k_j = &kernel.tau_j.dot_k_reduced;
-        let ddot_k_ij = &kernel.ddot_k_ij_reduced;
-        let zero_xr = Array2::<f64>::zeros(x_r.raw_dim());
-        let x_rij: &Array2<f64> = kernel.x_tau_tau_reduced.as_ref().unwrap_or(&zero_xr);
-        let has_xij = kernel.x_tau_tau_reduced.is_some();
-
-        let mut out = Array2::<f64>::zeros((n, m));
-        for col in 0..m {
-            let v = mat.column(col).to_owned();
-
-            //  Component 1:  2 (M ⊙ M_{τ_iτ_j}) · v
-            //  M_{τ_iτ_j} has 9 tails listed above.  Each summand
-            //  (M ⊙ Y_α B_α W_αᵀ) · v yields
-            //     rowwise_bilinear(Y_α, B_α · (W_αᵀ diag(v) X_r) · K, X_r)  [when
-            //     one side is Z K Zᵀ]
-            //  or the crossed  diag(X_r · (K · (X_rᵀ diag(v) W_α) · B_αᵀ) · Y_αᵀ)
-            //  variant.  Collect all 9 tails.
-            //
-            //  The four X_{r,ij}, X_r pairs are handled via
-            //  rowwise_bilinear and its transpose.
-            let mut t1 = Array1::<f64>::zeros(n);
-
-            //   tail A: Y=X_{r,ij}, A=K, W=X_r       (only if x_rij present)
-            //   tail B: Y=X_r,     A=K, W=X_{r,ij}
-            if has_xij {
-                let szz = RemlState::reduced_crossweighted_gram(x_r, x_rij, &v);
-                let mid = k.dot(&szz).dot(k);
-                t1 = t1 + Self::rowwise_bilinear(x_rij, &mid, x_r);
-                let szz2 = RemlState::reduced_crossweighted_gram(x_rij, x_r, &v);
-                let mid2 = k.dot(&szz2).dot(k);
-                t1 = t1 + Self::rowwise_bilinear(x_r, &mid2, x_r);
-            }
-
-            //   tail C: Y=X_{r,i}, A=K, W=X_{r,j}
-            //   tail D: Y=X_{r,j}, A=K, W=X_{r,i}
-            let sij = RemlState::reduced_crossweighted_gram(x_r, x_rj, &v);
-            let mij = k.dot(&sij).dot(k);
-            t1 = t1 + Self::rowwise_bilinear(x_ri, &mij, x_r);
-            let sji = RemlState::reduced_crossweighted_gram(x_r, x_ri, &v);
-            let mji = k.dot(&sji).dot(k);
-            t1 = t1 + Self::rowwise_bilinear(x_rj, &mji, x_r);
-
-            //   tail E: Y=X_{r,i}, A=K̇_j, W=X_r
-            //   tail F: Y=X_r,    A=K̇_j, W=X_{r,i}
-            let se_raw = RemlState::reducedweighted_gram(x_r, &v);
-            let me = k.dot(&se_raw).dot(dot_k_j);
-            t1 = t1 + Self::rowwise_bilinear(x_ri, &me, x_r);
-            let sf_raw = RemlState::reduced_crossweighted_gram(x_r, x_ri, &v);
-            let mf = k.dot(&sf_raw).dot(dot_k_j);
-            t1 = t1 + Self::rowwise_bilinear(x_r, &mf, x_r);
-
-            //   tail G: Y=X_{r,j}, A=K̇_i, W=X_r
-            //   tail H: Y=X_r,    A=K̇_i, W=X_{r,j}
-            let mg = k.dot(&se_raw).dot(dot_k_i);
-            t1 = t1 + Self::rowwise_bilinear(x_rj, &mg, x_r);
-            let sh_raw = RemlState::reduced_crossweighted_gram(x_r, x_rj, &v);
-            let mh = k.dot(&sh_raw).dot(dot_k_i);
-            t1 = t1 + Self::rowwise_bilinear(x_r, &mh, x_r);
-
-            //   tail I: Y=X_r,   A=K̈_{ij}, W=X_r   (uses apply_hadamard_gram
-            //   with K vs ddot_k_ij).
-            t1 = t1 + RemlState::apply_hadamard_gram(x_r, k, ddot_k_ij, &v);
-
-            //  Component 2:  2 (M_i ⊙ M_j) · v
-            //  M_i = X_{r,i} K X_rᵀ + X_r K X_{r,i}ᵀ + X_r K̇_i X_rᵀ     and mirror for j.
-            //  Each of the 9 cross-products (three tails of M_i × three of M_j)
-            //  gives a Hadamard-Gram apply.  Write them in full.
-            let mut t2 = Array1::<f64>::zeros(n);
-            //   (X_{r,i} K X_rᵀ) ⊙ (X_{r,j} K X_rᵀ)
-            let s11 = RemlState::reducedweighted_gram(x_r, &v);
-            let m11 = k.dot(&s11).dot(k);
-            t2 = t2 + Self::rowwise_bilinear(x_ri, &m11, x_rj);
-            //   (X_{r,i} K X_rᵀ) ⊙ (X_r K X_{r,j}ᵀ)
-            let s12 = RemlState::reduced_crossweighted_gram(x_r, x_rj, &v);
-            let m12 = k.dot(&s12).dot(k);
-            t2 = t2 + Self::rowwise_bilinear(x_ri, &m12, x_r);
-            //   (X_{r,i} K X_rᵀ) ⊙ (X_r K̇_j X_rᵀ)
-            let s13 = RemlState::reducedweighted_gram(x_r, &v);
-            let m13 = k.dot(&s13).dot(dot_k_j);
-            t2 = t2 + Self::rowwise_bilinear(x_ri, &m13, x_r);
-            //   (X_r K X_{r,i}ᵀ) ⊙ (X_{r,j} K X_rᵀ)
-            let s21 = RemlState::reduced_crossweighted_gram(x_ri, x_r, &v);
-            let m21 = k.dot(&s21).dot(k);
-            t2 = t2 + Self::rowwise_bilinear(x_r, &m21, x_rj);
-            //   (X_r K X_{r,i}ᵀ) ⊙ (X_r K X_{r,j}ᵀ)
-            let s22 = RemlState::reduced_crossweighted_gram(x_ri, x_rj, &v);
-            let m22 = k.dot(&s22).dot(k);
-            t2 = t2 + Self::rowwise_bilinear(x_r, &m22, x_r);
-            //   (X_r K X_{r,i}ᵀ) ⊙ (X_r K̇_j X_rᵀ)
-            let s23 = RemlState::reduced_crossweighted_gram(x_ri, x_r, &v);
-            let m23 = k.dot(&s23).dot(dot_k_j);
-            t2 = t2 + Self::rowwise_bilinear(x_r, &m23, x_r);
-            //   (X_r K̇_i X_rᵀ) ⊙ (X_{r,j} K X_rᵀ)
-            let s31 = RemlState::reducedweighted_gram(x_r, &v);
-            let m31 = dot_k_i.dot(&s31).dot(k);
-            t2 = t2 + Self::rowwise_bilinear(x_r, &m31, x_rj);
-            //   (X_r K̇_i X_rᵀ) ⊙ (X_r K X_{r,j}ᵀ)
-            let s32 = RemlState::reduced_crossweighted_gram(x_r, x_rj, &v);
-            let m32 = dot_k_i.dot(&s32).dot(k);
-            t2 = t2 + Self::rowwise_bilinear(x_r, &m32, x_r);
-            //   (X_r K̇_i X_rᵀ) ⊙ (X_r K̇_j X_rᵀ) — via apply_hadamard_gram with
-            //   (K̇_i, K̇_j) as the two symmetric factors.
-            t2 = t2 + RemlState::apply_hadamard_gram(x_r, dot_k_i, dot_k_j, &v);
-
-            let y = 2.0 * (t1 + t2);
-            out.column_mut(col).assign(&y);
-        }
-        out
-    }
-
-    /// Primitive A body: compute `Hφ_{τ_iτ_j}|β · V` via the outer
-    /// four-way formula.
-    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_apply(
         &self,
         x_tau_i: &Array2<f64>,
         x_tau_j: &Array2<f64>,
-        x_tau_tau: Option<&Array2<f64>>,
         kernel: &FirthTauTauPartialKernel,
         rhs: &Array2<f64>,
     ) -> Array2<f64> {
@@ -1439,129 +1478,1040 @@ impl FirthDenseOperator {
         let n = self.x_dense.nrows();
         let m = rhs.ncols();
 
-        //  η-space blocks
-        let etav = self.x_dense.dot(rhs); // n×m
-        let etav_i = x_tau_i.dot(rhs); // n×m
-        let etav_j = x_tau_j.dot(rhs); // n×m
-        let etav_ij = match x_tau_tau {
-            Some(xij) => xij.dot(rhs),
-            None => Array2::<f64>::zeros((n, m)),
-        };
+        // Short aliases.
+        let z = &self.z_reduced;
+        let x_r = &self.x_reduced;
+        let k = &self.k_reduced;
+        let x_ri = &kernel.x_tau_i_reduced;
+        let x_rj = &kernel.x_tau_j_reduced;
+        let deta_i = &kernel.deta_i_partial;
+        let deta_j = &kernel.deta_j_partial;
+        let dh_i = &kernel.dot_h_i_partial;
+        let dh_j = &kernel.dot_h_j_partial;
+        let dot_k_i = &kernel.dot_k_i_reduced;
+        let dot_k_j = &kernel.dot_k_j_reduced;
+        let dot_i_i = &kernel.dot_i_i_partial;
+        let dot_i_j = &kernel.dot_i_j_partial;
 
-        //  jet column views
-        let w1_col = self.w1.view().insert_axis(Axis(1));
-        let w2_col = self.w2.view().insert_axis(Axis(1));
-        let h_col = self.h_diag.view().insert_axis(Axis(1));
-        let dh_i_col = kernel.dot_h_i.view().insert_axis(Axis(1));
-        let dh_j_col = kernel.dot_h_j.view().insert_axis(Axis(1));
-        let ddh_ij_col = kernel.ddot_h_ij.view().insert_axis(Axis(1));
-
-        //  ẇ1_α, ẇ2_α columns and pair second-jet columns
-        let ddet_i = &self.w2 * &kernel.deta_i;
-        let ddet_j = &self.w2 * &kernel.deta_j;
-        let dw2_i = &self.w3 * &kernel.deta_i;
-        let dw2_j = &self.w3 * &kernel.deta_j;
-        let ddet_i_col = ddet_i.view().insert_axis(Axis(1));
-        let ddet_j_col = ddet_j.view().insert_axis(Axis(1));
-        let dw2_i_col = dw2_i.view().insert_axis(Axis(1));
-        let dw2_j_col = dw2_j.view().insert_axis(Axis(1));
-        //  cross second-jet on w: ∂_i ẇ2_j = w4·η̇_i·η̇_j + w3·η̈_ij
-        //  and  ∂_i ẇ1_j = w3·η̇_i·η̇_j + w2·η̈_ij.
+        // Optional second-design pieces: default to zero when the design is
+        // τ-linear (η̈_{ij} = 0, X_{ij} = 0).
+        let x_tau_tau_is_some = kernel.x_tau_tau_reduced.is_some();
+        let x_rij_zero = Array2::<f64>::zeros(x_r.raw_dim());
+        let x_rij: &Array2<f64> = kernel.x_tau_tau_reduced.as_ref().unwrap_or(&x_rij_zero);
         let zeros_n = Array1::<f64>::zeros(n);
-        let deta_ij_ref: &Array1<f64> = kernel.deta_ij.as_ref().unwrap_or(&zeros_n);
-        let dcross_w2 = &(&self.w4 * &kernel.deta_i) * &kernel.deta_j;
-        let dcross_w2 = dcross_w2 + &(&self.w3 * deta_ij_ref);
-        let dcross_w1 = &(&self.w3 * &kernel.deta_i) * &kernel.deta_j;
-        let dcross_w1 = dcross_w1 + &(&self.w2 * deta_ij_ref);
-        let dcross_w2_col = dcross_w2.view().insert_axis(Axis(1));
-        let dcross_w1_col = dcross_w1.view().insert_axis(Axis(1));
+        let deta_ij = kernel.deta_ij_partial.as_ref().unwrap_or(&zeros_n);
 
-        //  qv pieces
-        let qv = &etav * &w1_col;
-        let dqv_i = &(&etav * &ddet_i_col) + &(&etav_i * &w1_col);
-        let dqv_j = &(&etav * &ddet_j_col) + &(&etav_j * &w1_col);
-        let dqv_ij = &(&etav * &dcross_w1_col)
-            + &(&etav_j * &ddet_i_col)
-            + &(&etav_i * &ddet_j_col)
-            + &(&etav_ij * &w1_col);
-
-        //  m_qv and τ_j-drift:
-        //    m_qv        = P̄·qv
-        //    m_qv_j      = Ṁ_j·qv + P̄·dqv_j
-        //    ∂_i m_qv    = Ṁ_i·qv + P̄·dqv_i
-        //    ∂_i m_qv_j  = M̈_ij·qv + Ṁ_j·dqv_i + Ṁ_i·dqv_j + P̄·dqv_ij
-        let m_qv = self.apply_pbar_to_matrix(&qv);
-        let m_qv_j = self.apply_mtau_to_matrix(&kernel.tau_j, &qv) + self.apply_pbar_to_matrix(&dqv_j);
-        let di_m_qv =
-            self.apply_mtau_to_matrix(&kernel.tau_i, &qv) + self.apply_pbar_to_matrix(&dqv_i);
-        let pddot_qv = self.apply_p_ddot_ij_to_matrix(kernel, &qv);
-        let di_m_qv_j = pddot_qv
-            + self.apply_mtau_to_matrix(&kernel.tau_j, &dqv_i)
-            + self.apply_mtau_to_matrix(&kernel.tau_i, &dqv_j)
-            + self.apply_pbar_to_matrix(&dqv_ij);
-
-        //  r_V = (w2 ⊙ η_V) ⊙ h  −  m_qv ⊙ w1
-        let rv = &(&(&etav * &w2_col) * &h_col) - &(&m_qv * &w1_col);
-
-        //  r_{V,τ_j} = (ẇ2_j ⊙ η_V + w2 ⊙ η_{V,τ_j}) ⊙ h
-        //            + (w2 ⊙ η_V) ⊙ ḣ_j
-        //            − ( m_qv ⊙ ẇ1_j + m_qv_j ⊙ w1 )
-        let rvj = &(&(&(&etav * &dw2_j_col) + &(&etav_j * &w2_col)) * &h_col)
-            + &(&(&etav * &w2_col) * &dh_j_col)
-            - &(&(&m_qv * &ddet_j_col) + &(&m_qv_j * &w1_col));
-
-        //  ∂_i r_V
-        //    = ((w3·η̇_i) ⊙ η_V + w2 ⊙ η_{V,τ_i}) ⊙ h
-        //    + (w2 ⊙ η_V) ⊙ ḣ_i
-        //    − [ ∂_i m_qv ⊙ w1  +  m_qv ⊙ ẇ1_i ]
-        let di_rv = &(&(&(&etav * &dw2_i_col) + &(&etav_i * &w2_col)) * &h_col)
-            + &(&(&etav * &w2_col) * &dh_i_col)
-            - &(&(&di_m_qv * &w1_col) + &(&m_qv * &ddet_i_col));
-
-        //  ∂_i r_{V,τ_j} — assembled from the 4 pieces of r_{V,τ_j}.
-        //
-        //  (1) ∂_i[(ẇ2_j ⊙ η_V) ⊙ h]
-        //      = (∂_i ẇ2_j ⊙ η_V + ẇ2_j ⊙ η_{V,τ_i}) ⊙ h + (ẇ2_j ⊙ η_V) ⊙ ḣ_i
-        let p1 = &(&(&(&etav * &dcross_w2_col) + &(&etav_i * &dw2_j_col)) * &h_col)
-            + &(&(&etav * &dw2_j_col) * &dh_i_col);
-
-        //  (2) ∂_i[(w2 ⊙ η_{V,τ_j}) ⊙ h]
-        //      = (ẇ1_i ⊙ η_{V,τ_j} + w2 ⊙ η_{V,τ_iτ_j}) ⊙ h + (w2 ⊙ η_{V,τ_j}) ⊙ ḣ_i
-        //  Note ẇ1_i = w2 ⊙ η̇_i, and w3·η̇_i == dw2_i; BUT the dependency on
-        //  w2 ⊙ η_{V,τ_j} through ∂_i w2 = w3·η̇_i gives w3·η̇_i = dw2_i
-        //  multiplied by η_{V,τ_j}.  So:
-        let p2 = &(&(&(&etav_j * &dw2_i_col) + &(&etav_ij * &w2_col)) * &h_col)
-            + &(&(&etav_j * &w2_col) * &dh_i_col);
-
-        //  (3) ∂_i[(w2 ⊙ η_V) ⊙ ḣ_j]
-        //      = ((w3·η̇_i) ⊙ η_V + w2 ⊙ η_{V,τ_i}) ⊙ ḣ_j
-        //      + (w2 ⊙ η_V) ⊙ ḧ_{ij}
-        let p3 = &(&(&(&etav * &dw2_i_col) + &(&etav_i * &w2_col)) * &dh_j_col)
-            + &(&(&etav * &w2_col) * &ddh_ij_col);
-
-        //  (4) ∂_i[m_qv ⊙ ẇ1_j + m_qv_j ⊙ w1]
-        //    = ∂_i m_qv ⊙ ẇ1_j
-        //    + m_qv ⊙ ∂_i ẇ1_j                 (= m_qv ⊙ dcross_w1)
-        //    + ∂_i m_qv_j ⊙ w1
-        //    + m_qv_j ⊙ (w2 ⊙ η̇_i)              (= m_qv_j ⊙ ddet_i)
-        let p4 = &(&di_m_qv * &ddet_j_col)
-            + &(&m_qv * &dcross_w1_col)
-            + &(&di_m_qv_j * &w1_col)
-            + &(&m_qv_j * &ddet_i_col);
-
-        let di_rvj = p1 + p2 + p3 - p4;
-
-        //  Outer assembly:
-        //     0.5 [ X_{ij}ᵀ·rv + X_jᵀ·di_rv + X_iᵀ·rvj + Xᵀ·di_rvj ].
-        let mut out = if let Some(xij) = x_tau_tau {
-            xij.t().dot(&rv)
+        // ─────────────────────────────────────────────────────────────────
+        //  η̇ vectors in β-rhs space (η_V := X V, η_{i,V} := X_i V, etc.)
+        // ─────────────────────────────────────────────────────────────────
+        let eta_v = self.x_dense.dot(rhs); // n×m
+        let eta_i_v = x_tau_i.dot(rhs); // n×m
+        let eta_j_v = x_tau_j.dot(rhs); // n×m
+        // X_{ij} V from the reduced second-derivative design:
+        //   reduce_explicit_design: X_{r,τ} = diag(√a) X_τ Q,
+        //   invert:  X_{ij} = diag(1/√a) X_{r,ij} Qᵀ.
+        let eta_ij_v: Array2<f64> = if x_tau_tau_is_some {
+            let qt_v = self.q_basis.t().dot(rhs); // r×m
+            let mut out = x_rij.dot(&qt_v); // n×m in sqrt(a)-scaled space
+            if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+                for row in 0..out.nrows() {
+                    let s = scale[row];
+                    if s > 0.0 {
+                        let inv = s.recip();
+                        for col in 0..out.ncols() {
+                            out[[row, col]] *= inv;
+                        }
+                    } else {
+                        for col in 0..out.ncols() {
+                            out[[row, col]] = 0.0;
+                        }
+                    }
+                }
+            }
+            out
         } else {
-            Array2::<f64>::zeros((p, m))
+            Array2::<f64>::zeros((n, m))
         };
-        out = out + x_tau_j.t().dot(&di_rv);
-        out = out + x_tau_i.t().dot(&rvj);
-        out = out + self.x_dense.t().dot(&di_rvj);
-        0.5 * out
+
+        // ─────────────────────────────────────────────────────────────────
+        //  Shared per-direction reduced operators
+        //    A_τ = K İ K   (reduced analog of T_τ = K I_τ K)
+        //    K̇_τ = -A_τ  (already cached)
+        // ─────────────────────────────────────────────────────────────────
+        let a_i_reduced = -dot_k_i; // K İ_i K = -K̇_i
+        let a_j_reduced = -dot_k_j;
+
+        // ─────────────────────────────────────────────────────────────────
+        //  Ï_{ij}  — second cross derivative of reduced Fisher
+        // ─────────────────────────────────────────────────────────────────
+        //   Ï_{ij} = X_{r,ij}ᵀ W X_r + X_rᵀ W X_{r,ij}
+        //          + X_{r,i}ᵀ W X_{r,j} + X_{r,j}ᵀ W X_{r,i}
+        //          + X_{r,i}ᵀ Ẇ_j X_r + X_rᵀ Ẇ_j X_{r,i}
+        //          + X_{r,j}ᵀ Ẇ_i X_r + X_rᵀ Ẇ_i X_{r,j}
+        //          + X_rᵀ Ẅ_{ij} X_r.
+        //   Ẇ_α   = diag(w' ⊙ η̇_α),  Ẅ_{ij} = diag(w'' ⊙ η̇_i ⊙ η̇_j + w' ⊙ η̈_ij).
+        let dw_i = &self.w1 * deta_i;
+        let dw_j = &self.w1 * deta_j;
+        let ddw_ij = &(&self.w2 * &(deta_i * deta_j)) + &(&self.w1 * deta_ij);
+        let mut i_ddot = Array2::<f64>::zeros(k.raw_dim());
+        if x_tau_tau_is_some {
+            i_ddot = i_ddot + RemlState::weighted_cross(x_rij, x_r, &self.w);
+            i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_rij, &self.w);
+        }
+        i_ddot = i_ddot + RemlState::weighted_cross(x_ri, x_rj, &self.w);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_rj, x_ri, &self.w);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_ri, x_r, &dw_j);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_ri, &dw_j);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_rj, x_r, &dw_i);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_rj, &dw_i);
+        i_ddot = i_ddot + crate::faer_ndarray::fast_xt_diag_x(x_r, &ddw_ij);
+
+        // K̈_{ij} = −K Ï K + K İ_i K İ_j K + K İ_j K İ_i K.
+        //   Using K İ_α K = −K̇_α = a_α_reduced, the two product terms collapse to
+        //   K İ_i K İ_j K = a_i_reduced · İ_j · K,
+        //   K İ_j K İ_i K = a_j_reduced · İ_i · K.
+        let k_ddot: Array2<f64> = -k.dot(&i_ddot).dot(k)
+            + a_i_reduced.dot(dot_i_j).dot(k)
+            + a_j_reduced.dot(dot_i_i).dot(k);
+
+        // ─────────────────────────────────────────────────────────────────
+        //  ḧ_{ij}
+        // ─────────────────────────────────────────────────────────────────
+        //   ḧ_ij = 2 diag(X_{r,ij} K X_rᵀ)
+        //        + diag(X_r K̈_ij X_rᵀ)
+        //        + 2 diag(X_{r,i} K̇_j X_rᵀ)
+        //        + 2 diag(X_{r,j} K̇_i X_rᵀ)
+        //        + 2 diag(X_{r,i} K X_{r,j}ᵀ).
+        // Using diag(A Bᵀ) = rowwise_dot(A, B):
+        let dh_ij: Array1<f64> = {
+            let mut acc = Array1::<f64>::zeros(n);
+            if x_tau_tau_is_some {
+                let rij_k = x_rij.dot(k);
+                acc = acc + 2.0 * Self::rowwise_dot(&rij_k, x_r);
+            }
+            let xr_kddot = x_r.dot(&k_ddot);
+            acc = acc + Self::rowwise_dot(&xr_kddot, x_r);
+            let ri_kdot_j = x_ri.dot(dot_k_j);
+            acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
+            let rj_kdot_i = x_rj.dot(dot_k_i);
+            acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
+            let ri_k = x_ri.dot(k);
+            acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
+            acc
+        };
+
+        // ─────────────────────────────────────────────────────────────────
+        //  Γ, Γ̇_i, Γ̇_j, Γ̈_ij  (diagonal row-weight n-vectors)
+        // ─────────────────────────────────────────────────────────────────
+        //   γ        = w'' ⊙ h
+        //   γ̇_i     = w''' ⊙ η̇_i ⊙ h + w'' ⊙ ḣ_i
+        //   γ̈_ij   = w'''' ⊙ η̇_i ⊙ η̇_j ⊙ h
+        //            + w''' ⊙ η̈_ij ⊙ h
+        //            + w''' ⊙ η̇_i ⊙ ḣ_j
+        //            + w''' ⊙ η̇_j ⊙ ḣ_i
+        //            + w'' ⊙ ḧ_ij
+        let gamma = &self.w2 * &self.h_diag;
+        let gamma_dot_i = &(&(&self.w3 * deta_i) * &self.h_diag) + &(&self.w2 * dh_i);
+        let gamma_dot_j = &(&(&self.w3 * deta_j) * &self.h_diag) + &(&self.w2 * dh_j);
+        let gamma_ddot = &(&(&(&self.w4 * deta_i) * deta_j) * &self.h_diag)
+            + &(&(&(&self.w3 * deta_ij) * &self.h_diag)
+                + &(&(&self.w3 * deta_i) * dh_j)
+                + &(&(&self.w3 * deta_j) * dh_i)
+                + &(&self.w2 * &dh_ij));
+
+        // ─────────────────────────────────────────────────────────────────
+        //  Diagonal-term β-rhs contributions:
+        //    ∂²(XᵀΓX)/∂τ_i∂τ_j · V
+        //  = X_{ij}ᵀ (γ ⊙ η_V)       + Xᵀ (γ ⊙ η_{ij,V})         [if X_ij]
+        //    + X_iᵀ (γ ⊙ η_{j,V})    + X_jᵀ (γ ⊙ η_{i,V})
+        //    + X_iᵀ (γ̇_j ⊙ η_V)     + Xᵀ (γ̇_j ⊙ η_{i,V})
+        //    + X_jᵀ (γ̇_i ⊙ η_V)     + Xᵀ (γ̇_i ⊙ η_{j,V})
+        //    + Xᵀ (γ̈_ij ⊙ η_V).
+        // ─────────────────────────────────────────────────────────────────
+        let xt_i = x_tau_i.t();
+        let xt_j = x_tau_j.t();
+
+        let mut diag_term = Array2::<f64>::zeros((p, m));
+        let gamma_col = gamma.view().insert_axis(Axis(1));
+        let gamma_i_col = gamma_dot_i.view().insert_axis(Axis(1));
+        let gamma_j_col = gamma_dot_j.view().insert_axis(Axis(1));
+        let gamma_ij_col = gamma_ddot.view().insert_axis(Axis(1));
+
+        // X_iᵀ (γ ⊙ η_{j,V}) + X_jᵀ (γ ⊙ η_{i,V})
+        diag_term = diag_term + xt_i.dot(&(&eta_j_v * &gamma_col));
+        diag_term = diag_term + xt_j.dot(&(&eta_i_v * &gamma_col));
+        // X_iᵀ (γ̇_j ⊙ η_V) + X_jᵀ (γ̇_i ⊙ η_V)
+        diag_term = diag_term + xt_i.dot(&(&eta_v * &gamma_j_col));
+        diag_term = diag_term + xt_j.dot(&(&eta_v * &gamma_i_col));
+        // Xᵀ (γ̇_j ⊙ η_{i,V}) + Xᵀ (γ̇_i ⊙ η_{j,V})
+        diag_term = diag_term + self.x_dense_t.dot(&(&eta_i_v * &gamma_j_col));
+        diag_term = diag_term + self.x_dense_t.dot(&(&eta_j_v * &gamma_i_col));
+        // Xᵀ (γ̈_ij ⊙ η_V)
+        diag_term = diag_term + self.x_dense_t.dot(&(&eta_v * &gamma_ij_col));
+        // X_{ij}ᵀ (γ ⊙ η_V) + Xᵀ (γ ⊙ η_{ij,V})
+        if x_tau_tau_is_some {
+            // X_{ij}ᵀ = Q X_{r,ij}ᵀ · diag(1/√a)  (inverse of the reduce shim),
+            // but caller supplies the reduced second-derivative design.  We
+            // form X_{ij}ᵀ Y as q_basis · (X_{r,ij}ᵀ · diag(1/√a)·Y) = Q · X_{r,ij}ᵀ (Y unscaled).
+            // When no observation weights, X_{r,ij} = X_{ij} Q and
+            //   X_{ij}ᵀ Y = Q X_{r,ij}ᵀ Y.
+            let y = &eta_v * &gamma_col;
+            let xt_ij_y: Array2<f64> = if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+                let mut y_scaled = y.clone();
+                for row in 0..y_scaled.nrows() {
+                    let s = scale[row];
+                    if s > 0.0 {
+                        let inv = s.recip();
+                        for col in 0..y_scaled.ncols() {
+                            y_scaled[[row, col]] *= inv;
+                        }
+                    } else {
+                        for col in 0..y_scaled.ncols() {
+                            y_scaled[[row, col]] = 0.0;
+                        }
+                    }
+                }
+                self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+            } else {
+                self.q_basis.dot(&x_rij.t().dot(&y))
+            };
+            diag_term = diag_term + xt_ij_y;
+            diag_term = diag_term + self.x_dense_t.dot(&(&eta_ij_v * &gamma_col));
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        //  BᵀPB branch — 9-term expansion.
+        //
+        //  Represent each B-like operator as an "n-row scaling vector for the
+        //  X part plus tails along X_τ and X_{ij}".  For rhs V, define the
+        //  row-scaled η-space blocks R(B) = diag(scale) X V + tails.  Then
+        //  Bᵀ (P action) R is assembled by row-scaling and left-multiplying
+        //  the appropriate full designs.
+        // ─────────────────────────────────────────────────────────────────
+
+        // B V row-block (eta-space):  B V = diag(w') X V.
+        let w1_col = self.w1.view().insert_axis(Axis(1));
+        let b_v = &eta_v * &w1_col;
+
+        // Ḃ_i V = diag(w'' ⊙ η̇_i) X V + diag(w') X_i V.
+        let w2_deta_i = &self.w2 * deta_i;
+        let w2_deta_j = &self.w2 * deta_j;
+        let w2_deta_i_col = w2_deta_i.view().insert_axis(Axis(1));
+        let w2_deta_j_col = w2_deta_j.view().insert_axis(Axis(1));
+        let bdot_i_v = &(&eta_v * &w2_deta_i_col) + &(&eta_i_v * &w1_col);
+        let bdot_j_v = &(&eta_v * &w2_deta_j_col) + &(&eta_j_v * &w1_col);
+
+        // B̈_{ij} V =
+        //   diag(w''' ⊙ η̇_i ⊙ η̇_j + w'' ⊙ η̈_ij) X V
+        //   + diag(w'' ⊙ η̇_i) X_j V
+        //   + diag(w'' ⊙ η̇_j) X_i V
+        //   + diag(w') X_{ij} V.
+        let w3_didj = &(&self.w3 * deta_i) * deta_j;
+        let w2_dij = &self.w2 * deta_ij;
+        let bddot_scale = &w3_didj + &w2_dij;
+        let bddot_scale_col = bddot_scale.view().insert_axis(Axis(1));
+        let mut bddot_ij_v = &eta_v * &bddot_scale_col;
+        bddot_ij_v = bddot_ij_v + &(&eta_j_v * &w2_deta_i_col);
+        bddot_ij_v = bddot_ij_v + &(&eta_i_v * &w2_deta_j_col);
+        bddot_ij_v = bddot_ij_v + &(&eta_ij_v * &w1_col);
+
+        // P V  (columnwise, using K ⊙ K Hadamard gram on Z = X_r).
+        let p_bv = RemlState::apply_hadamard_gram_to_matrix(z, k, k, &b_v);
+        let p_bddot_ij_v =
+            RemlState::apply_hadamard_gram_to_matrix(z, k, k, &bddot_ij_v);
+
+        // Ṗ_i, Ṗ_j applied to B V, Ḃ_j V, Ḃ_i V — use the existing
+        // apply_mtau_to_matrix helper, which computes 2(M ⊙ Ṁ_τ) · mat.
+        //
+        // Construct a lightweight "FirthTauPartialKernel"-shaped tuple only for
+        // apply_mtau_to_matrix; we mirror its input contract inline to avoid
+        // owning a FirthTauPartialKernel copy here.
+        let pdot_i_bv = self.apply_mtau_from_reduced(x_ri, dot_k_i, &b_v);
+        let pdot_j_bv = self.apply_mtau_from_reduced(x_rj, dot_k_j, &b_v);
+        let pdot_i_bdot_j_v = self.apply_mtau_from_reduced(x_ri, dot_k_i, &bdot_j_v);
+        let pdot_j_bdot_i_v = self.apply_mtau_from_reduced(x_rj, dot_k_j, &bdot_i_v);
+
+        // P Ḃ_j V and P Ḃ_i V.
+        let p_bdot_j_v = RemlState::apply_hadamard_gram_to_matrix(z, k, k, &bdot_j_v);
+        let p_bdot_i_v = RemlState::apply_hadamard_gram_to_matrix(z, k, k, &bdot_i_v);
+
+        // P̈_{ij} V = 4 (Ṁ_i ⊙ Ṁ_j) V  + 2 (M ⊙ M̈_{ij}) V.
+        let p_ddot_b_v = self.apply_p_ddot_ij(
+            x_r, x_ri, x_rj, x_rij, k, dot_k_i, dot_k_j, &k_ddot, x_tau_tau_is_some, &b_v,
+        );
+
+        // Assemble 9 terms of D²(BᵀPB)[τ_i, τ_j] · V.
+        //   term1 = B̈_ijᵀ P B V + Bᵀ P B̈_ij V
+        //   term2 = Ḃ_iᵀ P Ḃ_j V + Ḃ_jᵀ P Ḃ_i V
+        //   term3 = Ḃ_iᵀ Ṗ_j B V + Bᵀ Ṗ_j Ḃ_i V
+        //   term4 = Ḃ_jᵀ Ṗ_i B V + Bᵀ Ṗ_i Ḃ_j V
+        //   term5 = Bᵀ P̈_ij B V
+        //
+        // "Bᵀ Q V" with B = diag(w') X equals left_scaled_xt(w1, Q V).
+        // "Ḃ_iᵀ Q V" = diag(w'' ⊙ η̇_i) X acting on the left, plus
+        //              diag(w') X_i on the left.  In transpose:
+        //   Ḃ_iᵀ Q V = Xᵀ (diag(w'' ⊙ η̇_i) Q V) + X_iᵀ (diag(w') Q V).
+        // "B̈_ijᵀ Q V" mirrors B̈_ij above in transpose.
+
+        let apply_bdot_tau_t = |scale_deta: &Array1<f64>,
+                                x_tau_mat: &Array2<f64>,
+                                q_v: &Array2<f64>| {
+            let scale_col = scale_deta.view().insert_axis(Axis(1));
+            self.x_dense_t.dot(&(q_v * &scale_col))
+                + x_tau_mat.t().dot(&(q_v * &w1_col))
+        };
+
+        let apply_bddot_ij_t = |q_v: &Array2<f64>| -> Array2<f64> {
+            let scale_col_full = bddot_scale.view().insert_axis(Axis(1));
+            let mut out = self.x_dense_t.dot(&(q_v * &scale_col_full));
+            out = out + x_tau_j.t().dot(&(q_v * &w2_deta_i_col));
+            out = out + x_tau_i.t().dot(&(q_v * &w2_deta_j_col));
+            if x_tau_tau_is_some {
+                // X_{ij}ᵀ (w1 ⊙ Q V)
+                let y = q_v * &w1_col;
+                let contrib: Array2<f64> = if let Some(scale) =
+                    self.observation_weight_sqrt.as_ref()
+                {
+                    let mut y_scaled = y.clone();
+                    for row in 0..y_scaled.nrows() {
+                        let s = scale[row];
+                        if s > 0.0 {
+                            let inv = s.recip();
+                            for col in 0..y_scaled.ncols() {
+                                y_scaled[[row, col]] *= inv;
+                            }
+                        } else {
+                            for col in 0..y_scaled.ncols() {
+                                y_scaled[[row, col]] = 0.0;
+                            }
+                        }
+                    }
+                    self.q_basis.dot(&x_rij.t().dot(&y_scaled))
+                } else {
+                    self.q_basis.dot(&x_rij.t().dot(&y))
+                };
+                out = out + contrib;
+            }
+            out
+        };
+
+        // term1
+        let t1a = apply_bddot_ij_t(&p_bv);
+        let t1b = self.left_scaled_xt(&self.w1, &p_bddot_ij_v);
+        // term2
+        let t2a = apply_bdot_tau_t(&w2_deta_i, x_tau_i, &p_bdot_j_v);
+        let t2b = apply_bdot_tau_t(&w2_deta_j, x_tau_j, &p_bdot_i_v);
+        // term3: Ḃ_iᵀ Ṗ_j B V + Bᵀ Ṗ_j Ḃ_i V
+        let t3a = apply_bdot_tau_t(&w2_deta_i, x_tau_i, &pdot_j_bv);
+        let t3b = self.left_scaled_xt(&self.w1, &pdot_j_bdot_i_v);
+        // term4: Ḃ_jᵀ Ṗ_i B V + Bᵀ Ṗ_i Ḃ_j V
+        let t4a = apply_bdot_tau_t(&w2_deta_j, x_tau_j, &pdot_i_bv);
+        let t4b = self.left_scaled_xt(&self.w1, &pdot_i_bdot_j_v);
+        // term5
+        let t5 = self.left_scaled_xt(&self.w1, &p_ddot_b_v);
+
+        let d2_bpb = t1a + t1b + t2a + t2b + t3a + t3b + t4a + t4b + t5;
+
+        0.5 * (diag_term - d2_bpb)
+    }
+
+    /// Pair-level exact Firth kernel at fixed β for a (τ_i, τ_j) outer
+    /// coordinate pair.
+    ///
+    /// Returns the two SCALAR- and P-VECTOR-valued second-derivative
+    /// objects that the unified REML evaluator threads into
+    /// `HyperCoordPair::{a,g}` as additive Firth contributions, plus an
+    /// optional prepared Primitive-A `FirthTauTauPartialKernel` that the
+    /// pair-callback can reuse for the `b_operator` action.
+    ///
+    /// ═════════════════════════════════════════════════════════════════════
+    ///  DERIVATIONS (fixed β, reduced-basis identifiable coords).
+    ///
+    ///  Φ = 0.5 log|I_r| − 0.5 log|S_r|,   K_r = I_r⁻¹,   G_r = diag(S_r⁻¹)
+    ///  Φ_{τ_i}|β = 0.5 tr(K_r İ_{r,i}) − 0.5 tr(G_r Ṡ_{r,i}).
+    ///
+    /// ┌── pair.a scalar Φ_{τ_i τ_j}|β ────────────────────────────────────┐
+    ///  ∂/∂τ_j [0.5 tr(K_r İ_{r,i})]
+    ///    = 0.5 tr(K̇_{r,j} İ_{r,i}) + 0.5 tr(K_r Ï_{r,ij})
+    ///    = −0.5 tr(K_r İ_{r,j} K_r İ_{r,i}) + 0.5 tr(K_r Ï_{r,ij})
+    ///
+    ///  ∂/∂τ_j [−0.5 tr(G_r Ṡ_{r,i})]
+    ///    = −0.5 tr(Ġ_{r,j} Ṡ_{r,i}) − 0.5 tr(G_r S̈_{r,ij})
+    ///  (G_r diagonal in canonical basis →
+    ///   Ġ_{r,j}_kk = −G_r_kk² · diag(Ṡ_{r,j})_kk.)
+    ///
+    ///  Ï_{r,ij} is the same 9-term Fisher cross used by Primitive A
+    ///  (see `hphi_tau_tau_partial_apply`:i_ddot block).
+    ///
+    ///  S̈_{r,ij} = X_{r,ij}^T X_r + X_r^T X_{r,ij}
+    ///            + X_{r,i}^T X_{r,j} + X_{r,j}^T X_{r,i}.
+    /// └─────────────────────────────────────────────────────────────────┘
+    ///
+    /// ┌── pair.g p-vector (gΦ)_{τ_i τ_j}|β ───────────────────────────────┐
+    ///  (gΦ)_{τ_i} = 0.5 X_{τ_i}^T (w1 ⊙ h)
+    ///              + 0.5 X^T [ (w2 ⊙ η̇_i) ⊙ h + w1 ⊙ ḣ_i ]
+    ///
+    ///  Differentiating wrt τ_j at fixed β, using η̇_α = X_α β, η̈_{ij} =
+    ///  X_{ij} β (when x_tau_tau is provided, else 0), and ḣ_α, ḧ_{ij}
+    ///  from Primitive A:
+    ///
+    ///  term_A = 0.5 ∂/∂τ_j [X_{τ_i}^T (w1 ⊙ h)]
+    ///        = 0.5 X_{τ_i τ_j}^T (w1 ⊙ h)          [if X_{ij} present]
+    ///        + 0.5 X_{τ_i}^T [ (w2 ⊙ η̇_j) ⊙ h + w1 ⊙ ḣ_j ]
+    ///
+    ///  term_B = 0.5 ∂/∂τ_j [X^T · v_{τ_i}] with
+    ///            v_{τ_i} = (w2 ⊙ η̇_i) ⊙ h + w1 ⊙ ḣ_i
+    ///        = 0.5 X_{τ_j}^T v_{τ_i}
+    ///        + 0.5 X^T · v̇_{τ_i,τ_j}
+    ///
+    ///  where the inner derivative
+    ///  v̇_{τ_i,τ_j} = (w3 ⊙ η̇_j ⊙ η̇_i) ⊙ h   (from ∂w2 = w3 ⊙ η̇_j)
+    ///              + (w2 ⊙ η̈_ij) ⊙ h          (from ∂η̇_i = η̈_{ij})
+    ///              + (w2 ⊙ η̇_i) ⊙ ḣ_j        (from ∂h = ḣ_j)
+    ///              + (w2 ⊙ η̇_j) ⊙ ḣ_i        (from ∂w1 = w2 ⊙ η̇_j, ⊙ ḣ_i)
+    ///              +  w1 ⊙ ḧ_{ij}             (from ∂ḣ_i = ḧ_{ij}).
+    /// └─────────────────────────────────────────────────────────────────┘
+    ///
+    /// ALL Ï_{r,ij}, η̈_{ij}, ḣ_i, ḧ_{ij} computations are identical to
+    /// those already computed inside Primitive A's `hphi_tau_tau_partial_apply`.
+    /// We replicate only the pieces needed to yield the scalar and p-vector
+    /// outputs to avoid computing the full p×m action when unnecessary.
+    pub(crate) fn exact_tau_tau_kernel(
+        &self,
+        x_tau_i: &Array2<f64>,
+        x_tau_j: &Array2<f64>,
+        x_tau_tau: Option<&Array2<f64>>,
+        beta: &Array1<f64>,
+        include_hphi_tau_tau_kernel: bool,
+    ) -> FirthTauTauExactKernel {
+        let deta_i = x_tau_i.dot(beta);
+        let deta_j = x_tau_j.dot(beta);
+        let deta_ij = x_tau_tau.as_ref().map(|xij| xij.dot(beta));
+
+        let x_tau_i_reduced = self.reduce_explicit_design(x_tau_i);
+        let x_tau_j_reduced = self.reduce_explicit_design(x_tau_j);
+        let x_tau_tau_reduced = x_tau_tau.map(|xij| self.reduce_explicit_design(xij));
+
+        let (dot_i_i, dot_h_i) =
+            self.dot_i_and_h_from_reduced(&x_tau_i_reduced, &deta_i);
+        let (dot_i_j, dot_h_j) =
+            self.dot_i_and_h_from_reduced(&x_tau_j_reduced, &deta_j);
+
+        // Ï_{r,ij} = X_{r,ij}^T W X_r + X_r^T W X_{r,ij}
+        //            + X_{r,i}^T W X_{r,j} + X_{r,j}^T W X_{r,i}
+        //            + X_{r,i}^T Ẇ_j X_r + X_r^T Ẇ_j X_{r,i}
+        //            + X_{r,j}^T Ẇ_i X_r + X_r^T Ẇ_i X_{r,j}
+        //            + X_r^T Ẅ_{ij} X_r
+        // Ẇ_α = diag(w' ⊙ η̇_α);  Ẅ_{ij} = diag(w'' ⊙ η̇_i ⊙ η̇_j + w' ⊙ η̈_{ij}).
+        let zeros_n = Array1::<f64>::zeros(self.x_dense.nrows());
+        let deta_ij_ref: &Array1<f64> = deta_ij.as_ref().unwrap_or(&zeros_n);
+        let dw_i = &self.w1 * &deta_i;
+        let dw_j = &self.w1 * &deta_j;
+        let ddw_ij = &(&self.w2 * &(&deta_i * &deta_j)) + &(&self.w1 * deta_ij_ref);
+
+        let x_r = &self.x_reduced;
+        let mut i_ddot = Array2::<f64>::zeros(self.k_reduced.raw_dim());
+        if let Some(x_rij) = x_tau_tau_reduced.as_ref() {
+            i_ddot = i_ddot + RemlState::weighted_cross(x_rij, x_r, &self.w);
+            i_ddot = i_ddot + RemlState::weighted_cross(x_r, x_rij, &self.w);
+        }
+        i_ddot = i_ddot + RemlState::weighted_cross(&x_tau_i_reduced, &x_tau_j_reduced, &self.w);
+        i_ddot = i_ddot + RemlState::weighted_cross(&x_tau_j_reduced, &x_tau_i_reduced, &self.w);
+        i_ddot = i_ddot + RemlState::weighted_cross(&x_tau_i_reduced, x_r, &dw_j);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_r, &x_tau_i_reduced, &dw_j);
+        i_ddot = i_ddot + RemlState::weighted_cross(&x_tau_j_reduced, x_r, &dw_i);
+        i_ddot = i_ddot + RemlState::weighted_cross(x_r, &x_tau_j_reduced, &dw_i);
+        i_ddot = i_ddot + crate::faer_ndarray::fast_xt_diag_x(x_r, &ddw_ij);
+
+        // pair.a likelihood contribution:
+        //   0.5 tr(K_r Ï_{r,ij}) − 0.5 tr(K_r İ_{r,j} K_r İ_{r,i}).
+        // K_r İ_{r,α} — reuse inline dot().
+        let k = &self.k_reduced;
+        let k_dot_i_i = k.dot(&dot_i_i);
+        let k_dot_i_j = k.dot(&dot_i_j);
+        let a_lik = 0.5 * RemlState::trace_product(k, &i_ddot)
+            - 0.5 * RemlState::trace_product(&k_dot_i_j, &k_dot_i_i);
+
+        // pair.a penalty-basis contribution:
+        //   Ṡ_{r,α} = X_{r,α}^T X_r + X_r^T X_{r,α}
+        //   S̈_{r,ij} = X_{r,ij}^T X_r + X_r^T X_{r,ij}
+        //            + X_{r,i}^T X_{r,j} + X_{r,j}^T X_{r,i}
+        //   tr(G_r Ṡ_{r,i}) = Σ_k G_r_kk · diag(Ṡ_{r,i})_kk
+        //   tr(Ġ_{r,j} Ṡ_{r,i}) = −Σ_k G_r_kk² · diag(Ṡ_{r,j})_kk · diag(Ṡ_{r,i})_kk
+        let dot_s_i =
+            fast_atb(&x_tau_i_reduced, x_r) + fast_atb(x_r, &x_tau_i_reduced);
+        let dot_s_j =
+            fast_atb(&x_tau_j_reduced, x_r) + fast_atb(x_r, &x_tau_j_reduced);
+        let mut s_ddot = Array2::<f64>::zeros(k.raw_dim());
+        if let Some(x_rij) = x_tau_tau_reduced.as_ref() {
+            s_ddot = s_ddot + fast_atb(x_rij, x_r) + fast_atb(x_r, x_rij);
+        }
+        s_ddot = s_ddot
+            + fast_atb(&x_tau_i_reduced, &x_tau_j_reduced)
+            + fast_atb(&x_tau_j_reduced, &x_tau_i_reduced);
+        // −tr(Ġ_j Ṡ_i) = +Σ G²·diag(Ṡ_j)_kk·diag(Ṡ_i)_kk;
+        // −tr(G_r S̈_ij) = −Σ G·diag(S̈_ij)_kk.
+        let g_inv = &self.x_metric_reduced_inv_diag;
+        let rdim = k.nrows();
+        let mut a_pen = 0.0_f64;
+        for kk in 0..rdim {
+            a_pen += 0.5 * g_inv[kk] * g_inv[kk] * dot_s_j[[kk, kk]] * dot_s_i[[kk, kk]];
+            a_pen -= 0.5 * g_inv[kk] * s_ddot[[kk, kk]];
+        }
+        let phi_tau_tau_partial = a_lik + a_pen;
+
+        // ─── pair.g p-vector: (gΦ)_{τ_i τ_j}|β ──────────────────────────
+        //
+        // Assemble ḧ_{ij} identically to Primitive A's body.  We need:
+        //   K̇_{r,α} = −K_r İ_{r,α} K_r,
+        //   K̈_{r,ij} = −K_r Ï_{r,ij} K_r + K_r İ_{r,i} K_r İ_{r,j} K_r
+        //                                 + K_r İ_{r,j} K_r İ_{r,i} K_r.
+        // (Same expression used by Primitive A; rebuilt here so we don't
+        //  depend on a pre-built FirthTauTauPartialKernel.)
+        let dot_k_i = -k.dot(&dot_i_i).dot(k);
+        let dot_k_j = -k.dot(&dot_i_j).dot(k);
+        let a_i_red = -&dot_k_i; // K İ_i K
+        let a_j_red = -&dot_k_j; // K İ_j K
+        let k_ddot: Array2<f64> = -k.dot(&i_ddot).dot(k)
+            + a_i_red.dot(&dot_i_j).dot(k)
+            + a_j_red.dot(&dot_i_i).dot(k);
+
+        // ḧ_{ij} = 2 diag(X_{r,ij} K X_r^T)
+        //        + diag(X_r K̈_{ij} X_r^T)
+        //        + 2 diag(X_{r,i} K̇_j X_r^T)
+        //        + 2 diag(X_{r,j} K̇_i X_r^T)
+        //        + 2 diag(X_{r,i} K X_{r,j}^T).
+        let n = self.x_dense.nrows();
+        let mut dh_ij = Array1::<f64>::zeros(n);
+        if let Some(x_rij) = x_tau_tau_reduced.as_ref() {
+            let rij_k = x_rij.dot(k);
+            dh_ij = dh_ij + 2.0 * Self::rowwise_dot(&rij_k, x_r);
+        }
+        let xr_kddot = x_r.dot(&k_ddot);
+        dh_ij = dh_ij + Self::rowwise_dot(&xr_kddot, x_r);
+        let ri_kdot_j = x_tau_i_reduced.dot(&dot_k_j);
+        dh_ij = dh_ij + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
+        let rj_kdot_i = x_tau_j_reduced.dot(&dot_k_i);
+        dh_ij = dh_ij + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
+        let ri_k = x_tau_i_reduced.dot(k);
+        dh_ij = dh_ij + 2.0 * Self::rowwise_dot(&ri_k, &x_tau_j_reduced);
+
+        // term_A = 0.5 X_{τ_i τ_j}^T (w1 ⊙ h)
+        //        + 0.5 X_{τ_i}^T [ (w2 ⊙ η̇_j) ⊙ h + w1 ⊙ ḣ_j ]
+        let w1_h = &self.w1 * &self.h_diag;
+        let mut gphi_tau_tau = Array1::<f64>::zeros(self.x_dense.ncols());
+        if let Some(x_ij) = x_tau_tau.as_ref() {
+            gphi_tau_tau = gphi_tau_tau + 0.5 * x_ij.t().dot(&w1_h);
+        }
+        let inner_j = &(&(&self.w2 * &deta_j) * &self.h_diag) + &(&self.w1 * &dot_h_j);
+        gphi_tau_tau = gphi_tau_tau + 0.5 * x_tau_i.t().dot(&inner_j);
+
+        // term_B pieces:  v_{τ_i} = (w2 ⊙ η̇_i) ⊙ h + w1 ⊙ ḣ_i
+        let v_tau_i = &(&(&self.w2 * &deta_i) * &self.h_diag) + &(&self.w1 * &dot_h_i);
+        gphi_tau_tau = gphi_tau_tau + 0.5 * x_tau_j.t().dot(&v_tau_i);
+
+        // v̇_{τ_i,τ_j} =
+        //    (w3 ⊙ η̇_j ⊙ η̇_i) ⊙ h
+        //  + (w2 ⊙ η̈_{ij}) ⊙ h
+        //  + (w2 ⊙ η̇_i) ⊙ ḣ_j
+        //  + (w2 ⊙ η̇_j) ⊙ ḣ_i
+        //  +  w1 ⊙ ḧ_{ij}.
+        let mut v_dot_ij = &(&(&self.w3 * &deta_j) * &deta_i) * &self.h_diag;
+        v_dot_ij = v_dot_ij + &(&(&self.w2 * deta_ij_ref) * &self.h_diag);
+        v_dot_ij = v_dot_ij + &(&(&self.w2 * &deta_i) * &dot_h_j);
+        v_dot_ij = v_dot_ij + &(&(&self.w2 * &deta_j) * &dot_h_i);
+        v_dot_ij = v_dot_ij + &(&self.w1 * &dh_ij);
+        gphi_tau_tau = gphi_tau_tau + 0.5 * self.x_dense.t().dot(&v_dot_ij);
+
+        let tau_tau_kernel = if include_hphi_tau_tau_kernel {
+            Some(FirthTauTauPartialKernel {
+                x_tau_i_reduced,
+                x_tau_j_reduced,
+                deta_i_partial: deta_i,
+                deta_j_partial: deta_j,
+                dot_h_i_partial: dot_h_i,
+                dot_h_j_partial: dot_h_j,
+                dot_k_i_reduced: dot_k_i,
+                dot_k_j_reduced: dot_k_j,
+                dot_i_i_partial: dot_i_i,
+                dot_i_j_partial: dot_i_j,
+                x_tau_tau_reduced,
+                deta_ij_partial: deta_ij,
+            })
+        } else {
+            None
+        };
+
+        FirthTauTauExactKernel {
+            phi_tau_tau_partial,
+            gphi_tau_tau,
+            tau_tau_kernel,
+        }
+    }
+
+    /// Apply `Ṗ_τ V = 2 (M ⊙ Ṁ_τ) V` given the reduced τ-drift design
+    /// `x_tau_reduced` and the reduced Fisher-inverse drift `dot_k_reduced`.
+    ///
+    /// This mirrors the body of `apply_mtau_to_matrix` but accepts the
+    /// x_tau/dot_k pieces directly, letting Primitive A reuse the same
+    /// matrix-free Ṗ_τ applies without owning a `FirthTauPartialKernel`.
+    fn apply_mtau_from_reduced(
+        &self,
+        x_tau_reduced: &Array2<f64>,
+        dot_k_reduced: &Array2<f64>,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
+        if mat.nrows() != self.x_dense.nrows() || mat.ncols() == 0 {
+            return Array2::<f64>::zeros(mat.raw_dim());
+        }
+        let mut out = Array2::<f64>::zeros(mat.raw_dim());
+        for col in 0..mat.ncols() {
+            let v = mat.column(col).to_owned();
+            let szz = RemlState::reducedweighted_gram(&self.z_reduced, &v);
+            let mzz = self.k_reduced.dot(&szz).dot(&self.k_reduced);
+            let t1 = Self::rowwise_bilinear(&self.z_reduced, &mzz, x_tau_reduced);
+
+            let szt =
+                RemlState::reduced_crossweighted_gram(&self.z_reduced, x_tau_reduced, &v);
+            let mzt = self.k_reduced.dot(&szt).dot(&self.k_reduced);
+            let t2 = RemlState::reduced_diag_gram(&self.z_reduced, &mzt);
+
+            let t3 = RemlState::apply_hadamard_gram(
+                &self.z_reduced,
+                &self.k_reduced,
+                dot_k_reduced,
+                &v,
+            );
+
+            let y = 2.0 * (t1 + t2 + t3);
+            out.column_mut(col).assign(&y);
+        }
+        out
+    }
+
+    /// Apply `P̈_{ij} V = 4 (Ṁ_i ⊙ Ṁ_j) V + 2 (M ⊙ M̈_{ij}) V` columnwise.
+    ///
+    /// `M̈_{ij}` expands into 9 pieces `Y_α C Y_βᵀ`; `Ṁ_i ⊙ Ṁ_j` into 9 cross
+    /// pieces `(Y_{1,α} B_{1,α} W_{1,α}ᵀ) ⊙ (Y_{2,β} B_{2,β} W_{2,β}ᵀ)`.  Both
+    /// are evaluated via the matrix-free identities:
+    ///
+    ///   [(ZAZᵀ) ⊙ (YBWᵀ) v]_i   = rowwise_bilinear(Y, B · (Wᵀdiag(v)Z) · A, Z)_i,
+    ///   [(YBWᵀ) ⊙ (Y'B'W'ᵀ) v]_i= rowwise_bilinear(Y, B · (Wᵀdiag(v)W') · B'ᵀ, Y')_i,
+    ///
+    /// with S := row-wise reducedweighted Gram.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_p_ddot_ij(
+        &self,
+        x_r: &Array2<f64>,
+        x_ri: &Array2<f64>,
+        x_rj: &Array2<f64>,
+        x_rij: &Array2<f64>,
+        k: &Array2<f64>,
+        dot_k_i: &Array2<f64>,
+        dot_k_j: &Array2<f64>,
+        k_ddot: &Array2<f64>,
+        x_tau_tau_is_some: bool,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
+        let n = self.x_dense.nrows();
+        let m = mat.ncols();
+        if mat.nrows() != n || m == 0 {
+            return Array2::<f64>::zeros(mat.raw_dim());
+        }
+        let mut out = Array2::<f64>::zeros((n, m));
+        for col in 0..m {
+            let v = mat.column(col).to_owned();
+            // Shared reducedweighted Grams for this column.  Only the Grams
+            // actually appearing in the 18 pieces below are computed.
+            let s_zz = RemlState::reducedweighted_gram(x_r, &v); // Z'diag(v)Z
+            let s_zj = RemlState::reduced_crossweighted_gram(x_r, x_rj, &v); // Z'diag(v)Y_j
+            let s_iz = RemlState::reduced_crossweighted_gram(x_ri, x_r, &v); // Y_i'diag(v)Z
+            let s_jz = RemlState::reduced_crossweighted_gram(x_rj, x_r, &v); // Y_j'diag(v)Z
+            let s_ij = RemlState::reduced_crossweighted_gram(x_ri, x_rj, &v); // Y_i'diag(v)Y_j
+
+            // ── 4 (Ṁ_i ⊙ Ṁ_j) v ──
+            // Ṁ_i has three pieces:
+            //   P_i,a = Y_i K Zᵀ          — Y=Y_i, B=K, W=Z
+            //   P_i,b = Z K̇_i Zᵀ         — Y=Z,   B=K̇_i, W=Z
+            //   P_i,c = Z K Y_iᵀ          — Y=Z,   B=K,  W=Y_i
+            // And symmetrically for Ṁ_j with (i→j).
+            //
+            // For each cross pair (α, β), compute
+            //   core = B_α · (W_αᵀ diag(v) W_β) · B_βᵀ,
+            //   y_piece = rowwise_bilinear(Y_α, core, Y_β),
+            // then sum all 9 and scale by 4.
+            let mut mdot_mdot = Array1::<f64>::zeros(n);
+            // (a_i, a_j): Y_i, K, Z  ×  Y_j, K, Z  → W_α=Z, W_β=Z, S = s_zz
+            {
+                let core = k.dot(&s_zz).dot(&k.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_ri, &core, x_rj);
+            }
+            // (a_i, b_j): Y_i, K, Z  ×  Z, K̇_j, Z  → S = s_zz; core = K · s_zz · K̇_jᵀ
+            {
+                let core = k.dot(&s_zz).dot(&dot_k_j.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_ri, &core, x_r);
+            }
+            // (a_i, c_j): Y_i, K, Z  ×  Z, K, Y_j  → S = s_zj; core = K · s_zj · Kᵀ
+            {
+                let core = k.dot(&s_zj).dot(&k.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_ri, &core, x_r);
+            }
+            // (b_i, a_j): Z, K̇_i, Z  ×  Y_j, K, Z  → S = s_zz; core = K̇_i · s_zz · Kᵀ
+            {
+                let core = dot_k_i.dot(&s_zz).dot(&k.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_r, &core, x_rj);
+            }
+            // (b_i, b_j): Z, K̇_i, Z  ×  Z, K̇_j, Z  → S = s_zz; core = K̇_i · s_zz · K̇_jᵀ
+            {
+                let core = dot_k_i.dot(&s_zz).dot(&dot_k_j.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+            // (b_i, c_j): Z, K̇_i, Z  ×  Z, K, Y_j  → S = s_zj; core = K̇_i · s_zj · Kᵀ
+            {
+                let core = dot_k_i.dot(&s_zj).dot(&k.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+            // (c_i, a_j): Z, K, Y_i  ×  Y_j, K, Z  → S = Y_iᵀ diag(v) Z = s_iz;
+            //   core = K · s_iz · Kᵀ
+            {
+                let core = k.dot(&s_iz).dot(&k.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_r, &core, x_rj);
+            }
+            // (c_i, b_j): Z, K, Y_i  ×  Z, K̇_j, Z  → S = Y_iᵀ diag(v) Z = s_iz;
+            //   core = K · s_iz · K̇_jᵀ
+            {
+                let core = k.dot(&s_iz).dot(&dot_k_j.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+            // (c_i, c_j): Z, K, Y_i  ×  Z, K, Y_j  → S = Y_iᵀ diag(v) Y_j = s_ij;
+            //   core = K · s_ij · Kᵀ
+            {
+                let core = k.dot(&s_ij).dot(&k.t());
+                mdot_mdot = mdot_mdot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+
+            // ── 2 (M ⊙ M̈_{ij}) v ──
+            // Each piece has the form Y_α C W_βᵀ; M = Z K Zᵀ with A=K.
+            // Identity:  [(ZAZᵀ) ⊙ (Y_α C W_βᵀ) v]_i
+            //          = rowwise_bilinear(Y_α, C · (W_βᵀ diag(v) Z) · A, Z).
+            let mut m_mddot = Array1::<f64>::zeros(n);
+            // (a) Y_α = X_{r,ij}, C = K, W_β = X_r  → W_βᵀ diag(v) Z = s_zz
+            if x_tau_tau_is_some {
+                let core = k.dot(&s_zz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_rij, &core, x_r);
+            }
+            // (b) Y_α = X_r, C = K, W_β = X_{r,ij} → W_βᵀ diag(v) Z = X_{r,ij}ᵀ diag(v) Z
+            if x_tau_tau_is_some {
+                let s_ijz = RemlState::reduced_crossweighted_gram(x_rij, x_r, &v);
+                let core = k.dot(&s_ijz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+            // (c) Y_α = X_{r,i}, C = K̇_j, W_β = X_r → S = s_zz
+            {
+                let core = dot_k_j.dot(&s_zz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_ri, &core, x_r);
+            }
+            // (d) Y_α = X_r, C = K̇_j, W_β = X_{r,i} → W_βᵀ diag(v) Z = s_iz
+            {
+                let core = dot_k_j.dot(&s_iz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+            // (e) Y_α = X_{r,j}, C = K̇_i, W_β = X_r → S = s_zz
+            {
+                let core = dot_k_i.dot(&s_zz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_rj, &core, x_r);
+            }
+            // (f) Y_α = X_r, C = K̇_i, W_β = X_{r,j} → W_βᵀ diag(v) Z = s_jz
+            {
+                let core = dot_k_i.dot(&s_jz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+            // (g) Y_α = X_{r,i}, C = K, W_β = X_{r,j} → W_βᵀ diag(v) Z = s_jz
+            {
+                let core = k.dot(&s_jz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_ri, &core, x_r);
+            }
+            // (h) Y_α = X_{r,j}, C = K, W_β = X_{r,i} → W_βᵀ diag(v) Z = s_iz
+            {
+                let core = k.dot(&s_iz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_rj, &core, x_r);
+            }
+            // (i) Y_α = X_r, C = K̈_ij, W_β = X_r → S = s_zz
+            {
+                let core = k_ddot.dot(&s_zz).dot(k);
+                m_mddot = m_mddot + Self::rowwise_bilinear(x_r, &core, x_r);
+            }
+
+            let col_out = 4.0 * mdot_mdot + 2.0 * m_mddot;
+            out.column_mut(col).assign(&col_out);
+        }
+        out
+    }
+
+    /// Primitive B — prepare step: assemble the reduced kernel for
+    /// D_β((H_φ)_τ|_β)[v].
+    ///
+    /// Consumes the existing `FirthTauPartialKernel`, the τ-drift partials
+    /// (`deta_partial = η̇_τ = X_τ β` and `dot_i_partial = İ_τ`), the
+    /// β-direction `FirthDirection` built from `deta = X v`, and
+    /// `x_tau_v = X_τ v`, and returns a cached kernel carrying the mixed
+    /// β-τ reduced quantities A_v, dh_v, D_β(İ_τ)[v], D_β(K̇_τ)[v],
+    /// D_β(ḣ_τ)[v], and the w-chain derivatives needed by
+    /// `d_beta_hphi_tau_partial_apply`.
+    pub(crate) fn d_beta_hphi_tau_partial_prepare_from_partials(
+        &self,
+        tau_kernel: &FirthTauPartialKernel,
+        deta_partial: &Array1<f64>,
+        dot_i_partial: &Array2<f64>,
+        beta_direction: &FirthDirection,
+        x_tau_v: &Array1<f64>,
+    ) -> FirthTauBetaPartialKernel {
+        // D_β(İ_τ)[v] — three-piece symmetric form from the product rule on
+        //   İ_τ = X_{r,τ}ᵀ W X_r + X_rᵀ W X_{r,τ} + X_rᵀ diag(w' ⊙ η̇_τ) X_r,
+        // where W = diag(w(η)) is the Fisher weight (not its derivative).
+        // The β-differential hits w (through η=Xβ) and η̇_τ (through X_τ β):
+        //   D_β(X_{r,τ}ᵀ W X_r)[v] = X_{r,τ}ᵀ diag(w' ⊙ δη_v) X_r,
+        //   D_β(X_rᵀ diag(w' ⊙ η̇_τ) X_r)[v]
+        //     = X_rᵀ diag(w'' ⊙ η̇_τ ⊙ δη_v + w' ⊙ δη_{τ,v}) X_r,
+        // where δη_v = beta_direction.deta, δη_{τ,v} = x_tau_v.
+        // s_v := w' ⊙ δη_v (same weight the FirthDirection uses to build
+        // g_u_reduced); b_vvec := w'' ⊙ δη_v = beta_direction.b_uvec is the
+        // weight for the third-term product-rule piece.
+        let s_v = &self.w1 * &beta_direction.deta;
+        let mixed_diag_weight =
+            &(&tau_kernel.dotw1 * &beta_direction.deta) + &(&self.w1 * x_tau_v);
+        let cross1 = RemlState::reduced_crossweighted_gram(
+            &tau_kernel.x_tau_reduced,
+            &self.x_reduced,
+            &s_v,
+        );
+        let cross2 = RemlState::reduced_crossweighted_gram(
+            &self.x_reduced,
+            &tau_kernel.x_tau_reduced,
+            &s_v,
+        );
+        let diag_piece = RemlState::reducedweighted_gram(&self.x_reduced, &mixed_diag_weight);
+        let d_beta_dot_i = &cross1 + &cross2 + &diag_piece;
+
+        // D_β(K̇_τ)[v] — direct Leibniz on K̇_τ = -K_r İ_τ K_r with
+        //   D_β K_r[v] = -K_r I'_v K_r = -beta_direction.a_u_reduced.
+        // Expanding yields
+        //   D_β K̇_τ[v] = +A_v İ_τ K_r − K_r D_β(İ_τ)[v] K_r + K_r İ_τ A_v,
+        // where A_v := beta_direction.a_u_reduced = +K_r I'_v K_r.  The
+        // FirthDirection carries a_u with the opposite sign convention to the
+        // derivation block's "A_v"; we keep the direction convention and
+        // compose signs correctly here.
+        let term_a = beta_direction
+            .a_u_reduced
+            .dot(dot_i_partial)
+            .dot(&self.k_reduced);
+        let term_b = self.k_reduced.dot(&d_beta_dot_i).dot(&self.k_reduced);
+        let term_c = self
+            .k_reduced
+            .dot(dot_i_partial)
+            .dot(&beta_direction.a_u_reduced);
+        let d_beta_dot_k = &term_a - &term_b + &term_c;
+
+        // D_β(ḣ_τ)[v] — β-differential of
+        //   ḣ_τ = 2·diag(X_{r,τ} K_r X_rᵀ) + diag(X_r K̇_τ X_rᵀ):
+        //   D_β ḣ_τ[v]
+        //     = 2·diag(X_{r,τ} D_β K_r[v] X_rᵀ) + diag(X_r D_β K̇_τ[v] X_rᵀ)
+        //     = -2·diag(X_{r,τ} A_v X_rᵀ) + diag(X_r (D_β K̇_τ[v]) X_rᵀ).
+        let cross_diag = Self::rowwise_bilinear(
+            &tau_kernel.x_tau_reduced,
+            &beta_direction.a_u_reduced,
+            &self.x_reduced,
+        );
+        let inner_diag = RemlState::reduced_diag_gram(&self.x_reduced, &d_beta_dot_k);
+        let d_beta_dot_h = -2.0 * &cross_diag + &inner_diag;
+
+        FirthTauBetaPartialKernel {
+            x_tau_reduced: tau_kernel.x_tau_reduced.clone(),
+            deta_partial: deta_partial.clone(),
+            dot_h_partial: tau_kernel.dot_h_partial.clone(),
+            dot_i_partial: dot_i_partial.clone(),
+            dot_k_reduced: tau_kernel.dot_k_reduced.clone(),
+            deta_v: beta_direction.deta.clone(),
+            deta_tau_v: x_tau_v.clone(),
+            g_v_reduced: beta_direction.g_u_reduced.clone(),
+            a_v_reduced: beta_direction.a_u_reduced.clone(),
+            dh_v: beta_direction.dh.clone(),
+            b_vvec: beta_direction.b_uvec.clone(),
+            d_beta_dot_i,
+            d_beta_dot_k,
+            d_beta_dot_h,
+        }
+    }
+
+    /// Apply the mixed β-τ P-action `P_{τ,v} · mat` to an n×m column block.
+    ///
+    /// Expansion:
+    ///   P_{τ,v} = 2 (M_v ⊙ M_τ) + 2 (M ⊙ M_{τ,v}),
+    ///     M_v     = X_r K̇_v X_rᵀ,  K̇_v = -A_v (A_v = a_v_reduced),
+    ///     M_τ     = X_{r,τ} K_r X_rᵀ + X_r K_r X_{r,τ}ᵀ + X_r K̇_τ X_rᵀ,
+    ///     M_{τ,v} = X_{r,τ} K̇_v X_rᵀ + X_r K̇_v X_{r,τ}ᵀ + X_r D_β K̇_τ[v] X_rᵀ.
+    /// Hadamard-Gram pieces are evaluated column-wise via
+    ///   ((Z M_A Wᵀ) ⊙ (Y M_B Xᵀ)) v row-i
+    ///       = z_iᵀ M_A (Wᵀ diag(v) X) M_Bᵀ y_i.
+    fn apply_p_tau_v_to_matrix(
+        &self,
+        kernel: &FirthTauBetaPartialKernel,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
+        let n = self.x_dense.nrows();
+        if mat.nrows() != n || mat.ncols() == 0 {
+            return Array2::<f64>::zeros(mat.raw_dim());
+        }
+        let z = &self.z_reduced;
+        let z_tau = &kernel.x_tau_reduced;
+        let k_r = &self.k_reduced;
+        let a_v = &kernel.a_v_reduced; // = +K_r I'_v K_r  (so K̇_v = -a_v)
+        let dot_k_tau = &kernel.dot_k_reduced; // K̇_τ = -K_r İ_τ K_r
+        let d_beta_dot_k = &kernel.d_beta_dot_k; // D_β K̇_τ[v]
+        let mut out = Array2::<f64>::zeros(mat.raw_dim());
+        for col in 0..mat.ncols() {
+            let v = mat.column(col).to_owned();
+            let s_zz = RemlState::reducedweighted_gram(z, &v);
+            let s_z_ztau = RemlState::reduced_crossweighted_gram(z, z_tau, &v);
+
+            // Piece 1: (X_r K̇_v X_rᵀ ⊙ X_{r,τ} K_r X_rᵀ) · v
+            //   = -rowwise_bilinear(Z, a_v S_zz K_r, Z_τ).
+            let mid_1 = a_v.dot(&s_zz).dot(k_r);
+            let t1 = -Self::rowwise_bilinear(z, &mid_1, z_tau);
+            // Piece 2: (X_r K̇_v X_rᵀ ⊙ X_r K_r X_{r,τ}ᵀ) · v
+            //   = -reduced_diag_gram(Z, a_v S_z_ztau K_r).
+            let mid_2 = a_v.dot(&s_z_ztau).dot(k_r);
+            let t2 = -RemlState::reduced_diag_gram(z, &mid_2);
+            // Piece 3: (X_r K̇_v X_rᵀ ⊙ X_r K̇_τ X_rᵀ) · v
+            //   = -reduced_diag_gram(Z, a_v S_zz K̇_τ).
+            let mid_3 = a_v.dot(&s_zz).dot(dot_k_tau);
+            let t3 = -RemlState::reduced_diag_gram(z, &mid_3);
+            // Piece 4: (M ⊙ X_{r,τ} K̇_v X_rᵀ) · v
+            //   = -rowwise_bilinear(Z, K_r S_zz a_v, Z_τ).
+            let mid_4 = k_r.dot(&s_zz).dot(a_v);
+            let t4 = -Self::rowwise_bilinear(z, &mid_4, z_tau);
+            // Piece 5: (M ⊙ X_r K̇_v X_{r,τ}ᵀ) · v
+            //   = -reduced_diag_gram(Z, K_r S_z_ztau a_v).
+            let mid_5 = k_r.dot(&s_z_ztau).dot(a_v);
+            let t5 = -RemlState::reduced_diag_gram(z, &mid_5);
+            // Piece 6: (M ⊙ X_r D_β K̇_τ[v] X_rᵀ) · v.
+            let t6 = RemlState::apply_hadamard_gram(z, k_r, d_beta_dot_k, &v);
+
+            // P_{τ,v} = 2·(pieces 1-3) + 2·(pieces 4-6); each group contributes
+            // with the same outer factor 2.
+            let y = 2.0 * (t1 + t2 + t3 + t4 + t5 + t6);
+            out.column_mut(col).assign(&y);
+        }
+        out
+    }
+
+    pub(crate) fn d_beta_hphi_tau_partial_apply(
+        &self,
+        x_tau: &Array2<f64>,
+        kernel: &FirthTauBetaPartialKernel,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        let p = self.x_dense.ncols();
+        if rhs.nrows() != p {
+            return Array2::<f64>::zeros((p, rhs.ncols()));
+        }
+        if rhs.ncols() == 0 || p == 0 {
+            return Array2::<f64>::zeros((p, rhs.ncols()));
+        }
+        // Matrix-free block apply of D_β((H_φ)_τ|_β)[v] evaluated on a rhs V.
+        // Structure follows hphi_tau_partial_apply but replaces every weight
+        // and every reduced Gram with its β-derivative in direction v:
+        //
+        //   (H_φ)_τ|_β (V) = 0.5 [X_τᵀ r(V) + Xᵀ r_τ(V)].
+        //
+        // D_β[v] leaves X, X_τ fixed and acts on r, r_τ:
+        //   D_β((H_φ)_τ|_β)[v](V) = 0.5 [X_τᵀ D_β r(V)[v] + Xᵀ D_β r_τ(V)[v]].
+        let etav = self.x_dense.dot(rhs);
+        let etav_tau = x_tau.dot(rhs);
+        let deta_v = &kernel.deta_v;
+        let deta_tau_v = &kernel.deta_tau_v;
+        let eta_tau = &kernel.deta_partial;
+        let dot_h = &kernel.dot_h_partial;
+
+        // Reuse τ-kernel weights.  dotw1 = w'' ⊙ η̇_τ, dotw2 = w''' ⊙ η̇_τ.
+        let dotw1 = &self.w2 * eta_tau;
+        let dotw2 = &self.w3 * eta_tau;
+
+        // β-derivative scaling vectors in direction v:
+        //   c_v              = D_β(w''·h)[v]    = w'''·δη_v·h + w''·dh_v
+        //   b_vvec           = D_β(w')[v]       = w''·δη_v   (= kernel.b_vvec)
+        //   d_beta_dotw1_vec = D_β(w''·η̇_τ)[v]  = w'''·δη_v·η̇_τ + w''·δη_{τ,v}
+        //   d_beta_dotw2_vec = D_β(w'''·η̇_τ)[v] = w''''·δη_v·η̇_τ + w'''·δη_{τ,v}
+        let c_v = &(&(&self.w3 * deta_v) * &self.h_diag) + &(&self.w2 * &kernel.dh_v);
+        let b_vvec = &kernel.b_vvec;
+        let d_beta_dotw1_vec =
+            &(&(&self.w3 * deta_v) * eta_tau) + &(&self.w2 * deta_tau_v);
+        let d_beta_dotw2_vec =
+            &(&(&self.w4 * deta_v) * eta_tau) + &(&self.w3 * deta_tau_v);
+
+        // Single-τ pieces (identical to hphi_tau_partial_apply).
+        let qv = &etav * &self.w1.view().insert_axis(Axis(1));
+        let qv_tau = &etav * &dotw1.view().insert_axis(Axis(1))
+            + &etav_tau * &self.w1.view().insert_axis(Axis(1));
+        let m_qv = self.apply_pbar_to_matrix(&qv);
+        // apply_mtau_to_matrix only reads x_tau_reduced and dot_k_reduced off
+        // the τ-kernel, but owning the full struct is cheap.
+        let tau_kernel_view = FirthTauPartialKernel {
+            dotw1: dotw1.clone(),
+            dotw2: dotw2.clone(),
+            dot_h_partial: dot_h.clone(),
+            x_tau_reduced: kernel.x_tau_reduced.clone(),
+            dot_k_reduced: kernel.dot_k_reduced.clone(),
+        };
+        let m_qv_tau = self.apply_mtau_to_matrix(&tau_kernel_view, &qv)
+            + self.apply_pbar_to_matrix(&qv_tau);
+
+        // β-derivatives of the single-τ pieces:
+        //   D_β qv     = etav · D_β w'[v]       = etav · b_vvec
+        //   D_β qv_tau = etav · D_β dotw1[v] + etav_tau · D_β w'[v]
+        let d_beta_qv = &etav * &b_vvec.view().insert_axis(Axis(1));
+        let d_beta_qv_tau = &etav * &d_beta_dotw1_vec.view().insert_axis(Axis(1))
+            + &etav_tau * &b_vvec.view().insert_axis(Axis(1));
+
+        //   D_β m_qv = P_v · qv + P · D_β qv
+        let d_beta_m_qv = self.apply_p_u_to_matrix(&kernel.a_v_reduced, &qv)
+            + self.apply_pbar_to_matrix(&d_beta_qv);
+
+        //   D_β m_qv_tau = P_{τ,v}·qv + P_τ·D_β qv + P_v·qv_tau + P·D_β qv_tau
+        let d_beta_m_qv_tau = self.apply_p_tau_v_to_matrix(kernel, &qv)
+            + self.apply_mtau_to_matrix(&tau_kernel_view, &d_beta_qv)
+            + self.apply_p_u_to_matrix(&kernel.a_v_reduced, &qv_tau)
+            + self.apply_pbar_to_matrix(&d_beta_qv_tau);
+
+        // D_β rv[v] where rv = etav·(w''·h) − w'·m_qv:
+        //   D_β rv[v] = etav·c_v − b_vvec·m_qv − w'·D_β m_qv.
+        let d_beta_rv = &etav * &c_v.view().insert_axis(Axis(1))
+            - &m_qv * &b_vvec.view().insert_axis(Axis(1))
+            - &d_beta_m_qv * &self.w1.view().insert_axis(Axis(1));
+
+        // D_β rv_tau[v] where
+        //   rv_tau = etav·dotw2·h + etav_tau·w''·h + etav·w''·dot_h
+        //            − m_qv·dotw1 − m_qv_tau·w'.
+        //
+        //   D_β(dotw2·h)[v]   = (w''''·δη_v·η̇_τ + w'''·δη_{τ,v})·h
+        //                        + dotw2·dh_v,
+        //   D_β(w''·h)[v]     = c_v,
+        //   D_β(w''·dot_h)[v] = w'''·δη_v·dot_h + w''·D_β dot_h[v],
+        //   D_β dotw1[v]      = d_beta_dotw1_vec,
+        //   D_β w'[v]         = b_vvec.
+        let d_beta_dotw2_h = &(&d_beta_dotw2_vec * &self.h_diag) + &(&dotw2 * &kernel.dh_v);
+        let d_beta_w2_doth =
+            &(&(&self.w3 * deta_v) * dot_h) + &(&self.w2 * &kernel.d_beta_dot_h);
+
+        let d_beta_rv_tau = &etav * &d_beta_dotw2_h.view().insert_axis(Axis(1))
+            + &etav_tau * &c_v.view().insert_axis(Axis(1))
+            + &etav * &d_beta_w2_doth.view().insert_axis(Axis(1))
+            - &d_beta_m_qv * &dotw1.view().insert_axis(Axis(1))
+            - &m_qv * &d_beta_dotw1_vec.view().insert_axis(Axis(1))
+            - &d_beta_m_qv_tau * &self.w1.view().insert_axis(Axis(1))
+            - &m_qv_tau * &b_vvec.view().insert_axis(Axis(1));
+
+        0.5 * (x_tau.t().dot(&d_beta_rv) + self.x_dense.t().dot(&d_beta_rv_tau))
     }
 }
 
@@ -1973,10 +2923,25 @@ mod tests {
         );
     }
 
-    /// Verify Primitive A (pair τ_i × τ_j) by central-FD'ing the single-τ
-    /// primitive along τ_j at fixed β.  Identity:
-    ///     ∂/∂τ_j [Hφ_{τ_i}|β · V]  =  Hφ_{τ_iτ_j}|β · V.
-    /// Tolerance 1e-7 relative max-abs.
+    /// Verify the Primitive A body (`hphi_tau_tau_partial_apply`) against a
+    /// finite-difference reference of the single-τ Primitive (
+    /// `hphi_tau_partial_apply`).
+    ///
+    /// Identity under test:
+    ///     ∂/∂τ_j  { (H_φ)_τ_i |_β · V }   =   ∂²H_φ/∂τ_i ∂τ_j |_β · V.
+    ///
+    /// Central-difference reference:
+    ///   1. Evaluate the single-τ primitive at x, and at x ± h·X_τ_j
+    ///      — rebuild the FirthDenseOperator (with fresh identifiable Q)
+    ///      at each perturbed design; H_φ applied to a p-space rhs is
+    ///      basis-invariant in unreduced β-coords, so Q rotation does not
+    ///      contaminate the comparison.
+    ///   2. FD_{i,j} = (T_{plus} − T_{minus}) / (2h) with T = hphi_tau_i_apply(V).
+    ///   3. Contract both (i,j) and (j,i) directions and verify symmetry
+    ///      of the analytic as a cross-check.
+    ///
+    /// Tolerance: 1e-7 relative max-abs (h chosen to balance truncation
+    /// error at ~h² and evaluator roundoff at ~ε/h).
     #[test]
     fn firthphi_tau_tau_partial_matches_finite_difference() {
         let x = array![
@@ -2008,53 +2973,55 @@ mod tests {
         let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
         let p = x.ncols();
 
+        // Reproducible small rhs block (p × m).
         let m = 3usize;
-        let vals = [0.21, -0.44, 0.17, 0.38, 0.05, -0.22, -0.11, 0.27, 0.31];
         let mut rhs = Array2::<f64>::zeros((p, m));
+        let vals = [
+            0.21, -0.44, 0.17, 0.38, 0.05, -0.22, -0.11, 0.27, 0.31,
+        ];
         for r in 0..p {
             for c in 0..m {
                 rhs[[r, c]] = vals[(r * m + c) % vals.len()];
             }
         }
 
-        let x_tau_i_r = op.reduce_explicit_design(&x_tau_i);
-        let x_tau_j_r = op.reduce_explicit_design(&x_tau_j);
+        // ── Analytic τ×τ pair apply at base design (x_tau_tau = None,
+        //    deta_ij = None, i.e. design is linear in τ).
+        let x_tau_i_reduced = op.reduce_explicit_design(&x_tau_i);
+        let x_tau_j_reduced = op.reduce_explicit_design(&x_tau_j);
         let deta_i = x_tau_i.dot(&beta);
         let deta_j = x_tau_j.dot(&beta);
-        let (dot_i_i, dot_h_i) = op.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i);
-        let (dot_i_j, dot_h_j) = op.dot_i_and_h_from_reduced(&x_tau_j_r, &deta_j);
+        let (dot_i_i, dot_h_i) = op.dot_i_and_h_from_reduced(&x_tau_i_reduced, &deta_i);
+        let (dot_i_j, dot_h_j) = op.dot_i_and_h_from_reduced(&x_tau_j_reduced, &deta_j);
 
         let kernel_ij = op.hphi_tau_tau_partial_prepare_from_partials(
-            x_tau_i_r.clone(),
-            x_tau_j_r.clone(),
-            deta_i.clone(),
-            deta_j.clone(),
-            dot_i_i.clone(),
-            dot_i_j.clone(),
+            x_tau_i_reduced.clone(),
+            x_tau_j_reduced.clone(),
+            &deta_i,
+            &deta_j,
             dot_h_i.clone(),
             dot_h_j.clone(),
+            dot_i_i.clone(),
+            dot_i_j.clone(),
             None,
             None,
         );
-        let analytic_ij =
-            op.hphi_tau_tau_partial_apply(&x_tau_i, &x_tau_j, None, &kernel_ij, &rhs);
-
         let kernel_ji = op.hphi_tau_tau_partial_prepare_from_partials(
-            x_tau_j_r,
-            x_tau_i_r,
-            deta_j,
-            deta_i,
-            dot_i_j,
-            dot_i_i,
+            x_tau_j_reduced,
+            x_tau_i_reduced,
+            &deta_j,
+            &deta_i,
             dot_h_j,
             dot_h_i,
+            dot_i_j,
+            dot_i_i,
             None,
             None,
         );
-        let analytic_ji =
-            op.hphi_tau_tau_partial_apply(&x_tau_j, &x_tau_i, None, &kernel_ji, &rhs);
+        let analytic_ij = op.hphi_tau_tau_partial_apply(&x_tau_i, &x_tau_j, &kernel_ij, &rhs);
+        let analytic_ji = op.hphi_tau_tau_partial_apply(&x_tau_j, &x_tau_i, &kernel_ji, &rhs);
 
-        //  Symmetry cross-check (Clairaut).
+        // Symmetry cross-check (Clairaut): ∂²H/∂τ_i∂τ_j = ∂²H/∂τ_j∂τ_i.
         let sym_diff: f64 = (&analytic_ij - &analytic_ji)
             .iter()
             .map(|v| v.abs())
@@ -2070,41 +3037,196 @@ mod tests {
             "τ×τ primitive not symmetric in direction order: sym_diff={sym_diff:.3e}"
         );
 
-        //  FD reference: central difference of single-τ primitive along τ_j.
-        let h = 1e-4_f64;
-        let fd_block_i = |x_eval: &Array2<f64>| -> Array2<f64> {
+        // ── FD reference: central difference of single-τ primitive in
+        //    τ_j direction, evaluated along τ_i.
+        let h = 1e-5_f64;
+        let fd_block = |x_eval: &Array2<f64>| -> Array2<f64> {
             let eta_e = x_eval.dot(&beta);
-            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed operator");
+            let op_e =
+                FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed firth operator");
             let x_tau_i_r = op_e.reduce_explicit_design(&x_tau_i);
             let deta_i_e = x_tau_i.dot(&beta);
-            let (dot_i_i_e, dot_h_i_e) = op_e.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i_e);
-            let ker_i_e = op_e.hphi_tau_partial_prepare_from_partials(
+            let (dot_i_i_e, dot_h_i_e) =
+                op_e.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i_e);
+            let kernel_i_e = op_e.hphi_tau_partial_prepare_from_partials(
                 x_tau_i_r,
                 &deta_i_e,
                 dot_h_i_e,
                 dot_i_i_e,
             );
-            op_e.hphi_tau_partial_apply(&x_tau_i, &ker_i_e, &rhs)
+            op_e.hphi_tau_partial_apply(&x_tau_i, &kernel_i_e, &rhs)
         };
         let x_plus = &x + &(h * &x_tau_j);
         let x_minus = &x - &(h * &x_tau_j);
-        let fd_ij = (&fd_block_i(&x_plus) - &fd_block_i(&x_minus)) / (2.0 * h);
+        let fd_ij = (&fd_block(&x_plus) - &fd_block(&x_minus)) / (2.0 * h);
 
-        let rel_maxabs = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+        // ── Compare analytic_ij (contracted against V along τ_j→analytic's
+        //    second index) to fd_ij (FD of T_i in τ_j direction).
+        let rel_max_abs_diff = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
             let scale = a
                 .iter()
                 .chain(b.iter())
                 .map(|v| v.abs())
                 .fold(0.0_f64, f64::max)
                 .max(1.0);
-            let max = (a - b).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-            max / scale
+            let max_diff = (a - b).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            max_diff / scale
         };
-        let err_ij = rel_maxabs(&analytic_ij, &fd_ij);
+        let err_ij = rel_max_abs_diff(&analytic_ij, &fd_ij);
+
+        // Also FD the other direction and compare to analytic_ji, to
+        // double-cover the primitive.
+        let fd_block_j = |x_eval: &Array2<f64>| -> Array2<f64> {
+            let eta_e = x_eval.dot(&beta);
+            let op_e =
+                FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed firth operator");
+            let x_tau_j_r = op_e.reduce_explicit_design(&x_tau_j);
+            let deta_j_e = x_tau_j.dot(&beta);
+            let (dot_i_j_e, dot_h_j_e) =
+                op_e.dot_i_and_h_from_reduced(&x_tau_j_r, &deta_j_e);
+            let kernel_j_e = op_e.hphi_tau_partial_prepare_from_partials(
+                x_tau_j_r,
+                &deta_j_e,
+                dot_h_j_e,
+                dot_i_j_e,
+            );
+            op_e.hphi_tau_partial_apply(&x_tau_j, &kernel_j_e, &rhs)
+        };
+        let x_plus_i = &x + &(h * &x_tau_i);
+        let x_minus_i = &x - &(h * &x_tau_i);
+        let fd_ji = (&fd_block_j(&x_plus_i) - &fd_block_j(&x_minus_i)) / (2.0 * h);
+        let err_ji = rel_max_abs_diff(&analytic_ji, &fd_ji);
+
+        let tol = 1e-7_f64;
         assert!(
-            err_ij < 1e-7,
-            "Primitive A mismatch (i,j): rel_max_abs={err_ij:.3e} > 1e-7\n\
-             analytic=\n{analytic_ij:?}\nfd=\n{fd_ij:?}"
+            err_ij < tol,
+            "∂²H_φ/∂τ_i∂τ_j apply mismatch (i,j): rel_max_abs_diff={err_ij:.3e} > {tol:.1e}\n\
+             analytic=\n{analytic_ij:?}\n\
+             fd=\n{fd_ij:?}"
+        );
+        assert!(
+            err_ji < tol,
+            "∂²H_φ/∂τ_j∂τ_i apply mismatch (j,i): rel_max_abs_diff={err_ji:.3e} > {tol:.1e}\n\
+             analytic=\n{analytic_ji:?}\n\
+             fd=\n{fd_ji:?}"
+        );
+    }
+
+    /// Verify the Primitive B body (`d_beta_hphi_tau_partial_apply`) against a
+    /// finite-difference reference of the single-τ Primitive
+    /// (`hphi_tau_partial_apply`).
+    ///
+    /// Identity under test (β held in the unreduced ambient; the design X is
+    /// fixed so only w, η̇_τ = X_τ β, and their β-derivatives move):
+    ///     D_β [ (H_φ)_τ|_β (β) · V ] [v]
+    ///       = d_beta_hphi_tau_partial_apply(v, V).
+    ///
+    /// Central-difference reference:
+    ///   1. Evaluate T(t) := hphi_tau_partial_apply(V) at β_t = β + t v,
+    ///      rebuilding FirthDenseOperator at each β (so η = X β_t and the
+    ///      w-chain are re-derived cleanly).  X is unchanged; Q is rebuilt
+    ///      but H_φ applied to a p-space rhs is basis-invariant.
+    ///   2. FD = (T(+h) − T(−h)) / (2h).
+    ///   3. Tolerance 1e-7 relative max-abs (h chosen to balance truncation
+    ///      error at ~h² and evaluator roundoff at ~ε/h).
+    #[test]
+    fn firth_d_beta_hphi_tau_partial_matches_finite_difference() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let x_tau = array![
+            [0.0, 0.15, -0.05],
+            [0.0, -0.10, 0.02],
+            [0.0, 0.08, 0.04],
+            [0.0, -0.06, -0.03],
+            [0.0, 0.05, 0.01],
+            [0.0, -0.12, 0.06],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        // β-direction v for the D_β[·][v] test.
+        let v = array![0.3, 0.2, -0.15];
+
+        let eta = x.dot(&beta);
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let p = x.ncols();
+
+        // Reproducible small rhs block (p × m).
+        let m = 3usize;
+        let mut rhs = Array2::<f64>::zeros((p, m));
+        let vals = [
+            0.21, -0.44, 0.17, 0.38, 0.05, -0.22, -0.11, 0.27, 0.31,
+        ];
+        for r in 0..p {
+            for c in 0..m {
+                rhs[[r, c]] = vals[(r * m + c) % vals.len()];
+            }
+        }
+
+        // ── Analytic apply at (x, β).
+        let x_tau_reduced = op.reduce_explicit_design(&x_tau);
+        let deta_partial = x_tau.dot(&beta);
+        let (dot_i_partial, dot_h_partial) =
+            op.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
+        let tau_kernel = op.hphi_tau_partial_prepare_from_partials(
+            x_tau_reduced.clone(),
+            &deta_partial,
+            dot_h_partial.clone(),
+            dot_i_partial.clone(),
+        );
+
+        let deta_v = x.dot(&v);
+        let direction = op.direction_from_deta(deta_v);
+        let x_tau_v = x_tau.dot(&v);
+        let pair_kernel = op.d_beta_hphi_tau_partial_prepare_from_partials(
+            &tau_kernel,
+            &deta_partial,
+            &dot_i_partial,
+            &direction,
+            &x_tau_v,
+        );
+        let analytic = op.d_beta_hphi_tau_partial_apply(&x_tau, &pair_kernel, &rhs);
+
+        // ── FD reference: central difference of single-τ primitive under
+        //    β → β ± h v.  X stays fixed; η, w, η̇_τ are re-derived.
+        let h = 1e-5_f64;
+        let single_tau_apply = |beta_eval: &Array1<f64>| -> Array2<f64> {
+            let eta_e = x.dot(beta_eval);
+            let op_e = FirthDenseOperator::build(&x, &eta_e).expect("perturbed firth operator");
+            let x_tau_r = op_e.reduce_explicit_design(&x_tau);
+            let deta_e = x_tau.dot(beta_eval);
+            let (dot_i_e, dot_h_e) = op_e.dot_i_and_h_from_reduced(&x_tau_r, &deta_e);
+            let ker_e = op_e.hphi_tau_partial_prepare_from_partials(
+                x_tau_r, &deta_e, dot_h_e, dot_i_e,
+            );
+            op_e.hphi_tau_partial_apply(&x_tau, &ker_e, &rhs)
+        };
+        let beta_plus = &beta + &(h * &v);
+        let beta_minus = &beta - &(h * &v);
+        let fd = (&single_tau_apply(&beta_plus) - &single_tau_apply(&beta_minus)) / (2.0 * h);
+
+        let rel_max_abs_diff = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+            let scale = a
+                .iter()
+                .chain(b.iter())
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let max_diff = (a - b).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            max_diff / scale
+        };
+        let err = rel_max_abs_diff(&analytic, &fd);
+
+        let tol = 1e-7_f64;
+        assert!(
+            err < tol,
+            "D_β (H_φ)_τ|_β apply mismatch: rel_max_abs_diff={err:.3e} > {tol:.1e}\n\
+             analytic=\n{analytic:?}\n\
+             fd=\n{fd:?}"
         );
     }
 

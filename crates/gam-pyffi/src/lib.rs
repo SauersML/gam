@@ -262,8 +262,7 @@ fn validate_formula_json_impl(
     let dataset = dataset_with_inferred_schema(headers, rows)?;
     let fit_config = parse_fit_config(config_json)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
-    let (family_name, model_class, supported_by_python) =
-        request_metadata(&materialized.request);
+    let (family_name, model_class, supported_by_python) = request_metadata(&materialized.request);
     let response_column = response_column_name(&formula);
     let payload = ValidationPayload {
         formula,
@@ -443,11 +442,9 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
 
 fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bool) {
     match request {
-        FitRequest::Standard(standard_request) => (
-            pretty_familyname(standard_request.family),
-            "standard",
-            true,
-        ),
+        FitRequest::Standard(standard_request) => {
+            (pretty_familyname(standard_request.family), "standard", true)
+        }
         FitRequest::GaussianLocationScale(_) => {
             ("Gaussian location-scale", "gaussian location-scale", false)
         }
@@ -457,9 +454,11 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::SurvivalLocationScale(_) => {
             ("Survival location-scale", "survival location-scale", false)
         }
-        FitRequest::BernoulliMarginalSlope(_) => {
-            ("Bernoulli marginal-slope", "bernoulli marginal-slope", false)
-        }
+        FitRequest::BernoulliMarginalSlope(_) => (
+            "Bernoulli marginal-slope",
+            "bernoulli marginal-slope",
+            false,
+        ),
         FitRequest::SurvivalMarginalSlope(_) => {
             ("Survival marginal-slope", "survival marginal-slope", false)
         }
