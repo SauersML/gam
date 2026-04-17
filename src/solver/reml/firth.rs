@@ -1422,8 +1422,9 @@ impl FirthDenseOperator {
     /// (to realize the 9-term D² expansion) and therefore owns both
     /// `x_tau_{i,j}_reduced` and their η̇_i / η̇_j.
     ///
-    /// Allow(dead_code): scaffold until pair-callback threading wires the
-    /// operator into `HyperCoordPair::b_operator` additively.
+    /// Non-test callers use `exact_tau_tau_kernel` which builds the kernel
+    /// inline (with the same field initializers).  Kept `pub(crate)` for
+    /// FD-test access and future out-of-band callers.
     #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_prepare_from_partials(
         &self,
@@ -1464,9 +1465,6 @@ impl FirthDenseOperator {
     /// τ-drift designs and the prepared kernel, and receives the fixed-β
     /// second-τ Firth drift as a dense p×m action.  Matrix-free in n.
     ///
-    /// Allow(dead_code): scaffold until pair-callback threading wires the
-    /// operator into `HyperCoordPair::b_operator` additively.
-    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_apply(
         &self,
         x_tau_i: &Array2<f64>,
@@ -1883,9 +1881,6 @@ impl FirthDenseOperator {
     /// We replicate only the pieces needed to yield the scalar and p-vector
     /// outputs to avoid computing the full p×m action when unnecessary.
     ///
-    /// Allow(dead_code): scaffold until pair-callback threading wires the
-    /// scalar / p-vector additive contributions into `HyperCoordPair::{a,g}`.
-    #[allow(dead_code)]
     pub(crate) fn exact_tau_tau_kernel(
         &self,
         x_tau_i: &Array2<f64>,

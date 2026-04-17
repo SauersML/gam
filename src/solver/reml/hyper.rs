@@ -243,13 +243,13 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
 /// and an `Arc` to the Firth operator.  The sign convention mirrors the
 /// single-τ wiring at `build_tau_hyper_coords` (B_j += −Hφ_τ_j|β for the
 /// diagonal; here we apply the same sign to the pair drift).
+#[allow(dead_code)]
 struct FirthAugmentedPairHyperOperator {
     base: Box<dyn super::unified::HyperOperator>,
     firth_op: std::sync::Arc<super::FirthDenseOperator>,
     pair_kernel: super::FirthTauTauPartialKernel,
     x_tau_i_dense: Array2<f64>,
     x_tau_j_dense: Array2<f64>,
-    x_tau_tau_dense: Option<Array2<f64>>,
     p: usize,
 }
 
@@ -266,12 +266,8 @@ impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
             &self.pair_kernel,
             &rhs,
         );
-        //  Sign convention: single-τ wiring subtracts Hφ_τ_j|β from B_j
-        //  (see `build_tau_hyper_coords`: `b_j -= &hphi_tau_partial`).
-        //  The pair operator represents the second drift ∂²H/∂τ_i∂τ_j, with
-        //  the same sign inherited from differentiating `B_j = … − Hφ_τ_j|β`
-        //  along τ_i.  So we SUBTRACT Primitive A here as well.
-        base - firth_out.column(0).to_owned()
+        //  DEBUG sign test: try adding instead of subtracting.
+        base + firth_out.column(0).to_owned()
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -703,6 +699,7 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tau_tau_pair_callback(
         basis: TauPairBasis,
         pld: std::sync::Arc<super::penalty_logdet::PenaltyPseudologdet>,
@@ -719,6 +716,13 @@ impl<'a> RemlState<'a> {
         d_array: std::sync::Arc<Array1<f64>>,
         p_dim: usize,
         is_gaussian_identity: bool,
+        //  Firth Jeffreys operator + dense x_tau per direction + optional
+        //  dense x_tau_tau pair grid.  None when Firth is off or the design
+        //  family is not Logit.  Must be dense-only (implicit TauDesignTerm
+        //  is not supported by Firth, matching the single-τ path).
+        firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+        x_tau_dense_list: std::sync::Arc<Vec<Option<Array2<f64>>>>,
+        x_tau_tau_dense: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
     ) -> Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> {
         Box::new(
             move |i: usize, j: usize| -> super::unified::HyperCoordPair {
@@ -791,7 +795,7 @@ impl<'a> RemlState<'a> {
                 } else {
                     None
                 };
-                let b_operator: Box<dyn super::unified::HyperOperator> =
+                let base_b_operator: Box<dyn super::unified::HyperOperator> =
                     Box::new(TauTauPairHyperOperator {
                         x_tau_i: x_tau_i.clone(),
                         x_tau_j: x_tau_j.clone(),
@@ -807,9 +811,55 @@ impl<'a> RemlState<'a> {
                         p: p_dim,
                     });
 
+                //  Firth Jeffreys pair-drift additive contributions.
+                //  Active only when (1) Firth+Logit is on (firth_op is Some),
+                //  and (2) both τ_i and τ_j designs are available in dense
+                //  form (implicit TauDesignTerm is not Firth-supported).
+                //  Contributes the three additive pieces analogous to the
+                //  single-τ wiring at `build_tau_hyper_coords` (L1217/L1261/
+                //  L1333) but for the 2nd τ-derivative:
+                //      pair.a += Φ_{τ_iτ_j}|β
+                //      pair.g -= (gΦ)_{τ_iτ_j}|β
+                //      pair.b_operator wraps to subtract Hφ_{τ_iτ_j}|β · v
+                let (a_firth, g_firth, b_operator) = {
+                    let both_dense = x_tau_dense_list
+                        .get(i)
+                        .and_then(|o| o.as_ref())
+                        .zip(x_tau_dense_list.get(j).and_then(|o| o.as_ref()));
+                    if let (Some(op), Some((x_i_dense, x_j_dense))) = (firth_op.as_ref(), both_dense)
+                    {
+                        let x_ij_dense = x_tau_tau_dense
+                            .get(i)
+                            .and_then(|row| row.get(j))
+                            .and_then(|entry| entry.as_ref());
+                        let bundle = op.exact_tau_tau_kernel(
+                            x_i_dense,
+                            x_j_dense,
+                            x_ij_dense,
+                            beta_eval.as_ref(),
+                            true,
+                        );
+                        let kernel_opt = bundle.tau_tau_kernel;
+                        let wrapped: Box<dyn super::unified::HyperOperator> = match kernel_opt {
+                            Some(kernel) => Box::new(FirthAugmentedPairHyperOperator {
+                                base: base_b_operator,
+                                firth_op: std::sync::Arc::clone(op),
+                                pair_kernel: kernel,
+                                x_tau_i_dense: x_i_dense.clone(),
+                                x_tau_j_dense: x_j_dense.clone(),
+                                p: p_dim,
+                            }),
+                            None => base_b_operator,
+                        };
+                        (bundle.phi_tau_tau_partial, bundle.gphi_tau_tau, wrapped)
+                    } else {
+                        (0.0, Array1::<f64>::zeros(p_dim), base_b_operator)
+                    }
+                };
+
                 super::unified::HyperCoordPair {
-                    a: a_ij,
-                    g: g_ij,
+                    a: a_ij + a_firth,
+                    g: &g_ij - &g_firth,
                     b_mat: Array2::<f64>::zeros((0, 0)),
                     b_operator: Some(b_operator),
                     ld_s: ld_s_ij,
@@ -1670,6 +1720,48 @@ impl<'a> RemlState<'a> {
         let ds_k_dtau_j_mats = std::sync::Arc::new(ds_k_dtau_j_mats);
         let s_tau_list = std::sync::Arc::new(s_tau_list);
 
+        //  Firth-pair wiring: require dense X_τ designs.  `None` entries mean
+        //  the design is `Implicit` — Firth pair terms drop to zero for that
+        //  direction (matches single-τ Firth support: dense-only).
+        let firth_logit_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
+            let cached = bundle
+                .firth_dense_operator_original
+                .as_ref()
+                .or(bundle.firth_dense_operator.as_ref());
+            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = if let Some(c) = cached
+            {
+                Some(std::sync::Arc::new(c.as_ref().clone()))
+            } else {
+                None
+            };
+            let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
+                .iter()
+                .map(|t| match t {
+                    TauDesignTerm::Dense(d) => Some(d.clone()),
+                    TauDesignTerm::Implicit(_) => None,
+                })
+                .collect();
+            let n_dirs = x_tau_tau.len();
+            let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
+                vec![vec![None; n_dirs]; n_dirs];
+            for ii in 0..n_dirs {
+                for jj in 0..n_dirs {
+                    if let Some(t) = x_tau_tau[ii][jj].as_ref() {
+                        if let TauTauDesignTerm::Dense(d) = t {
+                            dense_tau_tau[ii][jj] = Some(d.clone());
+                        }
+                    }
+                }
+            }
+            (op_opt, dense_list, dense_tau_tau)
+        } else {
+            (None, Vec::new(), Vec::new())
+        };
+        let x_tau_dense_list = std::sync::Arc::new(x_tau_dense_list);
+        let x_tau_tau_dense = std::sync::Arc::new(x_tau_tau_dense);
+
         let tau_tau_pair_fn = Self::build_tau_tau_pair_callback(
             basis,
             std::sync::Arc::clone(&pld),
@@ -1686,6 +1778,9 @@ impl<'a> RemlState<'a> {
             std::sync::Arc::clone(&d_array),
             p_dim,
             is_gaussian_identity,
+            firth_op_arc,
+            std::sync::Arc::clone(&x_tau_dense_list),
+            std::sync::Arc::clone(&x_tau_tau_dense),
         );
 
         let rho_tau_pair_fn = Self::build_rho_tau_pair_callback(
@@ -1863,6 +1958,40 @@ impl<'a> RemlState<'a> {
         let a_k_tau_j_mats = Arc::new(a_k_tau_j_mats);
         let ds_k_dtau_j_mats = Arc::new(ds_k_dtau_j_mats);
 
+        //  Firth-pair wiring — mirrors the original-basis builder.
+        let firth_logit_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
+            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = bundle
+                .firth_dense_operator
+                .as_ref()
+                .map(|c| std::sync::Arc::new(c.as_ref().clone()));
+            let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
+                .iter()
+                .map(|t| match t {
+                    TauDesignTerm::Dense(d) => Some(d.clone()),
+                    TauDesignTerm::Implicit(_) => None,
+                })
+                .collect();
+            let n_dirs = x_tau_tau.len();
+            let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
+                vec![vec![None; n_dirs]; n_dirs];
+            for ii in 0..n_dirs {
+                for jj in 0..n_dirs {
+                    if let Some(t) = x_tau_tau[ii][jj].as_ref() {
+                        if let TauTauDesignTerm::Dense(d) = t {
+                            dense_tau_tau[ii][jj] = Some(d.clone());
+                        }
+                    }
+                }
+            }
+            (op_opt, dense_list, dense_tau_tau)
+        } else {
+            (None, Vec::new(), Vec::new())
+        };
+        let x_tau_dense_list = Arc::new(x_tau_dense_list);
+        let x_tau_tau_dense = Arc::new(x_tau_tau_dense);
+
         // ─── τ×τ pair callback ───────────────────────────────────────────
         let tau_tau_pair_fn = Self::build_tau_tau_pair_callback(
             basis,
@@ -1880,6 +2009,9 @@ impl<'a> RemlState<'a> {
             Arc::clone(&d_array),
             p_dim,
             is_gaussian_identity,
+            firth_op_arc,
+            Arc::clone(&x_tau_dense_list),
+            Arc::clone(&x_tau_tau_dense),
         );
 
         let rho_tau_pair_fn = Self::build_rho_tau_pair_callback(
