@@ -2873,18 +2873,7 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    #[allow(dead_code)] // retired; kept temporarily alongside legacy linear-operator scaffolds
-    fn sigma_scale_factor(&self) -> Option<f64> {
-        let sigma = self.gaussian_frailty_sd?;
-        if !sigma.is_finite() || sigma <= 0.0 {
-            return None;
-        }
-        let jet =
-            crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
-        Some(jet.ds / jet.s)
-    }
-
-    // `sigma_beta_linear_operator` and `add_sigma_hessian_linear_terms`
+    // `sigma_scale_factor`, `sigma_beta_linear_operator`, and `add_sigma_hessian_linear_terms`
     // have been retired (mirror of the bernoulli_marginal_slope fix).
     // Their construction —
     //     direction[u] = (ṡ/s) · β[u]  for u ∈ {logslope, H, W}

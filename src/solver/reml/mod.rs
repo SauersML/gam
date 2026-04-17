@@ -3078,6 +3078,10 @@ pub(crate) struct FirthTauTauExactKernel {
 ///
 /// Wired in by the Primitive A FD test and Task #20 pair-callback
 /// integration.
+///
+/// Allow(dead_code): scaffold until pair-callback threading wires the
+/// operator into `HyperCoordPair::b_operator` additively.
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct FirthTauTauPartialKernel {
     pub(super) x_tau_i_reduced: Array2<f64>,
