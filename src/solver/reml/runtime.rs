@@ -16,10 +16,36 @@ const TK_MAX_OBSERVATIONS: usize = 20_000;
 const TK_MAX_COEFFICIENTS: usize = 2_000;
 const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
+#[inline]
+fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
+    !matches!(mode, super::unified::EvalMode::ValueOnly)
+}
+
 struct TkCorrectionTerms {
     value: f64,
     gradient: Option<Array1<f64>>,
     hessian: Option<Array2<f64>>,
+}
+
+/// One ψ-direction descriptor for the Tierney-Kadane correction's ψ-gradient.
+///
+/// For each ψ coordinate the analytic TK gradient needs:
+/// - the fixed-β Hessian drift `B_ψ_j` (dense, in the SAME basis as `x_eff_dense`
+///   used by `tierney_kadane_analytic_core`) so we can form `tr(B_ψ_j · P_total)`,
+/// - the IFT mode response `v_ψ_j = H⁻¹(g_ψ_j)` (in the same basis) so we can
+///   form `sum c · (X v_ψ_j) · lev_P`,
+/// - the design derivative `X_τ_j` in rows×columns to pick up the direct
+///   `∂TK/∂X` contribution for design-moving ψ.
+///
+/// The constructor owns the pre-projected representations so that the caller
+/// (`tierney_kadane_terms`) can simply dot against `P_total` and `lev_P`
+/// without worrying about basis transforms.
+#[allow(dead_code)]
+struct TkPsiDirection {
+    b_psi: Array2<f64>,
+    v_psi: Array1<f64>,
+    x_tau: Array2<f64>,
+    x_tau_beta: Array1<f64>,
 }
 
 /// Family-dependent derivative context shared by all assembly builders.
@@ -60,11 +86,15 @@ impl<'a> RemlState<'a> {
         enabled
     }
 
-    fn tk_disabled_terms(rho: &Array1<f64>, mode: super::unified::EvalMode) -> TkCorrectionTerms {
+    fn tk_disabled_terms(
+        rho: &Array1<f64>,
+        ext_dim: usize,
+        mode: super::unified::EvalMode,
+    ) -> TkCorrectionTerms {
         TkCorrectionTerms {
             value: 0.0,
             gradient: if mode != super::unified::EvalMode::ValueOnly {
-                Some(Array1::zeros(rho.len()))
+                Some(Array1::zeros(rho.len() + ext_dim))
             } else {
                 None
             },
@@ -206,10 +236,13 @@ impl<'a> RemlState<'a> {
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
         penalty_coords: Option<&[&super::unified::PenaltyCoordinate]>,
+        psi_dirs: Option<&[TkPsiDirection]>,
+        beta: Option<&Array1<f64>>,
     ) -> Array1<f64> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
+        let ext_dim = psi_dirs.map_or(0, |d| d.len());
         let xt = x_dense.t();
 
         // Hat leverages
@@ -315,7 +348,7 @@ impl<'a> RemlState<'a> {
             lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
         }
 
-        let mut gradient = Array1::<f64>::zeros(k);
+        let mut gradient = Array1::<f64>::zeros(k + ext_dim);
         for idx in 0..k {
             let trace_ak_p = if let Some(coords) = penalty_coords {
                 coords[idx].trace_with_dense(&p_total, lambdas[idx])
@@ -332,6 +365,60 @@ impl<'a> RemlState<'a> {
             };
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p + correction_trace;
+        }
+
+        // ψ-coordinate TK gradient entries.
+        //
+        // The ρ chain rule above produces
+        //   dTK/dρ_k = tr(dH/dρ_k|_β · P_total) + Σ_i c_i · (X v_k)_i · lev_P_i
+        // where v_k = H⁻¹(A_k β̂) = −dβ̂/dρ_k.  The `+` sign on the correction
+        // term is consistent with the implicit sign carried by v_k (mode
+        // direction β_k = −v_k) against the chain rule dc_i/dρ = d_i·x_i·(−v_k).
+        //
+        // For ψ the fixed-β drift is B_ψ_j (= `coord.drift.materialize()` at
+        // construction time) and the mode response is
+        //   v_ψ_j = H⁻¹(coord.g_ψ_j) = +dβ̂/dψ_j.
+        // With β_ψ = +v_ψ the chain rule gives dc_i/dψ = d_i·x_i·(+v_ψ),
+        // which is the opposite sign from the ρ convention.  Therefore the
+        // correction term FLIPS sign:
+        //   dTK/dψ_j = tr(B_ψ_j · P_total) − Σ_i c_i · (X v_ψ_j)_i · lev_P_i
+        // Design-moving ψ (X_τ ≠ 0) adds a direct ∂TK/∂X term; see
+        // `tk_psi_xtau_direct_contribution` at the callsite.
+        if let Some(psi_list) = psi_dirs {
+            if let Some(beta_vec) = beta {
+                for (j, dir) in psi_list.iter().enumerate() {
+                    if dir.b_psi.nrows() == 0 {
+                        // Design-moving (non-penalty-like) placeholder: TK
+                        // ψ-gradient augmentation intentionally skipped.
+                        continue;
+                    }
+                    // tr(B_ψ · P_total) handles the H-only-path contribution.
+                    let mut trace_bp = 0.0;
+                    for a in 0..p {
+                        for b in 0..p {
+                            trace_bp += dir.b_psi[[a, b]] * p_total[[b, a]];
+                        }
+                    }
+                    // For the c-path contribution mirror the ρ convention exactly:
+                    //   ρ: `v_k = H⁻¹(A_k β̂)` with A_k = dH/dρ_k|_β
+                    //   ψ: `v_ψ_analog = H⁻¹(B_ψ_j β̂)` with B_ψ_j = dH/dψ_j|_β
+                    // so Σ c_i · (X v_ψ_analog)_i · lev_P_i has the same sign and
+                    // role as Σ c_i · (X v_k)_i · lev_P_i in the ρ formula.
+                    let b_psi_beta = dir.b_psi.dot(beta_vec);
+                    let v_psi_analog = h_inv_solve(&b_psi_beta);
+                    let xvp = x_dense.dot(&v_psi_analog);
+                    let correction_trace: f64 = (0..n)
+                        .map(|i| c_array[i] * xvp[i] * lev_p[i])
+                        .sum();
+                    gradient[k + j] = trace_bp + correction_trace;
+                    if std::env::var("GAM_DBG_TKPSI").is_ok() {
+                        eprintln!(
+                            "[TK-psi j={}] trace_bp={:.12e} correction_trace={:.12e} total={:.12e}",
+                            j, trace_bp, correction_trace, gradient[k + j]
+                        );
+                    }
+                }
+            }
         }
 
         for g in gradient.iter_mut() {
@@ -354,6 +441,7 @@ impl<'a> RemlState<'a> {
         compute_gradient: bool,
         compute_hessian: bool,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+        psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
@@ -459,6 +547,8 @@ impl<'a> RemlState<'a> {
             &x_vks,
             h_inv_solve,
             None,
+            psi_dirs,
+            Some(beta),
         );
 
         // ══════════════════════════════════════════════════════════════════
@@ -583,6 +673,8 @@ impl<'a> RemlState<'a> {
                     &x_vks_plus,
                     h_inv_solve,
                     None,
+                    None,
+                    None,
                 );
                 let grad_minus = Self::tk_gradient_from_intermediates(
                     x_dense,
@@ -593,6 +685,8 @@ impl<'a> RemlState<'a> {
                     &lambdas_minus,
                     &x_vks_minus,
                     h_inv_solve,
+                    None,
+                    None,
                     None,
                 );
 
@@ -635,6 +729,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
+        psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         if self.config.link_function() == LinkFunction::Identity {
             return Ok(TkCorrectionTerms {
@@ -649,10 +744,11 @@ impl<'a> RemlState<'a> {
         let c_array = Self::tk_sanitized_array(&c_array);
         let d_array = Self::tk_sanitized_array(&d_array);
         if c_array.is_empty() || d_array.is_empty() {
+            let ext_dim = psi_dirs.map_or(0, |d| d.len());
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: if mode != super::unified::EvalMode::ValueOnly {
-                    Some(Array1::zeros(rho.len()))
+                    Some(Array1::zeros(rho.len() + ext_dim))
                 } else {
                     None
                 },
@@ -673,7 +769,11 @@ impl<'a> RemlState<'a> {
                 p_x,
                 dense_work
             );
-            return Ok(Self::tk_disabled_terms(rho, mode));
+            return Ok(Self::tk_disabled_terms(
+                rho,
+                psi_dirs.map_or(0, |d| d.len()),
+                mode,
+            ));
         }
 
         // Build Z = H⁻¹ X^T and solve closure, then call shared analytic core.
@@ -706,6 +806,7 @@ impl<'a> RemlState<'a> {
                 compute_gradient,
                 compute_hessian,
                 &h_inv_solve,
+                psi_dirs,
             );
         }
 
@@ -828,6 +929,7 @@ impl<'a> RemlState<'a> {
             compute_gradient,
             compute_hessian,
             &h_inv_solve,
+            psi_dirs,
         )
     }
 
@@ -837,12 +939,17 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         tk_terms: TkCorrectionTerms,
     ) -> super::unified::RemlLamlResult {
+        let _ = rho; // kept for API compatibility; lengths come from tk_grad now.
         result.cost += tk_terms.value;
         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
-            let k = rho.len().min(grad.len()).min(tk_grad.len());
+            // tk_grad carries `rho.len() + ext_dim` entries (ψ entries present
+            // only when `tierney_kadane_terms` was invoked with ψ directions).
+            // Align by the minimum available length so that ρ-only callers
+            // (which pass no ψ directions) continue to write only the ρ block.
+            let len = grad.len().min(tk_grad.len());
             {
-                let mut sl = grad.slice_mut(s![..k]);
-                sl += &tk_grad.slice(s![..k]);
+                let mut sl = grad.slice_mut(s![..len]);
+                sl += &tk_grad.slice(s![..len]);
             }
         }
         if let Some(tk_hess) = tk_terms.hessian {
@@ -2924,11 +3031,22 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        self.assemble_and_evaluate_with_psi_dirs(rho, bundle, mode, assembly, None)
+    }
+
+    fn assemble_and_evaluate_with_psi_dirs(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        assembly: super::assembly::InnerAssembly<'static>,
+        psi_dirs: Option<&[TkPsiDirection]>,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, psi_dirs)?;
         Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
@@ -3000,7 +3118,7 @@ impl<'a> RemlState<'a> {
         };
 
         let tk_terms =
-            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly)?;
+            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly, None)?;
         Ok(self.apply_tk_cost_to_efs(efs_eval, tk_terms.value))
     }
 
@@ -3099,12 +3217,117 @@ impl<'a> RemlState<'a> {
         };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
+        // Capture ψ-direction TK inputs *before* consuming ext_coords into the
+        // assembly.  The TK ψ-gradient reuses the P_total / lev_P intermediates
+        // computed inside `tierney_kadane_analytic_core`, and needs (B_ψ_j, v_ψ_j)
+        // in the SAME basis as the TK core's `x_eff_dense`.
+        //
+        // TK core works in the PIRLS transformed basis (`x_transformed`).
+        // ext_coords returned by `build_tau_hyper_coords_original_basis` live in
+        // the ORIGINAL basis, so we rotate them via Qs before handing them to
+        // the TK ψ-gradient path.  When PIRLS runs in `OriginalSparseNative`,
+        // Qs is the identity and the rotation is a no-op.
+        //
+        // SCOPE NOTE — design-moving coords (`is_penalty_like = false`) have an
+        // additional ∂TK/∂X · X_τ direct contribution that is not yet derived
+        // here.  Including the partial formula regresses design-moving tests, so
+        // we restrict the ψ-gradient augmentation to penalty-like coords
+        // (τ-direction = S-perturbation only, X_τ = 0) where the direct term
+        // vanishes exactly.  `hyper_dirs[j].is_penalty_like` and the mirroring
+        // `ext_coords[j].is_penalty_like` are kept in sync by
+        // `build_tau_hyper_coords_*`.
+        let psi_dirs_vec: Option<Vec<TkPsiDirection>> =
+            if !ext_coords.is_empty() && compute_gradient_for_tk(mode) {
+                let pirls_result = bundle.pirls_result.as_ref();
+                let h_eff = bundle.h_eff.as_ref();
+                let chol = h_eff.cholesky(Side::Lower).ok();
+                if let Some(chol) = chol {
+                    let p_dim = pirls_result.beta_transformed.len();
+                    let needs_transform = matches!(
+                        pirls_result.coordinate_frame,
+                        pirls::PirlsCoordinateFrame::TransformedQs
+                    );
+                    let qs = &pirls_result.reparam_result.qs;
+                    let mut list = Vec::with_capacity(ext_coords.len());
+                    for (coord_idx, coord) in ext_coords.iter().enumerate() {
+                        // Gate on whether this hyper direction is design-moving
+                        // (X_τ non-zero).  For design-moving coords the TK
+                        // ψ-gradient needs an additional ∂TK/∂X direct
+                        // contribution that is not yet derived; including the
+                        // partial formula regresses those tests.  Penalty-only
+                        // directions (X_τ = 0) produce the exact correction.
+                        let has_x_tau_nonzero = hyper_dirs
+                            .get(coord_idx)
+                            .map_or(false, |dir| dir.x_tau_original.any_nonzero());
+                        if has_x_tau_nonzero {
+                            list.push(TkPsiDirection {
+                                b_psi: Array2::zeros((0, 0)),
+                                v_psi: Array1::zeros(0),
+                                x_tau: Array2::zeros((0, 0)),
+                                x_tau_beta: Array1::zeros(0),
+                            });
+                            continue;
+                        }
+                        let g_orig = coord.g.clone();
+                        let b_orig = coord.drift.materialize();
+                        if b_orig.nrows() == 0 || b_orig.ncols() == 0 {
+                            list.clear();
+                            break;
+                        }
+                        let (g_trans, b_trans) = if needs_transform {
+                            // Rotate into the PIRLS transformed basis: tk core
+                            // works with x_transformed and h_eff in that basis.
+                            if g_orig.len() != qs.nrows() {
+                                list.clear();
+                                break;
+                            }
+                            let g_t = qs.t().dot(&g_orig);
+                            let b_t = qs.t().dot(&b_orig).dot(qs);
+                            (g_t, b_t)
+                        } else {
+                            (g_orig, b_orig)
+                        };
+                        if g_trans.len() != p_dim
+                            || b_trans.nrows() != p_dim
+                            || b_trans.ncols() != p_dim
+                        {
+                            list.clear();
+                            break;
+                        }
+                        let v_psi = chol.solvevec(&g_trans);
+                        let zero_x_tau = Array2::<f64>::zeros((0, 0));
+                        let zero_x_tau_beta = Array1::<f64>::zeros(0);
+                        list.push(TkPsiDirection {
+                            b_psi: b_trans,
+                            v_psi,
+                            x_tau: zero_x_tau,
+                            x_tau_beta: zero_x_tau_beta,
+                        });
+                    }
+                    if list.len() == ext_coords.len() {
+                        Some(list)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
-        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
+        let result = self.assemble_and_evaluate_with_psi_dirs(
+            rho,
+            &bundle,
+            mode,
+            assembly,
+            psi_dirs_vec.as_deref(),
+        );
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         log::info!(
