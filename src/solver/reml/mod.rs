@@ -1203,7 +1203,7 @@ mod tests {
         let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
-            rel < 3e-1,
+            rel < 1e-4,
             "linear-dir joint tau-tau block deviates from FD reference away from zero psi: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
     }
@@ -1351,7 +1351,7 @@ mod tests {
         let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
-            rel < 3e-1,
+            rel < 1e-4,
             "analytic tau-tau block deviates from FD reference: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
     }
@@ -1563,7 +1563,7 @@ mod tests {
         let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
-            rel < 3e-1,
+            rel < 1e-4,
             "Gaussian REML tau-tau Hessian mismatch: rel={rel:.3e}, \
              analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
@@ -1743,7 +1743,7 @@ mod tests {
         let den = h_ttfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
-            rel < 3e-1,
+            rel < 1e-4,
             "Logit REML design-moving tau-tau Hessian mismatch: rel={rel:.3e}, \
              analytic={h_tt_analytic:?}, fd={h_ttfd:?}"
         );
@@ -2062,7 +2062,7 @@ mod tests {
         let den = h_tt_fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
-            rel < 3e-1,
+            rel < 1e-4,
             "Binomial-logit n=30 tau-tau Hessian mismatch: rel={rel:.3e}, \
              analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
         );
