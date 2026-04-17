@@ -3047,6 +3047,36 @@ pub(crate) struct FirthTauExactKernel {
     tau_kernel: Option<FirthTauPartialKernel>,
 }
 
+/// Pair-level τ_i × τ_j reduced kernel carrying every reusable intermediate
+/// needed by `hphi_tau_tau_partial_apply` (Primitive A).  All objects are
+/// evaluated at fixed β.
+///
+/// Concretely, we pack the two single-τ kernels (i and j) plus:
+/// - Ï_{r,ij} = ∂²_{τ_iτ_j} I_r          (reduced r × r Fisher 2nd deriv)
+/// - K̈_{r,ij} = ∂²_{τ_iτ_j} K_r          (= −K_r Ï_{r,ij} K_r
+///                                         + K_r İ_i K_r İ_j K_r
+///                                         + K_r İ_j K_r İ_i K_r)
+/// - ḧ_{ij}   = ∂²_{τ_iτ_j} diag(M)       (n-vector)
+/// - η̈_{ij}  = X_{τ_iτ_j} β               (n-vector; None ↔ τ-linear design)
+/// - x_tau_tau_reduced: optional reduced-basis X_{τ_iτ_j} design (None when
+///                     τ-linear in design).
+#[derive(Clone)]
+pub(crate) struct FirthTauTauPartialKernel {
+    pub(super) tau_i: FirthTauPartialKernel,
+    pub(super) tau_j: FirthTauPartialKernel,
+    pub(super) deta_i: Array1<f64>,
+    pub(super) deta_j: Array1<f64>,
+    pub(super) dot_i_i_reduced: Array2<f64>,
+    pub(super) dot_i_j_reduced: Array2<f64>,
+    pub(super) ddot_i_ij_reduced: Array2<f64>,
+    pub(super) ddot_k_ij_reduced: Array2<f64>,
+    pub(super) dot_h_i: Array1<f64>,
+    pub(super) dot_h_j: Array1<f64>,
+    pub(super) ddot_h_ij: Array1<f64>,
+    pub(super) x_tau_tau_reduced: Option<Array2<f64>>,
+    pub(super) deta_ij: Option<Array1<f64>>,
+}
+
 /// Holds the state for the outer REML optimization and supplies cost and
 /// gradient evaluations to the `opt` optimizer.
 ///

@@ -1455,9 +1455,17 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     //   E[f(eta)] = sum_{k>=0} sigma^{2k} / (2^k k!) * f^{(2k)}(mu).
     //
     // Here f(x) = 1 - exp(-exp(x)) is entire, so the series is valid
-    // globally. In the hot path we truncate after the sigma^4 term:
-    //   E[f(eta)]      ~= f + (sigma^2/2) f'' + (sigma^4/24) f^{(4)}
-    //   d/dmu E[f(eta)]~= f' + (sigma^2/2) f''' + (sigma^4/24) f^{(5)}.
+    // globally. The coefficient at sigma^{2k} is 1/(2^k k!) — heat-kernel,
+    // NOT 1/(2k)! Taylor. Derivation: for Z ~ N(0,1), E[Z^{2k}] = (2k-1)!!
+    // = (2k)!/(2^k k!), so
+    //   E[f(mu+sigma Z)]
+    //     = sum_{2k >= 0} f^{(2k)}(mu) sigma^{2k}/(2k)! * (2k)!/(2^k k!)
+    //     = sum_{k >= 0} f^{(2k)}(mu) sigma^{2k}/(2^k k!).
+    // At k = 2 this gives 1/(2^2 2!) = 1/8, not 1/4! = 1/24.
+    //
+    // In the hot path we truncate after the sigma^4 term:
+    //   E[f(eta)]      ~= f + (sigma^2/2) f'' + (sigma^4/8)  f^{(4)}
+    //   d/dmu E[f(eta)]~= f' + (sigma^2/2) f''' + (sigma^4/8) f^{(5)}.
     //
     // The explicit derivatives below are written in terms of exp(mu) and
     // exp(-exp(mu)) so the PIRLS derivative uses the same approximation order
@@ -1515,13 +1523,13 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
             // = exp(η + σ²/2) via the Gaussian moment-generating function.
             cloglog_negative_tail_integrated_mean(mu, sigma)
         } else {
-            f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4
+            f0 + 0.5 * s2 * f2 + (s4 / 8.0) * f4
         },
         dmean_dmu: if negative_tail {
             // Negative tail: d/dμ E[μ(η+σZ)] ≈ exp(μ + σ²/2).
             cloglog_negative_tail_integrated_derivative(mu, sigma)
         } else {
-            (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0)
+            (f1 + 0.5 * s2 * f3 + (s4 / 8.0) * f5).max(0.0)
         },
         mode: IntegratedExpectationMode::ControlledAsymptotic,
     }
@@ -1543,6 +1551,28 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
     let dmean_dmu =
         integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| gumbel_survival_d1(x)).max(0.0);
+    // Also manually compute using direct loop for comparison
+    let n = adaptive_point_count_from_sd(sigma.abs());
+    let manual_dmean = with_gh_nodesweights(ctx, n, |nodes, weights| {
+        let scale = SQRT_2 * sigma;
+        let mut sum = 0.0_f64;
+        for i in 0..n {
+            sum += weights[i] * gumbel_survival_d1(mu + scale * nodes[i]);
+        }
+        sum / std::f64::consts::PI.sqrt()
+    });
+    eprintln!(
+        "DBG cloglog_ghq: mu={} sigma={} adaptive_n={} raw_dmean={:.6e} manual_dmean={:.6e}",
+        mu, sigma, n, dmean_dmu, manual_dmean
+    );
+    eprintln!(
+        "DBG cloglog_ghq: nodes/weights:"
+    );
+    with_gh_nodesweights(ctx, n, |nodes, weights| {
+        for i in 0..n {
+            eprintln!("  node[{}]={:.6} weight[{}]={:.6e}", i, nodes[i], i, weights[i]);
+        }
+    });
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -2367,7 +2397,12 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     };
     // Safety-net drift check with loose tolerances — see logit comment.
     let ghq = cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-5, 1e-3) {
+    let drift = integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-5, 1e-3);
+    eprintln!(
+        "DBG ctrl inner: mu={} sigma={} cand.mean={:.6e} cand.deriv={:.6e} ghq.mean={:.6e} ghq.deriv={:.6e} drift={}",
+        mu, sigma, candidate.mean, candidate.dmean_dmu, ghq.mean, ghq.dmean_dmu, drift
+    );
+    if drift {
         ghq
     } else {
         candidate
@@ -4958,6 +4993,10 @@ mod tests {
         for &(mu, sigma) in &cases {
             let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
             let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
+            eprintln!(
+                "DBG ctrl: mu={} sigma={} mean={:.6e} exp_mean={:.6e} deriv={:.6e} exp_deriv={:.6e}",
+                mu, sigma, approx.mean, expected_mean, approx.dmean_dmu, expected_deriv
+            );
             assert_relative_eq!(
                 approx.mean,
                 expected_mean,
