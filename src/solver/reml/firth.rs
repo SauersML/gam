@@ -1876,6 +1876,10 @@ impl FirthDenseOperator {
     /// those already computed inside Primitive A's `hphi_tau_tau_partial_apply`.
     /// We replicate only the pieces needed to yield the scalar and p-vector
     /// outputs to avoid computing the full p×m action when unnecessary.
+    ///
+    /// Allow(dead_code): scaffold until pair-callback threading wires the
+    /// scalar / p-vector additive contributions into `HyperCoordPair::{a,g}`.
+    #[allow(dead_code)]
     pub(crate) fn exact_tau_tau_kernel(
         &self,
         x_tau_i: &Array2<f64>,

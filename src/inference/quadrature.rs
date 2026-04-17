@@ -611,17 +611,20 @@ fn symmetric_tridiagonal_eigen(
 
     let eps = 1e-15;
     let max_iter = 100;
-
-    // Work on successively smaller submatrices
+    let mut t_norm = 0.0_f64;
+    for i in 0..N_POINTS {
+        let l = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
+        let r = if i + 1 < N_POINTS { off_diag[i].abs() } else { 0.0 };
+        t_norm = t_norm.max(diag[i].abs() + l + r);
+    }
     let mut n = N_POINTS;
     while n > 1 {
         let mut converged = false;
-        // Check for convergence of last off-diagonal element
         for _ in 0..max_iter {
-            // Find the largest unreduced block
             let mut m = n - 1;
             while m > 0 {
-                if off_diag[m - 1].abs() <= eps * (diag[m - 1].abs() + diag[m].abs()) {
+                let scl = (diag[m - 1].abs() + diag[m].abs()).max(t_norm);
+                if off_diag[m - 1].abs() <= eps * scl {
                     off_diag[m - 1] = 0.0;
                     break;
                 }
@@ -706,13 +709,32 @@ fn symmetric_tridiagonal_eigen_dynamic(
     }
     let eps = 1e-15;
     let max_iter = 200usize;
+    // Matrix 1-norm fallback scale. The row-local criterion
+    // `eps * (|d[m-1]| + |d[m]|)` collapses to zero when the diagonal is
+    // identically zero (as for physicist's Hermite), which stalls QR because
+    // no off-diagonal can satisfy `|e| <= 0`. LAPACK dsteqr uses ||T||_inf;
+    // we take the max absolute row sum and use it as a floor on the scale.
+    let mut t_norm = 0.0_f64;
+    for i in 0..dim {
+        let left = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
+        let right = if i + 1 < dim {
+            off_diag[i].abs()
+        } else {
+            0.0
+        };
+        let row_sum = diag[i].abs() + left + right;
+        if row_sum > t_norm {
+            t_norm = row_sum;
+        }
+    }
     let mut n = dim;
     while n > 1 {
         let mut converged = false;
         for _ in 0..max_iter {
             let mut m = n - 1;
             while m > 0 {
-                if off_diag[m - 1].abs() <= eps * (diag[m - 1].abs() + diag[m].abs()) {
+                let row_scale = (diag[m - 1].abs() + diag[m].abs()).max(t_norm);
+                if off_diag[m - 1].abs() <= eps * row_scale {
                     off_diag[m - 1] = 0.0;
                     break;
                 }
