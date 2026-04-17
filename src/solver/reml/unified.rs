@@ -3252,8 +3252,11 @@ pub fn reml_laml_evaluate(
                     let mut h_i = coord.drift.materialize();
                     if effective_deriv.has_corrections() {
                         let v_i = hop.solve(&coord.g);
+                        // ext mode direction β_i = +v_i (positive convention);
+                        // pass −v_i so the trait returns D_β H[+v_i].
+                        let neg_v_i = v_i.mapv(|z| -z);
                         if let Some(corr) =
-                            effective_deriv.hessian_derivative_correction_result(&v_i)?
+                            effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
                         {
                             drift_result_add_into_dense(&mut h_i, &corr);
                         }
@@ -3312,13 +3315,16 @@ pub fn reml_laml_evaluate(
                 }
             }
 
-            // ext-coordinates: dH_i = B_i + correction(v_i)
+            // ext-coordinates: Ḣ_i = B_i + D_β H[+v_i].
+            // ext mode direction β_i = +v_i (positive convention);
+            // pass −v_i so the trait returns D_β H[+v_i].
             for coord in solution.ext_coords.iter() {
                 let mut h_i = coord.drift.materialize();
                 if effective_deriv.has_corrections() {
                     let v_i = hop.solve(&coord.g);
+                    let neg_v_i = v_i.mapv(|z| -z);
                     if let Some(corr) =
-                        effective_deriv.hessian_derivative_correction_result(&v_i)?
+                        effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
                     {
                         drift_result_add_into_dense(&mut h_i, &corr);
                     }
@@ -3377,25 +3383,31 @@ pub fn reml_laml_evaluate(
     //
     // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
     //
-    // Sign convention: hessian_derivative_correction() expects v_i = H⁻¹(g_i)
-    // (positive), matching the ρ convention where v_k = H⁻¹(A_k β̂). The
-    // implementation internally negates to get the mode direction β_i = −v_i.
+    // IFT sign conventions differ between ρ and ext coordinates:
+    //   ρ : H·dβ̂/dρ_k = +A_k β̂  ⇒  dβ̂/dρ_k = −v_k  (v_k := H⁻¹(A_k β̂))
+    //   ψ : H·dβ̂/dψ_j = +g_j    ⇒  dβ̂/dψ_j = +v_j  (v_j := H⁻¹(g_j))
+    //
+    // The total Hessian drift is Ḣ = ∂H/∂θ|_β + D_β H[dβ̂/dθ].  For ψ the
+    // IFT direction β_j = +v_j, so the required correction is
+    // D_β H[+v_j] = +X' diag(c ⊙ X v_j) X.  The trait method
+    // `hessian_derivative_correction(arg)` evaluates D_β H[−arg]
+    // (= −X' diag(c ⊙ X arg) X for scalar GLMs, plus −D(H_φ)[X·(−arg)]
+    // for Firth).  To get D_β H[+v_j] we therefore pass −v_j.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
-        // Mode response: v_i = H⁻¹(g_i).
+        // Mode response: v_i = H⁻¹(g_i) = +dβ̂/dψ_i.
         let v_i = hop.solve(&coord.g);
 
-        // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[v_i].
-        // The HessianDerivativeProvider takes v_i (positive) and internally
-        // computes D_β H[−v_i], matching the ρ-coordinate convention.
+        // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
             stoch_traces[k + ext_idx]
         } else {
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction_result(&v_i)?
+                let neg_v_i = v_i.mapv(|z| -z);
+                effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
             } else {
                 None
             };
@@ -3981,9 +3993,13 @@ fn compute_outer_hessian(
 
     // Precompute ext mode responses and total Hessian drifts.
     //
-    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE, matching the ρ
-    // convention v_k = H⁻¹(A_k β̂).  The HessianDerivativeProvider trait
-    // internally negates to get the mode direction β_i = −v_i.
+    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE.  Unlike ρ (where
+    // dβ̂/dρ_k = −v_k), for ext coordinates the IFT gives
+    //   dβ̂/dψ_j = +v_j
+    // because H · dβ̂/dψ = g_j with g_j = X_τ'u − X'W(X_τβ̂) − S_τβ̂ (see
+    // `build_tau_hyper_coords_original_basis`).  Consequently the correct
+    // Hessian drift correction is D_β H[+v_j], and we pass −v_j to the trait
+    // since `hessian_derivative_correction(arg)` evaluates D_β H[−arg].
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_dim);
 
@@ -4010,9 +4026,10 @@ fn compute_outer_hessian(
         // operator-only fast path.
         let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
-            // Pass v_i (positive) — the trait internally negates to get
-            // D_β H[−v_i], the IFT correction at direction β_i = −v_i.
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
+            // Pass −v_i so the trait returns D_β H[+v_i], the IFT correction
+            // at the ext mode direction β_i = +v_i.
+            let neg_v_i = v_i.mapv(|z| -z);
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&neg_v_i)? {
                 h_i += &corr;
             }
         }
@@ -4329,6 +4346,21 @@ fn compute_outer_hessian(
                     incl_logdet_h,
                     incl_logdet_s,
                 );
+                if std::env::var("GAM_DEBUG_EXTEXT").is_ok() {
+                    eprintln!(
+                        "[ext_ext {}{}] a_i={:.6e} a_j={:.6e} gi_vj={:.6e} pair_a={:.6e} cross={:.6e} h2={:.6e} pair_ld_s={:.6e} h_val={:.6e}",
+                        ii,
+                        jj,
+                        coord_i.a,
+                        coord_j.a,
+                        coord_i.g.dot(&ext_v[jj]),
+                        pair.a,
+                        cross_trace,
+                        h2_trace,
+                        pair.ld_s,
+                        h_val,
+                    );
+                }
                 hess[[k + ii, k + jj]] = h_val;
                 if ii != jj {
                     hess[[k + jj, k + ii]] = h_val;
