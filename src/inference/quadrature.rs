@@ -282,14 +282,14 @@ const LOGIT_MAX_TERMS: usize = 160;
 /// truncation index would exceed LOGIT_MAX_TERMS, the backend rejects and
 /// the caller routes to GHQ.
 ///
-/// The value is set so that all downstream consumers (oracle-match,
-/// finite-difference derivative, symmetry identity) pass with strict
-/// positive margin while staying within the LOGIT_MAX_TERMS budget for
-/// the entire eligibility window (μ,σ) ∈ [−40,40] × [0.25, 6]. The worst
-/// case is σ = 0.25 with m ≈ σ, where the leading series coefficient
-/// peaks near 0.484/σ² ≈ 7.74 and the tail bound at N = 160 reaches
-/// ≈ 3·10⁻⁴.
-const LOGIT_ERFCX_ACCURACY_TARGET: f64 = 1.0e-4;
+/// Set to 1e-11 so that the erfcx branch only commits to a value when it
+/// can honor the sharp tolerances used by downstream consumers (oracle-
+/// match, finite-difference derivative, jet-match tests all pin to
+/// `max_relative = 1e-10`). At 1e-11 the series rejects in the central
+/// band near (μ=1.1, σ=0.8) where the tail bound reaches ~2.6e-5 at
+/// N=160, correctly deferring to GHQ which is accurate to ~1e-13 in that
+/// regime after the QR eigenvector fix.
+const LOGIT_ERFCX_ACCURACY_TARGET: f64 = 1.0e-11;
 const CLOGLOG_MILES_ALPHA: f64 = 60.0;
 const CLOGLOG_MILES_MAX_TERMS: usize = 256;
 const CLOGLOG_GAMMA_K_REF: f64 = 0.5;
@@ -1516,13 +1516,13 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     //   E[f(η)] = Σ_{k≥0} σ^(2k) / (2^k · k!) · f^(2k)(μ).
     //
     // Here f(x) = 1 − exp(−exp(x)) is entire, so the series is valid
-    // globally. Truncating at the σ⁴ term yields
+    // globally. Truncating at the σ⁶ term yields
     //
-    //   E[f(η)]       ≈ f + (σ²/2) f''    + (σ⁴/8) f^(4)
-    //   d/dμ E[f(η)]  ≈ f' + (σ²/2) f'''  + (σ⁴/8) f^(5).
+    //   E[f(η)]       ≈ f + (σ²/2) f'' + (σ⁴/8) f^(4) + (σ⁶/48) f^(6)
+    //   d/dμ E[f(η)]  ≈ f' + (σ²/2) f''' + (σ⁴/8) f^(5) + (σ⁶/48) f^(7).
     //
-    // The coefficient of f^(4) is 1/(2²·2!) = 1/8, not 1/4! = 1/24 —
-    // this is the heat-kernel weight, not the Taylor weight.
+    // Coefficients are heat-kernel weights 1/(2^k k!), not Taylor 1/(2k)!:
+    // 1/(2²·2!) = 1/8 (not 1/4! = 1/24), 1/(2³·3!) = 1/48 (not 1/6! = 1/720).
     //
     // A single formula covers the entire real line once the constituent
     // evaluations are written stably:
@@ -1560,20 +1560,62 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
 
     let s2 = sigma * sigma;
     let s4 = s2 * s2;
+    let s6 = s4 * s2;
+    let s8 = s4 * s4;
     let e2x = ex * ex;
     let e3x = e2x * ex;
     let e4x = e3x * ex;
     let e5x = e4x * ex;
+    let e6x = e5x * ex;
+    let e7x = e6x * ex;
+    let e8x = e7x * ex;
+    let e9x = e8x * ex;
     // -expm1(-ex) = 1 - exp(-ex) is bit-exact even when ex is subnormal.
+    //
+    // Derivatives of f(x) = 1 - exp(-exp(x)) follow the Stirling-second-kind
+    // pattern: f^(n)(x) = exp(-exp(x)) * sum_{k=1..n} (-1)^(k+1) S(n,k) u^k,
+    // where u = exp(x) and S(n,k) are Stirling numbers of the second kind:
+    //   S(2,.) = {1, 1}
+    //   S(3,.) = {1, 3, 1}
+    //   S(4,.) = {1, 7, 6, 1}
+    //   S(5,.) = {1, 15, 25, 10, 1}
+    //   S(6,.) = {1, 31, 90, 65, 15, 1}
+    //   S(7,.) = {1, 63, 301, 350, 140, 21, 1}
+    //   S(8,.) = {1, 127, 966, 1701, 1050, 266, 28, 1}
+    //   S(9,.) = {1, 255, 3025, 7770, 6951, 2646, 462, 36, 1}
     let f0 = -(-ex).exp_m1();
     let f1 = ex * surv;
     let f2 = surv * (ex - e2x);
     let f3 = surv * (ex - 3.0 * e2x + e3x);
     let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
     let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
+    let f6 = surv * (ex - 31.0 * e2x + 90.0 * e3x - 65.0 * e4x + 15.0 * e5x - e6x);
+    let f7 = surv
+        * (ex - 63.0 * e2x + 301.0 * e3x - 350.0 * e4x + 140.0 * e5x - 21.0 * e6x + e7x);
+    let f8 = surv
+        * (ex - 127.0 * e2x + 966.0 * e3x - 1701.0 * e4x + 1050.0 * e5x - 266.0 * e6x
+            + 28.0 * e7x
+            - e8x);
+    let f9 = surv
+        * (ex - 255.0 * e2x + 3025.0 * e3x - 7770.0 * e4x + 6951.0 * e5x - 2646.0 * e6x
+            + 462.0 * e7x
+            - 36.0 * e8x
+            + e9x);
+    // Heat-kernel coefficients 1/(2^k k!): k=1: 1/2, k=2: 1/8, k=3: 1/48,
+    // k=4: 1/384. Truncation after sigma^8 leaves O(sigma^10) remainder,
+    // comfortably below 1e-12 rel at sigma = 0.1 even in the negative tail.
     IntegratedMeanDerivative {
-        mean: f0 + 0.5 * s2 * f2 + (s4 / 8.0) * f4,
-        dmean_dmu: (f1 + 0.5 * s2 * f3 + (s4 / 8.0) * f5).max(0.0),
+        mean: f0
+            + 0.5 * s2 * f2
+            + (s4 / 8.0) * f4
+            + (s6 / 48.0) * f6
+            + (s8 / 384.0) * f8,
+        dmean_dmu: (f1
+            + 0.5 * s2 * f3
+            + (s4 / 8.0) * f5
+            + (s6 / 48.0) * f7
+            + (s8 / 384.0) * f9)
+            .max(0.0),
         mode: IntegratedExpectationMode::ControlledAsymptotic,
     }
 }
@@ -2429,7 +2471,13 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
         return candidate;
     }
     let ghq = cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-5, 1e-3) {
+    // Drift tolerances tightened on the derivative absolute floor: the
+    // Taylor truncation diverges in the positive-saturation band
+    // (e.g. mu ~ 3, sigma ~ 0.24) because f^(n) grow near the saturation
+    // transition, and a 1e-5 absolute floor hid 1e-6-scale errors there.
+    // GHQ is the trusted evaluator in that regime because f' has negligible
+    // probability outside the Gaussian 3-sigma window.
+    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-7, 1e-3) {
         ghq
     } else {
         candidate
@@ -2516,13 +2564,36 @@ pub fn integrated_inverse_link_jet(
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
         LinkFunction::Logit => {
-            let candidate = integrate_logit_inverse_link_jet_from_scalar_backend(
-                mu,
-                sigma,
-                |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
-                |x| component_point_jet(LinkComponent::Logit, x),
-            )?;
-            Ok(candidate)
+            // The scalar-backend FD path was locked out by roundoff at
+            // (μ, σ) ≈ (1.1, 0.8) where the outer 1e-10 accuracy contract
+            // bites against (1.8e-4)^2 finite-difference noise on the
+            // second derivative (~2–3 × 1e-11). Since the scalar backend is
+            // already GHQ in that regime (erfcx rejects), we close the loop
+            // by integrating the full pointwise jet directly — the same
+            // Gauss-Hermite nodes evaluate component_point_jet, so mean/d1
+            // retain their scalar-backend values to rounding and d2/d3 are
+            // recovered without differencing noise.
+            let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
+                component_point_jet(LinkComponent::Logit, x)
+            });
+            let mode = if sigma <= 1e-10 {
+                IntegratedExpectationMode::ExactClosedForm
+            } else {
+                // Mirror the scalar controlled-path mode when it accepts the
+                // exact erfcx backend; otherwise the node-sum above is a
+                // quadrature fallback.
+                match logit_posterior_meanwith_deriv_controlled(quadctx, mu, sigma) {
+                    Ok(scalar) => scalar.mode,
+                    Err(_) => IntegratedExpectationMode::QuadratureFallback,
+                }
+            };
+            Ok(IntegratedInverseLinkJet {
+                mean,
+                d1: d1.max(0.0),
+                d2,
+                d3,
+                mode,
+            })
         }
         LinkFunction::CLogLog => {
             validate_latent_cloglog_inputs(mu, sigma)?;
@@ -2552,14 +2623,35 @@ pub fn integrated_logit_inverse_link_jet_pirls(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedInverseLinkJet, EstimationError> {
-    integrate_logit_inverse_link_jet_from_scalar_backend(
-        mu,
-        sigma,
-        // Hot PIRLS path: exact special-function backend first, GHQ only if
-        // the exact backend rejects the inputs.
-        |m, s| logit_posterior_meanwith_deriv_controlled(quadctx, m, s),
-        |x| component_point_jet(LinkComponent::Logit, x),
-    )
+    // Direct jet integration via Gauss-Hermite: the same nodes deliver the
+    // full pointwise jet (mu, d1, d2, d3) so PIRLS receives higher
+    // derivatives without 4th-order finite-difference noise. Kept in sync
+    // with the Logit arm of `integrated_inverse_link_jet` so the PIRLS and
+    // general paths return identical values and modes.
+    if sigma <= 1e-10 {
+        let (mean, d1, d2, d3) = component_point_jet(LinkComponent::Logit, mu);
+        return Ok(IntegratedInverseLinkJet {
+            mean,
+            d1,
+            d2,
+            d3,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        });
+    }
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
+        component_point_jet(LinkComponent::Logit, x)
+    });
+    let mode = match logit_posterior_meanwith_deriv_controlled(quadctx, mu, sigma) {
+        Ok(scalar) => scalar.mode,
+        Err(_) => IntegratedExpectationMode::QuadratureFallback,
+    };
+    Ok(IntegratedInverseLinkJet {
+        mean,
+        d1: d1.max(0.0),
+        d2,
+        d3,
+        mode,
+    })
 }
 
 #[inline]
@@ -3330,62 +3422,6 @@ fn latent_cloglog_kernel_terms(
 }
 
 #[inline]
-fn integrated_jet_fd_step(sigma: f64) -> f64 {
-    (1e-4 * (1.0 + sigma.abs())).clamp(1e-5, 5e-2)
-}
-
-#[inline]
-fn integrate_logit_inverse_link_jet_from_scalar_backend(
-    mu: f64,
-    sigma: f64,
-    eval: impl Fn(f64, f64) -> Result<IntegratedMeanDerivative, EstimationError>,
-    point_jet: impl Fn(f64) -> (f64, f64, f64, f64),
-) -> Result<IntegratedInverseLinkJet, EstimationError> {
-    if sigma <= 1e-10 {
-        let (mean, d1, d2, d3) = point_jet(mu);
-        return Ok(IntegratedInverseLinkJet {
-            mean,
-            d1,
-            d2,
-            d3,
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        });
-    }
-
-    // Solver-facing non-GHQ jet reconstruction for the controlled logit
-    // backend. The scalar route exposes mean and d/dmu; PIRLS also consumes
-    // d2 and d3, so we differentiate that same scalar backend in mu with a
-    // fourth-order symmetric stencil rather than re-enter GHQ.
-    let h = integrated_jet_fd_step(sigma);
-    let c0 = eval(mu, sigma)?;
-    let cm1 = eval(mu - h, sigma)?;
-    let cp1 = eval(mu + h, sigma)?;
-    let cm2 = eval(mu - 2.0 * h, sigma)?;
-    let cp2 = eval(mu + 2.0 * h, sigma)?;
-
-    let d2 =
-        (cm2.dmean_dmu - 8.0 * cm1.dmean_dmu + 8.0 * cp1.dmean_dmu - cp2.dmean_dmu) / (12.0 * h);
-    let d3 = (-cp2.dmean_dmu + 16.0 * cp1.dmean_dmu - 30.0 * c0.dmean_dmu + 16.0 * cm1.dmean_dmu
-        - cm2.dmean_dmu)
-        / (12.0 * h * h);
-
-    let mut mode = c0.mode;
-    for sample_mode in [cm1.mode, cp1.mode, cm2.mode, cp2.mode] {
-        if integrated_expectation_mode_rank(sample_mode) > integrated_expectation_mode_rank(mode) {
-            mode = sample_mode;
-        }
-    }
-
-    Ok(IntegratedInverseLinkJet {
-        mean: c0.mean,
-        d1: c0.dmean_dmu.max(0.0),
-        d2,
-        d3,
-        mode,
-    })
-}
-
-#[inline]
 pub fn normal_expectation_1d_adaptive<F>(
     ctx: &QuadratureContext,
     eta: f64,
@@ -3417,9 +3453,13 @@ fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
     // location-scale and rare-event regimes where MC checks showed larger error.
     // 51 nodes covers the wide-sigma regime where 31-point GHQ accumulated
     // noticeable error against the Faddeeva / high-res numeric references.
+    // The moderate-sigma 31-point band was widened (1.0 → 0.5) after the
+    // Logit jet started feeding d2/d3 through the same Hermite rule: at
+    // σ ≈ 0.8, 21-pt d2 on the logistic-normal reaches only ~2.5e-10 rel
+    // vs 31-pt at ~3e-13, and several downstream tests pin to 1e-10.
     if max_sd.is_finite() && max_sd > 2.5 {
         51
-    } else if max_sd.is_finite() && max_sd > 1.0 {
+    } else if max_sd.is_finite() && max_sd > 0.5 {
         31
     } else if max_sd.is_finite() && max_sd > 0.35 {
         21

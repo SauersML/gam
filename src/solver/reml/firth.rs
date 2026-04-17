@@ -1959,13 +1959,21 @@ impl FirthDenseOperator {
         s_ddot = s_ddot
             + fast_atb(&x_tau_i_reduced, &x_tau_j_reduced)
             + fast_atb(&x_tau_j_reduced, &x_tau_i_reduced);
-        // −tr(Ġ_j Ṡ_i) = +Σ G²·diag(Ṡ_j)_kk·diag(Ṡ_i)_kk;
-        // −tr(G_r S̈_ij) = −Σ G·diag(S̈_ij)_kk.
+        // With G_r = diag(g) in the canonical reduced basis (where
+        // S_r is diagonal), S_r + τ·Ṡ is generally non-diagonal under
+        // perturbation, so Ġ_j = −G Ṡ_j G picks up OFF-DIAGONAL terms:
+        //     (Ġ_j)_{kl} = −G_k · (Ṡ_j)_{kl} · G_l.
+        // Hence tr(Ġ_j Ṡ_i) = −Σ_{k,l} G_k G_l (Ṡ_j)_{kl} (Ṡ_i)_{lk}.
+        // Using symmetry of Ṡ_i (and Ṡ_j):
+        //     −0.5 tr(Ġ_j Ṡ_i) = +0.5 Σ_{k,l} G_k G_l (Ṡ_j)_{kl} (Ṡ_i)_{kl}.
+        // The S̈_{ij} trace against diagonal G_r picks only the diagonal.
         let g_inv = &self.x_metric_reduced_inv_diag;
         let rdim = k.nrows();
         let mut a_pen = 0.0_f64;
         for kk in 0..rdim {
-            a_pen += 0.5 * g_inv[kk] * g_inv[kk] * dot_s_j[[kk, kk]] * dot_s_i[[kk, kk]];
+            for ll in 0..rdim {
+                a_pen += 0.5 * g_inv[kk] * g_inv[ll] * dot_s_j[[kk, ll]] * dot_s_i[[kk, ll]];
+            }
             a_pen -= 0.5 * g_inv[kk] * s_ddot[[kk, kk]];
         }
         let phi_tau_tau_partial = a_lik + a_pen;
@@ -2254,7 +2262,11 @@ impl FirthDenseOperator {
                 m_mddot = m_mddot + Self::rowwise_bilinear(x_r, &core, x_r);
             }
 
-            let col_out = 4.0 * mdot_mdot + 2.0 * m_mddot;
+            // P̈_{ij} = ∂²(M⊙M)/∂τ_i∂τ_j = 2(Ṁ_i ⊙ Ṁ_j) + 2(M ⊙ M̈_{ij}),
+            // with Ṁ_τ = ∂M/∂τ (NOT the pair-squared derivative).  Factor is 2,
+            // not 4 — the earlier "4·Ṁ_i⊙Ṁ_j" was a sign-of-the-derivative
+            // confusion between Ṁ and ∂(M⊙M)/∂τ = 2(M⊙Ṁ).
+            let col_out = 2.0 * mdot_mdot + 2.0 * m_mddot;
             out.column_mut(col).assign(&col_out);
         }
         out
@@ -2270,6 +2282,7 @@ impl FirthDenseOperator {
     /// β-τ reduced quantities A_v, dh_v, D_β(İ_τ)[v], D_β(K̇_τ)[v],
     /// D_β(ḣ_τ)[v], and the w-chain derivatives needed by
     /// `d_beta_hphi_tau_partial_apply`.
+    #[allow(dead_code)]
     pub(crate) fn d_beta_hphi_tau_partial_prepare_from_partials(
         &self,
         tau_kernel: &FirthTauPartialKernel,
@@ -2365,6 +2378,7 @@ impl FirthDenseOperator {
     /// Hadamard-Gram pieces are evaluated column-wise via
     ///   ((Z M_A Wᵀ) ⊙ (Y M_B Xᵀ)) v row-i
     ///       = z_iᵀ M_A (Wᵀ diag(v) X) M_Bᵀ y_i.
+    #[allow(dead_code)]
     fn apply_p_tau_v_to_matrix(
         &self,
         kernel: &FirthTauBetaPartialKernel,
@@ -2417,6 +2431,7 @@ impl FirthDenseOperator {
         out
     }
 
+    #[allow(dead_code)]
     pub(crate) fn d_beta_hphi_tau_partial_apply(
         &self,
         x_tau: &Array2<f64>,
@@ -2536,14 +2551,6 @@ mod tests {
         logit_inverse_link_jet5(eta).d1
     }
 
-    fn d1fd(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
-        (f(x + h) - f(x - h)) / (2.0 * h)
-    }
-
-    fn d2fd(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
-        (f(x + h) - 2.0 * f(x) + f(x - h)) / (h * h)
-    }
-
     fn firthphivalue(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
         let eta = x.dot(beta);
         let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
@@ -2570,6 +2577,24 @@ mod tests {
 
     #[test]
     fn firth_logisticweight_derivatives_match_finite_difference() {
+        // Validates op.w[i] (= jet.d1) and op.w1..w4[i] (= jet.d2..jet.d5)
+        // against direct central finite differences of the logistic inverse
+        // link pdf w(η) = μ(η)(1−μ(η)).
+        //
+        // Nested central differences amplify roundoff by 1/h per nesting
+        // level, so a d1fd-of-d1fd-of-d2fd cannot deliver the tolerances
+        // that 4th-order agreement requires. The principled replacement is
+        // a direct higher-order stencil whose truncation and roundoff are
+        // both controlled by a single step h:
+        //
+        //   d1  (2-pt):  (f(z+h) − f(z−h)) / (2h)                       O(h²) trunc
+        //   d2  (3-pt):  (f(z+h) − 2f(z) + f(z−h)) / h²                 O(h²) trunc
+        //   d3  (4-pt):  (−f(z−2h)+2f(z−h)−2f(z+h)+f(z+2h)) / (2h³)     O(h²) trunc
+        //   d4  (5-pt):  (f(z−2h)−4f(z−h)+6f(z)−4f(z+h)+f(z+2h)) / h⁴   O(h²) trunc
+        //
+        // At h = 1e-2 the logistic pdf and its higher derivatives stay of
+        // order ≤ 1, so truncation O(h²·M) ≲ 1e-4 and roundoff O(ε/h^n)
+        // is well below any asserted tolerance through the 4th order.
         let x = array![
             [1.0, -1.1, 0.2],
             [1.0, -0.5, -0.6],
@@ -2581,30 +2606,35 @@ mod tests {
         let eta = x.dot(&beta);
         let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
 
-        let h12 = 2e-5;
-        let h34 = 1e-3;
+        let h = 1e-2_f64;
         let w = |z: f64| logisticweight(z);
-        let w2 = |z: f64| d2fd(w, z, h12);
-        let w3 = |z: f64| d1fd(w2, z, h34);
+        let d1direct = |z: f64| (w(z + h) - w(z - h)) / (2.0 * h);
+        let d2direct = |z: f64| (w(z + h) - 2.0 * w(z) + w(z - h)) / (h * h);
+        let d3direct = |z: f64| {
+            (-w(z - 2.0 * h) + 2.0 * w(z - h) - 2.0 * w(z + h) + w(z + 2.0 * h))
+                / (2.0 * h.powi(3))
+        };
+        let d4direct = |z: f64| {
+            (w(z - 2.0 * h) - 4.0 * w(z - h) + 6.0 * w(z) - 4.0 * w(z + h) + w(z + 2.0 * h))
+                / h.powi(4)
+        };
         for i in 0..eta.len() {
             let z = eta[i];
             let wfd = w(z);
-            let w1fd = d1fd(w, z, h12);
-            let w2fd = d2fd(w, z, h12);
-            let w3fd = d1fd(w2, z, h34);
-            let w4fd = d1fd(w3, z, h34);
+            let w1fd = d1direct(z);
+            let w2fd = d2direct(z);
+            let w3fd = d3direct(z);
+            let w4fd = d4direct(z);
 
             assert!((op.w[i] - wfd).abs() < 1e-12);
             assert_eq!(op.w1[i].signum(), w1fd.signum());
             assert_eq!(op.w2[i].signum(), w2fd.signum());
-            // w3/w4 sign checks omitted: nested central-difference at these
-            // orders is too fragile to guarantee sign agreement.
-            assert!((op.w1[i] - w1fd).abs() < 2e-7);
-            assert!((op.w2[i] - w2fd).abs() < 2e-5);
-            assert!((op.w3[i] - w3fd).abs() < 4e-4);
-            println!("row {i}: z={z:.6} op.w4={} w4fd={} diff={}",
-                op.w4[i], w4fd, (op.w4[i] - w4fd).abs());
-            assert!((op.w4[i] - w4fd).abs() < 2e-3);
+            assert_eq!(op.w3[i].signum(), w3fd.signum());
+            assert_eq!(op.w4[i].signum(), w4fd.signum());
+            assert!((op.w1[i] - w1fd).abs() < 1e-5);
+            assert!((op.w2[i] - w2fd).abs() < 1e-4);
+            assert!((op.w3[i] - w3fd).abs() < 1e-4);
+            assert!((op.w4[i] - w4fd).abs() < 1e-3);
         }
     }
 
@@ -2934,6 +2964,123 @@ mod tests {
         assert!(
             err < 1e-6,
             "gphi_tau mismatch: analytic={analytic:?}, fd={fd:?}, err={err:e}"
+        );
+    }
+
+    /// Verify pair.a scalar (`phi_tau_tau_partial`) by central-FD'ing the
+    /// single-τ scalar `phi_tau_partial` along τ_j at fixed β.
+    /// Identity: ∂/∂τ_j [Φ_{τ_i}|β] = Φ_{τ_iτ_j}|β.
+    /// Tolerance 1e-7 relative.
+    #[test]
+    fn firthphi_tau_tau_pair_scalar_matches_finite_difference() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let x_tau_i = array![
+            [0.0, 0.15, -0.05],
+            [0.0, -0.10, 0.02],
+            [0.0, 0.08, 0.04],
+            [0.0, -0.06, -0.03],
+            [0.0, 0.05, 0.01],
+            [0.0, -0.12, 0.06],
+        ];
+        let x_tau_j = array![
+            [0.0, -0.04, 0.11],
+            [0.0, 0.09, -0.02],
+            [0.0, -0.06, 0.07],
+            [0.0, 0.10, -0.05],
+            [0.0, -0.03, 0.08],
+            [0.0, 0.07, -0.09],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        let eta = x.dot(&beta);
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+
+        let analytic = op
+            .exact_tau_tau_kernel(&x_tau_i, &x_tau_j, None, &beta, false)
+            .phi_tau_tau_partial;
+
+        let h = 1e-5_f64;
+        let eval_phi_tau_i = |x_eval: &Array2<f64>| -> f64 {
+            let eta_e = x_eval.dot(&beta);
+            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed op");
+            op_e.exact_tau_kernel(&x_tau_i, &beta, false).phi_tau_partial
+        };
+        let x_plus = &x + &(h * &x_tau_j);
+        let x_minus = &x - &(h * &x_tau_j);
+        let fd = (eval_phi_tau_i(&x_plus) - eval_phi_tau_i(&x_minus)) / (2.0 * h);
+
+        let rel = (analytic - fd).abs() / fd.abs().max(1.0);
+        assert!(
+            rel < 1e-7,
+            "pair.a scalar mismatch: analytic={analytic:.6e}, fd={fd:.6e}, rel={rel:.3e}"
+        );
+    }
+
+    /// Verify pair.g p-vector (`gphi_tau_tau`) by central-FD'ing the single-τ
+    /// `gphi_tau` along τ_j at fixed β.
+    /// Identity: ∂/∂τ_j [(gΦ)_{τ_i}|β] = (gΦ)_{τ_iτ_j}|β.
+    /// Tolerance 1e-7 relative max-abs.
+    #[test]
+    fn firthphi_tau_tau_pair_g_vector_matches_finite_difference() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let x_tau_i = array![
+            [0.0, 0.15, -0.05],
+            [0.0, -0.10, 0.02],
+            [0.0, 0.08, 0.04],
+            [0.0, -0.06, -0.03],
+            [0.0, 0.05, 0.01],
+            [0.0, -0.12, 0.06],
+        ];
+        let x_tau_j = array![
+            [0.0, -0.04, 0.11],
+            [0.0, 0.09, -0.02],
+            [0.0, -0.06, 0.07],
+            [0.0, 0.10, -0.05],
+            [0.0, -0.03, 0.08],
+            [0.0, 0.07, -0.09],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        let eta = x.dot(&beta);
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+
+        let analytic = op
+            .exact_tau_tau_kernel(&x_tau_i, &x_tau_j, None, &beta, false)
+            .gphi_tau_tau;
+
+        let h = 1e-5_f64;
+        let eval_gphi_tau_i = |x_eval: &Array2<f64>| -> Array1<f64> {
+            let eta_e = x_eval.dot(&beta);
+            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed op");
+            op_e.exact_tau_kernel(&x_tau_i, &beta, false).gphi_tau
+        };
+        let x_plus = &x + &(h * &x_tau_j);
+        let x_minus = &x - &(h * &x_tau_j);
+        let fd = (&eval_gphi_tau_i(&x_plus) - &eval_gphi_tau_i(&x_minus)) / (2.0 * h);
+
+        let scale = analytic
+            .iter()
+            .chain(fd.iter())
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let err_max = (&analytic - &fd).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let rel = err_max / scale;
+        assert!(
+            rel < 1e-7,
+            "pair.g p-vector mismatch: rel={rel:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
         );
     }
 
