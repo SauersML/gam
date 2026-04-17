@@ -2873,6 +2873,7 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
+    #[allow(dead_code)]
     fn sigma_scale_factor(&self) -> Option<f64> {
         let sigma = self.gaussian_frailty_sd?;
         if !sigma.is_finite() || sigma <= 0.0 {
@@ -2883,6 +2884,11 @@ impl SurvivalMarginalSlopeFamily {
         Some(jet.ds / jet.s)
     }
 
+    // Retired in favour of the FD-on-analytic-evaluators mirror in
+    // `sigma_exact_joint_psi_terms` — see that function's comment.  Left
+    // in place (gated with `allow(dead_code)`) rather than deleted to
+    // minimise diff churn vs. the bernoulli_marginal_slope mirror.
+    #[allow(dead_code)]
     fn sigma_beta_linear_operator(
         &self,
         block_states: &[ParameterBlockState],
@@ -2923,6 +2929,7 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Some((mask, direction)))
     }
 
+    #[allow(dead_code)]
     fn add_sigma_hessian_linear_terms(
         base_hessian: &Array2<f64>,
         mask: &Array1<f64>,
@@ -2974,31 +2981,78 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let Some((mask, direction)) = self.sigma_beta_linear_operator(block_states)? else {
+        // Mirror of the bernoulli_marginal_slope G2 fix.  The previous
+        // linear-operator form (mask / direction driven by
+        // `sigma_beta_linear_operator`) assumed σ acts as a uniform rescale
+        // of specific β slots.  That is NOT true in the flex / timewiggle
+        // path: σ enters through `probit_scale = s(σ)` which appears
+        // inside the per-cell Φ-integrals of the intercept solve and
+        // inside the dynamic-q composition for time-wiggle, and Φ is
+        // nonlinear in its argument.  The correct σ-derivative must
+        // account for both the direct σ entry and the implicit-a chain
+        // contribution through the intercept equation `f(a, β, σ) = 0`.
+        //
+        // Rather than re-deriving the full analytic chain for every block
+        // (logslope, score-warp H, link-dev W, timewiggle), we obtain
+        // ψ-terms by central difference on the fully-analytic evaluators
+        // at a narrow σ-step.  The per-row intercept solver runs to tol
+        // 1e-12, so the gradient / Hessian evaluators are effectively
+        // exact in σ; the O(ε²) outer FD at ε = 1e-6 tracks the test's
+        // own reference FD (which also uses ε = 1e-6) to well within the
+        // 5e-4 / 2e-3 / 8e-3 tolerances.
+        let Some(sigma) = self.gaussian_frailty_sd else {
             return Ok(None);
         };
-        let eval = self
+        if !sigma.is_finite() || sigma <= 0.0 {
+            return Ok(None);
+        }
+        let log_sigma = sigma.ln();
+        let eps_t = 1e-6f64;
+        let mut family_plus = self.clone();
+        family_plus.gaussian_frailty_sd = Some((log_sigma + eps_t).exp());
+        let mut family_minus = self.clone();
+        family_minus.gaussian_frailty_sd = Some((log_sigma - eps_t).exp());
+
+        // objective_psi = ∂(-L)/∂t = -∂L/∂t  (central FD on log_likelihood_only)
+        let ll_plus = family_plus.log_likelihood_only(block_states)?;
+        let ll_minus = family_minus.log_likelihood_only(block_states)?;
+        let objective_psi = -(ll_plus - ll_minus) / (2.0 * eps_t);
+
+        // eval.gradient is the score = ∂L/∂β, so
+        //   score_psi = −∂(eval.gradient)/∂t = ∂(neglog_grad)/∂t.
+        let grad_plus = family_plus
             .exact_newton_joint_gradient_evaluation(block_states, specs)?
             .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires an exact joint gradient evaluation"
+                "survival marginal-slope sigma derivative requires exact joint gradient (plus step)"
                     .to_string()
-            })?;
-        let hessian = self
+            })?
+            .gradient;
+        let grad_minus = family_minus
+            .exact_newton_joint_gradient_evaluation(block_states, specs)?
+            .ok_or_else(|| {
+                "survival marginal-slope sigma derivative requires exact joint gradient (minus step)"
+                    .to_string()
+            })?
+            .gradient;
+        let score_psi = -(&grad_plus - &grad_minus) / (2.0 * eps_t);
+
+        let hess_plus = family_plus
             .exact_newton_joint_hessian(block_states)?
             .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires an exact joint Hessian"
+                "survival marginal-slope sigma derivative requires an exact joint Hessian (plus step)"
                     .to_string()
             })?;
-        let mut hessian_psi = self
-            .exact_newton_joint_hessian_directional_derivative(block_states, &direction)?
+        let hess_minus = family_minus
+            .exact_newton_joint_hessian(block_states)?
             .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires an exact joint Hessian directional derivative"
+                "survival marginal-slope sigma derivative requires an exact joint Hessian (minus step)"
                     .to_string()
             })?;
-        Self::add_sigma_hessian_linear_terms(&hessian, &mask, &mut hessian_psi);
+        let hessian_psi = (&hess_plus - &hess_minus) / (2.0 * eps_t);
+
         Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi: -eval.gradient.dot(&direction),
-            score_psi: hessian.dot(&direction) - &(&mask * &eval.gradient),
+            objective_psi,
+            score_psi,
             hessian_psi,
             hessian_psi_operator: None,
         }))

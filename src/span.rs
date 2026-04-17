@@ -68,6 +68,11 @@ mod tests {
         );
     }
 
+    /// Documents the `span_index_for_breakpoints` helper convention only.
+    /// Specific design evaluators may override this for d2+ handling — see
+    /// `deviation_runtime.rs:186` and `inference/model.rs:761`, which both
+    /// apply a LEFT-bias at interior breakpoints because their C¹ basis
+    /// has distinct left/right limits for d2 at interior breaks.
     #[test]
     fn internal_breakpoints_use_right_hand_span() {
         let breakpoints = [-1.5, -0.9, 0.4, 2.0];

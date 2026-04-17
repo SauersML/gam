@@ -758,7 +758,13 @@ impl SavedAnchoredDeviationRuntime {
                 }
                 continue;
             }
-            let span_idx = self.span_index_for(value)?;
+            let mut span_idx = self.span_index_for(value)?;
+            // LEFT-bias at interior breakpoints mirrors deviation_runtime.rs:186 —
+            // see that comment for rationale (C¹ basis d2 has distinct left/right
+            // limits; paired with LEFT-bias local_cubic_on_span convention).
+            if span_idx > 0 && value == self.breakpoints[span_idx] {
+                span_idx -= 1;
+            }
             let t = value - self.breakpoints[span_idx];
             for basis_idx in 0..self.basis_dim {
                 let c0 = self.span_c0[span_idx][basis_idx];
