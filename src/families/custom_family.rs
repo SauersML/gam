@@ -6578,6 +6578,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // outer REML gradient formula (which assumes exact β̂ stationarity); a
     // non-converged β̂ produces large envelope-theorem violations that show
     // up as FD-vs-analytic gradient mismatches.
+    if std::env::var("GAM_DBG_OUTER").is_ok() {
+        eprintln!(
+            "[DBG-POLISH-ENTRY] use_joint_newton={} converged={}",
+            use_joint_newton, converged
+        );
+    }
     if use_joint_newton && !converged {
         let ranges_joint: Vec<(usize, usize)> = {
             let mut offset = 0;
@@ -6642,6 +6648,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             );
             let rhs = &eval_joint.gradient - &penalty_beta;
             let res_inf = rhs.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            if std::env::var("GAM_DBG_OUTER").is_ok() {
+                eprintln!("[DBG-POLISH] res_inf={:.6e}", res_inf);
+            }
             if res_inf <= inner_tol {
                 converged = true;
                 break;
@@ -6687,12 +6696,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
                 let trial_obj = -trial_ll + trial_penalty;
+                if std::env::var("GAM_DBG_OUTER").is_ok() {
+                    eprintln!(
+                        "[DBG-POLISH-LS] alpha={:.6e} trial_obj={:.12e} old_obj={:.12e}",
+                        alpha, trial_obj, old_obj
+                    );
+                }
                 if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
                     current_penalty = trial_penalty;
                     cached_eval = family.evaluate(&states)?;
                     accepted_polish = true;
                     break;
                 }
+            }
+            if std::env::var("GAM_DBG_OUTER").is_ok() {
+                eprintln!("[DBG-POLISH] accepted_polish={}", accepted_polish);
             }
             if !accepted_polish {
                 // Restore and stop polishing.
