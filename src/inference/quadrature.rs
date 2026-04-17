@@ -596,6 +596,21 @@ fn symmetric_tridiagonal_eigen(
 
     let eps = 1e-15;
     let max_iter = 100;
+    // Matrix 1-norm fallback for the convergence criterion — see
+    // `symmetric_tridiagonal_eigen_dynamic` for derivation.
+    let mut t_norm = 0.0_f64;
+    for i in 0..N_POINTS {
+        let left = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
+        let right = if i + 1 < N_POINTS {
+            off_diag[i].abs()
+        } else {
+            0.0
+        };
+        let row_sum = diag[i].abs() + left + right;
+        if row_sum > t_norm {
+            t_norm = row_sum;
+        }
+    }
 
     // Work on successively smaller submatrices
     let mut n = N_POINTS;
@@ -606,7 +621,8 @@ fn symmetric_tridiagonal_eigen(
             // Find the largest unreduced block
             let mut m = n - 1;
             while m > 0 {
-                if off_diag[m - 1].abs() <= eps * (diag[m - 1].abs() + diag[m].abs()) {
+                let row_scale = (diag[m - 1].abs() + diag[m].abs()).max(t_norm);
+                if off_diag[m - 1].abs() <= eps * row_scale {
                     off_diag[m - 1] = 0.0;
                     break;
                 }
@@ -691,13 +707,34 @@ fn symmetric_tridiagonal_eigen_dynamic(
     }
     let eps = 1e-15;
     let max_iter = 200usize;
+    // Matrix 1-norm estimate used as convergence scale. The per-row criterion
+    // `eps * (|d[m-1]| + |d[m]|)` collapses to zero when the diagonal is
+    // identically zero (as for physicist's Hermite), so a purely diagonal
+    // scale never lets any off-diagonal satisfy the test and the QR sweep
+    // stalls. LAPACK's dsteqr uses ||T||_1 = max over rows of the absolute
+    // row sum; we take that as the base scale and fall back on the row sum
+    // when it is larger.
+    let mut t_norm = 0.0_f64;
+    for i in 0..dim {
+        let left = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
+        let right = if i + 1 < dim {
+            off_diag[i].abs()
+        } else {
+            0.0
+        };
+        let row_sum = diag[i].abs() + left + right;
+        if row_sum > t_norm {
+            t_norm = row_sum;
+        }
+    }
     let mut n = dim;
     while n > 1 {
         let mut converged = false;
         for _ in 0..max_iter {
             let mut m = n - 1;
             while m > 0 {
-                if off_diag[m - 1].abs() <= eps * (diag[m - 1].abs() + diag[m].abs()) {
+                let row_scale = (diag[m - 1].abs() + diag[m].abs()).max(t_norm);
+                if off_diag[m - 1].abs() <= eps * row_scale {
                     off_diag[m - 1] = 0.0;
                     break;
                 }
@@ -1551,28 +1588,6 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
     let dmean_dmu =
         integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| gumbel_survival_d1(x)).max(0.0);
-    // Also manually compute using direct loop for comparison
-    let n = adaptive_point_count_from_sd(sigma.abs());
-    let manual_dmean = with_gh_nodesweights(ctx, n, |nodes, weights| {
-        let scale = SQRT_2 * sigma;
-        let mut sum = 0.0_f64;
-        for i in 0..n {
-            sum += weights[i] * gumbel_survival_d1(mu + scale * nodes[i]);
-        }
-        sum / std::f64::consts::PI.sqrt()
-    });
-    eprintln!(
-        "DBG cloglog_ghq: mu={} sigma={} adaptive_n={} raw_dmean={:.6e} manual_dmean={:.6e}",
-        mu, sigma, n, dmean_dmu, manual_dmean
-    );
-    eprintln!(
-        "DBG cloglog_ghq: nodes/weights:"
-    );
-    with_gh_nodesweights(ctx, n, |nodes, weights| {
-        for i in 0..n {
-            eprintln!("  node[{}]={:.6} weight[{}]={:.6e}", i, nodes[i], i, weights[i]);
-        }
-    });
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -2397,12 +2412,7 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     };
     // Safety-net drift check with loose tolerances — see logit comment.
     let ghq = cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
-    let drift = integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-5, 1e-3);
-    eprintln!(
-        "DBG ctrl inner: mu={} sigma={} cand.mean={:.6e} cand.deriv={:.6e} ghq.mean={:.6e} ghq.deriv={:.6e} drift={}",
-        mu, sigma, candidate.mean, candidate.dmean_dmu, ghq.mean, ghq.dmean_dmu, drift
-    );
-    if drift {
+    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-5, 1e-3) {
         ghq
     } else {
         candidate
@@ -4993,10 +5003,6 @@ mod tests {
         for &(mu, sigma) in &cases {
             let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
             let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
-            eprintln!(
-                "DBG ctrl: mu={} sigma={} mean={:.6e} exp_mean={:.6e} deriv={:.6e} exp_deriv={:.6e}",
-                mu, sigma, approx.mean, expected_mean, approx.dmean_dmu, expected_deriv
-            );
             assert_relative_eq!(
                 approx.mean,
                 expected_mean,

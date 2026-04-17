@@ -1164,6 +1164,7 @@ impl FirthDenseOperator {
     ///
     /// The returned kernel packages every reusable piece so that `apply`
     /// never recomputes shared Grams.
+    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_prepare_from_partials(
         &self,
         x_tau_i_reduced: Array2<f64>,
@@ -1291,6 +1292,7 @@ impl FirthDenseOperator {
     ///   (YAWᵀ ⊙ ZB Zᵀ) · v
     ///     = rowwise_bilinear(Y,  A · (Wᵀ diag(v) Z) · B, Z)
     /// when Y, W, Z are reduced-basis matrices and A, B are r×r symmetric.
+    #[allow(dead_code)]
     fn apply_p_ddot_ij_to_matrix(
         &self,
         kernel: &FirthTauTauPartialKernel,
@@ -1418,6 +1420,7 @@ impl FirthDenseOperator {
 
     /// Primitive A body: compute `Hφ_{τ_iτ_j}|β · V` via the outer
     /// four-way formula.
+    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_apply(
         &self,
         x_tau_i: &Array2<f64>,
@@ -1967,6 +1970,141 @@ mod tests {
         assert!(
             err < 1e-6,
             "gphi_tau mismatch: analytic={analytic:?}, fd={fd:?}, err={err:e}"
+        );
+    }
+
+    /// Verify Primitive A (pair τ_i × τ_j) by central-FD'ing the single-τ
+    /// primitive along τ_j at fixed β.  Identity:
+    ///     ∂/∂τ_j [Hφ_{τ_i}|β · V]  =  Hφ_{τ_iτ_j}|β · V.
+    /// Tolerance 1e-7 relative max-abs.
+    #[test]
+    fn firthphi_tau_tau_partial_matches_finite_difference() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let x_tau_i = array![
+            [0.0, 0.15, -0.05],
+            [0.0, -0.10, 0.02],
+            [0.0, 0.08, 0.04],
+            [0.0, -0.06, -0.03],
+            [0.0, 0.05, 0.01],
+            [0.0, -0.12, 0.06],
+        ];
+        let x_tau_j = array![
+            [0.0, -0.04, 0.11],
+            [0.0, 0.09, -0.02],
+            [0.0, -0.06, 0.07],
+            [0.0, 0.10, -0.05],
+            [0.0, -0.03, 0.08],
+            [0.0, 0.07, -0.09],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        let eta = x.dot(&beta);
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let p = x.ncols();
+
+        let m = 3usize;
+        let vals = [0.21, -0.44, 0.17, 0.38, 0.05, -0.22, -0.11, 0.27, 0.31];
+        let mut rhs = Array2::<f64>::zeros((p, m));
+        for r in 0..p {
+            for c in 0..m {
+                rhs[[r, c]] = vals[(r * m + c) % vals.len()];
+            }
+        }
+
+        let x_tau_i_r = op.reduce_explicit_design(&x_tau_i);
+        let x_tau_j_r = op.reduce_explicit_design(&x_tau_j);
+        let deta_i = x_tau_i.dot(&beta);
+        let deta_j = x_tau_j.dot(&beta);
+        let (dot_i_i, dot_h_i) = op.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i);
+        let (dot_i_j, dot_h_j) = op.dot_i_and_h_from_reduced(&x_tau_j_r, &deta_j);
+
+        let kernel_ij = op.hphi_tau_tau_partial_prepare_from_partials(
+            x_tau_i_r.clone(),
+            x_tau_j_r.clone(),
+            deta_i.clone(),
+            deta_j.clone(),
+            dot_i_i.clone(),
+            dot_i_j.clone(),
+            dot_h_i.clone(),
+            dot_h_j.clone(),
+            None,
+            None,
+        );
+        let analytic_ij =
+            op.hphi_tau_tau_partial_apply(&x_tau_i, &x_tau_j, None, &kernel_ij, &rhs);
+
+        let kernel_ji = op.hphi_tau_tau_partial_prepare_from_partials(
+            x_tau_j_r,
+            x_tau_i_r,
+            deta_j,
+            deta_i,
+            dot_i_j,
+            dot_i_i,
+            dot_h_j,
+            dot_h_i,
+            None,
+            None,
+        );
+        let analytic_ji =
+            op.hphi_tau_tau_partial_apply(&x_tau_j, &x_tau_i, None, &kernel_ji, &rhs);
+
+        //  Symmetry cross-check (Clairaut).
+        let sym_diff: f64 = (&analytic_ij - &analytic_ji)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let sym_scale: f64 = analytic_ij
+            .iter()
+            .chain(analytic_ji.iter())
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        assert!(
+            sym_diff / sym_scale < 1e-10,
+            "τ×τ primitive not symmetric in direction order: sym_diff={sym_diff:.3e}"
+        );
+
+        //  FD reference: central difference of single-τ primitive along τ_j.
+        let h = 1e-4_f64;
+        let fd_block_i = |x_eval: &Array2<f64>| -> Array2<f64> {
+            let eta_e = x_eval.dot(&beta);
+            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed operator");
+            let x_tau_i_r = op_e.reduce_explicit_design(&x_tau_i);
+            let deta_i_e = x_tau_i.dot(&beta);
+            let (dot_i_i_e, dot_h_i_e) = op_e.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i_e);
+            let ker_i_e = op_e.hphi_tau_partial_prepare_from_partials(
+                x_tau_i_r,
+                &deta_i_e,
+                dot_h_i_e,
+                dot_i_i_e,
+            );
+            op_e.hphi_tau_partial_apply(&x_tau_i, &ker_i_e, &rhs)
+        };
+        let x_plus = &x + &(h * &x_tau_j);
+        let x_minus = &x - &(h * &x_tau_j);
+        let fd_ij = (&fd_block_i(&x_plus) - &fd_block_i(&x_minus)) / (2.0 * h);
+
+        let rel_maxabs = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+            let scale = a
+                .iter()
+                .chain(b.iter())
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let max = (a - b).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            max / scale
+        };
+        let err_ij = rel_maxabs(&analytic_ij, &fd_ij);
+        assert!(
+            err_ij < 1e-7,
+            "Primitive A mismatch (i,j): rel_max_abs={err_ij:.3e} > 1e-7\n\
+             analytic=\n{analytic_ij:?}\nfd=\n{fd_ij:?}"
         );
     }
 
