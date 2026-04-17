@@ -3251,14 +3251,9 @@ pub fn reml_laml_evaluate(
                     coord_has_operator.push(false);
                     let mut h_i = coord.drift.materialize();
                     if effective_deriv.has_corrections() {
-                        // ψ-coordinate mode direction is +v_i = +H⁻¹(g_i)
-                        // (see sign-convention derivation in the gradient
-                        // loop below).  Provider expects β-direction = −v,
-                        // so pass −v_i to obtain C[+v_i].
                         let v_i = hop.solve(&coord.g);
-                        let correction_v = -&v_i;
                         if let Some(corr) =
-                            effective_deriv.hessian_derivative_correction_result(&correction_v)?
+                            effective_deriv.hessian_derivative_correction_result(&v_i)?
                         {
                             drift_result_add_into_dense(&mut h_i, &corr);
                         }
@@ -3321,12 +3316,9 @@ pub fn reml_laml_evaluate(
             for coord in solution.ext_coords.iter() {
                 let mut h_i = coord.drift.materialize();
                 if effective_deriv.has_corrections() {
-                    // ψ-coordinate mode direction is +v_i (see
-                    // sign-convention derivation in the ψ gradient loop).
                     let v_i = hop.solve(&coord.g);
-                    let correction_v = -&v_i;
                     if let Some(corr) =
-                        effective_deriv.hessian_derivative_correction_result(&correction_v)?
+                        effective_deriv.hessian_derivative_correction_result(&v_i)?
                     {
                         drift_result_add_into_dense(&mut h_i, &corr);
                     }
@@ -3383,48 +3375,27 @@ pub fn reml_laml_evaluate(
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
     //
-    // Sign-convention derivation for the IFT correction on ψ-coordinates
-    // (differs from the ρ-coordinate convention):
+    // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
     //
-    // The mode condition for the inner problem is ∂F/∂β(β̂(ψ), ψ) = 0.
-    //
-    //   For ρ: F = 0.5 β'·S(ρ)·β − ℓ(β), S(ρ) = Σ λ_k S_k.  Differentiating
-    //          0 = ∂F/∂β along ρ_k gives H·(dβ̂/dρ_k) = −A_k β̂, so
-    //          v_k := H⁻¹(A_k β̂) satisfies  dβ̂/dρ_k = −v_k.
-    //
-    //   For ψ (design-moving and/or penalty-moving): differentiating
-    //          0 = Sβ − ∂ℓ/∂β along ψ_j gives
-    //          H·(dβ̂/dψ_j) = X_τ' u − X' W X_τ β̂ − S_τ β̂ = g_j (as built).
-    //          Hence  v_j := H⁻¹(g_j) = +dβ̂/dψ_j.
-    //
-    // So the *mode direction* relative to v has OPPOSITE signs between ρ and
-    // ψ: β-direction = −v_k for ρ, but β-direction = +v_j for ψ.
-    //
-    // The provider's `hessian_derivative_correction(v)` returns C[−v], i.e.
-    // it assumes β-direction = −v (the ρ convention). To recover the ψ
-    // correction  C[+v_j]  we must feed the provider `−v_j`:
-    //     correction_ψ = hessian_derivative_correction(−v_j) = C[+v_j].
-    //
-    // Passing `v_j` unchanged would give C[−v_j], producing a wrong-sign IFT
-    // contribution that shows up as a systematic 20–30% gradient mismatch
-    // against central-FD on GLM (W depends on β) with non-trivial X_τ.
+    // Sign convention: hessian_derivative_correction() expects v_i = H⁻¹(g_i)
+    // (positive), matching the ρ convention where v_k = H⁻¹(A_k β̂). The
+    // implementation internally negates to get the mode direction β_i = −v_i.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
-        // Mode response: v_i = H⁻¹(g_i), where for ψ v_i = +dβ̂/dψ_i.
+        // Mode response: v_i = H⁻¹(g_i).
         let v_i = hop.solve(&coord.g);
-        // Provider expects β-direction = −v argument; for ψ the mode
-        // direction is +v_i, so pass −v_i to obtain C[+v_i].
-        let correction_v = -&v_i;
 
-        // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[+v_i] (ψ mode dir).
+        // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + C[v_i].
+        // The HessianDerivativeProvider takes v_i (positive) and internally
+        // computes D_β H[−v_i], matching the ρ-coordinate convention.
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
             stoch_traces[k + ext_idx]
         } else {
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction_result(&correction_v)?
+                effective_deriv.hessian_derivative_correction_result(&v_i)?
             } else {
                 None
             };
@@ -4010,11 +3981,9 @@ fn compute_outer_hessian(
 
     // Precompute ext mode responses and total Hessian drifts.
     //
-    // Sign convention: v_i = H⁻¹(g_i) stored positive. Unlike ρ (where the
-    // mode direction is β_k = −v_k), for ψ the IFT gives dβ̂/dψ_i = +v_i —
-    // see the ψ gradient loop above for the derivation. To obtain the IFT
-    // correction C[+v_i] from the provider (which produces C[−v]), we feed
-    // it −v_i.
+    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE, matching the ρ
+    // convention v_k = H⁻¹(A_k β̂).  The HessianDerivativeProvider trait
+    // internally negates to get the mode direction β_i = −v_i.
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_dim);
 
@@ -4041,9 +4010,9 @@ fn compute_outer_hessian(
         // operator-only fast path.
         let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
-            // ψ mode direction is +v_i, provider expects −v argument.
-            let correction_v = -&v_i;
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&correction_v)? {
+            // Pass v_i (positive) — the trait internally negates to get
+            // D_β H[−v_i], the IFT correction at direction β_i = −v_i.
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
                 h_i += &corr;
             }
         }
@@ -4796,10 +4765,7 @@ fn build_outer_hessian_operator(
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let v_i = hop.solve(&coord.g);
-        // ψ mode direction is +v_i; provider expects −v argument
-        // (see sign-convention derivation in the ψ gradient loop).
-        let correction_v = -&v_i;
-        let correction = effective_deriv.hessian_derivative_correction_result(&correction_v)?;
+        let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
         let mut dense = coord.drift.dense.clone();
         let mut operators: Vec<Arc<dyn HyperOperator>> = Vec::new();
         if let Some(block_local) = coord.drift.block_local.as_ref() {
