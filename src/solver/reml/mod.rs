@@ -537,8 +537,11 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn dbg_vtau_summand_breakdown() {
-        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+    fn dbg_vtau_term_by_term_logit_design_moving() {
+        // Debug-only: decompose V_τ = a_i + 0.5·trace_logdet - 0.5·ld_s + TK
+        // for the logit_design_moving_gradient fixture (X_τ ≠ 0, S_τ = 0) and
+        // central-FD each summand independently to find the divergent term.
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
             [1.0, -1.2, 0.3],
@@ -549,34 +552,98 @@ mod tests {
             [1.0, 0.9, -0.1],
             [1.0, 1.3, 0.8],
             [1.0, 1.7, -0.6],
+            [1.0, -0.5, 0.5],
+            [1.0, 0.3, -0.3],
         ];
-        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let x_tau = Array2::<f64>::zeros(x.raw_dim());
-        let s_tau = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15],];
-        let rho = array![0.0];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
+        let x_tau = array![
+            [0.0, 1e-3, -2e-3],
+            [0.0, -3e-3, 1e-3],
+            [0.0, 2e-3, 0.5e-3],
+            [0.0, -1e-3, 3e-3],
+            [0.0, 0.5e-3, -1e-3],
+            [0.0, 1.5e-3, 2e-3],
+            [0.0, -2e-3, -0.5e-3],
+            [0.0, 3e-3, 1e-3],
+            [0.0, -0.5e-3, 2e-3],
+            [0.0, 1e-3, -1.5e-3],
+        ];
+        let s_tau = Array2::<f64>::zeros((3, 3));
         let cfg = RemlConfig::external(
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-14,
             false,
         );
+        let rho = array![0.0];
 
+        // Analytic-at-center decomposition: a_i, 0.5·trace, 0.5·ld_s, TK.
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
+        let pr = bundle.pirls_result.as_ref();
+        let beta = beta_original_from_bundle(&bundle);
+        let u = &pr.solveweights * &(&pr.solveworking_response - &pr.final_eta);
+        let x_tau_beta = x_tau.dot(&beta);
+        let a_i_analytic = -u.dot(&x_tau_beta) + 0.5 * beta.dot(&s_tau.dot(&beta));
+
+        // Per-summand FD.  Each summand is a scalar computed from the outer
+        // quantities V decomposes into; we central-FD by rebuilding the state
+        // at ψ±h and re-evaluating only that summand.
         let h = 2e-5;
-        let x_plus = &x + &(x_tau.mapv(|v| h * v));
-        let x_minus = &x - &(x_tau.mapv(|v| h * v));
-        let s_plus = &s0 + &(s_tau.mapv(|v| h * v));
-        let s_minus = &s0 - &(s_tau.mapv(|v| h * v));
+        let make_summands = |x_eval: &Array2<f64>, s_eval: &Array2<f64>| -> (f64, f64, f64, f64) {
+            let st = build_logit_state(&y, &w, x_eval, s_eval, &cfg);
+            let bundle = st.obtain_eval_bundle(&rho).expect("bundle");
+            let pr = bundle.pirls_result.as_ref();
+            let beta = beta_original_from_bundle(&bundle);
+            // a-part surface: −ℓ + ½ β̂' S(ψ) β̂ = ½·deviance + ½·β̂'Sβ̂
+            let half_dev = 0.5 * pr.deviance;
+            let quad = 0.5 * beta.dot(&s_eval.dot(&beta));
+            let a_part = half_dev + quad;
+            // log|H|
+            let h_orig = h_original_from_bundle(&bundle);
+            let chol = h_orig.cholesky(Side::Lower).expect("chol H");
+            let logdet_h: f64 = chol.diag().iter().map(|v| 2.0 * v.ln()).sum();
+            // log|S| with tiny ridge for numerical stability of FD
+            let p_dim = s_eval.nrows();
+            let ridge = 1e-10;
+            let mut s_ridge = s_eval.clone();
+            for i in 0..p_dim {
+                s_ridge[[i, i]] += ridge;
+            }
+            let chol_s = s_ridge.cholesky(Side::Lower).expect("chol S+ridge");
+            let logdet_s: f64 = chol_s.diag().iter().map(|v| 2.0 * v.ln()).sum();
+            // Total cost (includes TK via compute_cost).
+            let total = st.compute_cost(&rho).expect("cost");
+            (a_part, logdet_h, logdet_s, total)
+        };
+        let x_plus = &x + &x_tau.mapv(|v| h * v);
+        let x_minus = &x - &x_tau.mapv(|v| h * v);
+        let s_plus = &s0 + &s_tau.mapv(|v| h * v);
+        let s_minus = &s0 - &s_tau.mapv(|v| h * v);
+        let (a_p, ldh_p, lds_p, tot_p) = make_summands(&x_plus, &s_plus);
+        let (a_m, ldh_m, lds_m, tot_m) = make_summands(&x_minus, &s_minus);
+        let a_fd = (a_p - a_m) / (2.0 * h);
+        let ldh_fd = (ldh_p - ldh_m) / (2.0 * h);
+        let lds_fd = (lds_p - lds_m) / (2.0 * h);
+        let tot_fd = (tot_p - tot_m) / (2.0 * h);
+        let v_laml_reconstructed = a_fd + 0.5 * ldh_fd - 0.5 * lds_fd;
+        let tk_fd_inferred = tot_fd - v_laml_reconstructed;
 
-        let state_plus_full = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
-        let state_minus_full = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-        unsafe { std::env::set_var("GAM_DBG_COST", "+"); }
-        let v_cost_plus = state_plus_full.compute_cost(&rho).expect("cost+");
-        eprintln!("[POST-COMPUTE-COST +] v_cost_plus={:.12e}", v_cost_plus);
-        unsafe { std::env::set_var("GAM_DBG_COST", "-"); }
-        let v_cost_minus = state_minus_full.compute_cost(&rho).expect("cost-");
-        eprintln!("[POST-COMPUTE-COST -] v_cost_minus={:.12e}", v_cost_minus);
-        unsafe { std::env::remove_var("GAM_DBG_COST"); }
-        let v_fd_cost = (v_cost_plus - v_cost_minus) / (2.0 * h);
-        eprintln!("[VTAU-FD] v_fd_cost={:.12e}", v_fd_cost);
+        eprintln!(
+            "[VTAU-TERM-BY-TERM] a_i_analytic={:.12e} a_fd_of_a_part={:.12e}",
+            a_i_analytic, a_fd,
+        );
+        eprintln!(
+            "[VTAU-TERM-BY-TERM] ldh_fd={:.12e}  (half_ldh_fd={:.12e})",
+            ldh_fd, 0.5 * ldh_fd,
+        );
+        eprintln!(
+            "[VTAU-TERM-BY-TERM] lds_fd={:.12e}  (half_lds_fd={:.12e})",
+            lds_fd, 0.5 * lds_fd,
+        );
+        eprintln!(
+            "[VTAU-TERM-BY-TERM] v_laml_reconstructed={:.12e} tk_fd_inferred={:.12e} total_fd={:.12e}",
+            v_laml_reconstructed, tk_fd_inferred, tot_fd,
+        );
     }
 
     #[test]
