@@ -3382,13 +3382,12 @@ impl<'a> RemlState<'a> {
                         //   X_τ_trans = X_τ_original · Qs,
                         // because η = (X_original · Qs) · β_transformed and the
                         // row patterns of X_τ don't depend on β.
-                        let x_tau_orig_dense = hyper_dirs
-                            .get(coord_idx)
-                            .and_then(|dir| dir.x_tau_original.try_dense());
-                        let x_tau_eff = match x_tau_orig_dense {
-                            Some(arr) if needs_transform => arr.dot(qs),
-                            Some(arr) => arr.to_owned(),
-                            None => Array2::<f64>::zeros((x_transformed.nrows(), p_dim)),
+                        let x_tau_eff = match hyper_dirs.get(coord_idx) {
+                            Some(dir) if dir.x_tau_original.any_nonzero() => {
+                                let arr = dir.x_tau_original.materialize();
+                                if needs_transform { arr.dot(qs) } else { arr }
+                            }
+                            _ => Array2::<f64>::zeros((x_transformed.nrows(), p_dim)),
                         };
 
                         // Total Hessian drift Ḣ_ψ = B_ψ + D_β H[+v_ψ]
