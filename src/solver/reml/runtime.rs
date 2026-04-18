@@ -996,7 +996,7 @@ impl<'a> RemlState<'a> {
                 } else {
                     Array2::<f64>::zeros((total, total))
                 };
-                let eps = 1e-4_f64;
+                let eps = 1e-5_f64;
                 for i in 0..ext_dim {
                     let dir_i = &psi_list[i];
                     if dir_i.h_dot.nrows() == 0 {

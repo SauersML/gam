@@ -5967,6 +5967,55 @@ pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
     f64::EPSILON.sqrt() * (eigenvalues.len() as f64).max(1.0)
 }
 
+/// How the penalized Hessian's log-determinant and its derivatives treat the
+/// spectrum below the stability floor `ε = spectral_epsilon(·)`.
+///
+/// Two conventions, both mathematically internally consistent:
+///
+/// ## `Smooth` (default — appropriate for almost all GLM/GAM families)
+///
+/// All eigenvalues contribute to `log|H|` via the smooth regularizer
+/// `r_ε(σ) = ½(σ + √(σ² + 4ε²))`.  Gradients use `φ'(σ) = 1/√(σ² + 4ε²)`
+/// so that `d log|H|_reg/dρ = Σ φ'(σ_j) · u_j^T (dH/dρ) u_j` is the EXACT
+/// derivative of the scalar objective `Σ log r_ε(σ_j)`.  Near-zero
+/// eigenvalues get a soft floor and still contribute to both the cost and
+/// its gradient, with no jumps or discontinuities.
+///
+/// ## `HardPseudo` (opt-in for structurally rank-deficient families)
+///
+/// When the model is known to carry a numerical null-space direction that
+/// is not informative — e.g. multi-block GAMLSS wiggle models where the
+/// threshold + constant wiggle-intercept are collinear — the smooth floor
+/// still contributes to `log|H|_reg` through that direction, and its
+/// first-order `dσ/dρ = u^T (dH/dρ) u` estimate is unreliable because the
+/// eigenvector u for a near-zero σ is a random linear combination of
+/// whatever the numerical eigensolver selected inside the null space.
+///
+/// Under `HardPseudo`, eigenvalues satisfying `σ_j ≤ ε` are EXCLUDED from
+/// `log|H|`, `tr(G_ε · A)`, `tr(H⁻¹ · ·)`, and every cross-trace.  This is
+/// the exact pseudo-logdeterminant on the active eigenspace:
+///
+///   log|H|₊  = Σ_{σ_j > ε} log σ_j
+///   d/dρ_k   = Σ_{σ_j > ε} (1/σ_j) · u_j^T (dH/dρ_k) u_j
+///
+/// with the smooth floor `r_ε(σ)` retained in place of `log σ` / `1/σ` so
+/// there is no discontinuity as an eigenvalue crosses ε.  The key property
+/// is that null-space directions drop out of both the cost and the
+/// gradient in a matched way, so FD-vs-analytic comparisons close cleanly
+/// (first-order pert theory applies only to directions that actually have
+/// curvature to perturb).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PseudoLogdetMode {
+    Smooth,
+    HardPseudo,
+}
+
+impl Default for PseudoLogdetMode {
+    fn default() -> Self {
+        Self::Smooth
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Dense spectral HessianOperator implementation
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6007,6 +6056,21 @@ impl DenseSpectralOperator {
     /// regularized via `r_ε(σ)`. All subsequent operations (logdet, trace,
     /// solve) use the regularized spectrum, ensuring mathematical consistency.
     pub fn from_symmetric(h: &Array2<f64>) -> Result<Self, String> {
+        Self::from_symmetric_with_mode(h, PseudoLogdetMode::Smooth)
+    }
+
+    /// Variant of [`from_symmetric`](Self::from_symmetric) that selects the
+    /// log-determinant convention.
+    ///
+    /// See [`PseudoLogdetMode`] for the derivation and the exact set of
+    /// kernels that differ between the two modes.  At a high level:
+    /// `Smooth` keeps every eigenpair in play with a soft floor, whereas
+    /// `HardPseudo` masks out `σ_j ≤ ε` consistently across logdet,
+    /// gradient traces, cross-traces, and the H⁻¹ kernels.
+    pub fn from_symmetric_with_mode(
+        h: &Array2<f64>,
+        mode: PseudoLogdetMode,
+    ) -> Result<Self, String> {
         use faer::Side;
 
         let n = h.nrows();
@@ -6024,15 +6088,35 @@ impl DenseSpectralOperator {
 
         let epsilon = spectral_epsilon(eigenvalues.as_slice().unwrap());
 
-        // Apply smooth regularization to all eigenvalues
+        // `active[j]` selects which eigenpairs participate in every trace
+        // and in the cached logdet.  Under `Smooth` every eigenpair is
+        // active (default behavior for well-conditioned problems).  Under
+        // `HardPseudo` eigenvalues ≤ ε are excluded from both the cost
+        // (`cached_logdet`) and the gradient kernel (`g_factor`,
+        // `w_factor`, `hinv_cross_kernel`, `logdet_hessian_kernel`), so
+        // the null-space directions of a rank-deficient H drop out of
+        // FD-vs-analytic gradient comparisons cleanly.
+        let active: Vec<bool> = match mode {
+            PseudoLogdetMode::Smooth => vec![true; n],
+            PseudoLogdetMode::HardPseudo => eigenvalues.iter().map(|&s| s > epsilon).collect(),
+        };
+
+        // Apply smooth regularization to all eigenvalues (even inactive ones:
+        // `reg_eigenvalues[j]` is still consulted by `trace_hinv_product`
+        // when using `w_factor[:, j]`, but we zero-out `w_factor[:, j]` for
+        // inactive eigenpairs so those entries never enter any sum).
         let reg_eigenvalues: Vec<f64> = eigenvalues
             .iter()
             .map(|&sigma| spectral_regularize(sigma, epsilon))
             .collect();
 
-        // Build W factor for traces: W[:, j] = u_j / sqrt(r_ε(σ_j))
+        // Build W factor for traces: W[:, j] = u_j / sqrt(r_ε(σ_j)) on
+        // active eigenpairs, 0 otherwise.
         let mut w_factor = Array2::zeros((n, n));
         for j in 0..n {
+            if !active[j] {
+                continue;
+            }
             let scale = 1.0 / reg_eigenvalues[j].sqrt();
             for row in 0..n {
                 w_factor[[row, j]] = eigenvectors[[row, j]] * scale;
@@ -6041,8 +6125,14 @@ impl DenseSpectralOperator {
 
         let mut hinv_cross_kernel = Array2::zeros((n, n));
         for a in 0..n {
+            if !active[a] {
+                continue;
+            }
             let inv_ra = 1.0 / reg_eigenvalues[a];
             for b in 0..n {
+                if !active[b] {
+                    continue;
+                }
                 hinv_cross_kernel[[a, b]] = inv_ra / reg_eigenvalues[b];
             }
         }
@@ -6054,6 +6144,9 @@ impl DenseSpectralOperator {
         let four_eps_sq = 4.0 * epsilon * epsilon;
         let mut g_factor = Array2::zeros((n, n));
         for j in 0..n {
+            if !active[j] {
+                continue;
+            }
             let sigma = eigenvalues[j];
             let phi_prime = 1.0 / (sigma * sigma + four_eps_sq).sqrt();
             let scale = phi_prime.sqrt();
@@ -6068,9 +6161,15 @@ impl DenseSpectralOperator {
             .map(|&s| (s * s + four_eps_sq).sqrt())
             .collect();
         for a in 0..n {
+            if !active[a] {
+                continue;
+            }
             let sigma_a = eigenvalues[a];
             let sqrt_a = sqrt_disc[a];
             for b in 0..n {
+                if !active[b] {
+                    continue;
+                }
                 logdet_hessian_kernel[[a, b]] = if a == b {
                     -sigma_a / (sqrt_a * sqrt_a * sqrt_a)
                 } else {
@@ -6081,8 +6180,12 @@ impl DenseSpectralOperator {
             }
         }
 
-        // Precompute logdet: Σ ln(r_ε(σ_i))
-        let cached_logdet: f64 = reg_eigenvalues.iter().map(|&v| v.ln()).sum();
+        // Precompute logdet: Σ_{active} ln(r_ε(σ_i)).
+        let cached_logdet: f64 = reg_eigenvalues
+            .iter()
+            .zip(active.iter())
+            .filter_map(|(&v, &act)| if act { Some(v.ln()) } else { None })
+            .sum();
 
         Ok(Self {
             reg_eigenvalues,
@@ -6690,13 +6793,22 @@ pub struct BlockCoupledOperator {
 }
 
 impl BlockCoupledOperator {
-    /// Create from an assembled joint Hessian.
+    /// Create from an assembled joint Hessian using the `Smooth` regularizer.
     ///
     /// `joint_hessian` is the full `p_total x p_total` penalized Hessian.
-    ///
     /// Internally performs a single eigendecomposition of `joint_hessian`.
     pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String> {
-        let inner = DenseSpectralOperator::from_symmetric(joint_hessian)
+        Self::from_joint_hessian_with_mode(joint_hessian, PseudoLogdetMode::Smooth)
+    }
+
+    /// Variant of [`from_joint_hessian`](Self::from_joint_hessian) that lets
+    /// the caller select `PseudoLogdetMode::HardPseudo` for families known
+    /// to carry a numerical null-space direction.
+    pub fn from_joint_hessian_with_mode(
+        joint_hessian: &Array2<f64>,
+        mode: PseudoLogdetMode,
+    ) -> Result<Self, String> {
+        let inner = DenseSpectralOperator::from_symmetric_with_mode(joint_hessian, mode)
             .map_err(|e| format!("BlockCoupledOperator eigendecomposition: {e}"))?;
 
         Ok(Self { inner })
