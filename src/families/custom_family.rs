@@ -5832,8 +5832,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
     let use_joint_newton = has_joint_exacthessian && specs.len() >= 2;
-    let inner_tol = options.inner_tol;
-    let inner_max_cycles = options.inner_max_cycles;
+    let inner_tol = if std::env::var("GAM_DBG_OUTER").is_ok() {
+        1e-12_f64.max(options.inner_tol * 1e-6)
+    } else {
+        options.inner_tol
+    };
+    let inner_max_cycles = if std::env::var("GAM_DBG_OUTER").is_ok() {
+        options.inner_max_cycles.max(500)
+    } else {
+        options.inner_max_cycles
+    };
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
     let mut s_lambdas = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {

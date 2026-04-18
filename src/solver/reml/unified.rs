@@ -3081,24 +3081,6 @@ pub fn reml_laml_evaluate(
             if *include_logdet_s {
                 cost -= 0.5 * log_det_s;
             }
-            if let Ok(tag) = std::env::var("GAM_DBG_COST") {
-                let firth_val = solution
-                    .firth
-                    .as_ref()
-                    .map_or(0.0, ExactJeffreysTerm::value);
-                eprintln!(
-                    "[DBG-COST {}] ll={:.12e} pen_quad={:.12e} logdet_h_raw={:.12e} hlogdet_corr={:.12e} logdet_s={:.12e} tk={:.12e} firth={:.12e} cost={:.12e}",
-                    tag,
-                    solution.log_likelihood,
-                    solution.penalty_quadratic,
-                    hop.logdet(),
-                    solution.hessian_logdet_correction,
-                    log_det_s,
-                    solution.tk_correction,
-                    firth_val,
-                    cost,
-                );
-            }
             (cost, *phi, 0.0)
         }
     };
@@ -3458,8 +3440,8 @@ pub fn reml_laml_evaluate(
         let v_i = hop.solve(&coord.g);
 
         // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
-        let mut dbg_base_trace = 0.0;
-        let mut dbg_corr_trace = 0.0;
+        let mut dbg_t_base = 0.0;
+        let mut dbg_t_ift = 0.0;
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -3473,23 +3455,23 @@ pub fn reml_laml_evaluate(
             };
             if let Some(corr) = correction.as_ref() {
                 let base = coord.drift.materialize();
-                let bt = hop.trace_logdet_gradient(&base);
-                let ct = corr.trace_logdet(hop);
-                dbg_base_trace = bt;
-                dbg_corr_trace = ct;
-                bt + ct
+                let tb = hop.trace_logdet_gradient(&base);
+                let ti = corr.trace_logdet(hop);
+                dbg_t_base = tb;
+                dbg_t_ift = ti;
+                tb + ti
             } else if let Some(op) = coord
                 .drift
                 .operator_ref()
                 .filter(|_| coord.drift.uses_operator_fast_path())
             {
                 let t = hop.trace_logdet_operator(op);
-                dbg_base_trace = t;
+                dbg_t_base = t;
                 t
             } else {
                 let h_i = coord.drift.materialize();
                 let t = hop.trace_logdet_h_k(&h_i, None);
-                dbg_base_trace = t;
+                dbg_t_base = t;
                 t
             }
         };
@@ -3505,15 +3487,14 @@ pub fn reml_laml_evaluate(
             incl_logdet_s,
         );
 
-        if let Ok(tag) = std::env::var("GAM_DEBUG_VTAU") {
+        if std::env::var("GAM_DBG_VTAU_EXT").is_ok() {
             eprintln!(
-                "[V_tau tag={} ext_idx={}] a={:.12e} ld_s={:.12e} base_trace={:.12e} corr_trace={:.12e} total_trace={:.12e} grad={:.12e}",
-                tag,
+                "[VTAU-EXT ext={}] a={:.12e} ld_s={:.12e} t_base={:.12e} t_ift={:.12e} trace={:.12e} grad={:.12e}",
                 ext_idx,
                 coord.a,
                 coord.ld_s,
-                dbg_base_trace,
-                dbg_corr_trace,
+                dbg_t_base,
+                dbg_t_ift,
                 trace_logdet_i,
                 grad[grad_idx],
             );
@@ -4428,21 +4409,6 @@ fn compute_outer_hessian(
                     incl_logdet_h,
                     incl_logdet_s,
                 );
-                if std::env::var("GAM_DEBUG_EXTEXT").is_ok() {
-                    eprintln!(
-                        "[ext_ext {}{}] a_i={:.6e} a_j={:.6e} gi_vj={:.6e} pair_a={:.6e} cross={:.6e} h2={:.6e} pair_ld_s={:.6e} h_val={:.6e}",
-                        ii,
-                        jj,
-                        coord_i.a,
-                        coord_j.a,
-                        coord_i.g.dot(&ext_v[jj]),
-                        pair.a,
-                        cross_trace,
-                        h2_trace,
-                        pair.ld_s,
-                        h_val,
-                    );
-                }
                 hess[[k + ii, k + jj]] = h_val;
                 if ii != jj {
                     hess[[k + jj, k + ii]] = h_val;
@@ -6083,6 +6049,38 @@ impl DenseSpectralOperator {
 
         let epsilon = spectral_epsilon(eigenvalues.as_slice().unwrap());
 
+        if std::env::var("GAM_DBG_OUTER").is_ok() {
+            let h00 = h[[0, 0]];
+            let mut logdet_total = 0.0;
+            let mut log_reg_eigs: Vec<f64> = Vec::with_capacity(n);
+            let mut u0_sq: Vec<f64> = Vec::with_capacity(n);
+            for j in 0..n {
+                let sigma = eigenvalues[j];
+                let reg = 0.5 * (sigma + (sigma * sigma + 4.0 * epsilon * epsilon).sqrt());
+                let log_reg = reg.ln();
+                logdet_total += log_reg;
+                log_reg_eigs.push(log_reg);
+                u0_sq.push(eigenvectors[[0, j]].powi(2));
+            }
+            let mut hinv00 = 0.0;
+            for j in 0..n {
+                let sigma = eigenvalues[j];
+                if sigma.abs() > 1e-14 {
+                    hinv00 += u0_sq[j] / sigma;
+                }
+            }
+            eprintln!(
+                "[DBG-SPECTRAL-H] n={} h[0,0]={:.6e} epsilon={:.18e} logdet_total={:.12e} hinv00={:.12e}",
+                n, h00, epsilon, logdet_total, hinv00,
+            );
+            for j in 0..n {
+                eprintln!(
+                    "[DBG-EIG] j={} sigma={:.18e} log_r_eps={:.18e} u[0]^2={:.18e}",
+                    j, eigenvalues[j], log_reg_eigs[j], u0_sq[j]
+                );
+            }
+        }
+
         // Apply smooth regularization to all eigenvalues
         let reg_eigenvalues: Vec<f64> = eigenvalues
             .iter()
@@ -6289,10 +6287,21 @@ impl HessianOperator for DenseSpectralOperator {
         // where φ'(σ) = 1/√(σ² + 4ε²).
         // Computed as Σ (AG ⊙ G) where G = U diag(√φ'(σ)).
         let ag = a.dot(&self.g_factor);
-        ag.iter()
+        let result: f64 = ag.iter()
             .zip(self.g_factor.iter())
             .map(|(&a, &g)| a * g)
-            .sum()
+            .sum();
+        if std::env::var("GAM_DBG_OUTER").is_ok() {
+            // Also compute exact tr(H_reg^{-1} A) as a sanity check.
+            let ndim = self.n_dim;
+            let a00 = if a.nrows() >= 1 && a.ncols() >= 1 { a[[0, 0]] } else { 0.0 };
+            let a_frob: f64 = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "[DBG-TRACE-LOGDET-GRAD] n_dim={} a[0,0]={:.6e} a_frob={:.6e} result={:.12e}",
+                ndim, a00, a_frob, result
+            );
+        }
+        result
     }
 
     fn trace_logdet_block_local(
@@ -6361,7 +6370,28 @@ impl HessianOperator for DenseSpectralOperator {
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         let projected = self.projected_operator(&self.g_factor, op);
-        projected.diag().sum()
+        let result = projected.diag().sum();
+        if std::env::var("GAM_DBG_OUTER").is_ok() {
+            let op_dense = op.to_dense();
+            let op00 = if op_dense.nrows() >= 1 { op_dense[[0, 0]] } else { 0.0 };
+            let op_frob: f64 = op_dense.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let g00 = self.g_factor[[0, 0]];
+            eprintln!(
+                "[DBG-TRACE-LOGDET-OP] n_dim={} op[0,0]={:.6e} op_frob={:.6e} g[0,0]={:.6e} result={:.12e}",
+                self.n_dim, op00, op_frob, g00, result
+            );
+            // Verify: result should equal tr(G_ε(H) * op)
+            // Direct: Σ_j φ'(σ_j) u_j^T op u_j where U is eigenvector matrix
+            // = Σ (op * g_factor ⊙ g_factor)
+            let op_g = op_dense.dot(&self.g_factor);
+            let direct: f64 = op_g
+                .iter()
+                .zip(self.g_factor.iter())
+                .map(|(&a, &g)| a * g)
+                .sum();
+            eprintln!("[DBG-TRACE-LOGDET-OP-DIRECT] direct={:.12e}", direct);
+        }
+        result
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
