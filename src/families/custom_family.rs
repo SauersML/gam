@@ -5832,16 +5832,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
     let use_joint_newton = has_joint_exacthessian && specs.len() >= 2;
-    let inner_tol = if std::env::var("GAM_DBG_OUTER").is_ok() {
-        1e-12_f64.max(options.inner_tol * 1e-6)
-    } else {
-        options.inner_tol
-    };
-    let inner_max_cycles = if std::env::var("GAM_DBG_OUTER").is_ok() {
-        options.inner_max_cycles.max(500)
-    } else {
-        options.inner_max_cycles
-    };
+    let inner_tol = options.inner_tol;
+    let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
     let mut s_lambdas = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
@@ -6266,12 +6258,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
             )?;
-            if std::env::var("GAM_DBG_OUTER").is_ok() {
-                eprintln!(
-                    "[DBG-INNER] cycle={} residual={:.6e} step_inf={:.6e} obj={:.12e}",
-                    cycle, residual, step_inf, lastobjective
-                );
-            }
             if residual <= inner_tol && step_inf <= inner_tol {
                 converged = true;
                 break;
@@ -6565,25 +6551,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             true
         };
-        if std::env::var("GAM_DBG_OUTER").is_ok()
-            && (cycle < 3 || cycle >= inner_max_cycles.saturating_sub(3))
-        {
-            let joint_res = if has_joint_exacthessian && specs.len() >= 2 {
-                exact_newton_joint_stationarity_inf_norm(
-                    &cached_eval,
-                    &states,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                )?
-            } else {
-                None
-            };
-            eprintln!(
-                "[DBG-BLOCK] cycle={} max_beta_step={:.6e} obj_change={:.6e} obj={:.12e} joint_res={:?} joint_ok={}",
-                cycle, max_beta_step, objective_change, lastobjective, joint_res, exact_joint_stationarity_ok
-            );
-        }
         if max_beta_step <= inner_tol
             && objective_change <= objective_tol
             && exact_joint_stationarity_ok
@@ -6608,12 +6575,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // outer REML gradient formula (which assumes exact β̂ stationarity); a
     // non-converged β̂ produces large envelope-theorem violations that show
     // up as FD-vs-analytic gradient mismatches.
-    if std::env::var("GAM_DBG_OUTER").is_ok() {
-        eprintln!(
-            "[DBG-POLISH-ENTRY] use_joint_newton={} converged={}",
-            use_joint_newton, converged
-        );
-    }
     if use_joint_newton && !converged {
         let ranges_joint: Vec<(usize, usize)> = {
             let mut offset = 0;
@@ -6712,15 +6673,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .filter(|(_, active)| !**active)
                 .map(|(v, _)| v.abs())
                 .fold(0.0_f64, f64::max);
-            if std::env::var("GAM_DBG_OUTER").is_ok() {
-                let res_inf_total = rhs.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-                eprintln!(
-                    "[DBG-POLISH] res_inf_total={:.6e} res_inf_free={:.6e} active_count={}",
-                    res_inf_total,
-                    res_inf_free,
-                    active_mask.iter().filter(|a| **a).count()
-                );
-            }
             if res_inf_free <= inner_tol {
                 converged = true;
                 break;
@@ -6770,13 +6722,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
             let step_inf_polish = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-            if std::env::var("GAM_DBG_OUTER").is_ok() {
-                eprintln!(
-                    "[DBG-POLISH-STEP] step_inf={:.6e} delta_first10={:?}",
-                    step_inf_polish,
-                    delta.iter().take(10).copied().collect::<Vec<_>>()
-                );
-            }
             if step_inf_polish <= inner_tol {
                 // No movement available — treat as converged.
                 converged = true;
@@ -8960,27 +8905,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-
-    // === TEMP INSTRUMENT ===
-    if std::env::var("GAM_DBG_OUTER").is_ok() {
-        let beta_all: Vec<f64> = inner
-            .block_states
-            .iter()
-            .flat_map(|s| s.beta.iter().copied())
-            .collect();
-        eprintln!(
-            "[DBG] rho={:?} converged={} cycles={} inner_max_cycles={} inner_tol={} ll={:.12e} penalty={:.12e} beta={:?}",
-            rho_current.as_slice().unwrap(),
-            inner.converged,
-            inner.cycles,
-            options.inner_max_cycles,
-            options.inner_tol,
-            inner.log_likelihood,
-            inner.penalty_value,
-            beta_all,
-        );
-    }
-    // === END TEMP ===
 
     // ── Try to obtain a joint Hessian and route through the unified evaluator ──
     //
