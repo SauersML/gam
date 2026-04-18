@@ -15,7 +15,8 @@ use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs, exact_intersection_nullity,
+    MatrixFreeSpdOperator, PseudoLogdetMode, compute_block_penalty_logdet_derivs,
+    exact_intersection_nullity,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -31,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
 
-pub use crate::solver::estimate::reml::unified::EvalMode;
+pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
 /// A penalty matrix that may be stored in Kronecker-factored form.
 ///
@@ -1210,6 +1211,22 @@ pub trait CustomFamily {
     /// still rejected.
     fn exact_newton_allows_semidefinitehessian(&self) -> bool {
         false
+    }
+
+    /// How the penalized Hessian's log-determinant and its derivatives
+    /// should handle eigenvalues below the numerical-stability floor.
+    ///
+    /// See [`PseudoLogdetMode`].  Default: `Smooth`, the stable choice for
+    /// full-rank Hessians.  Families whose model structure carries a
+    /// numerical null-space direction — e.g. multi-block GAMLSS wiggle
+    /// models where `q = q_0 + B(q_0)^⊤ β_w` is not identified from a
+    /// threshold shift — should override to `HardPseudo` so the null
+    /// direction drops out of both the REML cost and its gradient
+    /// consistently, rather than leaking a spurious first-order
+    /// contribution through the eigensolver's arbitrary choice of basis
+    /// inside the null space.
+    fn pseudo_logdet_mode(&self) -> PseudoLogdetMode {
+        PseudoLogdetMode::Smooth
     }
 }
 
@@ -7373,6 +7390,7 @@ fn joint_outer_evaluate(
     strict_spd: bool,
     eval_mode: EvalMode,
     options: &BlockwiseFitOptions,
+    pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     owned_compute_dh: Option<
@@ -7458,9 +7476,13 @@ fn joint_outer_evaluate(
                                 scaled_joint_trace_diagonal_ridge,
                             );
                             Arc::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
-                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
-                                )?,
+                                BlockCoupledOperator::from_joint_hessian_with_mode(
+                                    &j_for_traces,
+                                    pseudo_logdet_mode,
+                                )
+                                .map_err(|e| {
+                                    format!("BlockCoupledOperator from joint Hessian: {e}")
+                                })?,
                             )
                         }
                     }
@@ -7508,9 +7530,13 @@ fn joint_outer_evaluate(
                                 scaled_joint_trace_diagonal_ridge,
                             );
                             Arc::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
-                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
-                                )?,
+                                BlockCoupledOperator::from_joint_hessian_with_mode(
+                                    &j_for_traces,
+                                    pseudo_logdet_mode,
+                                )
+                                .map_err(|e| {
+                                    format!("BlockCoupledOperator from joint Hessian: {e}")
+                                })?,
                             )
                         }
                     }
@@ -7529,8 +7555,11 @@ fn joint_outer_evaluate(
                 scaled_joint_trace_diagonal_ridge,
             );
             Arc::new(
-                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
-                    .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
+                BlockCoupledOperator::from_joint_hessian_with_mode(
+                    &j_for_traces,
+                    pseudo_logdet_mode,
+                )
+                .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
             )
         };
 
@@ -7645,6 +7674,7 @@ fn joint_outer_evaluate_efs(
     include_logdet_s: bool,
     strict_spd: bool,
     options: &BlockwiseFitOptions,
+    pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     owned_compute_dh: Option<
@@ -7729,9 +7759,13 @@ fn joint_outer_evaluate_efs(
                                 scaled_joint_trace_diagonal_ridge,
                             );
                             Arc::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
-                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
-                                )?,
+                                BlockCoupledOperator::from_joint_hessian_with_mode(
+                                    &j_for_traces,
+                                    pseudo_logdet_mode,
+                                )
+                                .map_err(|e| {
+                                    format!("BlockCoupledOperator from joint Hessian: {e}")
+                                })?,
                             )
                         }
                     }
@@ -7779,9 +7813,13 @@ fn joint_outer_evaluate_efs(
                                 scaled_joint_trace_diagonal_ridge,
                             );
                             Arc::new(
-                                BlockCoupledOperator::from_joint_hessian(&j_for_traces).map_err(
-                                    |e| format!("BlockCoupledOperator from joint Hessian: {e}"),
-                                )?,
+                                BlockCoupledOperator::from_joint_hessian_with_mode(
+                                    &j_for_traces,
+                                    pseudo_logdet_mode,
+                                )
+                                .map_err(|e| {
+                                    format!("BlockCoupledOperator from joint Hessian: {e}")
+                                })?,
                             )
                         }
                     }
@@ -7800,8 +7838,11 @@ fn joint_outer_evaluate_efs(
                 scaled_joint_trace_diagonal_ridge,
             );
             Arc::new(
-                BlockCoupledOperator::from_joint_hessian(&j_for_traces)
-                    .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
+                BlockCoupledOperator::from_joint_hessian_with_mode(
+                    &j_for_traces,
+                    pseudo_logdet_mode,
+                )
+                .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
             )
         };
 
@@ -7939,6 +7980,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                     include_logdet_s,
                     strict_spd,
                     options,
+                    family.pseudo_logdet_mode(),
                     compute_dh.as_ref(),
                     compute_d2h.as_ref(),
                     None,
@@ -8118,6 +8160,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                     include_logdet_s,
                     strict_spd,
                     options,
+                    family.pseudo_logdet_mode(),
                     &compute_dh,
                     &compute_d2h,
                     None,
@@ -9165,6 +9208,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             strict_spd,
             eval_mode,
             options,
+            family.pseudo_logdet_mode(),
             &compute_dh,
             &compute_d2h,
             Some(owned_compute_dh),
@@ -9213,6 +9257,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             strict_spd,
             eval_mode,
             options,
+            family.pseudo_logdet_mode(),
             compute_dh.as_ref(),
             compute_d2h.as_ref(),
             None,
@@ -9392,6 +9437,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         strict_spd,
         eval_mode,
         options,
+        family.pseudo_logdet_mode(),
         &compute_dh,
         &compute_d2h,
         None,
@@ -9751,6 +9797,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 include_logdet_s,
                 strict_spd,
                 options,
+                family.pseudo_logdet_mode(),
                 &compute_dh,
                 &compute_d2h,
                 Some(owned_compute_dh),
