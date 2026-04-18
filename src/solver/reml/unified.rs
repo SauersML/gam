@@ -5941,33 +5941,30 @@ pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
 
 /// Compute the spectral regularization scale for a set of eigenvalues.
 ///
-/// `ε = √(machine_eps)` — a ρ-INDEPENDENT numerical-stability floor on the
-/// smooth regularization `r_ε(σ)`.  The previous formulation
-/// `ε = √(machine_eps) × max(|σ_max|, 1)` coupled ε to the largest
-/// eigenvalue of H(ρ), which made ε a function of ρ whenever the Hessian
-/// spectrum moved with ρ.  That coupling leaked a spurious ∂log|H|_reg/∂ρ
-/// contribution through the near-zero eigenvalues: for σ_j ≪ ε we have
-/// `log r_ε(σ_j) ≈ log ε`, so `d log r_ε(σ_j)/dρ` picks up `(1/ε) · dε/dρ`
-/// whenever max|σ_j| moved.  This created a first-order FD-vs-analytic
-/// mismatch in outer REML gradients (up to ~1.5% of the dominant
-/// `d log|H|/dρ` term on problems with one near-singular direction, e.g.
-/// multi-block GAMLSS wiggle models where the intercept/wiggle direction is
-/// effectively in the null space of the likelihood curvature).
+/// `ε = √(machine_eps) · p` where `p` is the matrix dimension — a
+/// ρ-INDEPENDENT numerical-stability floor on the smooth regularization
+/// `r_ε(σ)`.  The previous formulation `ε = √(machine_eps) · max(|σ_max|, 1)`
+/// coupled ε to the largest eigenvalue of H(ρ), which made ε a function of
+/// ρ whenever the Hessian spectrum moved with ρ.  That coupling leaked a
+/// spurious ∂log|H|_reg/∂ρ contribution through the near-zero eigenvalues:
+/// for σ_j ≪ ε we have `log r_ε(σ_j) ≈ log ε`, so `d log r_ε(σ_j)/dρ`
+/// picks up `(1/ε) · dε/dρ` whenever max|σ_j| moved.  That created a
+/// first-order FD-vs-analytic mismatch in outer REML gradients (up to
+/// ~1.5% of the dominant `d log|H|/dρ` term on problems with one near-
+/// singular direction, e.g. multi-block GAMLSS wiggle models where the
+/// intercept/wiggle direction is effectively in the null space of the
+/// likelihood curvature).
 ///
-/// The analytic gradient formula `tr(G_ε(H) · dH/dρ_k)` assumes ε is fixed;
-/// removing the ρ-coupling restores that assumption.  The absolute floor
-/// `√(machine_eps) ≈ 1.49e-8` is small enough to leave well-conditioned
-/// problems unaffected (where min σ ≫ ε) while still providing a smooth
-/// floor for genuinely-singular directions.
-///
-/// The `eigenvalues` argument is retained for API compatibility; callers
-/// must still pass a slice but the value is no longer consulted.  If a
-/// future scaling becomes necessary it must come from a ρ-INDEPENDENT
-/// quantity (e.g. a reference matrix captured once before optimization);
-/// using current eigenvalues of H(ρ) re-introduces the leakage above.
+/// The analytic gradient formula `tr(G_ε(H) · dH/dρ_k)` assumes ε is
+/// fixed; removing the ρ-coupling restores that assumption.  Scaling ε
+/// by the matrix dimension `p` (a ρ-independent integer, set by the
+/// problem geometry) gives numerical stability for larger systems without
+/// reintroducing ρ leakage.  The absolute floor stays below any physically
+/// meaningful eigenvalue (for p ≤ 10⁶, ε ≤ 1.5e-2; well-conditioned
+/// problems have min σ ≫ ε and are unaffected).
 #[inline]
-pub(crate) fn spectral_epsilon(_eigenvalues: &[f64]) -> f64 {
-    f64::EPSILON.sqrt()
+pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
+    f64::EPSILON.sqrt() * (eigenvalues.len() as f64).max(1.0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8074,10 +8071,11 @@ mod tests {
         // r_ε(0) = ε (small positive), so logdet includes both eigenvalues.
         // The dominant contribution is ln(r_ε(2)) ≈ ln(2).
         //
-        // `spectral_epsilon` is ρ-independent: ε = √(machine_eps) regardless
-        // of max|σ|. This ensures `d log|H|_reg/dρ` only has the first-order
-        // spectral-perturbation term `Σ φ'(σ_j) · dσ_j/dρ`, with no spurious
-        // contribution from ε moving with ρ.
+        // `spectral_epsilon` is ρ-independent: ε = √(machine_eps) · p where
+        // p is the matrix dimension. This ensures `d log|H|_reg/dρ` only
+        // has the first-order spectral-perturbation term
+        // `Σ φ'(σ_j) · dσ_j/dρ`, with no spurious contribution from ε
+        // moving with ρ.
         let epsilon = spectral_epsilon(&[0.0, 2.0]);
         let r0 = spectral_regularize(0.0, epsilon);
         let r2 = spectral_regularize(2.0, epsilon);
