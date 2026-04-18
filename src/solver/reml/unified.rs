@@ -3173,39 +3173,12 @@ pub fn reml_laml_evaluate(
     } else {
         None
     };
-    if std::env::var("GAM_DBG_OUTER").is_ok() {
-        if let Some(ref v_ks) = rho_v_ks {
-            for (idx, v_k) in v_ks.iter().enumerate() {
-                eprintln!(
-                    "[DBG-VK] idx={} a_k_beta_first10={:?} v_k_first10={:?}",
-                    idx,
-                    rho_curvature_a_k_betas[idx]
-                        .iter()
-                        .take(10)
-                        .copied()
-                        .collect::<Vec<_>>(),
-                    v_k.iter().take(10).copied().collect::<Vec<_>>(),
-                );
-            }
-        }
-    }
     let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
         rho_v_ks
             .as_ref()
             .expect("rho mode responses required for Hessian corrections")
             .iter()
-            .map(|v_k| {
-                let corr = effective_deriv.hessian_derivative_correction_result(v_k)?;
-                if std::env::var("GAM_DBG_OUTER").is_ok() {
-                    if let Some(ref c) = corr {
-                        let trace_hinv = c.trace_logdet(hop);
-                        eprintln!("[DBG-CORR] trace_hinv_corr={:.6e}", trace_hinv);
-                    } else {
-                        eprintln!("[DBG-CORR] corr=None");
-                    }
-                }
-                Ok::<Option<DriftDerivResult>, String>(corr)
-            })
+            .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
             .collect::<Result<Vec<_>, _>>()?
     } else {
         (0..k).map(|_| None).collect()
@@ -3404,19 +3377,6 @@ pub fn reml_laml_evaluate(
             incl_logdet_h,
             incl_logdet_s,
         );
-        if std::env::var("GAM_DBG_OUTER").is_ok() {
-            eprintln!(
-                "[DBG-GRAD] idx={} a_i={:.12e} trace_logdet={:.12e} ld_s={:.12e} grad={:.12e} rho_corr_some={} incl_h={} incl_s={}",
-                idx,
-                a_i,
-                trace_logdet_i,
-                solution.penalty_logdet.first[idx],
-                grad[idx],
-                rho_corrections[idx].is_some(),
-                incl_logdet_h,
-                incl_logdet_s,
-            );
-        }
     }
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
@@ -5981,15 +5941,33 @@ pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
 
 /// Compute the spectral regularization scale for a set of eigenvalues.
 ///
-/// `ε = √(machine_eps) × max(|σ_max|, 1)` — identical to the scale used by
-/// [`DenseSpectralOperator::from_symmetric`].
+/// `ε = √(machine_eps)` — a ρ-INDEPENDENT numerical-stability floor on the
+/// smooth regularization `r_ε(σ)`.  The previous formulation
+/// `ε = √(machine_eps) × max(|σ_max|, 1)` coupled ε to the largest
+/// eigenvalue of H(ρ), which made ε a function of ρ whenever the Hessian
+/// spectrum moved with ρ.  That coupling leaked a spurious ∂log|H|_reg/∂ρ
+/// contribution through the near-zero eigenvalues: for σ_j ≪ ε we have
+/// `log r_ε(σ_j) ≈ log ε`, so `d log r_ε(σ_j)/dρ` picks up `(1/ε) · dε/dρ`
+/// whenever max|σ_j| moved.  This created a first-order FD-vs-analytic
+/// mismatch in outer REML gradients (up to ~1.5% of the dominant
+/// `d log|H|/dρ` term on problems with one near-singular direction, e.g.
+/// multi-block GAMLSS wiggle models where the intercept/wiggle direction is
+/// effectively in the null space of the likelihood curvature).
+///
+/// The analytic gradient formula `tr(G_ε(H) · dH/dρ_k)` assumes ε is fixed;
+/// removing the ρ-coupling restores that assumption.  The absolute floor
+/// `√(machine_eps) ≈ 1.49e-8` is small enough to leave well-conditioned
+/// problems unaffected (where min σ ≫ ε) while still providing a smooth
+/// floor for genuinely-singular directions.
+///
+/// The `eigenvalues` argument is retained for API compatibility; callers
+/// must still pass a slice but the value is no longer consulted.  If a
+/// future scaling becomes necessary it must come from a ρ-INDEPENDENT
+/// quantity (e.g. a reference matrix captured once before optimization);
+/// using current eigenvalues of H(ρ) re-introduces the leakage above.
 #[inline]
-pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
-    let max_ev = eigenvalues
-        .iter()
-        .copied()
-        .fold(0.0_f64, |a: f64, b: f64| a.max(b.abs()));
-    f64::EPSILON.sqrt() * max_ev.max(1.0)
+pub(crate) fn spectral_epsilon(_eigenvalues: &[f64]) -> f64 {
+    f64::EPSILON.sqrt()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6048,38 +6026,6 @@ impl DenseSpectralOperator {
             .map_err(|e| format!("Eigendecomposition failed: {e}"))?;
 
         let epsilon = spectral_epsilon(eigenvalues.as_slice().unwrap());
-
-        if std::env::var("GAM_DBG_OUTER").is_ok() {
-            let h00 = h[[0, 0]];
-            let mut logdet_total = 0.0;
-            let mut log_reg_eigs: Vec<f64> = Vec::with_capacity(n);
-            let mut u0_sq: Vec<f64> = Vec::with_capacity(n);
-            for j in 0..n {
-                let sigma = eigenvalues[j];
-                let reg = 0.5 * (sigma + (sigma * sigma + 4.0 * epsilon * epsilon).sqrt());
-                let log_reg = reg.ln();
-                logdet_total += log_reg;
-                log_reg_eigs.push(log_reg);
-                u0_sq.push(eigenvectors[[0, j]].powi(2));
-            }
-            let mut hinv00 = 0.0;
-            for j in 0..n {
-                let sigma = eigenvalues[j];
-                if sigma.abs() > 1e-14 {
-                    hinv00 += u0_sq[j] / sigma;
-                }
-            }
-            eprintln!(
-                "[DBG-SPECTRAL-H] n={} h[0,0]={:.6e} epsilon={:.18e} logdet_total={:.12e} hinv00={:.12e}",
-                n, h00, epsilon, logdet_total, hinv00,
-            );
-            for j in 0..n {
-                eprintln!(
-                    "[DBG-EIG] j={} sigma={:.18e} log_r_eps={:.18e} u[0]^2={:.18e}",
-                    j, eigenvalues[j], log_reg_eigs[j], u0_sq[j]
-                );
-            }
-        }
 
         // Apply smooth regularization to all eigenvalues
         let reg_eigenvalues: Vec<f64> = eigenvalues
@@ -6287,21 +6233,10 @@ impl HessianOperator for DenseSpectralOperator {
         // where φ'(σ) = 1/√(σ² + 4ε²).
         // Computed as Σ (AG ⊙ G) where G = U diag(√φ'(σ)).
         let ag = a.dot(&self.g_factor);
-        let result: f64 = ag.iter()
+        ag.iter()
             .zip(self.g_factor.iter())
             .map(|(&a, &g)| a * g)
-            .sum();
-        if std::env::var("GAM_DBG_OUTER").is_ok() {
-            // Also compute exact tr(H_reg^{-1} A) as a sanity check.
-            let ndim = self.n_dim;
-            let a00 = if a.nrows() >= 1 && a.ncols() >= 1 { a[[0, 0]] } else { 0.0 };
-            let a_frob: f64 = a.iter().map(|v| v * v).sum::<f64>().sqrt();
-            eprintln!(
-                "[DBG-TRACE-LOGDET-GRAD] n_dim={} a[0,0]={:.6e} a_frob={:.6e} result={:.12e}",
-                ndim, a00, a_frob, result
-            );
-        }
-        result
+            .sum()
     }
 
     fn trace_logdet_block_local(
@@ -6370,28 +6305,7 @@ impl HessianOperator for DenseSpectralOperator {
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         let projected = self.projected_operator(&self.g_factor, op);
-        let result = projected.diag().sum();
-        if std::env::var("GAM_DBG_OUTER").is_ok() {
-            let op_dense = op.to_dense();
-            let op00 = if op_dense.nrows() >= 1 { op_dense[[0, 0]] } else { 0.0 };
-            let op_frob: f64 = op_dense.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let g00 = self.g_factor[[0, 0]];
-            eprintln!(
-                "[DBG-TRACE-LOGDET-OP] n_dim={} op[0,0]={:.6e} op_frob={:.6e} g[0,0]={:.6e} result={:.12e}",
-                self.n_dim, op00, op_frob, g00, result
-            );
-            // Verify: result should equal tr(G_ε(H) * op)
-            // Direct: Σ_j φ'(σ_j) u_j^T op u_j where U is eigenvector matrix
-            // = Σ (op * g_factor ⊙ g_factor)
-            let op_g = op_dense.dot(&self.g_factor);
-            let direct: f64 = op_g
-                .iter()
-                .zip(self.g_factor.iter())
-                .map(|(&a, &g)| a * g)
-                .sum();
-            eprintln!("[DBG-TRACE-LOGDET-OP-DIRECT] direct={:.12e}", direct);
-        }
-        result
+        projected.diag().sum()
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
@@ -8159,7 +8073,12 @@ mod tests {
         // With smooth regularization, the zero eigenvalue is mapped to
         // r_ε(0) = ε (small positive), so logdet includes both eigenvalues.
         // The dominant contribution is ln(r_ε(2)) ≈ ln(2).
-        let epsilon = f64::EPSILON.sqrt() * 2.0; // max_ev = 2
+        //
+        // `spectral_epsilon` is ρ-independent: ε = √(machine_eps) regardless
+        // of max|σ|. This ensures `d log|H|_reg/dρ` only has the first-order
+        // spectral-perturbation term `Σ φ'(σ_j) · dσ_j/dρ`, with no spurious
+        // contribution from ε moving with ρ.
+        let epsilon = spectral_epsilon(&[0.0, 2.0]);
         let r0 = spectral_regularize(0.0, epsilon);
         let r2 = spectral_regularize(2.0, epsilon);
         let expected_logdet = r0.ln() + r2.ln();

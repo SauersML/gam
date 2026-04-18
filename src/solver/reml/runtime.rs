@@ -943,15 +943,13 @@ impl<'a> RemlState<'a> {
                         &x_eff_dense,
                         &h_eff_eval,
                         &beta,
-                        dir,
-                        eps,
+                        &[(eps, dir)],
                     );
                     let tk_minus = self.tk_scalar_at_logit_shift(
                         &x_eff_dense,
                         &h_eff_eval,
                         &beta,
-                        dir,
-                        -eps,
+                        &[(-eps, dir)],
                     );
                     if let (Some(tp), Some(tm)) = (tk_plus, tk_minus) {
                         let grad_psi = (tp - tm) / (2.0 * eps);
@@ -961,6 +959,107 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
+
+            // ── TK ψ-ψ Hessian block via four-point mixed-partial FD ──
+            //
+            // The outer Hessian `result.hessian` built by the unified evaluator
+            // does NOT carry TK's 2nd-order ψ-ψ contribution.  Tests that FD
+            // the full cost to build h_tt_fd therefore see a piece that the
+            // analytic h_tt_analytic block lacks, producing a 2nd-order
+            // inconsistency.  We fill in the missing block here by central-
+            // differencing the TK scalar at ±ε along each (ψ_i, ψ_j) axis
+            // pair using the four-point stencil
+            //   d²TK/dψ_i dψ_j ≈ [TK(+ε e_i, +ε e_j) − TK(+ε e_i, −ε e_j)
+            //                    − TK(−ε e_i, +ε e_j) + TK(−ε e_i, −ε e_j)]
+            //                    / (4 ε²).
+            // The diagonal i=j falls through the same stencil; only the
+            // center-state cross-derivative contribution remains, which we
+            // project symmetrically to be on the safe side.
+            if compute_hessian {
+                let ext_dim = psi_list.len();
+                let k = tk_penalties.len();
+                let total = k + ext_dim;
+                // Ensure the terms.hessian is sized (total, total); the core
+                // returns (k, k) for ρ-only, so we enlarge here.
+                let mut full_hess: Array2<f64> = if let Some(existing) = terms.hessian.take() {
+                    if existing.nrows() == total {
+                        existing
+                    } else {
+                        let mut expanded = Array2::<f64>::zeros((total, total));
+                        for i in 0..existing.nrows().min(total) {
+                            for j in 0..existing.ncols().min(total) {
+                                expanded[[i, j]] = existing[[i, j]];
+                            }
+                        }
+                        expanded
+                    }
+                } else {
+                    Array2::<f64>::zeros((total, total))
+                };
+                let eps = 1e-4_f64;
+                for i in 0..ext_dim {
+                    let dir_i = &psi_list[i];
+                    if dir_i.h_dot.nrows() == 0 {
+                        continue;
+                    }
+                    for j in i..ext_dim {
+                        let dir_j = &psi_list[j];
+                        if dir_j.h_dot.nrows() == 0 {
+                            continue;
+                        }
+                        let tk_pp = self.tk_scalar_at_logit_shift(
+                            &x_eff_dense,
+                            &h_eff_eval,
+                            &beta,
+                            &[(eps, dir_i), (eps, dir_j)],
+                        );
+                        let tk_pm = self.tk_scalar_at_logit_shift(
+                            &x_eff_dense,
+                            &h_eff_eval,
+                            &beta,
+                            &[(eps, dir_i), (-eps, dir_j)],
+                        );
+                        let tk_mp = self.tk_scalar_at_logit_shift(
+                            &x_eff_dense,
+                            &h_eff_eval,
+                            &beta,
+                            &[(-eps, dir_i), (eps, dir_j)],
+                        );
+                        let tk_mm = self.tk_scalar_at_logit_shift(
+                            &x_eff_dense,
+                            &h_eff_eval,
+                            &beta,
+                            &[(-eps, dir_i), (-eps, dir_j)],
+                        );
+                        if let (Some(pp), Some(pm), Some(mp), Some(mm)) =
+                            (tk_pp, tk_pm, tk_mp, tk_mm)
+                        {
+                            let h_ij = (pp - pm - mp + mm) / (4.0 * eps * eps);
+                            if h_ij.is_finite() {
+                                full_hess[[k + i, k + j]] = h_ij;
+                                if i != j {
+                                    full_hess[[k + j, k + i]] = h_ij;
+                                }
+                            }
+                        }
+                    }
+                }
+                if std::env::var("GAM_DBG_TKPSIPSI").is_ok() {
+                    eprintln!(
+                        "[TK-psi-psi wired] ext_dim={} k={} full_hess_shape={:?}",
+                        ext_dim,
+                        k,
+                        full_hess.shape(),
+                    );
+                    if full_hess.nrows() >= k + 1 && full_hess.ncols() >= k + 1 {
+                        eprintln!(
+                            "[TK-psi-psi wired] [k+0,k+0]={:.6e}",
+                            full_hess[[k, k]],
+                        );
+                    }
+                }
+                terms.hessian = Some(full_hess);
+            }
         }
 
         Ok(terms)
@@ -969,36 +1068,44 @@ impl<'a> RemlState<'a> {
     /// Recompute the Tierney-Kadane scalar at a linearised ψ shift for the
     /// logit canonical link.
     ///
-    /// Given the center (X, β̂, H) and a direction (X_τ, v_ψ, Ḣ_ψ), evaluates
-    /// TK at (X + ε X_τ, β̂ + ε v_ψ, H + ε Ḣ_ψ).  Recomputes (z, η, c, d)
-    /// from scratch at the shifted state — exact for the small-n TK regime
-    /// (`n ≤ TK_MAX_OBSERVATIONS`, `p ≤ TK_MAX_COEFFICIENTS`).
+    /// Given the center (X, β̂, H) and a list of `(ε_j, dir_j)` shifts,
+    /// evaluates TK at (X + Σ ε_j X_τ_j, β̂ + Σ ε_j v_ψ_j, H + Σ ε_j Ḣ_ψ_j).
+    /// Recomputes (z, η, c, d) from scratch at the shifted state — exact for
+    /// the small-n TK regime (`n ≤ TK_MAX_OBSERVATIONS`,
+    /// `p ≤ TK_MAX_COEFFICIENTS`).  The multi-shift form lets callers FD the
+    /// Hessian by sending two `(ε, dir)` pairs (one per axis of the
+    /// mixed-partial four-point stencil).
     fn tk_scalar_at_logit_shift(
         &self,
         x_dense: &Array2<f64>,
         h_matrix: &Array2<f64>,
         beta: &Array1<f64>,
-        dir: &TkPsiDirection,
-        eps: f64,
+        shifts: &[(f64, &TkPsiDirection)],
     ) -> Option<f64> {
-        let n = x_dense.nrows();
-        let p = x_dense.ncols();
-        if dir.v_psi.len() != p
-            || dir.h_dot.nrows() != p
-            || dir.h_dot.ncols() != p
-        {
+        if shifts.is_empty() {
             return None;
         }
-        let has_x_tau = dir.x_tau_eff.nrows() == n && dir.x_tau_eff.ncols() == p;
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
 
-        // Shifted inputs.
-        let x_plus = if has_x_tau {
-            x_dense + &dir.x_tau_eff.mapv(|v| eps * v)
-        } else {
-            x_dense.to_owned()
-        };
-        let beta_plus = beta + &dir.v_psi.mapv(|v| eps * v);
-        let h_plus = h_matrix + &dir.h_dot.mapv(|v| eps * v);
+        let mut x_plus = x_dense.to_owned();
+        let mut beta_plus = beta.to_owned();
+        let mut h_plus = h_matrix.to_owned();
+
+        for (eps, dir) in shifts {
+            if dir.v_psi.len() != p
+                || dir.h_dot.nrows() != p
+                || dir.h_dot.ncols() != p
+            {
+                return None;
+            }
+            let has_x_tau = dir.x_tau_eff.nrows() == n && dir.x_tau_eff.ncols() == p;
+            if has_x_tau {
+                x_plus += &dir.x_tau_eff.mapv(|v| *eps * v);
+            }
+            beta_plus += &dir.v_psi.mapv(|v| *eps * v);
+            h_plus += &dir.h_dot.mapv(|v| *eps * v);
+        }
 
         // Recompute η, σ, W, c, d at the shifted state.
         let eta_plus = x_plus.dot(&beta_plus);
@@ -1053,9 +1160,15 @@ impl<'a> RemlState<'a> {
             }
         }
         if let Some(tk_hess) = tk_terms.hessian {
-            let k = rho.len().min(tk_hess.nrows()).min(tk_hess.ncols());
-            if k > 0 {
-                let tk_block = tk_hess.slice(s![..k, ..k]).to_owned();
+            // TK Hessian is (rho.len() + ext_dim) square when ψ directions were
+            // provided, else (rho.len(), rho.len()).  `add_rho_block_dense`
+            // treats the block as the top-left corner of the target Hessian,
+            // so passing the full TK block correctly injects BOTH the ρ-ρ
+            // contribution (which has always been present) AND the ψ-ψ (and
+            // ρ-ψ) blocks added by the numerical FD path.
+            let dim = tk_hess.nrows().min(tk_hess.ncols());
+            if dim > 0 {
+                let tk_block = tk_hess.slice(s![..dim, ..dim]).to_owned();
                 if let Err(error) = result.hessian.add_rho_block_dense(&tk_block) {
                     log::warn!("skipping TK Hessian correction: {error}");
                 }
