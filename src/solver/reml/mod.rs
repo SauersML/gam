@@ -938,15 +938,43 @@ mod tests {
             .compute_lamlhessian_diagnostic_numeric(&rho)
             .expect("diagnostic numeric hessian");
 
+
+        assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
+        assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
+        for i in 0..h_exact.nrows() {
+            for j in 0..i {
+                assert!(
+                    (h_exact[[i, j]] - h_exact[[j, i]]).abs() < 1e-8,
+                    "exact Hessian asymmetry at ({i},{j})"
+                );
+            }
+        }
+
         // ── Diagnostic FD split (gated by env var) ──
         if std::env::var("GAM_DBG_FIRTH_RANKDEF_HESS").is_ok() {
             let k = rho.len();
-            // FD Hessian of firth.value alone as a function of rho.
             let firth_val_at = |r: &Array1<f64>| -> f64 {
                 let b = state.obtain_eval_bundle(r).expect("bundle");
                 b.pirls_result.jeffreys_logdet().unwrap_or(0.0)
             };
-            let h0 = 1e-5;
+            for &h_trial in &[1e-2_f64, 1e-3_f64, 1e-4_f64, 1e-5_f64] {
+                let f0 = firth_val_at(&rho);
+                for i in 0..k {
+                    let mut rp = rho.clone();
+                    rp[i] += h_trial;
+                    let fp = firth_val_at(&rp);
+                    let mut rm = rho.clone();
+                    rm[i] -= h_trial;
+                    let fm = firth_val_at(&rm);
+                    eprintln!(
+                        "[FIRTH-HESS-DBG-GRAD] h={:.0e} firth.value d/drho_{i}: g={:.6e} d²={:.6e}",
+                        h_trial,
+                        (fp - fm) / (2.0 * h_trial),
+                        (fp - 2.0 * f0 + fm) / (h_trial * h_trial),
+                    );
+                }
+            }
+            let h0 = 1e-4;
             let f0 = firth_val_at(&rho);
             let mut h_firth_fd = Array2::<f64>::zeros((k, k));
             for i in 0..k {
@@ -991,17 +1019,6 @@ mod tests {
                         h_laml_fd[[i, j]],
                     );
                 }
-            }
-        }
-
-        assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
-        assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
-        for i in 0..h_exact.nrows() {
-            for j in 0..i {
-                assert!(
-                    (h_exact[[i, j]] - h_exact[[j, i]]).abs() < 1e-8,
-                    "exact Hessian asymmetry at ({i},{j})"
-                );
             }
         }
 
