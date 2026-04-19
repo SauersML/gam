@@ -4369,6 +4369,18 @@ fn compute_outer_hessian(
                     incl_logdet_h,
                     incl_logdet_s,
                 );
+                if std::env::var("GAM_DBG_EXTEXT_SUMMANDS").is_ok() {
+                    eprintln!(
+                        "[PSIPSI {}{}] pair_a={:.12e} g_i_dot_v_j={:.12e} cross={:.12e} h2={:.12e} pair_ld_s={:.12e} h_val={:.12e}",
+                        ii, jj,
+                        pair.a,
+                        coord_i.g.dot(&ext_v[jj]),
+                        cross_trace,
+                        h2_trace,
+                        pair.ld_s,
+                        h_val,
+                    );
+                }
                 hess[[k + ii, k + jj]] = h_val;
                 if ii != jj {
                     hess[[k + jj, k + ii]] = h_val;
@@ -6795,15 +6807,20 @@ pub struct BlockCoupledOperator {
 impl BlockCoupledOperator {
     /// Create from an assembled joint Hessian using the `Smooth` regularizer.
     ///
-    /// `joint_hessian` is the full `p_total x p_total` penalized Hessian.
-    /// Internally performs a single eigendecomposition of `joint_hessian`.
+    /// Test-only convenience wrapper around
+    /// [`from_joint_hessian_with_mode`](Self::from_joint_hessian_with_mode).
+    /// Production call sites thread the family's `PseudoLogdetMode`
+    /// explicitly through `_with_mode`, so the Smooth-only entry point is
+    /// intentionally gated to tests to keep the family-mode choice
+    /// unambiguous at every production callsite.
+    #[cfg(test)]
     pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String> {
         Self::from_joint_hessian_with_mode(joint_hessian, PseudoLogdetMode::Smooth)
     }
 
-    /// Variant of [`from_joint_hessian`](Self::from_joint_hessian) that lets
-    /// the caller select `PseudoLogdetMode::HardPseudo` for families known
-    /// to carry a numerical null-space direction.
+    /// Construct from an assembled joint Hessian using the supplied
+    /// [`PseudoLogdetMode`].  Internally performs a single
+    /// eigendecomposition of `joint_hessian`.
     pub fn from_joint_hessian_with_mode(
         joint_hessian: &Array2<f64>,
         mode: PseudoLogdetMode,
