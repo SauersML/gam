@@ -976,9 +976,15 @@ impl<'a> RemlState<'a> {
             // straightforward y suffices.
             let y_vec = self.y.to_owned();
 
+            // Diagnostic gate — `GAM_DBG_NO_TKPSIGRAD=1` skips the ψ-gradient
+            // TK correction so the test-harness FD equals pure LAML FD.
+            let skip_tk_grad = std::env::var("GAM_DBG_NO_TKPSIGRAD").is_ok();
             if let Some(ref mut grad) = terms.gradient {
                 let k = tk_penalties.len();
                 for (j, dir) in psi_list.iter().enumerate() {
+                    if skip_tk_grad {
+                        break;
+                    }
                     if dir.h_dot.nrows() == 0 {
                         continue; // placeholder (bad-shape or unsupported).
                     }
