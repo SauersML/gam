@@ -3069,17 +3069,28 @@ pub fn reml_laml_evaluate(
             // their scalar objective without it. Keeping the fixed-dispersion
             // evaluator aligned with those exact paths avoids objective drift
             // between the unified and direct custom-family implementations.
-            let mut cost = -solution.log_likelihood + 0.5 * solution.penalty_quadratic;
+            //
+            // Pair-subtract `log|H| − log|S|_+` before scaling by 0.5 and
+            // summing with the rest, mirroring the profiled-Gaussian cost
+            // expression above.  The pair `(log|H|, log|S|_+)` has nearly-
+            // identical ρ-motion at a rank-deficient optimum (the analytic
+            // gradient is their difference, which is tiny), so subtracting
+            // them FIRST preserves the leading-order cancellation in f64
+            // precision; adding them to `cost` independently would bury
+            // the difference below ~ULP(cost) ≈ f64::EPSILON * cost,
+            // inflating FD noise by orders of magnitude when FD ρ-gradients
+            // are computed outside this evaluator.
+            let logdet_pair_h = if *include_logdet_h { log_det_h } else { 0.0 };
+            let logdet_pair_s = if *include_logdet_s { log_det_s } else { 0.0 };
+            let cost_logdet_diff = 0.5 * (logdet_pair_h - logdet_pair_s);
+            let mut cost = cost_logdet_diff + (-solution.log_likelihood)
+                + 0.5 * solution.penalty_quadratic;
             if *include_logdet_h {
-                cost += 0.5 * log_det_h
-                    + solution.tk_correction
+                cost += solution.tk_correction
                     + solution
                         .firth
                         .as_ref()
                         .map_or(0.0, ExactJeffreysTerm::value);
-            }
-            if *include_logdet_s {
-                cost -= 0.5 * log_det_s;
             }
             (cost, *phi, 0.0)
         }
@@ -4394,6 +4405,7 @@ fn compute_outer_hessian(
     // ∂²Φ/∂ρₖ∂ρₗ is computed using the precomputed v_ks, h_k_matrices,
     // a_k_betas, and penalty_coords that are already available. This replaces
     // the formerly caller-injected Firth Hessian.
+    let hess_laml_only = hess.clone();
     if let Some(ref firth) = solution.firth {
         let fh = compute_firth_hessian_contribution(
             firth.operator(),
@@ -4407,6 +4419,11 @@ fn compute_outer_hessian(
         );
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
+        if std::env::var("GAM_DBG_FIRTH_RANKDEF_HESS").is_ok() {
+            eprintln!("[FIRTH-HESS-DBG] LAML-only hess = {:?}", hess_laml_only);
+            eprintln!("[FIRTH-HESS-DBG] Firth contribution = {:?}", fh);
+            eprintln!("[FIRTH-HESS-DBG] Total (LAML+Firth) = {:?}", hess);
+        }
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
