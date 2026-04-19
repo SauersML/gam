@@ -1120,6 +1120,19 @@ impl<'a> RemlState<'a> {
                         );
                     }
                 }
+                if std::env::var("GAM_DBG_TK_NULL_PSIPSI").is_ok() {
+                    // Diagnostic: zero out the ψ-ψ contribution from TK so we
+                    // can see how much of the analytic-vs-FD gap lives in the
+                    // REML path vs the TK stencil.
+                    for i in 0..ext_dim {
+                        for j in i..ext_dim {
+                            full_hess[[k + i, k + j]] = 0.0;
+                            if i != j {
+                                full_hess[[k + j, k + i]] = 0.0;
+                            }
+                        }
+                    }
+                }
                 terms.hessian = Some(full_hess);
             }
         }
@@ -1153,6 +1166,20 @@ impl<'a> RemlState<'a> {
     /// TK at that physically-perturbed mode — matching the semantics of the
     /// FD reference harness which also rebuilds the inner solve at
     /// (X ± h X_τ, S ± h S_τ).
+    ///
+    /// # Firth bias reduction
+    ///
+    /// When `firth_bias_reduction` is enabled for the Logit link, PIRLS is
+    /// finding the root of the Firth-corrected score
+    ///
+    ///   -X^T(y - σ) + S β - 0.5 X^T(c ⊙ h_Fisher) = 0
+    ///
+    /// where `h_Fisher_i = X_i · (X^T W X)^{-1} · X_i^T` is the leverage of
+    /// the Fisher information (without penalty), which is the Jeffreys
+    /// functional `Φ(β) = 0.5 log|X^T W X|_+`.  The Newton below includes
+    /// the same term so that the re-solved β̂_plus is the physically-
+    /// perturbed Firth-corrected optimum, matching the FD reference harness
+    /// which also runs Firth-corrected PIRLS at each perturbed state.
     ///
     /// Only called for the logit canonical link (c = W(1-2σ), d = W(1-6W))
     /// where the W, c, d arrays are closed-form in η.  The inner Newton
@@ -1202,38 +1229,32 @@ impl<'a> RemlState<'a> {
             beta_plus += &dir.v_psi.mapv(|v| *eps * v);
         }
 
-        // Newton solve: ∇F_pen(β) = −X_plus^T(y − σ(X_plus β)) + S_plus β = 0.
+        // Newton solve: ∇F_pen(β) = 0, where
+        //
+        //   ∇F_pen(β) = −X_plus^T(y − σ(X_plus β)) + S_plus β
+        //               [− 0.5 · X_plus^T(c ⊙ h_Fisher)]    if Firth active
         //
         // With the first-order warm start above, the initial residual is
-        // already O(ε²); a few Newton iterations bring it to machine
-        // precision.  Bail if Cholesky fails or steps clearly diverge.
+        // O(ε²); a few Newton iterations bring it to machine precision.
+        // Bail on Cholesky failure or clearly diverging steps.
+        //
+        // `firth_active` mirrors the PIRLS Firth path: when the config flag
+        // is set AND the link is logit, PIRLS solves the Jeffreys-augmented
+        // score, so our Newton must do the same to reach the same β̂_plus
+        // the FD reference harness reaches.
+        let firth_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
         let tol_g = 1e-12_f64;
         let max_iters = 16usize;
         let dbg_newton = std::env::var("GAM_DBG_TK_NEWTON").is_ok();
         let mut iter_count = 0usize;
         let mut initial_g_norm = 0.0_f64;
-        if dbg_newton {
-            // Test gradient at β_0 (no shift applied yet, just to sanity check).
-            let eta_0 = x_dense.dot(beta);
-            let mut sigma_0 = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let e = eta_0[i];
-                sigma_0[i] = if e >= 0.0 { 1.0 / (1.0 + (-e).exp()) } else { let z = e.exp(); z / (1.0 + z) };
-            }
-            let g0_ll = -(x_dense.t().dot(&(y - &sigma_0)));
-            let g0_pen = s_total.dot(beta);
-            let g0 = &g0_ll + &g0_pen;
-            let g0_norm: f64 = g0.iter().map(|v| v * v).sum::<f64>().sqrt();
-            eprintln!("[TK-newton] base-state g0_norm={:.3e} beta_0={:?}", g0_norm, beta);
-            eprintln!("[TK-newton] g0_ll={:?} g0_pen={:?}", g0_ll, g0_pen);
-            eprintln!("[TK-newton] s_total={:?}", s_total);
-            eprintln!("[TK-newton] y={:?} sigma_0={:?} eta_0={:?}", y, sigma_0, eta_0);
-        }
         for _ in 0..max_iters {
             iter_count += 1;
             let eta = x_plus.dot(&beta_plus);
             let mut sigma_vec = Array1::<f64>::zeros(n);
             let mut w_vec = Array1::<f64>::zeros(n);
+            let mut c_vec = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let e = eta[i];
                 let sigma = if e >= 0.0 {
@@ -1243,12 +1264,49 @@ impl<'a> RemlState<'a> {
                     let z = e.exp();
                     z / (1.0 + z)
                 };
+                let w = sigma * (1.0 - sigma);
                 sigma_vec[i] = sigma;
-                w_vec[i] = sigma * (1.0 - sigma);
+                w_vec[i] = w;
+                c_vec[i] = w * (1.0 - 2.0 * sigma);
             }
+            // Fisher info I_F = X_plus^T W X_plus (no penalty — Jeffreys uses
+            // the **Fisher** information, not the penalized Hessian).
+            let x_w_plus: Array2<f64> = {
+                let mut tmp = x_plus.clone();
+                for i in 0..n {
+                    let wi = w_vec[i];
+                    for a in 0..p {
+                        tmp[[i, a]] *= wi;
+                    }
+                }
+                tmp
+            };
+            let i_fisher = x_plus.t().dot(&x_w_plus);
+            // h_Fisher_i = X_plus_i · I_F^{-1} · X_plus_i^T — the Jeffreys
+            // leverage.  Only needed when Firth is active.
+            let h_fisher = if firth_active {
+                let i_factor = i_fisher.cholesky(Side::Lower).ok()?;
+                let xt_plus = x_plus.t().to_owned();
+                let z_fisher = i_factor.solve_mat(&xt_plus);
+                let mut h = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let val = x_plus.row(i).dot(&z_fisher.column(i));
+                    h[i] = if val.is_finite() { val } else { 0.0 };
+                }
+                h
+            } else {
+                Array1::<f64>::zeros(n)
+            };
+
             let y_minus_sigma = y - &sigma_vec;
             let mut g = -(x_plus.t().dot(&y_minus_sigma));
             g += &s_plus.dot(&beta_plus);
+            if firth_active {
+                // Firth/Jeffreys score: -0.5 · X^T(c ⊙ h_Fisher).
+                let ch: Array1<f64> = &c_vec * &h_fisher;
+                let firth_score = x_plus.t().dot(&ch).mapv(|v| -0.5 * v);
+                g += &firth_score;
+            }
             let g_norm: f64 = g.iter().map(|v| v * v).sum::<f64>().sqrt();
             if iter_count == 1 {
                 initial_g_norm = g_norm;
@@ -1262,18 +1320,10 @@ impl<'a> RemlState<'a> {
             if g_norm < tol_g {
                 break;
             }
-            // H_in = X_plus^T W X_plus + S_plus
-            let xw: Array2<f64> = {
-                let mut tmp = x_plus.clone();
-                for i in 0..n {
-                    let wi = w_vec[i];
-                    for a in 0..p {
-                        tmp[[i, a]] *= wi;
-                    }
-                }
-                x_plus.t().dot(&tmp)
-            };
-            let mut h_in = xw;
+            // H_in ≈ X_plus^T W X_plus + S_plus (Fisher-like Newton matrix;
+            // we omit the Firth Hessian correction since it is of order W×W
+            // and does not hurt Newton convergence near the optimum).
+            let mut h_in = i_fisher;
             h_in += &s_plus;
             let factor = h_in.cholesky(Side::Lower).ok()?;
             let step = factor.solvevec(&g);
@@ -3236,7 +3286,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::DenseSpectralOperator;
+        use super::unified::{DenseSpectralOperator, PseudoLogdetMode};
 
         let pirls_result = bundle.pirls_result.as_ref();
         let ridge_passport = pirls_result.ridge_passport;
@@ -3254,12 +3304,35 @@ impl<'a> RemlState<'a> {
             )
         };
 
+        // When Firth bias reduction is active, the design column space may be
+        // rank-deficient (e.g. aliased covariates).  The PIRLS penalized Hessian
+        // H_total = X'WX + S − H_φ then inherits that rank deficiency on any
+        // direction that is simultaneously null for X'WX, S, AND H_φ.  Under
+        // `Smooth`, the small eigenvalues of H_total get a soft ε-floor that
+        // leaks a spurious non-zero gradient contribution through the null
+        // direction; both `log|H|` and its derivatives then count a direction
+        // that carries no actual curvature.  Switching to `HardPseudo` masks
+        // those `σ_j ≤ ε` eigenpairs consistently across `logdet`,
+        // `trace_logdet_*`, and `H⁻¹` solves, so log|H|, its ρ-gradient, and
+        // its ρ-Hessian all see the same reduced active subspace.
+        //
+        // Rationale: the Firth/Jeffreys penalty, the penalized score equation,
+        // and therefore dβ̂/dρ all live on the identifiable subspace (matching
+        // `firth_op.q_basis`); extending the logdet kernel to the null space
+        // is both unphysical and FD-inconsistent.
+        let hessian_mode = if bundle.firth_dense_operator.is_some() {
+            PseudoLogdetMode::HardPseudo
+        } else {
+            PseudoLogdetMode::Smooth
+        };
+
         let hessian_op = std::sync::Arc::new(
-            DenseSpectralOperator::from_symmetric(&h_for_operator).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from PIRLS Hessian: {e}"
-                ))
-            })?,
+            DenseSpectralOperator::from_symmetric_with_mode(&h_for_operator, hessian_mode)
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "DenseSpectralOperator from PIRLS Hessian: {e}"
+                    ))
+                })?,
         );
 
         let (penalty_rank, penalty_logdet) =
