@@ -4468,10 +4468,168 @@ fn compute_outer_hessian(
                         "[FIRTH-HESS-DBG] [{},{}] LAML-only={:.6e} Firth={:.6e} Total={:.6e}",
                         i, j,
                         hess_laml_only[[i, j]],
-                        fh[[i, j]],
+                        if i < k && j < k { fh[[i, j]] } else { 0.0 },
                         hess[[i, j]],
                     );
                 }
+            }
+        }
+
+        // ── Firth Hessian: penalty-only ext coordinates ─────────────────
+        //
+        // The cost contains an additive +Φ(β̂(θ)) term (Firth/Jeffreys bias
+        // correction, Φ = ½ log|I_r|).  Its second derivative in ANY outer
+        // coordinate θ composes through β̂(θ) as
+        //
+        //   d²Φ/dθ_i dθ_j = (∇²_β Φ) · β̂_i · β̂_j + (∇_β Φ) · β̂_{ij}
+        //
+        // The rho-rho call above handles θ = ρ.  The ρ-ψ and ψ-ψ blocks of
+        // the outer Hessian for penalty-only ψ directions need the same
+        // chain rule, which is what the block below supplies.
+        //
+        // Sign convention contrast — rho vs. ext:
+        //   - v_ks[k]  = H⁻¹(A_k β̂) satisfies  dβ̂/dρ_k = −v_ks[k].
+        //   - ext_v[i] = H⁻¹(coord_i.g) = H⁻¹(−S_τ_i β̂) = +dβ̂/dτ_i
+        //     (for penalty-only ext, where coord.g reduces to −S_τ β̂).
+        //
+        // IFT 2nd derivative of β̂ under outer perturbations θ (with
+        // H = X'WX + S the analytic-code Hessian convention, which is the
+        // same one used to build ext_h_matrices and v_ks):
+        //
+        //   Rho-rho  (dβ̂/dρ = −v, A_k = λ_k S_k, ∂A_k/∂ρ_l = δ_{kl} A_k):
+        //     H · d²β̂/dρ_k ρ_l = +dH/dρ_l · v_k − δ_{kl} A_k β̂ + A_k · v_l
+        //     ⇒ rhs_rho = Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂   (matches code)
+        //     ⇒ u_rho = H⁻¹ rhs_rho = +d²β̂/dρ_k ρ_l.
+        //
+        //   Ext-ext  (dβ̂/dτ = +ext_v, A_i = S_τ_i, ∂A_i/∂τ_j = 0 for
+        //             penalty-only linear-in-τ directions at ψ=0):
+        //     H · d²β̂/dτ_i τ_j = −dH/dτ_j · ext_v_i − S_τ_i · ext_v_j
+        //     ⇒ rhs_ext = −(Ḣ_j ext_v_i + S_τ_i ext_v_j)
+        //     ⇒ u_ext = H⁻¹ rhs_ext = +d²β̂/dτ_i τ_j.
+        //
+        //   Rho-ext  (mixed: k is rho, i is ext):
+        //     H · d²β̂/dρ_k dτ_i = +Ḣ_k · ext_v_i − A_k · (d/dτ_i)β̂|_β + ...
+        //                       = +Ḣ_k · ext_v_i − A_k ext_v_i           (hmm?)
+        //     Actually: differentiate Hdβ̂/dρ_k = −A_k β̂ w.r.t. τ_i:
+        //       (dH/dτ_i) dβ̂/dρ_k + H d²β̂/dρ_k dτ_i
+        //         = −A_k dβ̂/dτ_i  (since A_k has no τ dependence)
+        //     Using dβ̂/dρ_k = −v_k and dβ̂/dτ_i = +ext_v_i:
+        //       (dH/dτ_i)(−v_k) + H d²β̂/dρ_k dτ_i = −A_k ext_v_i
+        //       H d²β̂/dρ_k dτ_i = (dH/dτ_i) v_k − A_k ext_v_i
+        //     ⇒ rhs_mix = dH/dτ_i · v_k − A_k · ext_v_i
+        //     ⇒ u_mix = H⁻¹ rhs_mix = +d²β̂/dρ_k dτ_i.
+        //
+        // Each term of the generic formula computes:
+        //   term_a = g_φ_reduced_inner_product(u)           = ½ tr(K D_β I[u])
+        //   term_b = ½ tr(K · X'·diag(w'' (Xv_a)(Xv_b)) X)  [quadratic in v]
+        //   term_c = −½ tr(K D_β I[v_a] K D_β I[v_b])       [quadratic in v]
+        //
+        // For quadratic-in-v terms (b, c) the sign convention doesn't matter
+        // as long as we use the TRUE dβ̂/dθ — using ext_v_i = +dβ̂/dτ_i is
+        // exactly what's needed; for rho we'd use (−v_ks[k]) = dβ̂/dρ_k.
+        // For term_a we use u with u = +d²β̂/dθ_i dθ_j.
+        //
+        // The total d²Φ/dθ_i dθ_j = term_a_θ + term_b_θ + term_c_θ.
+        let firth_op = firth.operator();
+        let penalty_only_ext: Vec<usize> = solution
+            .ext_coords
+            .iter()
+            .enumerate()
+            .filter_map(|(ei, coord)| {
+                if ext_h_matrices[ei].is_none() {
+                    return None;
+                }
+                // Penalty-only: coord.g == −S_τ β̂ ⇒ drift.apply(β̂) + coord.g == 0.
+                let drift_beta = coord.drift.apply(&solution.beta);
+                let drift_norm: f64 = drift_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let residual: f64 = drift_beta
+                    .iter()
+                    .zip(coord.g.iter())
+                    .map(|(&d, &g)| {
+                        let r = d + g;
+                        r * r
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                let tol = 1e-9_f64 * drift_norm.max(1.0);
+                if residual <= tol { Some(ei) } else { None }
+            })
+            .collect();
+
+        // Build β-direction vectors signed as +dβ̂/dθ for every coord we
+        // want to treat: this is −v_ks for rho, +ext_v for ext.  The Firth
+        // Jeffreys operator only consumes these as quadratic forms via
+        // X·direction in term_b/term_c and as u in term_a.
+        let rho_dbeta: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|x| -x)).collect();
+        let ext_dbeta: Vec<&Array1<f64>> = penalty_only_ext.iter().map(|&ei| &ext_v[ei]).collect();
+
+        // Cached positive-direction Firth directions for term_b/term_c: each
+        // `dirs[k]` represents D_β I[β-direction_k] in reduced form.
+        let rho_dirs: Vec<super::FirthDirection> = rho_dbeta
+            .iter()
+            .map(|v| firth_op.direction_from_deta(firth_op.x_dense.dot(v)))
+            .collect();
+        let ext_dirs: Vec<super::FirthDirection> = ext_dbeta
+            .iter()
+            .map(|v| firth_op.direction_from_deta(firth_op.x_dense.dot(*v)))
+            .collect();
+
+        // ── ext-ext block ── d²Φ/dτ_i dτ_j
+        for (ii, &ei_i) in penalty_only_ext.iter().enumerate() {
+            for (jj, &ei_j) in penalty_only_ext.iter().enumerate().skip(ii) {
+                let h_j = ext_h_matrices[ei_j].as_ref().unwrap();
+                let s_tau_i = solution.ext_coords[ei_i].drift.materialize();
+                let v_i = ext_dbeta[ii];
+                let v_j = ext_dbeta[jj];
+                // rhs = −(Ḣ_j v_i + S_τ_i v_j)
+                let mut rhs = h_j.dot(v_i);
+                rhs += &s_tau_i.dot(v_j);
+                rhs.mapv_inplace(|z| -z);
+                let u_ij = hop.solve(&rhs);
+                let dir_u = firth_op.direction_from_deta(firth_op.x_dense.dot(&u_ij));
+                let term_a = 0.5 * trace_reduced(&firth_op.k_reduced, &dir_u.g_u_reduced);
+                // term_b = ½ tr(K · g_{v_i v_j})
+                let deta_i: Array1<f64> = firth_op.x_dense.dot(v_i);
+                let deta_j: Array1<f64> = firth_op.x_dense.dot(v_j);
+                let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_i * &deta_j);
+                let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
+                let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
+                // term_c = −½ tr(K · g_{v_j} · K · g_{v_i})
+                let k_g_vi = firth_op.k_reduced.dot(&ext_dirs[ii].g_u_reduced);
+                let k_g_vj = firth_op.k_reduced.dot(&ext_dirs[jj].g_u_reduced);
+                let term_c = -0.5 * super::RemlState::trace_product(&k_g_vj, &k_g_vi);
+                let j_ij = term_a + term_b + term_c;
+                hess[[k + ei_i, k + ei_j]] += j_ij;
+                if ei_i != ei_j {
+                    hess[[k + ei_j, k + ei_i]] += j_ij;
+                }
+            }
+        }
+
+        // ── rho-ext block ── d²Φ/dρ_k dτ_i
+        for (kk, v_rho_k) in rho_dbeta.iter().enumerate() {
+            for (ii, &ei_i) in penalty_only_ext.iter().enumerate() {
+                let a_k = &a_k_matrices[kk];
+                let h_i = ext_h_matrices[ei_i].as_ref().unwrap();
+                let v_ext_i = ext_dbeta[ii];
+                // rhs = Ḣ_i · v_rho_k − A_k · v_ext_i
+                //      (note: `v_rho_k` is already −v_ks[kk] = +dβ̂/dρ_k)
+                let mut rhs = h_i.dot(v_rho_k);
+                rhs -= &a_k.dot(v_ext_i);
+                let u_ki = hop.solve(&rhs);
+                let dir_u = firth_op.direction_from_deta(firth_op.x_dense.dot(&u_ki));
+                let term_a = 0.5 * trace_reduced(&firth_op.k_reduced, &dir_u.g_u_reduced);
+                let deta_k: Array1<f64> = firth_op.x_dense.dot(v_rho_k);
+                let deta_i: Array1<f64> = firth_op.x_dense.dot(v_ext_i);
+                let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_k * &deta_i);
+                let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
+                let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
+                let k_g_vk = firth_op.k_reduced.dot(&rho_dirs[kk].g_u_reduced);
+                let k_g_vi = firth_op.k_reduced.dot(&ext_dirs[ii].g_u_reduced);
+                let term_c = -0.5 * super::RemlState::trace_product(&k_g_vi, &k_g_vk);
+                let j_ki = term_a + term_b + term_c;
+                hess[[kk, k + ei_i]] += j_ki;
+                hess[[k + ei_i, kk]] += j_ki;
             }
         }
     }
