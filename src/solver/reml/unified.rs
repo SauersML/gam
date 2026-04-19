@@ -4420,9 +4420,18 @@ fn compute_outer_hessian(
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
         if std::env::var("GAM_DBG_FIRTH_RANKDEF_HESS").is_ok() {
-            eprintln!("[FIRTH-HESS-DBG] LAML-only hess = {:?}", hess_laml_only);
-            eprintln!("[FIRTH-HESS-DBG] Firth contribution = {:?}", fh);
-            eprintln!("[FIRTH-HESS-DBG] Total (LAML+Firth) = {:?}", hess);
+            let n = hess.nrows();
+            for i in 0..n {
+                for j in 0..n {
+                    eprintln!(
+                        "[FIRTH-HESS-DBG] [{},{}] LAML-only={:.6e} Firth={:.6e} Total={:.6e}",
+                        i, j,
+                        hess_laml_only[[i, j]],
+                        fh[[i, j]],
+                        hess[[i, j]],
+                    );
+                }
+            }
         }
     }
 
