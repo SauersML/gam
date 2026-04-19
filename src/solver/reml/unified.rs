@@ -6041,6 +6041,14 @@ impl Default for PseudoLogdetMode {
 pub struct DenseSpectralOperator {
     /// Regularized eigenvalues: `r_ε(σ_i)` for each raw eigenvalue `σ_i`.
     reg_eigenvalues: Vec<f64>,
+    /// Per-eigenvalue mask: `true` if the eigenpair participates in all
+    /// traces, solves, and logdet contributions.  Under
+    /// [`PseudoLogdetMode::Smooth`] every entry is `true`.  Under
+    /// [`PseudoLogdetMode::HardPseudo`] entries with `σ_j ≤ ε` are `false`,
+    /// so the numerical null space is excluded consistently from
+    /// `log|H|_+`, its gradient, its cross-traces, AND `H⁻¹` solves
+    /// (`H⁺` on the active subspace).
+    active_mask: Vec<bool>,
     /// Eigenvectors of H (columns).
     eigenvectors: Array2<f64>,
     /// Precomputed: W = U diag(1/√r_ε(σ)) for efficient traces.
@@ -6201,6 +6209,7 @@ impl DenseSpectralOperator {
 
         Ok(Self {
             reg_eigenvalues,
+            active_mask: active,
             eigenvectors,
             w_factor,
             hinv_cross_kernel,
@@ -6290,9 +6299,17 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        // H_reg⁻¹ v = Σ_j (1/r_ε(σ_j)) (uⱼᵀv) uⱼ
+        // H_reg⁻¹ v = Σ_j (1/r_ε(σ_j)) (uⱼᵀv) uⱼ.  Inactive eigenpairs
+        // (σ_j ≤ ε under `HardPseudo`) are skipped so the returned vector
+        // lives entirely in the active subspace — otherwise v_k picks up a
+        // huge spurious component along the numerical null space direction
+        // (coefficient ~ 1/r_ε(σ_j) for σ_j ≈ 0) that is not part of the
+        // IFT mode response `dβ̂/dρ` and would leak into the REML gradient.
         let mut result = Array1::zeros(self.n_dim);
         for j in 0..self.n_dim {
+            if !self.active_mask[j] {
+                continue;
+            }
             let u = self.eigenvectors.column(j);
             let coeff = u.dot(rhs) / self.reg_eigenvalues[j];
             for row in 0..self.n_dim {
@@ -6305,8 +6322,14 @@ impl HessianOperator for DenseSpectralOperator {
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
         let mut projected = self.eigenvectors.t().dot(rhs);
         for j in 0..self.n_dim {
-            let scale = 1.0 / self.reg_eigenvalues[j];
-            projected.row_mut(j).mapv_inplace(|value| value * scale);
+            if self.active_mask[j] {
+                let scale = 1.0 / self.reg_eigenvalues[j];
+                projected.row_mut(j).mapv_inplace(|value| value * scale);
+            } else {
+                // Zero out inactive eigendirections so `H⁺` acts on the
+                // active subspace only (mirroring the single-vector `solve`).
+                projected.row_mut(j).fill(0.0);
+            }
         }
         self.eigenvectors.dot(&projected)
     }
