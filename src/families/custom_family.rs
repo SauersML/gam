@@ -12467,23 +12467,52 @@ mod tests {
             )
             .expect("objective-");
             let gfd = (fp - fm) / (2.0 * h);
-            let rel = (g0[k] - gfd).abs() / gfd.abs().max(1e-8);
-            assert_eq!(
-                g0[k].signum(),
-                gfd.signum(),
-                "outer LAML gradient sign mismatch at {}: analytic={} fd={}",
-                k,
-                g0[k],
-                gfd
-            );
-            assert!(
-                rel < 2e-2,
-                "outer LAML gradient mismatch at {}: analytic={} fd={} rel={}",
-                k,
-                g0[k],
-                gfd,
-                rel
-            );
+
+            // Noise floor for FD-vs-analytic comparisons.
+            //
+            // At a rank-deficient optimum (σ_min(H) ≲ ε_machine) the outer
+            // REML gradient is a DIFFERENCE of two nearly-equal O(1)
+            // quantities — ½ λ_k (H⁺[k,k] − S⁺[k,k]) — so the true gradient
+            // is very close to zero.  The FD estimator `(f_p − f_m)/(2h)`
+            // then measures cost-sum round-off: at f64 precision each cost
+            // value carries an uncertainty of ~EPS · |cost|, and the
+            // symmetric FD inflates that by 1/(2h), producing a noise floor
+            // of roughly `EPS · |cost| / h` on |gfd|.  Below that floor
+            // neither `|gfd|`, `|g0|`, nor `sign(gfd)` reflect the true
+            // derivative — they reflect arithmetic noise.
+            //
+            // Concretely: for this test `|cost| ~ 6`, `h = 1e-5`, so the
+            // floor is ~1.3e-10 (≈ f64::EPSILON · 6 / 1e-5).  We round up
+            // to a problem-scale-derived value and treat pairs where BOTH
+            // |g0| and |gfd| lie below the floor as a pass (the assertion
+            // is making a claim about the TRUE derivative, and a true
+            // derivative strictly less than noise is indistinguishable
+            // from zero — sign is not a correctness property there).
+            let cost_magnitude = f0.abs().max(1.0);
+            let noise_floor = (10.0 * f64::EPSILON * cost_magnitude / h).max(1e-9);
+            let both_in_noise = g0[k].abs() < noise_floor && gfd.abs() < noise_floor;
+
+            if !both_in_noise {
+                assert_eq!(
+                    g0[k].signum(),
+                    gfd.signum(),
+                    "outer LAML gradient sign mismatch at {}: analytic={} fd={} noise_floor={:.3e}",
+                    k,
+                    g0[k],
+                    gfd,
+                    noise_floor,
+                );
+                let rel = (g0[k] - gfd).abs() / gfd.abs().max(noise_floor);
+                assert!(
+                    rel < 2e-2,
+                    "outer LAML gradient mismatch at {}: analytic={} fd={} rel={} noise_floor={:.3e}",
+                    k,
+                    g0[k],
+                    gfd,
+                    rel,
+                    noise_floor,
+                );
+            }
         }
     }
 
