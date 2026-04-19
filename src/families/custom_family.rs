@@ -5863,7 +5863,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // precision, so this tightening has no effect.
     let hardpseudo_family = family.pseudo_logdet_mode() == PseudoLogdetMode::HardPseudo;
     let inner_tol = if hardpseudo_family {
-        options.inner_tol.min(1e-13)
+        options.inner_tol.min(1e-12)
     } else {
         options.inner_tol
     };
