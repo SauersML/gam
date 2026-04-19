@@ -1023,6 +1023,13 @@ impl<'a> RemlState<'a> {
             // The diagonal i=j falls through the same stencil; only the
             // center-state cross-derivative contribution remains, which we
             // project symmetrically to be on the safe side.
+            // Diagnostic gate: when `GAM_DBG_NO_TKPSIPSI=1` skip the TK ψ-ψ
+            // Hessian block so the analytic ψ-ψ Hessian contains *only* the
+            // LAML contribution.  Used for isolating LAML-side 2nd-derivative
+            // bugs that are separate from TK.  Must be removed before final
+            // commit.
+            let compute_hessian = compute_hessian
+                && std::env::var("GAM_DBG_NO_TKPSIPSI").is_err();
             if compute_hessian {
                 let ext_dim = psi_list.len();
                 let k = tk_penalties.len();
