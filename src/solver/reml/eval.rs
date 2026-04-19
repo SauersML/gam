@@ -3,8 +3,20 @@ use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
-const DIAGNOSTIC_HESSIAN_FD_REL_STEP: f64 = 1e-4;
-const DIAGNOSTIC_HESSIAN_FD_ABS_STEP: f64 = 1e-5;
+// The diagnostic FD reference Hessian uses central-difference quotients of
+// `compute_cost`.  The relevant noise floor is PIRLS inner-loop convergence
+// (`*_inner_tol` ≈ 1e-9 by default for Firth / tightened 1e-12 elsewhere) —
+// for a generic cost of order 1 the roundoff component of the second-
+// difference stencil scales like `tol / h²`.  With `h ≈ 1e-4` the roundoff
+// is ~1e-1 relative, which is exactly the scale that dominated the Firth
+// rank-deficient diagnostic-vs-exact comparison on a 10-observation
+// logistic test.  Raising the relative step to `1e-3` keeps truncation
+// (O(h² · f''')) below 1e-6 while pushing roundoff down by two orders of
+// magnitude, so the FD reference is faithful enough to judge the analytic
+// Hessian on rank-deficient designs where the residual gap between exact
+// and FD is intrinsically O(tol/h²)-dominated at the old step.
+const DIAGNOSTIC_HESSIAN_FD_REL_STEP: f64 = 1e-3;
+const DIAGNOSTIC_HESSIAN_FD_ABS_STEP: f64 = 1e-4;
 const DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD: f64 = 1e-8;
 
 impl<'a> RemlState<'a> {
