@@ -938,6 +938,62 @@ mod tests {
             .compute_lamlhessian_diagnostic_numeric(&rho)
             .expect("diagnostic numeric hessian");
 
+        // ── Diagnostic FD split (gated by env var) ──
+        if std::env::var("GAM_DBG_FIRTH_RANKDEF_HESS").is_ok() {
+            let k = rho.len();
+            // FD Hessian of firth.value alone as a function of rho.
+            let firth_val_at = |r: &Array1<f64>| -> f64 {
+                let b = state.obtain_eval_bundle(r).expect("bundle");
+                b.pirls_result.jeffreys_logdet().unwrap_or(0.0)
+            };
+            let h0 = 1e-5;
+            let f0 = firth_val_at(&rho);
+            let mut h_firth_fd = Array2::<f64>::zeros((k, k));
+            for i in 0..k {
+                let mut rp = rho.clone();
+                rp[i] += h0;
+                let fp = firth_val_at(&rp);
+                let mut rm = rho.clone();
+                rm[i] -= h0;
+                let fm = firth_val_at(&rm);
+                h_firth_fd[[i, i]] = (fp - 2.0 * f0 + fm) / (h0 * h0);
+                for j in 0..i {
+                    let mut rpp = rho.clone();
+                    rpp[i] += h0;
+                    rpp[j] += h0;
+                    let fpp = firth_val_at(&rpp);
+                    let mut rpm = rho.clone();
+                    rpm[i] += h0;
+                    rpm[j] -= h0;
+                    let fpm = firth_val_at(&rpm);
+                    let mut rmp = rho.clone();
+                    rmp[i] -= h0;
+                    rmp[j] += h0;
+                    let fmp = firth_val_at(&rmp);
+                    let mut rmm = rho.clone();
+                    rmm[i] -= h0;
+                    rmm[j] -= h0;
+                    let fmm = firth_val_at(&rmm);
+                    let v = (fpp - fpm - fmp + fmm) / (4.0 * h0 * h0);
+                    h_firth_fd[[i, j]] = v;
+                    h_firth_fd[[j, i]] = v;
+                }
+            }
+            let h_laml_fd = &h_fallback - &h_firth_fd;
+            for i in 0..k {
+                for j in 0..k {
+                    eprintln!(
+                        "[FIRTH-HESS-DBG-TEST] [{},{}] exact={:.6e} fallback={:.6e} firth_fd={:.6e} impliedLAML_fd={:.6e}",
+                        i, j,
+                        h_exact[[i, j]],
+                        h_fallback[[i, j]],
+                        h_firth_fd[[i, j]],
+                        h_laml_fd[[i, j]],
+                    );
+                }
+            }
+        }
+
         assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
         assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
         for i in 0..h_exact.nrows() {
