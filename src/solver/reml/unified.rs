@@ -3553,41 +3553,66 @@ pub fn reml_laml_evaluate(
 
 /// Compute the Firth bias-reduction Hessian contribution ∂²Φ/∂ρₖ∂ρₗ.
 ///
-/// The Firth penalty is Φ = ½ log|I(β̂)|₊ where I is the Fisher information.
-/// Its second derivative with respect to the outer parameters ρ is:
+/// The Firth penalty is Φ = ½ log|I(β̂)|₊ where I is the (possibly rank-
+/// deficient) Fisher information.  With β̂(ρ) differentiated via the implicit
+/// function theorem on the penalized score equation, the derivatives obey
+///   dβ̂/dρ_k  = −v_k,       v_k := H⁻¹(A_k β̂),
+///   d²β̂/dρ_k dρ_l = +u_kl, u_kl := H⁻¹(Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂)
+/// where H is the *penalized* Hessian (possibly including H_φ when Firth
+/// augments the inner objective).  Note the sign on the second derivative:
+/// differentiating v_k = H⁻¹(A_k β̂) wrt ρ_l gives d(v_k)/dρ_l = −u_kl, and
+/// d²β̂/dρ_k dρ_l = d(−v_k)/dρ_l = +u_kl.
+///
+/// For f(β) = ½ log|I(β)|₊ with β̂ moving through ρ, the total second
+/// derivative is
+///   d²f/dρ_k dρ_l = (dβ̂/dρ_l)ᵀ H_f (dβ̂/dρ_k) + g_f · (d²β̂/dρ_k dρ_l)
+///                 = v_lᵀ H_f v_k + g_f · u_kl.
+/// Expanding with H_f = ½[∇²log|I|] and using the matrix calculus identity
+///   g_f[i]            = ½ tr(I⁺ · D_β I[e_i]),
+///   v_lᵀ H_f v_k      = ½ tr(I⁺ · D²_β I[v_k, v_l]) − ½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k]),
+/// gives the correct contribution
 ///
 /// ```text
-/// J_{kl} = ½ [tr(H⁻¹ Ï_{kl}) − tr(H⁻¹ İ_l H⁻¹ İ_k)]
+/// J_{kl} = ½ tr(I⁺ · D_β I[u_kl])
+///        + ½ tr(I⁺ · D²_β I[v_k, v_l])
+///        − ½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k])
 /// ```
 ///
-/// This parallels the LAML Hessian structure EXACTLY:
-/// - The LAML Hessian has ½[tr(H⁻¹ Ḧ_{kl}) − tr(H⁻¹ Ḣ_l H⁻¹ Ḣ_k)]
-///   with penalized Hessian H and observed-weight corrections.
-/// - The Firth Hessian has ½[tr(H⁻¹ Ï_{kl}) − tr(H⁻¹ İ_l H⁻¹ İ_k)]
-///   using Fisher-weight corrections D(H_φ) and D²(H_φ).
+/// where I⁺ is the Moore-Penrose pseudoinverse of the Fisher information on
+/// its identifiable subspace.  For rank-deficient designs `Col(X)` is a strict
+/// subspace of ℝᵖ and `I⁺ = Q I_r⁻¹ Qᵀ` with Q the orthonormal basis for that
+/// identifiable subspace and I_r = Qᵀ I Q the reduced-space Fisher block.  The
+/// pseudoinverse convention is the one that makes `log|I|₊` smooth (constant
+/// rank of I as β moves) and matches the actual scalar stored in
+/// `ExactJeffreysTerm::value()` = ½ log|I_r|.
 ///
-/// The key identity connecting the two representations is:
-///   İ_k = D_β I[β_k] = D(H_φ)[B_k],  where B_k = −v_k = −H⁻¹(A_k β̂)
-///
-/// For the second drift:
-///   Ï_{kl} = D_β I[β_{kl}] + D²_β I[β_k, β_l]
-///          = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
-///
-/// where β_{kl} is the second implicit mode response from the LAML computation.
-///
-/// Note: we use `hop` (penalized Hessian H) for `tr(H⁻¹ ·)` operations because
-/// the Firth gradient formula ∂Φ/∂ρ_k = −½ tr(H⁻¹ D(H_φ)[B_k]) uses H⁻¹,
-/// not I⁻¹. This is because the chain rule through β̂(ρ) produces H⁻¹ from the
-/// implicit function theorem applied to the penalized score equation.
+/// Implementation notes.  All three traces are evaluated on the reduced basis
+/// via K_r = I_r⁻¹ and the reduced Gram maps that `FirthDirection` already
+/// stores.  For any direction u with `dir.deta = X·u`:
+///   g_u_reduced   = X_rᵀ diag(w' ⊙ X u) X_r = Qᵀ (D_β I[u]) Q,
+/// so `tr(I⁺ · D_β I[u]) = tr(K_r · g_u_reduced)`.  For the cross term we use
+/// `tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k]) = tr(K_r · g_v_l · K_r · g_v_k)`.
+/// The mixed second-β-derivative is
+///   g_uv_reduced  = X_rᵀ diag(w'' ⊙ (X v_k) ⊙ (X v_l)) X_r = Qᵀ (D²_β I[v_k, v_l]) Q,
+/// so `tr(I⁺ · D²_β I[v_k, v_l]) = tr(K_r · g_uv_reduced)`.  These reduced-
+/// basis traces do NOT touch the penalized Hessian `hop`; the Firth operator
+/// alone carries the Fisher-info pseudoinverse on the identifiable subspace,
+/// which is the only object that appears in `d²(½ log|I|)/dρ²`.
 ///
 /// # Arguments
-/// - `firth_op`: The precomputed Firth dense operator (Fisher info, weight derivatives).
-/// - `hop`: The penalized Hessian operator (for H⁻¹ solves and traces).
-/// - `beta`: Coefficients at the converged mode (for dimensioning the identity matrix).
+/// - `firth_op`: The precomputed Firth dense operator — supplies the reduced
+///   design X_r, the reduced Fisher inverse K_r = I_r⁻¹, and the weight
+///   derivative arrays w', w'' needed for D_β I and D²_β I.
+/// - `hop`: The penalized Hessian operator.  Only used for `u_kl` solves
+///   (second-order β response) because that sign convention comes from the
+///   penalized score equation; the trace contractions themselves use I⁺.
+/// - `beta`: Coefficients at the converged mode (unused for the reduced-basis
+///   Firth contribution, retained for API stability and sign checks).
 /// - `v_ks`: Precomputed mode responses v_k = H⁻¹(A_k β̂).
-/// - `h_k_matrices`: Precomputed total Hessian drifts Ḣ_k = A_k + C[v_k].
-/// - `a_k_betas`: Precomputed A_k β̂ vectors.
-/// - `a_k_matrices`: Precomputed penalty derivative matrices A_k = λ_k S_k.
+/// - `h_k_matrices`: Precomputed total Hessian drifts Ḣ_k = A_k + correction.
+/// - `a_k_betas`: Precomputed A_k β̂ vectors (needed for the `δ_{kl}`
+///   component of the second mode response RHS).
+/// - `penalty_coords`, `lambdas`: Penalty λ_k A_k terms for the RHS build.
 pub fn compute_firth_hessian_contribution(
     firth_op: &super::FirthDenseOperator,
     hop: &dyn HessianOperator,
@@ -3598,64 +3623,62 @@ pub fn compute_firth_hessian_contribution(
     penalty_coords: &[PenaltyCoordinate],
     lambdas: &[f64],
 ) -> Array2<f64> {
+    let _ = beta;
     let k = v_ks.len();
-    let p = beta.len();
     let mut firth_hess = Array2::zeros((k, k));
+    if k == 0 {
+        return firth_hess;
+    }
 
-    // Precompute Firth directions and D(H_φ)[B_k] for each coordinate.
-    // B_k = −v_k, so δη_k = X·(−v_k).
-    let mut firth_dirs: Vec<super::FirthDirection> = Vec::with_capacity(k);
-    let mut dhphi_ks: Vec<Array2<f64>> = Vec::with_capacity(k);
-
+    // Reduced basis building block — `direction_from_deta(X·u)` returns a
+    // `FirthDirection` whose `g_u_reduced = Qᵀ (D_β I[u]) Q`.  We pass the
+    // *positive* δη so the direction represents D_β I[+u] literally; the
+    // d(v_k)/dρ sign bookkeeping is handled by the outer formula in ρ-space.
+    let mut dirs_positive: Vec<super::FirthDirection> = Vec::with_capacity(k);
     for idx in 0..k {
-        let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]).mapv(|v| -v);
-        let dir_k = firth_op.direction_from_deta(deta_k);
-        let dhphi_k = firth_op.hphi_direction(&dir_k);
-        firth_dirs.push(dir_k);
-        dhphi_ks.push(dhphi_k);
+        let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]);
+        dirs_positive.push(firth_op.direction_from_deta(deta_k));
     }
 
     for kk in 0..k {
         for ll in kk..k {
-            // ── Cross-trace: −tr(G_ε(H)Ḣ_l G_ε(H)Ḣ_k) via divided-difference ──
-            // The cost logdet uses Σ ln(r_ε(σ)), so the Hessian cross term
-            // must use the Γ kernel, not the plain H⁻¹⊗H⁻¹ kernel.
-            let cross_trace = -hop.trace_logdet_hessian_cross(&dhphi_ks[ll], &dhphi_ks[kk]);
-
-            // ── Second drift: tr(G_ε(H) Ï_{kl}) ──
-            // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
+            // ── Second-β-response RHS: Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂ ──
             //
-            // B_{kl} = −β_{kl} where β_{kl} = H⁻¹(Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂)
-            // is the second implicit mode response (reused from LAML computation).
+            // u_kl = H⁻¹ · rhs is the magnitude of d²β̂/dρ_k dρ_l (the IFT
+            // correction).  We pass +u_kl (not −u_kl) into the direction
+            // builder because the outer formula already accounts for its
+            // sign via `d²β̂/dρ_k dρ_l = +u_kl`.
             let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
             rhs += &penalty_coords[kk].scaled_matvec(&v_ks[ll], lambdas[kk]);
             if kk == ll {
                 rhs -= &a_k_betas[kk];
             }
             let u_kl = hop.solve(&rhs);
-
-            // D(H_φ)[B_{kl}]: first directional derivative at B_{kl} = −u_kl.
-            // δη_{kl} = X·(−u_kl).
-            let deta_kl: Array1<f64> = firth_op.x_dense.dot(&u_kl).mapv(|v| -v);
+            let deta_kl: Array1<f64> = firth_op.x_dense.dot(&u_kl);
             let dir_kl = firth_op.direction_from_deta(deta_kl);
-            let dhphi_kl = firth_op.hphi_direction(&dir_kl);
 
-            // D²(H_φ)[B_k, B_l]: second directional derivative.
-            let eye = Array2::<f64>::eye(p);
-            let d2hphi_kl =
-                firth_op.hphisecond_direction_apply(&firth_dirs[kk], &firth_dirs[ll], &eye);
+            // ── Term A:  ½ tr(I⁺ · D_β I[u_kl])  =  ½ tr(K_r · g_u_kl_reduced) ──
+            let term_a = 0.5 * trace_reduced(&firth_op.k_reduced, &dir_kl.g_u_reduced);
 
-            // Ï_{kl} = D(H_φ)[B_{kl}] + D²(H_φ)[B_k, B_l]
-            let ddot_kl = &dhphi_kl + &d2hphi_kl;
-            let second_drift_trace = hop.trace_logdet_gradient(&ddot_kl);
+            // ── Term B:  ½ tr(I⁺ · D²_β I[v_k, v_l]) ──
+            // The mixed reduced Gram is
+            //   g_uv_reduced = X_rᵀ diag(w'' ⊙ (X v_k) ⊙ (X v_l)) X_r,
+            // built here directly so this function does not rely on extra
+            // public surface from the Firth operator.  `w2` is w'' at the
+            // current η.
+            let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[kk]);
+            let deta_l: Array1<f64> = firth_op.x_dense.dot(&v_ks[ll]);
+            let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_k * &deta_l);
+            let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
+            let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
 
-            // J_{kl} = −½ [second_drift_trace − cross_trace]
-            //
-            // The sign is negative because the Firth gradient uses
-            // ∂Φ/∂ρ_k = −½ tr(G_ε D(H_φ)[B_k]), so the second derivative
-            // inherits the same overall negative sign.
-            let j_kl = -0.5 * (second_drift_trace - cross_trace);
+            // ── Term C:  −½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k])
+            //          = −½ tr(K_r · g_v_l · K_r · g_v_k) ──
+            let k_g_vl = firth_op.k_reduced.dot(&dirs_positive[ll].g_u_reduced);
+            let k_g_vk = firth_op.k_reduced.dot(&dirs_positive[kk].g_u_reduced);
+            let term_c = -0.5 * super::RemlState::trace_product(&k_g_vl, &k_g_vk);
 
+            let j_kl = term_a + term_b + term_c;
             firth_hess[[kk, ll]] = j_kl;
             if kk != ll {
                 firth_hess[[ll, kk]] = j_kl;
@@ -3664,6 +3687,24 @@ pub fn compute_firth_hessian_contribution(
     }
 
     firth_hess
+}
+
+/// Reduced-basis trace helper for `tr(A · B)` on a pair of r×r matrices.
+/// Used by the Firth Hessian contribution where A = K_r and B is a reduced
+/// Gram (both symmetric, both in the identifiable subspace).
+#[inline]
+fn trace_reduced(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    debug_assert_eq!(a.nrows(), a.ncols());
+    debug_assert_eq!(b.nrows(), b.ncols());
+    debug_assert_eq!(a.nrows(), b.nrows());
+    let n = a.nrows();
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            acc += a[[i, j]] * b[[j, i]];
+        }
+    }
+    acc
 }
 
 /// Precompute the adjoint trace vector z_c = H⁻¹ Xᵀ (c ⊙ h) from raw GLM ingredients.
