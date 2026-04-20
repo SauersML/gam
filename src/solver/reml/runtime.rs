@@ -976,15 +976,9 @@ impl<'a> RemlState<'a> {
             // straightforward y suffices.
             let y_vec = self.y.to_owned();
 
-            // Diagnostic gate — `GAM_DBG_NO_TKPSIGRAD=1` skips the ψ-gradient
-            // TK correction so the test-harness FD equals pure LAML FD.
-            let skip_tk_grad = std::env::var("GAM_DBG_NO_TKPSIGRAD").is_ok();
             if let Some(ref mut grad) = terms.gradient {
                 let k = tk_penalties.len();
                 for (j, dir) in psi_list.iter().enumerate() {
-                    if skip_tk_grad {
-                        break;
-                    }
                     if dir.h_dot.nrows() == 0 {
                         continue; // placeholder (bad-shape or unsupported).
                     }
@@ -1029,13 +1023,6 @@ impl<'a> RemlState<'a> {
             // The diagonal i=j falls through the same stencil; only the
             // center-state cross-derivative contribution remains, which we
             // project symmetrically to be on the safe side.
-            // Diagnostic gate: when `GAM_DBG_NO_TKPSIPSI=1` skip the TK ψ-ψ
-            // Hessian block so the analytic ψ-ψ Hessian contains *only* the
-            // LAML contribution.  Used for isolating LAML-side 2nd-derivative
-            // bugs that are separate from TK.  Must be removed before final
-            // commit.
-            let compute_hessian = compute_hessian
-                && std::env::var("GAM_DBG_NO_TKPSIPSI").is_err();
             if compute_hessian {
                 let ext_dim = psi_list.len();
                 let k = tk_penalties.len();
@@ -1115,33 +1102,6 @@ impl<'a> RemlState<'a> {
                                 if i != j {
                                     full_hess[[k + j, k + i]] = h_ij;
                                 }
-                            }
-                        }
-                    }
-                }
-                if std::env::var("GAM_DBG_TKPSIPSI").is_ok() {
-                    eprintln!(
-                        "[TK-psi-psi wired] ext_dim={} k={} full_hess_shape={:?}",
-                        ext_dim,
-                        k,
-                        full_hess.shape(),
-                    );
-                    if full_hess.nrows() >= k + 1 && full_hess.ncols() >= k + 1 {
-                        eprintln!(
-                            "[TK-psi-psi wired] [k+0,k+0]={:.6e}",
-                            full_hess[[k, k]],
-                        );
-                    }
-                }
-                if std::env::var("GAM_DBG_TK_NULL_PSIPSI").is_ok() {
-                    // Diagnostic: zero out the ψ-ψ contribution from TK so we
-                    // can see how much of the analytic-vs-FD gap lives in the
-                    // REML path vs the TK stencil.
-                    for i in 0..ext_dim {
-                        for j in i..ext_dim {
-                            full_hess[[k + i, k + j]] = 0.0;
-                            if i != j {
-                                full_hess[[k + j, k + i]] = 0.0;
                             }
                         }
                     }
@@ -1259,11 +1219,7 @@ impl<'a> RemlState<'a> {
             && matches!(self.config.link_function(), LinkFunction::Logit);
         let tol_g = 1e-12_f64;
         let max_iters = 16usize;
-        let dbg_newton = std::env::var("GAM_DBG_TK_NEWTON").is_ok();
-        let mut iter_count = 0usize;
-        let mut initial_g_norm = 0.0_f64;
         for _ in 0..max_iters {
-            iter_count += 1;
             let eta = x_plus.dot(&beta_plus);
             let mut sigma_vec = Array1::<f64>::zeros(n);
             let mut w_vec = Array1::<f64>::zeros(n);
@@ -1321,15 +1277,6 @@ impl<'a> RemlState<'a> {
                 g += &firth_score;
             }
             let g_norm: f64 = g.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if iter_count == 1 {
-                initial_g_norm = g_norm;
-            }
-            if dbg_newton {
-                eprintln!(
-                    "[TK-newton] iter={} g_norm={:.3e} beta={:?}",
-                    iter_count, g_norm, beta_plus
-                );
-            }
             if g_norm < tol_g {
                 break;
             }
@@ -1345,12 +1292,6 @@ impl<'a> RemlState<'a> {
                 return None;
             }
             beta_plus -= &step;
-        }
-        if dbg_newton {
-            eprintln!(
-                "[TK-newton] final iter={} initial_g={:.3e}",
-                iter_count, initial_g_norm
-            );
         }
 
         // Recompute η, W, c, d at the post-Newton β̂_plus.
