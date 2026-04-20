@@ -3411,8 +3411,6 @@ pub fn reml_laml_evaluate(
         let v_i = hop.solve(&coord.g);
 
         // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
-        let mut dbg_t_base = 0.0;
-        let mut dbg_t_ift = 0.0;
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -3428,22 +3426,16 @@ pub fn reml_laml_evaluate(
                 let base = coord.drift.materialize();
                 let tb = hop.trace_logdet_gradient(&base);
                 let ti = corr.trace_logdet(hop);
-                dbg_t_base = tb;
-                dbg_t_ift = ti;
                 tb + ti
             } else if let Some(op) = coord
                 .drift
                 .operator_ref()
                 .filter(|_| coord.drift.uses_operator_fast_path())
             {
-                let t = hop.trace_logdet_operator(op);
-                dbg_t_base = t;
-                t
+                hop.trace_logdet_operator(op)
             } else {
                 let h_i = coord.drift.materialize();
-                let t = hop.trace_logdet_h_k(&h_i, None);
-                dbg_t_base = t;
-                t
+                hop.trace_logdet_h_k(&h_i, None)
             }
         };
 
@@ -3458,18 +3450,6 @@ pub fn reml_laml_evaluate(
             incl_logdet_s,
         );
 
-        if std::env::var("GAM_DBG_VTAU_EXT").is_ok() {
-            eprintln!(
-                "[VTAU-EXT ext={}] a={:.12e} ld_s={:.12e} t_base={:.12e} t_ift={:.12e} trace={:.12e} grad={:.12e}",
-                ext_idx,
-                coord.a,
-                coord.ld_s,
-                dbg_t_base,
-                dbg_t_ift,
-                trace_logdet_i,
-                grad[grad_idx],
-            );
-        }
     }
 
     // Add correction gradients (ρ-only).
@@ -4421,18 +4401,6 @@ fn compute_outer_hessian(
                     incl_logdet_h,
                     incl_logdet_s,
                 );
-                if std::env::var("GAM_DBG_EXTEXT_SUMMANDS").is_ok() {
-                    eprintln!(
-                        "[PSIPSI {}{}] pair_a={:.12e} g_i_dot_v_j={:.12e} cross={:.12e} h2={:.12e} pair_ld_s={:.12e} h_val={:.12e}",
-                        ii, jj,
-                        pair.a,
-                        coord_i.g.dot(&ext_v[jj]),
-                        cross_trace,
-                        h2_trace,
-                        pair.ld_s,
-                        h_val,
-                    );
-                }
                 hess[[k + ii, k + jj]] = h_val;
                 if ii != jj {
                     hess[[k + jj, k + ii]] = h_val;
@@ -4446,7 +4414,6 @@ fn compute_outer_hessian(
     // ∂²Φ/∂ρₖ∂ρₗ is computed using the precomputed v_ks, h_k_matrices,
     // a_k_betas, and penalty_coords that are already available. This replaces
     // the formerly caller-injected Firth Hessian.
-    let hess_laml_only = hess.clone();
     if let Some(ref firth) = solution.firth {
         let fh = compute_firth_hessian_contribution(
             firth.operator(),
@@ -4460,20 +4427,6 @@ fn compute_outer_hessian(
         );
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
-        if std::env::var("GAM_DBG_FIRTH_RANKDEF_HESS").is_ok() {
-            let n = hess.nrows();
-            for i in 0..n {
-                for j in 0..n {
-                    eprintln!(
-                        "[FIRTH-HESS-DBG] [{},{}] LAML-only={:.6e} Firth={:.6e} Total={:.6e}",
-                        i, j,
-                        hess_laml_only[[i, j]],
-                        if i < k && j < k { fh[[i, j]] } else { 0.0 },
-                        hess[[i, j]],
-                    );
-                }
-            }
-        }
 
         // ── Firth Hessian: penalty-only ext coordinates ─────────────────
         //
