@@ -4531,29 +4531,21 @@ fn compute_outer_hessian(
         //
         // The total d²Φ/dθ_i dθ_j = term_a_θ + term_b_θ + term_c_θ.
         let firth_op = firth.operator();
-        let penalty_only_ext: Vec<usize> = solution
-            .ext_coords
-            .iter()
-            .enumerate()
-            .filter_map(|(ei, coord)| {
-                if ext_h_matrices[ei].is_none() {
-                    return None;
-                }
-                // Penalty-only: coord.g == −S_τ β̂ ⇒ drift.apply(β̂) + coord.g == 0.
-                let drift_beta = coord.drift.apply(&solution.beta);
-                let drift_norm: f64 = drift_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let residual: f64 = drift_beta
-                    .iter()
-                    .zip(coord.g.iter())
-                    .map(|(&d, &g)| {
-                        let r = d + g;
-                        r * r
-                    })
-                    .sum::<f64>()
-                    .sqrt();
-                let tol = 1e-9_f64 * drift_norm.max(1.0);
-                if residual <= tol { Some(ei) } else { None }
-            })
+        // Previously this block was gated on a "penalty-only" residual check
+        // (coord.drift·β + coord.g ≈ 0), which filtered out design-moving
+        // directions.  That left design-moving ext coords with NO Firth
+        // chain-rule contribution to d²Φ/dτ² — contributing ~3% rel error
+        // on joint_tau_tau_* tests even for penalty-only configurations,
+        // because those configurations also had design-moving ext coords
+        // mixed in.  Remove the filter: the rhs formula below uses
+        // `coord.drift.materialize()` (which IS the full drift operator,
+        // summing dense + block_local + operator contributions) and
+        // `ext_h_matrices[ei]` (which is the total Hessian drift along the
+        // ext direction, including both ∂H/∂τ and D_β H[β̂_τ]).  Both
+        // handle penalty-only and design-moving directions uniformly, so
+        // dropping the gate is principled rather than approximate.
+        let active_ext: Vec<usize> = (0..solution.ext_coords.len())
+            .filter(|&ei| ext_h_matrices[ei].is_some())
             .collect();
 
         // Build β-direction vectors signed as +dβ̂/dθ for every coord we
@@ -4561,7 +4553,7 @@ fn compute_outer_hessian(
         // Jeffreys operator only consumes these as quadratic forms via
         // X·direction in term_b/term_c and as u in term_a.
         let rho_dbeta: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|x| -x)).collect();
-        let ext_dbeta: Vec<&Array1<f64>> = penalty_only_ext.iter().map(|&ei| &ext_v[ei]).collect();
+        let ext_dbeta: Vec<&Array1<f64>> = active_ext.iter().map(|&ei| &ext_v[ei]).collect();
 
         // Cached positive-direction Firth directions for term_b/term_c: each
         // `dirs[k]` represents D_β I[β-direction_k] in reduced form.
@@ -4575,8 +4567,8 @@ fn compute_outer_hessian(
             .collect();
 
         // ── ext-ext block ── d²Φ/dτ_i dτ_j
-        for (ii, &ei_i) in penalty_only_ext.iter().enumerate() {
-            for (jj, &ei_j) in penalty_only_ext.iter().enumerate().skip(ii) {
+        for (ii, &ei_i) in active_ext.iter().enumerate() {
+            for (jj, &ei_j) in active_ext.iter().enumerate().skip(ii) {
                 let h_j = ext_h_matrices[ei_j].as_ref().unwrap();
                 let s_tau_i = solution.ext_coords[ei_i].drift.materialize();
                 let v_i = ext_dbeta[ii];
@@ -4608,7 +4600,7 @@ fn compute_outer_hessian(
 
         // ── rho-ext block ── d²Φ/dρ_k dτ_i
         for (kk, v_rho_k) in rho_dbeta.iter().enumerate() {
-            for (ii, &ei_i) in penalty_only_ext.iter().enumerate() {
+            for (ii, &ei_i) in active_ext.iter().enumerate() {
                 let a_k = &a_k_matrices[kk];
                 let h_i = ext_h_matrices[ei_i].as_ref().unwrap();
                 let v_ext_i = ext_dbeta[ii];
