@@ -5519,11 +5519,20 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     } else {
         Derivative::FiniteDifference
     };
+    // The analytic outer Hessian is routed to ARC (adaptive cubic
+    // regularization), which handles indefinite Hessians natively via
+    // cubic regularization + trust region. We intentionally do NOT gate on
+    // `exact_newton_outer_geometry_supports_second_order_solver` here: the
+    // only consumer of the resulting Hessian is ARC, and ARC does not require
+    // the Hessian to be SPD. Previously this gate forced RidgedQuadraticReml
+    // families (binomial+ps custom family) onto BFGS+BfgsApprox, which stalls
+    // at iter 0 with Strong Wolfe failures because the rank-2 BFGS update is
+    // directionally wrong for the ridged surrogate surface. The fix is to
+    // expose the analytic Hessian and let ARC drive the outer iteration.
     let hessian = if options.use_outer_hessian
         && exact_outer_hessian_problem_scale_allows(specs)
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()
-        && exact_newton_outer_geometry_supports_second_order_solver(family)
     {
         Derivative::Analytic
     } else {
@@ -10537,9 +10546,21 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         custom_family_outer_derivatives(family, specs, &outer_options);
     let hessian = cap_hessian;
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
+    // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
+    // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
+    // families whose joint likelihood Hessian depends on β — e.g. GAMLSS /
+    // location-scale where cross-block penalties induce non-block-diagonal
+    // curvature that the EFS multiplicative fixed-point cannot resolve in
+    // practice. On problems of this class the fixed-point iteration
+    // stagnates far from the optimum and burns budget before BFGS gets a
+    // turn. Opt out up front so the planner goes straight to analytic-
+    // gradient BFGS instead of paying for a doomed EFS attempt first.
+    let multi_block_beta_dependent =
+        specs.len() > 1 && family.exact_newton_joint_hessian_beta_dependent();
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
+        .with_disable_fixed_point(multi_block_beta_dependent)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
         .with_fd_step(1e-4)
@@ -10952,7 +10973,11 @@ mod tests {
     }
 
     #[test]
-    fn custom_family_outer_derivatives_rejects_surrogate_second_order_geometry() {
+    fn custom_family_outer_derivatives_exposes_surrogate_second_order_geometry() {
+        // RidgedQuadraticReml is the default objective; its analytic outer
+        // Hessian is routed to ARC, which handles indefinite Hessians via
+        // cubic regularization. The previous behavior forced these families
+        // onto BFGS+BfgsApprox and caused benchmark hangs at iter 0.
         #[derive(Clone)]
         struct SurrogateFamily;
 
@@ -10994,7 +11019,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::Derivative::Unavailable
+            crate::solver::outer_strategy::Derivative::Analytic
         );
     }
 

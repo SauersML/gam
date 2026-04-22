@@ -8938,10 +8938,46 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn post_update_block_beta(
         &self,
         _: &[ParameterBlockState],
-        _: usize,
+        block_idx: usize,
         _: &ParameterBlockSpec,
-        beta: Array1<f64>,
+        mut beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        // Accepted line-search trials are not guaranteed to satisfy the
+        // structural lower bounds at zero tolerance: the QP solver's internal
+        // `project_to_lower_bounds` runs only inside the constrained solve,
+        // but the joint-Newton line search computes
+        // `trial = old + alpha * delta` and assigns it directly. Over
+        // iterations, floating-point drift pushes the binding coefficient a
+        // few ulp below its bound (the active-set classifier tolerates
+        // 1e-6, so intermediate iterates can land well into the negative),
+        // which the next iteration's `max_feasible_time_step` guard rejects
+        // at -1e-10. Project back to the feasible set here so every accepted
+        // beta is feasible at zero tolerance — a single source of truth.
+        if block_idx == Self::BLOCK_TIME
+            && let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref()
+        {
+            if beta.len() != lower_bounds.len() {
+                return Err(format!(
+                    "survival location-scale time post-update dimension mismatch: beta={}, bounds={}",
+                    beta.len(),
+                    lower_bounds.len()
+                ));
+            }
+            for j in 0..beta.len() {
+                let lb = lower_bounds[j];
+                if lb.is_finite() && beta[j] < lb {
+                    beta[j] = lb;
+                }
+            }
+        } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
+            // Link-wiggle coefficients are structurally non-negative (see
+            // max_feasible_link_wiggle_step, which checks beta[j] >= 0).
+            for j in 0..beta.len() {
+                if beta[j] < 0.0 {
+                    beta[j] = 0.0;
+                }
+            }
+        }
         Ok(beta)
     }
 }
@@ -9195,6 +9231,9 @@ pub(crate) fn fit_survival_location_scale_terms(
 
     let threshold_terms = spatial_length_scale_term_indices(&spec.thresholdspec);
     let log_sigma_terms = spatial_length_scale_term_indices(&spec.log_sigmaspec);
+    // Survival location-scale is a multi-block family with β-dependent
+    // joint Hessian: disable EFS/HybridEFS at plan time so the outer never
+    // pays for a stalled fixed-point attempt before landing on BFGS.
     let solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[spec.thresholdspec.clone(), spec.log_sigmaspec.clone()],
@@ -9204,6 +9243,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
+        true,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let fit = fit_survival_location_scale(build_spec(

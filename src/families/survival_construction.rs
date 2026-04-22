@@ -482,15 +482,22 @@ where
         return Ok(initial.clone());
     };
     let dim = seed.len();
+    // Baseline theta is not a log-smoothing rho; the Survival retreat seed
+    // at bounds.1=12 would overflow rate=exp(12). Pin as auxiliary and box
+    // tightly around the heuristic.
     let mut seed_config = crate::seeding::SeedConfig::default();
-    seed_config.max_seeds = 8;
-    seed_config.seed_budget = 2;
-    seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
+    seed_config.max_seeds = 1;
+    seed_config.seed_budget = 1;
+    seed_config.risk_profile = crate::seeding::SeedRiskProfile::Gaussian;
+    seed_config.num_auxiliary_trailing = dim;
+    let lower = seed.mapv(|v| v - 6.0);
+    let upper = seed.mapv(|v| v + 6.0);
     let problem = OuterProblem::new(dim)
         .with_tolerance(1e-4)
         .with_max_iter(30)
         .with_fd_step(1e-3)
         .with_seed_config(seed_config)
+        .with_bounds(lower, upper)
         .with_heuristic_lambdas(seed.to_vec());
     let target = initial.target;
     let mut obj = problem.build_objective(

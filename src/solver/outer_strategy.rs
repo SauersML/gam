@@ -16,10 +16,10 @@
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
-    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FiniteDiffGradient,
-    FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
-    FixedPointSample, FixedPointStatus, MaxIterations, ObjectiveEvalError, SecondOrderObjective,
-    SecondOrderSample, Solution, Tolerance, ZerothOrderObjective,
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FirstOrderObjective,
+    FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective, FixedPointSample,
+    FixedPointStatus, MaxIterations, ObjectiveEvalError, SecondOrderObjective, SecondOrderSample,
+    Solution, Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -298,6 +298,19 @@ pub struct OuterCapability {
     /// Policy hint: even when an analytic Hessian exists, prefer a gradient-only
     /// outer solver because each second-order evaluation is too expensive.
     pub prefer_gradient_only: bool,
+    /// Policy hint: even when the objective implements `eval_efs()` and the
+    /// coordinate structure is penalty-like, the planner must NOT select
+    /// EFS/HybridEfs for this problem.
+    ///
+    /// Set by the caller for problem classes where the Wood-Fasiolo structural
+    /// property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus parameter-independent
+    /// nullspace) is known not to hold — e.g. GAMLSS/location-scale families
+    /// where the joint Hessian is β-dependent and cross-block smoothers
+    /// induce non-diagonal curvature that the EFS multiplicative fixed-point
+    /// cannot resolve. Also set by the automatic fallback cascade when an
+    /// EFS/HybridEfs attempt failed to converge, so the next attempt falls
+    /// back to analytic-gradient BFGS rather than retrying EFS.
+    pub disable_fixed_point: bool,
 }
 
 impl OuterCapability {
@@ -320,12 +333,14 @@ impl OuterCapability {
 
     fn efs_plan_eligible(&self) -> bool {
         self.fixed_point_available
+            && !self.disable_fixed_point
             && self.all_penalty_like()
             && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
     }
 
     fn hybrid_efs_plan_eligible(&self) -> bool {
         self.fixed_point_available
+            && !self.disable_fixed_point
             && self.has_psi_coords()
             && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
     }
@@ -611,19 +626,14 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
-        (Analytic, FiniteDifference) => OuterPlan {
-            solver: S::Bfgs,
-            hessian_source: H::BfgsApprox,
-        },
-
-        (FiniteDifference, _) => OuterPlan {
-            solver: S::Bfgs,
-            hessian_source: H::BfgsApprox,
-        },
-
-        // No declared gradient: the runner will still approximate one from
-        // `eval_cost()` when BFGS is the only viable non-EFS strategy.
-        (Unavailable, _) => OuterPlan {
+        // FD-gradient planning is a production footgun: the runner now rejects
+        // non-analytic gradients in `Solver::Bfgs`, but we still emit a plan
+        // here so the error surfaces with context rather than as a panic on an
+        // unmatched arm. The caller must supply an analytic gradient or use an
+        // EFS-eligible capability.
+        (Analytic, FiniteDifference)
+        | (FiniteDifference, _)
+        | (Unavailable, _) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
@@ -674,24 +684,48 @@ fn downgrade_hessian(cap: &OuterCapability) -> Option<OuterCapability> {
     })
 }
 
-fn downgrade_gradient(cap: &OuterCapability) -> Option<OuterCapability> {
-    (cap.gradient == Derivative::Analytic).then(|| {
-        let mut degraded = cap.clone();
-        degraded.gradient = Derivative::FiniteDifference;
-        degraded.hessian = Derivative::Unavailable;
-        degraded
-    })
+/// Disable the EFS/HybridEfs planner path, forcing BFGS-class solvers on the
+/// next attempt. Returns `None` if fixed-point is already disabled.
+fn disable_fixed_point(cap: &OuterCapability) -> Option<OuterCapability> {
+    (!cap.disable_fixed_point && (cap.efs_plan_eligible() || cap.hybrid_efs_plan_eligible())).then(
+        || {
+            let mut degraded = cap.clone();
+            degraded.disable_fixed_point = true;
+            degraded
+        },
+    )
 }
 
 fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
+    // Production fallback ladder is strictly analytic-gradient.
+    //
+    // Silently degrading an `Analytic` gradient capability to
+    // `FiniteDifference` was a loaded footgun: the FD path costs 2k inner
+    // PIRLS solves per outer gradient evaluation, and for large-n binomial
+    // biobank problems (n=320k, p≈71) it would burn the entire benchmark
+    // budget spinning on warm-started PIRLS (`iters=1 max_eta=5.9`) without
+    // ever reporting failure. The primary analytic path must converge on its
+    // own merits — masking non-convergence with FD just hid the real problem.
+    //
+    // The cascade is now:
+    //   1. If EFS/HybridEFS was the primary plan, retry with fixed-point
+    //      disabled so BFGS can use the declared analytic gradient directly.
+    //   2. If analytic Hessian was declared, retry with it downgraded to
+    //      BFGS-approximation (still analytic gradient).
+    //   3. No further retries — the caller surfaces the RemlOptimizationFailed
+    //      error so the non-convergence is visible.
     let mut attempts = Vec::new();
-    if let Some(grad_cap) = downgrade_hessian(cap) {
-        attempts.push(grad_cap.clone());
-        if let Some(fd_cap) = downgrade_gradient(&grad_cap) {
-            attempts.push(fd_cap);
+
+    if let Some(no_fp_cap) = disable_fixed_point(cap) {
+        attempts.push(no_fp_cap.clone());
+        if let Some(grad_cap) = downgrade_hessian(&no_fp_cap) {
+            attempts.push(grad_cap);
         }
-    } else if let Some(fd_cap) = downgrade_gradient(cap) {
-        attempts.push(fd_cap);
+        return attempts;
+    }
+
+    if let Some(grad_cap) = downgrade_hessian(cap) {
+        attempts.push(grad_cap);
     }
     attempts
 }
@@ -1480,6 +1514,7 @@ pub struct OuterProblem {
     gradient: Derivative,
     hessian: Derivative,
     prefer_gradient_only: bool,
+    disable_fixed_point: bool,
     psi_dim: usize,
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
@@ -1501,6 +1536,7 @@ impl OuterProblem {
             gradient: Derivative::Unavailable,
             hessian: Derivative::Unavailable,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
             psi_dim: 0,
             barrier_config: None,
             tolerance: 1e-5,
@@ -1526,6 +1562,18 @@ impl OuterProblem {
     }
     pub fn with_prefer_gradient_only(mut self, prefer_gradient_only: bool) -> Self {
         self.prefer_gradient_only = prefer_gradient_only;
+        self
+    }
+    /// Forbid the planner from selecting EFS/HybridEfs, even when the
+    /// objective implements `eval_efs()` and the coordinate structure would
+    /// otherwise make pure/hybrid EFS eligible.
+    ///
+    /// Callers use this for families where the Wood-Fasiolo structural
+    /// property is known not to hold (e.g. GAMLSS/location-scale with
+    /// β-dependent joint Hessian), so EFS would stagnate and burn budget
+    /// before the automatic cascade falls back to gradient-based BFGS.
+    pub fn with_disable_fixed_point(mut self, disable: bool) -> Self {
+        self.disable_fixed_point = disable;
         self
     }
     pub fn with_psi_dim(mut self, dim: usize) -> Self {
@@ -1581,6 +1629,7 @@ impl OuterProblem {
             gradient: self.gradient,
             hessian: self.hessian,
             prefer_gradient_only: self.prefer_gradient_only,
+            disable_fixed_point: self.disable_fixed_point,
             n_params: self.n_params,
             psi_dim: self.psi_dim,
             fixed_point_available: false,
@@ -2299,75 +2348,56 @@ fn run_outer_with_plan(
                 }
             }
             Solver::Bfgs => {
-                let gradient_available = cap.gradient == Derivative::Analytic;
-                if gradient_available {
-                    let seed_eval = obj
-                        .eval_with_order(&seed, OuterEvalOrder::ValueAndGradient)
-                        .map_err(|err| into_objective_error("outer eval failed", err));
-                    let seed_eval = match seed_eval {
-                        Ok(seed_eval) => seed_eval,
-                        Err(err) => {
-                            let err = match err {
-                                ObjectiveEvalError::Recoverable { message }
-                                | ObjectiveEvalError::Fatal { message } => {
-                                    EstimationError::RemlOptimizationFailed(message)
-                                }
-                            };
-                            log::warn!(
-                                "[OUTER] {context}: rejecting seed before solver start: {err}"
-                            );
-                            last_seed_error = Some(err.to_string());
-                            continue 'seed_attempts;
-                        }
-                    };
-                    let seed_eval = finite_outer_first_order_eval_or_error(
-                        "outer eval failed",
-                        layout,
-                        seed_eval,
-                    )
-                    .map_err(|err| match err {
-                        ObjectiveEvalError::Recoverable { message }
-                        | ObjectiveEvalError::Fatal { message } => {
-                            EstimationError::RemlOptimizationFailed(message)
-                        }
-                    });
-                    if let Err(err) = seed_eval {
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                        last_seed_error = Some(err.to_string());
-                        continue 'seed_attempts;
-                    }
-                } else {
-                    let seed_cost = obj
-                        .eval_cost(&seed)
-                        .map_err(|err| into_objective_error("outer eval_cost failed", err));
-                    let seed_cost = match seed_cost {
-                        Ok(seed_cost) => seed_cost,
-                        Err(err) => {
-                            let err = match err {
-                                ObjectiveEvalError::Recoverable { message }
-                                | ObjectiveEvalError::Fatal { message } => {
-                                    EstimationError::RemlOptimizationFailed(message)
-                                }
-                            };
-                            log::warn!(
-                                "[OUTER] {context}: rejecting seed before solver start: {err}"
-                            );
-                            last_seed_error = Some(err.to_string());
-                            continue 'seed_attempts;
-                        }
-                    };
-                    let seed_cost = finite_cost_or_error("outer eval_cost failed", seed_cost)
-                        .map_err(|err| match err {
+                // Production invariant: the outer BFGS runner never accepts a
+                // non-analytic gradient capability. The FD-BFGS wrapping path
+                // was a silent footgun that could spin for the entire benchmark
+                // budget on large-n binomial problems (~2k PIRLS solves per
+                // outer gradient at n=320k, masking a non-converging primary
+                // analytic path). Fail loudly at the top of the seed loop so
+                // the caller surfaces the underlying capability/plan mismatch
+                // instead of degrading correctness behind the scenes.
+                if cap.gradient != Derivative::Analytic {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "{context}: outer BFGS requires an analytic gradient capability; \
+                         FD-gradient fallback is disabled in production (plan={the_plan}, \
+                         declared gradient={:?})",
+                        cap.gradient,
+                    )));
+                }
+                let seed_eval = obj
+                    .eval_with_order(&seed, OuterEvalOrder::ValueAndGradient)
+                    .map_err(|err| into_objective_error("outer eval failed", err));
+                let seed_eval = match seed_eval {
+                    Ok(seed_eval) => seed_eval,
+                    Err(err) => {
+                        let err = match err {
                             ObjectiveEvalError::Recoverable { message }
                             | ObjectiveEvalError::Fatal { message } => {
                                 EstimationError::RemlOptimizationFailed(message)
                             }
-                        });
-                    if let Err(err) = seed_cost {
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                        };
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed before solver start: {err}"
+                        );
                         last_seed_error = Some(err.to_string());
                         continue 'seed_attempts;
                     }
+                };
+                let seed_eval = finite_outer_first_order_eval_or_error(
+                    "outer eval failed",
+                    layout,
+                    seed_eval,
+                )
+                .map_err(|err| match err {
+                    ObjectiveEvalError::Recoverable { message }
+                    | ObjectiveEvalError::Fatal { message } => {
+                        EstimationError::RemlOptimizationFailed(message)
+                    }
+                });
+                if let Err(err) = seed_eval {
+                    log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
+                    last_seed_error = Some(err.to_string());
+                    continue 'seed_attempts;
                 }
                 started_seeds += 1;
                 seed_slot = started_seeds;
@@ -2377,43 +2407,22 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
-                if gradient_available {
-                    let objective = OuterFirstOrderBridge { obj, layout };
-                    let mut optimizer = Bfgs::new(seed.clone(), objective)
-                        .with_bounds(bounds)
-                        .with_tolerance(tol)
-                        .with_max_iterations(max_iter);
-                    match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                        Err(BfgsError::MaxIterationsReached { last_solution }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                        }
-                        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                        }
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                            "BFGS solver failed: {e:?}"
-                        ))),
+                let objective = OuterFirstOrderBridge { obj, layout };
+                let mut optimizer = Bfgs::new(seed.clone(), objective)
+                    .with_bounds(bounds)
+                    .with_tolerance(tol)
+                    .with_max_iterations(max_iter);
+                match optimizer.run() {
+                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                    Err(BfgsError::MaxIterationsReached { last_solution }) => {
+                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
-                } else {
-                    let objective = FiniteDiffGradient::new(OuterCostBridge { obj, layout })
-                        .with_step(config.fd_step);
-                    let mut optimizer = Bfgs::new(seed.clone(), objective)
-                        .with_bounds(bounds)
-                        .with_tolerance(tol)
-                        .with_max_iterations(max_iter);
-                    match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                        Err(BfgsError::MaxIterationsReached { last_solution }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                        }
-                        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                        }
-                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                            "BFGS solver failed: {e:?}"
-                        ))),
+                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
+                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                        "BFGS solver failed: {e:?}"
+                    ))),
                 }
             }
             Solver::Efs => {
@@ -2669,6 +2678,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -2685,6 +2695,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: true,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2701,6 +2712,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2717,6 +2729,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2733,6 +2746,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2740,7 +2754,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_fd_gradient_always_bfgs() {
+    fn plan_fd_gradient_still_maps_to_bfgs_for_error_context() {
+        // FD-gradient capabilities must not be declared by production callers;
+        // the runner now errors out on the Bfgs path. The planner still
+        // produces a `Solver::Bfgs` plan so the eventual error can format a
+        // meaningful "plan={plan}" context string instead of panicking on an
+        // unmatched match arm.
         for n in [1, 5, 20] {
             let cap = OuterCapability {
                 gradient: Derivative::FiniteDifference,
@@ -2750,6 +2769,7 @@ mod tests {
                 fixed_point_available: false,
                 barrier_config: None,
                 prefer_gradient_only: false,
+                disable_fixed_point: false,
             };
             let p = plan(&cap);
             assert_eq!(p.solver, Solver::Bfgs);
@@ -2758,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_fd_gradient_with_hessian_still_bfgs() {
+    fn plan_fd_gradient_with_hessian_still_bfgs_for_error_context() {
         let cap = OuterCapability {
             gradient: Derivative::FiniteDifference,
             hessian: Derivative::Analytic,
@@ -2767,6 +2787,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2782,6 +2803,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2798,6 +2820,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2814,6 +2837,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2830,6 +2854,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2846,6 +2871,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -2862,6 +2888,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         // Arc is always preferred when analytic Hessian is available.
@@ -2880,6 +2907,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2904,6 +2932,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: Some(barrier),
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2928,6 +2957,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: Some(barrier),
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -2978,6 +3008,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -3153,6 +3184,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::HybridEfs);
@@ -3169,6 +3201,7 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -3187,6 +3220,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::HybridEfs);
@@ -3203,6 +3237,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
@@ -3221,6 +3256,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
@@ -3238,6 +3274,7 @@ mod tests {
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Efs);
@@ -3245,7 +3282,9 @@ mod tests {
     }
 
     #[test]
-    fn automatic_fallbacks_degrade_hessian_then_gradient() {
+    fn automatic_fallbacks_only_degrade_hessian_not_gradient() {
+        // The analytic gradient MUST NOT be silently degraded to FD; see
+        // `automatic_fallback_attempts` for the production-safety rationale.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
@@ -3254,17 +3293,95 @@ mod tests {
             fixed_point_available: false,
             barrier_config: None,
             prefer_gradient_only: false,
+            disable_fixed_point: false,
         };
         let attempts = automatic_fallback_attempts(&cap);
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].gradient, Derivative::Analytic);
         assert_eq!(attempts[0].hessian, Derivative::Unavailable);
-        assert_eq!(attempts[1].gradient, Derivative::FiniteDifference);
-        assert_eq!(attempts[1].hessian, Derivative::Unavailable);
     }
 
     #[test]
-    fn run_malformed_gradient_seed_can_fall_back_to_cost_only_plan() {
+    fn automatic_fallbacks_from_efs_prefer_analytic_bfgs_over_fd() {
+        // When the primary plan is EFS, the first fallback must keep the
+        // analytic gradient and just disable the fixed-point path so the
+        // planner picks gradient-based BFGS. Silently downgrading to finite
+        // differences here was the long-standing production bug we are
+        // guarding against.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            psi_dim: 0,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        assert_eq!(plan(&cap).solver, Solver::Efs);
+
+        let attempts = automatic_fallback_attempts(&cap);
+        assert!(!attempts.is_empty(), "EFS failure must have a fallback");
+        assert_eq!(attempts[0].gradient, Derivative::Analytic);
+        assert_eq!(attempts[0].hessian, Derivative::Unavailable);
+        assert!(attempts[0].disable_fixed_point);
+        assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
+
+        // FD-gradient fallback was removed in production (silent BFGS-FD
+        // spin was a footgun on large-n binomial biobank problems); the
+        // cascade must stay on analytic-gradient attempts.
+        assert!(
+            attempts
+                .iter()
+                .all(|c| c.gradient == Derivative::Analytic),
+            "fallback cascade must not introduce a finite-difference gradient",
+        );
+    }
+
+    #[test]
+    fn automatic_fallbacks_from_hybrid_efs_prefer_analytic_bfgs_over_fd() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            psi_dim: 2,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        assert_eq!(plan(&cap).solver, Solver::HybridEfs);
+
+        let attempts = automatic_fallback_attempts(&cap);
+        assert!(!attempts.is_empty());
+        assert_eq!(attempts[0].gradient, Derivative::Analytic);
+        assert!(attempts[0].disable_fixed_point);
+        assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
+    }
+
+    #[test]
+    fn plan_disable_fixed_point_forces_bfgs_even_when_efs_eligible() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 15,
+            psi_dim: 0,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: true,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn run_malformed_gradient_seed_surfaces_as_error() {
+        // A capability that declares Analytic gradient but returns a malformed
+        // one must fail loudly. The previous FD-fallback behaviour masked the
+        // underlying bug by silently spinning a cost-only BFGS with
+        // finite-difference gradient — that path is disabled in production.
         let problem = OuterProblem::new(2)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Unavailable)
@@ -3283,11 +3400,13 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let result = problem
+        let err = problem
             .run(&mut obj, "test gradient mismatch")
-            .expect("finite-difference fallback should recover from malformed analytic gradients");
-        assert_eq!(result.plan_used.solver, Solver::Bfgs);
-        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
+            .expect_err("malformed analytic gradient must surface as error");
+        assert!(
+            matches!(err, EstimationError::RemlOptimizationFailed(_)),
+            "unexpected error variant: {err:?}",
+        );
     }
 
     #[test]
