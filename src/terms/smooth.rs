@@ -10144,6 +10144,10 @@ fn try_exact_joint_spatial_aniso_optimization(
             Derivative::Unavailable
         },
         prefer_gradient_only,
+        // Single-block spatial path: penalty-like rho + spatial psi.
+        // EFS/HybridEFS remain eligible; the Wood-Fasiolo PSD structure holds
+        // for single-block families with β-independent joint H_L.
+        false,
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
@@ -10440,6 +10444,10 @@ fn try_exact_joint_spatial_isotropic_optimization(
             Derivative::Unavailable
         },
         prefer_gradient_only,
+        // Single-block spatial path: penalty-like rho + spatial psi.
+        // EFS/HybridEFS remain eligible; the Wood-Fasiolo PSD structure holds
+        // for single-block families with β-independent joint H_L.
+        false,
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
@@ -11742,6 +11750,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     gradient: crate::solver::outer_strategy::Derivative,
     hessian: crate::solver::outer_strategy::Derivative,
     prefer_gradient_only: bool,
+    disable_fixed_point: bool,
     risk_profile: crate::seeding::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
@@ -11755,6 +11764,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_gradient(gradient)
         .with_hessian(hessian)
         .with_prefer_gradient_only(prefer_gradient_only)
+        .with_disable_fixed_point(disable_fixed_point)
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
@@ -11781,6 +11791,7 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     seed_risk_profile: crate::seeding::SeedRiskProfile,
     analytic_joint_gradient_available: bool,
     analytic_joint_hessian_available: bool,
+    disable_fixed_point: bool,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
@@ -11962,6 +11973,7 @@ where
             Derivative::Unavailable
         },
         prefer_gradient_only,
+        disable_fixed_point,
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
@@ -14333,6 +14345,7 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
+            false,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -14598,6 +14611,7 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
+            false,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -16279,6 +16293,7 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian,
             true,
             true,
+            false,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);

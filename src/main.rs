@@ -3481,21 +3481,19 @@ fn run_predict_survival(
                     .zip(eta_se.iter())
                     .map(|(&mu, &se)| normal_cdf(-mu / (1.0 + se * se).sqrt())),
             );
-            let (mean_lo, mean_hi) = if args.uncertainty {
+            if args.uncertainty {
                 if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
                     return Err(format!("--level must be in (0,1), got {}", args.level));
                 }
                 let z_alpha = standard_normal_quantile(0.5 + args.level * 0.5)?;
                 let eta_lo = &eta - &(eta_se.mapv(|value| z_alpha * value));
                 let eta_hi = &eta + &(eta_se.mapv(|value| z_alpha * value));
-                (
-                    Some(eta_hi.mapv(|value| normal_cdf(-value))),
-                    Some(eta_lo.mapv(|value| normal_cdf(-value))),
-                )
+                let mean_lo = Some(eta_hi.mapv(|value| normal_cdf(-value)));
+                let mean_hi = Some(eta_lo.mapv(|value| normal_cdf(-value)));
+                (eta, mean, Some(eta_se), mean_lo, mean_hi)
             } else {
-                (None, None)
-            };
-            (eta, mean, Some(eta_se), mean_lo, mean_hi)
+                (eta, mean, None, None, None)
+            }
         } else if args.uncertainty {
             if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
                 return Err(format!("--level must be in (0,1), got {}", args.level));
@@ -3561,10 +3559,17 @@ fn run_predict_survival(
     // available through the exact location-scale path. Pad with zeros
     // so coefficient indexing stays consistent.
     // (The location-scale predict path above handles timewiggle properly.)
-    for i in 0..n {
-        for j in 0..p_cov {
-            x_exit[[i, p_time + p_timewiggle + j]] = cov_design.design.get(i, j);
-        }
+    //
+    // Materialize the covariate design once into dense form. Calling
+    // `DesignMatrix::get(i, j)` in a per-cell loop would re-densify the
+    // entire operator-backed block on every call (the Lazy/BlockDesignOperator
+    // default `to_dense_arc` does not cache), turning this copy into an
+    // O(n · p_cov · (n · p_cov)) catastrophe at biobank scale.
+    let cov_dense = cov_design.design.as_dense_cow();
+    if p_cov > 0 {
+        x_exit
+            .slice_mut(s![.., (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov)])
+            .assign(&cov_dense);
     }
     if args.noise_offset_column.is_some() {
         return Err(
@@ -4051,15 +4056,23 @@ where
         return Ok(initial.clone());
     };
     let dim = seed.len();
+    // Baseline theta is not a log-smoothing rho; the Survival risk profile
+    // would retreat to bounds.1=12 per dim, making rate=exp(12) overflow eta.
+    // Pin all dims as auxiliary (seeds collapse to the heuristic anchor) and
+    // box the search tightly around it.
     let mut seed_config = gam::seeding::SeedConfig::default();
-    seed_config.max_seeds = 4;
-    seed_config.seed_budget = 2;
-    seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
+    seed_config.max_seeds = 1;
+    seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam::seeding::SeedRiskProfile::Gaussian;
+    seed_config.num_auxiliary_trailing = dim;
+    let lower = seed.mapv(|v| v - 6.0);
+    let upper = seed.mapv(|v| v + 6.0);
     let problem = gam::solver::outer_strategy::OuterProblem::new(dim)
         .with_tolerance(1e-3)
         .with_max_iter(12)
         .with_fd_step(1e-3)
         .with_seed_config(seed_config)
+        .with_bounds(lower, upper)
         .with_heuristic_lambdas(seed.to_vec());
     let target = initial.target;
     let mut obj = problem.build_objective(
@@ -6294,24 +6307,35 @@ fn run_sample_survival(
     let mut x_entry = Array2::<f64>::zeros((n, p));
     let mut x_exit = Array2::<f64>::zeros((n, p));
     let mut x_derivative = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        for j in 0..p_time {
-            x_entry[[i, j]] = tb_entry_dense[[i, j]];
-            x_exit[[i, j]] = tb_exit_dense[[i, j]];
-            x_derivative[[i, j]] = tb_deriv_dense[[i, j]];
+    if p_time > 0 {
+        x_entry.slice_mut(s![.., ..p_time]).assign(&tb_entry_dense);
+        x_exit.slice_mut(s![.., ..p_time]).assign(&tb_exit_dense);
+        x_derivative
+            .slice_mut(s![.., ..p_time])
+            .assign(&tb_deriv_dense);
+    }
+    if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref() {
+        if p_timewiggle > 0 {
+            x_entry
+                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+                .assign(entry_w);
+            x_exit
+                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+                .assign(exit_w);
+            x_derivative
+                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+                .assign(deriv_w);
         }
-        if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref() {
-            for j in 0..p_timewiggle {
-                x_entry[[i, p_time + j]] = entry_w[[i, j]];
-                x_exit[[i, p_time + j]] = exit_w[[i, j]];
-                x_derivative[[i, p_time + j]] = deriv_w[[i, j]];
-            }
-        }
-        for j in 0..p_cov {
-            let z = cov_design.design.get(i, j);
-            x_entry[[i, p_time + p_timewiggle + j]] = z;
-            x_exit[[i, p_time + p_timewiggle + j]] = z;
-        }
+    }
+    if p_cov > 0 {
+        // Materialize the operator-backed covariate design once. Indexing it
+        // per (i, j) via DesignMatrix::get re-densifies the whole block on
+        // every call (lazy operators do not cache to_dense_arc output),
+        // which is catastrophic at biobank scale.
+        let cov_dense = cov_design.design.as_dense_cow();
+        let cov_range = (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov);
+        x_entry.slice_mut(s![.., cov_range.clone()]).assign(&cov_dense);
+        x_exit.slice_mut(s![.., cov_range]).assign(&cov_dense);
     }
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
     for (idx, s) in time_build.penalties.iter().enumerate() {
