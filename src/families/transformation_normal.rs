@@ -2893,6 +2893,10 @@ pub fn fit_transformation_normal(
         crate::seeding::SeedRiskProfile::Gaussian,
         analytic_gradient,
         analytic_hessian,
+        // Transformation-normal has β-dependent H (through 1/h'²), so the
+        // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
+        // planner goes straight to analytic-gradient BFGS.
+        true,
         // fit_fn
         |_, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;

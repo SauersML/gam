@@ -5072,17 +5072,29 @@ impl DesignMatrix {
 
     /// Element access: returns the value at row `i`, column `j`.
     ///
-    /// For dense matrices this is O(1). For sparse matrices, this converts to
-    /// a dense cache first and then indexes, so callers doing per-row sweeps
-    /// should prefer `to_dense()` for bulk access.
+    /// For materialized dense matrices this is O(1). For sparse matrices,
+    /// the dense form is cached on the `SparseDesignMatrix` itself, so
+    /// repeated calls amortize to O(1) after the first call populates the
+    /// cache. For operator-backed (Lazy) dense matrices this call performs
+    /// an O(n) single-column materialization via `extract_column`; callers
+    /// sweeping many cells should call `as_dense_cow()` or `to_dense()`
+    /// once and index the returned array directly — calling `get` in a
+    /// per-cell loop on a Lazy operator is O(nrows · ncols) per call
+    /// because the operator has no dense cache.
     #[inline]
     pub fn get(&self, i: usize, j: usize) -> f64 {
         match self {
             Self::Dense(matrix) => match matrix.as_dense_ref() {
                 Some(dense) => dense[[i, j]],
-                None => matrix
-                    .try_to_dense_arc("DesignMatrix::get")
-                    .unwrap_or_else(|msg| panic!("{msg}"))[[i, j]],
+                // Lazy operator: pull a single column via apply(e_j) so that
+                // each call is O(n) instead of O(nrows · ncols); the default
+                // `try_to_dense_arc` would re-materialize the full operator
+                // on every call because Lazy operators have no dense cache.
+                None => {
+                    let mut e_j = Array1::<f64>::zeros(matrix.ncols());
+                    e_j[j] = 1.0;
+                    matrix.apply(&e_j)[i]
+                }
             },
             Self::Sparse(sp) => {
                 let dense = sp

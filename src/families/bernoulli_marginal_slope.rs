@@ -8310,6 +8310,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
         Ok(built)
     };
 
+    // Bernoulli marginal-slope is a multi-block family with β-dependent
+    // joint Hessian: EFS/HybridEFS fixed-point structural invariant fails,
+    // so we disable fixed-point at plan time rather than burning cycles on
+    // a stalled first attempt that silently falls back.
     let solved = optimize_spatial_length_scale_exact_joint(
         data_view,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
@@ -8319,6 +8323,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         crate::seeding::SeedRiskProfile::GeneralizedLinear,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
+        true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let sigma = sigma_from_theta(theta);

@@ -1718,6 +1718,16 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             let noise_terms = spatial_length_scale_term_indices(builder.noisespec());
             let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
             let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+            // Two-block GAMLSS/location-scale joint likelihoods have a
+            // β-dependent cross-block Hessian (the (μ,log σ) / (t,log σ)
+            // off-diagonal blocks involve residual/response scalars that
+            // shift when β moves). The Wood-Fasiolo structural property
+            // `H^{-1/2} B_k H^{-1/2} ≽ 0` plus parameter-independent
+            // nullspace — the mathematical basis for EFS convergence —
+            // fails here, so EFS/HybridEFS must be excluded at plan time
+            // rather than retried as a silent first attempt that stalls
+            // for hundreds of seconds before the runner falls back.
+            let gamlss_disable_fixed_point = true;
             optimize_spatial_length_scale_exact_joint(
                 data,
                 &[builder.meanspec().clone(), builder.noisespec().clone()],
@@ -1730,6 +1740,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 // we intentionally plan it as gradient/fixed-point rather
                 // than an ARC/Newton Hessian solve.
                 false,
+                gamlss_disable_fixed_point,
                 |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
