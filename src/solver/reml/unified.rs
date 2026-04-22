@@ -6156,12 +6156,20 @@ pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
 ///
 /// ## `Smooth` (default — appropriate for almost all GLM/GAM families)
 ///
-/// All eigenvalues contribute to `log|H|` via the smooth regularizer
+/// Eigenvalues above the structural positive-eigenvalue threshold — the same
+/// ~100·p·ε_mach·‖H‖ cutoff that `fixed_subspace_penalty_rank_and_logdet`
+/// applies to `log|S|_+` — contribute to `log|H|` via the smooth regularizer
 /// `r_ε(σ) = ½(σ + √(σ² + 4ε²))`.  Gradients use `φ'(σ) = 1/√(σ² + 4ε²)`
 /// so that `d log|H|_reg/dρ = Σ φ'(σ_j) · u_j^T (dH/dρ) u_j` is the EXACT
-/// derivative of the scalar objective `Σ log r_ε(σ_j)`.  Near-zero
-/// eigenvalues get a soft floor and still contribute to both the cost and
-/// its gradient, with no jumps or discontinuities.
+/// derivative of the scalar objective `Σ log r_ε(σ_j)` over the active set.
+/// For a well-conditioned H the threshold sits far below every genuine
+/// eigenvalue and every pair is active, so behaviour matches the previous
+/// unfiltered soft-floor formulation.  In the rank-deficient regime where
+/// `rank(X) + rank(S) < p` (e.g. small-n high-dim Duchon), H has eigenvalues
+/// inside the numerical noise band; those directions are also null in S, so
+/// excluding them from BOTH `log|H|` and `log|S|_+` keeps the LAML ratio
+/// well-defined on the identified subspace rather than driving
+/// `½ log|H| − ½ log|S|_+` to −∞.
 ///
 /// ## `HardPseudo` (opt-in for structurally rank-deficient families)
 ///
@@ -6279,15 +6287,28 @@ impl DenseSpectralOperator {
         let epsilon = spectral_epsilon(eigenvalues.as_slice().unwrap());
 
         // `active[j]` selects which eigenpairs participate in every trace
-        // and in the cached logdet.  Under `Smooth` every eigenpair is
-        // active (default behavior for well-conditioned problems).  Under
-        // `HardPseudo` eigenvalues ≤ ε are excluded from both the cost
-        // (`cached_logdet`) and the gradient kernel (`g_factor`,
-        // `w_factor`, `hinv_cross_kernel`, `logdet_hessian_kernel`), so
-        // the null-space directions of a rank-deficient H drop out of
-        // FD-vs-analytic gradient comparisons cleanly.
+        // and in the cached logdet.  Under `Smooth` we retain every eigenpair
+        // that sits above the structural positive-eigenvalue threshold
+        // (the same threshold that `fixed_subspace_penalty_rank_and_logdet`
+        // uses for `log|S|_+`).  For a well-conditioned H this threshold is
+        // ~100·p·ε_mach·‖H‖, far below any genuine eigenvalue, so `active`
+        // is all-true and the mode reduces to its previous soft-floor
+        // behaviour.  In the rank-deficient regime (e.g. n=120, 16-D Duchon
+        // k=6, where `rank(X) + rank(S) < p`), H has eigenvalues inside the
+        // numerical noise band; those null directions are also structurally
+        // null in S, so excluding them from BOTH logdets keeps the LAML
+        // ratio `|H|_+ / |S|_+` well-defined on the identified subspace and
+        // prevents the `½ log|H| − ½ log|S|_+` term from diverging to −∞.
+        // Under `HardPseudo` eigenvalues ≤ ε (scaled by `spectral_epsilon`)
+        // are excluded — a tighter filter used when Firth-style Jeffreys
+        // penalties enforce identifiability exactly on the active subspace.
+        let structural_threshold =
+            positive_eigenvalue_threshold(eigenvalues.as_slice().unwrap());
         let active: Vec<bool> = match mode {
-            PseudoLogdetMode::Smooth => vec![true; n],
+            PseudoLogdetMode::Smooth => eigenvalues
+                .iter()
+                .map(|&s| s > structural_threshold)
+                .collect(),
             PseudoLogdetMode::HardPseudo => eigenvalues.iter().map(|&s| s > epsilon).collect(),
         };
 
