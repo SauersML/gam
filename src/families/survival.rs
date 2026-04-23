@@ -1551,7 +1551,20 @@ impl WorkingModelSurvival {
         };
 
         let p = beta.len();
-        let k_count = self.penalties.blocks.len();
+        let active_penalty_blocks: Vec<&PenaltyBlock> = self
+            .penalties
+            .blocks
+            .iter()
+            .filter(|b| b.lambda > 0.0)
+            .collect();
+        if rho.len() != active_penalty_blocks.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "survival LAML rho dimension {} does not match active penalty block count {}",
+                rho.len(),
+                active_penalty_blocks.len()
+            )));
+        }
+        let k_count = active_penalty_blocks.len();
 
         // --- Hessian operator ---
         let h_dense = state.hessian.to_dense();
@@ -1563,6 +1576,7 @@ impl WorkingModelSurvival {
             .penalties
             .blocks
             .iter()
+            .filter(|b| b.lambda > 0.0)
             .map(|b| PenaltyBlockDesc {
                 matrix: &b.matrix,
                 range_start: b.range.start,
@@ -1575,9 +1589,7 @@ impl WorkingModelSurvival {
         // --- Penalty logdet derivatives ---
         let per_block_rho: Vec<Array1<f64>> =
             rho.iter().map(|&r| Array1::from_vec(vec![r])).collect();
-        let per_block_penalty_matrices: Vec<Vec<Array2<f64>>> = self
-            .penalties
-            .blocks
+        let per_block_penalty_matrices: Vec<Vec<Array2<f64>>> = active_penalty_blocks
             .iter()
             .map(|b| vec![b.matrix.clone()])
             .collect();
@@ -1585,9 +1597,7 @@ impl WorkingModelSurvival {
             .iter()
             .map(|v| v.as_slice())
             .collect();
-        let per_block_nullspace_vecs: Vec<Vec<usize>> = self
-            .penalties
-            .blocks
+        let per_block_nullspace_vecs: Vec<Vec<usize>> = active_penalty_blocks
             .iter()
             .map(|b| vec![b.nullspace_dim])
             .collect();
@@ -1630,6 +1640,7 @@ impl WorkingModelSurvival {
             },
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
             deriv_provider: Some(Box::new(provider)),
             tk_correction: 0.0,
             tk_gradient: None,
@@ -2625,6 +2636,161 @@ mod tests {
                 state.gradient[j]
             );
         }
+    }
+
+    fn laml_fd_test_model(lambda: f64) -> WorkingModelSurvival {
+        let age_entry = array![1.0_f64, 2.0, 3.0, 4.0];
+        let age_exit = array![1.8_f64, 2.8, 4.1, 5.2];
+        let event_target = array![1u8, 0u8, 1u8, 0u8];
+        let event_competing = array![0u8, 0u8, 0u8, 0u8];
+        let sampleweight = array![1.0_f64, 1.3, 0.8, 1.1];
+        let x_entry = array![
+            [1.0, age_entry[0].ln()],
+            [1.0, age_entry[1].ln()],
+            [1.0, age_entry[2].ln()],
+            [1.0, age_entry[3].ln()]
+        ];
+        let x_exit = array![
+            [1.0, age_exit[0].ln()],
+            [1.0, age_exit[1].ln()],
+            [1.0, age_exit[2].ln()],
+            [1.0, age_exit[3].ln()]
+        ];
+        let x_derivative = array![
+            [0.0, 1.0 / age_exit[0]],
+            [0.0, 1.0 / age_exit[1]],
+            [0.0, 1.0 / age_exit[2]],
+            [0.0, 1.0 / age_exit[3]]
+        ];
+        let penalties = PenaltyBlocks::new(vec![
+            PenaltyBlock {
+                matrix: array![[3.0]],
+                lambda: 0.0,
+                range: 0..1,
+                nullspace_dim: 0,
+            },
+            PenaltyBlock {
+                matrix: array![[2.5]],
+                lambda,
+                range: 1..2,
+                nullspace_dim: 0,
+            },
+        ]);
+        survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            penalties,
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct LAML FD survival model")
+    }
+
+    fn laml_test_logdet_h(state: &WorkingState) -> f64 {
+        use crate::estimate::reml::unified::{spectral_epsilon, spectral_regularize};
+        use crate::faer_ndarray::FaerEigh;
+
+        let h_dense = state.hessian.to_dense();
+        let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
+        let eps = spectral_epsilon(evals.as_slice().unwrap());
+        evals
+            .iter()
+            .map(|&sigma| spectral_regularize(sigma, eps).ln())
+            .sum()
+    }
+
+    fn fit_laml_fd_test_model(
+        rho_value: f64,
+        beta0: &Array1<f64>,
+    ) -> (
+        WorkingModelSurvival,
+        Array1<f64>,
+        WorkingState,
+        f64,
+        Array1<f64>,
+    ) {
+        let mut model = laml_fd_test_model(rho_value.exp());
+        let options = crate::pirls::WorkingModelPirlsOptions {
+            max_iterations: 80,
+            convergence_tolerance: 1e-10,
+            max_step_halving: 12,
+            min_step_size: 1e-10,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: model.monotonicity_linear_constraints(),
+        };
+        let summary = crate::pirls::runworking_model_pirls(
+            &mut model,
+            Coefficients::new(beta0.clone()),
+            &options,
+            |_| {},
+        )
+        .expect("fit survival model for LAML FD test");
+        assert!(
+            matches!(
+                summary.status,
+                crate::pirls::PirlsStatus::Converged
+                    | crate::pirls::PirlsStatus::StalledAtValidMinimum
+            ),
+            "unexpected PIRLS status: {:?}",
+            summary.status
+        );
+        let beta = summary.beta.as_ref().to_owned();
+        let state = model.update_state(&beta).expect("state at fitted beta");
+        let rho = Array1::from_iter(
+            model
+                .penalties
+                .blocks
+                .iter()
+                .filter(|b| b.lambda > 0.0)
+                .map(|b| b.lambda.ln()),
+        );
+        let (obj, grad) = model
+            .unified_lamlobjective_and_rhogradient(&beta, &state, &rho)
+            .expect("survival LAML objective and gradient");
+        (model, beta, state, obj, grad)
+    }
+
+    #[test]
+    fn laml_gradient_and_objective_ignore_inactive_penalty_prefix_blocks() {
+        let rho0 = -0.35_f64;
+        let beta0 = array![-1.2_f64, 2.7];
+        let (_model, beta, state, obj, grad) = fit_laml_fd_test_model(rho0, &beta0);
+        let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * laml_test_logdet_h(&state)
+            - 0.5 * (rho0 + 2.5_f64.ln());
+
+        assert_eq!(grad.len(), 1);
+        assert!(
+            (obj - expected).abs() < 1e-10,
+            "survival LAML objective mismatch with inactive prefix block: obj={} expected={}",
+            obj,
+            expected
+        );
+
+        let eps = 1e-4;
+        let (_, _, _, obj_plus, _) = fit_laml_fd_test_model(rho0 + eps, &beta);
+        let (_, _, _, obj_minus, _) = fit_laml_fd_test_model(rho0 - eps, &beta);
+        let fd = (obj_plus - obj_minus) / (2.0 * eps);
+
+        assert_eq!(
+            grad[0].signum(),
+            fd.signum(),
+            "survival LAML rho-gradient sign mismatch: grad={} fd={fd}",
+            grad[0]
+        );
+        assert!(
+            (grad[0] - fd).abs() < 2e-4,
+            "survival LAML rho-gradient mismatch: grad={} fd={fd}",
+            grad[0]
+        );
     }
 
     #[test]

@@ -1107,10 +1107,25 @@ fn prepared_scale_design(
 fn prepared_gaussian_log_sigma_design(
     mu_design: &Array2<f64>,
     log_sigma_design: &Array2<f64>,
-    weights: &Array1<f64>,
-    non_intercept_start: usize,
 ) -> Result<Array2<f64>, String> {
-    prepared_scale_design(mu_design, log_sigma_design, weights, non_intercept_start)
+    if mu_design.nrows() != log_sigma_design.nrows() {
+        return Err(format!(
+            "gaussian log-sigma design row mismatch: mean rows={}, log_sigma rows={}",
+            mu_design.nrows(),
+            log_sigma_design.nrows()
+        ));
+    }
+    // Gaussian location-scale remains identifiable even when μ and log σ use
+    // the same covariate basis:
+    //
+    //   L(μ, η) = 0.5 * Σ_i [ (y_i - μ_i)^2 exp(-2η_i) + 2η_i ],
+    //   μ = X_μ β_μ,  η = X_σ β_σ.
+    //
+    // Shared columns are not a frame mismatch. β_μ and β_σ enter through
+    // different sufficient statistics (residual and residual²), so replacing
+    // X_σ with (I - P_{X_μ}) X_σ would impose an extra constraint and can
+    // erase real heteroscedastic signal when the two blocks share a basis.
+    Ok(log_sigma_design.clone())
 }
 
 fn identified_binomial_log_sigma_design(
@@ -1971,15 +1986,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                prepared_gaussian_log_sigma_design(
-                    &mean_dense,
-                    &noise_dense,
-                    &self.weights,
-                    noise_design
-                        .intercept_range
-                        .end
-                        .min(noise_design.design.ncols()),
-                )?,
+                prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)?,
             )),
             offset: self.noise_offset.clone(),
             penalties: noise_design.penalties_as_penalty_matrix(),
@@ -2014,16 +2021,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
     ) -> Self::Family {
         let mean_dense = mean_design.design.as_dense_cow();
         let noise_dense = noise_design.design.as_dense_cow();
-        let preparednoise_design = prepared_gaussian_log_sigma_design(
-            &mean_dense,
-            &noise_dense,
-            &self.weights,
-            noise_design
-                .intercept_range
-                .end
-                .min(noise_design.design.ncols()),
-        )
-        .expect("prepared Gaussian log-sigma design should match block construction");
+        let preparednoise_design = prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)
+            .expect("prepared Gaussian log-sigma design should match block construction");
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
@@ -2139,15 +2138,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                prepared_gaussian_log_sigma_design(
-                    &mean_dense,
-                    &noise_dense,
-                    &self.weights,
-                    noise_design
-                        .intercept_range
-                        .end
-                        .min(noise_design.design.ncols()),
-                )?,
+                prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)?,
             )),
             offset: self.noise_offset.clone(),
             penalties: noise_design.penalties_as_penalty_matrix(),
@@ -2214,16 +2205,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     ) -> Self::Family {
         let mean_dense = mean_design.design.as_dense_cow();
         let noise_dense = noise_design.design.as_dense_cow();
-        let preparednoise_design = prepared_gaussian_log_sigma_design(
-            &mean_dense,
-            &noise_dense,
-            &self.weights,
-            noise_design
-                .intercept_range
-                .end
-                .min(noise_design.design.ncols()),
-        )
-        .expect("prepared Gaussian log-sigma design should match wiggle block construction");
+        let preparednoise_design = prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)
+            .expect("prepared Gaussian log-sigma design should match wiggle block construction");
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
@@ -4424,7 +4407,11 @@ fn gaussian_jointrow_scalars(
     for i in 0..nobs {
         let jet = crate::families::sigma_link::exp_sigma_jet1_scalar(eta_ls[i]);
         let s = jet.sigma;
-        let ki = jet.d1 / s; // κ = (dσ/dη_ls)/σ
+        // For the exact exp sigma link, κ = (dσ/dη_ls)/σ = exp(eta_ls)/exp(eta_ls) = 1
+        // identically. Computing the ratio as `jet.d1 / s` turns the far-right tail
+        // into `inf / inf`, which poisons the exact Newton path with NaNs even though
+        // the mathematical coefficient is well defined.
+        let ki = 1.0;
         let wi = weights[i] / (s * s);
         let ri = y[i] - etamu[i];
         obs_weight[i].write(weights[i]);
@@ -16099,6 +16086,24 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_log_sigma_design_keeps_shared_mean_basis() {
+        let shared = array![[1.0, -1.5], [1.0, -0.25], [1.0, 0.75], [1.0, 2.0],];
+        let prepared = prepared_gaussian_log_sigma_design(&shared, &shared)
+            .expect("gaussian log-sigma design should accept shared columns");
+
+        for i in 0..shared.nrows() {
+            for j in 0..shared.ncols() {
+                assert!(
+                    (prepared[[i, j]] - shared[[i, j]]).abs() < 1e-12,
+                    "gaussian log-sigma design should preserve shared basis at ({i}, {j}): got {}, expected {}",
+                    prepared[[i, j]],
+                    shared[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_tail() {
         let family = GaussianLocationScaleFamily {
             y: array![0.0],
@@ -16162,6 +16167,51 @@ mod tests {
         assert!(
             (ll_plus - 2.0 * ll0 + ll_minus).abs() < 1e-5,
             "far-tail Gaussian log-sigma block should have near-zero observed curvature"
+        );
+    }
+
+    #[test]
+    fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
+        let mu_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]]));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]]));
+        let family = GaussianLocationScaleFamily {
+            y: array![0.0],
+            weights: array![1.0],
+            mu_design: Some(mu_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            cached_row_scalars: std::sync::RwLock::new(None),
+        };
+        let beta_mu = array![0.0];
+        let beta_ls = array![710.0];
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_mu.clone(),
+                eta: mu_design.matrixvectormultiply(&beta_mu),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: log_sigma_design.matrixvectormultiply(&beta_ls),
+            },
+        ];
+
+        let hessian = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint hessian")
+            .expect("expected Gaussian exact joint hessian");
+        assert!(
+            hessian.iter().all(|value| value.is_finite()),
+            "far-tail Gaussian exact Hessian should stay finite; got {hessian:?}"
+        );
+
+        let direction = array![0.25, -0.5];
+        let dh = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+            .expect("joint dH")
+            .expect("expected Gaussian exact joint hessian directional derivative");
+        assert!(
+            dh.iter().all(|value| value.is_finite()),
+            "far-tail Gaussian exact Hessian directional derivative should stay finite; got {dh:?}"
         );
     }
 

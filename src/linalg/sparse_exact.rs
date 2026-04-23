@@ -1,13 +1,13 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
-use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
-use faer::Side;
+use crate::solver::pirls::{sparse_reml_penalized_hessian, PirlsWorkspace};
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
+use faer::Side;
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const ZERO_TOL: f64 = 1e-12;
 
@@ -34,6 +34,7 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
 
 #[derive(Clone, Default)]
 pub struct SparseTraceWorkspace {
+    bound_factor_addr: Option<usize>,
     selected_block_inv_cache: BTreeMap<(usize, usize), Array2<f64>>,
     selected_support_inv_cache: BTreeMap<Vec<usize>, Array2<f64>>,
 }
@@ -60,12 +61,22 @@ pub struct SparsePenalizedSystem {
 }
 
 impl SparseTraceWorkspace {
+    fn bind_factor(&mut self, factor: &SparseExactFactor) {
+        let factor_addr = factor as *const SparseExactFactor as usize;
+        if self.bound_factor_addr != Some(factor_addr) {
+            self.bound_factor_addr = Some(factor_addr);
+            self.selected_block_inv_cache.clear();
+            self.selected_support_inv_cache.clear();
+        }
+    }
+
     pub(crate) fn selected_block_inverse(
         &mut self,
         factor: &SparseExactFactor,
         p_start: usize,
         p_end: usize,
     ) -> Result<&Array2<f64>, EstimationError> {
+        self.bind_factor(factor);
         if p_end <= p_start || p_end > factor.n {
             return Err(EstimationError::InvalidInput(format!(
                 "invalid selected-inverse block [{p_start},{p_end}) for dimension {}",
@@ -105,6 +116,7 @@ impl SparseTraceWorkspace {
         factor: &SparseExactFactor,
         support: &[usize],
     ) -> Result<&Array2<f64>, EstimationError> {
+        self.bind_factor(factor);
         let key = Self::canonical_support(support, factor.n)?;
         if key.is_empty() {
             self.selected_support_inv_cache
@@ -731,9 +743,9 @@ pub fn build_sparse_penalty_blocks_from_canonical(
 
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::cholesky::llt::factor::LltRegularization;
-use faer::sparse::SymbolicSparseColMat;
 use faer::sparse::linalg::amd;
 use faer::sparse::linalg::cholesky::simplicial;
+use faer::sparse::SymbolicSparseColMat;
 
 /// A simplicial Cholesky factorization with raw access to L's CSC pattern and
 /// values, plus the AMD permutation.  Built using faer's low-level simplicial
@@ -896,8 +908,8 @@ pub fn factorize_simplicial(
 /// Result of the Takahashi selected inversion.
 ///
 /// Z stores entries of H⁻¹ at positions corresponding to the filled sparsity
-/// pattern of the Cholesky factor L.  Entries outside this pattern are
-/// structurally zero (or, more precisely, not computed).
+/// pattern of the Cholesky factor L. Off-pattern entries are recovered exactly
+/// on demand by cached column solves against the same simplicial factor.
 pub struct TakahashiInverse {
     /// Z values stored in the same CSC pattern as L (lower triangular)
     z_values: Vec<f64>,
@@ -905,6 +917,13 @@ pub struct TakahashiInverse {
     col_ptr: Vec<usize>,
     /// Row indices (owned copy from L)
     row_idx: Vec<usize>,
+    /// Numeric values of the simplicial Cholesky factor L.
+    l_values: Vec<f64>,
+    /// Row-oriented access to L for forward solves in the permuted basis.
+    rows_lower: Arc<Vec<Vec<(usize, f64)>>>,
+    /// Exact inverse columns solved on demand for entries outside the selected
+    /// inverse pattern. Keys are permuted-basis column indices.
+    exact_columns: Mutex<BTreeMap<usize, Arc<Vec<f64>>>>,
     /// Inverse permutation returned by faer.
     perm_inv: Vec<usize>,
     /// Dimension
@@ -921,11 +940,81 @@ impl TakahashiInverse {
         slice.binary_search(&row).ok().map(|pos| start + pos)
     }
 
+    fn solve_permuted_column_from_cholesky(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        l_values: &[f64],
+        rows_lower: &[Vec<(usize, f64)>],
+        rhs_col: usize,
+    ) -> Vec<f64> {
+        let mut rhs = vec![0.0f64; n];
+        rhs[rhs_col] = 1.0;
+        let mut forward = vec![0.0f64; n];
+        let mut solution = vec![0.0f64; n];
+
+        for row in 0..n {
+            let mut sum = rhs[row];
+            let mut diag = None;
+            for &(col, value) in &rows_lower[row] {
+                if col < row {
+                    sum -= value * forward[col];
+                } else if col == row {
+                    diag = Some(value);
+                }
+            }
+            let l_rr = diag.expect("simplicial factor row should contain its diagonal");
+            forward[row] = sum / l_rr;
+        }
+
+        for row in (0..n).rev() {
+            let col_start = col_ptr[row];
+            let col_end = col_ptr[row + 1];
+            let mut sum = forward[row];
+            let l_rr = l_values[col_start];
+            for idx in (col_start + 1)..col_end {
+                let lower_row = row_idx[idx];
+                sum -= l_values[idx] * solution[lower_row];
+            }
+            solution[row] = sum / l_rr;
+        }
+
+        solution
+    }
+
+    fn exact_permuted_column(&self, col: usize) -> Arc<Vec<f64>> {
+        {
+            let cache = self
+                .exact_columns
+                .lock()
+                .expect("exact Takahashi column cache mutex poisoned");
+            if let Some(solution) = cache.get(&col) {
+                return solution.clone();
+            }
+        }
+
+        let solution = Arc::new(Self::solve_permuted_column_from_cholesky(
+            self.n,
+            &self.col_ptr,
+            &self.row_idx,
+            &self.l_values,
+            self.rows_lower.as_ref(),
+            col,
+        ));
+
+        let mut cache = self
+            .exact_columns
+            .lock()
+            .expect("exact Takahashi column cache mutex poisoned");
+        cache.entry(col).or_insert_with(|| solution.clone()).clone()
+    }
+
     /// Compute the selected inverse from a simplicial Cholesky factor.
     ///
     /// Given H = LLᵀ in the permuted basis, this solves for the exact inverse
-    /// columns and stores only the entries that live in the sparsity pattern of
-    /// L. The public interface remains the same as the Takahashi-style path.
+    /// columns and stores the entries that live in the sparsity pattern of L.
+    /// Off-pattern exact entries are recovered later by cached column solves
+    /// from the same simplicial factor.
     pub fn compute(factor: &SimplicialFactor) -> Self {
         let n = factor.n;
         let col_ptr = factor.l_col_ptr.clone();
@@ -945,38 +1034,15 @@ impl TakahashiInverse {
         // Compute the exact inverse columns in the permuted basis and store the
         // entries that live in the sparsity pattern of L. This preserves the
         // public selected-inverse interface while avoiding recursion drift.
-        let mut rhs = vec![0.0f64; n];
-        let mut forward = vec![0.0f64; n];
-        let mut solution = vec![0.0f64; n];
         for j in 0..n {
-            rhs.fill(0.0);
-            rhs[j] = 1.0;
-
-            for row in 0..n {
-                let mut sum = rhs[row];
-                let mut diag = None;
-                for &(col, value) in &rows_lower[row] {
-                    if col < row {
-                        sum -= value * forward[col];
-                    } else if col == row {
-                        diag = Some(value);
-                    }
-                }
-                let l_rr = diag.expect("simplicial factor row should contain its diagonal");
-                forward[row] = sum / l_rr;
-            }
-
-            for row in (0..n).rev() {
-                let col_start = col_ptr[row];
-                let col_end = col_ptr[row + 1];
-                let mut sum = forward[row];
-                let l_rr = factor.l_values[col_start];
-                for idx in (col_start + 1)..col_end {
-                    let lower_row = row_idx[idx];
-                    sum -= factor.l_values[idx] * solution[lower_row];
-                }
-                solution[row] = sum / l_rr;
-            }
+            let solution = Self::solve_permuted_column_from_cholesky(
+                n,
+                &col_ptr,
+                &row_idx,
+                &factor.l_values,
+                &rows_lower,
+                j,
+            );
 
             for idx in col_ptr[j]..col_ptr[j + 1] {
                 let row = row_idx[idx];
@@ -988,6 +1054,9 @@ impl TakahashiInverse {
             z_values,
             col_ptr,
             row_idx,
+            l_values: factor.l_values.clone(),
+            rows_lower: Arc::new(rows_lower),
+            exact_columns: Mutex::new(BTreeMap::new()),
             perm_inv: factor.perm_inv.clone(),
             n,
         }
@@ -1008,7 +1077,7 @@ impl TakahashiInverse {
         if let Some(pos) = Self::find_entry(&self.col_ptr, &self.row_idx, row, col) {
             self.z_values[pos]
         } else {
-            0.0 // Entry not in filled pattern = zero in selected inverse
+            self.exact_permuted_column(col)[row]
         }
     }
 
@@ -1025,9 +1094,11 @@ impl TakahashiInverse {
     pub fn block(&self, start: usize, end: usize) -> Array2<f64> {
         let dim = end - start;
         let mut out = Array2::zeros((dim, dim));
-        for i in 0..dim {
-            for j in 0..dim {
-                out[[i, j]] = self.get(start + i, start + j);
+        let permuted_rows: Vec<usize> = (start..end).map(|idx| self.perm_inv[idx]).collect();
+        for (j_local, &pj) in permuted_rows.iter().enumerate() {
+            let column = self.exact_permuted_column(pj);
+            for (i_local, &pi) in permuted_rows.iter().enumerate() {
+                out[[i_local, j_local]] = column[pi];
             }
         }
         out
@@ -1165,6 +1236,33 @@ mod tests {
     }
 
     #[test]
+    fn selected_block_inverse_cache_clears_when_factor_changes() {
+        let h1 = array![[3.0, 0.1, 0.0], [0.1, 2.0, 0.2], [0.0, 0.2, 1.5]];
+        let h2 = array![[4.0, 0.2, 0.0], [0.2, 2.5, 0.3], [0.0, 0.3, 1.8]];
+        let factor1 =
+            factorize_sparse_spd(&dense_to_sparse_symmetric_upper(&h1, ZERO_TOL).unwrap()).unwrap();
+        let factor2 =
+            factorize_sparse_spd(&dense_to_sparse_symmetric_upper(&h2, ZERO_TOL).unwrap()).unwrap();
+        let mut ws = SparseTraceWorkspace::default();
+
+        let first = ws.selected_block_inverse(&factor1, 1, 3).unwrap().clone();
+        assert_eq!(ws.selected_block_inv_cache.len(), 1);
+
+        let second = ws.selected_block_inverse(&factor2, 1, 3).unwrap().clone();
+        assert_eq!(ws.selected_block_inv_cache.len(), 1);
+
+        let mut differs = false;
+        for i in 0..first.nrows() {
+            for j in 0..first.ncols() {
+                if (first[[i, j]] - second[[i, j]]).abs() > 1e-10 {
+                    differs = true;
+                }
+            }
+        }
+        assert!(differs, "cache should be recomputed for a different factor");
+    }
+
+    #[test]
     fn takahashi_diagonal_matches_dense_inverse() {
         // 4x4 SPD matrix
         let h = array![
@@ -1248,5 +1346,40 @@ mod tests {
         let taka_result = trace_hinv_sk_takahashi(&taka, &blocks[0]);
 
         approx_eq(taka_result, reference, 1e-10);
+    }
+
+    #[test]
+    fn takahashi_get_and_block_recover_off_pattern_inverse_entries() {
+        let h = array![
+            [4.0, 1.0, 0.0, 0.0],
+            [1.0, 3.0, 1.0, 0.0],
+            [0.0, 1.0, 2.5, 1.0],
+            [0.0, 0.0, 1.0, 2.0]
+        ];
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+
+        let chol = h.cholesky(Side::Lower).unwrap();
+        let mut h_inv = Array2::<f64>::zeros((4, 4));
+        for j in 0..4 {
+            let mut rhs = Array1::<f64>::zeros(4);
+            rhs[j] = 1.0;
+            let col = chol.solvevec(&rhs);
+            for i in 0..4 {
+                h_inv[[i, j]] = col[i];
+            }
+        }
+
+        let sfactor = factorize_simplicial(&h_sparse).unwrap();
+        let taka = TakahashiInverse::compute(&sfactor);
+
+        assert!(
+            h_inv[[0, 2]].abs() > 1e-8,
+            "reference off-pattern inverse entry should be nonzero"
+        );
+        approx_eq(taka.get(0, 2), h_inv[[0, 2]], 1e-10);
+
+        let block = taka.block(0, 3);
+        approx_eq(block[[0, 2]], h_inv[[0, 2]], 1e-10);
+        approx_eq(block[[2, 0]], h_inv[[2, 0]], 1e-10);
     }
 }

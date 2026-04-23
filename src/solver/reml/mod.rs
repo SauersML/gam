@@ -218,6 +218,7 @@ mod tests {
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::pirls::PirlsCoordinateFrame;
+    use crate::solver::estimate::reml::unified::HessianOperator;
     use crate::solver::outer_strategy::{HessianResult, OuterEval, OuterEvalOrder};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::GlmLikelihoodSpec;
@@ -702,6 +703,113 @@ mod tests {
             "[VTAU-TERM-BY-TERM] v_laml_reconstructed={:.12e} tk_fd_inferred={:.12e} total_fd={:.12e}",
             v_laml_reconstructed, tk_fd_inferred, tot_fd,
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn dbg_binomial_logit_n30_projected_logdet_trace() {
+        use super::unified::{HessianDerivativeProvider, HessianOperator};
+
+        let f = BinomialLogitDesignMotionFixture::new();
+        let state = f.state();
+        let rho = &f.rho;
+        let bundle = state.obtain_eval_bundle(rho).expect("bundle");
+        let pr = bundle.pirls_result.as_ref();
+        let qs = &pr.reparam_result.qs;
+        let h_orig = h_original_from_bundle(&bundle);
+        let h_trans = qs.t().dot(&h_orig).dot(qs);
+
+        let cases = vec![
+            (
+                "penalty_only",
+                DirectionalHyperParam::single_penalty(
+                    0,
+                    Array2::<f64>::zeros(f.x.raw_dim()),
+                    f.s_tau_penalty.clone(),
+                    None,
+                    None,
+                )
+                .expect("penalty-only direction"),
+            ),
+            (
+                "design_only",
+                DirectionalHyperParam::single_penalty(
+                    0,
+                    f.x_tau_design.clone(),
+                    Array2::<f64>::zeros((5, 5)),
+                    None,
+                    None,
+                )
+                .expect("design-only direction"),
+            ),
+        ];
+
+        for (label, hyper) in cases {
+            let (ext_coords, _, _, _) = state
+                .build_tau_unified_objects_from_bundle(rho, &bundle, &[hyper])
+                .expect("tau objects");
+            let coord = &ext_coords[0];
+            let hop = super::unified::DenseSpectralOperator::from_symmetric_with_mode(
+                &h_orig,
+                super::unified::PseudoLogdetMode::Smooth,
+            )
+            .expect("dense spectral op");
+            let deriv_provider = super::unified::SinglePredictorGlmDerivatives {
+                c_array: pr.solve_c_array.clone(),
+                d_array: Some(pr.solve_d_array.clone()),
+                x_transformed: state.x().clone(),
+            };
+
+            let v_i = hop.solve(&coord.g);
+            let correction = if deriv_provider.has_corrections() {
+                let neg_v_i = v_i.mapv(|z| -z);
+                deriv_provider
+                    .hessian_derivative_correction_result(&neg_v_i)
+                    .expect("hessian-derivative correction")
+            } else {
+                None
+            };
+
+            let mut hdot_orig = coord.drift.materialize();
+            if let Some(corr) = correction {
+                match corr {
+                    super::unified::DriftDerivResult::Dense(matrix) => hdot_orig += &matrix,
+                    super::unified::DriftDerivResult::Operator(op) => hdot_orig += &op.to_dense(),
+                }
+            }
+
+            let full_trace = hop.trace_logdet_gradient(&hdot_orig);
+            let hdot_qs = qs.t().dot(&hdot_orig);
+            let hdot_trans: Array2<f64> = hdot_qs.dot(qs);
+            let step_scale = hdot_trans
+                .iter()
+                .fold(0.0_f64, |acc: f64, value: &f64| acc.max(value.abs()))
+                .max(1.0);
+            let h = 1e-6 / step_scale;
+            let logdet_plus = state
+                .fixed_subspace_hessian_logdet_projected(
+                    &(&h_trans + &hdot_trans.mapv(|v| h * v)),
+                    &pr.reparam_result.e_transformed,
+                    pr.ridge_passport,
+                )
+                .expect("projected logdet +");
+            let logdet_minus = state
+                .fixed_subspace_hessian_logdet_projected(
+                    &(&h_trans - &hdot_trans.mapv(|v| h * v)),
+                    &pr.reparam_result.e_transformed,
+                    pr.ridge_passport,
+                )
+                .expect("projected logdet -");
+            let projected_trace_fd = (logdet_plus - logdet_minus) / (2.0 * h);
+
+            eprintln!(
+                "[DBG-PROJ-TRACE] {label} full_trace={:.12e} projected_trace_fd={:.12e} half_gap={:.12e} hdot00={:.12e}",
+                full_trace,
+                projected_trace_fd,
+                0.5 * (full_trace - projected_trace_fd),
+                hdot_orig[[0, 0]],
+            );
+        }
     }
 
     #[test]
@@ -1617,6 +1725,21 @@ mod tests {
     fn profiled_gaussian_penalty_only_gradient_matches_fd() {
         let f = GaussianRemlFixture::new();
         let state = f.state();
+        let bundle = state.obtain_eval_bundle(&f.rho).expect("bundle");
+        let pr = bundle.pirls_result.as_ref();
+        let (penalty_rank, _) = state
+            .fixed_subspace_penalty_rank_and_logdet(
+                &pr.reparam_result.e_transformed,
+                pr.ridge_passport,
+            )
+            .expect("penalty rank");
+        let h_trans = bundle.h_eff.as_ref();
+        let h_orig = h_original_from_bundle(&bundle);
+        let h_trans_cross = if penalty_rank < h_trans.ncols() {
+            h_trans.slice(s![..penalty_rank, penalty_rank..]).to_owned()
+        } else {
+            Array2::<f64>::zeros((penalty_rank, 0))
+        };
         let x_tau = Array2::<f64>::zeros(f.x.raw_dim());
         let hyper = DirectionalHyperParam::single_penalty(
             0,
@@ -1630,6 +1753,15 @@ mod tests {
         let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
             .expect("analytic directional gradient");
         let v_taufd = f.fd_directional_gradient(&x_tau, &f.s_tau_penalty);
+        println!(
+            "GAUSS penalty-only analytic={v_tau_analytic:.12e} fd={v_taufd:.12e} penalty_rank={} p={} e_shape={:?} frame={:?} h_trans_cross={:?} h_orig_cross={:?}",
+            penalty_rank,
+            f.x.ncols(),
+            pr.reparam_result.e_transformed.dim(),
+            pr.coordinate_frame,
+            h_trans_cross,
+            h_orig.slice(s![1.., 0..1]).to_owned()
+        );
 
         let v_rel = (v_tau_analytic - v_taufd).abs() / v_taufd.abs().max(1e-10);
         assert!(
@@ -2059,6 +2191,21 @@ mod tests {
         // explicit X_τ contribution is zero.
         let f = BinomialLogitDesignMotionFixture::new();
         let state = f.state();
+        let bundle = state.obtain_eval_bundle(&f.rho).expect("bundle");
+        let pr = bundle.pirls_result.as_ref();
+        let (penalty_rank, _) = state
+            .fixed_subspace_penalty_rank_and_logdet(
+                &pr.reparam_result.e_transformed,
+                pr.ridge_passport,
+            )
+            .expect("penalty rank");
+        let h_trans = bundle.h_eff.as_ref();
+        let h_orig = h_original_from_bundle(&bundle);
+        let h_trans_cross = if penalty_rank < h_trans.ncols() {
+            h_trans.slice(s![..penalty_rank, penalty_rank..]).to_owned()
+        } else {
+            Array2::<f64>::zeros((penalty_rank, 0))
+        };
         let x_tau = Array2::<f64>::zeros(f.x.raw_dim());
         let hyper = DirectionalHyperParam::single_penalty(
             0,
@@ -2072,6 +2219,15 @@ mod tests {
         let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
             .expect("analytic directional gradient");
         let v_tau_fd = f.fd_directional_gradient(&x_tau, &f.s_tau_penalty);
+        println!(
+            "BINOM penalty-only analytic={v_tau_analytic:.12e} fd={v_tau_fd:.12e} penalty_rank={} p={} e_shape={:?} frame={:?} h_trans_cross={:?} h_orig_cross={:?}",
+            penalty_rank,
+            f.x.ncols(),
+            pr.reparam_result.e_transformed.dim(),
+            pr.coordinate_frame,
+            h_trans_cross,
+            h_orig.slice(s![1.., 0..1]).to_owned()
+        );
 
         let v_rel = (v_tau_analytic - v_tau_fd).abs() / v_tau_fd.abs().max(1e-10);
         assert!(
@@ -2199,6 +2355,198 @@ mod tests {
             v_rel < 1e-3,
             "Binomial-logit n=30 rho=1.5 design-moving gradient mismatch: rel={v_rel:.3e}, \
              analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_rank_deficient_penalty_only_trace_terms() {
+        fn dense_inverse(h: &Array2<f64>) -> Array2<f64> {
+            let p = h.nrows();
+            let chol = h.cholesky(Side::Lower).expect("chol(H)");
+            let mut inv = Array2::<f64>::zeros((p, p));
+            let mut basis = Array1::<f64>::zeros(p);
+            for j in 0..p {
+                basis[j] = 1.0;
+                let col = chol.solvevec(&basis);
+                inv.column_mut(j).assign(&col);
+                basis[j] = 0.0;
+            }
+            inv
+        }
+
+        fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+            let mut out = 0.0;
+            for i in 0..a.nrows() {
+                for j in 0..a.ncols() {
+                    out += a[[i, j]] * b[[j, i]];
+                }
+            }
+            out
+        }
+
+        fn projected_trace_last_block(h: &Array2<f64>, b: &Array2<f64>) -> f64 {
+            let h_ss = h.slice(s![1.., 1..]).to_owned();
+            let b_ss = b.slice(s![1.., 1..]).to_owned();
+            let h_ss_inv = dense_inverse(&h_ss);
+            trace_product(&h_ss_inv, &b_ss)
+        }
+
+        fn analyze_case(
+            label: &str,
+            state: &RemlState<'_>,
+            rho: &Array1<f64>,
+            hyper: DirectionalHyperParam,
+            fd: f64,
+            profiled_gaussian: bool,
+        ) {
+            let bundle = state.obtain_eval_bundle(rho).expect("bundle");
+            let pr = bundle.pirls_result.as_ref();
+            let (ext_coords, _, _, _) = state
+                .build_tau_unified_objects_from_bundle(rho, &bundle, &[hyper])
+                .expect("tau objects");
+            let coord = ext_coords.into_iter().next().expect("one tau coord");
+            let h_orig = h_original_from_bundle(&bundle);
+            let hop = super::unified::DenseSpectralOperator::from_symmetric_with_mode(
+                &h_orig,
+                super::unified::PseudoLogdetMode::Smooth,
+            )
+            .expect("dense spectral op");
+            let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
+                if profiled_gaussian {
+                    Box::new(super::unified::GaussianDerivatives)
+                } else {
+                    Box::new(super::unified::SinglePredictorGlmDerivatives {
+                        c_array: pr.solve_c_array.clone(),
+                        d_array: Some(pr.solve_d_array.clone()),
+                        x_transformed: state.x().clone(),
+                    })
+                };
+            let h_inv = dense_inverse(&h_orig);
+            let beta = beta_original_from_bundle(&bundle);
+            let b = coord.drift.materialize();
+            let g_from_penalty = -b.dot(&beta);
+            let g_err = (&coord.g - &g_from_penalty)
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            let v = hop.solve(&coord.g);
+            let neg_v = v.mapv(|z| -z);
+            let correction = deriv_provider
+                .hessian_derivative_correction_result(&neg_v)
+                .expect("correction")
+                .map(|result| match result {
+                    super::unified::DriftDerivResult::Dense(matrix) => matrix,
+                    super::unified::DriftDerivResult::Operator(op) => op.to_dense(),
+                })
+                .unwrap_or_else(|| Array2::<f64>::zeros((h_orig.nrows(), h_orig.ncols())));
+            let total = &b + &correction;
+            let smooth_trace_b = hop.trace_logdet_gradient(&b);
+            let smooth_trace_c = hop.trace_logdet_gradient(&correction);
+            let smooth_trace_total = hop.trace_logdet_gradient(&total);
+            let exact_trace_b = trace_product(&h_inv, &b);
+            let exact_trace_c = trace_product(&h_inv, &correction);
+            let exact_trace_total = trace_product(&h_inv, &total);
+            let projected_trace_b = projected_trace_last_block(&h_orig, &b);
+            let projected_trace_c = projected_trace_last_block(&h_orig, &correction);
+            let projected_trace_total = projected_trace_last_block(&h_orig, &total);
+            let h_ss = h_orig.slice(s![1.., 1..]).to_owned();
+            let h_ss_inv = dense_inverse(&h_ss);
+            let h_inv_ss = h_inv.slice(s![1.., 1..]).to_owned();
+            let schur_gap = &h_inv_ss - &h_ss_inv;
+            let logdet_smooth = hop.logdet();
+            let logdet_projected = {
+                let chol = h_ss.cholesky(Side::Lower).expect("chol(H_ss)");
+                chol.diag().iter().map(|v| 2.0 * v.ln()).sum::<f64>()
+            };
+            let penalty_term = if profiled_gaussian {
+                let dp_raw = pr.deviance + pr.stable_penalty_term;
+                let (dp_c, dp_cgrad) = crate::solver::estimate::smooth_floor_dp(dp_raw);
+                let denom = (pr.finalmu.len() as f64 - 1.0).max(1e-8);
+                let phi = dp_c / denom;
+                dp_cgrad * coord.a / phi
+            } else {
+                coord.a
+            };
+            let analytic_from_terms = penalty_term + 0.5 * smooth_trace_total - 0.5 * coord.ld_s;
+            let projected_from_terms =
+                penalty_term + 0.5 * projected_trace_total - 0.5 * coord.ld_s;
+
+            eprintln!("\n== {label} ==");
+            eprintln!(
+                "frame={:?} e_shape={}x{} penalty_rank={} logdet_corr={:.12e}",
+                pr.coordinate_frame,
+                pr.reparam_result.e_transformed.nrows(),
+                pr.reparam_result.e_transformed.ncols(),
+                state
+                    .fixed_subspace_penalty_rank_and_logdet(
+                        &pr.reparam_result.e_transformed,
+                        pr.ridge_passport
+                    )
+                    .expect("penalty rank")
+                    .0,
+                logdet_projected - logdet_smooth
+            );
+            eprintln!("beta={beta:?}");
+            eprintln!("g_err_vs_-S_tau_beta={g_err:.3e}");
+            eprintln!("H[0,1:]={:?}", h_orig.slice(s![0, 1..]).to_owned());
+            eprintln!(
+                "correction_row0={:?}",
+                correction.slice(s![0, ..]).to_owned()
+            );
+            eprintln!(
+                "trace_B smooth={smooth_trace_b:.12e} exact={exact_trace_b:.12e} projected={projected_trace_b:.12e}"
+            );
+            eprintln!(
+                "trace_C smooth={smooth_trace_c:.12e} exact={exact_trace_c:.12e} projected={projected_trace_c:.12e}"
+            );
+            eprintln!(
+                "trace_total smooth={smooth_trace_total:.12e} exact={exact_trace_total:.12e} projected={projected_trace_total:.12e}"
+            );
+            eprintln!("coord.a={:.12e} ld_s={:.12e}", coord.a, coord.ld_s);
+            eprintln!(
+                "analytic_from_terms={analytic_from_terms:.12e} projected_from_terms={projected_from_terms:.12e} fd={fd:.12e}"
+            );
+            eprintln!("Hinv_SS - H_SS^-1 = {schur_gap:?}");
+        }
+
+        let f_bin = BinomialLogitDesignMotionFixture::new();
+        let x_tau_bin = Array2::<f64>::zeros(f_bin.x.raw_dim());
+        let hyper_bin = DirectionalHyperParam::single_penalty(
+            0,
+            x_tau_bin.clone(),
+            f_bin.s_tau_penalty.clone(),
+            None,
+            None,
+        )
+        .expect("binomial penalty-only hyper");
+        analyze_case(
+            "binomial penalty-only",
+            &f_bin.state(),
+            &f_bin.rho,
+            hyper_bin,
+            f_bin.fd_directional_gradient(&x_tau_bin, &f_bin.s_tau_penalty),
+            false,
+        );
+
+        let f_gau = GaussianRemlFixture::new();
+        let x_tau_gau = Array2::<f64>::zeros(f_gau.x.raw_dim());
+        let hyper_gau = DirectionalHyperParam::single_penalty(
+            0,
+            x_tau_gau.clone(),
+            f_gau.s_tau_penalty.clone(),
+            None,
+            None,
+        )
+        .expect("gaussian penalty-only hyper");
+        analyze_case(
+            "gaussian penalty-only",
+            &f_gau.state(),
+            &f_gau.rho,
+            hyper_gau,
+            f_gau.fd_directional_gradient(&x_tau_gau, &f_gau.s_tau_penalty),
+            true,
         );
     }
 }
