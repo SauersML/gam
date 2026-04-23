@@ -6694,8 +6694,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // should keep polishing: if β_i is clipped at the boundary and
             // KKT multiplier μ_i > 0, then rhs[i] is the multiplier, not a
             // free-space gradient violation.
-            let block_constraints_now =
-                collect_block_linear_constraints(family, &states, specs)?;
+            let block_constraints_now = collect_block_linear_constraints(family, &states, specs)?;
             let joint_constraints_now = assemble_joint_linear_constraints(
                 &block_constraints_now,
                 &ranges_joint,
@@ -6703,11 +6702,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let mut active_mask: Vec<bool> = vec![false; total_p_joint];
             if let Some(ref constraints) = joint_constraints_now
-                && let Ok(Some(bounds)) =
-                    extract_simple_lower_bounds(constraints, total_p_joint)
+                && let Ok(Some(bounds)) = extract_simple_lower_bounds(constraints, total_p_joint)
             {
-                for (idx, (bound, beta_val)) in
-                    bounds.lower_bounds.iter().zip(beta_joint.iter()).enumerate()
+                for (idx, (bound, beta_val)) in bounds
+                    .lower_bounds
+                    .iter()
+                    .zip(beta_joint.iter())
+                    .enumerate()
                 {
                     if *bound > f64::NEG_INFINITY && (*beta_val - *bound).abs() < 1e-12 {
                         active_mask[idx] = true;
@@ -6729,8 +6730,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // else unconstrained.
             let delta = if let Some(ref constraints) = joint_constraints_now {
                 let warm = flatten_joint_active_set(&cached_active_sets, &block_constraints_now);
-                let lower_bounds_opt =
-                    extract_simple_lower_bounds(constraints, total_p_joint).ok().flatten();
+                let lower_bounds_opt = extract_simple_lower_bounds(constraints, total_p_joint)
+                    .ok()
+                    .flatten();
                 if let Some(bounds) = lower_bounds_opt.as_ref() {
                     match solve_quadratic_with_simple_lower_bounds(
                         &h_dense,
@@ -11016,10 +11018,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
     #[test]

@@ -35,6 +35,6 @@ pub fn assert_manualwith_ad_band(
 macro_rules! assert_manual_ad_band {
     ($case:expr, $x:expr, $quantity:expr, $manual:expr, $( $name:expr => $value:expr ),+ $(,)?) => {{
         let refs = [$(($name, $value)),+];
-        crate::common::assert_manualwith_ad_band($case, $x, $quantity, $manual, &refs);
+        $crate::common::assert_manualwith_ad_band($case, $x, $quantity, $manual, &refs);
     }};
 }
