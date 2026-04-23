@@ -495,7 +495,6 @@ where
     let problem = OuterProblem::new(dim)
         .with_tolerance(1e-4)
         .with_max_iter(30)
-        .with_fd_step(1e-3)
         .with_seed_config(seed_config)
         .with_bounds(lower, upper)
         .with_heuristic_lambdas(seed.to_vec());

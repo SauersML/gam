@@ -578,7 +578,6 @@ fn fit_survival_location_scale_model(
             let problem = crate::solver::outer_strategy::OuterProblem::new(dim)
                 .with_tolerance(1e-4)
                 .with_max_iter(30)
-                .with_fd_step(1e-3)
                 .with_seed_config(seed_config)
                 .with_heuristic_lambdas(init.to_vec());
             let context = format!("survival inverse-link optimization ({name}, dim={dim})");

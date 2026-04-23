@@ -1201,23 +1201,6 @@ fn finite_efs_eval_or_error(
     Ok(eval)
 }
 
-struct OuterCostBridge<'a> {
-    obj: &'a mut dyn OuterObjective,
-    layout: OuterThetaLayout,
-}
-
-impl ZerothOrderObjective for OuterCostBridge<'_> {
-    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.layout
-            .validate_point_len(x, "outer eval_cost failed")?;
-        let cost = self
-            .obj
-            .eval_cost(x)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
-        finite_cost_or_error("outer eval_cost failed", cost)
-    }
-}
-
 struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -1471,7 +1454,6 @@ fn solution_into_outer_result(
 struct OuterConfig {
     tolerance: f64,
     max_iter: usize,
-    fd_step: f64,
     bounds: Option<(Array1<f64>, Array1<f64>)>,
     seed_config: crate::seeding::SeedConfig,
     rho_bound: f64,
@@ -1486,7 +1468,6 @@ impl Default for OuterConfig {
         Self {
             tolerance: 1e-5,
             max_iter: 200,
-            fd_step: 1e-4,
             bounds: None,
             seed_config: crate::seeding::SeedConfig::default(),
             rho_bound: 30.0,
@@ -1519,7 +1500,6 @@ pub struct OuterProblem {
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
     max_iter: usize,
-    fd_step: f64,
     bounds: Option<(Array1<f64>, Array1<f64>)>,
     rho_bound: f64,
     seed_config: crate::seeding::SeedConfig,
@@ -1541,7 +1521,6 @@ impl OuterProblem {
             barrier_config: None,
             tolerance: 1e-5,
             max_iter: 200,
-            fd_step: 1e-4,
             bounds: None,
             rho_bound: 30.0,
             seed_config: crate::seeding::SeedConfig::default(),
@@ -1592,10 +1571,6 @@ impl OuterProblem {
         self.max_iter = n;
         self
     }
-    pub fn with_fd_step(mut self, h: f64) -> Self {
-        self.fd_step = h;
-        self
-    }
     pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self {
         self.bounds = Some((lo, hi));
         self
@@ -1642,7 +1617,6 @@ impl OuterProblem {
         OuterConfig {
             tolerance: self.tolerance,
             max_iter: self.max_iter,
-            fd_step: self.fd_step,
             bounds: self.bounds.clone(),
             seed_config: self.seed_config.clone(),
             rho_bound: self.rho_bound,
@@ -3037,6 +3011,7 @@ mod tests {
                 fixed_point_available: false,
                 barrier_config: None,
                 prefer_gradient_only: false,
+                disable_fixed_point: false,
             },
             cost_fn: |_: &mut i32, _: &Array1<f64>| Ok(1.0),
             eval_fn: |_: &mut i32, _: &Array1<f64>| {
