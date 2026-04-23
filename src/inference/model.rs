@@ -313,6 +313,19 @@ impl FittedModelPayload {
             adaptive_regularization_diagnostics: None,
         }
     }
+
+    fn validate_payload_version(&self) -> Result<(), String> {
+        if self.version != MODEL_PAYLOAD_VERSION {
+            return Err(format!(
+                "saved model payload schema mismatch: file has version={}, \
+                 this binary expects MODEL_PAYLOAD_VERSION={}. \
+                 Refit with the current CLI, or rebuild the reader at the same \
+                 version the model was written with.",
+                self.version, MODEL_PAYLOAD_VERSION
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -583,6 +596,102 @@ fn validate_survival_location_scale_saved_fit(
             expected,
             expected
         ));
+    }
+    Ok(())
+}
+
+fn validate_marginal_slope_saved_fit(
+    fit: &UnifiedFitResult,
+    score_warp: Option<&SavedAnchoredDeviationRuntime>,
+    link_deviation: Option<&SavedAnchoredDeviationRuntime>,
+    fit_label: &str,
+) -> Result<(), String> {
+    let expected_blocks =
+        2 + usize::from(score_warp.is_some()) + usize::from(link_deviation.is_some());
+    if fit.blocks.len() != expected_blocks {
+        return Err(format!(
+            "bernoulli marginal-slope saved {fit_label} requires exactly {expected_blocks} coefficient blocks [marginal, logslope{}{}], got {}",
+            if score_warp.is_some() {
+                ", score-warp"
+            } else {
+                ""
+            },
+            if link_deviation.is_some() {
+                ", link-deviation"
+            } else {
+                ""
+            },
+            fit.blocks.len(),
+        ));
+    }
+    if let Some(runtime) = score_warp {
+        let beta = &fit.blocks[2].beta;
+        if beta.len() != runtime.basis_dim {
+            return Err(format!(
+                "bernoulli marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                beta.len(),
+                runtime.basis_dim
+            ));
+        }
+    }
+    if let Some(runtime) = link_deviation {
+        let idx = 2 + usize::from(score_warp.is_some());
+        let beta = &fit.blocks[idx].beta;
+        if beta.len() != runtime.basis_dim {
+            return Err(format!(
+                "bernoulli marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                beta.len(),
+                runtime.basis_dim
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_survival_marginal_slope_saved_fit(
+    fit: &UnifiedFitResult,
+    score_warp: Option<&SavedAnchoredDeviationRuntime>,
+    link_deviation: Option<&SavedAnchoredDeviationRuntime>,
+    fit_label: &str,
+) -> Result<(), String> {
+    let expected_blocks =
+        3 + usize::from(score_warp.is_some()) + usize::from(link_deviation.is_some());
+    if fit.blocks.len() != expected_blocks {
+        return Err(format!(
+            "survival marginal-slope saved {fit_label} requires {expected_blocks} blocks [time, marginal, slope{}{}], got {}",
+            if score_warp.is_some() {
+                ", score-warp"
+            } else {
+                ""
+            },
+            if link_deviation.is_some() {
+                ", link-deviation"
+            } else {
+                ""
+            },
+            fit.blocks.len(),
+        ));
+    }
+    if let Some(runtime) = score_warp {
+        let beta = &fit.blocks[3].beta;
+        if beta.len() != runtime.basis_dim {
+            return Err(format!(
+                "survival marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                beta.len(),
+                runtime.basis_dim
+            ));
+        }
+    }
+    if let Some(runtime) = link_deviation {
+        let idx = 3 + usize::from(score_warp.is_some());
+        let beta = &fit.blocks[idx].beta;
+        if beta.len() != runtime.basis_dim {
+            return Err(format!(
+                "survival marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                beta.len(),
+                runtime.basis_dim
+            ));
+        }
     }
     Ok(())
 }
@@ -1340,6 +1449,7 @@ impl FittedModel {
     }
 
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
+        self.payload().validate_payload_version()?;
         if matches!(
             self.predict_model_class(),
             PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
@@ -1386,6 +1496,36 @@ impl FittedModel {
             validate_survival_location_scale_saved_fit(
                 self.payload(),
                 runtime.link_wiggle.as_ref(),
+            )?;
+        } else if matches!(
+            runtime.model_class,
+            PredictModelClass::BernoulliMarginalSlope
+        ) {
+            let unified = self.payload().unified.as_ref().ok_or_else(|| {
+                "marginal-slope model is missing unified fit payload; refit with current CLI"
+                    .to_string()
+            })?;
+            validate_marginal_slope_saved_fit(
+                unified,
+                runtime.score_warp.as_ref(),
+                runtime.link_deviation.as_ref(),
+                "unified",
+            )?;
+        } else if matches!(runtime.model_class, PredictModelClass::Survival)
+            && self
+                .payload()
+                .survival_likelihood
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("marginal-slope"))
+        {
+            let fit = self.payload().fit_result.as_ref().ok_or_else(|| {
+                "survival marginal-slope model is missing canonical fit_result payload".to_string()
+            })?;
+            validate_survival_marginal_slope_saved_fit(
+                fit,
+                runtime.score_warp.as_ref(),
+                runtime.link_deviation.as_ref(),
+                "fit_result",
             )?;
         }
         Ok(runtime)
@@ -1694,15 +1834,7 @@ impl FittedModel {
         // close them with an exact-version check anchored to the canonical
         // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
         // identically between writers and readers running the same schema.
-        if self.version != MODEL_PAYLOAD_VERSION {
-            return Err(format!(
-                "saved model payload schema mismatch: file has version={}, \
-                 this binary expects MODEL_PAYLOAD_VERSION={}. \
-                 Refit with the current CLI, or rebuild the reader at the same \
-                 version the model was written with.",
-                self.version, MODEL_PAYLOAD_VERSION
-            ));
-        }
+        self.validate_payload_version()?;
         if self.fit_result.is_none() {
             return Err(
                 "model is missing canonical fit_result payload; refit with current CLI".to_string(),
@@ -2031,14 +2163,52 @@ impl FittedModel {
         // diagnostic: `gam fit` catches its own bad output at save, and
         // `gam predict` catches bad input at load rather than mid-pipeline.
         if let Some(runtime) = self.score_warp_runtime.as_ref() {
-            runtime.validate_exact_replay_contract().map_err(|err| {
-                format!("saved anchored score-warp runtime is invalid: {err}")
-            })?;
+            runtime
+                .validate_exact_replay_contract()
+                .map_err(|err| format!("saved anchored score-warp runtime is invalid: {err}"))?;
         }
         if let Some(runtime) = self.link_deviation_runtime.as_ref() {
             runtime.validate_exact_replay_contract().map_err(|err| {
                 format!("saved anchored link-deviation runtime is invalid: {err}")
             })?;
+        }
+        if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
+            validate_marginal_slope_saved_fit(
+                self.fit_result.as_ref().expect("checked above"),
+                self.score_warp_runtime.as_ref(),
+                self.link_deviation_runtime.as_ref(),
+                "fit_result",
+            )?;
+            let unified = self.unified.as_ref().ok_or_else(|| {
+                "marginal-slope model is missing unified fit payload; refit with current CLI"
+                    .to_string()
+            })?;
+            validate_marginal_slope_saved_fit(
+                unified,
+                self.score_warp_runtime.as_ref(),
+                self.link_deviation_runtime.as_ref(),
+                "unified",
+            )?;
+        }
+        if self
+            .survival_likelihood
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("marginal-slope"))
+        {
+            validate_survival_marginal_slope_saved_fit(
+                self.fit_result.as_ref().expect("checked above"),
+                self.score_warp_runtime.as_ref(),
+                self.link_deviation_runtime.as_ref(),
+                "fit_result",
+            )?;
+            if let Some(unified) = self.unified.as_ref() {
+                validate_survival_marginal_slope_saved_fit(
+                    unified,
+                    self.score_warp_runtime.as_ref(),
+                    self.link_deviation_runtime.as_ref(),
+                    "unified",
+                )?;
+            }
         }
 
         // Structural invariant: nonlinear saved models must retain a usable
@@ -2236,5 +2406,226 @@ pub fn load_survival_time_basis_config_from_model(
             })
         }
         other => Err(format!("unsupported saved survival_time_basis '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL;
+    use crate::families::lognormal_kernel::FrailtySpec;
+    use crate::pirls::PirlsStatus;
+    use crate::solver::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
+    use crate::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
+    use ndarray::{Array1, Array2, array};
+
+    fn empty_termspec() -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        }
+    }
+
+    fn anchored_runtime(basis_dim: usize) -> SavedAnchoredDeviationRuntime {
+        SavedAnchoredDeviationRuntime {
+            kernel: ANCHORED_DEVIATION_KERNEL.to_string(),
+            breakpoints: vec![-1.0, 1.0],
+            basis_dim,
+            span_c0: vec![vec![0.0; basis_dim]],
+            span_c1: vec![vec![0.0; basis_dim]],
+            span_c2: vec![vec![0.0; basis_dim]],
+            span_c3: vec![vec![0.0; basis_dim]],
+        }
+    }
+
+    fn saved_fit(blocks: Vec<FittedBlock>) -> UnifiedFitResult {
+        let beta = Array1::from_vec(
+            blocks
+                .iter()
+                .flat_map(|block| block.beta.iter().copied())
+                .collect(),
+        );
+        let p = beta.len();
+        UnifiedFitResult {
+            blocks,
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            likelihood_family: Some(LikelihoodFamily::BinomialProbit),
+            likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: Some(Array2::zeros((p, p))),
+            covariance_corrected: Some(Array2::zeros((p, p))),
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: vec![],
+            beta,
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts {
+                pirls: None,
+                survival_link_wiggle_knots: None,
+                survival_link_wiggle_degree: None,
+            },
+            inner_cycles: 0,
+        }
+    }
+
+    fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
+        let mut payload = FittedModelPayload::new(
+            version,
+            "y ~ 1".to_string(),
+            ModelKind::MarginalSlope,
+            FittedFamily::MarginalSlope {
+                likelihood: LikelihoodFamily::BinomialProbit,
+                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                frailty: FrailtySpec::None,
+            },
+            "bernoulli-marginal-slope".to_string(),
+        );
+        payload.fit_result = Some(fit.clone());
+        payload.unified = Some(fit);
+        payload.data_schema = Some(DataSchema {
+            columns: vec![SchemaColumn {
+                name: "z".to_string(),
+                kind: ColumnKindTag::Continuous,
+                levels: vec![],
+            }],
+        });
+        payload.training_headers = Some(vec!["z".to_string()]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_noise = Some(empty_termspec());
+        payload.formula_logslope = Some("1".to_string());
+        payload.z_column = Some("z".to_string());
+        payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        payload.marginal_baseline = Some(0.0);
+        payload.logslope_baseline = Some(0.0);
+        payload.link = Some("probit".to_string());
+        payload
+    }
+
+    fn survival_marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
+        let mut payload = FittedModelPayload::new(
+            version,
+            "Surv(entry, exit, event) ~ 1".to_string(),
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("marginal-slope".to_string()),
+                survival_distribution: Some("probit".to_string()),
+                frailty: FrailtySpec::None,
+            },
+            "survival".to_string(),
+        );
+        payload.fit_result = Some(fit.clone());
+        payload.unified = Some(fit);
+        payload.survival_likelihood = Some("marginal-slope".to_string());
+        payload.survival_distribution = Some("probit".to_string());
+        payload
+    }
+
+    #[test]
+    fn validate_for_persistence_rejects_marginal_slope_score_warp_basis_mismatch() {
+        let fit = saved_fit(vec![
+            FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.3],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        let mut payload = marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        payload.score_warp_runtime = Some(anchored_runtime(2));
+
+        let err = FittedModel::from_payload(payload)
+            .validate_for_persistence()
+            .expect_err("marginal-slope score-warp basis mismatch should fail validation");
+        assert!(err.contains("score-warp coefficient mismatch"));
+    }
+
+    #[test]
+    fn saved_prediction_runtime_rejects_survival_marginal_slope_link_basis_mismatch() {
+        let fit = saved_fit(vec![
+            FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Time,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.3],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.4],
+                role: BlockRole::LinkWiggle,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        payload.link_deviation_runtime = Some(anchored_runtime(2));
+
+        let err = FittedModel::from_payload(payload)
+            .saved_prediction_runtime()
+            .expect_err(
+                "survival marginal-slope link basis mismatch should fail runtime validation",
+            );
+        assert!(err.contains("link-deviation coefficient mismatch"));
+    }
+
+    #[test]
+    fn saved_prediction_runtime_rejects_stale_payload_version() {
+        let fit = saved_fit(vec![
+            FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        let payload = marginal_slope_payload(MODEL_PAYLOAD_VERSION - 1, fit);
+
+        let err = FittedModel::from_payload(payload)
+            .saved_prediction_runtime()
+            .expect_err("stale payload version should fail before runtime assembly");
+        assert!(err.contains("payload schema mismatch"));
     }
 }
