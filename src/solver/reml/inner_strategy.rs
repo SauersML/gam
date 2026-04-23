@@ -1,6 +1,5 @@
 use super::*;
 use crate::pirls::PirlsWorkspace;
-use crate::types::LinkFunction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GeometryBackendKind {
@@ -65,10 +64,37 @@ impl<'a> RemlState<'a> {
                 density_h_upper_est,
             };
 
-        if self.config.firth_bias_reduction
-            && !matches!(self.config.link_function(), LinkFunction::Logit)
-        {
-            return dense_backend("firth_non_logit", None, None);
+        if self.config.firth_bias_reduction {
+            // Route ALL Firth-active fits (Logit or otherwise) through the
+            // dense-spectral backend.  The sparse bundle assembly at
+            // `prepare_sparse_eval_bundlewithkey` factors
+            // `X'WX + S_λ + barrier`, WITHOUT subtracting the Jeffreys
+            // Hessian `H_φ`.  The dense path at
+            // `prepare_dense_eval_bundlewithkey` (runtime.rs:2175-2194)
+            // explicitly subtracts `H_φ` from `h_total` before caching,
+            // so `bundle.h_total = X'WX + S_λ − H_φ (+ barrier)`.
+            //
+            // The `FirthAwareGlmDerivatives` provider returns
+            // `dH/dρ = A_k + D_β(X'WX − H_φ)[v_k]`, including the
+            // Firth correction term `−D(H_φ)[B_k]`.  If the sparse
+            // logdet operator is factored from `X'WX + S_λ` but the
+            // derivative provider differentiates `X'WX + S_λ − H_φ`,
+            // then `log|H|` and `trace_logdet(dH/dρ)` live on different
+            // Hessian surfaces — the REML cost and its ρ-gradient
+            // would no longer be consistent (see `reml_laml_evaluate`
+            // in unified.rs, where both `log|H|` and
+            // `trace_logdet(dH/dρ)` come from the same `hop`, yet
+            // `dH/dρ` is assembled via `effective_deriv
+            // .hessian_derivative_correction_result(&neg_v_i)`).
+            //
+            // Subtracting `H_φ` inside the sparse factoring path would
+            // require materialising `H_φ` densely (Firth H_φ is a
+            // generally-dense p×p matrix — it's defined on the
+            // identifiable column-space of `X`), which would destroy
+            // the sparsity that justified going sparse in the first
+            // place.  Routing to dense is the only cost-gradient-
+            // consistent option.
+            return dense_backend("firth_bias_reduction_active", None, None);
         }
         if p < 256 {
             return dense_backend("p_below_threshold", None, None);
