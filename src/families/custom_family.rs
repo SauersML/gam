@@ -10538,7 +10538,9 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // based on the presence of a wiggle block.
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{Derivative, OuterEval, OuterEvalOrder, OuterProblem};
+    use crate::solver::outer_strategy::{
+        Derivative, FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem,
+    };
 
     // Mutable bookkeeping for the outer optimization loop. These fields were
     // previously behind Mutex because the old optimizer bridge used `Fn`
@@ -10568,10 +10570,21 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // gradient BFGS instead of paying for a doomed EFS attempt first.
     let multi_block_beta_dependent =
         specs.len() > 1 && family.exact_newton_joint_hessian_beta_dependent();
+    // Custom family outer plans never degrade to BFGS + Hessian approximation
+    // in production. The automatic fallback ladder's remaining step is
+    // `downgrade_hessian`, which converts Analytic → Unavailable → BFGS +
+    // BfgsApprox, and the EFS → BFGS-with-analytic-gradient retry also uses
+    // BfgsApprox for its Hessian. Both are hostile to the RidgedQuadraticReml
+    // surrogate surface (directionally wrong rank-2 updates, documented Strong
+    // Wolfe iter-0 failures) and were the direct cause of the 45-minute hangs
+    // on binomial-logit + P-spline benchmarks. If the primary Arc + Analytic
+    // plan fails, surface the non-convergence as an error rather than masking
+    // it with a weaker method.
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
+        .with_fallback_policy(FallbackPolicy::Disabled)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
