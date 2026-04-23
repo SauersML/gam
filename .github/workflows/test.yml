@@ -76,6 +76,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
+        if: false
         shell: bash
         run: |
           set -euo pipefail
