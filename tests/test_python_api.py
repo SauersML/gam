@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import pathlib
 
+import pytest
+
+pytest.importorskip("gam._rust")
+
 import matplotlib
 import numpy as np
 import pandas as pd
-import pytest
 
 import gam
 from gam.sklearn import GAMClassifier, GAMRegressor
 
 
 matplotlib.use("Agg")
-pytest.importorskip("gam._rust")
 
 
 def training_rows() -> list[dict[str, float]]:
@@ -157,6 +159,17 @@ def test_numpy_inputs_and_outputs():
     model = gam.fit({"x0": x_train[:, 0].tolist(), "y": y_train.tolist()}, "y ~ x0")
     raw = model.predict(x_test, return_type="numpy")
     assert raw.shape == (2, 2)
+
+
+def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target():
+    x_train = pd.DataFrame([{"x0": 0.0}, {"x0": 1.0}, {"x0": 2.0}, {"x0": 3.0}])
+    y_train = np.array([1.0, 2.0, 3.0, 4.0])
+
+    est = GAMRegressor(formula="x0")
+    est.fit(x_train, y_train)
+
+    assert est.formula_ == "y ~ x0"
+    assert est.feature_names_in_.tolist() == ["x0"]
 
 
 def test_sklearn_classifier_roundtrip():

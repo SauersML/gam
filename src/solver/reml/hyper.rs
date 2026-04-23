@@ -2,6 +2,7 @@ use super::*;
 use crate::matrix::{
     CoefficientTransformOperator, DenseDesignMatrix, DenseRightProductView, DesignMatrix,
 };
+use ndarray::Zip;
 
 // ─── Binomial auxiliary terms for link-parameter ext_coord construction ───
 //
@@ -234,6 +235,68 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
     }
 }
 
+#[derive(Clone)]
+struct TauBetaDriftDerivOperator {
+    x_tau: Array2<f64>,
+    x_design: DesignMatrix,
+    c_x_u: Array1<f64>,
+    c_x_tau_u_plus_d_cross: Array1<f64>,
+    p: usize,
+}
+
+impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+        let x_v = self.x_design.matrixvectormultiply(v);
+        let term1 = self.x_tau.t().dot(&(&self.c_x_u * &x_v));
+        let x_tau_v = self.x_tau.dot(v);
+        let term2 = self
+            .x_design
+            .transpose_vector_multiply(&(&self.c_x_u * &x_tau_v));
+        let term3 = self
+            .x_design
+            .transpose_vector_multiply(&(&self.c_x_tau_u_plus_d_cross * &x_v));
+        term1 + term2 + term3
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.p, self.p));
+        let mut basis = Array1::<f64>::zeros(self.p);
+        for j in 0..self.p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
+    }
+}
+
+fn drift_deriv_result_from_parts(
+    dense: Option<Array2<f64>>,
+    mut operators: Vec<std::sync::Arc<dyn super::unified::HyperOperator>>,
+    dim_hint: usize,
+) -> Option<super::unified::DriftDerivResult> {
+    match (dense, operators.len()) {
+        (None, 0) => None,
+        (Some(matrix), 0) => Some(super::unified::DriftDerivResult::Dense(matrix)),
+        (None, 1) => Some(super::unified::DriftDerivResult::Operator(
+            operators.pop().expect("single operator drift derivative"),
+        )),
+        (dense, _) => Some(super::unified::DriftDerivResult::Operator(
+            std::sync::Arc::new(super::unified::CompositeHyperOperator {
+                dense,
+                operators,
+                dim_hint,
+            }),
+        )),
+    }
+}
+
 /// Augments a pair `HyperOperator` with the fixed-β Firth (Jeffreys) pair
 /// Hessian-drift action `Hφ_{τ_iτ_j}|β · v` via Primitive A.
 ///
@@ -266,8 +329,7 @@ impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
             &self.pair_kernel,
             &rhs,
         );
-        //  DEBUG sign test: try adding instead of subtracting.
-        base + firth_out.column(0).to_owned()
+        base - firth_out.column(0).to_owned()
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -1038,6 +1100,7 @@ impl<'a> RemlState<'a> {
             Vec<super::unified::HyperCoord>,
             Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
             Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Option<super::unified::FixedDriftDerivFn>,
         ),
         EstimationError,
     > {
@@ -1060,7 +1123,7 @@ impl<'a> RemlState<'a> {
             let identity_pair2: Box<
                 dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync,
             > = Box::new(|_, _| super::unified::HyperCoordPair::zero());
-            return Ok((Vec::new(), identity_pair, identity_pair2));
+            return Ok((Vec::new(), identity_pair, identity_pair2, None));
         }
         let backend_label;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
@@ -1068,7 +1131,13 @@ impl<'a> RemlState<'a> {
             let ext_coords = self.build_tau_hyper_coords_sparse_exact(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_sparse_exact(rho, bundle, hyper_dirs)?;
-            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+            let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
+            {
+                None
+            } else {
+                Some(self.build_tau_fixed_drift_deriv_original_basis(bundle, hyper_dirs)?)
+            };
+            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         } else if matches!(
             bundle.pirls_result.coordinate_frame,
             crate::pirls::PirlsCoordinateFrame::TransformedQs
@@ -1080,13 +1149,25 @@ impl<'a> RemlState<'a> {
             let ext_coords = self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_original_basis(rho, bundle, hyper_dirs)?;
-            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+            let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
+            {
+                None
+            } else {
+                Some(self.build_tau_fixed_drift_deriv_original_basis(bundle, hyper_dirs)?)
+            };
+            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         } else {
             backend_label = "generic";
             let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks(rho, bundle, hyper_dirs)?;
-            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn))
+            let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
+            {
+                None
+            } else {
+                Some(self.build_tau_fixed_drift_deriv(bundle, hyper_dirs)?)
+            };
+            Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         };
         log::info!(
             "[outer-timing] build_tau_unified_objects_from_bundle ({}, n={}, p={}, psi_dim={}): {:.1}ms",
@@ -1154,6 +1235,7 @@ impl<'a> RemlState<'a> {
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
+                    firth_g: None,
                 })
                 .collect::<Vec<_>>());
         }
@@ -1313,6 +1395,7 @@ impl<'a> RemlState<'a> {
             let mut a_j = -u.dot(&x_tau_beta_j) + 0.5 * beta_eval.dot(&s_tau_j.dot(&beta_eval));
             // Firth partial: Φ_{τ_j}|_β = 0.5 tr(I_r^{-1} I_{r,τ_j}).
             let mut firth_tau_kernel_j: Option<FirthTauPartialKernel> = None;
+            let mut firth_g_j: Option<Array1<f64>> = None;
             if let Some(op) = firth_op.as_ref() {
                 let x_tau_j = Self::ensure_transformed_x_tau_dense(
                     &mut x_tau_j_dense,
@@ -1323,6 +1406,7 @@ impl<'a> RemlState<'a> {
                 let need_kernel = x_tau_j.iter().any(|v| *v != 0.0);
                 let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, need_kernel);
                 a_j += tau_bundle.phi_tau_partial;
+                firth_g_j = Some(tau_bundle.gphi_tau.clone());
                 if need_kernel {
                     firth_tau_kernel_j = Some(tau_bundle.tau_kernel.expect(
                         "firth_exact_tau_kernel should return kernel when need_kernel=true",
@@ -1358,15 +1442,8 @@ impl<'a> RemlState<'a> {
                 .dot(&u)
             };
             let mut g_j = x_tau_t_u - xt_weighted_x_tau_beta_j - s_tau_j.dot(&beta_eval);
-            if let Some(op) = firth_op.as_ref() {
-                let x_tau_j = Self::ensure_transformed_x_tau_dense(
-                    &mut x_tau_j_dense,
-                    &hyper_dirs[j],
-                    &reparam_result.qs,
-                    free_basis_opt.as_ref(),
-                )?;
-                let tau_bundle = Self::firth_exact_tau_kernel(op, x_tau_j, &beta_eval, false);
-                g_j -= &tau_bundle.gphi_tau;
+            if let Some(firth_g_j) = firth_g_j.as_ref() {
+                g_j -= firth_g_j;
             }
 
             // --- B_j: fixed-β Hessian drift ---
@@ -1458,10 +1535,151 @@ impl<'a> RemlState<'a> {
                 ld_s: ld_s_j,
                 b_depends_on_beta,
                 is_penalty_like: hyper_dirs[j].is_penalty_like,
+                firth_g: firth_g_j,
             });
         }
 
         Ok(coords)
+    }
+
+    fn build_tau_fixed_drift_deriv_from_dense_tau(
+        x_design: DesignMatrix,
+        beta_eval: Array1<f64>,
+        x_tau_dense_list: Vec<Array2<f64>>,
+        c_array: Array1<f64>,
+        d_array: Array1<f64>,
+        firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
+    ) -> super::unified::FixedDriftDerivFn {
+        let x_design = std::sync::Arc::new(x_design);
+        let beta_eval = std::sync::Arc::new(beta_eval);
+        let x_tau_beta_list: Vec<Array1<f64>> = x_tau_dense_list
+            .iter()
+            .map(|x_tau| x_tau.dot(beta_eval.as_ref()))
+            .collect();
+        let x_tau_dense_list = std::sync::Arc::new(x_tau_dense_list);
+        let x_tau_beta_list = std::sync::Arc::new(x_tau_beta_list);
+        let c_array = std::sync::Arc::new(c_array);
+        let d_array = std::sync::Arc::new(d_array);
+
+        Box::new(
+            move |ext_idx: usize,
+                  direction: &Array1<f64>|
+                  -> Option<super::unified::DriftDerivResult> {
+                let x_tau = x_tau_dense_list.get(ext_idx)?;
+                let x_tau_beta = x_tau_beta_list.get(ext_idx)?;
+                if x_tau.ncols() != direction.len() || x_tau_beta.len() != x_tau.nrows() {
+                    return None;
+                }
+
+                let x_u = x_design.matrixvectormultiply(direction);
+                let x_tau_u = x_tau.dot(direction);
+
+                let mut c_x_u = x_u.clone();
+                Zip::from(&mut c_x_u)
+                    .and(c_array.as_ref())
+                    .for_each(|value, &c| *value *= c);
+
+                let mut c_x_tau_u_plus_d_cross = x_tau_u.clone();
+                Zip::from(&mut c_x_tau_u_plus_d_cross)
+                    .and(c_array.as_ref())
+                    .for_each(|value, &c| *value *= c);
+
+                Zip::from(&mut c_x_tau_u_plus_d_cross)
+                    .and(d_array.as_ref())
+                    .and(&x_u)
+                    .and(x_tau_beta)
+                    .for_each(|value, &d, &xu, &xtb| *value += d * xu * xtb);
+
+                let mut dense = firth_op.as_ref().and_then(|op| {
+                    op.d_beta_hphi_tau_partial_dense(x_tau, beta_eval.as_ref(), direction)
+                        .map(|mut matrix| {
+                            matrix.mapv_inplace(|value| -value);
+                            matrix
+                        })
+                });
+
+                let mut operators: Vec<std::sync::Arc<dyn super::unified::HyperOperator>> =
+                    Vec::new();
+                if c_x_u.iter().any(|value| value.abs() > 0.0)
+                    || c_x_tau_u_plus_d_cross.iter().any(|value| value.abs() > 0.0)
+                {
+                    operators.push(std::sync::Arc::new(TauBetaDriftDerivOperator {
+                        x_tau: x_tau.clone(),
+                        x_design: x_design.as_ref().clone(),
+                        c_x_u,
+                        c_x_tau_u_plus_d_cross,
+                        p: direction.len(),
+                    }));
+                }
+
+                drift_deriv_result_from_parts(dense.take(), operators, direction.len())
+            },
+        )
+    }
+
+    fn build_tau_fixed_drift_deriv(
+        &self,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<super::unified::FixedDriftDerivFn, EstimationError> {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let reparam_result = &pirls_result.reparam_result;
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+
+        let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
+        if let Some(z) = free_basis_opt.as_ref() {
+            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+        }
+
+        let x_design =
+            build_active_design_matrix(&pirls_result.x_transformed, free_basis_opt.as_ref())
+                .map_err(EstimationError::InvalidInput)?;
+        let x_tau_dense_list = hyper_dirs
+            .iter()
+            .map(|dir| dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let firth_logit_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let firth_op = if firth_logit_active {
+            let x_dense_arc = pirls_result
+                .x_transformed
+                .try_to_dense_arc("build_tau_fixed_drift_deriv requires dense transformed design for Firth operator")
+                .map_err(EstimationError::InvalidInput)?;
+            let x_dense_owned = free_basis_opt.as_ref().map(|z| {
+                DenseRightProductView::new(x_dense_arc.as_ref())
+                    .with_factor(z)
+                    .materialize()
+            });
+            let x_dense = x_dense_owned
+                .as_ref()
+                .unwrap_or_else(|| x_dense_arc.as_ref());
+            let op = if free_basis_opt.is_none() {
+                if let Some(cached) = bundle.firth_dense_operator.as_ref() {
+                    cached.as_ref().clone()
+                } else {
+                    Self::build_firth_dense_operator(
+                        x_dense,
+                        &pirls_result.final_eta,
+                        self.weights,
+                    )?
+                }
+            } else {
+                Self::build_firth_dense_operator(x_dense, &pirls_result.final_eta, self.weights)?
+            };
+            Some(std::sync::Arc::new(op))
+        } else {
+            None
+        };
+
+        Ok(Self::build_tau_fixed_drift_deriv_from_dense_tau(
+            x_design,
+            beta_eval,
+            x_tau_dense_list,
+            pirls_result.solve_c_array.clone(),
+            pirls_result.solve_d_array.clone(),
+            firth_op,
+        ))
     }
 
     /// Sparse-exact τ builder in the original sparse/native coefficient basis.
@@ -1493,6 +1711,7 @@ impl<'a> RemlState<'a> {
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
+                    firth_g: None,
                 })
                 .collect());
         }
@@ -1523,12 +1742,8 @@ impl<'a> RemlState<'a> {
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
-        let firth_op = if firth_logit_active {
-            if let Some(cached) = bundle
-                .firth_dense_operator_original
-                .as_ref()
-                .or(bundle.firth_dense_operator.as_ref())
-            {
+        let firth_op_original = if firth_logit_active {
+            if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                 Some(cached.as_ref().clone())
             } else {
                 let x_dense_arc = self
@@ -1564,15 +1779,17 @@ impl<'a> RemlState<'a> {
             let mut g_j = dir.x_tau_original.transpose_mul_original(&u)?
                 - self.x().transpose_vector_multiply(&weighted_x_tau_beta_j)
                 - s_tau_j.dot(&beta_eval);
+            let mut firth_g_j: Option<Array1<f64>> = None;
 
             let mut firth_hphi_tau_partial = None;
-            if let Some(op) = firth_op.as_ref() {
+            if let Some(op) = firth_op_original.as_ref() {
                 let x_tau_dense = dir.x_tau_dense();
                 let need_kernel = dir.x_tau_original.any_nonzero();
                 let tau_bundle =
                     Self::firth_exact_tau_kernel(op, &x_tau_dense, &beta_eval, need_kernel);
                 g_j -= &tau_bundle.gphi_tau;
                 a_j += tau_bundle.phi_tau_partial;
+                firth_g_j = Some(tau_bundle.gphi_tau.clone());
                 if let Some(kernel) = tau_bundle.tau_kernel.as_ref() {
                     let eye = Array2::<f64>::eye(p_dim);
                     firth_hphi_tau_partial = Some(Self::firth_hphi_tau_partial_apply(
@@ -1609,10 +1826,56 @@ impl<'a> RemlState<'a> {
                 ld_s: ld_s_j,
                 b_depends_on_beta: !is_gaussian_identity,
                 is_penalty_like: dir.is_penalty_like,
+                firth_g: firth_g_j,
             });
         }
 
         Ok(coords)
+    }
+
+    fn build_tau_fixed_drift_deriv_original_basis(
+        &self,
+        bundle: &EvalShared,
+        hyper_dirs: &[DirectionalHyperParam],
+    ) -> Result<super::unified::FixedDriftDerivFn, EstimationError> {
+        let pirls_result = bundle.pirls_result.as_ref();
+        let beta_eval = self.sparse_exact_beta_original(pirls_result);
+        let x_tau_dense_list: Vec<Array2<f64>> = hyper_dirs
+            .iter()
+            .map(DirectionalHyperParam::x_tau_dense)
+            .collect();
+
+        let firth_logit_active = self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let firth_op = if firth_logit_active {
+            let op = if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
+                cached.as_ref().clone()
+            } else {
+                let x_dense_arc = self
+                    .x()
+                    .try_to_dense_arc(
+                        "build_tau_fixed_drift_deriv_original_basis requires dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Self::build_firth_dense_operator(
+                    x_dense_arc.as_ref(),
+                    &pirls_result.final_eta,
+                    self.weights,
+                )?
+            };
+            Some(std::sync::Arc::new(op))
+        } else {
+            None
+        };
+
+        Ok(Self::build_tau_fixed_drift_deriv_from_dense_tau(
+            self.x().clone(),
+            beta_eval,
+            x_tau_dense_list,
+            pirls_result.solve_c_array.clone(),
+            pirls_result.solve_d_array.clone(),
+            firth_op,
+        ))
     }
 
     pub(crate) fn build_tau_hyper_coords_sparse_exact(
@@ -1727,16 +1990,22 @@ impl<'a> RemlState<'a> {
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
-            let cached = bundle
-                .firth_dense_operator_original
-                .as_ref()
-                .or(bundle.firth_dense_operator.as_ref());
-            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = if let Some(c) = cached
-            {
-                Some(std::sync::Arc::new(c.as_ref().clone()))
-            } else {
-                None
-            };
+            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> =
+                if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
+                    Some(std::sync::Arc::new(cached.as_ref().clone()))
+                } else {
+                    let x_dense_arc = self
+                    .x()
+                    .try_to_dense_arc(
+                        "original-basis tau pair callbacks require dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                    Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                        x_dense_arc.as_ref(),
+                        &pirls_result.final_eta,
+                        self.weights,
+                    )?))
+                };
             let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
                 .iter()
                 .map(|t| match t {
@@ -2108,6 +2377,7 @@ impl<'a> RemlState<'a> {
                     ld_s: 0.0,
                     b_depends_on_beta: true,
                     is_penalty_like: false,
+                    firth_g: None,
                 })
                 .collect());
         }
@@ -2222,6 +2492,7 @@ impl<'a> RemlState<'a> {
                 // they change W through the link function, not through
                 // penalty matrix derivatives. Not eligible for EFS.
                 is_penalty_like: false,
+                firth_g: None,
             });
         }
 
@@ -2290,6 +2561,7 @@ impl<'a> RemlState<'a> {
                     ld_s: 0.0,
                     b_depends_on_beta: true,
                     is_penalty_like: false,
+                    firth_g: None,
                 })
                 .collect());
         }
@@ -2388,6 +2660,7 @@ impl<'a> RemlState<'a> {
                 ld_s: 0.0,
                 b_depends_on_beta: true,
                 is_penalty_like: false,
+                firth_g: None,
             });
         }
 

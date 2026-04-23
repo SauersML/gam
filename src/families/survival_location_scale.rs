@@ -1068,6 +1068,7 @@ struct SurvivalLocationScaleFamily {
     x_time_entry: Arc<Array2<f64>>,
     x_time_exit: Arc<Array2<f64>>,
     x_time_deriv: Arc<Array2<f64>>,
+    time_derivative_offset_exit: Arc<Array1<f64>>,
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
@@ -1394,11 +1395,11 @@ impl SurvivalLocationScaleFamily {
         } else {
             (0.995 * alpha).clamp(0.0, 1.0)
         };
-        // Per-row derivative-guard gate: x_time_deriv·beta must stay at or
-        // above derivative_guard along the path.  Derivation of the binary
-        // gate policy versus a throttle:
+        // Per-row derivative-guard gate: d_raw = offset + x_time_deriv·beta
+        // must stay at or above derivative_guard along the path. Derivation of
+        // the binary gate policy versus a throttle:
         //
-        //   Let g_r(α) = x_time_deriv[r,:]·(beta + α·delta) for row r.
+        //   Let g_r(α) = offset_r + x_time_deriv[r,:]·(beta + α·delta) for row r.
         //   Feasibility requires g_r(α) ≥ derivative_guard for every row.
         //   With `drift_r = x_time_deriv[r,:]·delta < 0`, the maximal α that
         //   keeps g_r at exactly the guard is
@@ -1431,7 +1432,7 @@ impl SurvivalLocationScaleFamily {
             let guard = self.derivative_guard;
             for row in 0..deriv.nrows() {
                 let row_view = deriv.row(row);
-                let current = row_view.dot(beta);
+                let current = self.time_derivative_offset_exit[row] + row_view.dot(beta);
                 let drift = row_view.dot(delta);
                 let slack = current - guard;
                 if slack < -1e-10 {
@@ -2206,8 +2207,9 @@ impl SurvivalLocationScaleFamily {
 
     /// Like [`Self::exact_log_pdf_derivatives_rescaled`] but with a log-scale shift
     /// on the derivative magnitudes.  For CLogLog the `exp(eta)` terms in
-    /// the derivatives become `exp(eta - deriv_log_scale)`.  The function
-    /// value is returned unshifted.
+    /// the derivatives become `exp(eta - deriv_log_scale)`, and the constant
+    /// term in `d/deta log f = 1 - exp(eta)` is scaled by the same factor.
+    /// The function value is returned unshifted.
     fn exact_log_pdf_derivatives_rescaled(
         inverse_link: &InverseLink,
         eta: f64,
@@ -2239,7 +2241,14 @@ impl SurvivalLocationScaleFamily {
             InverseLink::Standard(LinkFunction::CLogLog) => {
                 let t_val = eta.exp(); // for function value (may be Inf)
                 let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives
-                Ok((eta - t_val, 1.0 - t_deriv, -t_deriv, -t_deriv, -t_deriv))
+                let deriv_scale = (-deriv_log_scale).exp();
+                Ok((
+                    eta - t_val,
+                    deriv_scale - t_deriv,
+                    -t_deriv,
+                    -t_deriv,
+                    -t_deriv,
+                ))
             }
             InverseLink::Standard(LinkFunction::Identity) => Ok((0.0, 0.0, 0.0, 0.0, 0.0)),
             _ => {
@@ -3427,6 +3436,53 @@ fn filtered_initial_beta(hint: Option<&Array1<f64>>, expected: usize) -> Option<
     hint.filter(|beta| beta.len() == expected).cloned()
 }
 
+fn structural_time_initial_beta_guess(
+    design_derivative_exit: &Array2<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    derivative_guard: f64,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+) -> Option<Array1<f64>> {
+    let n = design_derivative_exit.nrows();
+    let p = design_derivative_exit.ncols();
+    if p == 0 || n == 0 || derivative_offset_exit.len() != n || age_exit.len() != n {
+        return None;
+    }
+
+    let mut target = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let desired = 1.0 / age_exit[i].max(1e-9);
+        target[i] = (desired - derivative_offset_exit[i]).max(0.0);
+    }
+
+    let xtx = design_derivative_exit.t().dot(design_derivative_exit);
+    let xty = design_derivative_exit.t().dot(&target);
+    let eps = 1e-6 * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
+    let mut lhs = xtx;
+    for i in 0..p {
+        lhs[[i, i]] += eps;
+    }
+
+    use crate::faer_ndarray::FaerCholesky;
+    let chol = lhs.cholesky(faer::Side::Lower).ok()?;
+    let mut beta_init = chol.solvevec(&xty);
+    if let Some(lower_bounds) = coefficient_lower_bounds {
+        if let Some(constraints) = lower_bound_constraints(lower_bounds) {
+            beta_init = project_onto_linear_constraints(p, &constraints, Some(&beta_init));
+        }
+    }
+
+    let d_raw_init = design_derivative_exit.dot(&beta_init) + derivative_offset_exit;
+    if d_raw_init
+        .iter()
+        .all(|v| v.is_finite() && *v >= derivative_guard)
+    {
+        Some(beta_init)
+    } else {
+        None
+    }
+}
+
 fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> BlockwiseFitOptions {
     BlockwiseFitOptions {
         inner_max_cycles: spec.max_iter,
@@ -3525,39 +3581,13 @@ fn prepare_survival_location_scale_model(
     let mut time_prepared = prepare_identified_time_block(&spec.time_block, spec.derivative_guard)?;
 
     if time_prepared.initial_beta.is_none() {
-        let deriv_offset_max = spec
-            .time_block
-            .derivative_offset_exit
-            .iter()
-            .fold(0.0_f64, |a, &v| a.max(v.abs()));
-        if deriv_offset_max < 1e-8 {
-            let x = &time_prepared.design_derivative_exit;
-            let p = x.ncols();
-            if p > 0 && n > 0 {
-                let mut target = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    target[i] = 1.0 / spec.age_exit[i].max(1e-9);
-                }
-                let xtx = x.t().dot(x);
-                let xty = x.t().dot(&target);
-                let eps = 1e-6 * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
-                let mut lhs = xtx;
-                for i in 0..p {
-                    lhs[[i, i]] += eps;
-                }
-                use crate::faer_ndarray::FaerCholesky;
-                if let Ok(chol) = lhs.cholesky(faer::Side::Lower) {
-                    let beta_init = chol.solvevec(&xty);
-                    let d_raw_init = x.dot(&beta_init);
-                    if d_raw_init
-                        .iter()
-                        .all(|v| v.is_finite() && *v >= spec.derivative_guard)
-                    {
-                        time_prepared.initial_beta = Some(beta_init);
-                    }
-                }
-            }
-        }
+        time_prepared.initial_beta = structural_time_initial_beta_guess(
+            &time_prepared.design_derivative_exit,
+            &spec.time_block.derivative_offset_exit,
+            &spec.age_exit,
+            spec.derivative_guard,
+            time_prepared.coefficient_lower_bounds.as_ref(),
+        );
     }
 
     let time_solver_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -3747,6 +3777,7 @@ fn prepare_survival_location_scale_model(
         x_time_entry: Arc::new(time_prepared.design_entry.clone()),
         x_time_exit: Arc::new(time_prepared.design_exit.clone()),
         x_time_deriv: Arc::new(time_prepared.design_derivative_exit.clone()),
+        time_derivative_offset_exit: Arc::new(spec.time_block.derivative_offset_exit.clone()),
         time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
         time_wiggle_ncols: protected_timewiggle_cols,
@@ -4173,9 +4204,13 @@ fn prepare_identified_time_block(
             .to_string()
     })?;
     let linear_constraints = lower_bound_constraints(&coefficient_lower_bounds);
-    let initial_beta = linear_constraints.as_ref().map(|constraints| {
-        project_onto_linear_constraints(p, constraints, input.initial_beta.as_ref())
-    });
+    let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
+        (Some(constraints), Some(beta0)) => {
+            Some(project_onto_linear_constraints(p, constraints, Some(beta0)))
+        }
+        (_, Some(beta0)) => Some(beta0.clone()),
+        _ => None,
+    };
 
     Ok(TimeBlockPrepared {
         design_entry,
@@ -8995,17 +9030,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx == Self::BLOCK_TIME
             && let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref()
         {
-            if beta.len() != lower_bounds.len() {
-                return Err(format!(
-                    "survival location-scale time post-update dimension mismatch: beta={}, bounds={}",
-                    beta.len(),
-                    lower_bounds.len()
-                ));
-            }
-            for j in 0..beta.len() {
-                let lb = lower_bounds[j];
-                if lb.is_finite() && beta[j] < lb {
-                    beta[j] = lb;
+            if beta.len() == lower_bounds.len() {
+                for j in 0..beta.len() {
+                    let lb = lower_bounds[j];
+                    if lb.is_finite() && beta[j] < lb {
+                        beta[j] = lb;
+                    }
                 }
             }
         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
@@ -9654,6 +9684,7 @@ mod tests {
             x_time_entry: Arc::new(array![[1.0], [1.0], [1.0]]),
             x_time_exit: Arc::new(array![[1.2], [0.9], [1.4]]),
             x_time_deriv: Arc::new(array![[1.0], [1.0], [1.0]]),
+            time_derivative_offset_exit: Arc::new(Array1::from_elem(3, 1e-8)),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -9762,6 +9793,34 @@ mod tests {
         assert_eq!(alpha, 0.0);
         let feasible = states[0].beta[0] + alpha * -2.0;
         assert!(feasible >= 0.0);
+    }
+
+    #[test]
+    fn time_block_feasible_step_accepts_zero_beta_when_offset_encodes_guard() {
+        let family = survival_exact_newton_test_family();
+        let states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 1e-8],
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 0.0],
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0, 0.0, 0.0],
+            },
+        ];
+        let alpha = family
+            .max_feasible_step_size(
+                &states,
+                SurvivalLocationScaleFamily::BLOCK_TIME,
+                &array![0.0],
+            )
+            .expect("zero-step structural state should be valid")
+            .expect("time step should be bounded");
+        assert_eq!(alpha, 1.0);
     }
 
     #[test]
@@ -10215,6 +10274,144 @@ mod tests {
     }
 
     #[test]
+    fn prepare_model_accepts_time_initializer_when_offset_completes_guard() {
+        let n = 3usize;
+        let derivative_guard = 5e-10;
+        let derivative_offset_exit = Array1::from_elem(n, 6e-10);
+        let spec = SurvivalLocationScaleSpec {
+            age_entry: Array1::from_elem(n, 1.0),
+            age_exit: Array1::from_elem(n, 5e9),
+            event_target: array![1.0, 0.0, 1.0],
+            weights: Array1::ones(n),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard,
+            max_iter: 4,
+            tol: 1e-8,
+            time_block: TimeBlockInput {
+                design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
+                design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
+                design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
+                offset_entry: Array1::zeros(n),
+                offset_exit: Array1::zeros(n),
+                derivative_offset_exit: derivative_offset_exit.clone(),
+                structural_monotonicity: true,
+                penalties: vec![Array2::zeros((1, 1))],
+                nullspace_dims: vec![1],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            timewiggle_block: None,
+            linkwiggle_block: None,
+        };
+
+        let prepared = prepare_survival_location_scale_model(&spec)
+            .expect("offset-supported time initializer should be accepted");
+        let beta_init = prepared.blockspecs[0]
+            .initial_beta
+            .as_ref()
+            .expect("time initializer should be present");
+        let d_raw_init = Array2::ones((n, 1)).dot(beta_init) + &derivative_offset_exit;
+        assert!(
+            d_raw_init.iter().all(|v| *v >= derivative_guard),
+            "initializer must satisfy derivative guard once offsets are included: {d_raw_init:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_model_seeds_structural_time_initializer_when_offset_equals_guard() {
+        let n = 20usize;
+        let p_time = 8usize;
+        let derivative_guard = DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
+        let derivative_offset_exit = Array1::from_elem(n, derivative_guard);
+        let age_exit = Array1::from_iter((0..n).map(|i| 4.0 + (i as f64) * 14.0));
+        let mut design_derivative_exit = Array2::<f64>::zeros((n, p_time));
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            for j in 0..p_time {
+                let center = (j as f64 + 0.5) / (p_time as f64);
+                let x = 8.0 * (t - center);
+                let sigmoid = 1.0 / (1.0 + (-x).exp());
+                design_derivative_exit[[i, j]] = 8.0 * sigmoid * (1.0 - sigmoid) / age_exit[i];
+            }
+        }
+
+        let spec = SurvivalLocationScaleSpec {
+            age_entry: Array1::from_elem(n, 1e-9),
+            age_exit: age_exit.clone(),
+            event_target: Array1::zeros(n),
+            weights: Array1::ones(n),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard,
+            max_iter: 4,
+            tol: 1e-8,
+            time_block: TimeBlockInput {
+                design_entry: DesignMatrix::from(Array2::zeros((n, p_time))),
+                design_exit: DesignMatrix::from(Array2::zeros((n, p_time))),
+                design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
+                offset_entry: Array1::zeros(n),
+                offset_exit: Array1::zeros(n),
+                derivative_offset_exit: derivative_offset_exit.clone(),
+                structural_monotonicity: true,
+                penalties: vec![Array2::eye(p_time)],
+                nullspace_dims: vec![],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            timewiggle_block: None,
+            linkwiggle_block: None,
+        };
+
+        let prepared = prepare_survival_location_scale_model(&spec)
+            .expect("guard-sized derivative offset should still seed time initializer");
+        let beta_init = prepared.blockspecs[0]
+            .initial_beta
+            .as_ref()
+            .expect("time initializer should be present");
+        let d_raw_init = design_derivative_exit.dot(beta_init) + &derivative_offset_exit;
+
+        assert!(beta_init.iter().all(|v| v.is_finite() && *v >= 0.0));
+        assert!(beta_init.iter().any(|v| *v > 0.0));
+        assert!(
+            d_raw_init
+                .iter()
+                .all(|v| v.is_finite() && *v >= derivative_guard),
+            "initializer must satisfy derivative guard once offsets are included: {d_raw_init:?}"
+        );
+    }
+
+    #[test]
     fn identified_time_block_degenerate_entry_preserves_full_dimension() {
         let design_entry = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         let design_exit = array![[0.1, 0.5, 0.9], [0.2, 0.6, 1.0], [0.3, 0.7, 1.0]];
@@ -10481,6 +10678,37 @@ mod tests {
         assert!((d2 + 1.0).abs() <= 1e-15);
         assert_eq!(d3, 0.0);
         assert_eq!(d4, 0.0);
+    }
+
+    #[test]
+    fn exact_log_pdf_derivatives_rescaled_scale_cloglog_uniformly() {
+        let eta = 501.0;
+        let log_scale = 1.0;
+        let (logf, d1, d2, d3, d4) =
+            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
+                &InverseLink::Standard(LinkFunction::CLogLog),
+                eta,
+                log_scale,
+            )
+            .expect("rescaled cloglog log-pdf derivatives");
+        let (unscaled_logf, u1, u2, u3, u4) =
+            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
+                &InverseLink::Standard(LinkFunction::CLogLog),
+                eta,
+                0.0,
+            )
+            .expect("unscaled cloglog log-pdf derivatives");
+        let scale = (-log_scale).exp();
+        let expected_d1 = scale * u1;
+        let expected_d2 = scale * u2;
+        let expected_d3 = scale * u3;
+        let expected_d4 = scale * u4;
+
+        assert_eq!(logf, unscaled_logf);
+        assert!((d1 - expected_d1).abs() <= 1e-12 * expected_d1.abs());
+        assert!((d2 - expected_d2).abs() <= 1e-12 * expected_d2.abs());
+        assert!((d3 - expected_d3).abs() <= 1e-12 * expected_d3.abs());
+        assert!((d4 - expected_d4).abs() <= 1e-12 * expected_d4.abs());
     }
 
     #[test]
@@ -12143,6 +12371,7 @@ mod tests {
             x_time_entry: Arc::new(x_entry),
             x_time_exit: Arc::new(x_exit.clone()),
             x_time_deriv: Arc::new(x_deriv.clone()),
+            time_derivative_offset_exit: Arc::new(offset_deriv.clone()),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -12287,6 +12516,10 @@ mod tests {
             x_time_entry: Arc::new(Array2::zeros((n, 1))),
             x_time_exit: Arc::new(Array2::ones((n, 1))),
             x_time_deriv: Arc::new(Array2::ones((n, 1))),
+            time_derivative_offset_exit: Arc::new(Array1::from_elem(
+                n,
+                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+            )),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,

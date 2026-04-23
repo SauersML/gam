@@ -327,7 +327,7 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
         fi
         
         # Check if already in config (avoid duplicates)
-        if ! grep -q '.local/bin' "$SHELL_RC" 2>/dev/null; then
+        if ! grep -Fq "$PATH_LINE" "$SHELL_RC" 2>/dev/null; then
             echo "" >> "$SHELL_RC"
             echo "# Added by gam installer" >> "$SHELL_RC"
             echo "$PATH_LINE" >> "$SHELL_RC"

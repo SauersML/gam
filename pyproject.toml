@@ -22,7 +22,14 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = [
+  "pytest>=8",
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.4",
+]
 numpy = ["numpy>=1.26"]
 pandas = ["pandas>=2.0", "pyarrow>=14"]
 plot = ["matplotlib>=3.8"]

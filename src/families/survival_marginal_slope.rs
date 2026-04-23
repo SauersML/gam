@@ -6,8 +6,8 @@ use crate::custom_family::{
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
-    slice_joint_into_block_working_sets,
+    exact_joint_psi_terms_from_log_sigma_fd, first_psi_linear_map, fit_custom_family,
+    second_psi_linear_map, slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
@@ -2916,79 +2916,19 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        // Mirror of the bernoulli_marginal_slope G2 fix.  The previous
-        // linear-operator form (mask / direction driven by
-        // `sigma_beta_linear_operator`) assumed σ acts as a uniform rescale
-        // of specific β slots.  That is NOT true in the flex path: σ enters
-        // through `probit_scale = s(σ)` which appears inside the per-cell
-        // Φ-integrals of the intercept solve, and Φ is nonlinear in its
-        // argument.  The correct σ-derivative must account for both the
-        // direct σ entry and the implicit-a chain contribution through the
-        // intercept equation `f(a, β, σ) = 0`.
-        //
-        // Rather than re-deriving the full analytic chain for every block
-        // (including timewiggle / link-dev / score-warp interactions), we
-        // obtain ψ-terms by central difference on the fully-analytic
-        // evaluators at a narrow σ-step.  The gradient and Hessian
-        // evaluators are themselves smooth in σ, so O(ε²) accuracy on the
-        // outer FD is sufficient — matching exactly how the bernoulli
-        // mirror arrives at a passing test to 5e-4 / 2e-3 / 8e-3.
-        let Some(sigma) = self.gaussian_frailty_sd else {
-            return Ok(None);
-        };
-        if !sigma.is_finite() || sigma <= 0.0 {
-            return Ok(None);
-        }
-        let log_sigma = sigma.ln();
-        let eps_t = 5e-4f64;
-        let mut family_plus = self.clone();
-        family_plus.gaussian_frailty_sd = Some((log_sigma + eps_t).exp());
-        let mut family_minus = self.clone();
-        family_minus.gaussian_frailty_sd = Some((log_sigma - eps_t).exp());
-
-        // objective_psi = ∂(-L)/∂t = -∂L/∂t  (central FD on log_likelihood_only)
-        let ll_plus = family_plus.log_likelihood_only(block_states)?;
-        let ll_minus = family_minus.log_likelihood_only(block_states)?;
-        let objective_psi = -(ll_plus - ll_minus) / (2.0 * eps_t);
-
-        // eval.gradient is the score = ∂L/∂β, so
-        //   score_psi = −∂(eval.gradient)/∂t = ∂(neglog_grad)/∂t.
-        let grad_plus = family_plus
-            .exact_newton_joint_gradient_evaluation(block_states, specs)?
-            .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires exact joint gradient (plus step)"
-                    .to_string()
-            })?
-            .gradient;
-        let grad_minus = family_minus
-            .exact_newton_joint_gradient_evaluation(block_states, specs)?
-            .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires exact joint gradient (minus step)"
-                    .to_string()
-            })?
-            .gradient;
-        let score_psi = -(&grad_plus - &grad_minus) / (2.0 * eps_t);
-
-        let hess_plus = family_plus
-            .exact_newton_joint_hessian(block_states)?
-            .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires an exact joint Hessian (plus step)"
-                    .to_string()
-            })?;
-        let hess_minus = family_minus
-            .exact_newton_joint_hessian(block_states)?
-            .ok_or_else(|| {
-                "survival marginal-slope sigma derivative requires an exact joint Hessian (minus step)"
-                    .to_string()
-            })?;
-        let hessian_psi = (&hess_plus - &hess_minus) / (2.0 * eps_t);
-
-        Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi,
-            score_psi,
-            hessian_psi,
-            hessian_psi_operator: None,
-        }))
+        exact_joint_psi_terms_from_log_sigma_fd(
+            self,
+            self.gaussian_frailty_sd,
+            block_states,
+            specs,
+            "survival marginal-slope",
+            |family, sigma| family.gaussian_frailty_sd = Some(sigma),
+            |family, states| family.log_likelihood_only(states),
+            |family, states, gradient_specs| {
+                family.exact_newton_joint_gradient_evaluation(states, gradient_specs)
+            },
+            |family, states| family.exact_newton_joint_hessian(states),
+        )
     }
 
     fn flex_timewiggle_active(&self) -> bool {
