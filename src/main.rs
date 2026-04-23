@@ -13454,6 +13454,91 @@ mod tests {
     }
 
     #[test]
+    fn survival_binary_prediction_csv_emits_bounds_without_effective_se() {
+        // Parallel contract invariant to
+        // survival_prediction_csv_emits_bounds_without_effective_se: the binary
+        // writer (used by SavedLatentWindowKind::EventProbability) must emit
+        // mean_lower / mean_upper when the caller supplies bounds without
+        // `eta_se`.
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_survival_binary_pred_bounds_only_{ts}.csv"));
+
+        let eta: Array1<f64> = array![0.5, -0.25];
+        let event = array![0.7, 0.2];
+        let lower = array![0.5, 0.1];
+        let upper = array![0.9, 0.4];
+        write_survival_binary_prediction_csv(
+            &path,
+            eta.view(),
+            event.view(),
+            None,
+            Some(lower.view()),
+            Some(upper.view()),
+        )
+        .expect("write survival binary prediction csv with bounds");
+
+        let text = fs::read_to_string(&path).expect("read csv");
+        let header = text.lines().next().unwrap_or("");
+        assert_eq!(
+            header,
+            "eta,mean,event_prob,failure_prob,survival_prob,risk_score,mean_lower,mean_upper",
+            "survival binary output must include bounds when supplied without effective_se",
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
+        // Parallel contract invariant: lower XOR upper is structurally invalid.
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_survival_binary_pred_half_bounds_{ts}.csv"));
+
+        let eta: Array1<f64> = array![0.0];
+        let event = array![0.5];
+        let lower = array![0.1];
+        let upper = array![0.9];
+
+        let err_lower_only = write_survival_binary_prediction_csv(
+            &path,
+            eta.view(),
+            event.view(),
+            None,
+            Some(lower.view()),
+            None,
+        )
+        .expect_err("lower-only binary bounds must be rejected");
+        assert!(
+            err_lower_only.contains("event_upper missing"),
+            "lower-only binary error message wrong: {err_lower_only}"
+        );
+
+        let err_upper_only = write_survival_binary_prediction_csv(
+            &path,
+            eta.view(),
+            event.view(),
+            None,
+            None,
+            Some(upper.view()),
+        )
+        .expect_err("upper-only binary bounds must be rejected");
+        assert!(
+            err_upper_only.contains("event_lower missing"),
+            "upper-only binary error message wrong: {err_upper_only}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
         let mut path = std::env::temp_dir();
         let ts = SystemTime::now()
