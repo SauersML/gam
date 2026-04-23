@@ -1099,6 +1099,48 @@ impl SpatialLogKappaCoords {
         self
     }
 
+    /// Project ψ values into `[lower, upper]` element-wise. Used after
+    /// `from_length_scales*` + `reseed_from_data` when a user-supplied
+    /// `spec.length_scale` falls outside the data-derived ψ window set by
+    /// `{lower,upper}_bounds*_from_data`. BFGS requires theta0 ∈ [lower,
+    /// upper]; projecting is the unique closest feasible seed. The user's
+    /// length_scale was always a hint for the outer optimizer (the optimizer
+    /// is authoritative for κ), not a hard constraint — so clipping preserves
+    /// their intent as far as the geometry allows. Emits `log::info!` when
+    /// any coordinate moves, so the outside-window case is diagnostically
+    /// visible (not silent).
+    pub(crate) fn clamp_to_bounds(
+        mut self,
+        lower: &SpatialLogKappaCoords,
+        upper: &SpatialLogKappaCoords,
+    ) -> Self {
+        debug_assert_eq!(self.values.len(), lower.values.len());
+        debug_assert_eq!(self.values.len(), upper.values.len());
+        let mut any_projected = false;
+        for idx in 0..self.values.len() {
+            let lo = lower.values[idx];
+            let hi = upper.values[idx];
+            if !(lo.is_finite() && hi.is_finite()) {
+                continue;
+            }
+            let v = self.values[idx];
+            if v < lo {
+                self.values[idx] = lo;
+                any_projected = true;
+            } else if v > hi {
+                self.values[idx] = hi;
+                any_projected = true;
+            }
+        }
+        if any_projected {
+            log::info!(
+                "[spatial-kappa] projected ψ seed into data-derived bounds; \
+                 user length_scale falls outside [1e-2/r_max, 1e2/r_min] geometry window"
+            );
+        }
+        self
+    }
+
     /// Reconstruct from theta tail with known dimensionality layout.
     pub(crate) fn from_theta_tail_with_dims(
         theta: &Array1<f64>,
@@ -10054,6 +10096,9 @@ fn try_exact_joint_spatial_length_scale_optimization(
             kappa_options,
         )
     };
+    // Project seed onto data-derived bounds; spec.length_scale is a hint,
+    // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     let setup = ExactJointHyperSetup::new(
         best.fit.lambdas.mapv(f64::ln),
         Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),

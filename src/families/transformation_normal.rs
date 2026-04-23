@@ -2750,6 +2750,8 @@ pub fn fit_transformation_normal(
         &kappa_dims,
         kappa_options,
     );
+    // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
+    let kappa0 = kappa0.clamp_to_bounds(&kappa_lower, &kappa_upper);
 
     // Check analytic derivative capability.
     let analytic_psi_available =

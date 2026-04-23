@@ -3421,6 +3421,8 @@ fn build_survival_two_block_exact_joint_setup(
     upper_vals.extend(log_sigma_upper.as_array().iter());
     let log_kappa_upper =
         SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), all_dims);
+    // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
 
     ExactJointHyperSetup::new(
         rho0,
