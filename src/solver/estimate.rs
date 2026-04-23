@@ -4824,7 +4824,6 @@ mod fd_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-    use serde_json::json;
 
     fn decode_invariant_test_fit() -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
@@ -4894,7 +4893,11 @@ mod fd_policy_tests {
     fn unified_fit_decode_validation_rejects_beta_drift_from_blocks() {
         let fit = decode_invariant_test_fit();
         let mut payload = serde_json::to_value(&fit).expect("serialize fit");
-        payload["beta"] = json!([9.0, 8.0]);
+        // `Array1<f64>` uses ndarray's own (versioned-sequence) serde format,
+        // not a bare JSON array, so round-trip the drifted value through
+        // serde_json to honour that schema while still corrupting the data.
+        payload["beta"] = serde_json::to_value(&Array1::from(vec![9.0_f64, 8.0_f64]))
+            .expect("serialize drifted beta");
         let decoded: UnifiedFitResult =
             serde_json::from_value(payload).expect("deserialize corrupted fit");
         let err = decoded
@@ -4911,7 +4914,9 @@ mod fd_policy_tests {
     fn unified_fit_decode_validation_rejects_geometry_drift_from_inference() {
         let fit = decode_invariant_test_fit();
         let mut payload = serde_json::to_value(&fit).expect("serialize fit");
-        payload["geometry"]["penalized_hessian"] = json!([[4.0, 0.0], [0.0, 5.0]]);
+        let drifted_hessian: Array2<f64> = array![[4.0, 0.0], [0.0, 5.0]];
+        payload["geometry"]["penalized_hessian"] =
+            serde_json::to_value(&drifted_hessian).expect("serialize drifted penalized Hessian");
         let decoded: UnifiedFitResult =
             serde_json::from_value(payload).expect("deserialize corrupted fit");
         let err = decoded
