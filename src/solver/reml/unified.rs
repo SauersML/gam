@@ -2416,15 +2416,58 @@ impl PenaltySubspaceTrace {
     /// Uses the identity `tr(K · A) = tr(H_proj⁻¹ · U_Sᵀ A U_S)` so the
     /// reduction runs on the r × r subspace rather than materializing K.
     pub fn trace_projected_logdet(&self, a: &Array2<f64>) -> f64 {
-        // R = U_Sᵀ · A · U_S (r × r)
+        self.trace_projected_logdet_reduced(&self.reduce(a))
+    }
+
+    /// Reduce a p × p matrix `A` to its r × r projection `U_Sᵀ · A · U_S`.
+    ///
+    /// Exposed so callers that need the same reduced matrix for both the
+    /// single-trace `tr(K · A)` and the cross-trace `tr(K · A · K · B)`
+    /// can avoid repeating the p × p · p × r matmuls.
+    pub fn reduce(&self, a: &Array2<f64>) -> Array2<f64> {
         let u_s_t_a = self.u_s.t().dot(a);
-        let r_mat = u_s_t_a.dot(&self.u_s);
-        // tr(H_proj⁻¹ · R)
+        u_s_t_a.dot(&self.u_s)
+    }
+
+    /// Compute `tr(H_proj⁻¹ · R)` given an already-reduced `R = U_Sᵀ A U_S`.
+    pub fn trace_projected_logdet_reduced(&self, r_mat: &Array2<f64>) -> f64 {
         let mut trace = 0.0;
         let r = self.h_proj_inverse.nrows();
         for i in 0..r {
             for j in 0..r {
                 trace += self.h_proj_inverse[[i, j]] * r_mat[[j, i]];
+            }
+        }
+        trace
+    }
+
+    /// Compute `tr(K · A · K · B)` where `K = U_S · H_proj⁻¹ · U_Sᵀ`.
+    ///
+    /// Identity: `tr(K A K B) = tr((H_proj⁻¹ · U_Sᵀ A U_S) · (H_proj⁻¹ · U_Sᵀ B U_S))`,
+    /// reducing to two r × r products.  Used by the outer-Hessian cross
+    /// trace `−tr(K Ḣ_j K Ḣ_i)` in place of the full-space
+    /// `trace_logdet_hessian_cross` when the rank-deficient LAML fix is
+    /// active.
+    pub fn trace_projected_logdet_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        let ra = self.reduce(a);
+        let rb = self.reduce(b);
+        self.trace_projected_logdet_cross_reduced(&ra, &rb)
+    }
+
+    /// Cross-trace given pre-reduced blocks `R_A = U_Sᵀ A U_S`, `R_B = U_Sᵀ B U_S`.
+    pub fn trace_projected_logdet_cross_reduced(
+        &self,
+        ra: &Array2<f64>,
+        rb: &Array2<f64>,
+    ) -> f64 {
+        // left = H_proj⁻¹ · R_A ;  right = H_proj⁻¹ · R_B ;  tr(left · right).
+        let left = self.h_proj_inverse.dot(ra);
+        let right = self.h_proj_inverse.dot(rb);
+        let r = left.nrows();
+        let mut trace = 0.0;
+        for i in 0..r {
+            for j in 0..r {
+                trace += left[[i, j]] * right[[j, i]];
             }
         }
         trace
@@ -3626,7 +3669,15 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
-        let use_operator = hop.dim() >= 512 && hessian_kernel.is_some();
+        // The matrix-free operator path uses the full-space `G_ε(H)` kernel
+        // throughout; it does not yet route through the projected kernel
+        // that the rank-deficient LAML fix demands.  Fall through to the
+        // analytic `compute_outer_hessian` path (which does apply the
+        // projection) whenever a `penalty_subspace_trace` is installed, so
+        // the outer Hessian stays consistent with the projected cost.
+        let use_operator = hop.dim() >= 512
+            && hessian_kernel.is_some()
+            && solution.penalty_subspace_trace.is_none();
         if use_operator {
             let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
                 build_outer_hessian_operator(
@@ -3792,11 +3843,15 @@ fn compute_ift_correction_trace(
     effective_deriv: &dyn HessianDerivativeProvider,
     adjoint_z_c: Option<&Array1<f64>>,
     glm_ingredients: Option<&ScalarGlmIngredients<'_>>,
+    subspace: Option<&PenaltySubspaceTrace>,
 ) -> Result<f64, String> {
     if !effective_deriv.has_corrections() {
         return Ok(0.0);
     }
-    if let Some(z_c) = adjoint_z_c {
+    // The adjoint shortcut `tr(H⁻¹ C[u]) = uᵀ z_c` is only valid for the
+    // full-space kernel.  When the projected kernel is required, fall back
+    // to materialising the correction and tracing through the subspace.
+    if let (Some(z_c), None) = (adjoint_z_c, subspace) {
         let c_trace = rhs.dot(z_c);
         let d_trace = glm_ingredients
             .and_then(|ing| compute_fourth_derivative_trace(ing, v_i, v_j, hop))
@@ -3807,7 +3862,18 @@ fn compute_ift_correction_trace(
         if let Some(correction) =
             effective_deriv.hessian_second_derivative_correction_result(v_i, v_j, &u)?
         {
-            Ok(correction.trace_logdet(hop))
+            if let Some(kernel) = subspace {
+                // correction's DriftDerivResult materialises to a dense
+                // matrix for the projected trace.
+                match correction {
+                    DriftDerivResult::Dense(matrix) => Ok(kernel.trace_projected_logdet(&matrix)),
+                    DriftDerivResult::Operator(op) => {
+                        Ok(kernel.trace_projected_logdet(&op.to_dense()))
+                    }
+                }
+            } else {
+                Ok(correction.trace_logdet(hop))
+            }
         } else {
             Ok(0.0)
         }
@@ -3831,16 +3897,27 @@ fn compute_drift_deriv_traces(
     v_i: &Array1<f64>,
     v_j: &Array1<f64>,
     fixed_drift_deriv: Option<&FixedDriftDerivFn>,
+    subspace: Option<&PenaltySubspaceTrace>,
 ) -> f64 {
+    let trace_via = |result: DriftDerivResult| -> f64 {
+        if let Some(kernel) = subspace {
+            match result {
+                DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
+                DriftDerivResult::Operator(op) => kernel.trace_projected_logdet(&op.to_dense()),
+            }
+        } else {
+            match result {
+                DriftDerivResult::Dense(matrix) => hop.trace_logdet_gradient(&matrix),
+                DriftDerivResult::Operator(op) => hop.trace_logdet_operator(op.as_ref()),
+            }
+        }
+    };
     let mut trace = 0.0;
     // M_i[v_j] = D_β B_i[v_j]
     if b_i_depends {
         if let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv) {
             if let Some(result) = drift_fn(ei, v_j) {
-                trace += match result {
-                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
-                    DriftDerivResult::Operator(ref op) => hop.trace_logdet_operator(op.as_ref()),
-                };
+                trace += trace_via(result);
             }
         }
     }
@@ -3848,10 +3925,7 @@ fn compute_drift_deriv_traces(
     if b_j_depends {
         if let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv) {
             if let Some(result) = drift_fn(ej, v_i) {
-                trace += match result {
-                    DriftDerivResult::Dense(ref m) => hop.trace_logdet_gradient(m),
-                    DriftDerivResult::Operator(ref op) => hop.trace_logdet_operator(op.as_ref()),
-                };
+                trace += trace_via(result);
             }
         }
     }
@@ -3867,8 +3941,17 @@ fn compute_base_h2_trace(
     hop: &dyn HessianOperator,
     b_mat: &Array2<f64>,
     b_operator: Option<&dyn HyperOperator>,
+    subspace: Option<&PenaltySubspaceTrace>,
 ) -> f64 {
-    if let Some(op) = b_operator {
+    if let Some(kernel) = subspace {
+        if let Some(op) = b_operator {
+            kernel.trace_projected_logdet(&op.to_dense())
+        } else if b_mat.nrows() > 0 {
+            kernel.trace_projected_logdet(b_mat)
+        } else {
+            0.0
+        }
+    } else if let Some(op) = b_operator {
         hop.trace_logdet_operator(op)
     } else if b_mat.nrows() > 0 {
         hop.trace_logdet_gradient(b_mat)
@@ -4017,7 +4100,8 @@ fn compute_outer_hessian(
     // is a dense p x p matrix, so we fall back to dense materialization.
     let use_stochastic_cross_traces = any_ext_implicit
         && can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h)
-        && !effective_deriv.has_corrections();
+        && !effective_deriv.has_corrections()
+        && solution.penalty_subspace_trace.is_none();
 
     // Precompute ext mode responses and total Hessian drifts.
     //
@@ -4130,19 +4214,56 @@ fn compute_outer_hessian(
         None
     };
 
-    let exact_logdet_cross_traces = if incl_logdet_h && stochastic_cross_traces.is_none() {
-        let mut all_h_matrices: Vec<&Array2<f64>> = Vec::with_capacity(k + ext_dim);
+    // When the rank-deficient LAML fix replaces the full-space logdet
+    // kernel with the projected `U_S · H_proj⁻¹ · U_Sᵀ`, the cross-trace
+    // `−tr(K Ḣ_j K Ḣ_i)` must also use the projected kernel for the same
+    // reason the first-order trace does (the IFT correction `D_β H[v]`
+    // spills onto `null(S)` for non-Gaussian families).  Collect the
+    // reduced drifts `R_d = U_Sᵀ Ḣ_d U_S` once and reuse them for every
+    // pair; per-pair cost is then O(r²) instead of O(p²) per cross.
+    let subspace = solution.penalty_subspace_trace.as_deref();
+    let reduced_h_drifts: Option<Vec<Array2<f64>>> = subspace.map(|kernel| {
+        let mut reduced = Vec::with_capacity(k + ext_dim);
         for matrix in &h_k_matrices {
-            all_h_matrices.push(matrix);
+            reduced.push(kernel.reduce(matrix));
         }
         for matrix in &ext_h_matrices {
-            all_h_matrices.push(
-                matrix
-                    .as_ref()
-                    .expect("exact logdet cross traces require dense ext Hessian drifts"),
+            reduced.push(
+                kernel.reduce(
+                    matrix
+                        .as_ref()
+                        .expect("projected ext Hessian drift requires dense materialisation"),
+                ),
             );
         }
-        Some(hop.trace_logdet_hessian_crosses(&all_h_matrices))
+        reduced
+    });
+    let exact_logdet_cross_traces = if incl_logdet_h && stochastic_cross_traces.is_none() {
+        if let (Some(kernel), Some(reduced)) = (subspace, reduced_h_drifts.as_ref()) {
+            let n = reduced.len();
+            let mut out = Array2::<f64>::zeros((n, n));
+            for i in 0..n {
+                for j in i..n {
+                    let value = -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
+                    out[[i, j]] = value;
+                    out[[j, i]] = value;
+                }
+            }
+            Some(out)
+        } else {
+            let mut all_h_matrices: Vec<&Array2<f64>> = Vec::with_capacity(k + ext_dim);
+            for matrix in &h_k_matrices {
+                all_h_matrices.push(matrix);
+            }
+            for matrix in &ext_h_matrices {
+                all_h_matrices.push(
+                    matrix
+                        .as_ref()
+                        .expect("exact logdet cross traces require dense ext Hessian drifts"),
+                );
+            }
+            Some(hop.trace_logdet_hessian_crosses(&all_h_matrices))
+        }
     } else {
         None
     };
@@ -4164,10 +4285,17 @@ fn compute_outer_hessian(
             // Second Hessian drift trace via shared helpers.
             //
             // RHS = Ḣ_l v_k + B_k v_l − δ_{kl} g_k
-            // base = δ_{kl} tr(G_ε A_k)
+            // base = δ_{kl} tr(K A_k)
             // correction = compute_ift_correction_trace(RHS, v_k, v_l)
+            //
+            // `K` is the full-space `G_ε(H)` unless the rank-deficient LAML
+            // fix is active, in which case every trace routes through the
+            // projected kernel so the outer Hessian matches the projected
+            // `½ log|U_Sᵀ H U_S|_+` cost.
             let base = if kk == ll {
-                if solution.penalty_coords[kk].is_block_local() {
+                if let Some(kernel) = subspace {
+                    kernel.trace_projected_logdet(&a_k_matrices[kk])
+                } else if solution.penalty_coords[kk].is_block_local() {
                     let (block, start, end) = solution.penalty_coords[kk].scaled_block_local(1.0);
                     hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
                 } else {
@@ -4191,6 +4319,7 @@ fn compute_outer_hessian(
                 effective_deriv,
                 adjoint_z_c.as_ref(),
                 glm_ingredients.as_ref(),
+                subspace,
             )?;
 
             let h_kl_trace = base + correction;
@@ -4254,7 +4383,12 @@ fn compute_outer_hessian(
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
                     rhs -= &ext_h_v_rho;
 
-                    let base = compute_base_h2_trace(hop, &pair.b_mat, pair.b_operator.as_deref());
+                    let base = compute_base_h2_trace(
+                        hop,
+                        &pair.b_mat,
+                        pair.b_operator.as_deref(),
+                        subspace,
+                    );
 
                     let m_terms = compute_drift_deriv_traces(
                         hop,
@@ -4265,6 +4399,7 @@ fn compute_outer_hessian(
                         &v_ks[rho_idx],
                         &ext_v[ext_idx],
                         solution.fixed_drift_deriv.as_ref(),
+                        subspace,
                     );
 
                     let neg_ext_v = ext_v[ext_idx].mapv(|value| -value);
@@ -4276,6 +4411,7 @@ fn compute_outer_hessian(
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
+                        subspace,
                     )?;
 
                     (cross_trace, base + m_terms + correction)
@@ -4342,7 +4478,12 @@ fn compute_outer_hessian(
                     rhs -= &coord_i.drift.apply(&ext_v[jj]);
                     rhs -= &hj_vi;
 
-                    let base = compute_base_h2_trace(hop, &pair.b_mat, pair.b_operator.as_deref());
+                    let base = compute_base_h2_trace(
+                        hop,
+                        &pair.b_mat,
+                        pair.b_operator.as_deref(),
+                        subspace,
+                    );
 
                     let m_terms = compute_drift_deriv_traces(
                         hop,
@@ -4353,6 +4494,7 @@ fn compute_outer_hessian(
                         &ext_v[ii],
                         &ext_v[jj],
                         solution.fixed_drift_deriv.as_ref(),
+                        subspace,
                     );
 
                     let neg_ext_v_i = ext_v[ii].mapv(|value| -value);
@@ -4365,6 +4507,7 @@ fn compute_outer_hessian(
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
+                        subspace,
                     )?;
 
                     (cross_trace, base + m_terms + correction)
@@ -4843,8 +4986,16 @@ fn build_outer_hessian_operator(
                 pair_ld_s[[col, row]] = pair.ld_s;
                 pair_g[row][col] = Some(pair.g.clone());
                 pair_g[col][row] = Some(pair.g);
-                let base =
-                    compute_base_h2_trace(hop.as_ref(), &pair.b_mat, pair.b_operator.as_deref());
+                // `build_outer_hessian_operator` only fires when the
+                // projected-logdet kernel is absent (see guard in
+                // `reml_laml_evaluate`), so the full-space trace here is
+                // correct.  Passing `None` keeps the call sites uniform.
+                let base = compute_base_h2_trace(
+                    hop.as_ref(),
+                    &pair.b_mat,
+                    pair.b_operator.as_deref(),
+                    None,
+                );
                 base_h2[[row, col]] = base;
                 base_h2[[col, row]] = base;
             }
@@ -4864,8 +5015,12 @@ fn build_outer_hessian_operator(
                 let g_pair = pair.g.clone();
                 pair_g[row][col] = Some(g_pair.clone());
                 pair_g[col][row] = Some(g_pair);
-                let base =
-                    compute_base_h2_trace(hop.as_ref(), &pair.b_mat, pair.b_operator.as_deref());
+                let base = compute_base_h2_trace(
+                    hop.as_ref(),
+                    &pair.b_mat,
+                    pair.b_operator.as_deref(),
+                    None,
+                );
                 base_h2[[row, col]] = base;
                 base_h2[[col, row]] = base;
             }
@@ -4883,6 +5038,7 @@ fn build_outer_hessian_operator(
                 &coords[ii].v,
                 &coords[jj].v,
                 solution.fixed_drift_deriv.as_ref(),
+                None,
             );
             m_pair_trace[[ii, jj]] = trace;
             m_pair_trace[[jj, ii]] = trace;
