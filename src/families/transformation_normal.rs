@@ -2728,10 +2728,23 @@ pub fn fit_transformation_normal(
         covariate_spec,
         &spatial_terms,
         kappa_options,
-    );
+    )
+    .reseed_from_data(covariate_data, covariate_spec, &spatial_terms, kappa_options);
     let kappa_dims = kappa0.dims_per_term().to_vec();
-    let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&kappa_dims, kappa_options);
-    let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&kappa_dims, kappa_options);
+    let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        covariate_data,
+        covariate_spec,
+        &spatial_terms,
+        &kappa_dims,
+        kappa_options,
+    );
+    let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        covariate_data,
+        covariate_spec,
+        &spatial_terms,
+        &kappa_dims,
+        kappa_options,
+    );
 
     // Check analytic derivative capability.
     let analytic_psi_available =
