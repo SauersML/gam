@@ -8406,24 +8406,31 @@ mod tests {
 
     #[test]
     fn test_dense_spectral_operator_singular() {
-        // Rank-1 matrix: H = [1 1; 1 1] has eigenvalues {0, 2}
+        // Rank-1 matrix: H = [1 1; 1 1] has eigenvalues {0, 2}.
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
-        // With smooth regularization, the zero eigenvalue is mapped to
-        // r_ε(0) = ε (small positive), so logdet includes both eigenvalues.
-        // The dominant contribution is ln(r_ε(2)) ≈ ln(2).
-        //
-        // `spectral_epsilon` is ρ-independent: ε = √(machine_eps) · p where
-        // p is the matrix dimension. This ensures `d log|H|_reg/dρ` only
-        // has the first-order spectral-perturbation term
-        // `Σ φ'(σ_j) · dσ_j/dρ`, with no spurious contribution from ε
-        // moving with ρ.
+        // Under `Smooth` mode (the default used by `from_symmetric`), the
+        // `active` mask now retains only eigenvalues strictly above the
+        // structural positive-eigenvalue threshold ~100·p·ε_mach·‖H‖ — the
+        // same cutoff `fixed_subspace_penalty_rank_and_logdet` applies to
+        // `log|S|_+`.  This keeps the LAML ratio `|H|_+/|S|_+` well-defined
+        // on the identified subspace in rank-deficient fits (see commit
+        // 1c4ebf63).  For H = [[1,1],[1,1]] the zero eigenvalue sits well
+        // below the threshold (σ=0 < 100·2·ε_mach·2 ≈ 8.9e-14) and is
+        // excluded from `cached_logdet`; only σ=2, which is well above
+        // the threshold, contributes.  `r_ε(2) = ½(2 + √(4+4ε²)) ≈ 2`, so
+        // the expected logdet is `ln(r_ε(2)) ≈ ln(2)`.
         let epsilon = spectral_epsilon(&[0.0, 2.0]);
-        let r0 = spectral_regularize(0.0, epsilon);
+        let threshold = positive_eigenvalue_threshold(&[0.0, 2.0]);
+        assert!(0.0 <= threshold, "threshold must be non-negative");
+        assert!(2.0 > threshold, "σ=2 must stay above the structural cutoff");
         let r2 = spectral_regularize(2.0, epsilon);
-        let expected_logdet = r0.ln() + r2.ln();
+        let expected_logdet = r2.ln();
         assert!((op.logdet() - expected_logdet).abs() < 1e-10);
+        // The null direction must not pollute traces: `trace_hinv_product`
+        // sums over the active mask only, so a finite result on a singular
+        // H is the structural invariant.
         let trace = op.trace_hinv_product(&Array2::eye(2));
         assert!(trace.is_finite());
     }
