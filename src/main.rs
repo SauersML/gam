@@ -47,8 +47,8 @@ use gam::inference::formula_dsl::{
     validate_marginal_slope_z_column_exclusion,
 };
 use gam::inference::model::{
-    DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, ModelKind,
-    PredictModelClass, SavedAnchoredDeviationRuntime, SavedBaselineTimeWiggleRuntime,
+    DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
+    ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime, SavedBaselineTimeWiggleRuntime,
     SavedLatentZNormalization, load_survival_time_basis_config_from_model,
     survival_baseline_config_from_model,
 };
@@ -506,7 +506,12 @@ enum PredictModeArg {
     Map,
 }
 
-const MODEL_VERSION: u32 = 4;
+/// CLI-side alias for the canonical model-payload schema version defined in
+/// `gam::inference::model::MODEL_PAYLOAD_VERSION`. Kept as a re-export so
+/// existing `FittedModelPayload::new(MODEL_VERSION, ...)` call sites remain
+/// unchanged; the underlying source of truth now lives next to the struct
+/// whose schema it describes, eliminating drift between writer and reader.
+const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
 
 struct CliFirthValidation<'a> {
     enabled: bool,

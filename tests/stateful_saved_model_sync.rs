@@ -3,7 +3,8 @@ use gam::estimate::{
 };
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, ModelKind, PredictModelClass,
+    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    PredictModelClass,
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{
@@ -116,7 +117,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     let covariance =
         Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
     let mut payload = FittedModelPayload::new(
-        1,
+        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -180,7 +181,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
 fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
     let latent_state = LatentCLogLogState::new(0.65).expect("valid latent state");
     let mut payload = FittedModelPayload::new(
-        1,
+        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -243,7 +244,7 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
 #[test]
 fn survival_marginal_slope_saved_models_require_special_predict_handling() {
     let mut payload = FittedModelPayload::new(
-        1,
+        MODEL_PAYLOAD_VERSION,
         "Surv(t0, t1, event) ~ s(x)".to_string(),
         ModelKind::Survival,
         FittedFamily::Survival {

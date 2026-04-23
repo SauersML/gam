@@ -24,6 +24,27 @@ use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
+/// Canonical saved-model payload schema version.
+///
+/// Every `FittedModelPayload` written by any binary (CLI `gam`, gam-pyffi,
+/// downstream library users) must set this as its `version` field, and every
+/// load path asserts equality via `validate_for_persistence`. Bump this when:
+///   - A required field is added to `FittedModelPayload` and the set of
+///     Option<T> fields that must be `Some(...)` for a given `family_state`
+///     changes (otherwise the `#[serde(default)]` decode would silently fill
+///     the new field with `None` when loading an older model and the CLI
+///     predict path would run with stale metadata).
+///   - The on-wire shape of any `serde`-tagged enum variant changes such that
+///     older payloads no longer round-trip losslessly.
+///   - The semantics of an existing field change (e.g. sign convention,
+///     coordinate frame) in a way that predict output would silently diverge
+///     between old and new readers.
+///
+/// Do NOT bump for purely additive `Option<T>` fields that the save-time
+/// invariant (`validate_for_persistence`) does not yet require. Those are
+/// forward-compatible.
+pub const MODEL_PAYLOAD_VERSION: u32 = 4;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataSchema {
     pub columns: Vec<SchemaColumn>,
@@ -1660,6 +1681,28 @@ impl FittedModel {
     }
 
     pub fn validate_for_persistence(&self) -> Result<(), String> {
+        // Hard version gate. The struct's ~40 Option<T> fields carry
+        // `#[serde(default)]`, which is by design forward-compatible: old
+        // payloads missing a new optional field decode with `None`. BUT:
+        // when a new CLI release adds a required field for some family_state
+        // (enforced below), an older model loaded by the newer CLI would have
+        // `None` in that slot and the family-specific branch below would
+        // correctly reject it — unless the new field also happens to slot
+        // under a branch that hasn't been touched. Conversely, a newer model
+        // loaded by an older CLI silently drops fields the older struct
+        // doesn't know about. Both directions are silent-drift hazards. We
+        // close them with an exact-version check anchored to the canonical
+        // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
+        // identically between writers and readers running the same schema.
+        if self.version != MODEL_PAYLOAD_VERSION {
+            return Err(format!(
+                "saved model payload schema mismatch: file has version={}, \
+                 this binary expects MODEL_PAYLOAD_VERSION={}. \
+                 Refit with the current CLI, or rebuild the reader at the same \
+                 version the model was written with.",
+                self.version, MODEL_PAYLOAD_VERSION
+            ));
+        }
         if self.fit_result.is_none() {
             return Err(
                 "model is missing canonical fit_result payload; refit with current CLI".to_string(),
