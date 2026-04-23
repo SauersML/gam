@@ -868,8 +868,10 @@ mod tests {
         let mismatched_bytes =
             serde_json::to_vec(&model).expect("mismatched model should serialize");
 
-        let err = load_model_impl(&mismatched_bytes)
-            .expect_err("load_model_impl should reject mismatched payload versions");
+        let err = match load_model_impl(&mismatched_bytes) {
+            Ok(_) => panic!("load_model_impl should reject mismatched payload versions"),
+            Err(e) => e,
+        };
         assert!(
             err.contains("saved model payload schema mismatch"),
             "unexpected error: {err}"

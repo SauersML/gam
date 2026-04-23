@@ -1009,7 +1009,7 @@ mod tests {
             + 2.0 * r_psi.dot(&d).dot(&r_psi.t())
             + r.dot(&d).dot(&r_psi_psi.t());
 
-        let root = super::unified::penalty_matrix_root(&s_mat).unwrap();
+        let root = crate::estimate::reml::unified::penalty_matrix_root(&s_mat).unwrap();
         let penalty = crate::construction::CanonicalPenalty::from_dense_root(root, 3);
         let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], 0.0, 3)
             .expect("block-factored pseudo-logdet");
@@ -1034,7 +1034,7 @@ mod tests {
         let s = array![[4.0, 2.0], [2.0, 1.0]];
         let ridge = 1e-4_f64;
 
-        let root = super::unified::penalty_matrix_root(&s).unwrap();
+        let root = crate::estimate::reml::unified::penalty_matrix_root(&s).unwrap();
         let penalty = crate::construction::CanonicalPenalty::from_dense_root(root, 2);
         let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], ridge, 2)
             .expect("block-factored pseudo-logdet");

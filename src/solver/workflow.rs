@@ -2361,8 +2361,10 @@ mod tests {
         );
         request.optimize_inverse_link = false;
 
-        let err = fit_survival_location_scale_model(request)
-            .expect_err("survival link wiggle should reject unsupported inverse links");
+        let err = match fit_survival_location_scale_model(request) {
+            Ok(_) => panic!("survival link wiggle should reject unsupported inverse links"),
+            Err(e) => e,
+        };
 
         assert!(err.contains("survival link wiggle"));
         assert!(err.contains("does not support"));
