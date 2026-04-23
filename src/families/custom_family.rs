@@ -16,6 +16,7 @@ use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
     MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs, exact_intersection_nullity,
+    spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -4569,6 +4570,7 @@ fn with_ridged_surrogate_reml_guard<T>(
     })
 }
 
+#[allow(dead_code)]
 fn record_ridged_surrogate_reml_warning(n_negative: usize, ridge: f64) -> Result<(), String> {
     let mut warning_idx = None;
     let mut warning_limit = None;
@@ -4631,33 +4633,49 @@ fn stable_logdet_with_ridge_policy(
         }
         RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
         RidgeDeterminantMode::PositivePart => {
-            // Explicit ridged surrogate objective:
+            // Smooth-regularized logdet objective, aligned with the gradient
+            // operator (`DenseSpectralOperator` in `Smooth` mode):
             //
-            //   log |A + ridge I|_+ = Σ_{lambda_j > floor} log(lambda_j)
+            //   log |A|_reg = Σ_j log r_ε(σ_j),   r_ε(σ) = ½(σ + √(σ² + 4ε²))
             //
-            // This is a *surrogate* objective, not a valid Laplace term when
-            // the Hessian is indefinite.
+            // Every eigenvalue contributes; none are silently dropped.  The
+            // regularizer r_ε is C∞, strictly positive for all real σ, and
+            // numerically agrees with plain log σ when σ ≫ ε.  Negative
+            // eigenvalues contribute ≈ log(ε²/|σ|) (quadratic damping) so
+            // indefinite Hessians produce a finite, differentiable cost
+            // rather than a discontinuous positive-part pseudo-determinant.
             //
-            // Primary: eigendecomposition (positive-part filtering).
-            // Fallback: escalating-ridge Cholesky when eigh fails despite
-            // internal jitter schedule.  For nearly-SPD matrices the Cholesky
-            // logdet ≈ positive-part logdet; for mildly indefinite matrices
-            // the ridge bias is a constant offset that does not affect REML
-            // gradients.  Cholesky is a direct (non-iterative) algorithm, so
-            // it cannot suffer QR-style convergence failures.
-            let floor = ridge.max(1e-14);
+            // This matches exactly what the downstream
+            // `trace_logdet_gradient = Σ φ'(σ) u^T (dH/dρ) u` computes as the
+            // analytic gradient — eliminating the cost/gradient mismatch
+            // that previously broke BFGS line search on indefinite outer
+            // Hessians.
+            //
+            // Fallback: escalating-ridge Cholesky when eigh fails despite the
+            // internal jitter schedule.  Cholesky is a direct algorithm so it
+            // cannot suffer QR-style convergence failures.
             match crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower) {
                 Ok((evals, _)) => {
-                    let n_negative = evals.iter().filter(|&&ev| ev < -floor).count();
+                    let eval_vec: Vec<f64> = evals
+                        .as_slice()
+                        .map(|sl| sl.to_vec())
+                        .unwrap_or_else(|| evals.iter().copied().collect());
+                    let eps = spectral_epsilon(&eval_vec).max(ridge.max(1e-14));
+                    let n_negative =
+                        eval_vec.iter().filter(|&&ev| ev < -eps).count();
                     if n_negative > 0 {
-                        record_ridged_surrogate_reml_warning(n_negative, ridge)?;
+                        // Diagnostic only: indefiniteness is now handled
+                        // correctly by the smooth regularizer, not ignored.
+                        log::debug!(
+                            "[SmoothRegularizedLogdet] Hessian has {n_negative} \
+                             eigenvalue(s) below -eps={eps:.2e}; r_ε damps them \
+                             smoothly instead of dropping them."
+                        );
                     }
-                    let mut logdet = 0.0;
-                    for &ev in &evals {
-                        if ev > floor {
-                            logdet += ev.ln();
-                        }
-                    }
+                    let logdet: f64 = eval_vec
+                        .iter()
+                        .map(|&sigma| spectral_regularize(sigma, eps).ln())
+                        .sum();
                     Ok(logdet)
                 }
                 Err(eigh_err) => positive_part_cholesky_fallback(&a, ridge, &eigh_err),
@@ -12327,19 +12345,42 @@ mod tests {
     }
 
     #[test]
-    fn ridged_surrogate_reml_guard_aborts_repeated_positive_part_path() {
+    fn indefinite_hessian_uses_smooth_regularized_logdet() {
+        // Indefinite Hessian: eigenvalues {-1, 2}.
+        //
+        // Old behaviour: silently drop the -1 direction from logdet, warn,
+        // and after enough repeats escalate to an EFS abort (first-order
+        // fallback marker).
+        //
+        // New behaviour: every eigenvalue contributes via the smooth
+        // regularizer r_ε(σ) = ½(σ + √(σ² + 4ε²)).  No direction is ignored,
+        // no escalation, and the logdet matches what the downstream
+        // `DenseSpectralOperator` gradient computes — eliminating the
+        // cost/gradient mismatch that broke BFGS line search.
         let h = array![[-1.0, 0.0], [0.0, 2.0]];
-        let err = with_ridged_surrogate_reml_guard(1, || {
-            stable_logdet_with_ridge_policy(
-                &h,
-                1e-12,
-                RidgePolicy::explicit_stabilization_pospart(),
-            )
-        })
-        .expect_err("repeated positive-part surrogate warnings should abort EFS");
+        let logdet = stable_logdet_with_ridge_policy(
+            &h,
+            1e-12,
+            RidgePolicy::explicit_stabilization_pospart(),
+        )
+        .expect("smooth-regularized logdet must be finite for indefinite H");
         assert!(
-            err.contains(crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER),
-            "unexpected error message: {err}"
+            logdet.is_finite(),
+            "smooth-regularized logdet should be finite, got {logdet}"
+        );
+        // Reference value using the same formula directly on the eigenvalues
+        // of H + ridge·I (ridge = 1e-12 here).  Since ε ≫ ridge (spectral_epsilon
+        // floors at √(eps_mach) ≈ 1.5e-8 for p=2), the ridge contribution is
+        // absorbed into ε and the expected value is Σ log r_ε(σ_j).
+        let eps = spectral_epsilon(&[-1.0_f64, 2.0]).max(1e-12_f64.max(1e-14));
+        // A + ridge·I has eigenvalues shifted by 1e-12, negligible relative to ε.
+        let expected: f64 = [-1.0_f64 + 1e-12, 2.0 + 1e-12]
+            .iter()
+            .map(|&s| spectral_regularize(s, eps).ln())
+            .sum();
+        assert!(
+            (logdet - expected).abs() < 1e-10,
+            "logdet={logdet}, expected={expected}"
         );
     }
 
