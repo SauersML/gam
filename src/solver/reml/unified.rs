@@ -751,10 +751,6 @@ impl ExactJeffreysTerm {
         self.operator.jeffreys_logdet()
     }
 
-    #[inline]
-    pub(crate) fn operator(&self) -> &super::FirthDenseOperator {
-        self.operator.as_ref()
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2439,19 +2435,6 @@ impl PenaltySubspaceTrace {
             }
         }
         trace
-    }
-
-    /// Compute `tr(K · A · K · B)` where `K = U_S · H_proj⁻¹ · U_Sᵀ`.
-    ///
-    /// Identity: `tr(K A K B) = tr((H_proj⁻¹ · U_Sᵀ A U_S) · (H_proj⁻¹ · U_Sᵀ B U_S))`,
-    /// reducing to two r × r products.  Used by the outer-Hessian cross
-    /// trace `−tr(K Ḣ_j K Ḣ_i)` in place of the full-space
-    /// `trace_logdet_hessian_cross` when the rank-deficient LAML fix is
-    /// active.
-    pub fn trace_projected_logdet_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        let ra = self.reduce(a);
-        let rb = self.reduce(b);
-        self.trace_projected_logdet_cross_reduced(&ra, &rb)
     }
 
     /// Cross-trace given pre-reduced blocks `R_A = U_Sᵀ A U_S`, `R_B = U_Sᵀ B U_S`.
