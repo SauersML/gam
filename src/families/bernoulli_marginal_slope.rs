@@ -712,8 +712,7 @@ fn joint_setup(
     );
     let mut upper_vals = marginal_upper.as_array().to_vec();
     upper_vals.extend(logslope_upper.as_array().iter());
-    let log_kappa_upper =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
+    let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
     ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
