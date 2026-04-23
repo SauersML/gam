@@ -3382,19 +3382,33 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::DenseSpectralOperator;
+        use super::unified::{DenseSpectralOperator, PseudoLogdetMode};
 
         let pirls_result = bundle.pirls_result.as_ref();
         let ridge_passport = pirls_result.ridge_passport;
 
         let h_total_original =
             self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
+        // Match `build_dense_assembly`: under Firth bias-reduction the penalized
+        // Hessian `X'WX + S − H_φ` inherits the Jeffreys-identifiable subspace,
+        // and `Smooth` would leak a spurious gradient contribution through the
+        // null directions.  Keep `log|H|`, its gradient, its cross-traces, and
+        // `H⁻¹` solves consistent on the same reduced active subspace by using
+        // `HardPseudo` whenever a Firth operator is in play.
+        let hessian_mode = if bundle.firth_dense_operator.is_some()
+            || bundle.firth_dense_operator_original.is_some()
+        {
+            PseudoLogdetMode::HardPseudo
+        } else {
+            PseudoLogdetMode::Smooth
+        };
         let hessian_op = std::sync::Arc::new(
-            DenseSpectralOperator::from_symmetric(&h_total_original).map_err(|e| {
-                EstimationError::InvalidInput(format!(
-                    "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
-                ))
-            })?,
+            DenseSpectralOperator::from_symmetric_with_mode(&h_total_original, hessian_mode)
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
+                    ))
+                })?,
         );
 
         let e_for_logdet = pirls_result.reparam_result.e_transformed.clone();
