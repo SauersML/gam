@@ -14551,11 +14551,8 @@ mod tests {
 
         // Also verify the drop-in reference behaviour using constraints_lb0
         // (two rows, one truly unconstrained): same result.
-        let inf_with_two_row = projected_stationarity_inf_norm(
-            &residual_active,
-            &beta_active,
-            Some(&constraints_lb0),
-        );
+        let inf_with_two_row =
+            projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&constraints_lb0));
         // constraints_lb0 is rejected by extract_simple_lower_bounds (b entry
         // for second row is -inf, which trips the decomposition), so this
         // falls back to plain inf-norm = 0.5 — exercising the "unparseable
@@ -14573,22 +14570,16 @@ mod tests {
             a: array![[1.0]],
             b: array![0.0],
         };
-        let inf_wrong_sign = projected_stationarity_inf_norm(
-            &residual_wrong_sign,
-            &beta_wrong_sign,
-            Some(&single1),
-        );
+        let inf_wrong_sign =
+            projected_stationarity_inf_norm(&residual_wrong_sign, &beta_wrong_sign, Some(&single1));
         assert_relative_eq!(inf_wrong_sign, 0.2_f64, epsilon = 1e-12);
 
         // Test (iv): an interior coordinate with a valid lower bound keeps
         // contributing to the norm, whatever the residual sign.
         let beta_interior = array![1.5];
         let residual_interior = array![0.4];
-        let inf_interior = projected_stationarity_inf_norm(
-            &residual_interior,
-            &beta_interior,
-            Some(&single1),
-        );
+        let inf_interior =
+            projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1));
         assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
     }
 }
