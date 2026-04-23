@@ -4684,6 +4684,8 @@ pub fn filter_active_penalty_candidates(
                 dropped_reason
             );
         }
+        let kronecker_factors =
+            validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         penaltyinfo.push(PenaltyInfo {
             source: candidate.source,
             original_index,
@@ -4692,11 +4694,39 @@ pub fn filter_active_penalty_candidates(
             dropped_reason,
             nullspace_dim_hint: analysis.nullity,
             normalization_scale: candidate.normalization_scale,
-            kronecker_factors: candidate.kronecker_factors,
+            kronecker_factors,
         });
     }
 
     Ok((penalties, nullspace_dims, penaltyinfo))
+}
+
+fn validated_kronecker_factors(
+    factors: Option<Vec<Array2<f64>>>,
+    matrix: &Array2<f64>,
+) -> Option<Vec<Array2<f64>>> {
+    let factors = factors?;
+    let Some((first, rest)) = factors.split_first() else {
+        return None;
+    };
+    let mut kron = first.clone();
+    for factor in rest {
+        kron = crate::construction::kronecker_product(&kron, factor);
+    }
+    if kron.dim() != matrix.dim() {
+        return None;
+    }
+
+    let scale = kron
+        .iter()
+        .chain(matrix.iter())
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+        .max(1.0);
+    let max_abs_diff = kron
+        .iter()
+        .zip(matrix.iter())
+        .fold(0.0_f64, |acc, (&lhs, &rhs)| acc.max((lhs - rhs).abs()));
+    (max_abs_diff <= scale * 1e-10).then_some(factors)
 }
 
 /// Build the double-penalty ridge from the structural null space of a PSD penalty.
@@ -17272,6 +17302,50 @@ mod tests {
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
         ));
+    }
+
+    #[test]
+    fn filter_active_penalty_candidates_preserves_matching_kronecker_factors() {
+        let s = array![[1.0, -1.0], [-1.0, 1.0]];
+        let identity = Array2::<f64>::eye(2);
+        let kron = crate::construction::kronecker_product(&s, &identity);
+        let (_, _, penaltyinfo) = filter_active_penalty_candidates(vec![PenaltyCandidate {
+            matrix: kron,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::TensorMarginal { dim: 0 },
+            normalization_scale: 1.0,
+            kronecker_factors: Some(vec![s.clone(), identity.clone()]),
+        }])
+        .expect("matching Kronecker factors should be retained");
+
+        assert_eq!(penaltyinfo.len(), 1);
+        assert!(penaltyinfo[0].kronecker_factors.is_some());
+    }
+
+    #[test]
+    fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projection() {
+        let s = array![[1.0, -1.0], [-1.0, 1.0]];
+        let identity = Array2::<f64>::eye(2);
+        let kron = crate::construction::kronecker_product(&s, &identity);
+        let z = array![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0]
+        ];
+        let projected = z.t().dot(&kron).dot(&z);
+        let (_, _, penaltyinfo) = filter_active_penalty_candidates(vec![PenaltyCandidate {
+            matrix: projected,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::TensorMarginal { dim: 0 },
+            normalization_scale: 1.0,
+            kronecker_factors: Some(vec![s, identity]),
+        }])
+        .expect("projected penalty should still analyze");
+
+        assert_eq!(penaltyinfo.len(), 1);
+        assert!(penaltyinfo[0].active);
+        assert!(penaltyinfo[0].kronecker_factors.is_none());
     }
 
     #[test]
