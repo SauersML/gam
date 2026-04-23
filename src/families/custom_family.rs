@@ -6554,7 +6554,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);
                 if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
-                    let raw_descent = gradient - &s_lambda.dot(&beta_old);
+                    let mut raw_descent = gradient - &s_lambda.dot(&beta_old);
+                    if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                        raw_descent -= &beta_old.mapv(|v| ridge * v);
+                    }
                     let raw_norm = raw_descent.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
                     let descent_dir = if raw_norm > MAX_NEWTON_STEP {
                         &raw_descent * (MAX_NEWTON_STEP / raw_norm)
@@ -11688,6 +11691,33 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct OneBlockLinearLikelihoodExactFamily {
+        score: f64,
+    }
+
+    impl CustomFamily for OneBlockLinearLikelihoodExactFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .beta
+                .first()
+                .copied()
+                .ok_or_else(|| "missing coefficient".to_string())?;
+            Ok(FamilyEvaluation {
+                log_likelihood: self.score * beta,
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![self.score],
+                    hessian: SymmetricMatrix::Dense(array![[0.0]]),
+                }],
+            })
+        }
+    }
+
+    #[derive(Clone)]
     struct PreferJointExactFamily;
 
     impl CustomFamily for PreferJointExactFamily {
@@ -12154,6 +12184,48 @@ mod tests {
             inner.log_likelihood < -1e-8,
             "raw log-likelihood should drop for this strongly penalized move; got {}",
             inner.log_likelihood
+        );
+    }
+
+    #[test]
+    fn exact_newton_backtracking_descent_includes_explicit_ridge() {
+        let family = OneBlockLinearLikelihoodExactFamily { score: 0.5 };
+        let spec = ParameterBlockSpec {
+            name: "b0".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![1.0]),
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            inner_tol: 0.0,
+            outer_max_iter: 1,
+            outer_tol: 1e-8,
+            minweight: 1e-12,
+            ridge_floor: 1.0,
+            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+            use_remlobjective: false,
+            compute_covariance: false,
+            use_outer_hessian: false,
+            screening_max_inner_iterations: None,
+        };
+        let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
+            .expect("inner blockwise fit should succeed");
+
+        let beta = inner.block_states[0].beta[0];
+        let objective = -inner.log_likelihood + inner.penalty_value;
+        assert!(
+            beta < 1.0 - 1e-12,
+            "ridge-aware fallback descent should shrink beta after rejecting the uphill Newton step; got {}",
+            beta
+        );
+        assert!(
+            objective < -1e-12,
+            "accepted fallback step should lower the penalized objective; got {}",
+            objective
         );
     }
 

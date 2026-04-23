@@ -2381,6 +2381,56 @@ pub(crate) fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
 // have been replaced by the canonical PenaltyPseudologdet in
 // super::penalty_logdet. All callers now use that module directly.
 
+/// Projected-logdet trace kernel for rank-deficient penalty geometries.
+///
+/// When the outer cost is evaluated as `log|U_Sᵀ H U_S|_+` on the positive
+/// eigenspace of `S_λ` (see `hessian_logdet_correction`), the derivative
+/// `d log|U_Sᵀ H U_S|/dτ = tr(U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ · Ḣ)` uses the
+/// **projected** inverse kernel, not the full-space `H⁻¹`.  The two agree
+/// only when `Ḣ` has no support on `null(S)` — true for ρ-direction
+/// penalty drifts `A_k = λ_k S_k` (S_k vanishes on null(S) by construction),
+/// but **false** for the IFT correction `D_β H[v] = X' diag(c ⊙ X v) X`
+/// of non-Gaussian GLMs, because the intercept column `X[:,0] = 1_n`
+/// typically lies in `null(S)` and gives `D_β H[v]` non-zero rows/columns
+/// on that direction.
+///
+/// Evaluating `tr(H⁻¹ · Ḣ)` then picks up a spurious null-space
+/// contribution that is absent from the cost's projected logdet derivative;
+/// this manifests as a ~3–4% FD/analytic drift on binomial-logit REML
+/// gradient tests.  For Gaussian identity, `c = 0` so `D_β H[v] = 0` and
+/// the leakage vanishes, which is why Gaussian fixtures pass untouched.
+///
+/// `u_s`           — p × r orthonormal basis of `range(S_+)`.
+/// `h_proj_inverse` — r × r symmetric matrix `(U_Sᵀ H U_S)⁻¹`, precomputed
+/// from the same `H_proj = U_Sᵀ · H · U_S` that feeds `log|H_proj|_+`.
+#[derive(Clone, Debug)]
+pub struct PenaltySubspaceTrace {
+    pub u_s: Array2<f64>,
+    pub h_proj_inverse: Array2<f64>,
+}
+
+impl PenaltySubspaceTrace {
+    /// Compute `tr(K · A)` where `K = U_S · H_proj⁻¹ · U_Sᵀ` — the
+    /// projected logdet kernel that matches `d log|U_Sᵀ H U_S|/dτ`.
+    ///
+    /// Uses the identity `tr(K · A) = tr(H_proj⁻¹ · U_Sᵀ A U_S)` so the
+    /// reduction runs on the r × r subspace rather than materializing K.
+    pub fn trace_projected_logdet(&self, a: &Array2<f64>) -> f64 {
+        // R = U_Sᵀ · A · U_S (r × r)
+        let u_s_t_a = self.u_s.t().dot(a);
+        let r_mat = u_s_t_a.dot(&self.u_s);
+        // tr(H_proj⁻¹ · R)
+        let mut trace = 0.0;
+        let r = self.h_proj_inverse.nrows();
+        for i in 0..r {
+            for j in 0..r {
+                trace += self.h_proj_inverse[[i, j]] * r_mat[[j, i]];
+            }
+        }
+        trace
+    }
+}
+
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
 /// fixed dispersion (non-Gaussian LAML).
 #[derive(Clone, Debug)]
@@ -2470,6 +2520,12 @@ pub struct InnerSolution<'dp> {
     /// uniformly rescaled exact curvature matrix.
     pub hessian_logdet_correction: f64,
 
+    /// When the cost uses `log|U_Sᵀ H U_S|_+` (rank-deficient LAML fix),
+    /// this carries the matching projected kernel so the gradient trace
+    /// `tr(K · Ḣ)` agrees with the cost's derivative.  See
+    /// [`PenaltySubspaceTrace`] for the full derivation.
+    pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
+
     /// Uniform scale applied to rho-coordinate penalty derivatives only in the
     /// H-dependent trace / solve parts of the outer calculus.
     pub rho_curvature_scale: f64,
@@ -2526,6 +2582,7 @@ pub struct InnerSolutionBuilder<'dp> {
     tk_gradient: Option<Array1<f64>>,
     firth: Option<ExactJeffreysTerm>,
     hessian_logdet_correction: f64,
+    penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     rho_curvature_scale: f64,
     nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
@@ -2562,6 +2619,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_gradient: None,
             firth: None,
             hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
@@ -2590,6 +2648,15 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 
     pub fn hessian_logdet_correction(mut self, correction: f64) -> Self {
         self.hessian_logdet_correction = correction;
+        self
+    }
+
+    /// Install the projected-logdet trace kernel that pairs with the
+    /// `hessian_logdet_correction` on a rank-deficient penalty surface.
+    /// See [`PenaltySubspaceTrace`] for the derivation and when it is
+    /// required for gradient consistency.
+    pub fn penalty_subspace_trace(mut self, kernel: Option<Arc<PenaltySubspaceTrace>>) -> Self {
+        self.penalty_subspace_trace = kernel;
         self
     }
 
@@ -2663,6 +2730,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             tk_gradient: self.tk_gradient,
             firth: self.firth,
             hessian_logdet_correction: self.hessian_logdet_correction,
+            penalty_subspace_trace: self.penalty_subspace_trace,
             rho_curvature_scale: self.rho_curvature_scale,
             n_observations: self.n_observations,
             nullspace_dim,
@@ -3109,7 +3177,7 @@ pub fn reml_laml_evaluate(
         } => {
             // Fixed-dispersion Laplace / maximum penalized likelihood:
             //   V(ρ) = −ℓ(β̂) + ½ β̂ᵀSβ̂
-            //         + [½ log|H| + TK + Firth]  if include_logdet_h
+            //         + [½ log|H| + TK − Firth]  if include_logdet_h
             //         − [½ log|S|₊]               if include_logdet_s
             //
             // The additive Gaussian normalization constant 0.5 * M * log(2πφ)
@@ -3249,9 +3317,12 @@ pub fn reml_laml_evaluate(
     // Hutchinson traces based on H^{-1} are only valid for logdet-gradient
     // terms on backends where the logdet kernel is exactly H^{-1}.
     // Smooth spectral regularization uses G_eps(H) instead, so those backends
-    // must stay on the exact trace path.
+    // must stay on the exact trace path.  The rank-deficient LAML fix also
+    // replaces the kernel with the projected `U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ`,
+    // which the Hutchinson path cannot produce — stay exact when it is active.
     let total_p = hop.dim();
-    let use_stochastic_traces = can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h);
+    let use_stochastic_traces = can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h)
+        && solution.penalty_subspace_trace.is_none();
 
     // When using stochastic traces, pre-collect all H_k matrices (both rho and
     // ext coordinates) and batch them through a single StochasticTraceEstimator.
@@ -3413,11 +3484,30 @@ pub fn reml_laml_evaluate(
         // Cost derivative: a_i = ½ β̂ᵀ Aₖ β̂.
         let a_i = 0.5 * solution.beta.dot(a_k_beta);
 
-        // Trace term: tr(G_ε(H) Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
+        // Trace term: tr(K · Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
+        //
+        // Kernel choice mirrors the ψ/τ block: full-space `G_ε(H)` when the
+        // cost uses the unprojected `log|H|`, or the identified-subspace
+        // kernel `U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ` when the rank-deficient LAML
+        // fix is active.  `Aₖ = λₖ Sₖ` is zero on `null(S)` by construction,
+        // but the third-derivative correction `C[vₖ] = X'·diag(c ⊙ X vₖ)·X`
+        // leaks onto the intercept direction for non-Gaussian families — so
+        // the two kernels disagree whenever `hessian_logdet_correction ≠ 0`
+        // and `c_array ≠ 0`.
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
             stoch_traces[idx]
+        } else if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+            let drift = penalty_total_drift_result(
+                coord,
+                curvature_lambdas[idx],
+                rho_corrections[idx].as_ref(),
+            );
+            match drift {
+                DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
+                DriftDerivResult::Operator(op) => kernel.trace_projected_logdet(&op.to_dense()),
+            }
         } else if coord.is_block_local() && rho_corrections[idx].is_none() {
             let (block, start, end) = coord.scaled_block_local(1.0);
             hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
@@ -3458,7 +3548,24 @@ pub fn reml_laml_evaluate(
         // Mode response: v_i = H⁻¹(g_i) = +dβ̂/dψ_i.
         let v_i = hop.solve(&coord.g);
 
-        // Trace term: tr(G_ε(H) Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
+        // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
+        //
+        // Kernel choice pairs with the cost:
+        //   * Default cost `½ log|H|` (or `Σ log r_ε(σ_j)` under Smooth spectral
+        //     regularization) → K = G_ε(H), computed full-space.
+        //   * Rank-deficient LAML fix (`hessian_logdet_correction ≠ 0`) uses
+        //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
+        //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
+        //
+        // For non-Gaussian families the total drift `Ḣ_i = B_i + D_β H[+v_i]`
+        // includes `D_β H[+v_i] = X'·diag(c ⊙ X v_i)·X`, which has non-zero
+        // support on `null(S)` whenever `X` contains an all-ones intercept
+        // column — the null direction of `S_λ`.  Using the full-space
+        // `G_ε(H)` there picks up a spurious null-space contribution absent
+        // from `d log|U_Sᵀ H U_S|_+/dτ`; the projected kernel reroutes the
+        // trace through `range(S_+)` only, matching the cost exactly.
+        // Gaussian identity skips this path harmlessly because `c = 0` forces
+        // `D_β H = 0`, so `Ḣ` already lives entirely in `range(S_+)²`.
         let trace_logdet_i = if !incl_logdet_h {
             0.0
         } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -3470,9 +3577,17 @@ pub fn reml_laml_evaluate(
             } else {
                 None
             };
-            match hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim()) {
-                DriftDerivResult::Dense(matrix) => hop.trace_logdet_h_k(&matrix, None),
-                DriftDerivResult::Operator(op) => hop.trace_logdet_operator(op.as_ref()),
+            let drift =
+                hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim());
+            match (&solution.penalty_subspace_trace, drift) {
+                (Some(kernel), DriftDerivResult::Dense(matrix)) => {
+                    kernel.trace_projected_logdet(&matrix)
+                }
+                (Some(kernel), DriftDerivResult::Operator(op)) => {
+                    kernel.trace_projected_logdet(&op.to_dense())
+                }
+                (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
+                (None, DriftDerivResult::Operator(op)) => hop.trace_logdet_operator(op.as_ref()),
             }
         };
 
@@ -3565,165 +3680,6 @@ pub fn reml_laml_evaluate(
         gradient: Some(grad),
         hessian,
     })
-}
-
-/// Compute the Firth bias-reduction Hessian contribution ∂²Φ/∂ρₖ∂ρₗ.
-///
-/// The Firth penalty is Φ = ½ log|I(β̂)|₊ where I is the (possibly rank-
-/// deficient) Fisher information.  With β̂(ρ) differentiated via the implicit
-/// function theorem on the penalized score equation, the derivatives obey
-///   dβ̂/dρ_k  = −v_k,       v_k := H⁻¹(A_k β̂),
-///   d²β̂/dρ_k dρ_l = +u_kl, u_kl := H⁻¹(Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂)
-/// where H is the *penalized* Hessian (possibly including H_φ when Firth
-/// augments the inner objective).  Note the sign on the second derivative:
-/// differentiating v_k = H⁻¹(A_k β̂) wrt ρ_l gives d(v_k)/dρ_l = −u_kl, and
-/// d²β̂/dρ_k dρ_l = d(−v_k)/dρ_l = +u_kl.
-///
-/// For f(β) = ½ log|I(β)|₊ with β̂ moving through ρ, the total second
-/// derivative is
-///   d²f/dρ_k dρ_l = (dβ̂/dρ_l)ᵀ H_f (dβ̂/dρ_k) + g_f · (d²β̂/dρ_k dρ_l)
-///                 = v_lᵀ H_f v_k + g_f · u_kl.
-/// Expanding with H_f = ½[∇²log|I|] and using the matrix calculus identity
-///   g_f[i]            = ½ tr(I⁺ · D_β I[e_i]),
-///   v_lᵀ H_f v_k      = ½ tr(I⁺ · D²_β I[v_k, v_l]) − ½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k]),
-/// gives the correct contribution
-///
-/// ```text
-/// J_{kl} = ½ tr(I⁺ · D_β I[u_kl])
-///        + ½ tr(I⁺ · D²_β I[v_k, v_l])
-///        − ½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k])
-/// ```
-///
-/// where I⁺ is the Moore-Penrose pseudoinverse of the Fisher information on
-/// its identifiable subspace.  For rank-deficient designs `Col(X)` is a strict
-/// subspace of ℝᵖ and `I⁺ = Q I_r⁻¹ Qᵀ` with Q the orthonormal basis for that
-/// identifiable subspace and I_r = Qᵀ I Q the reduced-space Fisher block.  The
-/// pseudoinverse convention is the one that makes `log|I|₊` smooth (constant
-/// rank of I as β moves) and matches the actual scalar stored in
-/// `ExactJeffreysTerm::value()` = ½ log|I_r|.
-///
-/// Implementation notes.  All three traces are evaluated on the reduced basis
-/// via K_r = I_r⁻¹ and the reduced Gram maps that `FirthDirection` already
-/// stores.  For any direction u with `dir.deta = X·u`:
-///   g_u_reduced   = X_rᵀ diag(w' ⊙ X u) X_r = Qᵀ (D_β I[u]) Q,
-/// so `tr(I⁺ · D_β I[u]) = tr(K_r · g_u_reduced)`.  For the cross term we use
-/// `tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k]) = tr(K_r · g_v_l · K_r · g_v_k)`.
-/// The mixed second-β-derivative is
-///   g_uv_reduced  = X_rᵀ diag(w'' ⊙ (X v_k) ⊙ (X v_l)) X_r = Qᵀ (D²_β I[v_k, v_l]) Q,
-/// so `tr(I⁺ · D²_β I[v_k, v_l]) = tr(K_r · g_uv_reduced)`.  These reduced-
-/// basis traces do NOT touch the penalized Hessian `hop`; the Firth operator
-/// alone carries the Fisher-info pseudoinverse on the identifiable subspace,
-/// which is the only object that appears in `d²(½ log|I|)/dρ²`.
-///
-/// # Arguments
-/// - `firth_op`: The precomputed Firth dense operator — supplies the reduced
-///   design X_r, the reduced Fisher inverse K_r = I_r⁻¹, and the weight
-///   derivative arrays w', w'' needed for D_β I and D²_β I.
-/// - `hop`: The penalized Hessian operator.  Only used for `u_kl` solves
-///   (second-order β response) because that sign convention comes from the
-///   penalized score equation; the trace contractions themselves use I⁺.
-/// - `beta`: Coefficients at the converged mode (unused for the reduced-basis
-///   Firth contribution, retained for API stability and sign checks).
-/// - `v_ks`: Precomputed mode responses v_k = H⁻¹(A_k β̂).
-/// - `h_k_matrices`: Precomputed total Hessian drifts Ḣ_k = A_k + correction.
-/// - `a_k_betas`: Precomputed A_k β̂ vectors (needed for the `δ_{kl}`
-///   component of the second mode response RHS).
-/// - `penalty_coords`, `lambdas`: Penalty λ_k A_k terms for the RHS build.
-pub fn compute_firth_hessian_contribution(
-    firth_op: &super::FirthDenseOperator,
-    hop: &dyn HessianOperator,
-    beta: &Array1<f64>,
-    v_ks: &[Array1<f64>],
-    h_k_matrices: &[Array2<f64>],
-    a_k_betas: &[Array1<f64>],
-    penalty_coords: &[PenaltyCoordinate],
-    lambdas: &[f64],
-) -> Array2<f64> {
-    let _ = beta;
-    let k = v_ks.len();
-    let mut firth_hess = Array2::zeros((k, k));
-    if k == 0 {
-        return firth_hess;
-    }
-
-    let rho_dbeta: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|value| -value)).collect();
-    let mut firth_dirs: Vec<super::FirthDirection> = Vec::with_capacity(k);
-    let mut firth_dhphi: Vec<Array2<f64>> = Vec::with_capacity(k);
-    for dbeta in &rho_dbeta {
-        let deta = firth_op.x_dense.dot(dbeta);
-        let dir = firth_op.direction_from_deta(deta);
-        let dhphi = firth_op.hphi_direction(&dir);
-        firth_dirs.push(dir);
-        firth_dhphi.push(dhphi);
-    }
-
-    for kk in 0..k {
-        for ll in kk..k {
-            // ── Second-β-response RHS: Ḣ_l v_k + A_k v_l − δ_{kl} A_k β̂ ──
-            //
-            // u_kl = H⁻¹ · rhs is the magnitude of d²β̂/dρ_k dρ_l (the IFT
-            // correction).  We pass +u_kl (not −u_kl) into the direction
-            // builder because the outer formula already accounts for its
-            // sign via `d²β̂/dρ_k dρ_l = +u_kl`.
-            let mut total_h_l = h_k_matrices[ll].clone();
-            total_h_l -= &firth_dhphi[ll];
-            let mut rhs = total_h_l.dot(&v_ks[kk]);
-            rhs += &penalty_coords[kk].scaled_matvec(&v_ks[ll], lambdas[kk]);
-            if kk == ll {
-                rhs -= &a_k_betas[kk];
-            }
-            let u_kl = hop.solve(&rhs);
-            let deta_kl: Array1<f64> = firth_op.x_dense.dot(&u_kl);
-            let dir_kl = firth_op.direction_from_deta(deta_kl);
-
-            // ── Term A:  ½ tr(I⁺ · D_β I[u_kl])  =  ½ tr(K_r · g_u_kl_reduced) ──
-            let term_a = 0.5 * trace_reduced(&firth_op.k_reduced, &dir_kl.g_u_reduced);
-
-            // ── Term B:  ½ tr(I⁺ · D²_β I[v_k, v_l]) ──
-            // The mixed reduced Gram is
-            //   g_uv_reduced = X_rᵀ diag(w'' ⊙ (X v_k) ⊙ (X v_l)) X_r,
-            // built here directly so this function does not rely on extra
-            // public surface from the Firth operator.  `w2` is w'' at the
-            // current η.
-            let deta_k: Array1<f64> = firth_op.x_dense.dot(&rho_dbeta[kk]);
-            let deta_l: Array1<f64> = firth_op.x_dense.dot(&rho_dbeta[ll]);
-            let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_k * &deta_l);
-            let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
-            let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
-
-            // ── Term C:  −½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k])
-            //          = −½ tr(K_r · g_v_l · K_r · g_v_k) ──
-            let k_g_vl = firth_op.k_reduced.dot(&firth_dirs[ll].g_u_reduced);
-            let k_g_vk = firth_op.k_reduced.dot(&firth_dirs[kk].g_u_reduced);
-            let term_c = -0.5 * super::RemlState::trace_product(&k_g_vl, &k_g_vk);
-
-            let j_kl = term_a + term_b + term_c;
-            firth_hess[[kk, ll]] = j_kl;
-            if kk != ll {
-                firth_hess[[ll, kk]] = j_kl;
-            }
-        }
-    }
-
-    firth_hess
-}
-
-/// Reduced-basis trace helper for `tr(A · B)` on a pair of r×r matrices.
-/// Used by the Firth Hessian contribution where A = K_r and B is a reduced
-/// Gram (both symmetric, both in the identifiable subspace).
-#[inline]
-fn trace_reduced(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-    debug_assert_eq!(a.nrows(), a.ncols());
-    debug_assert_eq!(b.nrows(), b.ncols());
-    debug_assert_eq!(a.nrows(), b.nrows());
-    let n = a.nrows();
-    let mut acc = 0.0_f64;
-    for i in 0..n {
-        for j in 0..n {
-            acc += a[[i, j]] * b[[j, i]];
-        }
-    }
-    acc
 }
 
 /// Precompute the adjoint trace vector z_c = H⁻¹ Xᵀ (c ⊙ h) from raw GLM ingredients.
@@ -4460,26 +4416,6 @@ fn compute_outer_hessian(
         }
     }
 
-    // ── Firth Hessian contribution (computed internally from the exact Jeffreys term) ──
-    //
-    // ∂²Φ/∂ρₖ∂ρₗ is computed using the precomputed v_ks, h_k_matrices,
-    // a_k_betas, and penalty_coords that are already available. This replaces
-    // the formerly caller-injected Firth Hessian.
-    if let Some(ref firth) = solution.firth {
-        let fh = compute_firth_hessian_contribution(
-            firth.operator(),
-            hop,
-            &solution.beta,
-            &v_ks,
-            &h_k_matrices,
-            &a_k_betas,
-            &solution.penalty_coords,
-            &curvature_lambdas,
-        );
-        let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
-        sl += &fh;
-    }
-
     if hess.iter().any(|v| !v.is_finite()) {
         return Err(
             "Outer Hessian contains non-finite entries; exact higher-order derivatives are invalid"
@@ -4606,8 +4542,6 @@ struct UnifiedOuterHessianOperator {
     incl_logdet_s: bool,
     kernel: OuterHessianDerivativeKernel,
     adjoint_z_c: Option<Array1<f64>>,
-    firth_hessian: Option<Array2<f64>>,
-    rho_dim: usize,
 }
 
 impl UnifiedOuterHessianOperator {
@@ -4801,13 +4735,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             );
         }
 
-        if let Some(firth_hessian) = self.firth_hessian.as_ref() {
-            let alpha_rho = alpha.slice(ndarray::s![..self.rho_dim]).to_owned();
-            let firth_out = firth_hessian.dot(&alpha_rho);
-            out.slice_mut(ndarray::s![..self.rho_dim])
-                .scaled_add(1.0, &firth_out);
-        }
-
         Ok(out)
     }
 }
@@ -4852,21 +4779,11 @@ fn build_outer_hessian_operator(
     };
 
     let mut coords = Vec::with_capacity(total);
-    let mut rho_h_matrices = Vec::with_capacity(k);
-    let mut rho_a_k_betas = Vec::with_capacity(k);
-
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
         let a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
         let v_k = hop.solve(&a_k_beta);
         let correction = effective_deriv.hessian_derivative_correction_result(&v_k)?;
-        let h_k =
-            match penalty_total_drift_result(coord, curvature_lambdas[idx], correction.as_ref()) {
-                DriftDerivResult::Dense(matrix) => matrix,
-                DriftDerivResult::Operator(op) => op.to_dense(),
-            };
-        rho_h_matrices.push(h_k.clone());
-        rho_a_k_betas.push(a_k_beta.clone());
         let mut total_dense = None;
         let mut total_operators = Vec::new();
         match penalty_total_drift_result(coord, curvature_lambdas[idx], correction.as_ref()) {
@@ -4994,19 +4911,6 @@ fn build_outer_hessian_operator(
         }
     }
 
-    let firth_hessian = solution.firth.as_ref().map(|firth| {
-        let rho_v: Vec<Array1<f64>> = coords[..k].iter().map(|coord| coord.v.clone()).collect();
-        compute_firth_hessian_contribution(
-            firth.operator(),
-            hop.as_ref(),
-            &solution.beta,
-            &rho_v,
-            &rho_h_matrices,
-            &rho_a_k_betas,
-            &solution.penalty_coords,
-            &curvature_lambdas,
-        )
-    });
     let adjoint_z_c = if incl_logdet_h {
         match &kernel {
             OuterHessianDerivativeKernel::ScalarGlm {
@@ -5042,8 +4946,6 @@ fn build_outer_hessian_operator(
         incl_logdet_s,
         kernel,
         adjoint_z_c,
-        firth_hessian,
-        rho_dim: k,
     })
 }
 
@@ -6638,18 +6540,16 @@ impl SparseCholeskyOperator {
             }
 
             let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
-            let solved = match crate::linalg::sparse_exact::solve_sparse_spdmulti(
-                &self.factor,
-                &rhs_view,
-            ) {
-                Ok(sol) => sol,
-                Err(e) => {
-                    log::warn!(
+            let solved =
+                match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view) {
+                    Ok(sol) => sol,
+                    Err(e) => {
+                        log::warn!(
                         "SparseCholeskyOperator::trace_hinv_operator_exact multi-solve failed: {e}"
                     );
-                    return f64::NAN;
-                }
-            };
+                        return f64::NAN;
+                    }
+                };
             for local_col in 0..cols {
                 trace += solved[[start + local_col, local_col]];
             }
@@ -6679,15 +6579,13 @@ impl SparseCholeskyOperator {
             }
 
             let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
-            let solved = crate::linalg::sparse_exact::solve_sparse_spdmulti(
-                &self.factor,
-                &rhs_view,
-            )
-            .map_err(|e| {
-                format!(
+            let solved =
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
+                    .map_err(|e| {
+                        format!(
                     "SparseCholeskyOperator::solve_operator_columns_exact multi-solve failed: {e}"
                 )
-            })?;
+                    })?;
             solved_all
                 .slice_mut(ndarray::s![.., start..end])
                 .assign(&solved);
@@ -8376,11 +8274,10 @@ mod tests {
     fn test_gaussian_derivatives_has_no_corrections() {
         let g = GaussianDerivatives;
         assert!(!g.has_corrections());
-        assert!(
-            g.hessian_derivative_correction(&array![1.0, 2.0])
-                .unwrap()
-                .is_none()
-        );
+        assert!(g
+            .hessian_derivative_correction(&array![1.0, 2.0])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -8407,6 +8304,7 @@ mod tests {
             tk_gradient: None,
             firth: None,
             hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
             n_observations: 100,
             nullspace_dim: 0.0,
@@ -8432,6 +8330,158 @@ mod tests {
         let grad = result.gradient.unwrap();
         assert_eq!(grad.len(), 1);
         assert!(grad[0].is_finite());
+    }
+
+    #[test]
+    fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
+        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, -1.0]];
+        let eta = array![0.0, 0.4, -0.2];
+        let firth_op = std::sync::Arc::new(
+            super::super::FirthDenseOperator::build(&x, &eta).expect("firth operator"),
+        );
+        let firth_value = firth_op.jeffreys_logdet();
+
+        let solution = InnerSolution {
+            log_likelihood: 0.0,
+            penalty_quadratic: 0.0,
+            hessian_op: Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap()),
+            beta: Array1::zeros(2),
+            penalty_coords: Vec::new(),
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: Array1::zeros(0),
+                second: None,
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: Some(ExactJeffreysTerm::new(firth_op)),
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            n_observations: x.nrows(),
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: false,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+
+        let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
+        assert_relative_eq!(result.cost, -firth_value, epsilon = 1e-12);
+    }
+
+    struct FixedCorrectionDerivatives {
+        correction: Array2<f64>,
+    }
+
+    impl HessianDerivativeProvider for FixedCorrectionDerivatives {
+        fn hessian_derivative_correction(
+            &self,
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(self.correction.clone()))
+        }
+
+        fn has_corrections(&self) -> bool {
+            true
+        }
+    }
+
+    fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'static> {
+        let lambda = rho.exp();
+        let h = array![[3.0 + 4.0 * rho, 0.0], [0.0, 5.0 + lambda],];
+        let full_logdet = h[[0, 0]].ln() + h[[1, 1]].ln();
+        let projected_logdet = h[[1, 1]].ln();
+
+        InnerSolution {
+            log_likelihood: 0.0,
+            penalty_quadratic: 0.0,
+            hessian_op: Arc::new(
+                DenseSpectralOperator::from_symmetric_with_mode(&h, PseudoLogdetMode::HardPseudo)
+                    .unwrap(),
+            ),
+            beta: Array1::zeros(2),
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(array![[0.0, 1.0]])],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![0.0],
+                second: None,
+            },
+            deriv_provider: Box::new(FixedCorrectionDerivatives {
+                correction: array![[4.0, 0.0], [0.0, 0.0]],
+            }),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: projected_logdet - full_logdet,
+            penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+                u_s: array![[0.0], [1.0]],
+                h_proj_inverse: array![[1.0 / h[[1, 1]]]],
+            })),
+            rho_curvature_scale: 1.0,
+            n_observations: 10,
+            nullspace_dim: 1.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: false,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        }
+    }
+
+    #[test]
+    fn test_rho_gradient_uses_projected_logdet_kernel_when_available() {
+        let rho = 0.0;
+        let result = reml_laml_evaluate(
+            &build_projected_rho_gradient_solution(rho),
+            &[rho],
+            EvalMode::ValueAndGradient,
+            None,
+        )
+        .unwrap();
+        let analytic = result.gradient.expect("gradient")[0];
+
+        let eps = 1e-6;
+        let rho_plus = rho + eps;
+        let cost_plus = reml_laml_evaluate(
+            &build_projected_rho_gradient_solution(rho_plus),
+            &[rho_plus],
+            EvalMode::ValueOnly,
+            None,
+        )
+        .unwrap()
+        .cost;
+
+        let rho_minus = rho - eps;
+        let cost_minus = reml_laml_evaluate(
+            &build_projected_rho_gradient_solution(rho_minus),
+            &[rho_minus],
+            EvalMode::ValueOnly,
+            None,
+        )
+        .unwrap()
+        .cost;
+
+        let fd = (cost_plus - cost_minus) / (2.0 * eps);
+        assert_relative_eq!(analytic, fd, epsilon = 1e-8, max_relative = 1e-8);
+
+        let full_space_trace = 4.0 / 3.0 + 1.0 / 6.0;
+        assert!(
+            (analytic - 0.5 * full_space_trace).abs() > 0.5,
+            "projected rho trace should exclude the null-space leakage term"
+        );
     }
 
     /// Helper: build an InnerSolution for a Gaussian model at a given rho.
@@ -8534,6 +8584,7 @@ mod tests {
             tk_gradient: None,
             firth: None,
             hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
             n_observations: n,
             nullspace_dim: 0.0,
@@ -8583,6 +8634,7 @@ mod tests {
             tk_gradient: None,
             firth: None,
             hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
             n_observations: n,
             nullspace_dim: 0.0,
