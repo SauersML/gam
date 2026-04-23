@@ -12025,6 +12025,25 @@ mod tests {
                 eprintln!("beta_time: {:?}", result.beta_time());
                 eprintln!("beta_threshold: {:?}", result.beta_threshold());
                 eprintln!("beta_log_sigma: {:?}", result.beta_log_sigma());
+                // Structural-monotonicity invariant implied by the test's
+                // name: the I-spline-like time block carries structural
+                // lower bounds of zero (see
+                // `structural_time_coefficient_lower_bounds`), and
+                // `post_update_block_beta` projects the iterate onto that
+                // box after every accepted line-search step.  Every
+                // accepted coefficient must therefore satisfy β ≥ 0 — the
+                // precondition for the monotone I-spline reconstruction
+                // the workflow consumes downstream.
+                assert!(
+                    result.beta_time().iter().all(|&b| b.is_finite()),
+                    "structural time coefficients must be finite: {:?}",
+                    result.beta_time(),
+                );
+                assert!(
+                    result.beta_time().iter().all(|&b| b >= 0.0),
+                    "structural time coefficients must be non-negative after projection: {:?}",
+                    result.beta_time(),
+                );
             }
             Err(e) => {
                 panic!("fit_survival_location_scale failed: {e}");
