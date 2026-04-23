@@ -1568,6 +1568,10 @@ fn compute_warm_start(
 
     let projection_log_lambdas = Array1::zeros(covariate_penalties.len());
     let zero_offset = Array1::zeros(n);
+    // Use the minimum ridge that `solve_penalizedweighted_projection` keeps as
+    // its own numerical floor (1e-12). A larger ridge here biases the
+    // projection and prevents the warm start from exactly absorbing the
+    // offset into the affine seed even when X'WX is perfectly conditioned.
     let coeff_int = solve_penalizedweighted_projection(
         covariate_design,
         &zero_offset,
@@ -1575,7 +1579,7 @@ fn compute_warm_start(
         weights,
         covariate_penalties,
         &projection_log_lambdas,
-        1e-8,
+        1e-12,
     )?;
     let coeff_slope = solve_penalizedweighted_projection(
         covariate_design,
@@ -1584,7 +1588,7 @@ fn compute_warm_start(
         weights,
         covariate_penalties,
         &projection_log_lambdas,
-        1e-8,
+        1e-12,
     )?;
 
     beta.slice_mut(s![0..p_cov]).assign(&coeff_int);

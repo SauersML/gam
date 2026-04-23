@@ -163,7 +163,13 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
         let mut gram = a_active.dot(&a_active.t());
         let mut rhs = a_active.dot(gradient);
         let ridge_scale = gram.diag().iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        let ridge = 1e-12 * ridge_scale.max(1.0);
+        // The ridge only exists to let the SPD solve succeed when active
+        // rows of A are linearly dependent (singular Gram). A larger ridge
+        // biases the Lagrange multipliers and manifests as a stationarity
+        // residual of the same magnitude at perfectly-conditioned active
+        // constraints. Use a ULP-scale floor instead so stationarity
+        // vanishes to machine precision when Gram is well-conditioned.
+        let ridge = f64::EPSILON * ridge_scale.max(1.0);
         for i in 0..n_active {
             gram[[i, i]] += ridge;
         }
