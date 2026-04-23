@@ -592,15 +592,21 @@ fn fit_survival_location_scale_model(
             F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
             R: Fn(&Array1<f64>) -> Option<InverseLink>,
         {
+            use crate::solver::outer_strategy::{OuterProblem, SolverClass};
             let dim = init.len();
-            let mut seed_config = crate::seeding::SeedConfig::default();
-            seed_config.max_seeds = 8;
-            seed_config.seed_budget = 2;
-            seed_config.risk_profile = crate::seeding::SeedRiskProfile::Survival;
-            let problem = crate::solver::outer_strategy::OuterProblem::new(dim)
+            // Inverse-link parameters (SAS epsilon/log_delta, BetaLogistic shape,
+            // Mixture rho) have no analytic ∂LAML/∂θ_link; route through the
+            // gated gradient-free CompassSearch variant rather than BFGS. Box
+            // bounds keep line-search probes inside a physically admissible
+            // region (|epsilon|, |log_delta| ≤ 6 gives the SAS link a finite
+            // range on both tails).
+            let lower = init.mapv(|v| v - 6.0);
+            let upper = init.mapv(|v| v + 6.0);
+            let problem = OuterProblem::new(dim)
+                .with_solver_class(SolverClass::AuxiliaryGradientFree)
                 .with_tolerance(1e-4)
-                .with_max_iter(30)
-                .with_seed_config(seed_config)
+                .with_max_iter(240)
+                .with_bounds(lower, upper)
                 .with_heuristic_lambdas(init.to_vec());
             let context = format!("survival inverse-link optimization ({name}, dim={dim})");
             let mut obj = problem.build_objective(
@@ -608,7 +614,10 @@ fn fit_survival_location_scale_model(
                 |f: &mut F, rho: &ndarray::Array1<f64>| f(rho),
                 |_: &mut F, _: &ndarray::Array1<f64>| {
                     Err(EstimationError::InvalidInput(
-                        "cost-only objective has no eval".to_string(),
+                        "inverse-link aux optimizer: CompassSearch dispatch only \
+                         calls eval_cost; eval(gradient) is unreachable by \
+                         construction"
+                            .to_string(),
                     ))
                 },
                 None::<fn(&mut F)>,
