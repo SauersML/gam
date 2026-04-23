@@ -15174,7 +15174,32 @@ mod tests {
     }
 
     #[test]
-    fn test_thin_plate_dimension4_builds_finite_basis() {
+    fn test_thin_plate_dimension4_uses_quadratic_polynomial_nullspace() {
+        let data = array![[0.1, 0.2, 0.3, 0.4], [0.6, 0.7, 0.8, 0.9]];
+        let mut knots = Array2::<f64>::zeros((16, 4));
+        let mut seed = 7u64;
+        for i in 0..knots.nrows() {
+            for j in 0..knots.ncols() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                knots[[i, j]] = ((seed >> 33) as f64) / ((1u64 << 31) as f64)
+                    + 0.05 * i as f64
+                    + 0.01 * j as f64;
+            }
+        }
+        let tps = create_thin_plate_spline_basis(data.view(), knots.view())
+            .expect("dimension-4 TPS should build with a quadratic null space");
+        assert_eq!(tps.dimension, 4);
+        assert_eq!(tps.num_polynomial_basis, 15);
+        assert_eq!(tps.num_kernel_basis, 1);
+        assert_eq!(tps.basis.nrows(), data.nrows());
+        assert_eq!(tps.basis.ncols(), 16);
+        assert!(tps.basis.iter().all(|v| v.is_finite()));
+        assert!(tps.penalty_bending.iter().all(|v| v.is_finite()));
+        assert!(tps.penalty_ridge.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_thin_plate_dimension4_rejects_insufficient_knots_for_quadratic_nullspace() {
         let data = array![[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]];
         let knots = array![
             [0.0, 0.0, 0.0, 0.0],
@@ -15183,18 +15208,13 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0]
         ];
-        let tps = create_thin_plate_spline_basis(data.view(), knots.view())
-            .expect("dimension-4 TPS should build via general polyharmonic kernel");
-        assert_eq!(tps.dimension, 4);
-        assert_eq!(tps.num_polynomial_basis, 5);
-        assert_eq!(tps.basis.nrows(), data.nrows());
-        assert_eq!(
-            tps.basis.ncols(),
-            tps.num_kernel_basis + tps.num_polynomial_basis
-        );
-        assert!(tps.basis.iter().all(|v| v.is_finite()));
-        assert!(tps.penalty_bending.iter().all(|v| v.is_finite()));
-        assert!(tps.penalty_ridge.iter().all(|v| v.is_finite()));
+        match create_thin_plate_spline_basis(data.view(), knots.view()) {
+            Err(BasisError::InvalidInput(msg)) => {
+                assert!(msg.contains("requires at least 15 knots"));
+                assert!(msg.contains("degree-2 polynomial null space"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]
