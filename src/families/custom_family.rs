@@ -6261,12 +6261,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 delta.mapv_inplace(|v| v * (MAX_JOINT_STEP / step_inf));
             }
 
-            if step_inf <= inner_tol {
-                converged = true;
-                cycles_done = cycle + 1;
-                break;
-            }
-
+            // A small Newton proposal is not enough for exact outer calculus:
+            // we still need the joint residual check after evaluating the
+            // candidate state, because ||delta|| can be small while the joint
+            // KKT residual is still above tolerance.
             // Line search: try full step, then halve
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let mut accepted = false;
@@ -6828,13 +6826,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if !delta.iter().all(|v| v.is_finite()) {
                 break;
             }
-            let step_inf_polish = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-            if step_inf_polish <= inner_tol {
-                // No movement available — treat as converged.
-                converged = true;
-                break;
-            }
-
+            // Keep polishing until the free-space joint residual is small; a
+            // tiny delta alone is not a certificate of stationarity.
             // Damped line search with projection.
             let old_states: Vec<ParameterBlockState> = states.clone();
             let old_obj = -eval_for_polish.log_likelihood + current_penalty;
