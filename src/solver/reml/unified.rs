@@ -8423,8 +8423,8 @@ mod tests {
         // the expected logdet is `ln(r_ε(2)) ≈ ln(2)`.
         let epsilon = spectral_epsilon(&[0.0, 2.0]);
         let threshold = positive_eigenvalue_threshold(&[0.0, 2.0]);
-        assert!(0.0 <= threshold, "threshold must be non-negative");
-        assert!(2.0 > threshold, "σ=2 must stay above the structural cutoff");
+        assert!(threshold >= 0.0, "threshold must be non-negative");
+        assert!(threshold < 2.0, "σ=2 must stay above the structural cutoff");
         let r2 = spectral_regularize(2.0, epsilon);
         let expected_logdet = r2.ln();
         assert!((op.logdet() - expected_logdet).abs() < 1e-10);
