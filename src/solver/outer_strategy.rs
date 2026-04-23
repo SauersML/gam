@@ -582,7 +582,7 @@ pub enum OuterEvalOrder {
 }
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterPlan {
     pub solver: Solver,
     pub hessian_source: HessianSource,
