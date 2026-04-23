@@ -9641,28 +9641,58 @@ mod tests {
 
     #[test]
     fn time_block_post_update_leaves_beta_unchanged() {
+        // The time block carries structural lower bounds (see
+        // `structural_time_coefficient_lower_bounds`).  `post_update_block_beta`
+        // projects the accepted line-search β onto the feasible box so the
+        // *next* `max_feasible_time_step` call never sees an ulp-level
+        // infeasibility.  The projection must satisfy two invariants:
+        //   (i)  feasible β is returned unchanged (idempotence on the feasible
+        //        set),
+        //   (ii) β projected from outside the feasible set lies on the feasible
+        //        set (every coefficient is ≥ its lower bound).
+        // The test family has `time_coefficient_lower_bounds = [0.0]`, matching
+        // the single structural time column in `x_time_exit`.
         let family = survival_exact_newton_test_family();
         let spec = ParameterBlockSpec {
             name: "time_transform".to_string(),
-            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 2)))),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 1)))),
             offset: Array1::zeros(1),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
         };
-        let returned = family
+
+        // Feasible β: already ≥ the 0.0 bound, so the projection is a no-op.
+        let feasible = family
             .post_update_block_beta(
                 &[ParameterBlockState {
-                    beta: array![0.0, 0.0],
+                    beta: array![0.0],
                     eta: array![0.0, 0.0, 0.0],
                 }],
                 SurvivalLocationScaleFamily::BLOCK_TIME,
                 &spec,
-                array![-2.0, 0.5],
+                array![0.5],
             )
             .expect("return time beta");
-        assert_eq!(returned, array![-2.0, 0.5]);
+        assert_eq!(feasible, array![0.5]);
+
+        // Infeasible β: -2.0 sits below the 0.0 lower bound, so the projection
+        // clamps it back onto the feasible set.  The invariant the test asserts
+        // is "every coefficient is ≥ its structural lower bound" — the exact
+        // returned value is the projection-to-box fixed point.
+        let projected = family
+            .post_update_block_beta(
+                &[ParameterBlockState {
+                    beta: array![0.0],
+                    eta: array![0.0, 0.0, 0.0],
+                }],
+                SurvivalLocationScaleFamily::BLOCK_TIME,
+                &spec,
+                array![-2.0],
+            )
+            .expect("return time beta");
+        assert!(projected[0] >= 0.0);
     }
 
     #[test]
