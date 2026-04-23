@@ -1514,11 +1514,19 @@ enum CompassSearchOutcome {
     /// — i.e. the iterate is a step-minimizer over the positive basis
     /// {±step·e_i} at scale < step_tol. By Kolda-Lewis-Torczon Thm 3.3 this
     /// implies first-order stationarity up to the step-tol grid.
-    Converged { point: Array1<f64>, cost: f64, polls: usize },
+    Converged {
+        point: Array1<f64>,
+        cost: f64,
+        polls: usize,
+    },
     /// The poll budget was exhausted before step contraction reached the
     /// tolerance. Return the best-seen iterate; caller treats as
     /// non-converged so log/diagnostics surface the truncation.
-    BudgetExhausted { point: Array1<f64>, cost: f64, polls: usize },
+    BudgetExhausted {
+        point: Array1<f64>,
+        cost: f64,
+        polls: usize,
+    },
 }
 
 /// Coordinate compass search with bound clamping.
@@ -1568,10 +1576,7 @@ fn compass_search_outer(
                 }
                 let mut candidate = x.clone();
                 candidate[i] = candidate_i;
-                let probe = obj
-                    .eval_cost(&candidate)
-                    .ok()
-                    .filter(|v| v.is_finite());
+                let probe = obj.eval_cost(&candidate).ok().filter(|v| v.is_finite());
                 if let Some(c) = probe
                     && c < best_cost
                 {
@@ -1587,9 +1592,17 @@ fn compass_search_outer(
         }
     }
     if step <= step_tol {
-        CompassSearchOutcome::Converged { point: x, cost: best_cost, polls }
+        CompassSearchOutcome::Converged {
+            point: x,
+            cost: best_cost,
+            polls,
+        }
     } else {
-        CompassSearchOutcome::BudgetExhausted { point: x, cost: best_cost, polls }
+        CompassSearchOutcome::BudgetExhausted {
+            point: x,
+            cost: best_cost,
+            polls,
+        }
     }
 }
 

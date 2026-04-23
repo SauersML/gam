@@ -2304,14 +2304,10 @@ mod tests {
             entry: array![-0.2_f64],
             derivative: array![-0.4_f64],
         };
-        let grad = baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("ok")
-        .expect("non-linear");
+        let grad =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("ok")
+                .expect("non-linear");
         // Hand-compute: grad[k] = r_X·∂eta_exit/∂θ_k + r_D·∂o_D_exit/∂θ_k + r_E·∂eta_entry/∂θ_k.
         let p_exit = baseline_offset_theta_partials(age_exit[0], &cfg)
             .unwrap()
@@ -2349,14 +2345,10 @@ mod tests {
             derivative: array![-0.2_f64, 0.0_f64],
         };
         // Must not error despite age_entry[0] == 0.
-        let grad = baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("must not fail on origin-entry row with r_entry=0")
-        .expect("non-linear");
+        let grad =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("must not fail on origin-entry row with r_entry=0")
+                .expect("non-linear");
         assert_eq!(grad.len(), 2);
         // Row 1's entry channel contributes, row 0's does not.
         let p_exit_0 = baseline_offset_theta_partials(10.0, &cfg).unwrap().unwrap();
@@ -2393,13 +2385,9 @@ mod tests {
             entry: array![0.0_f64],
             derivative: array![0.0_f64],
         };
-        let grad = baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("ok");
+        let grad =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("ok");
         assert!(grad.is_none());
     }
 
@@ -2466,22 +2454,17 @@ mod tests {
             entry: r_e.clone(),
             derivative: r_d.clone(),
         };
-        let grad = baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("ok")
-        .expect("non-linear");
+        let grad =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("ok")
+                .expect("non-linear");
 
         // Construct NLL(θ) with β* held to the same eta/s values by treating
         // eta_i, s_i as fixed "linear predictor" samples and shifting by
         // (offset(θ) - offset(θ_base)). That's exactly the RP NLL with β*
         // held constant and offsets varied through θ.
         let nll = |theta_plus: &Array1<f64>| -> f64 {
-            let cfg_p =
-                survival_baseline_config_from_theta(cfg.target, theta_plus).expect("cfg_p");
+            let cfg_p = survival_baseline_config_from_theta(cfg.target, theta_plus).expect("cfg_p");
             let mut sum = 0.0_f64;
             for i in 0..3 {
                 let (eta_x_p, d_x_p) = evaluate_survival_baseline(age_exit[i], &cfg_p).unwrap();
@@ -2508,9 +2491,7 @@ mod tests {
             sum
         };
 
-        let theta_base = survival_baseline_theta_from_config(&cfg)
-            .unwrap()
-            .unwrap();
+        let theta_base = survival_baseline_theta_from_config(&cfg).unwrap().unwrap();
         let h = 1e-6;
         for k in 0..theta_base.len() {
             let mut tp = theta_base.clone();
@@ -2544,13 +2525,8 @@ mod tests {
             entry: array![0.0_f64, 0.0, 0.0],
             derivative: array![0.0_f64, 0.0, 0.0],
         };
-        let err = baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect_err("length mismatch must error");
+        let err = baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+            .expect_err("length mismatch must error");
         assert!(err.contains("length mismatch"), "err={err}");
     }
 }

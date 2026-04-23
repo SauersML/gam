@@ -1325,15 +1325,15 @@ fn spatial_term_psi_bounds(
                 _ => pairwise_distance_bounds(centers.view()),
             }
         }
-        _ => standardized_spatial_term_data(data, term).ok().and_then(|x| {
-            match aniso.as_deref() {
+        _ => standardized_spatial_term_data(data, term)
+            .ok()
+            .and_then(|x| match aniso.as_deref() {
                 Some(eta) if eta.len() == x.ncols() => {
                     let y = points_in_aniso_y_space(x.view(), eta);
                     pairwise_distance_bounds_sampled(y.view())
                 }
                 _ => pairwise_distance_bounds_sampled(x.view()),
-            }
-        }),
+            }),
     };
     let Some((r_min, r_max)) = r_bounds else {
         return fallback;
