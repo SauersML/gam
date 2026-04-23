@@ -11,7 +11,6 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
         .with_gradient(Derivative::Analytic)
         .with_tolerance(1e-5)
         .with_max_iter(60)
-        .with_fd_step(1e-5)
         .with_seed_config(gam::solver::seeding::SeedConfig {
             max_seeds: 1,
             seed_budget: 1,

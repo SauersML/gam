@@ -10563,7 +10563,6 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_disable_fixed_point(multi_block_beta_dependent)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
-        .with_fd_step(1e-4)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone());

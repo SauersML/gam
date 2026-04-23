@@ -3137,7 +3137,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .with_psi_dim(theta_dim - rho_dim)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
-        .with_fd_step(1e-4)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
         .with_seed_config(crate::seeding::SeedConfig {

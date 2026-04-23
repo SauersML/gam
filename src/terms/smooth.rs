@@ -5742,7 +5742,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(options.max_iter)
-        .with_fd_step(1e-4)
         .with_seed_config(crate::seeding::SeedConfig::default())
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(initial_theta.clone());
@@ -10151,7 +10150,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
-        1e-5,
     );
 
     let eval_outer = |ctx: &mut &mut AnisoJointContext<'_>,
@@ -10451,7 +10449,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         seed_risk_profile_for_likelihood_family(family),
         1e-6,
         50,
-        1e-5,
     );
 
     let eval_outer = |ctx: &mut &mut IsoJointContext<'_>,
@@ -11754,7 +11751,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     risk_profile: crate::seeding::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
-    fd_step: f64,
 ) -> crate::solver::outer_strategy::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
@@ -11768,7 +11764,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
-        .with_fd_step(fd_step)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
         .with_seed_config(crate::seeding::SeedConfig {
@@ -11977,7 +11972,6 @@ where
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
-        1e-4,
     );
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
