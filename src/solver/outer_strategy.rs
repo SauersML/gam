@@ -1775,6 +1775,20 @@ impl OuterProblem {
         self
     }
 
+    /// Override the fallback policy. Default is [`FallbackPolicy::Automatic`].
+    ///
+    /// Set [`FallbackPolicy::Disabled`] when the caller requires the primary
+    /// plan to stand on its own — callers use this when the automatic
+    /// degradation ladder would violate a hard correctness constraint (e.g.
+    /// custom-family outer must never use BFGS + Hessian approximation because
+    /// the surrogate surface is directionally hostile to rank-2 Hessian
+    /// updates, and the cascade's only remaining retry converts
+    /// `Analytic` Hessian → `Unavailable` → BFGS+BfgsApprox).
+    pub fn with_fallback_policy(mut self, policy: FallbackPolicy) -> Self {
+        self.fallback_policy = policy;
+        self
+    }
+
     /// Derive the capability flags from the builder state.
     /// `fixed_point_available` is set to `false` here; `build_objective`
     /// overrides it based on whether an EFS closure is actually provided.
@@ -2711,11 +2725,11 @@ fn run_outer_with_plan(
                 // Aux direct-search: uses cost values only, never queries
                 // gradient or Hessian. config.tolerance is the step-length
                 // floor, config.max_iter is the total-poll budget.
-                let seed_cost = obj
-                    .eval_cost(&seed)
-                    .map_err(|err| EstimationError::RemlOptimizationFailed(
-                        format!("aux direct-search seed cost failed ({context}): {err}")
-                    ))?;
+                let seed_cost = obj.eval_cost(&seed).map_err(|err| {
+                    EstimationError::RemlOptimizationFailed(format!(
+                        "aux direct-search seed cost failed ({context}): {err}"
+                    ))
+                })?;
                 if !seed_cost.is_finite() {
                     last_seed_error = Some(format!(
                         "aux direct-search rejects non-finite seed cost ({seed_cost})"
@@ -2736,18 +2750,16 @@ fn run_outer_with_plan(
                     config.max_iter,
                 );
                 match outcome {
-                    CompassSearchOutcome::Converged { point, cost, polls } => {
-                        Ok(OuterResult {
-                            rho: point,
-                            final_value: cost,
-                            iterations: polls,
-                            final_grad_norm: 0.0,
-                            final_gradient: None,
-                            final_hessian: None,
-                            converged: true,
-                            plan_used: *the_plan,
-                        })
-                    }
+                    CompassSearchOutcome::Converged { point, cost, polls } => Ok(OuterResult {
+                        rho: point,
+                        final_value: cost,
+                        iterations: polls,
+                        final_grad_norm: 0.0,
+                        final_gradient: None,
+                        final_hessian: None,
+                        converged: true,
+                        plan_used: *the_plan,
+                    }),
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
                         Ok(OuterResult {
                             rho: point,
