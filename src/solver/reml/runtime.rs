@@ -2595,40 +2595,15 @@ impl<'a> RemlState<'a> {
                 })
             }
             pirls::PirlsStatus::MaxIterationsReached => {
-                // Envelope-theorem outer gradients require the inner solve to be near
-                // stationarity; a loose max-iter acceptance threshold (e.g. 1.0) causes
-                // persistent KKT/envelope diagnostic failures and inaccurate hyper-gradients.
-                let acceptable_kkt = if self.runtime_sas_link_state.is_some() {
-                    // SAS-link outer sweeps can stall at boundary-heavy rho configurations
-                    // before satisfying strict default KKT tolerances; allow a wider
-                    // near-stationary band to avoid false hard failures in those regimes.
-                    (self.config.convergence_tolerance * 50.0).max(1e-2)
-                } else {
-                    (self.config.convergence_tolerance * 10.0).max(1e-4)
-                };
-                if pirls_result.lastgradient_norm > acceptable_kkt {
-                    // The fit timed out and gradient is still too large for reliable outer
-                    // derivatives, so fail fast and let the caller backtrack.
-                    log::error!(
-                        "P-IRLS failed convergence check: gradient norm {:.3e} > {:.3e} (iter {})",
-                        pirls_result.lastgradient_norm,
-                        acceptable_kkt,
-                        pirls_result.iteration
-                    );
-                    Err(EstimationError::PirlsDidNotConverge {
-                        max_iterations: pirls_result.iteration,
-                        last_change: pirls_result.lastgradient_norm,
-                    })
-                } else {
-                    // Near-stationary despite max iterations; treat as usable.
-                    log::warn!(
-                        "P-IRLS reached max iterations but gradient norm {:.3e} <= {:.3e}; accepting near-stationary fit.",
-                        pirls_result.lastgradient_norm,
-                        acceptable_kkt
-                    );
-                    self.updatewarm_start_from(pirls_result.as_ref());
-                    Ok(pirls_result)
-                }
+                log::error!(
+                    "P-IRLS reached max iterations without certifying a valid minimum (gradient norm {:.3e}, iter {})",
+                    pirls_result.lastgradient_norm,
+                    pirls_result.iteration
+                );
+                Err(EstimationError::PirlsDidNotConverge {
+                    max_iterations: pirls_result.iteration,
+                    last_change: pirls_result.lastgradient_norm,
+                })
             }
         }
     }
