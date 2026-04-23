@@ -10495,7 +10495,9 @@ mod tests {
         SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
     use gam::estimate::{FitGeometry, FittedBlock, FittedLinkState, UnifiedFitResultParts};
-    use gam::gamlss::buildwiggle_block_input_from_knots;
+    use gam::gamlss::{
+        buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
+    };
     use gam::inference::data::{
         EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
     };
@@ -10519,7 +10521,7 @@ mod tests {
         InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
         LogLikelihoodNormalization,
     };
-    use ndarray::{Array1, Array2, ArrayView1, array, s};
+    use ndarray::{Array1, Array2, array, s};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand_distr::{Distribution, StandardNormal};
@@ -16347,15 +16349,11 @@ mod tests {
     fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
         let q0 = array![-1.25, -0.2, 0.35, 1.4];
         let knots = vec![-2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0];
-        let design = create_basis::<Dense>(
-            q0.view(),
-            KnotSource::Provided(ArrayView1::from(&knots)),
-            3,
-            BasisOptions::value(),
-        )
-        .expect("build raw basis")
-        .0;
-        let constrained_cols = design.ncols().saturating_sub(2);
+        let knot_arr = Array1::from_vec(knots.clone());
+        let constrained_cols =
+            monotone_wiggle_basis_with_derivative_order(q0.view(), &knot_arr, 3, 0)
+                .expect("build monotone link-wiggle basis")
+                .ncols();
         let beta_link_wiggle = (0..constrained_cols)
             .map(|j| match j % 5 {
                 0 => 0.2,
