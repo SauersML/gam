@@ -527,6 +527,7 @@ fn fit_survival_location_scale_model(
         let inverse_link = spec.inverse_link.clone();
 
         let fit = if let Some(wiggle) = wiggle {
+            ensure_joint_wiggle_supported(&inverse_link, "survival link wiggle")?;
             let mut pilot_spec = spec.clone();
             pilot_spec.linkwiggle_block = None;
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;
@@ -2335,6 +2336,36 @@ mod tests {
                 .any(|note| note.contains("score-warp block")),
             "workflow notes should mention logslope_formula linkwiggle routing"
         );
+    }
+
+    #[test]
+    fn survival_location_scale_wiggle_rejects_unsupported_inverse_link() {
+        let data = workflow_test_dataset();
+        let materialized = materialize(
+            "Surv(age_entry, age_exit, event) ~ bmi + linkwiggle(degree=4, internal_knots=3, penalty_order=\"1\")",
+            &data,
+            &FitConfig::default(),
+        )
+        .expect("workflow materialization should succeed");
+
+        let MaterializedModel { request, .. } = materialized;
+        let FitRequest::SurvivalLocationScale(mut request) = request else {
+            panic!("expected survival location-scale request");
+        };
+        request.spec.inverse_link = InverseLink::Sas(
+            state_from_sasspec(SasLinkSpec {
+                initial_epsilon: 0.1,
+                initial_log_delta: 0.0,
+            })
+            .expect("valid SAS state"),
+        );
+        request.optimize_inverse_link = false;
+
+        let err = fit_survival_location_scale_model(request)
+            .expect_err("survival link wiggle should reject unsupported inverse links");
+
+        assert!(err.contains("survival link wiggle"));
+        assert!(err.contains("does not support"));
     }
 
     #[test]

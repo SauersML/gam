@@ -3,8 +3,8 @@ use gam::estimate::{
 };
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    PredictModelClass,
+    FittedFamily, FittedModel, FittedModelPayload, ModelKind, PredictModelClass,
+    MODEL_PAYLOAD_VERSION,
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{
@@ -12,7 +12,49 @@ use gam::types::{
     LogLikelihoodNormalization, SasLinkState,
 };
 use ndarray::{Array1, Array2};
+use serde_json::Value;
+use std::path::Path;
 use tempfile::tempdir;
+
+const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 4;
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 68;
+const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
+
+fn read_saved_model_json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read model"))
+        .expect("saved model json")
+}
+
+fn assert_saved_model_schema_is_pinned(saved: &Value) {
+    let payload = saved.as_object().expect("saved model payload object");
+    assert_eq!(
+        payload.len(),
+        EXPECTED_MODEL_PAYLOAD_FIELD_COUNT,
+        "saved model payload fields changed; audit stateful sync coverage before updating this test"
+    );
+    assert_eq!(
+        saved.get("version").and_then(Value::as_u64),
+        Some(EXPECTED_MODEL_PAYLOAD_VERSION),
+        "saved model schema version changed; audit stateful payload fields before updating this test"
+    );
+}
+
+fn standard_family_state(saved: &Value) -> &serde_json::Map<String, Value> {
+    let family_state = saved
+        .get("family_state")
+        .and_then(Value::as_object)
+        .expect("family_state object");
+    assert_eq!(
+        family_state.len(),
+        EXPECTED_STANDARD_FAMILY_FIELD_COUNT,
+        "standard family_state fields changed; audit stateful sync coverage before updating this test"
+    );
+    assert_eq!(
+        family_state.get("family_kind").and_then(Value::as_str),
+        Some("standard")
+    );
+    family_state
+}
 
 fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
@@ -154,10 +196,27 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     let path = dir.path().join("model.json");
     model.save_to_path(&path).expect("save model");
 
-    let raw = std::fs::read_to_string(&path).expect("read model");
-    assert!(
-        raw.contains("\"sas_state\""),
+    let saved = read_saved_model_json(&path);
+    assert_saved_model_schema_is_pinned(&saved);
+    let family_state = standard_family_state(&saved);
+    assert_eq!(
+        family_state.get("likelihood").and_then(Value::as_str),
+        Some("BinomialSas")
+    );
+    assert_eq!(
+        family_state.get("link").and_then(Value::as_str),
+        Some("Sas")
+    );
+    assert_eq!(
+        family_state.get("sas_state"),
+        Some(&serde_json::to_value(sas_state).expect("sas state json")),
         "serialized model should include synchronized family_state.sas_state"
+    );
+    assert_eq!(family_state.get("latent_cloglog_state"), Some(&Value::Null));
+    assert_eq!(family_state.get("mixture_state"), Some(&Value::Null));
+    assert_eq!(
+        saved.get("sas_param_covariance"),
+        Some(&serde_json::json!([[0.1, 0.02], [0.02, 0.2]]))
     );
 
     let loaded = FittedModel::load_from_path(&path).expect("load model");
@@ -221,11 +280,24 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
     let path = dir.path().join("latent-cloglog-model.json");
     model.save_to_path(&path).expect("save model");
 
-    let raw = std::fs::read_to_string(&path).expect("read model");
-    assert!(
-        raw.contains("\"latent_cloglog_state\""),
+    let saved = read_saved_model_json(&path);
+    assert_saved_model_schema_is_pinned(&saved);
+    let family_state = standard_family_state(&saved);
+    assert_eq!(
+        family_state.get("likelihood").and_then(Value::as_str),
+        Some("BinomialLatentCLogLog")
+    );
+    assert_eq!(
+        family_state.get("link").and_then(Value::as_str),
+        Some("CLogLog")
+    );
+    assert_eq!(
+        family_state.get("latent_cloglog_state"),
+        Some(&serde_json::to_value(latent_state).expect("latent state json")),
         "serialized model should include synchronized family_state.latent_cloglog_state"
     );
+    assert_eq!(family_state.get("mixture_state"), Some(&Value::Null));
+    assert_eq!(family_state.get("sas_state"), Some(&Value::Null));
 
     let loaded = FittedModel::load_from_path(&path).expect("load model");
     let loaded_state = loaded

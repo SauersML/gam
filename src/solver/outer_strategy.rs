@@ -2815,7 +2815,8 @@ fn run_outer_with_plan(
                 // Aux direct-search: uses cost values only, never queries
                 // gradient or Hessian. config.tolerance is the step-length
                 // floor, config.max_iter is the total-poll budget.
-                let seed_cost = obj.eval_cost(&seed).map_err(|err| {
+                let projected_seed = project_to_bounds(seed, Some(&bounds_template));
+                let seed_cost = obj.eval_cost(&projected_seed).map_err(|err| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "aux direct-search seed cost failed ({context}): {err}"
                     ))
@@ -2833,7 +2834,7 @@ fn run_outer_with_plan(
                 let (lo, hi) = &bounds_template;
                 let outcome = compass_search_outer(
                     obj,
-                    seed.clone(),
+                    projected_seed,
                     seed_cost,
                     lo.view(),
                     hi.view(),
@@ -4498,5 +4499,43 @@ mod tests {
             false,
         );
         assert_eq!(b, 1);
+    }
+
+    #[test]
+    fn run_aux_compass_projects_seed_before_seed_cost() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_solver_class(SolverClass::AuxiliaryGradientFree)
+            .with_bounds(array![0.0], array![1.0])
+            .with_initial_rho(array![2.0])
+            .with_max_iter(64);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let seen = Arc::clone(&seen);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    seen.lock().unwrap().push(theta.clone());
+                    Ok((theta[0] - 2.0).powi(2))
+                }
+            },
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "aux direct-search test should not call eval".to_string(),
+                ))
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "aux direct-search seed projection")
+            .expect("aux direct-search should evaluate the projected seed");
+        assert_eq!(result.plan_used.solver, Solver::CompassSearch);
+        assert_eq!(result.rho, array![1.0]);
+        assert_eq!(result.final_value, 1.0);
+        assert_eq!(
+            seen.lock().unwrap().first().cloned(),
+            Some(array![1.0]),
+            "aux direct-search must project the seed before evaluating its cost",
+        );
     }
 }
