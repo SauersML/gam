@@ -713,6 +713,9 @@ fn joint_setup(
     let mut upper_vals = marginal_upper.as_array().to_vec();
     upper_vals.extend(logslope_upper.as_array().iter());
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
+    // Project seed onto bounds in case a user-provided spec.length_scale falls
+    // outside the data-derived ψ window; seed was a hint, not a hard constraint.
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
