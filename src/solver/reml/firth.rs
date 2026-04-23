@@ -972,12 +972,41 @@ impl FirthDenseOperator {
         let dotw2 = &self.w3 * deta_partial;
         let dot_k = -self.k_reduced.dot(&dot_i_partial).dot(&self.k_reduced);
         FirthTauPartialKernel {
+            deta_partial: deta_partial.clone(),
             dotw1,
             dotw2,
             dot_h_partial,
             x_tau_reduced,
+            dot_i_partial,
             dot_k_reduced: dot_k,
         }
+    }
+
+    pub(crate) fn d_beta_hphi_tau_partial_dense(
+        &self,
+        x_tau: &Array2<f64>,
+        beta: &Array1<f64>,
+        beta_direction: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
+        if x_tau.nrows() != self.x_dense.nrows() || x_tau.ncols() != beta.len() {
+            return None;
+        }
+        if !x_tau.iter().any(|value| *value != 0.0) {
+            return None;
+        }
+        let tau_bundle = self.exact_tau_kernel(x_tau, beta, true);
+        let tau_kernel = tau_bundle.tau_kernel?;
+        let firth_direction = self.direction_from_deta(self.x_dense.dot(beta_direction));
+        let x_tau_v = x_tau.dot(beta_direction);
+        let kernel = self.d_beta_hphi_tau_partial_prepare_from_partials(
+            &tau_kernel,
+            &tau_kernel.deta_partial,
+            &tau_kernel.dot_i_partial,
+            &firth_direction,
+            &x_tau_v,
+        );
+        let eye = Array2::<f64>::eye(beta_direction.len());
+        Some(self.d_beta_hphi_tau_partial_apply(x_tau, &kernel, &eye))
     }
 
     pub(crate) fn apply_pbar_to_matrix(&self, mat: &Array2<f64>) -> Array2<f64> {
@@ -2465,10 +2494,12 @@ impl FirthDenseOperator {
         // apply_mtau_to_matrix only reads x_tau_reduced and dot_k_reduced off
         // the τ-kernel, but owning the full struct is cheap.
         let tau_kernel_view = FirthTauPartialKernel {
+            deta_partial: eta_tau.clone(),
             dotw1: dotw1.clone(),
             dotw2: dotw2.clone(),
             dot_h_partial: dot_h.clone(),
             x_tau_reduced: kernel.x_tau_reduced.clone(),
+            dot_i_partial: kernel.dot_i_partial.clone(),
             dot_k_reduced: kernel.dot_k_reduced.clone(),
         };
         let m_qv_tau =

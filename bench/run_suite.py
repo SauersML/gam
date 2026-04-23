@@ -7880,6 +7880,26 @@ def _append_enabled_result_rows(results: list[dict], rows, s_cfg) -> None:
             results.append(row)
 
 
+def _append_contender_result_if_enabled(
+    results: list[dict],
+    s_cfg,
+    contender: str,
+    build_row,
+) -> None:
+    if not _is_contender_enabled(s_cfg, contender):
+        return
+    row = build_row()
+    if row is not None:
+        results.append(row)
+
+
+def _required_contender_for_scenario(s_cfg, ds: dict) -> str | None:
+    contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
+    if not _is_contender_enabled(s_cfg, contender):
+        return None
+    return contender
+
+
 def _is_non_blocking_failure(row: dict) -> bool:
     return str(row.get("contender", "")) in NON_BLOCKING_FAILURE_CONTENDERS
 
@@ -7940,17 +7960,24 @@ def main():
         with _workspace_tempdir(prefix="gam_bench_shared_folds_") as shared_td:
             shared_fold_artifacts = build_shared_fold_artifacts(ds, folds, Path(shared_td))
             if ds["family"] != "survival":
-                results.append(
-                    run_rust_scenario_cv(
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_gam",
+                    lambda: run_rust_scenario_cv(
                         s_cfg,
+                        contender_name="rust_gam",
                         ds=ds,
                         folds=folds,
                         shared_fold_artifacts=shared_fold_artifacts,
-                    )
+                    ),
                 )
                 if ds["family"] == "binomial":
-                    results.append(
-                        run_rust_scenario_cv(
+                    _append_contender_result_if_enabled(
+                        results,
+                        s_cfg,
+                        "rust_gam_flexible",
+                        lambda: run_rust_scenario_cv(
                             s_cfg,
                             contender_name="rust_gam_flexible",
                             ds=ds,
@@ -7959,11 +7986,14 @@ def main():
                             formula_link=_flexible_link_name(
                                 _default_rust_formula_link_for_family(ds["family"])
                             ),
-                        )
+                        ),
                     )
             if _is_matern_rust_scenario(s_cfg):
-                results.append(
-                    run_rust_scenario_cv(
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_matern_decomposed",
+                    lambda: run_rust_scenario_cv(
                         s_cfg,
                         contender_name="rust_matern_decomposed",
                         ds=ds,
@@ -7971,11 +8001,14 @@ def main():
                         shared_fold_artifacts=shared_fold_artifacts,
                         rust_cfg_override={"double_penalty": True},
                         eval_ood=True,
-                    )
+                    ),
                 )
                 if ds["family"] == "binomial":
-                    results.append(
-                        run_rust_scenario_cv(
+                    _append_contender_result_if_enabled(
+                        results,
+                        s_cfg,
+                        "rust_matern_decomposed_flexible",
+                        lambda: run_rust_scenario_cv(
                             s_cfg,
                             contender_name="rust_matern_decomposed_flexible",
                             ds=ds,
@@ -7986,10 +8019,13 @@ def main():
                             formula_link=_flexible_link_name(
                                 _default_rust_formula_link_for_family(ds["family"])
                             ),
-                        )
+                        ),
                     )
-                results.append(
-                    run_rust_scenario_cv(
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_matern_standard",
+                    lambda: run_rust_scenario_cv(
                         s_cfg,
                         contender_name="rust_matern_standard",
                         ds=ds,
@@ -7997,11 +8033,14 @@ def main():
                         shared_fold_artifacts=shared_fold_artifacts,
                         rust_cfg_override={"double_penalty": False},
                         eval_ood=True,
-                    )
+                    ),
                 )
                 if ds["family"] == "binomial":
-                    results.append(
-                        run_rust_scenario_cv(
+                    _append_contender_result_if_enabled(
+                        results,
+                        s_cfg,
+                        "rust_matern_standard_flexible",
+                        lambda: run_rust_scenario_cv(
                             s_cfg,
                             contender_name="rust_matern_standard_flexible",
                             ds=ds,
@@ -8012,11 +8051,14 @@ def main():
                             formula_link=_flexible_link_name(
                                 _default_rust_formula_link_for_family(ds["family"])
                             ),
-                        )
+                        ),
                     )
             if str(s_cfg.get("name", "")).startswith("continuous_order_"):
-                results.append(
-                    run_rust_scenario_cv(
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_continuous_order_probe",
+                    lambda: run_rust_scenario_cv(
                         s_cfg,
                         contender_name="rust_continuous_order_probe",
                         ds=ds,
@@ -8024,22 +8066,28 @@ def main():
                         shared_fold_artifacts=shared_fold_artifacts,
                         rust_cfg_override={"double_penalty": True},
                         collect_continuous_order=True,
-                    )
+                    ),
                 )
             if str(s_cfg.get("name", "")) == "thread3_admixture_cliff":
-                results.append(
-                    run_rust_scenario_cv(
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_thread3_standard_reml",
+                    lambda: run_rust_scenario_cv(
                         s_cfg,
                         contender_name="rust_thread3_standard_reml",
                         ds=ds,
                         folds=folds,
                         shared_fold_artifacts=shared_fold_artifacts,
                         rust_cfg_override={"double_penalty": True},
-                    )
+                    ),
                 )
                 if ds["family"] == "binomial":
-                    results.append(
-                        run_rust_scenario_cv(
+                    _append_contender_result_if_enabled(
+                        results,
+                        s_cfg,
+                        "rust_thread3_standard_reml_flexible",
+                        lambda: run_rust_scenario_cv(
                             s_cfg,
                             contender_name="rust_thread3_standard_reml_flexible",
                             ds=ds,
@@ -8049,10 +8097,13 @@ def main():
                             formula_link=_flexible_link_name(
                                 _default_rust_formula_link_for_family(ds["family"])
                             ),
-                        )
+                        ),
                     )
-                results.append(
-                    run_rust_scenario_cv(
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_thread3_adaptive_reml",
+                    lambda: run_rust_scenario_cv(
                         s_cfg,
                         contender_name="rust_thread3_adaptive_reml",
                         ds=ds,
@@ -8064,11 +8115,14 @@ def main():
                             "--adaptive-regularization",
                             "true",
                         ],
-                    )
+                    ),
                 )
                 if ds["family"] == "binomial":
-                    results.append(
-                        run_rust_scenario_cv(
+                    _append_contender_result_if_enabled(
+                        results,
+                        s_cfg,
+                        "rust_thread3_adaptive_reml_flexible",
+                        lambda: run_rust_scenario_cv(
                             s_cfg,
                             contender_name="rust_thread3_adaptive_reml_flexible",
                             ds=ds,
@@ -8080,13 +8134,21 @@ def main():
                                 "--adaptive-regularization",
                                 "true",
                             ],
-                        )
+                            formula_link=_flexible_link_name(
+                                _default_rust_formula_link_for_family(ds["family"])
+                            ),
+                        ),
                     )
-            rust_gamlss_row = run_rust_gamlss_scenario_cv(
-                s_cfg,
-                ds=ds,
-                folds=folds,
-                shared_fold_artifacts=shared_fold_artifacts,
+            rust_gamlss_row = (
+                run_rust_gamlss_scenario_cv(
+                    s_cfg,
+                    contender_name="rust_gamlss",
+                    ds=ds,
+                    folds=folds,
+                    shared_fold_artifacts=shared_fold_artifacts,
+                )
+                if _is_contender_enabled(s_cfg, "rust_gamlss")
+                else None
             )
             if rust_gamlss_row is not None:
                 results.append(rust_gamlss_row)
@@ -8103,9 +8165,7 @@ def main():
                             shared_fold_artifacts=shared_fold_artifacts,
                         )
                     )
-                if ds["family"] == "binomial" and _is_contender_enabled(
-                    s_cfg, "rust_gamlss_marginal_slope"
-                ):
+                if ds["family"] == "binomial":
                     _ms_cfg = _effective_scenario_fit_mapping(s_cfg["name"]) or {}
                     _ms_extra = (
                         ["--scale-dimensions"] if _ms_cfg.get("scale_dimensions") else None
@@ -8115,15 +8175,16 @@ def main():
                         if _ms_cfg.get("scale_dimensions")
                         else "rust_gamlss_marginal_slope"
                     )
-                    results.append(
-                        run_rust_gamlss_marginal_slope_cv(
-                            s_cfg,
-                            contender_name=_ms_contender,
-                            ds=ds,
-                            folds=folds,
-                            rust_fit_extra_args=_ms_extra,
+                    if _is_contender_enabled(s_cfg, _ms_contender):
+                        results.append(
+                            run_rust_gamlss_marginal_slope_cv(
+                                s_cfg,
+                                contender_name=_ms_contender,
+                                ds=ds,
+                                folds=folds,
+                                rust_fit_extra_args=_ms_extra,
+                            )
                         )
-                    )
             rust_gamlss_surv_row = (
                 run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "rust_gamlss_survival")
@@ -8239,7 +8300,9 @@ def main():
     for s_cfg in scenarios:
         s_name = s_cfg["name"]
         ds = dataset_for_scenario(s_cfg)
-        required_contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
+        required_contender = _required_contender_for_scenario(s_cfg, ds)
+        if required_contender is None:
+            continue
         has_required_ok = any(
             r.get("scenario_name") == s_name
             and r.get("contender") == required_contender

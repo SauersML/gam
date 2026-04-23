@@ -1031,8 +1031,6 @@ impl<'a> RemlState<'a> {
                 let ext_dim = psi_list.len();
                 let k = tk_penalties.len();
                 let total = k + ext_dim;
-                // Ensure the terms.hessian is sized (total, total); the core
-                // returns (k, k) for ρ-only, so we enlarge here.
                 let mut full_hess: Array2<f64> = if let Some(existing) = terms.hessian.take() {
                     if existing.nrows() == total {
                         existing
@@ -1048,12 +1046,6 @@ impl<'a> RemlState<'a> {
                 } else {
                     Array2::<f64>::zeros((total, total))
                 };
-                // Step size for the 4-point mixed-partial FD.  The inner
-                // Newton re-solve gives β̂_plus to ~machine precision, so
-                // the residual error is dominated by the O(ε²) stencil
-                // truncation; ε = 1e-4 keeps the round-off floor well below
-                // the signal magnitude (O(1) TK values × 1e-8 ≈ 1e-8, orders
-                // of magnitude below the test tolerance of 1e-4 relative).
                 let eps = 1e-4_f64;
                 for i in 0..ext_dim {
                     let dir_i = &psi_list[i];
@@ -3670,39 +3662,43 @@ impl<'a> RemlState<'a> {
         let pirls_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
-        let (ext_coords, ext_pair_fn, rho_ext_pair_fn) = if !hyper_dirs.is_empty() {
-            if mode == super::unified::EvalMode::ValueGradientHessian {
-                let (coords, epf, repf) =
-                    self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
-                (coords, Some(epf), Some(repf))
-            } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-                (
-                    self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?,
-                    None,
-                    None,
-                )
-            } else if matches!(
-                bundle.pirls_result.coordinate_frame,
-                pirls::PirlsCoordinateFrame::TransformedQs
-            ) && self
-                .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                .is_none()
-            {
-                (
-                    self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
-                    None,
-                    None,
-                )
+        let (ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) =
+            if !hyper_dirs.is_empty() {
+                if mode == super::unified::EvalMode::ValueGradientHessian {
+                    let (coords, epf, repf, fixed_drift_deriv) =
+                        self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
+                    (coords, Some(epf), Some(repf), fixed_drift_deriv)
+                } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                    (
+                        self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else if matches!(
+                    bundle.pirls_result.coordinate_frame,
+                    pirls::PirlsCoordinateFrame::TransformedQs
+                ) && self
+                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                    .is_none()
+                {
+                    (
+                        self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    (
+                        self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                }
             } else {
-                (
-                    self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
-                    None,
-                    None,
-                )
-            }
-        } else {
-            (Vec::new(), None, None)
-        };
+                (Vec::new(), None, None, None)
+            };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         // Capture ψ-direction TK inputs *before* consuming ext_coords into the
@@ -3846,6 +3842,7 @@ impl<'a> RemlState<'a> {
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
+        assembly.fixed_drift_deriv = fixed_drift_deriv;
         let result = self.assemble_and_evaluate_with_psi_dirs(
             rho,
             &bundle,

@@ -1383,7 +1383,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                              current {current_cost:.6}, halving ψ step"
                         );
                         for (j, &i) in psi_indices.iter().enumerate() {
-                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 2) as i32);
+                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 1) as i32);
                             combined_step[i] = halved;
                         }
                     }
@@ -1393,7 +1393,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                             "[HYBRID-EFS] ψ backtrack {bt}: trial eval failed, halving ψ step"
                         );
                         for (j, &i) in psi_indices.iter().enumerate() {
-                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 2) as i32);
+                            let halved = original_psi_steps[j] * 0.5_f64.powi((bt + 1) as i32);
                             combined_step[i] = halved;
                         }
                     }
@@ -2613,6 +2613,7 @@ fn run_outer_with_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::opt::FixedPointObjective;
     use ndarray::array;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
@@ -3024,6 +3025,77 @@ mod tests {
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 12,
+            psi_dim: 1,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let mut obj = ClosureObjective {
+            state: (),
+            cap: cap.clone(),
+            cost_fn: |_: &mut (), theta: &Array1<f64>| {
+                let psi = theta[11];
+                let cost = if (psi - 0.0).abs() < 1e-12 {
+                    1.0
+                } else if (psi - 0.5).abs() < 1e-12 {
+                    0.5
+                } else {
+                    2.0
+                };
+                Ok(cost)
+            },
+            eval_fn: |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: theta[11].abs(),
+                    gradient: Array1::zeros(theta.len()),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            eval_order_fn: None::<
+                fn(&mut (), &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+            >,
+            reset_fn: None::<fn(&mut ())>,
+            efs_fn: Some(|_: &mut (), theta: &Array1<f64>| {
+                let mut steps = vec![0.0; theta.len()];
+                steps[11] = 1.0;
+                Ok(EfsEval {
+                    cost: 1.0,
+                    steps,
+                    beta: None,
+                    psi_gradient: Some(array![1.0]),
+                    psi_indices: Some(vec![11]),
+                })
+            }),
+        };
+        let mut bridge = OuterFixedPointBridge {
+            obj: &mut obj,
+            layout: cap.theta_layout(),
+            barrier_config: None,
+        };
+
+        let sample = bridge
+            .eval_step(&Array1::zeros(cap.n_params))
+            .expect("hybrid EFS step should backtrack cleanly");
+
+        assert_eq!(sample.status, FixedPointStatus::Continue);
+        assert_eq!(sample.step.len(), cap.n_params);
+        assert_eq!(sample.step[11], 0.5);
+        assert!(
+            sample
+                .step
+                .iter()
+                .enumerate()
+                .all(|(idx, &value)| idx == 11 || value == 0.0)
+        );
     }
 
     #[test]

@@ -303,6 +303,36 @@ fn orthogonal_similarity_transform_faer(
     rotated
 }
 
+fn trace_penalty_in_orthogonal_basis(
+    matrix: &Mat<f64>,
+    block_dim: usize,
+    orthogonal: &Mat<f64>,
+    rotated_eigenvalues: &[f64],
+    delta: f64,
+) -> f64 {
+    let matrix_block = matrix.as_ref().submatrix(0, 0, block_dim, block_dim);
+    let cols = orthogonal.ncols();
+    debug_assert!(rotated_eigenvalues.len() >= cols);
+    let mut projected = Mat::<f64>::zeros(block_dim, cols);
+    matmul(
+        projected.as_mut(),
+        Accum::Replace,
+        matrix_block,
+        orthogonal.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+    let mut trace = KahanSum::default();
+    for l in 0..cols {
+        let mut diag_ll = KahanSum::default();
+        for i in 0..block_dim {
+            diag_ll.add(orthogonal[(i, l)] * projected[(i, l)]);
+        }
+        trace.add(diag_ll.sum() / (rotated_eigenvalues[l] + delta));
+    }
+    trace.sum()
+}
+
 fn clamp_eigenvalues_for_stability(eigenvalues: &mut [f64], context: &str) {
     // Upstream basis builders are expected to construct PSD penalties.
     // This clamp is a downstream numerical cleanup step for machine-scale
@@ -1882,24 +1912,17 @@ pub fn stable_reparameterizationwith_invariant(
 
     for (k, lambda) in lambdas.iter().enumerate() {
         let s_k = &s_k_penalized_cache[k];
-        // Compute tr((S+δI)⁻¹ S_k) via the eigenbasis to avoid precision loss
-        // from materializing s_reg_inv. Each eigencomponent contributes
-        //   (U^T S_k U)_{l,l} / (d_l + δ).
-        let mut trace = KahanSum::default();
-        for l in 0..penalized_rank {
-            let inv_d = 1.0 / (range_eigs_sorted[l] + delta);
-            let mut diag_ll = KahanSum::default();
-            for i in 0..penalized_rank {
-                let u_i = range_rotation[(i, l)];
-                let mut row_dot = KahanSum::default();
-                for j in 0..penalized_rank {
-                    row_dot.add(s_k[(i, j)] * range_rotation[(j, l)]);
-                }
-                diag_ll.add(u_i * row_dot.sum());
-            }
-            trace.add(inv_d * diag_ll.sum());
-        }
-        det1vec[k] = *lambda * trace.sum();
+        // Compute tr((S+δI)⁻¹ S_k) in the range eigenbasis without ever
+        // materializing (S+δI)⁻¹. Using faer's matmul keeps this contraction
+        // aligned with the orthogonal-similarity debug reference path.
+        let trace = trace_penalty_in_orthogonal_basis(
+            s_k,
+            penalized_rank,
+            &range_rotation,
+            &range_eigs_sorted,
+            delta,
+        );
+        det1vec[k] = *lambda * trace;
     }
 
     #[cfg(debug_assertions)]

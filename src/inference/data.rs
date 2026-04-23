@@ -960,6 +960,9 @@ pub fn encode_recordswith_inferred_schema(
     headers: Vec<String>,
     records: Vec<StringRecord>,
 ) -> Result<EncodedDataset, String> {
+    if records.is_empty() {
+        return Err("table data cannot be empty".to_string());
+    }
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(headers.len());
     for (j, name) in headers.iter().enumerate() {
         schema_cols.push(infer_schema_column(name, &records, j)?);
@@ -977,6 +980,9 @@ pub fn encode_recordswith_schema(
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<EncodedDataset, String> {
     let n = records.len();
+    if n == 0 {
+        return Err("table data cannot be empty".to_string());
+    }
     let p = headers.len();
     let mut values = Array2::<f64>::zeros((n, p));
     let schema_byname: HashMap<&str, &SchemaColumn> = schema
@@ -1139,4 +1145,30 @@ fn infer_schema_column(
             Vec::new()
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_records_rejects_empty_input() {
+        let headers = vec!["x".to_string()];
+        let schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "x".to_string(),
+                kind: ColumnKindTag::Continuous,
+                levels: Vec::new(),
+            }],
+        };
+
+        let err = encode_recordswith_inferred_schema(headers.clone(), Vec::new())
+            .expect_err("empty inferred records should error");
+        assert_eq!(err, "table data cannot be empty");
+
+        let err =
+            encode_recordswith_schema(headers, Vec::new(), &schema, UnseenCategoryPolicy::Error)
+                .expect_err("empty schema-guided records should error");
+        assert_eq!(err, "table data cannot be empty");
+    }
 }

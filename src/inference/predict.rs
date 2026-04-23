@@ -2679,6 +2679,69 @@ impl PredictableModel for BinomialLocationScalePredictor {
 /// The "design" in `PredictInput` is the threshold design matrix, and
 /// "design_noise" is the log-sigma design matrix. The time dimension
 /// (x_time_exit) is handled externally and is not part of this predictor.
+const SURVIVAL_EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
+
+#[inline]
+fn survival_inverse_sigma_from_eta_log_sigma(eta_log_sigma: f64) -> f64 {
+    (-eta_log_sigma).min(SURVIVAL_EXP_NEG_STABLE_MAX_ARG).exp()
+}
+
+#[inline]
+fn survival_q0_and_inverse_sigma(eta_threshold: f64, eta_log_sigma: f64) -> (f64, f64) {
+    let inv_sigma = survival_inverse_sigma_from_eta_log_sigma(eta_log_sigma);
+    if eta_threshold == 0.0 {
+        return (0.0, inv_sigma);
+    }
+    let log_abs = eta_threshold.abs().ln() + (-eta_log_sigma).min(SURVIVAL_EXP_NEG_STABLE_MAX_ARG);
+    let q0 = if log_abs > SURVIVAL_EXP_NEG_STABLE_MAX_ARG {
+        if eta_threshold > 0.0 {
+            -f64::MAX
+        } else {
+            f64::MAX
+        }
+    } else {
+        -eta_threshold * inv_sigma
+    };
+    (q0, inv_sigma)
+}
+
+#[inline]
+fn survival_tail_value_from_failure_jet(
+    inverse_link: &InverseLink,
+    eta: f64,
+    failure_jet: &InverseLinkJet,
+) -> f64 {
+    match inverse_link {
+        InverseLink::Standard(crate::types::LinkFunction::Probit) => {
+            if eta.is_nan() {
+                f64::NAN
+            } else if eta == f64::INFINITY {
+                0.0
+            } else if eta == f64::NEG_INFINITY {
+                1.0
+            } else {
+                0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2)
+            }
+        }
+        InverseLink::Standard(crate::types::LinkFunction::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(crate::types::LinkFunction::CLogLog) => (-(eta.exp())).exp(),
+        _ => (1.0 - failure_jet.mu).clamp(0.0, 1.0),
+    }
+}
+
+#[inline]
+fn inverse_link_survival_tail_value_and_failure_density(
+    inverse_link: &InverseLink,
+    eta: f64,
+) -> Result<(f64, f64), EstimationError> {
+    let failure_jet =
+        crate::solver::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)?;
+    Ok((
+        survival_tail_value_from_failure_jet(inverse_link, eta, &failure_jet).clamp(0.0, 1.0),
+        failure_jet.d1,
+    ))
+}
+
 pub struct SurvivalPredictor {
     pub beta_threshold: Array1<f64>,
     pub beta_log_sigma: Array1<f64>,
@@ -2725,16 +2788,12 @@ impl SurvivalPredictor {
         eta_log_sigma: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = eta_threshold.len();
-        let strategy = strategy_for_family(
-            crate::types::LikelihoodFamily::BinomialProbit,
-            Some(&self.inverse_link),
-        );
         let mut survival_prob = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let q0 = -eta_threshold[i] * (-eta_log_sigma[i]).exp();
-            // survival = 1 - F(q0) = F(-q0)
-            let jet = strategy.inverse_link_jet(-q0)?;
-            survival_prob[i] = jet.mu.clamp(0.0, 1.0);
+            let (q0, _) = survival_q0_and_inverse_sigma(eta_threshold[i], eta_log_sigma[i]);
+            let (survival, _) =
+                inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q0)?;
+            survival_prob[i] = survival;
         }
         Ok(survival_prob)
     }
@@ -2797,10 +2856,6 @@ impl PredictableModel for SurvivalPredictor {
             )?;
 
             // Delta-method SE for survival probability.
-            let strategy = strategy_for_family(
-                crate::types::LikelihoodFamily::BinomialProbit,
-                Some(&self.inverse_link),
-            );
             let mean_se_vec = linear_predictor_se_from_backend(&backend, n, |rows| {
                 let x_t = design_row_chunk(&input.design, rows.clone())?;
                 let x_s = design_row_chunk(design_noise, rows.clone())?;
@@ -2809,12 +2864,16 @@ impl PredictableModel for SurvivalPredictor {
                 let rows_in_chunk = eta_t_chunk.len();
                 let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
                 for i in 0..rows_in_chunk {
-                    let inv_sigma = (-eta_ls_chunk[i]).exp();
-                    let q0 = -eta_t_chunk[i] * inv_sigma;
-                    let jet = strategy.inverse_link_jet(-q0).map_err(|e| e.to_string())?;
-                    let phi_neg_q0 = jet.d1;
-                    let dsurv_deta_t = phi_neg_q0 * inv_sigma;
-                    let dsurv_deta_s = -phi_neg_q0 * eta_t_chunk[i] * inv_sigma;
+                    let (q0, inv_sigma) =
+                        survival_q0_and_inverse_sigma(eta_t_chunk[i], eta_ls_chunk[i]);
+                    let (_, failure_density) =
+                        inverse_link_survival_tail_value_and_failure_density(
+                            &self.inverse_link,
+                            q0,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let dsurv_deta_t = failure_density * inv_sigma;
+                    let dsurv_deta_s = failure_density * q0;
                     for j in 0..p_t {
                         grad[[i, j]] = dsurv_deta_t * x_t[[i, j]];
                     }
@@ -2954,13 +3013,13 @@ impl PredictableModel for SurvivalPredictor {
                             [cov_ts[i], var_s[i].max(0.0)],
                         ],
                         |threshold, log_sigma| {
-                            let survival_eta = threshold * (-log_sigma).exp();
-                            let jet =
-                                crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                            let (q0, _) = survival_q0_and_inverse_sigma(threshold, log_sigma);
+                            let (survival, _) =
+                                inverse_link_survival_tail_value_and_failure_density(
                                     &self.inverse_link,
-                                    survival_eta,
+                                    q0,
                                 )?;
-                            Ok(jet.mu.clamp(0.0, 1.0))
+                            Ok(survival)
                         },
                     )
                 })
@@ -3915,6 +3974,58 @@ mod tests {
         .expect("gaussian location-scale fit")
     }
 
+    fn survival_fit_with_covariance(
+        beta_threshold: Array1<f64>,
+        beta_log_sigma: Array1<f64>,
+        covariance: Array2<f64>,
+    ) -> UnifiedFitResult {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![
+                FittedBlock {
+                    beta: beta_threshold,
+                    role: BlockRole::Threshold,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: beta_log_sigma,
+                    role: BlockRole::Scale,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            likelihood_family: Some(crate::types::LikelihoodFamily::RoystonParmar),
+            likelihood_scale: crate::types::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: Some(covariance),
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts {
+                pirls: None,
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        })
+        .expect("survival fit")
+    }
+
     #[test]
     fn predict_posterior_mean_probit_matches_closed_form_reference() {
         let x = array![[1.0], [1.0]];
@@ -4416,5 +4527,86 @@ mod tests {
             .expect("survival uncertainty");
         let eta_se = out.eta_se.expect("eta_se should be present");
         assert!((eta_se[0] - 3.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn survival_predictor_cloglog_point_and_se_use_upper_tail_at_q0() {
+        let predictor = SurvivalPredictor {
+            beta_threshold: array![-1.0],
+            beta_log_sigma: array![0.0],
+            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            covariance: Some(array![[4.0, 0.0], [0.0, 0.0]]),
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]),
+            auxiliary_scalar: None,
+        };
+
+        let out = predictor
+            .predict_with_uncertainty(&input)
+            .expect("cloglog survival prediction");
+        let q0 = 1.0_f64;
+        let expected_survival = (-(q0.exp())).exp();
+        let expected_mean_se = 2.0 * (q0 - q0.exp()).exp();
+
+        assert!((out.mean[0] - expected_survival).abs() <= 1e-12);
+        assert!(
+            (out.mean_se.expect("mean_se should be present")[0] - expected_mean_se).abs() <= 1e-12
+        );
+    }
+
+    #[test]
+    fn survival_predictor_cloglog_posterior_mean_zero_covariance_matches_point_prediction() {
+        let predictor = SurvivalPredictor {
+            beta_threshold: array![-1.0],
+            beta_log_sigma: array![0.0],
+            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            covariance: Some(Array2::zeros((2, 2))),
+        };
+        let fit = survival_fit_with_covariance(array![-1.0], array![0.0], Array2::zeros((2, 2)));
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]),
+            auxiliary_scalar: None,
+        };
+
+        let point = predictor
+            .predict_plugin_response(&input)
+            .expect("cloglog survival point prediction");
+        let posterior = predictor
+            .predict_posterior_mean(&input, &fit, None)
+            .expect("cloglog survival posterior mean");
+
+        assert!((posterior.mean[0] - point.mean[0]).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn survival_predictor_zero_threshold_with_tiny_sigma_stays_finite() {
+        let predictor = SurvivalPredictor {
+            beta_threshold: array![0.0],
+            beta_log_sigma: array![0.0],
+            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            covariance: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![-1000.0]),
+            auxiliary_scalar: None,
+        };
+
+        let point = predictor
+            .predict_plugin_response(&input)
+            .expect("cloglog survival point prediction");
+        let expected = (-1.0_f64).exp();
+
+        assert!(point.mean[0].is_finite());
+        assert!((point.mean[0] - expected).abs() <= 1e-12);
     }
 }

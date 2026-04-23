@@ -1402,16 +1402,15 @@ fn cloglog_survival_extreme_asymptotic(
 
 // ── Exact Gumbel survival primitives ─────────────────────────────────────
 //
-// The Gumbel survival function S(x) = exp(-exp(x)) and its derivative
-// S'(x) = exp(x)·exp(-exp(x)) are the building blocks for the cloglog
-// link and all survival transforms.  These two functions are exact for ALL
-// finite x under IEEE 754 without any clamping:
+// The Gumbel survival function S(x) = exp(-exp(x)) is the complement of the
+// cloglog mean μ(x) = 1 - S(x). Both are exact for ALL finite x under IEEE 754
+// without any clamping:
 //
-//   x → -∞: exp(x) → 0,    S → exp(-0) = 1,  S' → 0·1 = 0
-//   x → +∞: exp(x) → +∞,   S → exp(-∞) = 0,  S' → ∞·0 = 0
+//   x → -∞: exp(x) → 0,    S → exp(-0) = 1,  μ' → 0·1 = 0
+//   x → +∞: exp(x) → +∞,   S → exp(-∞) = 0,  μ' → ∞·0 = 0
 //
-// The only subtlety is in S': when x > 709, exp(x) overflows to +∞,
-// and ∞ · 0 = NaN.  But x - exp(x) → -∞ for any x > 0, so S' = 0.
+// The only subtlety is in μ': when x > 709, exp(x) overflows to +∞,
+// and ∞ · 0 = NaN. But x - exp(x) → -∞ for any x > 0, so μ' = 0.
 // We detect the intermediate overflow and return 0.0 exactly.
 
 /// Exact Gumbel survival: S(x) = exp(-exp(x)).
@@ -1424,12 +1423,12 @@ fn gumbel_survival(x: f64) -> f64 {
     (-x.exp()).exp()
 }
 
-/// Exact Gumbel survival derivative: S'(x) = exp(x) · exp(-exp(x)).
+/// Exact cloglog mean derivative: μ'(x) = exp(x) · exp(-exp(x)) = -S'(x).
 ///
 /// Handles intermediate overflow: when exp(x) = ∞, the true derivative
 /// is 0 (double-exponential decay dominates), so we return 0.0.
 #[inline]
-fn gumbel_survival_d1(x: f64) -> f64 {
+fn cloglog_mean_d1_exact(x: f64) -> f64 {
     let ex = x.exp();
     if ex.is_infinite() {
         0.0
@@ -1485,7 +1484,7 @@ fn cloglog_negative_tail_mean(eta: f64) -> f64 {
 
 /// Pointwise cloglog derivative dμ/dη in the deep negative tail.
 ///
-/// Production code now uses `gumbel_survival_d1` which is exact for all
+/// Production code now uses `cloglog_mean_d1_exact` which is exact for all
 /// finite x.  This function is retained for its dedicated unit test.
 #[cfg(test)]
 #[inline]
@@ -1527,7 +1526,7 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     if sigma <= CLOGLOG_SIGMA_DEGENERATE {
         return IntegratedMeanDerivative {
             mean: cloglog_mean_exact(mu),
-            dmean_dmu: gumbel_survival_d1(mu),
+            dmean_dmu: cloglog_mean_d1_exact(mu),
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
@@ -1612,13 +1611,13 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     if sigma < 1e-10 {
         return IntegratedMeanDerivative {
             mean: cloglog_mean_exact(mu),
-            dmean_dmu: gumbel_survival_d1(mu),
+            dmean_dmu: cloglog_mean_d1_exact(mu),
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
     let dmean_dmu =
-        integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| gumbel_survival_d1(x)).max(0.0);
+        integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| cloglog_mean_d1_exact(x)).max(0.0);
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -2406,9 +2405,9 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
             // cloglog_mean_exact uses expm1 to avoid 1 − 1 cancellation for
             // all mu, and handles exp overflow (mu > 709) via expm1(-∞) = −1.
             mean: cloglog_mean_exact(mu),
-            // gumbel_survival_d1 is exact for all finite mu: it detects
+            // cloglog_mean_d1_exact is exact for all finite mu: it detects
             // intermediate exp overflow and returns 0.0 (correct limit).
-            dmean_dmu: gumbel_survival_d1(mu),
+            dmean_dmu: cloglog_mean_d1_exact(mu),
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
@@ -4909,7 +4908,7 @@ mod tests {
 
     fn cloglog_reference_mean_and_derivative(mu: f64, sigma: f64) -> (f64, f64) {
         if sigma <= CLOGLOG_SIGMA_DEGENERATE {
-            return (cloglog_mean_exact(mu), gumbel_survival_d1(mu));
+            return (cloglog_mean_exact(mu), cloglog_mean_d1_exact(mu));
         }
 
         // Independent reference: exact pointwise cloglog mean/derivative
@@ -4924,7 +4923,7 @@ mod tests {
         });
         let deriv = simpson_integrate(-z_max, z_max, n_intervals, |z| {
             let eta = mu + sigma * z;
-            inv_sqrt_2pi * (-0.5 * z * z).exp() * gumbel_survival_d1(eta)
+            inv_sqrt_2pi * (-0.5 * z * z).exp() * cloglog_mean_d1_exact(eta)
         });
         (mean, deriv)
     }
@@ -5012,7 +5011,7 @@ mod tests {
         );
         assert_relative_eq!(
             out.dmean_dmu,
-            gumbel_survival_d1(mu),
+            cloglog_mean_d1_exact(mu),
             epsilon = 1e-30,
             max_relative = 1e-15
         );
@@ -5179,7 +5178,7 @@ mod tests {
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
             let eta = mu + sigma * z;
             mean_mc += cloglog_mean_exact(eta);
-            deriv_mc += gumbel_survival_d1(eta);
+            deriv_mc += cloglog_mean_d1_exact(eta);
         }
         mean_mc /= n_samples as f64;
         deriv_mc /= n_samples as f64;
@@ -5636,7 +5635,7 @@ mod tests {
             );
             assert_relative_eq!(
                 out.dmean_dmu,
-                gumbel_survival_d1(mu),
+                cloglog_mean_d1_exact(mu),
                 epsilon = 1e-28,
                 max_relative = 1e-15
             );

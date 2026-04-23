@@ -291,7 +291,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                 _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
                 _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
                 _RUN_SUITE._is_contender_enabled = (
-                    lambda _scenario, contender: contender == "rust_gamlss_survival"
+                    lambda _scenario, contender: contender == "rust_thread3_adaptive_reml"
                 )
                 _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
                 _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
@@ -309,6 +309,80 @@ class RunSuiteMappingTests(unittest.TestCase):
 
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0], ["--adaptive-regularization", "true"])
+
+    def test_thread3_adaptive_flexible_passes_flexible_formula_link(self) -> None:
+        seen_formula_links = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_datapoint_figures = _RUN_SUITE.generate_scenario_datapoint_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _fake_run_rust_scenario_cv(*args, **kwargs):
+                if kwargs.get("contender_name") == "rust_thread3_adaptive_reml_flexible":
+                    seen_formula_links.append(kwargs.get("formula_link"))
+                return {
+                    "status": "ok",
+                    "scenario_name": "thread3_admixture_cliff",
+                    "contender": kwargs.get("contender_name", "rust_gam"),
+                    "model_spec": "5-fold CV",
+                    "evaluation": "5-fold CV",
+                }
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                scenario_path.write_text(json.dumps({"scenarios": [{"name": "thread3_admixture_cliff"}]}))
+
+                _RUN_SUITE.run_rust_scenario_cv = _fake_run_rust_scenario_cv
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"y": 0.0, "pc1": 0.0}],
+                    "features": ["pc1"],
+                    "target": "y",
+                    "family": "binomial",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                _RUN_SUITE._is_contender_enabled = lambda _scenario, contender: contender in {
+                    "rust_gam",
+                    "rust_thread3_adaptive_reml_flexible",
+                }
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.generate_scenario_datapoint_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.generate_scenario_datapoint_figures = orig_datapoint_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertEqual(
+            seen_formula_links,
+            [
+                _RUN_SUITE._flexible_link_name(
+                    _RUN_SUITE._default_rust_formula_link_for_family("binomial")
+                )
+            ],
+        )
 
     def test_survival_benchmark_fit_options_require_structural_ispline_basis(self) -> None:
         expected = {
@@ -531,7 +605,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                 _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
                 _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
                 _RUN_SUITE._is_contender_enabled = (
-                    lambda _scenario, contender: contender in {"rust_gam_sas", "rust_gamlss_survival"}
+                    lambda _scenario, contender: contender in {"rust_gam", "rust_gamlss"}
                 )
                 _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
                 _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
@@ -628,6 +702,211 @@ class RunSuiteMappingTests(unittest.TestCase):
             _RUN_SUITE.zip_figure_dir = orig_zip
 
         self.assertEqual(seen_survival, ["rust_gamlss_survival"])
+
+    def test_main_does_not_require_excluded_core_rust_contenders(self) -> None:
+        seen = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_run_gamlss = _RUN_SUITE.run_rust_gamlss_scenario_cv
+        orig_run_gamlss_marginal_slope = _RUN_SUITE.run_rust_gamlss_marginal_slope_cv
+        orig_run_gamlss_survival = _RUN_SUITE.run_rust_gamlss_survival_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_datapoint_figures = _RUN_SUITE.generate_scenario_datapoint_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _unexpected_runner(*args, **kwargs):
+                contender = kwargs.get("contender_name", "unknown")
+                seen.append(contender)
+                raise AssertionError(f"excluded contender scheduled: {contender}")
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                exclude_contenders = [
+                    "rust_gam",
+                    "rust_gam_flexible",
+                    "rust_gamlss",
+                    "rust_gamlss_flexible",
+                    "rust_gamlss_marginal_slope",
+                    "rust_gamlss_marginal_slope_aniso",
+                    "r_gamlss",
+                    "r_mgcv",
+                    "r_mgcv_gaulss",
+                    "r_gamboostlss",
+                    "r_bamlss",
+                    "r_brms",
+                ]
+                scenario_path.write_text(
+                    json.dumps(
+                        {
+                            "scenarios": [
+                                {
+                                    "name": "geo_subpop16_margslope_aniso_duchon16d_k50",
+                                    "exclude_contenders": exclude_contenders,
+                                }
+                            ]
+                        }
+                    )
+                )
+
+                _RUN_SUITE.run_rust_scenario_cv = _unexpected_runner
+                _RUN_SUITE.run_rust_gamlss_scenario_cv = _unexpected_runner
+                _RUN_SUITE.run_rust_gamlss_marginal_slope_cv = _unexpected_runner
+                _RUN_SUITE.run_rust_gamlss_survival_cv = _unexpected_runner
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"y": 0.0, "pc1": 0.0}],
+                    "features": ["pc1"],
+                    "target": "y",
+                    "family": "binomial",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                excluded = set(exclude_contenders)
+                _RUN_SUITE._is_contender_enabled = lambda _scenario, contender: contender not in (
+                    excluded
+                    | {
+                        "rust_gamlss_survival",
+                        "rust_gamlss_survival_marginal_slope",
+                        "r_mgcv_coxph",
+                        "python_sksurv_rsf",
+                        "python_sksurv_coxnet",
+                        "python_lifelines_coxph_enet",
+                        "r_glmnet_cox",
+                        "python_sksurv_gb_coxph",
+                        "python_sksurv_componentwise_gb_coxph",
+                        "python_lifelines_weibull_aft",
+                        "python_lifelines_lognormal_aft",
+                        "python_xgboost_aft",
+                    }
+                )
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.generate_scenario_datapoint_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+                payload = json.loads(out_path.read_text())
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.run_rust_gamlss_scenario_cv = orig_run_gamlss
+            _RUN_SUITE.run_rust_gamlss_marginal_slope_cv = orig_run_gamlss_marginal_slope
+            _RUN_SUITE.run_rust_gamlss_survival_cv = orig_run_gamlss_survival
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.generate_scenario_datapoint_figures = orig_datapoint_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertEqual(seen, [])
+        self.assertEqual(payload["results"], [])
+
+    def test_main_skips_excluded_aniso_marginal_slope_contender(self) -> None:
+        seen = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_run_gamlss = _RUN_SUITE.run_rust_gamlss_scenario_cv
+        orig_run_gamlss_marginal_slope = _RUN_SUITE.run_rust_gamlss_marginal_slope_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_datapoint_figures = _RUN_SUITE.generate_scenario_datapoint_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _fake_run_rust_gamlss_scenario_cv(*args, **kwargs):
+                return {
+                    "status": "ok",
+                    "scenario_name": "geo_subpop16_margslope_aniso_duchon16d_k50",
+                    "contender": kwargs.get("contender_name", "rust_gamlss"),
+                    "model_spec": "5-fold CV",
+                    "evaluation": "5-fold CV",
+                }
+
+            def _unexpected_marginal_slope(*args, **kwargs):
+                contender = kwargs.get("contender_name", "unknown")
+                seen.append(contender)
+                raise AssertionError(f"excluded contender scheduled: {contender}")
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                scenario_path.write_text(
+                    json.dumps(
+                        {
+                            "scenarios": [
+                                {
+                                    "name": "geo_subpop16_margslope_aniso_duchon16d_k50",
+                                    "exclude_contenders": ["rust_gamlss_marginal_slope_aniso"],
+                                }
+                            ]
+                        }
+                    )
+                )
+
+                _RUN_SUITE.run_rust_scenario_cv = lambda *args, **kwargs: {
+                    "status": "ok",
+                    "scenario_name": "geo_subpop16_margslope_aniso_duchon16d_k50",
+                    "contender": kwargs.get("contender_name", "rust_gam"),
+                    "model_spec": "5-fold CV",
+                    "evaluation": "5-fold CV",
+                }
+                _RUN_SUITE.run_rust_gamlss_scenario_cv = _fake_run_rust_gamlss_scenario_cv
+                _RUN_SUITE.run_rust_gamlss_marginal_slope_cv = _unexpected_marginal_slope
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"y": 0.0, "pc1": 0.0}],
+                    "features": ["pc1"],
+                    "target": "y",
+                    "family": "binomial",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                enabled = {"rust_gam", "rust_gamlss"}
+                _RUN_SUITE._is_contender_enabled = (
+                    lambda scenario, contender: contender in enabled
+                    and contender not in set(scenario.get("exclude_contenders", []))
+                )
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.generate_scenario_datapoint_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.run_rust_gamlss_scenario_cv = orig_run_gamlss
+            _RUN_SUITE.run_rust_gamlss_marginal_slope_cv = orig_run_gamlss_marginal_slope
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.generate_scenario_datapoint_figures = orig_datapoint_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertEqual(seen, [])
 
 
 if __name__ == "__main__":

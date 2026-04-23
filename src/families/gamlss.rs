@@ -3644,11 +3644,20 @@ fn binomial_neglog_q_derivatives_cloglog_closed_form(
     }
     let z = q.exp(); // z = e^q; may be large but that's handled below
     let h = cloglog_stable_h(z);
+    let y0 = 1.0 - y;
+    let y0_term = if y0 == 0.0 { 0.0 } else { y0 * z };
 
     // y=0 branch: all derivatives equal w*z (since F_{y=0} = w*e^q).
     // y=1 branch: uses the h-polynomial forms.
     // General y: linear combination.
-    let y0_term = (1.0 - y) * z; // common y=0 contribution to each derivative
+    //
+    // Once h rounds to 0, the y=1 contribution has already underflowed to 0
+    // in f64. Returning the remaining y=0 branch here avoids 0 * inf products
+    // when q is deep in the right tail.
+    if y == 0.0 || h == 0.0 {
+        let base = weight * y0_term;
+        return (base, base, base);
+    }
 
     let m1 = weight * (y0_term - y * h);
     let m2 = weight * (y0_term + y * h * (h + z - 1.0));
@@ -3666,7 +3675,11 @@ fn binomial_neglog_q_fourth_derivative_cloglog_closed_form(y: f64, weight: f64, 
     }
     let z = q.exp();
     let h = cloglog_stable_h(z);
-    let y0_term = (1.0 - y) * z;
+    let y0 = 1.0 - y;
+    let y0_term = if y0 == 0.0 { 0.0 } else { y0 * z };
+    if y == 0.0 || h == 0.0 {
+        return weight * y0_term;
+    }
     let h2 = h * h;
     let h3 = h2 * h;
     let z2 = z * z;
@@ -15739,6 +15752,36 @@ mod tests {
             firstweights.objective_psirow[0],
             expected_score_ls
         );
+    }
+
+    #[test]
+    fn cloglog_binomial_right_tail_derivatives_stay_finite() {
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_cloglog_closed_form(1.0, 1.0, 1000.0);
+        let m4 = binomial_neglog_q_fourth_derivative_cloglog_closed_form(1.0, 1.0, 300.0);
+
+        assert_eq!(m1, 0.0);
+        assert_eq!(m2, 0.0);
+        assert_eq!(m3, 0.0);
+        assert_eq!(m4, 0.0);
+    }
+
+    #[test]
+    fn cloglog_binomial_fractional_right_tail_keeps_y0_branch() {
+        let y = 0.25;
+        let weight = 2.0;
+        let q = 300.0;
+        let expected = weight * (1.0 - y) * q.exp();
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_cloglog_closed_form(y, weight, q);
+        let m4 = binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, weight, q);
+
+        assert!(m1.is_finite());
+        assert!(m2.is_finite());
+        assert!(m3.is_finite());
+        assert!(m4.is_finite());
+        assert_eq!(m1, expected);
+        assert_eq!(m2, expected);
+        assert_eq!(m3, expected);
+        assert_eq!(m4, expected);
     }
 
     #[test]
