@@ -4116,6 +4116,70 @@ impl<'a> RemlState<'a> {
         Ok(())
     }
 
+    /// Rotate link-parameter `HyperCoord`s from the PIRLS transformed basis
+    /// into the original coefficient basis, gated on the same predicate
+    /// `build_auto_assembly` uses to select `build_dense_original_assembly`.
+    ///
+    /// The SAS / mixture / beta-logistic link-ext builders
+    /// (`build_sas_link_ext_coords`, `build_mixture_link_ext_coords`) form
+    /// `g_j = −X_tᵀ·du/dθ_j` and `B_j = X_tᵀ·diag(dW/dθ_j)·X_t` from
+    /// `pirls_result.x_transformed`, i.e. in the transformed basis.  When
+    /// PIRLS is in `TransformedQs` with no active constraints,
+    /// `build_auto_assembly` routes through `build_dense_original_assembly`
+    /// — which reports `β` and `H` in the ORIGINAL basis.  Attaching
+    /// transformed-basis `(g_j, B_j)` to an original-basis assembly would
+    /// evaluate `coord.g·β` and `coord.drift·v` across mismatched frames.
+    ///
+    /// Under an orthogonal rotation `Qs` with `β_original = Qs·β_transformed`
+    /// (matching `sparse_exact_beta_original` /
+    /// `bundle_matrix_in_original_basis`), the covariant / bilinear
+    /// transformation laws give
+    ///
+    ///   g_original = Qs · g_transformed                   (covariant vector)
+    ///   B_original = Qs · B_transformed · Qsᵀ            (bilinear form)
+    ///
+    /// derived from scalar invariance `⟨g_o, β_o⟩ = ⟨g_t, β_t⟩` and
+    /// `β_oᵀ B_o β_o = β_tᵀ B_t β_t`, both under `β_o = Qs β_t`.
+    ///
+    /// Scalars (`a`, `ld_s`) and semantic flags (`b_depends_on_beta`,
+    /// `is_penalty_like`) are basis-invariant by construction.  The
+    /// `HyperCoordDrift::block_local` and `operator` variants are never
+    /// emitted by the link-ext builders (they use only `from_dense`), so
+    /// only `drift.dense` needs rotation.
+    fn rotate_link_ext_coords_to_original(
+        &self,
+        bundle: &EvalShared,
+        coords: &mut [super::unified::HyperCoord],
+    ) {
+        if coords.is_empty() {
+            return;
+        }
+        let pirls_result = bundle.pirls_result.as_ref();
+        let needs_rotation = matches!(
+            pirls_result.coordinate_frame,
+            pirls::PirlsCoordinateFrame::TransformedQs
+        ) && self
+            .active_constraint_free_basis(pirls_result)
+            .is_none();
+        if !needs_rotation {
+            return;
+        }
+        let qs = &pirls_result.reparam_result.qs;
+        let qs_t = qs.t();
+        for coord in coords.iter_mut() {
+            if coord.g.len() == qs.nrows() {
+                coord.g = qs.dot(&coord.g);
+            }
+            if let Some(b) = coord.drift.dense.as_mut() {
+                if b.nrows() == qs.nrows() && b.ncols() == qs.nrows() {
+                    // B_original = Qs · B_transformed · Qsᵀ
+                    let tmp = qs.dot(&*b);
+                    *b = tmp.dot(&qs_t);
+                }
+            }
+        }
+    }
+
     pub fn evaluate_unified_with_link_ext(
         &self,
         rho: &Array1<f64>,
@@ -4123,11 +4187,16 @@ impl<'a> RemlState<'a> {
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
-        let ext_coords = self.build_link_ext_coords(&bundle)?;
+        let mut ext_coords = self.build_link_ext_coords(&bundle)?;
 
         if ext_coords.is_empty() {
             return self.evaluate_unified(rho, &bundle, mode);
         }
+
+        // Rotate link-ext coords to match the basis `build_auto_assembly`
+        // will pick for the assembly (original basis under TransformedQs +
+        // no active constraints).  See `rotate_link_ext_coords_to_original`.
+        self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords);
 
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, true)?;
         assembly.ext_coords = ext_coords;
@@ -4141,11 +4210,17 @@ impl<'a> RemlState<'a> {
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
-        let ext_coords = self.build_link_ext_coords(&bundle)?;
+        let mut ext_coords = self.build_link_ext_coords(&bundle)?;
 
         if ext_coords.is_empty() {
             return self.compute_efs_steps(rho);
         }
+
+        // Same rotation gate as `evaluate_unified_with_link_ext`: the EFS
+        // path eventually builds its assembly via `build_auto_assembly`
+        // inside `evaluate_efs`, which picks original basis under the same
+        // predicate.
+        self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords);
 
         self.evaluate_efs(rho, &bundle, ext_coords)
     }
