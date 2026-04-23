@@ -3414,28 +3414,48 @@ impl<'a> RemlState<'a> {
     /// Build an `InnerAssembly` by auto-detecting the backend.
     ///
     /// - Sparse-exact SPD  → `build_sparse_assembly`
-    /// - QS-transformed + unconstrained + ext_coords being injected → `build_dense_original_assembly`
-    /// - Otherwise → `build_dense_assembly`
+    /// - QS-transformed + unconstrained (with or without ext_coords)
+    ///     → `build_dense_original_assembly`
+    /// - Otherwise → `build_dense_assembly` (used only when active
+    ///     inequality constraints force evaluation in the transformed frame)
     ///
-    /// The QS-original dispatch only fires when `has_ext` is true,
-    /// because ext_coord derivatives (ψ) are computed in original coordinates.
+    /// Coordinate-frame correctness.
+    /// `self.canonical_penalties` — which `build_penalty_coords()` feeds into
+    /// the outer gradient as `PenaltyCoordinate::{DenseRoot, BlockRoot}` — is
+    /// stored in the ORIGINAL (pre-`Qs`) coefficient basis. PIRLS, however,
+    /// runs in the QS-transformed frame and reports `β_transformed =
+    /// Qsᵀ · β_original`. If we hand the assembly `β_transformed` together
+    /// with original-basis penalty roots, then `coord.apply_penalty(β, λ)`
+    /// silently returns `λ · S_orig · β_t`, which is **not** a valid
+    /// `∂(½ βᵀ Sβ)/∂ρₖ` in any single basis (the scalar `βᵀSβ` is invariant,
+    /// but `Sβ` is not). That inconsistency is what starved BFGS of descent
+    /// steps on large-n binomial+logit — only 2/200 line searches accepted —
+    /// because the analytic gradient disagreed with the cost by a term that
+    /// grew with the off-diagonal structure of `Qs`.
+    ///
+    /// Dispatching the unconstrained dense path through
+    /// `build_dense_original_assembly` keeps `β`, the Hessian operator, the
+    /// GLM derivative design, and the penalty coordinates all in the same
+    /// (original) basis, restoring cost–gradient consistency. The only path
+    /// that still needs `build_dense_assembly` is the monotonicity/active-set
+    /// branch, where `free_basis_opt` already rotates everything into a
+    /// reduced QS subspace (and the original-basis penalty-coord fast path
+    /// isn't wired through the projected `Z` matrix yet).
     fn build_auto_assembly(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
-        has_ext: bool,
+        _has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
-        } else if has_ext
-            && matches!(
-                bundle.pirls_result.coordinate_frame,
-                pirls::PirlsCoordinateFrame::TransformedQs
-            )
-            && self
-                .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                .is_none()
+        } else if matches!(
+            bundle.pirls_result.coordinate_frame,
+            pirls::PirlsCoordinateFrame::TransformedQs
+        ) && self
+            .active_constraint_free_basis(bundle.pirls_result.as_ref())
+            .is_none()
         {
             self.build_dense_original_assembly(rho, bundle, mode)
         } else {
@@ -3573,12 +3593,24 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.assemble_and_evaluate(
-            rho,
-            bundle,
-            mode,
-            self.build_dense_assembly(rho, bundle, mode)?,
-        )
+        // Dispatch through `build_auto_assembly` rather than hard-wiring
+        // `build_dense_assembly`.
+        //
+        // `build_dense_assembly` keeps β and H in PIRLS's QS-transformed frame
+        // while `self.canonical_penalties` (consumed by the outer gradient via
+        // `build_penalty_coords()`) stays in the ORIGINAL basis. The scalar
+        // cost is invariant to that rotation, but `coord.apply_penalty(β, λ)`
+        // is not: it returns `λ S_orig β_t`, which is neither `λ S_orig β_orig`
+        // nor `λ S_t β_t`. That fed a miscalibrated `½ βᵀ Sβ` first partial
+        // into BFGS on unconstrained dense problems (n=320k, p=71, duchon),
+        // which accepted only 2/200 line-search steps before stalling while
+        // the finite-difference gradient on the *same* cost made steady
+        // progress. `build_auto_assembly` routes unconstrained
+        // `TransformedQs` fits through `build_dense_original_assembly`, which
+        // maps β and H back to the original basis so every ingredient agrees
+        // with the canonical-penalty coordinate frame.
+        let assembly = self.build_auto_assembly(rho, bundle, mode, false)?;
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
     /// Sparse-exact bridge: delegates to `build_sparse_assembly` + `assemble_and_evaluate`.
