@@ -881,8 +881,9 @@ impl SpatialLogKappaCoords {
     /// - If isotropic (no aniso_log_scales, or 1-D): 1 entry = −ln(length_scale).
     /// - If anisotropic with a scalar length scale: d entries, one ψ_a per axis.
     ///   Initialized as ψ_a = −ln(length_scale) + η_a  where η_a are the existing
-    ///   aniso_log_scales (which sum to zero). If aniso_log_scales is empty or missing
-    ///   for a multi-dimensional term, the scalar −ln(length_scale) is broadcast.
+    ///   aniso_log_scales (which sum to zero). Multi-dimensional terms without
+    ///   explicit anisotropy stay scalar here so the seed dimensionality matches
+    ///   `spatial_dims_per_term`.
     /// - If pure Duchon anisotropic: d - 1 free entries store the leading η_a
     ///   values directly; the final axis is reconstructed to keep Ση_a = 0.
     pub(crate) fn from_length_scales_aniso(
@@ -921,15 +922,8 @@ impl SpatialLogKappaCoords {
                     }
                     dims.push(d);
                 }
-                _ if d > 1 => {
-                    // Anisotropic term but no existing scales: broadcast scalar
-                    for _ in 0..d {
-                        vals.push(psi_bar);
-                    }
-                    dims.push(d);
-                }
                 _ => {
-                    // Isotropic (1-D or no multi-dim info)
+                    // Isotropic (1-D, or multi-D without explicit anisotropy)
                     vals.push(psi_bar);
                     dims.push(1);
                 }
@@ -1004,10 +998,12 @@ impl SpatialLogKappaCoords {
     }
 
     /// Anisotropic-aware lower bounds derived from per-term data geometry.
-    /// Broadcasts the term's scalar ψ_lo bound across all of its axes. The
-    /// ψ_a coordinates are parameterized as `ψ_a = ψ̄ + η_a` (see
-    /// `from_length_scales_aniso`), so they sit in the same log-κ units as
-    /// the scalar window and the same bound applies per axis.
+    /// For hybrid anisotropic terms the scalar ψ_lo bound applies to the
+    /// mean `ψ̄`, not directly to every raw axis coordinate `ψ_a = ψ̄ + η_a`.
+    /// Shift each axis by the current centered `η_a` so projecting/clamping
+    /// the seed moves only the global scale direction and does not silently
+    /// shrink anisotropy that is already consistent with the current
+    /// `length_scale`.
     ///
     /// Pure Duchon anisotropy is structurally different: its stored
     /// coordinates are (d-1) free η_a values representing log axis-scale
@@ -1036,8 +1032,16 @@ impl SpatialLogKappaCoords {
             } else {
                 spatial_term_psi_bounds(data, spec, term_idx, options).0
             };
+            let axis_offsets = if is_pure_duchon_aniso_term(spec, term_idx) || d <= 1 {
+                vec![0.0; d]
+            } else {
+                get_spatial_aniso_log_scales(spec, term_idx)
+                    .filter(|eta| eta.len() == d)
+                    .map(|eta| center_aniso_log_scales(&eta))
+                    .unwrap_or_else(|| vec![0.0; d])
+            };
             for offset in 0..d {
-                values[cursor + offset] = psi_lo;
+                values[cursor + offset] = psi_lo + axis_offsets[offset];
             }
             cursor += d;
         }
@@ -1048,8 +1052,8 @@ impl SpatialLogKappaCoords {
     }
 
     /// Anisotropic-aware upper bounds derived from per-term data geometry.
-    /// See `lower_bounds_aniso_from_data` for the pure-Duchon-aniso dispatch
-    /// rationale.
+    /// See `lower_bounds_aniso_from_data` for the hybrid-aniso offsetting and
+    /// pure-Duchon dispatch rationale.
     pub(crate) fn upper_bounds_aniso_from_data(
         data: ArrayView2<'_, f64>,
         spec: &TermCollectionSpec,
@@ -1069,8 +1073,16 @@ impl SpatialLogKappaCoords {
             } else {
                 spatial_term_psi_bounds(data, spec, term_idx, options).1
             };
+            let axis_offsets = if is_pure_duchon_aniso_term(spec, term_idx) || d <= 1 {
+                vec![0.0; d]
+            } else {
+                get_spatial_aniso_log_scales(spec, term_idx)
+                    .filter(|eta| eta.len() == d)
+                    .map(|eta| center_aniso_log_scales(&eta))
+                    .unwrap_or_else(|| vec![0.0; d])
+            };
             for offset in 0..d {
-                values[cursor + offset] = psi_hi;
+                values[cursor + offset] = psi_hi + axis_offsets[offset];
             }
             cursor += d;
         }
@@ -16331,6 +16343,148 @@ mod tests {
         let expected = [0.36666666666666664, -0.13333333333333336];
         for (got, want) in coords.as_array().iter().zip(expected.iter()) {
             assert!((got - want).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "matern_aniso".to_string(),
+                    basis: SmoothBasisSpec::Matern {
+                        feature_cols: vec![0, 1],
+                        spec: MaternBasisSpec {
+                            center_strategy: CenterStrategy::UserProvided(array![
+                                [0.0, 0.0],
+                                [1.0, 0.0],
+                                [0.0, 1.0],
+                            ]),
+                            length_scale: 0.5,
+                            nu: MaternNu::FiveHalves,
+                            include_intercept: false,
+                            double_penalty: false,
+                            identifiability: MaternIdentifiability::None,
+                            aniso_log_scales: Some(vec![0.3, -0.3]),
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "matern_iso".to_string(),
+                    basis: SmoothBasisSpec::Matern {
+                        feature_cols: vec![0, 1],
+                        spec: MaternBasisSpec {
+                            center_strategy: CenterStrategy::UserProvided(array![
+                                [0.0, 0.0],
+                                [1.0, 0.0],
+                                [0.0, 1.0],
+                            ]),
+                            length_scale: 0.25,
+                            nu: MaternNu::ThreeHalves,
+                            include_intercept: false,
+                            double_penalty: false,
+                            identifiability: MaternIdentifiability::None,
+                            aniso_log_scales: None,
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                },
+            ],
+        };
+
+        let term_indices = [0usize, 1usize];
+        let coords = SpatialLogKappaCoords::from_length_scales_aniso(
+            &spec,
+            &term_indices,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        );
+
+        assert_eq!(spatial_dims_per_term(&spec, &term_indices), vec![2, 1]);
+        assert_eq!(coords.dims_per_term(), &[2, 1]);
+        let expected = [-0.5_f64.ln() + 0.3, -0.5_f64.ln() - 0.3, -0.25_f64.ln()];
+        for (got, want) in coords.as_array().iter().zip(expected.iter()) {
+            assert!((got - want).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.1, 1.0], [1.1, 1.2]];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern_aniso".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::UserProvided(array![
+                            [0.0, 0.0],
+                            [1.0, 0.0],
+                            [0.0, 1.0],
+                            [1.0, 1.0],
+                        ]),
+                        length_scale: 1.0,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::None,
+                        aniso_log_scales: Some(vec![3.0, -3.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let options = SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 1,
+            rel_tol: 1e-6,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: (-2.0_f64).exp(),
+            max_length_scale: 1.0_f64.exp(),
+            pilot_subsample_threshold: 0,
+        };
+        let spatial_terms = vec![0];
+        let dims_per_term = spatial_dims_per_term(&spec, &spatial_terms);
+        let seed = SpatialLogKappaCoords::from_length_scales_aniso(&spec, &spatial_terms, &options);
+        let lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+            data.view(),
+            &spec,
+            &spatial_terms,
+            &dims_per_term,
+            &options,
+        );
+        let upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+            data.view(),
+            &spec,
+            &spatial_terms,
+            &dims_per_term,
+            &options,
+        );
+
+        let projected = seed.clone().clamp_to_bounds(&lower, &upper);
+        assert_eq!(projected.as_array(), seed.as_array());
+
+        let updated = projected
+            .apply_tospec(&spec, &spatial_terms)
+            .expect("aniso projection should decode");
+        match &updated.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => {
+                assert!((spec.length_scale - 1.0).abs() <= 1e-12);
+                let eta = spec
+                    .aniso_log_scales
+                    .as_ref()
+                    .expect("anisotropy should be preserved");
+                assert!((eta[0] - 3.0).abs() <= 1e-12);
+                assert!((eta[1] + 3.0).abs() <= 1e-12);
+            }
+            _ => panic!("expected Matérn term"),
         }
     }
 
