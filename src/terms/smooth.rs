@@ -13,7 +13,7 @@ use crate::basis::{
     build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
     estimate_penalty_nullity, filter_active_penalty_candidates, orthogonality_transform_for_design,
-    select_centers_by_strategy,
+    pairwise_distance_bounds, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -986,6 +986,139 @@ impl SpatialLogKappaCoords {
         }
     }
 
+    /// Isotropic lower bounds derived from per-term data geometry.
+    /// Each entry gets the ψ_lo bound returned by `spatial_term_psi_bounds`
+    /// for the corresponding term, intersected with the options window.
+    pub(crate) fn lower_bounds_from_data(
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        let mut values = Array1::<f64>::zeros(term_indices.len());
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            values[slot] = spatial_term_psi_bounds(data, spec, term_idx, options).0;
+        }
+        Self {
+            values,
+            dims_per_term: vec![1; term_indices.len()],
+        }
+    }
+
+    /// Isotropic upper bounds derived from per-term data geometry.
+    pub(crate) fn upper_bounds_from_data(
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        let mut values = Array1::<f64>::zeros(term_indices.len());
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            values[slot] = spatial_term_psi_bounds(data, spec, term_idx, options).1;
+        }
+        Self {
+            values,
+            dims_per_term: vec![1; term_indices.len()],
+        }
+    }
+
+    /// Anisotropic-aware lower bounds derived from per-term data geometry.
+    /// Broadcasts the term's scalar ψ_lo bound across all of its anisotropy
+    /// axes — the η_a correction (aniso_log_scales) lives at the initializer
+    /// level and retains Ση_a = 0 by construction.
+    pub(crate) fn lower_bounds_aniso_from_data(
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        dims_per_term: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        debug_assert_eq!(term_indices.len(), dims_per_term.len());
+        let total: usize = dims_per_term.iter().sum();
+        let mut values = Array1::<f64>::zeros(total);
+        let mut cursor = 0;
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            let (psi_lo, _) = spatial_term_psi_bounds(data, spec, term_idx, options);
+            let d = dims_per_term[slot];
+            for offset in 0..d {
+                values[cursor + offset] = psi_lo;
+            }
+            cursor += d;
+        }
+        Self {
+            values,
+            dims_per_term: dims_per_term.to_vec(),
+        }
+    }
+
+    /// Anisotropic-aware upper bounds derived from per-term data geometry.
+    pub(crate) fn upper_bounds_aniso_from_data(
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        dims_per_term: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        debug_assert_eq!(term_indices.len(), dims_per_term.len());
+        let total: usize = dims_per_term.iter().sum();
+        let mut values = Array1::<f64>::zeros(total);
+        let mut cursor = 0;
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            let (_, psi_hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
+            let d = dims_per_term[slot];
+            for offset in 0..d {
+                values[cursor + offset] = psi_hi;
+            }
+            cursor += d;
+        }
+        Self {
+            values,
+            dims_per_term: dims_per_term.to_vec(),
+        }
+    }
+
+    /// Rewrite any ψ entries whose originating term lacks an explicit
+    /// `length_scale` so they sit at the midpoint of the per-term data-derived
+    /// ψ window. Used so the outer optimizer starts inside the physically
+    /// meaningful region instead of at an arbitrary `options.max_length_scale`
+    /// derived seed. For terms with an explicit length_scale, the user's
+    /// choice is respected. Anisotropy offsets η_a (those stored by
+    /// `from_length_scales_aniso`) are preserved: we re-center around the new
+    /// ψ̄, keeping Ση_a = 0.
+    pub(crate) fn reseed_from_data(
+        mut self,
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        debug_assert_eq!(term_indices.len(), self.dims_per_term.len());
+        let mut cursor = 0;
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            let d = self.dims_per_term[slot];
+            let Some(psi_bar_new) = spatial_term_psi_seed(data, spec, term_idx, options) else {
+                cursor += d;
+                continue;
+            };
+            if is_pure_duchon_aniso_term(spec, term_idx) {
+                // Pure Duchon stores d-1 free η_a directly; there is no ψ̄
+                // component to reseed (only axial anisotropy).
+                cursor += d;
+                continue;
+            }
+            if d == 0 {
+                continue;
+            }
+            let current: Vec<f64> = self.values.slice(s![cursor..cursor + d]).to_vec();
+            let psi_bar_old = current.iter().sum::<f64>() / d as f64;
+            for (offset, &old_value) in current.iter().enumerate() {
+                self.values[cursor + offset] = psi_bar_new + (old_value - psi_bar_old);
+            }
+            cursor += d;
+        }
+        self
+    }
+
     /// Reconstruct from theta tail with known dimensionality layout.
     pub(crate) fn from_theta_tail_with_dims(
         theta: &Array1<f64>,
@@ -1116,6 +1249,77 @@ fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
     get_spatial_length_scale(spec, term_idx).is_some() || is_pure_duchon_aniso_term(spec, term_idx)
+}
+
+/// Per-term data-derived ψ = log κ bounds.
+///
+/// Uses the same safe operating range documented in
+/// [`crate::basis::build_matern_basis`] / [`crate::basis::build_duchon_basis`]:
+///   κ ∈ [1e-2 / r_max, 1e2 / r_min]
+/// where (r_min, r_max) are pairwise-distance extrema of the term's resolved
+/// centers (post-fit) or the standardized feature data columns (pre-fit).
+/// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
+///
+/// When geometry is unavailable (e.g., fewer than 2 distinct points), falls
+/// back to the scalar `options.min_length_scale` / `options.max_length_scale`
+/// window so the outer optimizer never sees NaN bounds.
+///
+/// The returned window is intersected with the options window so user-set
+/// `min_length_scale` / `max_length_scale` remain hard limits.
+fn spatial_term_psi_bounds(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+    options: &SpatialLengthScaleOptimizationOptions,
+) -> (f64, f64) {
+    let fallback = (
+        -options.max_length_scale.ln(),
+        -options.min_length_scale.ln(),
+    );
+    let Some(term) = spec.smooth_terms.get(term_idx) else {
+        return fallback;
+    };
+    // Prefer resolved centers (post-fit) since they live in the same standardized
+    // space the kernel actually sees. If not UserProvided yet, fall back to the
+    // standardized feature data columns.
+    let r_bounds = match spatial_term_center_strategy(term) {
+        Some(CenterStrategy::UserProvided(centers)) if centers.nrows() >= 2 => {
+            pairwise_distance_bounds(centers.view())
+        }
+        _ => standardized_spatial_term_data(data, term)
+            .ok()
+            .and_then(|x| pairwise_distance_bounds(x.view())),
+    };
+    let Some((r_min, r_max)) = r_bounds else {
+        return fallback;
+    };
+    let psi_lo_data = (1e-2 / r_max).ln();
+    let psi_hi_data = (1e2 / r_min).ln();
+    // Intersect with the options window so min/max_length_scale remain hard caps.
+    let psi_lo = psi_lo_data.max(fallback.0);
+    let psi_hi = psi_hi_data.min(fallback.1);
+    if psi_lo >= psi_hi {
+        // Degenerate intersection — fall back to the options window to keep the
+        // outer optimizer from collapsing to a point.
+        return fallback;
+    }
+    (psi_lo, psi_hi)
+}
+
+/// Data-derived ψ seed for a spatial term when the user has not set an
+/// explicit length_scale on its basis spec. Uses the geometric mean of the
+/// data-informed kappa range (i.e., the midpoint of the ψ window).
+fn spatial_term_psi_seed(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+    options: &SpatialLengthScaleOptimizationOptions,
+) -> Option<f64> {
+    if get_spatial_length_scale(spec, term_idx).is_some() {
+        return None; // user/spec-provided length_scale wins
+    }
+    let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
+    Some(0.5 * (psi_lo + psi_hi))
 }
 
 fn spatial_term_psi_to_length_scale_and_aniso(
@@ -9803,21 +10007,48 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let use_aniso = has_aniso_terms(resolvedspec, spatial_terms);
 
     // Build initial ψ values and bounds, using aniso-aware constructors
-    // when any term has d > 1 axes.
+    // when any term has d > 1 axes. Bounds are tied to each term's center
+    // geometry (r_min, r_max) so κ cannot saturate at an upper bound that
+    // has no relationship to the data's distance scale.
     let log_kappa0 = if use_aniso {
         SpatialLogKappaCoords::from_length_scales_aniso(resolvedspec, spatial_terms, kappa_options)
     } else {
         SpatialLogKappaCoords::from_length_scales(resolvedspec, spatial_terms, kappa_options)
     };
+    // If the user/spec did not set a length_scale, re-seed ψ at the midpoint
+    // of the data-derived window instead of the arbitrary options fallback.
+    let log_kappa0 = log_kappa0.reseed_from_data(data, resolvedspec, spatial_terms, kappa_options);
     let log_kappa_lower = if use_aniso {
-        SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options)
+        SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            &dims_per_term,
+            kappa_options,
+        )
     } else {
-        SpatialLogKappaCoords::lower_bounds(spatial_terms.len(), kappa_options)
+        SpatialLogKappaCoords::lower_bounds_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            kappa_options,
+        )
     };
     let log_kappa_upper = if use_aniso {
-        SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options)
+        SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            &dims_per_term,
+            kappa_options,
+        )
     } else {
-        SpatialLogKappaCoords::upper_bounds(spatial_terms.len(), kappa_options)
+        SpatialLogKappaCoords::upper_bounds_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            kappa_options,
+        )
     };
     let setup = ExactJointHyperSetup::new(
         best.fit.lambdas.mapv(f64::ln),

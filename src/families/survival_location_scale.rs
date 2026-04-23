@@ -3345,6 +3345,7 @@ fn survival_psi_derivatives_support_exact_joint_hessian(
 }
 
 fn build_survival_two_block_exact_joint_setup(
+    data: ndarray::ArrayView2<'_, f64>,
     thresholdspec: &TermCollectionSpec,
     log_sigmaspec: &TermCollectionSpec,
     rho0: Array1<f64>,
@@ -3359,20 +3360,58 @@ fn build_survival_two_block_exact_joint_setup(
         thresholdspec,
         &threshold_terms,
         kappa_options,
-    );
+    )
+    .reseed_from_data(data, thresholdspec, &threshold_terms, kappa_options);
     let log_sigma_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
         log_sigmaspec,
         &log_sigma_terms,
         kappa_options,
-    );
+    )
+    .reseed_from_data(data, log_sigmaspec, &log_sigma_terms, kappa_options);
     let mut all_values = threshold_kappa.as_array().to_vec();
     all_values.extend(log_sigma_kappa.as_array().iter());
-    let mut all_dims = threshold_kappa.dims_per_term().to_vec();
-    all_dims.extend(log_sigma_kappa.dims_per_term());
+    let threshold_dims = threshold_kappa.dims_per_term().to_vec();
+    let log_sigma_dims = log_sigma_kappa.dims_per_term().to_vec();
+    let mut all_dims = threshold_dims.clone();
+    all_dims.extend(log_sigma_dims.iter().copied());
     let log_kappa0 =
         SpatialLogKappaCoords::new_with_dims(Array1::from_vec(all_values), all_dims.clone());
-    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&all_dims, kappa_options);
-    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&all_dims, kappa_options);
+    let threshold_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        thresholdspec,
+        &threshold_terms,
+        &threshold_dims,
+        kappa_options,
+    );
+    let log_sigma_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        log_sigmaspec,
+        &log_sigma_terms,
+        &log_sigma_dims,
+        kappa_options,
+    );
+    let mut lower_vals = threshold_lower.as_array().to_vec();
+    lower_vals.extend(log_sigma_lower.as_array().iter());
+    let log_kappa_lower =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(lower_vals), all_dims.clone());
+    let threshold_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        thresholdspec,
+        &threshold_terms,
+        &threshold_dims,
+        kappa_options,
+    );
+    let log_sigma_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        log_sigmaspec,
+        &log_sigma_terms,
+        &log_sigma_dims,
+        kappa_options,
+    );
+    let mut upper_vals = threshold_upper.as_array().to_vec();
+    upper_vals.extend(log_sigma_upper.as_array().iter());
+    let log_kappa_upper =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), all_dims);
 
     ExactJointHyperSetup::new(
         rho0,

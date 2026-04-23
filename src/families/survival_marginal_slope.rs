@@ -12330,6 +12330,7 @@ fn inner_fit(
 }
 
 fn joint_setup(
+    data: ArrayView2<'_, f64>,
     time_penalties: usize,
     marginalspec: &TermCollectionSpec,
     marginal_penalties: usize,
@@ -12356,22 +12357,63 @@ fn joint_setup(
         marginalspec,
         &marginal_terms,
         kappa_options,
-    );
+    )
+    .reseed_from_data(data, marginalspec, &marginal_terms, kappa_options);
     let logslope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
         logslopespec,
         &logslope_terms,
         kappa_options,
-    );
+    )
+    .reseed_from_data(data, logslopespec, &logslope_terms, kappa_options);
     let mut values = empty_kappa.as_array().to_vec();
     values.extend(marginal_kappa.as_array().iter());
     values.extend(logslope_kappa.as_array().iter());
+    let marginal_dims = marginal_kappa.dims_per_term().to_vec();
+    let logslope_dims = logslope_kappa.dims_per_term().to_vec();
     let mut dims = empty_kappa.dims_per_term().to_vec();
-    dims.extend(marginal_kappa.dims_per_term());
-    dims.extend(logslope_kappa.dims_per_term());
+    dims.extend(marginal_dims.iter().copied());
+    dims.extend(logslope_dims.iter().copied());
     let log_kappa0 =
         SpatialLogKappaCoords::new_with_dims(Array1::from_vec(values.clone()), dims.clone());
-    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&dims, kappa_options);
-    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&dims, kappa_options);
+    // Bounds: concatenate [empty | marginal data-aware | logslope data-aware]
+    let marginal_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        marginalspec,
+        &marginal_terms,
+        &marginal_dims,
+        kappa_options,
+    );
+    let logslope_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        logslopespec,
+        &logslope_terms,
+        &logslope_dims,
+        kappa_options,
+    );
+    let mut lower_vals = Vec::with_capacity(dims.iter().sum());
+    lower_vals.extend(marginal_lower.as_array().iter());
+    lower_vals.extend(logslope_lower.as_array().iter());
+    let log_kappa_lower =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(lower_vals), dims.clone());
+    let marginal_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        marginalspec,
+        &marginal_terms,
+        &marginal_dims,
+        kappa_options,
+    );
+    let logslope_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        logslopespec,
+        &logslope_terms,
+        &logslope_dims,
+        kappa_options,
+    );
+    let mut upper_vals = Vec::with_capacity(dims.iter().sum());
+    upper_vals.extend(marginal_upper.as_array().iter());
+    upper_vals.extend(logslope_upper.as_array().iter());
+    let log_kappa_upper =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
     ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
@@ -12752,6 +12794,7 @@ pub fn fit_survival_marginal_slope_terms(
         out
     };
     let setup = joint_setup(
+        data,
         time_penalties_len,
         &marginalspec_boot,
         marginal_design.penalties.len(),
