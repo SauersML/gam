@@ -13361,6 +13361,92 @@ mod tests {
     }
 
     #[test]
+    fn survival_prediction_csv_emits_bounds_without_effective_se() {
+        // Contract invariant: when a caller supplies interval bounds without
+        // `eta_se` (e.g. latent-window survival predictions: see
+        // SavedLatentWindowKind::Survival::write_predictions), the writer must
+        // still emit mean_lower / mean_upper columns instead of silently
+        // discarding them.
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_survival_pred_bounds_only_{ts}.csv"));
+
+        let eta: Array1<f64> = array![0.5, -0.25];
+        let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
+        let lower = array![0.3, 0.4];
+        let upper = array![0.9, 0.8];
+        write_survival_prediction_csv(
+            &path,
+            eta.view(),
+            surv.view(),
+            None,
+            Some(lower.view()),
+            Some(upper.view()),
+        )
+        .expect("write survival prediction csv with bounds");
+
+        let text = fs::read_to_string(&path).expect("read csv");
+        let header = text.lines().next().unwrap_or("");
+        assert_eq!(
+            header,
+            "eta,mean,survival_prob,risk_score,failure_prob,mean_lower,mean_upper",
+            "survival output must include bounds when supplied without effective_se",
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn survival_prediction_csv_errors_on_half_supplied_bounds() {
+        // Contract invariant: lower XOR upper is structurally invalid and must
+        // return an error rather than produce a malformed CSV.
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_survival_pred_half_bounds_{ts}.csv"));
+
+        let eta: Array1<f64> = array![0.0];
+        let surv = array![0.5];
+        let lower = array![0.1];
+        let upper = array![0.9];
+
+        let err_lower_only = write_survival_prediction_csv(
+            &path,
+            eta.view(),
+            surv.view(),
+            None,
+            Some(lower.view()),
+            None,
+        )
+        .expect_err("lower-only survival bounds must be rejected");
+        assert!(
+            err_lower_only.contains("survival_upper missing"),
+            "lower-only error message wrong: {err_lower_only}"
+        );
+
+        let err_upper_only = write_survival_prediction_csv(
+            &path,
+            eta.view(),
+            surv.view(),
+            None,
+            None,
+            Some(upper.view()),
+        )
+        .expect_err("upper-only survival bounds must be rejected");
+        assert!(
+            err_upper_only.contains("survival_lower missing"),
+            "upper-only error message wrong: {err_upper_only}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
         let mut path = std::env::temp_dir();
         let ts = SystemTime::now()
