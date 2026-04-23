@@ -3108,8 +3108,14 @@ pub struct UnifiedFitResult {
     /// Joint coefficient vector (first block for standard GAMs, concatenated for multi-block).
     #[serde(default)]
     pub beta: Array1<f64>,
-    /// Inner solver convergence status.
-    #[serde(default = "default_pirls_status")]
+    /// Inner solver convergence status. Required at decode time: a missing
+    /// field on an older-schema or corrupted saved model previously decoded
+    /// as `Converged` via a default, silently promoting non-converged β̂
+    /// through warm-start propagation, predict-time confidence intervals,
+    /// and outer-loop convergence semantics. With the MODEL_PAYLOAD_VERSION
+    /// gate in place, older schemas are rejected before this field is read,
+    /// so requiring the field here is safe and strictly removes the silent
+    /// default.
     pub pirls_status: crate::pirls::PirlsStatus,
     /// Maximum absolute linear predictor value at convergence.
     #[serde(default)]
@@ -3123,10 +3129,6 @@ pub struct UnifiedFitResult {
     /// Inner cycle count (blockwise path).
     #[serde(default)]
     pub inner_cycles: usize,
-}
-
-fn default_pirls_status() -> crate::pirls::PirlsStatus {
-    crate::pirls::PirlsStatus::Converged
 }
 
 impl Default for FittedLinkState {
