@@ -6332,6 +6332,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
+                &block_constraints,
             )?;
             if residual <= inner_tol && step_inf <= inner_tol {
                 converged = true;
@@ -6615,6 +6616,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // causing 100s of wasted cycles on an already-converged solution.
         let exact_joint_stationarity_ok = if has_joint_exacthessian && specs.len() >= 2 {
             exact_newton_joint_stationarity_inf_norm(
+                family,
+                specs,
                 &cached_eval,
                 &states,
                 &s_lambdas,
@@ -10133,7 +10136,65 @@ fn penalizedobjective_at_beta<F: CustomFamily + Clone + Send + Sync + 'static>(
     Ok(-eval.log_likelihood + penalty)
 }
 
-fn exact_newton_joint_stationarity_inf_norm(
+/// Inf-norm of the penalized stationarity residual with KKT multipliers
+/// projected out at active lower bounds.
+///
+/// For a box-constrained convex quadratic, the KKT conditions at β̂ read
+///
+///   [S·β̂ − ∇ℓ(β̂)]_j + λ_j = 0                (j with active bound β̂_j = lb_j)
+///   [S·β̂ − ∇ℓ(β̂)]_j      = 0                (j free / strictly interior)
+///   λ_j ≥ 0                                  (dual feasibility)
+///
+/// so `residual_j = +λ_j` on active-bound coordinates — not a convergence
+/// defect but a valid inequality multiplier. The inner-loop convergence
+/// check must measure only the **free-set** residual, otherwise it never
+/// fires at a constrained optimum and falls through to blockwise fallback,
+/// wasting inner cycles and reporting spurious non-convergence.
+///
+/// This helper zeros the residual at coordinate `j` when
+///   (i)  `j` carries a finite lower bound, AND
+///   (ii) `β_j` is within a scale-relative tolerance of that bound, AND
+///   (iii) `residual_j > 0` (sign of a valid inequality multiplier).
+///
+/// The tolerance matches `projected_gradient_norm` in `pirls.rs:2186`
+/// (`1e-6 · max(|β_j|, |lb_j|, 1) + 1e-10`), so the joint-Newton and
+/// blockwise PIRLS convergence criteria agree on the active set.
+///
+/// When `constraints` is `None` or cannot be decomposed into simple lower
+/// bounds (coupled inequalities), behaviour falls back to the unprojected
+/// inf-norm, which is the correct measure for unconstrained / coupled
+/// problems.
+fn projected_stationarity_inf_norm(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: Option<&LinearInequalityConstraints>,
+) -> f64 {
+    debug_assert_eq!(residual.len(), beta.len());
+    let lower_bounds: Option<Array1<f64>> = constraints
+        .and_then(|c| extract_simple_lower_bounds(c, beta.len()).ok().flatten())
+        .map(|b| b.lower_bounds);
+    let mut inf = 0.0_f64;
+    for j in 0..residual.len() {
+        let r = residual[j];
+        if let Some(lb_arr) = lower_bounds.as_ref() {
+            let lb = lb_arr[j];
+            if lb.is_finite() && r > 0.0 {
+                let scale = beta[j].abs().max(lb.abs()).max(1.0);
+                let tol = 1e-6 * scale + 1e-10;
+                if beta[j] - lb <= tol {
+                    // Active lower bound with multiplier-signed residual; skip.
+                    continue;
+                }
+            }
+        }
+        inf = inf.max(r.abs());
+    }
+    inf
+}
+
+fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
     eval: &FamilyEvaluation,
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
@@ -10143,7 +10204,11 @@ fn exact_newton_joint_stationarity_inf_norm(
     if eval.blockworking_sets.len() != states.len() || states.len() != s_lambdas.len() {
         return Err("exact-newton joint stationarity check: block dimension mismatch".to_string());
     }
+    if specs.len() != states.len() {
+        return Err("exact-newton joint stationarity check: spec/state count mismatch".to_string());
+    }
 
+    let block_constraints = collect_block_linear_constraints(family, states, specs)?;
     let mut inf_norm = 0.0_f64;
     for b in 0..states.len() {
         let gradient = match &eval.blockworking_sets[b] {
@@ -10163,12 +10228,15 @@ fn exact_newton_joint_stationarity_inf_norm(
             //
             //   r_b = P_mode,b * beta_b - gradient_b.
             //
-            // This is the quantity that must be small at the inner mode before
-            // the outer LAML derivative formulas are trustworthy. Using only
-            // coordinate step size can declare convergence too early for
-            // coupled exact-Newton families, leaving a visibly wrong outer
-            // objective/gradient even when the blockwise updates have nearly
-            // stalled.
+            // For blocks with simple lower-bound constraints (e.g. I-spline
+            // monotone time coefficients, monotone wiggle coefficients) the
+            // residual on an active-bound coordinate is the KKT multiplier
+            // λ_j ≥ 0 rather than a convergence defect; the projection in
+            // `projected_stationarity_inf_norm` drops those entries so the
+            // inf-norm measures only the free-set residual that must be
+            // driven to zero. Using only coordinate step size or an
+            // unprojected norm can declare convergence too early OR fail to
+            // ever declare convergence at a constrained optimum.
             BlockWorkingSet::ExactNewton { gradient, .. } => gradient,
             _ => return Ok(None),
         };
@@ -10176,7 +10244,11 @@ fn exact_newton_joint_stationarity_inf_norm(
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
-        let block_inf = residual.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let block_inf = projected_stationarity_inf_norm(
+            &residual,
+            &states[b].beta,
+            block_constraints[b].as_ref(),
+        );
         inf_norm = inf_norm.max(block_inf);
     }
     Ok(Some(inf_norm))
@@ -10227,12 +10299,20 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
+    block_constraints: &[Option<LinearInequalityConstraints>],
 ) -> Result<f64, String> {
     if states.len() != specs.len() || states.len() != s_lambdas.len() {
         return Err(
             "exact-newton joint stationarity check from gradient: block dimension mismatch"
                 .to_string(),
         );
+    }
+    if block_constraints.len() != states.len() {
+        return Err(format!(
+            "exact-newton joint stationarity check from gradient: constraint count mismatch, got {}, expected {}",
+            block_constraints.len(),
+            states.len()
+        ));
     }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if gradient.len() != total_p {
@@ -10243,6 +10323,11 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         ));
     }
 
+    // Same KKT projection as `exact_newton_joint_stationarity_inf_norm`:
+    // multipliers at active lower bounds are not convergence defects, so we
+    // measure only the free-set residual. See `projected_stationarity_inf_norm`
+    // for the tolerance choice and its parallel with `projected_gradient_norm`
+    // in `pirls.rs`.
     let mut inf_norm = 0.0_f64;
     let mut offset = 0usize;
     for b in 0..states.len() {
@@ -10252,7 +10337,11 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
-        let block_inf = residual.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let block_inf = projected_stationarity_inf_norm(
+            &residual,
+            &states[b].beta,
+            block_constraints[b].as_ref(),
+        );
         inf_norm = inf_norm.max(block_inf);
         offset += width;
     }
@@ -14414,5 +14503,92 @@ mod tests {
             result.is_ok(),
             "fit should complete when only small block steps: {result:?}"
         );
+    }
+
+    /// Direct test of the KKT-aware projection in
+    /// `projected_stationarity_inf_norm`.
+    ///
+    /// Contract:
+    ///   (i)   with no constraints, returns the plain inf-norm of the residual;
+    ///   (ii)  at an active lower bound with multiplier-signed residual
+    ///         (`β_j == lb_j` and `residual_j > 0`) the coordinate is skipped;
+    ///   (iii) at an active lower bound with wrong-signed residual
+    ///         (`residual_j < 0`) the coordinate still contributes;
+    ///   (iv)  interior coordinates always contribute regardless of
+    ///         residual sign.
+    ///
+    /// This pins the exact convergence semantics that the joint-Newton loop
+    /// relies on: a genuine constrained-KKT optimum must score zero, while
+    /// infeasibility and interior non-stationarity remain observable.
+    #[test]
+    fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
+        // Test (i): no constraints → plain inf-norm.
+        let beta = array![1.0, 2.0, -0.5];
+        let residual = array![0.3, -0.1, 0.2];
+        let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None);
+        assert_relative_eq!(inf_nocon, 0.3_f64, epsilon = 1e-12);
+
+        // Test (ii): β_j at its lower bound with residual_j > 0 is a KKT
+        // multiplier; projection drops it, so only the interior entry (-0.1)
+        // contributes.
+        let beta_active = array![0.0, 2.0];
+        let residual_active = array![0.5, -0.1];
+        let constraints_lb0 = LinearInequalityConstraints {
+            a: array![[1.0, 0.0], [0.0, 1.0]],
+            b: array![0.0, f64::NEG_INFINITY], // only β_0 has a finite lower bound
+        };
+        // `extract_simple_lower_bounds` treats infinite b-entries as
+        // unconstrained because `row_norm`-filtering picks exactly one coefficient per row
+        // — the NEG_INFINITY b propagates as an unreachable bound. Build a
+        // proper single-row constraint instead.
+        let single = LinearInequalityConstraints {
+            a: array![[1.0, 0.0]],
+            b: array![0.0],
+        };
+        let inf_projected =
+            projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single));
+        assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
+
+        // Also verify the drop-in reference behaviour using constraints_lb0
+        // (two rows, one truly unconstrained): same result.
+        let inf_with_two_row = projected_stationarity_inf_norm(
+            &residual_active,
+            &beta_active,
+            Some(&constraints_lb0),
+        );
+        // constraints_lb0 is rejected by extract_simple_lower_bounds (b entry
+        // for second row is -inf, which trips the decomposition), so this
+        // falls back to plain inf-norm = 0.5 — exercising the "unparseable
+        // constraints" fallback branch explicitly.
+        assert_relative_eq!(inf_with_two_row, 0.5_f64, epsilon = 1e-12);
+
+        // Test (iii): β_j at its bound but residual points the WRONG way
+        // (residual_j < 0 means the KKT dual feasibility λ_j ≥ 0 is violated
+        // — i.e. the bound should release).  Keep that coordinate in the
+        // norm so the optimizer does not declare convergence on an infeasible
+        // multiplier.
+        let beta_wrong_sign = array![0.0];
+        let residual_wrong_sign = array![-0.2];
+        let single1 = LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        };
+        let inf_wrong_sign = projected_stationarity_inf_norm(
+            &residual_wrong_sign,
+            &beta_wrong_sign,
+            Some(&single1),
+        );
+        assert_relative_eq!(inf_wrong_sign, 0.2_f64, epsilon = 1e-12);
+
+        // Test (iv): an interior coordinate with a valid lower bound keeps
+        // contributing to the norm, whatever the residual sign.
+        let beta_interior = array![1.5];
+        let residual_interior = array![0.4];
+        let inf_interior = projected_stationarity_inf_norm(
+            &residual_interior,
+            &beta_interior,
+            Some(&single1),
+        );
+        assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
     }
 }
