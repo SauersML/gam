@@ -3384,30 +3384,75 @@ impl<'a> RemlState<'a> {
 
         let beta = self.sparse_exact_beta_original(pirls_result);
 
-        // Barrier Hessian diagonal in the ORIGINAL basis.
+        // Barrier Hessian diagonal: restore ORIGINAL-basis barrier curvature
+        // on `h_total_original`.
         //
-        // `prepare_dense_eval_bundle` adds a barrier diagonal
+        // `prepare_dense_eval_bundle` (runtime.rs:2192-2202) adds
         // `τ · diag(1/Δ_j²)` to `bundle.h_total` IN THE TRANSFORMED BASIS,
-        // guarded by `barrier_config_from_constraints(linear_constraints_
-        // transformed)`.  That guard picks only simple-bound rows (a single
-        // nonzero = 1.0), which is generically destroyed by the orthogonal
-        // `Qs` rotation of the constraint rows, so the transformed-basis
-        // barrier commonly evaluates to `None` and the bundle carries no
-        // barrier contribution.  Meanwhile `build_sparse_derivative_context`
-        // uses `self.linear_constraints` (ORIGINAL basis) to construct the
-        // `BarrierConfig` that wraps the derivative provider, and
-        // `reml_laml_evaluate` adds `barrier_cost(&solution.beta_original)`
-        // to the cost (unified.rs:3106-3112).  Without re-adding the
-        // barrier Hessian to `h_total_original`, the `log|H|`, its
-        // ρ-gradient via `trace_logdet_gradient(dH/dρ)`, and the barrier
-        // cost would each be evaluated against a different Hessian surface:
-        // the cost and dH/dρ would see the barrier curvature, but `log|H|`
-        // would not.
+        // gated on
+        // `barrier_config_from_constraints(pirls_result
+        //  .linear_constraints_transformed)`.  That gate only accepts
+        // simple-bound rows (exactly one nonzero = 1.0 in the transformed
+        // constraint matrix).  `build_transformed_lower_bound_constraints`
+        // / `build_transformed_linear_constraints` rotate each original
+        // simple bound `e_jᵀ β_o ≥ b` into `qs.row(j)ᵀ β_t ≥ b`; for
+        // non-trivial `Qs` that row is dense, so the transformed-basis
+        // gate typically returns `None` and no barrier is added to
+        // `bundle.h_total`.  The edge case where it DOES fire is when
+        // `qs.row(j)` happens to equal some standard basis vector `e_kᵀ`
+        // (Qs permutation-or-identity on that row), and the bundle then
+        // carries `τ / (β_t[k] − b)²` at position `[k, k]` in the
+        // transformed Hessian.
         //
-        // Fix the inconsistency at the source: apply the same
-        // `τ·diag(1/Δ_j²)` diagonal increment, but in the original basis
-        // (using `self.linear_constraints` and `β_original`), mirroring
-        // the transformed-basis addition at the bundle assembly site.
+        // After `bundle_matrix_in_original_basis` rotates by `Qs · ... ·
+        //  Qsᵀ`, any such transformed diagonal increment becomes `Qs ·
+        //  diag(τ/Δ_t²) · Qsᵀ` in the original basis — which is a
+        // DIFFERENT matrix than the correct original-basis barrier
+        // `τ · diag(1/Δ_o²)` at the original simple-bound indices.  Even
+        // in the identity-preserving edge case, double-adding is wrong.
+        //
+        // Clean invariant: strip the rotated transformed-basis barrier
+        // first, then apply the ORIGINAL-basis barrier directly.  The
+        // transformed-basis barrier is reproducible: we can rebuild its
+        // `BarrierConfig` from `pirls_result.linear_constraints_
+        //  transformed` and its β from `pirls_result.beta_transformed`,
+        // rotate the resulting diagonal up into the original basis via
+        // `Qs · D · Qsᵀ`, and subtract it.  Then add the correct
+        // `τ · diag_o(1/Δ_o²)` using `self.linear_constraints` and
+        // `β_original`.
+        //
+        // This makes `log|H|`, its ρ-gradient (`trace_logdet_gradient(
+        //  dH/dρ)` in unified.rs), and the `barrier_cost` added at
+        // unified.rs:3106-3112 all derive from the same penalized
+        // Hessian surface `X'WX + S − H_φ + τ·diag_o(1/Δ_o²)`, which
+        // the `BarrierDerivativeProvider` at unified.rs:3133-3150
+        // differentiates in the original basis via
+        // `self.linear_constraints`-derived config.
+        let transformed_barrier_to_strip = pirls_result
+            .linear_constraints_transformed
+            .as_ref()
+            .and_then(Self::barrier_config_from_constraints);
+        if let Some(ref barrier_cfg_t) = transformed_barrier_to_strip {
+            let mut diag_trans = Array2::<f64>::zeros((beta.len(), beta.len()));
+            let beta_t = pirls_result.beta_transformed.as_ref();
+            match barrier_cfg_t.add_barrier_hessian_diagonal(&mut diag_trans, beta_t) {
+                Ok(()) => {
+                    let qs = &pirls_result.reparam_result.qs;
+                    // diag_orig_form = Qs · diag_trans · Qsᵀ — the rotated
+                    // form of whatever transformed barrier already sits in
+                    // bundle.h_total.
+                    let tmp = qs.dot(&diag_trans);
+                    let rotated = tmp.dot(&qs.t());
+                    h_total_original -= &rotated;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Transformed-basis barrier-diagonal reconstruction failed ({e}); \
+                         leaving bundle Hessian unchanged before adding original-basis barrier"
+                    );
+                }
+            }
+        }
         if let Some(barrier_cfg) = self
             .linear_constraints
             .as_ref()
