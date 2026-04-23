@@ -3281,7 +3281,12 @@ where
                                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
                                         return Err(lm_nonconvergence_error(
                                             options,
-                                            state.gradient.dot(&state.gradient).sqrt(),
+                                            constrained_stationarity_norm(
+                                                &state.gradient,
+                                                beta.as_ref(),
+                                                options.coefficient_lower_bounds.as_ref(),
+                                                options.linear_constraints.as_ref(),
+                                            ),
                                         ));
                                     }
                                     if lm_can_retry(loop_lambda) {
@@ -3331,8 +3336,12 @@ where
                         beta = candidate_beta;
 
                         // Update Iteration Info
-                        let candidategrad_norm =
-                            accepted_state.gradient.dot(&accepted_state.gradient).sqrt();
+                        let candidategrad_norm = constrained_stationarity_norm(
+                            &accepted_state.gradient,
+                            beta.as_ref(),
+                            options.coefficient_lower_bounds.as_ref(),
+                            options.linear_constraints.as_ref(),
+                        );
                         let deviance_change = actual_reduction;
 
                         iteration_callback(&WorkingModelIterationInfo {
@@ -3354,13 +3363,14 @@ where
                             .map(f64::abs)
                             .fold(0.0, f64::max);
 
-                        // Check Convergence
-                        // For bound-constrained problems, use the projected gradient
-                        // (excludes KKT multiplier components at active bounds).
-                        let convergence_grad_norm = projected_gradient_norm(
+                        // Check convergence in the current PIRLS coefficient frame.
+                        // For active inequality constraints, valid KKT multipliers
+                        // must be projected out rather than counted as defects.
+                        let convergence_grad_norm = constrained_stationarity_norm(
                             &accepted_state.gradient,
                             beta.as_ref(),
                             options.coefficient_lower_bounds.as_ref(),
+                            options.linear_constraints.as_ref(),
                         );
 
                         // Preserve the structural ridge computed by the model.
@@ -3417,14 +3427,13 @@ where
                             continue;
                         }
                         // Reject Step
-                        let stategrad_norm = state.gradient.dot(&state.gradient).sqrt();
-                        // For bound-constrained problems, use the projected gradient
-                        // to judge stationarity (excludes KKT multiplier components).
-                        let projected_grad = projected_gradient_norm(
+                        let stategrad_norm = constrained_stationarity_norm(
                             &state.gradient,
                             beta.as_ref(),
                             options.coefficient_lower_bounds.as_ref(),
+                            options.linear_constraints.as_ref(),
                         );
+                        let projected_grad = stategrad_norm;
                         let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
 
                         // Near stationarity: the screening rejected all candidates, but the
@@ -3481,7 +3490,12 @@ where
                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
                         return Err(lm_nonconvergence_error(
                             options,
-                            state.gradient.dot(&state.gradient).sqrt(),
+                            constrained_stationarity_norm(
+                                &state.gradient,
+                                beta.as_ref(),
+                                options.coefficient_lower_bounds.as_ref(),
+                                options.linear_constraints.as_ref(),
+                            ),
                         ));
                     }
                     // Retry only clearly numerical candidate-evaluation failures.
@@ -3498,11 +3512,13 @@ where
         last_change: lastgradient_norm,
     })?;
 
-    // Post-loop rescue: use projected gradient for bound-constrained problems.
-    let final_projected_grad = projected_gradient_norm(
+    // Post-loop rescue: use the constrained stationarity residual in the
+    // current PIRLS basis, not the raw gradient norm.
+    let final_projected_grad = constrained_stationarity_norm(
         &state.gradient,
         beta.as_ref(),
         options.coefficient_lower_bounds.as_ref(),
+        options.linear_constraints.as_ref(),
     );
     if matches!(status, PirlsStatus::MaxIterationsReached) {
         if final_projected_grad < options.convergence_tolerance {
@@ -7256,6 +7272,22 @@ mod tests {
     }
 
     #[test]
+    fn sparse_native_decision_rejects_finite_lower_bounds() {
+        let triplets: Vec<_> = (0..64).map(|i| Triplet::new(i, i, 1.0)).collect();
+        let x = SparseColMat::try_new_from_triplets(64, 64, &triplets)
+            .expect("sparse identity should build");
+        let x = DesignMatrix::from(x);
+        let s = Array2::from_diag(&Array1::ones(64));
+        let mut lower_bounds = Array1::from_elem(64, f64::NEG_INFINITY);
+        lower_bounds[0] = 0.0;
+        let mut workspace = PirlsWorkspace::new(64, 64, 0, 0);
+        let decision =
+            should_use_sparse_native_pirls(&mut workspace, &x, &s, Some(&lower_bounds), None);
+        assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
+        assert_eq!(decision.reason, "constraints_present");
+    }
+
+    #[test]
     fn sparse_penalized_assembly_matches_dense_diagonal_case() {
         let triplets = vec![
             Triplet::new(0, 0, 1.0),
@@ -7970,6 +8002,31 @@ mod root_cause_tests {
             state.deviance = 0.5;
             state.gradient = array![0.5];
             Ok(state)
+        }
+    }
+
+    #[derive(Default)]
+    struct ActiveConstraintKktModel;
+
+    impl WorkingModel for ActiveConstraintKktModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(beta, curvature, 1.0, 0.0))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(beta, curvature, 1.0, 0.0))
         }
     }
 
