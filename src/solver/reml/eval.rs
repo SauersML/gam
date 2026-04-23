@@ -19,6 +19,16 @@ const DIAGNOSTIC_HESSIAN_FD_REL_STEP: f64 = 1e-3;
 const DIAGNOSTIC_HESSIAN_FD_ABS_STEP: f64 = 1e-4;
 const DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD: f64 = 1e-8;
 
+struct EvalCacheInvalidationGuard<'a> {
+    cache_manager: &'a EvalCacheManager,
+}
+
+impl Drop for EvalCacheInvalidationGuard<'_> {
+    fn drop(&mut self) {
+        self.cache_manager.invalidate_eval_bundle();
+    }
+}
+
 impl<'a> RemlState<'a> {
     /// Compute first and second derivatives of the exact pseudo-logdet
     /// log|S|₊ with respect to ρ.
@@ -124,6 +134,12 @@ impl<'a> RemlState<'a> {
         if k == 0 {
             return Ok(h);
         }
+        // This routine probes multiple perturbed rho values via `compute_cost`,
+        // which updates the single-slot eval caches. Drop them on exit so later
+        // callers never observe a bundle or outer eval keyed to a perturbation.
+        let _cache_guard = EvalCacheInvalidationGuard {
+            cache_manager: &self.cache_manager,
+        };
 
         let f0 = self.compute_cost(rho)?;
         let mut steps = Vec::with_capacity(k);
