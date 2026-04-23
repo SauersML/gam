@@ -3204,7 +3204,7 @@ pub fn reml_laml_evaluate(
                 cost_logdet_diff + (-solution.log_likelihood) + 0.5 * solution.penalty_quadratic;
             if *include_logdet_h {
                 cost += solution.tk_correction
-                    + solution
+                    - solution
                         .firth
                         .as_ref()
                         .map_or(0.0, ExactJeffreysTerm::value);
@@ -3290,7 +3290,7 @@ pub fn reml_laml_evaluate(
         .zip(curvature_lambdas.iter().copied())
         .map(|(coord, lambda)| penalty_a_k_beta(coord, &solution.beta, lambda))
         .collect();
-    let need_rho_v = effective_deriv.has_corrections() || solution.firth.is_some();
+    let need_rho_v = effective_deriv.has_corrections();
     let rho_v_ks: Option<Vec<Array1<f64>>> = if need_rho_v {
         Some(
             rho_curvature_a_k_betas
@@ -3608,28 +3608,6 @@ pub fn reml_laml_evaluate(
         {
             let mut sl = grad.slice_mut(ndarray::s![..k]);
             sl += tk_grad;
-        }
-    }
-
-    // Firth gradient: ∂Φ/∂ρ_k = −0.5 tr(G_ε(H) D(H_φ)[B_k])
-    //
-    // The Firth contribution is part of dH_total/dρ_k inside 0.5 log|H|.
-    // The cost uses the regularized logdet Σ ln(r_ε(σ_j)), so the derivative
-    // must use the matching kernel φ'(σ) = 1/√(σ²+4ε²) via
-    // trace_logdet_gradient, NOT the plain inverse kernel 1/r_ε(σ) via
-    // trace_hinv_product.  Mixing kernels causes a systematic gradient
-    // mismatch on ill-conditioned or rank-deficient designs where ε is
-    // non-negligible.
-    if let Some(ref firth) = solution.firth {
-        let firth_op = firth.operator();
-        for idx in 0..k {
-            let v_k = &rho_v_ks
-                .as_ref()
-                .expect("rho mode responses required for Firth gradient")[idx];
-            let deta_k: Array1<f64> = firth_op.x_dense.dot(v_k).mapv(|v| -v);
-            let dir_k = firth_op.direction_from_deta(deta_k);
-            let dhphi_k = firth_op.hphi_direction(&dir_k);
-            grad[idx] += -0.5 * hop.trace_logdet_gradient(&dhphi_k);
         }
     }
 
