@@ -476,104 +476,53 @@ pub fn optimize_survival_baseline_config<F>(
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<f64, String>,
 {
+    use crate::solver::outer_strategy::{OuterProblem, SolverClass};
     let Some(seed) = survival_baseline_theta_from_config(initial)? else {
         return Ok(initial.clone());
     };
+    let dim = seed.len();
     let target = initial.target;
     let lower = seed.mapv(|v| v - 6.0);
     let upper = seed.mapv(|v| v + 6.0);
-    let init_step = 1.0;
-    let step_tol = 1e-4;
-    let max_polls = 240;
-    let mut cost_at_theta = |theta: &Array1<f64>| -> Option<f64> {
-        match survival_baseline_config_from_theta(target, theta) {
-            Ok(cfg) => objective(&cfg).ok().filter(|v| v.is_finite()),
-            Err(_) => None,
-        }
+    let problem = OuterProblem::new(dim)
+        .with_solver_class(SolverClass::AuxiliaryGradientFree)
+        .with_tolerance(1e-4)
+        .with_max_iter(240)
+        .with_bounds(lower, upper)
+        .with_heuristic_lambdas(seed.to_vec());
+    let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
+        let cfg = survival_baseline_config_from_theta(target, theta)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        objective(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)
     };
-    let theta = compass_search_auxiliary(
-        seed,
-        lower.view(),
-        upper.view(),
-        init_step,
-        step_tol,
-        max_polls,
-        &mut cost_at_theta,
-    )
-    .ok_or_else(|| format!("{context}: auxiliary cost was non-finite at the heuristic seed"))?;
-    survival_baseline_config_from_theta(target, &theta)
-}
-
-/// Coordinate-compass direct-search minimizer for low-dim auxiliary problems.
-///
-/// Why this helper exists: some survival auxiliary searches (baseline-theta
-/// for gompertz-makeham, SAS/BetaLogistic/Mixture inverse-link) have no
-/// analytic gradient available. The production outer-BFGS runner correctly
-/// refuses non-analytic-gradient capabilities to prevent silent FD-grad
-/// masking on the REML outer. For these 2–3 dim auxiliary searches we use a
-/// derivative-free method instead of degrading BFGS.
-///
-/// Method: opportunistic compass search with positive basis {±e_i} and
-/// step contraction. Given a continuously differentiable cost bounded below
-/// on the compact box [lower, upper], compass search converges to a
-/// stationary point (Kolda-Lewis-Torczon, SIAM Review 45:385, 2003, Thm 3.3).
-/// No finite differences are evaluated — the algorithm only compares cost
-/// values at polled points, so it is categorically distinct from the
-/// forbidden FD-gradient BFGS fallback.
-///
-/// Termination: `step < step_tol` or `polls >= max_polls`. Returns the
-/// best-seen theta, or None when the cost at the seed itself is non-finite.
-fn compass_search_auxiliary<C>(
-    mut x: Array1<f64>,
-    lower: ndarray::ArrayView1<'_, f64>,
-    upper: ndarray::ArrayView1<'_, f64>,
-    init_step: f64,
-    step_tol: f64,
-    max_polls: usize,
-    cost: &mut C,
-) -> Option<Array1<f64>>
-where
-    C: FnMut(&Array1<f64>) -> Option<f64>,
-{
-    for i in 0..x.len() {
-        x[i] = x[i].clamp(lower[i], upper[i]);
-    }
-    let mut best_cost = cost(&x)?;
-    let mut step = init_step;
-    let mut polls: usize = 0;
-    while step > step_tol && polls < max_polls {
-        let mut improved = false;
-        // Opportunistic coordinate sweep: first improvement at any (i, sign)
-        // moves the iterate and resets the sweep at the new point with the
-        // SAME step. Requires strict improvement (no tolerance ε), which is
-        // what the convergence theorem demands.
-        'sweep: for i in 0..x.len() {
-            for &sign in &[1.0, -1.0] {
-                if polls >= max_polls {
-                    break 'sweep;
-                }
-                polls += 1;
-                let candidate_i = (x[i] + sign * step).clamp(lower[i], upper[i]);
-                if (candidate_i - x[i]).abs() < step_tol {
-                    continue;
-                }
-                let mut candidate = x.clone();
-                candidate[i] = candidate_i;
-                if let Some(c) = cost(&candidate) {
-                    if c < best_cost {
-                        x = candidate;
-                        best_cost = c;
-                        improved = true;
-                        break 'sweep;
-                    }
-                }
-            }
-        }
-        if !improved {
-            step *= 0.5;
-        }
-    }
-    Some(x)
+    let mut obj = problem.build_objective(
+        (),
+        cost_fn,
+        |_: &mut (), _: &ndarray::Array1<f64>| -> Result<
+            crate::solver::outer_strategy::OuterEval,
+            crate::estimate::EstimationError,
+        > {
+            Err(crate::estimate::EstimationError::InvalidInput(
+                "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \
+                 eval(gradient) is unreachable by construction"
+                    .to_string(),
+            ))
+        },
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &ndarray::Array1<f64>,
+            ) -> Result<
+                crate::solver::outer_strategy::EfsEval,
+                crate::estimate::EstimationError,
+            >,
+        >,
+    );
+    let result = problem
+        .run(&mut obj, context)
+        .map_err(|e| format!("{context} failed: {e}"))?;
+    survival_baseline_config_from_theta(target, &result.rho)
 }
 
 // ---------------------------------------------------------------------------
