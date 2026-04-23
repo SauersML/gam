@@ -3387,10 +3387,18 @@ fn run_predict_survival(
             let eta_se = eta_se_default
                 .clone()
                 .unwrap_or_else(|| out.eta_standard_error.clone());
-            let response_sd = out
-                .response_standard_error
-                .clone()
-                .unwrap_or_else(|| Array1::zeros(n));
+            // predict_survival_location_scalewith_uncertainty is called with
+            // include_response_sd = args.uncertainty just above, so under this
+            // branch (args.uncertainty == true) response_standard_error is
+            // contractually Some(_). Substituting zeros on None would silently
+            // collapse mean_lower/mean_upper to the point estimate — the caller
+            // would read zero-width bounds as a high-confidence prediction
+            // when what actually happened is the uncertainty pipeline failed
+            // to populate SDs. Fail loudly instead.
+            let response_sd = out.response_standard_error.clone().ok_or_else(|| {
+                "internal error: survival location-scale response_standard_error missing under --uncertainty"
+                    .to_string()
+            })?;
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             let (mean_lo, mean_hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
