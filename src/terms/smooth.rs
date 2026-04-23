@@ -9180,33 +9180,6 @@ fn exact_joint_spatial_outer_hessian_available(
             ))
 }
 
-fn dense_joint_exact_design_prefers_gradient_only(design: &TermCollectionDesign) -> bool {
-    // Historical heuristic: `design.design.as_sparse().is_none()` — i.e. any
-    // dense design was forced onto gradient-only BFGS. That throws away the
-    // analytic outer Hessian unconditionally (even on p ~ 50 problems where
-    // the Hessian is tens of KB) and drives ARC into BFGS+BfgsApprox, which
-    // needs ~p iterations of rank-2 updates to rebuild the curvature BFGS is
-    // approximating — each iteration a full biobank-scale PIRLS fit. That was
-    // the 40-minute timeout on `rust_margslope_aniso_matern16d_linkwiggle_
-    // scorewarp_fast`: ARC would have closed in <10 outer iterations with the
-    // declared Analytic Hessian instead.
-    //
-    // The memory-budget concern the old heuristic was gesturing at is
-    // properly handled by `spatial_tau_tau_hessian_policy` one branch over
-    // (`TauTauHessianPolicy::prefer_gradient_only`), which inspects actual
-    // byte counts for the Hessian plan vs. a configured budget. That check
-    // remains authoritative. This function no longer downgrades based on
-    // design sparsity alone.
-    let _ = design;
-    false
-}
-
-fn dense_joint_exact_designs_prefer_gradient_only(designs: &[TermCollectionDesign]) -> bool {
-    designs
-        .iter()
-        .any(dense_joint_exact_design_prefers_gradient_only)
-}
-
 fn spatial_tau_tau_hessian_policy(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
@@ -10368,17 +10341,11 @@ fn try_exact_joint_spatial_aniso_optimization(
     } else {
         None
     };
-    let dense_design_prefers_gradient_only =
-        dense_joint_exact_design_prefers_gradient_only(baseline_design);
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only = analytic_outer_hessian_available
-        && (dense_design_prefers_gradient_only || tau_tau_prefers_gradient_only);
-    if dense_design_prefers_gradient_only {
-        log::info!(
-            "[OUTER] aniso-psi joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
-        );
-    } else if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
+    let prefer_gradient_only =
+        analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
+    if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
         log::info!(
             "[OUTER] aniso-psi joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
             policy.any_has_implicit,
@@ -10669,17 +10636,11 @@ fn try_exact_joint_spatial_isotropic_optimization(
     } else {
         None
     };
-    let dense_design_prefers_gradient_only =
-        dense_joint_exact_design_prefers_gradient_only(baseline_design);
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only = analytic_outer_hessian_available
-        && (dense_design_prefers_gradient_only || tau_tau_prefers_gradient_only);
-    if dense_design_prefers_gradient_only {
-        log::info!(
-            "[OUTER] iso-kappa joint REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
-        );
-    } else if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
+    let prefer_gradient_only =
+        analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
+    if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
         log::info!(
             "[OUTER] iso-kappa joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
             policy.any_has_implicit,
@@ -12307,17 +12268,11 @@ where
     } else {
         None
     };
-    let dense_design_prefers_gradient_only =
-        dense_joint_exact_designs_prefer_gradient_only(&boot_designs);
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only = analytic_outer_hessian_available
-        && (dense_design_prefers_gradient_only || tau_tau_prefers_gradient_only);
-    if dense_design_prefers_gradient_only {
-        log::info!(
-            "[OUTER] n-block exact-joint spatial: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
-        );
-    } else if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
+    let prefer_gradient_only =
+        analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
+    if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
         log::info!(
             "[OUTER] n-block exact-joint spatial: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
             policy.any_has_implicit,
