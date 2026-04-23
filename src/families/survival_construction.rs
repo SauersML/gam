@@ -1606,16 +1606,6 @@ pub fn evaluate_survival_baseline(
         );
     }
 
-    fn gompertz_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
-        if shape.abs() < 1e-10 {
-            return (rate * age, rate);
-        }
-        let shape_age = shape * age;
-        let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
-        let instant_hazard = rate * shape_age.exp();
-        (cumulative_hazard, instant_hazard)
-    }
-
     match cfg.target {
         SurvivalBaselineTarget::Linear => Ok((0.0, 0.0)),
         SurvivalBaselineTarget::Weibull => {
@@ -1628,7 +1618,7 @@ pub fn evaluate_survival_baseline(
         SurvivalBaselineTarget::Gompertz => {
             let rate = cfg.rate.unwrap_or(1.0);
             let shape = cfg.shape.unwrap_or(0.0);
-            let (h, inst) = gompertz_components(age, rate, shape);
+            let (h, inst) = gompertz_hazard_components(age, rate, shape);
             if h <= 0.0 || !h.is_finite() {
                 return Err(if shape.abs() < 1e-10 {
                     "invalid gompertz baseline at near-zero shape".to_string()
@@ -1643,7 +1633,7 @@ pub fn evaluate_survival_baseline(
             let makeham = cfg.makeham.unwrap_or(0.0);
             let rate = cfg.rate.unwrap_or(1.0);
             let shape = cfg.shape.unwrap_or(0.0);
-            let (h_gompertz, inst_gompertz) = gompertz_components(age, rate, shape);
+            let (h_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
             let h = makeham * age + h_gompertz;
             if h <= 0.0 || !h.is_finite() {
                 return Err(
@@ -2066,12 +2056,14 @@ mod tests {
     #[test]
     fn gompertz_offset_partials_match_central_diff() {
         // Several (rate, shape, age) combinations spanning the small-shape
-        // Taylor branch (shape ~ 1e-12, exactly at the pivot) and the normal
-        // branch (shape >> 1e-10), plus sign-reversed shape.
+        // Taylor branch (|shape| < 1e-10) and the normal branch
+        // (shape >> 1e-10), plus sign-reversed shape.
         let cases = [
             (0.5_f64, 0.01_f64, 30.0_f64),
             (0.2, 0.05, 60.0),
             (1.0, 0.001, 10.0),
+            (0.4, 5e-11, 25.0),
+            (0.4, -5e-11, 25.0),
             (0.3, -0.02, 40.0),
             (0.8, 0.2, 5.0),
         ];
@@ -2086,8 +2078,11 @@ mod tests {
             let analytic = baseline_offset_theta_partials(age, &cfg)
                 .expect("ok")
                 .expect("non-linear");
-            // central difference h = 1e-5 for log-space / shape (x·h = 1e-3 worst case)
-            let fd = fd_baseline_offset(age, &cfg, 1e-5);
+            // Keep the FD probe inside the Taylor branch for tiny |shape| so
+            // the numeric derivative matches the same small-shape map as the
+            // analytic helper.
+            let h = if shape.abs() < 1e-9 { 1e-11 } else { 1e-5 };
+            let fd = fd_baseline_offset(age, &cfg, h);
             assert_eq!(analytic.len(), 2);
             // Gompertz θ=(log_rate, shape). Rate channel: ∂eta/∂log_rate=1, ∂o_D/∂log_rate=0.
             assert_close(
@@ -2221,6 +2216,8 @@ mod tests {
             (0.3_f64, 0.05_f64, 0.002_f64, 40.0_f64),
             (0.5, 0.01, 0.01, 25.0),
             (0.2, 0.001, 0.005, 60.0),
+            (0.4, 5e-11, 0.01, 25.0),
+            (0.4, -5e-11, 0.01, 25.0),
             (0.8, 0.2, 0.05, 5.0),
         ];
         for &(rate, shape, makeham, age) in &cases {
@@ -2234,7 +2231,8 @@ mod tests {
             let analytic = baseline_offset_theta_partials(age, &cfg)
                 .expect("ok")
                 .expect("nl");
-            let fd = fd_baseline_offset(age, &cfg, 1e-5);
+            let h = if shape.abs() < 1e-9 { 1e-11 } else { 1e-5 };
+            let fd = fd_baseline_offset(age, &cfg, h);
             assert_eq!(analytic.len(), 3);
             for k in 0..3 {
                 assert_close(
