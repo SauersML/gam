@@ -3503,8 +3503,36 @@ impl<'a> RemlState<'a> {
         };
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
-        // Sparse path uses a Cholesky-derived log|H| (no smooth-floor
-        // null-eigenvalue contribution), so no projection correction.
+        // Sparse-exact `log|H|` is Cholesky-derived from `X'WX + S_λ + δI`,
+        // not a `PseudoLogdetMode::Smooth` eigenvalue sum, so the
+        // `(p − rank) · ln ε` floor leakage that motivated e33c06be on
+        // dense cannot occur here: Cholesky either succeeds (H is SPD,
+        // logdet sums true log-diagonals) or fails (ridge escalates in
+        // powers of 10 via `ensure_sparse_positive_definitewithridge`).
+        //
+        // The analogous rank-deficiency concern — that a nonzero ridge
+        // δ would contribute `(p − rank(X'WX + S)) · log(δ)` to
+        // `logdet_h` while `sparse_penalty_logdet_runtime` excludes that
+        // subspace from `log|S|_+` — is structurally out of reach on the
+        // backends that select sparse-exact:
+        //
+        //   1. `estimate_sparse_native_decision` gates on H density, which
+        //      implies large p and typically n ≫ p (biobank-scale) — i.e.
+        //      `X'WX` is rank-full, so `X'WX + S` is rank-full, so
+        //      `ridge_used = 0` and no leak term exists.
+        //   2. The small-n/high-dim regime that motivated e33c06be (n=120,
+        //      k=6 Duchon) is dense territory; it never chooses
+        //      `SparseNative` because the sparse density heuristic rejects
+        //      near-dense systems.
+        //
+        // No projection correction is emitted here; pass 0.0 through to
+        // `finish_assembly`.  If a future test exercise ever finds a
+        // sparse-native fit with `ridge_used > 0` AND genuine null
+        // directions of `X'WX + S`, extend `sparse_penalty_logdet_runtime`
+        // to include the ridge-matched null contributions (keeping both
+        // sides of the LAML ratio on the same p-dim space) rather than
+        // reintroducing the range(S_+) projection; Cholesky can't cheaply
+        // compute `U_S^T H U_S` without densifying H.
         Ok(self.finish_assembly(
             pirls_result,
             ctx,
@@ -4430,6 +4458,15 @@ impl<'a> RemlState<'a> {
             return Ok(());
         }
         let pirls_result = bundle.pirls_result.as_ref();
+        // Sparse-native (OriginalSparseNative) path is structurally
+        // identity-rotated: `make_reparam_operator` sets
+        // `x_transformed = x_original` and `sparse_exact_beta_original`
+        // returns β verbatim, so link-ext coords built from
+        // `pirls_result.x_transformed` are already in the original basis
+        // that `build_sparse_assembly` reports `β` and `H` in.  The gate
+        // below therefore returns Ok(()) without touching coords whenever
+        // the frame is OriginalSparseNative — the analogue of 4ec0208f's
+        // dense rotation is a no-op on sparse, not a missing fix.
         let needs_rotation = matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
