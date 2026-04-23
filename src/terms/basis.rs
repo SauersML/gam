@@ -4045,7 +4045,11 @@ fn select_kmeans_centers(
     const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
     if n > KMEANS_PILOT_MAX_ROWS {
         let pilot_n = KMEANS_PILOT_MAX_ROWS.max(num_centers);
-        log::warn!(
+        // log::info! rather than warn! — this is a deliberate performance
+        // choice (O(n·k·iter) kmeans scales badly past ~20K rows), not a
+        // problem the user can act on. Surfacing it as a warning adds
+        // noise to CI output and mislabels normal operation.
+        log::info!(
             "kmeans center selection using {}-row pilot subsample instead of full {} rows",
             pilot_n,
             n
@@ -4790,7 +4794,8 @@ pub fn build_thin_plate_basiswithworkspace(
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
     if use_lazy {
-        log::warn!(
+        // log::info! — deliberate memory-saving choice, not an anomaly.
+        log::info!(
             "thin-plate basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             base_cols,
@@ -8860,7 +8865,8 @@ pub fn build_matern_basiswithworkspace(
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), design_cols);
     let (design, candidates) = if use_lazy {
-        log::warn!(
+        // log::info! — deliberate memory-saving choice, not an anomaly.
+        log::info!(
             "Matérn basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             design_cols,
@@ -12051,7 +12057,8 @@ pub fn build_duchon_basiswithworkspace(
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
     let (design, identifiability_transform) = if use_lazy {
-        log::warn!(
+        // log::info! — deliberate memory-saving choice, not an anomaly.
+        log::info!(
             "Duchon basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             base_cols,
