@@ -6,7 +6,8 @@ use gam::inference::data::{
     encode_recordswith_schema,
 };
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, ModelKind, PredictModelClass,
+    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    PredictModelClass,
 };
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{SmoothBasisSpec, TermCollectionSpec, build_term_collection_design};
@@ -18,7 +19,7 @@ use pyo3::types::{PyBytes, PyDict};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-const MODEL_VERSION: u32 = 4;
+const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -837,5 +838,41 @@ fn block_role_name(role: BlockRole) -> &'static str {
         BlockRole::Time => "time",
         BlockRole::Threshold => "threshold",
         BlockRole::LinkWiggle => "link-wiggle",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_version_matches_canonical_payload_version() {
+        assert_eq!(MODEL_VERSION, MODEL_PAYLOAD_VERSION);
+    }
+
+    #[test]
+    fn load_model_rejects_payload_version_mismatch() {
+        let model = FittedModel::from_payload(FittedModelPayload::new(
+            MODEL_VERSION + 1,
+            "y ~ x".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodFamily::GaussianIdentity,
+                link: Some(family_to_link(LikelihoodFamily::GaussianIdentity)),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            LikelihoodFamily::GaussianIdentity.name().to_string(),
+        ));
+        let mismatched_bytes =
+            serde_json::to_vec(&model).expect("mismatched model should serialize");
+
+        let err = load_model_impl(&mismatched_bytes)
+            .expect_err("load_model_impl should reject mismatched payload versions");
+        assert!(
+            err.contains("saved model payload schema mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }
