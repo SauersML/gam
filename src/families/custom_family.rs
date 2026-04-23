@@ -454,16 +454,16 @@ pub(crate) fn exact_outer_hessian_problem_scale_allows(specs: &[ParameterBlockSp
 
 /// Shared cost-aware gate for second-order exact outer derivatives.
 ///
-/// This gate is intentionally based on the outer hyperparameter dimension,
-/// not the inner coefficient dimension. Matrix-free/operator Hessians already
-/// avoid the old `p²` blow-up, so the only meaningful generic affordability
-/// proxy here is the size of a dense K×K outer Hessian if one were
-/// materialized.
+/// The outer Hessian returned by `compute_outer_hessian` has shape
+/// (K+ext_dim) × (K+ext_dim) where K = total number of smoothing parameters.
+/// Inner coefficient dimension p and sample count n enter only through block-
+/// local H⁻¹ solves that are already performed for the gradient, so the only
+/// meaningful affordability proxy for the second-order path is the size of the
+/// dense K×K outer Hessian. Inner n·p or n·p² proxies do not correspond to any
+/// allocation in the Hessian assembly and would incorrectly block affordable
+/// problems (e.g. K=8, n=50000, p=80 → outer Hessian is 64 f64s, but an n·p²
+/// gate would disable it).
 pub fn cost_gated_outer_order(specs: &[ParameterBlockSpec]) -> ExactOuterDerivativeOrder {
-    if !exact_outer_hessian_problem_scale_allows(specs) {
-        return ExactOuterDerivativeOrder::First;
-    }
-
     let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
     let outer_elements = k.saturating_mul(k);
     if outer_elements > DEFAULT_EXACT_OUTER_MAX_ELEMENTS {
@@ -5554,8 +5554,11 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     // at iter 0 with Strong Wolfe failures because the rank-2 BFGS update is
     // directionally wrong for the ridged surrogate surface. The fix is to
     // expose the analytic Hessian and let ARC drive the outer iteration.
+    //
+    // Availability is a property of the family's second-derivative form, not
+    // of the inner problem size. The K×K affordability gate already lives
+    // inside `order.has_hessian()` via `cost_gated_outer_order`.
     let hessian = if options.use_outer_hessian
-        && exact_outer_hessian_problem_scale_allows(specs)
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()
     {
@@ -11075,7 +11078,17 @@ mod tests {
     }
 
     #[test]
-    fn custom_family_outer_derivatives_disables_large_model_second_order() {
+    fn custom_family_outer_derivatives_keeps_second_order_for_large_inner_problem() {
+        // Inner (n, p) scale does not block the analytic outer Hessian: the
+        // outer Hessian assembled by `compute_outer_hessian` is shape
+        // (K+ext_dim)×(K+ext_dim) where K = total penalties. For large inner
+        // problems with modest K (the common case: n=50000, p=50, K=2) the
+        // outer Hessian is tiny and must remain available so ARC can drive
+        // the outer iteration. Prior versions of this test enforced an
+        // inner-size cutoff that disabled the Hessian for exactly the
+        // benchmark sizes (medium: n=50000,p=50; pathological: n=50000,p=80)
+        // that were hanging 45-minute GH jobs on BFGS+BfgsApprox Strong Wolfe
+        // failures at iter 0.
         #[derive(Clone)]
         struct StrictFamily;
 
@@ -11121,10 +11134,7 @@ mod tests {
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::Derivative::Unavailable
-        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
     #[test]
