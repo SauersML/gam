@@ -14076,12 +14076,15 @@ mod tests {
 
     #[test]
     fn duchon_linear_nullspace_builds_and_reports_nullspace_dim() {
-        let n = 14usize;
+        // DuchonNullspaceOrder::Linear in dimension d needs at least d+1
+        // affinely independent centers to span [1, x_1, ..., x_d].
+        let n = 20usize;
         let d = 10usize;
         let mut data = Array2::<f64>::zeros((n, d));
         for i in 0..n {
             for j in 0..d {
-                data[[i, j]] = (i as f64) * 0.07 + (j as f64) * 0.05;
+                let jitter = ((i * 7 + j * 5) % 13) as f64 * 0.011;
+                data[[i, j]] = (i as f64) * 0.07 + (j as f64) * 0.05 + jitter;
             }
         }
 
@@ -14090,7 +14093,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(0.9),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,

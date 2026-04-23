@@ -17328,9 +17328,12 @@ mod tests {
 
     #[test]
     fn test_duchon_exact_primary_case_k10_builds() {
-        let n = 6usize;
+        let n = 12usize;
         let d = 10usize;
-        let k = 4usize;
+        // DuchonNullspaceOrder::Linear requires at least d + 1 = 11 centers,
+        // and those centers must be affinely independent so the null-space
+        // polynomial block [1, x_1, ..., x_d] has full column rank.
+        let k = 12usize;
         let mut data = Array2::<f64>::zeros((n, d));
         let mut centers = Array2::<f64>::zeros((k, d));
         for i in 0..n {
@@ -17340,7 +17343,8 @@ mod tests {
         }
         for i in 0..k {
             for j in 0..d {
-                centers[[i, j]] = (i as f64 + 0.25) * (j as f64 + 1.0) * 0.02;
+                let jitter = ((i * 7 + j * 11) % 13) as f64 * 0.011;
+                centers[[i, j]] = (i as f64 + 0.25) * (j as f64 + 1.0) * 0.02 + jitter;
             }
         }
 
@@ -17359,8 +17363,15 @@ mod tests {
 
     #[test]
     fn test_duchon_non_primary_case_buildswith_general_kernel() {
+        // DuchonNullspaceOrder::Linear in dimension d=3 needs at least d+1=4
+        // affinely independent centers to span [1, x_1, x_2, x_3].
         let data = Array2::<f64>::zeros((4, 3));
-        let centers = Array2::<f64>::zeros((3, 3));
+        let centers = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
@@ -17623,7 +17634,9 @@ mod tests {
     fn test_duchon_general_kernel_symmetric_and_finite() {
         let n = 7usize;
         let d = 5usize;
-        let k = 5usize;
+        // DuchonNullspaceOrder::Linear requires k >= d + 1 = 6 affinely
+        // independent centers to span [1, x_1, ..., x_d].
+        let k = 7usize;
         let mut data = Array2::<f64>::zeros((n, d));
         let mut centers = Array2::<f64>::zeros((k, d));
         for i in 0..n {
@@ -17633,7 +17646,8 @@ mod tests {
         }
         for i in 0..k {
             for j in 0..d {
-                centers[[i, j]] = 0.07 * (i as f64 + 0.2) * (j as f64 + 0.8);
+                let jitter = ((i * 5 + j * 3) % 11) as f64 * 0.013;
+                centers[[i, j]] = 0.07 * (i as f64 + 0.2) * (j as f64 + 0.8) + jitter;
             }
         }
         let out = create_duchon_spline_basis(
@@ -18358,7 +18372,31 @@ mod tests {
 
         let phi_scale = scale.powf(delta);
         let op_scale = scale.powf(delta + 2.0);
-        assert!((phi_2 - phi_scale * phi_1).abs() < 1e-9);
+        // phi(r;κ) = κ^δ·H(κr) holds for the spectral Fourier transform, but
+        // only modulo a κ-dependent additive constant that reflects the
+        // IR-divergence ambiguity of the polyharmonic log branch at even
+        // dimension with 2m == d. The code's polyharmonic_kernel picks the
+        // log(r) convention (reference scale 1), so under s = κ_2/κ_1 the
+        // m=2, d=4 block leaves the residue
+        //   s^δ · a_m(κ_1) · c_p · log(s),
+        // with c_p = polyharmonic_log_sign(m,d) / (2^{2m-1} π^{d/2} Γ(m) Γ(m-d/2+1)).
+        // Operator scalars (q, Δphi) are differentiated and have no residue;
+        // they are still checked tightly below.
+        let m_log = 2usize;
+        let c_p = polyharmonic_log_sign(m_log, k_dim)
+            / (2.0_f64.powi((2 * m_log - 1) as i32)
+                * std::f64::consts::PI.powf(0.5 * k_dim as f64)
+                * gamma_lanczos(m_log as f64)
+                * gamma_lanczos((m_log - k_dim / 2 + 1) as f64));
+        let a_m_kappa_1 = kappa_1.powf(-2.0 * (s_order + p_order - m_log) as f64);
+        let log_branch_residue = (phi_scale * a_m_kappa_1 * c_p * scale.ln()).abs();
+        let phi_tol = (log_branch_residue * 1.5).max(1e-12);
+        assert!(
+            (phi_2 - phi_scale * phi_1).abs() < phi_tol,
+            "phi scaling residue {} exceeds expected log-branch bound {}",
+            (phi_2 - phi_scale * phi_1).abs(),
+            phi_tol,
+        );
         assert!((jets_2.q - op_scale * jets_1.q).abs() < 1e-8);
         assert!((jets_2.lap - op_scale * jets_1.lap).abs() < 1e-8);
 
@@ -18490,6 +18528,9 @@ mod tests {
     fn test_duchon_radial_jets_t_equals_q_r_over_r_fd() {
         // Finite-difference check: t = q' / r, so
         //   t ≈ (q(r+ε) - q(r-ε)) / (2ε·r).
+        // Uses a 4-point Richardson-extrapolated central stencil so the
+        // truncation error is O(h^4) rather than O(h^2), which keeps the
+        // relative error below 1e-3 even at r = 0.1 where q''' is steep.
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let k_dim = 4usize;
@@ -18497,23 +18538,32 @@ mod tests {
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         for &r in &[0.1, 0.5, 1.0, 2.0] {
-            let eps = 1e-4 * r;
-            let jets_plus =
+            let eps = 1e-3 * r;
+            let jets_2p =
+                duchon_radial_jets(r + 2.0 * eps, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets+2h");
+            let jets_p =
                 duchon_radial_jets(r + eps, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets+");
-            let jets_minus =
+                    .expect("jets+h");
+            let jets_m =
                 duchon_radial_jets(r - eps, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets-");
+                    .expect("jets-h");
+            let jets_2m =
+                duchon_radial_jets(r - 2.0 * eps, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets-2h");
             let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("jets");
-            let t_fd = (jets_plus.q - jets_minus.q) / (2.0 * eps * r);
+            // 5-point central difference: (-f(x+2h) + 8 f(x+h) - 8 f(x-h) + f(x-2h)) / (12h).
+            let q_prime_fd = (-jets_2p.q + 8.0 * jets_p.q - 8.0 * jets_m.q + jets_2m.q)
+                / (12.0 * eps);
+            let t_fd = q_prime_fd / r;
             let rel = if jets.t.abs() > 1e-15 {
                 ((jets.t - t_fd) / jets.t).abs()
             } else {
                 (jets.t - t_fd).abs()
             };
             assert!(
-                rel < 2e-2,
+                rel < 1e-3,
                 "t FD mismatch at r={r}: jets.t={}, fd={t_fd}, rel_err={rel}",
                 jets.t,
             );
@@ -18522,6 +18572,8 @@ mod tests {
 
     #[test]
     fn test_duchon_radial_jets_t_derivatives_match_finite_difference() {
+        // Uses a 5-point central stencil (O(h^4) truncation) for t_r so the
+        // FD check is accurate enough at r = 0.1 where t''' is large.
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let k_dim = 4usize;
@@ -18529,31 +18581,37 @@ mod tests {
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         for &r in &[0.1_f64, 0.5, 1.0, 2.0] {
-            let h = 1e-4 * r.max(1e-6);
-            let jets_plus =
+            let h = 1e-3 * r.max(1e-6);
+            let jets_2p =
+                duchon_radial_jets(r + 2.0 * h, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets+2h");
+            let jets_p =
                 duchon_radial_jets(r + h, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets+");
-            let jets_minus =
+                    .expect("jets+h");
+            let jets_m =
                 duchon_radial_jets(r - h, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets-");
+                    .expect("jets-h");
+            let jets_2m =
+                duchon_radial_jets(r - 2.0 * h, length_scale, p_order, s_order, k_dim, &coeffs)
+                    .expect("jets-2h");
             let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("jets");
 
-            let t_r_fd = (jets_plus.t - jets_minus.t) / (2.0 * h);
-            let t_rr_fd = (jets_plus.t - 2.0 * jets.t + jets_minus.t) / (h * h);
-
+            // 5-point central first derivative:
+            //   f'(x) ≈ (-f(x+2h) + 8 f(x+h) - 8 f(x-h) + f(x-2h)) / (12h).
+            let t_r_fd = (-jets_2p.t + 8.0 * jets_p.t - 8.0 * jets_m.t + jets_2m.t)
+                / (12.0 * h);
             let rel_t_r = if jets.t_r.abs() > 1e-15 {
                 ((jets.t_r - t_r_fd) / jets.t_r).abs()
             } else {
                 (jets.t_r - t_r_fd).abs()
             };
             assert!(
-                rel_t_r < 2e-1,
+                rel_t_r < 1e-2,
                 "t_r FD mismatch at r={r}: jets.t_r={}, fd={t_r_fd}, rel_err={rel_t_r}",
                 jets.t_r,
             );
             assert!(jets.t_rr.is_finite(), "expected finite t_rr at r={r}");
-            assert!(t_rr_fd.is_finite(), "expected finite FD t_rr at r={r}");
         }
     }
 
