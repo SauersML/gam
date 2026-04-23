@@ -12353,6 +12353,8 @@ fn joint_setup(
     upper_vals.extend(marginal_upper.as_array().iter());
     upper_vals.extend(logslope_upper.as_array().iter());
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
+    // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
