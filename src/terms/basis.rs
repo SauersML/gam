@@ -18539,23 +18539,35 @@ mod tests {
 
         for &r in &[0.1, 0.5, 1.0, 2.0] {
             let eps = 1e-3 * r;
-            let jets_2p =
-                duchon_radial_jets(r + 2.0 * eps, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets+2h");
+            let jets_2p = duchon_radial_jets(
+                r + 2.0 * eps,
+                length_scale,
+                p_order,
+                s_order,
+                k_dim,
+                &coeffs,
+            )
+            .expect("jets+2h");
             let jets_p =
                 duchon_radial_jets(r + eps, length_scale, p_order, s_order, k_dim, &coeffs)
                     .expect("jets+h");
             let jets_m =
                 duchon_radial_jets(r - eps, length_scale, p_order, s_order, k_dim, &coeffs)
                     .expect("jets-h");
-            let jets_2m =
-                duchon_radial_jets(r - 2.0 * eps, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets-2h");
+            let jets_2m = duchon_radial_jets(
+                r - 2.0 * eps,
+                length_scale,
+                p_order,
+                s_order,
+                k_dim,
+                &coeffs,
+            )
+            .expect("jets-2h");
             let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("jets");
             // 5-point central difference: (-f(x+2h) + 8 f(x+h) - 8 f(x-h) + f(x-2h)) / (12h).
-            let q_prime_fd = (-jets_2p.q + 8.0 * jets_p.q - 8.0 * jets_m.q + jets_2m.q)
-                / (12.0 * eps);
+            let q_prime_fd =
+                (-jets_2p.q + 8.0 * jets_p.q - 8.0 * jets_m.q + jets_2m.q) / (12.0 * eps);
             let t_fd = q_prime_fd / r;
             let rel = if jets.t.abs() > 1e-15 {
                 ((jets.t - t_fd) / jets.t).abs()
@@ -18585,12 +18597,10 @@ mod tests {
             let jets_2p =
                 duchon_radial_jets(r + 2.0 * h, length_scale, p_order, s_order, k_dim, &coeffs)
                     .expect("jets+2h");
-            let jets_p =
-                duchon_radial_jets(r + h, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets+h");
-            let jets_m =
-                duchon_radial_jets(r - h, length_scale, p_order, s_order, k_dim, &coeffs)
-                    .expect("jets-h");
+            let jets_p = duchon_radial_jets(r + h, length_scale, p_order, s_order, k_dim, &coeffs)
+                .expect("jets+h");
+            let jets_m = duchon_radial_jets(r - h, length_scale, p_order, s_order, k_dim, &coeffs)
+                .expect("jets-h");
             let jets_2m =
                 duchon_radial_jets(r - 2.0 * h, length_scale, p_order, s_order, k_dim, &coeffs)
                     .expect("jets-2h");
@@ -18599,8 +18609,7 @@ mod tests {
 
             // 5-point central first derivative:
             //   f'(x) ≈ (-f(x+2h) + 8 f(x+h) - 8 f(x-h) + f(x-2h)) / (12h).
-            let t_r_fd = (-jets_2p.t + 8.0 * jets_p.t - 8.0 * jets_m.t + jets_2m.t)
-                / (12.0 * h);
+            let t_r_fd = (-jets_2p.t + 8.0 * jets_p.t - 8.0 * jets_m.t + jets_2m.t) / (12.0 * h);
             let rel_t_r = if jets.t_r.abs() > 1e-15 {
                 ((jets.t_r - t_r_fd) / jets.t_r).abs()
             } else {

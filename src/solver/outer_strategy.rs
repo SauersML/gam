@@ -809,7 +809,18 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
         }
     }
 
-    if let Some(grad_cap) = downgrade_hessian(cap) {
+    if let Some(mut grad_cap) = downgrade_hessian(cap) {
+        // Primary plan was Arc (analytic Hessian). Dropping the Hessian here
+        // must not detour through the EFS planner arm: Arc already saw the
+        // analytic Hessian and failed, so silently switching to an EFS
+        // fixed-point on the same structure is a lateral hop, not a fallback.
+        // We suppress `fixed_point_available` on the degraded cap so the
+        // planner lands on BFGS directly. We do NOT set `disable_fixed_point`
+        // here — that marker is reserved for the "we already tried EFS and it
+        // failed" cascade (see the EFS/HybridEfs branch above).
+        if matches!(plan(cap).solver, Solver::Arc) {
+            grad_cap.fixed_point_available = false;
+        }
         attempts.push(grad_cap);
     }
     attempts
@@ -1283,12 +1294,7 @@ fn finite_efs_eval_or_error(
 ) -> Result<EfsEval, ObjectiveEvalError> {
     layout.validate_efs_eval(&eval, context)?;
     finite_cost_or_error(context, eval.cost)?;
-    if let Some((idx, value)) = eval
-        .steps
-        .iter()
-        .enumerate()
-        .find(|(_, v)| !v.is_finite())
-    {
+    if let Some((idx, value)) = eval.steps.iter().enumerate().find(|(_, v)| !v.is_finite()) {
         let coord_kind = match eval.psi_indices.as_deref() {
             Some(indices) if indices.contains(&idx) => "ψ",
             Some(_) => "ρ/τ",
@@ -1430,12 +1436,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         // produced the NaN. The opt crate's FixedPoint::run also detects
         // this downstream (opt 0.2.2 lib.rs:4949) but surfaces only the bare
         // `NonFiniteStep` variant with no context, which is not actionable.
-        if let Some((idx, value)) = eval
-            .steps
-            .iter()
-            .enumerate()
-            .find(|(_, v)| !v.is_finite())
-        {
+        if let Some((idx, value)) = eval.steps.iter().enumerate().find(|(_, v)| !v.is_finite()) {
             let psi_indices = eval.psi_indices.as_deref();
             let coord_kind = match psi_indices {
                 Some(indices) if indices.contains(&idx) => "ψ",

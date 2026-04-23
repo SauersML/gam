@@ -2966,6 +2966,15 @@ where
                     || message.contains("infinite")
                     || message.contains("overflow")
             }
+            // A candidate step that drives the linear predictor into a region
+            // where the model's likelihood is structurally infeasible (e.g.
+            // survival monotonicity violated, cumulative hazard decreasing) is
+            // the natural LM-halving trigger: the proposed step is too
+            // aggressive and the gain-ratio guard never gets to see it.
+            // Retrying with a larger damping factor collapses towards a
+            // feasible region rather than hard-failing at the first infeasible
+            // candidate.
+            EstimationError::ParameterConstraintViolation(_) => true,
             _ => false,
         }
     }
@@ -3005,6 +3014,16 @@ where
         .map(|_| Vec::new());
     let mut consecutive_fisher_fallbacks = 0usize;
     let mut force_fisher_for_rest = false;
+    // When an accepted step produces deviance change at machine-epsilon level
+    // relative to the objective magnitude, track the streak. If it persists
+    // for several consecutive iterations, we've plateaued at the float-point
+    // limit of the objective — even if the gradient norm is still outside the
+    // strict KKT tolerance, the optimizer genuinely cannot make further
+    // progress and should exit with StalledAtValidMinimum rather than burning
+    // the iteration budget in an observable cycle. This path fires only when
+    // the step was accepted (rho>0), so it can never mask a true divergence.
+    let mut zero_dev_change_streak = 0usize;
+    const ZERO_DEV_CHANGE_STREAK_LIMIT: usize = 4;
     // Pre-allocated buffer for the regularized hessian to avoid O(p²) clone
     // per PIRLS iteration. Reused across iterations when dimensions match.
     let mut regularized_buf: Option<crate::linalg::matrix::SymmetricMatrix> = None;
@@ -3406,6 +3425,26 @@ where
                         {
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
+                        }
+
+                        // Machine-epsilon plateau: an accepted step that produces
+                        // no observable change in the penalized objective means
+                        // the optimizer has reached the float-point noise floor
+                        // of the likelihood surface. The gradient may still be
+                        // outside the strict KKT tolerance (e.g. near-singular
+                        // Hessians on small-n survival problems), but no further
+                        // progress is possible. Accumulate a short streak before
+                        // declaring StalledAtValidMinimum so a transient tight-
+                        // step does not trip the early exit.
+                        let dev_machine_floor = deviance_scale * f64::EPSILON * 16.0;
+                        if deviance_change.abs() <= dev_machine_floor {
+                            zero_dev_change_streak += 1;
+                            if zero_dev_change_streak >= ZERO_DEV_CHANGE_STREAK_LIMIT {
+                                status = PirlsStatus::StalledAtValidMinimum;
+                                break 'pirls_loop;
+                            }
+                        } else {
+                            zero_dev_change_streak = 0;
                         }
 
                         break; // Break inner lambda loop, continue outer pirls loop

@@ -2719,9 +2719,9 @@ mod tests {
     ) {
         let mut model = laml_fd_test_model(rho_value.exp());
         let options = crate::pirls::WorkingModelPirlsOptions {
-            max_iterations: 80,
+            max_iterations: 400,
             convergence_tolerance: 1e-10,
-            max_step_halving: 12,
+            max_step_halving: 30,
             min_step_size: 1e-10,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,

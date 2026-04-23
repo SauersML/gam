@@ -750,7 +750,6 @@ impl ExactJeffreysTerm {
     pub(crate) fn value(&self) -> f64 {
         self.operator.jeffreys_logdet()
     }
-
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2438,11 +2437,7 @@ impl PenaltySubspaceTrace {
     }
 
     /// Cross-trace given pre-reduced blocks `R_A = U_Sᵀ A U_S`, `R_B = U_Sᵀ B U_S`.
-    pub fn trace_projected_logdet_cross_reduced(
-        &self,
-        ra: &Array2<f64>,
-        rb: &Array2<f64>,
-    ) -> f64 {
+    pub fn trace_projected_logdet_cross_reduced(&self, ra: &Array2<f64>, rb: &Array2<f64>) -> f64 {
         // left = H_proj⁻¹ · R_A ;  right = H_proj⁻¹ · R_B ;  tr(left · right).
         let left = self.h_proj_inverse.dot(ra);
         let right = self.h_proj_inverse.dot(rb);
@@ -4227,7 +4222,8 @@ fn compute_outer_hessian(
             let mut out = Array2::<f64>::zeros((n, n));
             for i in 0..n {
                 for j in i..n {
-                    let value = -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
+                    let value =
+                        -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
                     out[[i, j]] = value;
                     out[[j, i]] = value;
                 }
