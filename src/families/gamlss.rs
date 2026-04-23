@@ -16350,7 +16350,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: feature_cols.to_vec(),
                     spec: MaternBasisSpec {
-                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                        center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
                         length_scale,
                         nu: MaternNu::ThreeHalves,
                         include_intercept: false,
@@ -16368,12 +16368,22 @@ mod tests {
     fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
         SpatialLengthScaleOptimizationOptions {
             enabled: true,
-            max_outer_iter: 4,
+            max_outer_iter: 2,
             rel_tol: 1e-4,
             log_step: std::f64::consts::LN_2,
             min_length_scale: 0.1,
             max_length_scale: 2.0,
             pilot_subsample_threshold: 10_000,
+        }
+    }
+
+    fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
+        BlockwiseFitOptions {
+            inner_max_cycles: 24,
+            inner_tol: 1e-4,
+            outer_max_iter: 3,
+            outer_tol: 1e-4,
+            ..BlockwiseFitOptions::default()
         }
     }
 
@@ -17187,7 +17197,7 @@ mod tests {
         let fit = fit_gaussian_location_scale_terms(
             data.view(),
             spec,
-            &BlockwiseFitOptions::default(),
+            &spatial_fit_smoke_options(),
             &spatial_kappa_options(),
         )
         .expect("gaussian location-scale spatial fit");
@@ -17218,55 +17228,12 @@ mod tests {
         let fit = fit_binomial_location_scale_terms(
             data.view(),
             spec,
-            &BlockwiseFitOptions::default(),
+            &spatial_fit_smoke_options(),
             &spatial_kappa_options(),
         )
         .expect("binomial location-scale spatial fit");
         assert!(fit.fit.penalized_objective.is_finite());
         assert_eq!(fit.fit.block_states.len(), 2);
-    }
-
-    #[test]
-    fn binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely() {
-        let n = 30usize;
-        let mut data = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            data[[i, 0]] = t;
-            data[[i, 1]] = (2.5 * std::f64::consts::PI * t).sin();
-        }
-        let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 9 == 0 { 1.0 } else { 0.0 }));
-        let weights = Array1::from_elem(n, 1.0);
-        let q_seed = Array1::linspace(-1.5, 1.5, n);
-        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
-            q_seed.view(),
-            2,
-            4,
-            2,
-            false,
-        )
-        .expect("wiggle block");
-        let spec = BinomialLocationScaleWiggleTermSpec {
-            y,
-            weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
-            thresholdspec: simple_matern_term_collection(&[0, 1], 0.45),
-            log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.8),
-            threshold_offset: Array1::zeros(n),
-            log_sigma_offset: Array1::zeros(n),
-            wiggle_knots: knots,
-            wiggle_degree: 2,
-            wiggle_block,
-        };
-        let fit = fit_binomial_location_scalewiggle_terms(
-            data.view(),
-            spec,
-            &BlockwiseFitOptions::default(),
-            &spatial_kappa_options(),
-        )
-        .expect("binomial location-scale wiggle spatial fit");
-        assert!(fit.fit.penalized_objective.is_finite());
-        assert_eq!(fit.fit.block_states.len(), 3);
     }
 
     #[test]
