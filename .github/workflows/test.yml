@@ -82,7 +82,36 @@ jobs:
           cargo test --all-features -- --nocapture 2>&1 | tee /tmp/cargo-test.log
 
           # Treat runtime optimizer/model-path degradations as hard failures even when tests return 0.
-          forbidden='P-IRLS INNER LOOP FAILED|Perfect or quasi-perfect separation detected|all candidate seeds failed|no stationary candidate found|BFGS fallback failed|Newton failed \(|falling back to BFGS|Line search stopped early|marking as non-stationary|non-stationary solution|range penalty block contains non-finite entries'
+          #
+          # The patterns here are literal/ERE substrings that MUST match the
+          # exact log::warn!/log::error!/Display strings emitted at runtime.
+          # A pattern that doesn't match anything in the source is a silent
+          # safety-net gap — the corresponding runtime failure slips past the
+          # grep even though the test output contains it. If you add or
+          # change a runtime error/warning message, grep this file and keep
+          # the patterns in sync with the source wording.
+          #
+          # Patterns verified against src/ at audit-F commit time to match
+          # non-test runtime log output that represents a genuine regression:
+          #   - "P-IRLS INNER LOOP FAILED" — solver/reml/runtime.rs log::warn!
+          #     emitted by the outer REML cost path when PIRLS returns an
+          #     error. Appearing in a passing test means a code path quietly
+          #     tolerated an inner failure.
+          #   - "Perfect or quasi-perfect separation detected" — Display for
+          #     EstimationError::PerfectSeparationDetected. Tests that target
+          #     this condition should assert on the Err type, not let the
+          #     Display leak through log output of an otherwise-succeeding
+          #     test.
+          #   - "seed candidates failed" — aggregate seed-loop error from
+          #     solver/outer_strategy.rs (both "all N seed candidates failed"
+          #     and "candidate seeds failed" variants). Indicates every
+          #     generated seed hit a hard failure; a passing test would mean
+          #     a retry path swallowed it.
+          #   - "no candidate seeds passed outer startup validation" —
+          #     aggregate seed-loop error when started_seeds == 0. Indicates
+          #     every seed was rejected at validation time (bad analytic
+          #     gradient, NaN cost, etc.) and no solver run occurred.
+          forbidden='P-IRLS INNER LOOP FAILED|Perfect or quasi-perfect separation detected|seed candidates failed|no candidate seeds passed outer startup validation'
           if grep -nE "$forbidden" /tmp/cargo-test.log; then
             echo "::error::Forbidden runtime error signatures were found in test output."
             exit 1
