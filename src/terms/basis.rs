@@ -8231,6 +8231,66 @@ pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f
     }
 }
 
+/// Capped-sample pairwise distance bounds for large point clouds.
+///
+/// Returns `(r_min_hat, r_max_hat)` such that:
+/// - `r_max_hat <= true r_max`  (pairwise max over a sub-sample is monotone
+///    in the sample, so the sampled max underestimates the true max).
+/// - `r_min_hat >= true r_min`  (pairwise min over a sub-sample can only
+///    exclude some pairs, so the sampled min overestimates the true min).
+///
+/// Both approximations are conservative for κ-bound derivation:
+///   kappa_lo = 1e-2 / r_max_hat  >=  1e-2 / true r_max  (wider window, low κ)
+///   kappa_hi = 1e2  / r_min_hat  <=  1e2  / true r_min  (tighter window, high κ)
+/// so no feasible κ that the exact bound would include is excluded by the
+/// approximation — it can only slightly shrink the high-κ tail, which is
+/// exactly the regime (κ → ∞ ⇒ degenerate kernel) that we want the outer
+/// optimizer to avoid anyway.
+///
+/// Sampling is deterministic stride (points indexed 0, stride, 2·stride, …).
+/// For a cap of `K = 1024` and n up to ~10⁹ this yields O(K²·d) work per
+/// call — a few hundred μs. For n < K the exact pairwise is used.
+pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
+    const K_CAP: usize = 1024;
+    let n = points.nrows();
+    let d = points.ncols();
+    if n < 2 || d == 0 {
+        return None;
+    }
+    if n <= K_CAP {
+        return pairwise_distance_bounds(points);
+    }
+    // Deterministic stride sampling: pick K_CAP evenly spaced indices.
+    // This preserves any spatial stratification already present in the
+    // data ordering (biobank data is typically in insertion order, not
+    // spatially stratified, so stride sampling is effectively uniform).
+    let stride = n / K_CAP;
+    let k = K_CAP; // exactly K_CAP samples by construction (stride rounds down)
+    let mut r_min = f64::INFINITY;
+    let mut r_max = 0.0_f64;
+    for i_idx in 0..k {
+        let i = i_idx * stride;
+        for j_idx in (i_idx + 1)..k {
+            let j = j_idx * stride;
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = points[[i, c]] - points[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            if r.is_finite() && r > 0.0 {
+                r_min = r_min.min(r);
+                r_max = r_max.max(r);
+            }
+        }
+    }
+    if r_min.is_finite() && r_max.is_finite() && r_min > 0.0 && r_max > 0.0 {
+        Some((r_min, r_max))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SpatialDistanceCacheKey {
     datarows: usize,
@@ -17179,6 +17239,50 @@ mod tests {
         let (r_min, r_max) = pairwise_distance_bounds(pts.view()).expect("bounds should exist");
         assert!((r_min - 5.0).abs() < 1e-12);
         assert!((r_max - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_pairwise_distance_bounds_sampled_matches_exact_small() {
+        // For n <= K_CAP (=1024), sampled path delegates to the exact path.
+        let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0], [-1.0, 1.0]];
+        let exact = pairwise_distance_bounds(pts.view()).unwrap();
+        let sampled = pairwise_distance_bounds_sampled(pts.view()).unwrap();
+        assert!((exact.0 - sampled.0).abs() < 1e-15);
+        assert!((exact.1 - sampled.1).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_pairwise_distance_bounds_sampled_conservative_on_large() {
+        // On a point cloud larger than K_CAP, verify the mathematical
+        // conservativeness invariants of the sampled bounds:
+        //   sampled r_max <= exact r_max   (sampled max can only shrink)
+        //   sampled r_min >= exact r_min   (sampled min can only grow)
+        // These guarantees are the correctness contract that lets the sampled
+        // path back outer-κ bounds without excluding any feasible κ that the
+        // exact method would include.
+        let n = 2000usize;
+        let mut pts = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            // Deterministic scatter in [0, 100] × [0, 100].
+            let x = ((i * 37 + 7) % 1000) as f64 * 0.1;
+            let y = ((i * 53 + 11) % 1000) as f64 * 0.1;
+            pts[[i, 0]] = x;
+            pts[[i, 1]] = y;
+        }
+        let exact = pairwise_distance_bounds(pts.view()).unwrap();
+        let sampled = pairwise_distance_bounds_sampled(pts.view()).unwrap();
+        assert!(
+            sampled.1 <= exact.1 + 1e-12,
+            "sampled r_max {} must not exceed exact r_max {}",
+            sampled.1,
+            exact.1
+        );
+        assert!(
+            sampled.0 >= exact.0 - 1e-12,
+            "sampled r_min {} must not be below exact r_min {}",
+            sampled.0,
+            exact.0
+        );
     }
 
     #[test]

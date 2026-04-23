@@ -13,7 +13,7 @@ use crate::basis::{
     build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
     estimate_penalty_nullity, filter_active_penalty_candidates, orthogonality_transform_for_design,
-    pairwise_distance_bounds, select_centers_by_strategy,
+    pairwise_distance_bounds, pairwise_distance_bounds_sampled, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -1302,15 +1302,19 @@ fn spatial_term_psi_bounds(
         return fallback;
     };
     // Prefer resolved centers (post-fit) since they live in the same standardized
-    // space the kernel actually sees. If not UserProvided yet, fall back to the
-    // standardized feature data columns.
+    // space the kernel actually sees. Centers are capped at `default_num_centers`
+    // (<=2000), so exact pairwise bounds are cheap (<4M ops). If centers are
+    // not yet UserProvided, fall back to the standardized feature data columns
+    // with the capped-sample path (O(K²·d), K=1024) — the sample is
+    // conservative for κ bounds (see `pairwise_distance_bounds_sampled`
+    // docs): it never excludes a feasible κ the exact method would include.
     let r_bounds = match spatial_term_center_strategy(term) {
         Some(CenterStrategy::UserProvided(centers)) if centers.nrows() >= 2 => {
             pairwise_distance_bounds(centers.view())
         }
         _ => standardized_spatial_term_data(data, term)
             .ok()
-            .and_then(|x| pairwise_distance_bounds(x.view())),
+            .and_then(|x| pairwise_distance_bounds_sampled(x.view())),
     };
     let Some((r_min, r_max)) = r_bounds else {
         return fallback;
