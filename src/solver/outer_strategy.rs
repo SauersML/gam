@@ -788,20 +788,25 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     // own merits — masking non-convergence with FD just hid the real problem.
     //
     // The cascade is now:
-    //   1. If EFS/HybridEFS was the primary plan, retry with fixed-point
-    //      disabled so BFGS can use the declared analytic gradient directly.
+    //   1. If the primary plan is EFS/HybridEFS AND an analytic gradient is
+    //      available, retry with fixed-point disabled so BFGS can use that
+    //      declared analytic gradient directly.
     //   2. If analytic Hessian was declared, retry with it downgraded to
     //      BFGS-approximation (still analytic gradient).
     //   3. No further retries — the caller surfaces the RemlOptimizationFailed
     //      error so the non-convergence is visible.
     let mut attempts = Vec::new();
 
-    if let Some(no_fp_cap) = disable_fixed_point(cap) {
-        attempts.push(no_fp_cap.clone());
-        if let Some(grad_cap) = downgrade_hessian(&no_fp_cap) {
-            attempts.push(grad_cap);
+    if cap.gradient == Derivative::Analytic
+        && matches!(plan(cap).solver, Solver::Efs | Solver::HybridEfs)
+    {
+        if let Some(no_fp_cap) = disable_fixed_point(cap) {
+            attempts.push(no_fp_cap.clone());
+            if let Some(grad_cap) = downgrade_hessian(&no_fp_cap) {
+                attempts.push(grad_cap);
+            }
+            return attempts;
         }
-        return attempts;
     }
 
     if let Some(grad_cap) = downgrade_hessian(cap) {
@@ -3763,6 +3768,48 @@ mod tests {
         assert!(!attempts.is_empty());
         assert_eq!(attempts[0].gradient, Derivative::Analytic);
         assert!(attempts[0].disable_fixed_point);
+        assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
+    }
+
+    #[test]
+    fn automatic_fallbacks_without_gradient_stop_at_fixed_point_status() {
+        for (psi_dim, expected_solver) in [(0, Solver::Efs), (2, Solver::HybridEfs)] {
+            let cap = OuterCapability {
+                gradient: Derivative::Unavailable,
+                hessian: Derivative::Unavailable,
+                n_params: 15,
+                psi_dim,
+                fixed_point_available: true,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            };
+            assert_eq!(plan(&cap).solver, expected_solver);
+            assert!(
+                automatic_fallback_attempts(&cap).is_empty(),
+                "gradient-unavailable fixed-point capabilities must not fabricate a BFGS fallback",
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_fallbacks_do_not_repeat_arc_when_fixed_point_is_irrelevant() {
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 15,
+            psi_dim: 0,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        assert_eq!(plan(&cap).solver, Solver::Arc);
+
+        let attempts = automatic_fallback_attempts(&cap);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].hessian, Derivative::Unavailable);
+        assert!(!attempts[0].disable_fixed_point);
         assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
     }
 
