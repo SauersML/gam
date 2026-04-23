@@ -3379,8 +3379,50 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let ridge_passport = pirls_result.ridge_passport;
 
-        let h_total_original =
+        let mut h_total_original =
             self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref());
+
+        let beta = self.sparse_exact_beta_original(pirls_result);
+
+        // Barrier Hessian diagonal in the ORIGINAL basis.
+        //
+        // `prepare_dense_eval_bundle` adds a barrier diagonal
+        // `τ · diag(1/Δ_j²)` to `bundle.h_total` IN THE TRANSFORMED BASIS,
+        // guarded by `barrier_config_from_constraints(linear_constraints_
+        // transformed)`.  That guard picks only simple-bound rows (a single
+        // nonzero = 1.0), which is generically destroyed by the orthogonal
+        // `Qs` rotation of the constraint rows, so the transformed-basis
+        // barrier commonly evaluates to `None` and the bundle carries no
+        // barrier contribution.  Meanwhile `build_sparse_derivative_context`
+        // uses `self.linear_constraints` (ORIGINAL basis) to construct the
+        // `BarrierConfig` that wraps the derivative provider, and
+        // `reml_laml_evaluate` adds `barrier_cost(&solution.beta_original)`
+        // to the cost (unified.rs:3106-3112).  Without re-adding the
+        // barrier Hessian to `h_total_original`, the `log|H|`, its
+        // ρ-gradient via `trace_logdet_gradient(dH/dρ)`, and the barrier
+        // cost would each be evaluated against a different Hessian surface:
+        // the cost and dH/dρ would see the barrier curvature, but `log|H|`
+        // would not.
+        //
+        // Fix the inconsistency at the source: apply the same
+        // `τ·diag(1/Δ_j²)` diagonal increment, but in the original basis
+        // (using `self.linear_constraints` and `β_original`), mirroring
+        // the transformed-basis addition at the bundle assembly site.
+        if let Some(barrier_cfg) = self
+            .linear_constraints
+            .as_ref()
+            .and_then(Self::barrier_config_from_constraints)
+        {
+            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta) {
+                log::warn!(
+                    "Original-basis barrier Hessian diagonal skipped: {e}; \
+                     cost/gradient/logdet consistency may regress on infeasible \
+                     candidates (slack ≤ 0).  BFGS line search must maintain \
+                     feasibility for the barrier-aware outer objective."
+                );
+            }
+        }
+
         // Match `build_dense_assembly`: under Firth bias-reduction the penalized
         // Hessian `X'WX + S − H_φ` inherits the Jeffreys-identifiable subspace,
         // and `Smooth` would leak a spurious gradient contribution through the
@@ -3407,7 +3449,6 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, penalty_logdet) =
             self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
 
-        let beta = self.sparse_exact_beta_original(pirls_result);
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
@@ -4155,9 +4196,7 @@ impl<'a> RemlState<'a> {
         let needs_rotation = matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
-        ) && self
-            .active_constraint_free_basis(pirls_result)
-            .is_none();
+        ) && self.active_constraint_free_basis(pirls_result).is_none();
         if !needs_rotation {
             return;
         }
