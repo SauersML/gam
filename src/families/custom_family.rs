@@ -14537,10 +14537,11 @@ mod tests {
             a: array![[1.0, 0.0], [0.0, 1.0]],
             b: array![0.0, f64::NEG_INFINITY], // only β_0 has a finite lower bound
         };
-        // `extract_simple_lower_bounds` treats infinite b-entries as
-        // unconstrained because `row_norm`-filtering picks exactly one coefficient per row
-        // — the NEG_INFINITY b propagates as an unreachable bound. Build a
-        // proper single-row constraint instead.
+        // Build a minimal single-row constraint first (β_0 ≥ 0) so the
+        // "active lower bound + positive residual" branch of the projection
+        // is exercised in isolation.  β_1 is left unconstrained relative to
+        // this single-row constraint matrix (it's not pinned by any row),
+        // so its contribution (|-0.1| = 0.1) stays in the inf-norm.
         let single = LinearInequalityConstraints {
             a: array![[1.0, 0.0]],
             b: array![0.0],
@@ -14549,15 +14550,18 @@ mod tests {
             projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single));
         assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
 
-        // Also verify the drop-in reference behaviour using constraints_lb0
-        // (two rows, one truly unconstrained): same result.
+        // Also verify the per-coord handling of an explicitly-unconstrained
+        // row (b = -inf) in the two-row form: β_0 has a finite lower bound
+        // of 0 (from row 0), β_1 gets lb = -inf (from row 1 via b/a), which
+        // `lb.is_finite() == false` routes to the "no lower bound" branch of
+        // the projection.  The active-bound drop still fires on coord 0, so
+        // the result matches the single-row case: 0.1.  This documents that
+        // the projection's per-coord `lb.is_finite()` gate is what makes the
+        // unconstrained-coord case work — NOT rejection of the whole
+        // constraint set by `extract_simple_lower_bounds`.
         let inf_with_two_row =
             projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&constraints_lb0));
-        // constraints_lb0 is rejected by extract_simple_lower_bounds (b entry
-        // for second row is -inf, which trips the decomposition), so this
-        // falls back to plain inf-norm = 0.5 — exercising the "unparseable
-        // constraints" fallback branch explicitly.
-        assert_relative_eq!(inf_with_two_row, 0.5_f64, epsilon = 1e-12);
+        assert_relative_eq!(inf_with_two_row, 0.1_f64, epsilon = 1e-12);
 
         // Test (iii): β_j at its bound but residual points the WRONG way
         // (residual_j < 0 means the KKT dual feasibility λ_j ≥ 0 is violated
