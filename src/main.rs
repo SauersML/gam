@@ -10342,6 +10342,19 @@ fn write_survival_prediction_csv(
         cols.push(("effective_se", &se_v));
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
+    } else if let (Some(lo), Some(hi)) = (survival_lower, survival_upper) {
+        lo_v = lo.to_vec();
+        hi_v = hi.to_vec();
+        cols.push(("mean_lower", &lo_v));
+        cols.push(("mean_upper", &hi_v));
+    } else if survival_lower.is_some() {
+        return Err(
+            "internal error: survival_upper missing while survival_lower is present".to_string(),
+        );
+    } else if survival_upper.is_some() {
+        return Err(
+            "internal error: survival_lower missing while survival_upper is present".to_string(),
+        );
     }
 
     write_prediction_csv_unified(path, &cols)
