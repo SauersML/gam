@@ -1599,6 +1599,59 @@ impl Default for SpatialLengthScaleOptimizationOptions {
     }
 }
 
+impl SpatialLengthScaleOptimizationOptions {
+    /// Validate the struct's invariants. Callers that construct these options
+    /// from external input (CLI, config, Python API) should call this before
+    /// passing the options into the fitter. Returns `Err` with a descriptive
+    /// message when an invariant is violated; the fitter then panics or
+    /// returns `EstimationError` at its own boundary.
+    ///
+    /// Invariants:
+    ///   * `min_length_scale > 0`, finite
+    ///   * `max_length_scale > 0`, finite
+    ///   * `min_length_scale < max_length_scale`
+    ///   * `rel_tol > 0`, finite
+    ///   * `log_step > 0`, finite
+    ///
+    /// These invariants are what the downstream κ-bound and ψ-window code
+    /// assumes (`-log(max_ls)` must be finite, `(min,max)` must not be
+    /// inverted, etc.). Without validation, invalid options produce silent
+    /// NaN-propagation inside the outer optimizer.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.min_length_scale.is_finite() || self.min_length_scale <= 0.0 {
+            return Err(format!(
+                "SpatialLengthScaleOptimizationOptions::min_length_scale must be > 0 and finite, got {}",
+                self.min_length_scale
+            ));
+        }
+        if !self.max_length_scale.is_finite() || self.max_length_scale <= 0.0 {
+            return Err(format!(
+                "SpatialLengthScaleOptimizationOptions::max_length_scale must be > 0 and finite, got {}",
+                self.max_length_scale
+            ));
+        }
+        if self.min_length_scale >= self.max_length_scale {
+            return Err(format!(
+                "SpatialLengthScaleOptimizationOptions requires min_length_scale < max_length_scale, got min={} max={}",
+                self.min_length_scale, self.max_length_scale
+            ));
+        }
+        if !self.rel_tol.is_finite() || self.rel_tol <= 0.0 {
+            return Err(format!(
+                "SpatialLengthScaleOptimizationOptions::rel_tol must be > 0 and finite, got {}",
+                self.rel_tol
+            ));
+        }
+        if !self.log_step.is_finite() || self.log_step <= 0.0 {
+            return Err(format!(
+                "SpatialLengthScaleOptimizationOptions::log_step must be > 0 and finite, got {}",
+                self.log_step
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RandomEffectBlock {
     name: String,
@@ -10079,6 +10132,13 @@ fn try_exact_joint_spatial_length_scale_optimization(
     if spatial_terms.is_empty() {
         return Ok(None);
     }
+    // Fail loud on nonsensical κ options rather than letting them propagate
+    // silent NaNs (e.g. inverted min/max inverts the BFGS window, negative
+    // scales produce NaN logs). This is the first function on every outer-κ
+    // path; downstream paths assume validated options.
+    kappa_options
+        .validate()
+        .map_err(EstimationError::InvalidInput)?;
     if try_build_spatial_log_kappa_hyper_dirs(data, resolvedspec, &best.design, spatial_terms)?
         .is_none()
     {
