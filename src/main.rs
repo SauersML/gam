@@ -7,7 +7,7 @@ use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::create_difference_penalty_matrix;
 use gam::estimate::{
-    AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus, EstimationError,
+    AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
