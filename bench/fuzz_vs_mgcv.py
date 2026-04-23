@@ -1169,6 +1169,82 @@ def main():
 
     print_leaderboard(results, top_n=args.top)
 
+    # ─── CI fail policy ────────────────────────────────────────────────
+    #
+    # Until this block was added, `main()` returned normally after
+    # print_leaderboard regardless of per-trial outcomes, so the fuzz CI
+    # workflow was green even when every trial hit "[R:ERR]" or reported a
+    # large mgcv-vs-rust disagreement. `!!!` / `[R:ERR]` were purely human-
+    # readable log decorations with no effect on exit code.
+    #
+    # Two regression classes are now blocking:
+    #
+    # 1. **rust-only failures** — any trial where `rust.error` is set while
+    #    `mgcv.error` is None. This is the harness's unambiguous "rust
+    #    regressed on a scenario mgcv handles" signal. Transient timeouts
+    #    are counted; if a timeout is genuinely uninformative it is a
+    #    separate bug to fix upstream, not a failure mode to tolerate.
+    #
+    # 2. **large correctness gap** — any trial where
+    #    `primary_gap > GAP_FAIL_THRESHOLD`. By the harness convention
+    #    (line 994 label, line 956 sign), `primary_gap = mgcv_metric -
+    #    rust_metric`, so a POSITIVE gap means rust is BELOW mgcv on the
+    #    primary metric (r2 for gaussian, auc for binomial). The threshold
+    #    is inherited verbatim from the same value the `!!!` marker
+    #    already uses at line 1142 — consistency over tuning per the
+    #    team-lead directive. A tighter threshold can be introduced later
+    #    if this proves noisy on small-n scenarios.
+    #
+    # The per-trial output (prints, jsonl writes) is unchanged; only the
+    # final exit policy changes.
+    GAP_FAIL_THRESHOLD = 0.1  # inherited from the `!!!` marker at line 1142
+    rust_only_failures = [
+        r for r in results
+        if r.rust.get("error") and not r.mgcv.get("error")
+    ]
+    large_gap_regressions = [
+        r for r in results
+        if r.primary_gap is not None and r.primary_gap > GAP_FAIL_THRESHOLD
+    ]
+    if rust_only_failures or large_gap_regressions:
+        print(f"\n{'=' * 120}")
+        print("  CI FAIL: fuzz harness detected blocking regressions")
+        print("=" * 120)
+        if rust_only_failures:
+            print(
+                f"  rust-only failures (rust.error set, mgcv.error unset): "
+                f"{len(rust_only_failures)}"
+            )
+            for r in rust_only_failures[:10]:
+                s = r.scenario
+                err = str(r.rust.get("error", ""))[:200]
+                print(
+                    f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
+                    f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
+                    f"kn={s['knots']} :: {err}"
+                )
+        if large_gap_regressions:
+            print(
+                f"  large-gap regressions (mgcv_{{metric}} - rust_{{metric}} > "
+                f"{GAP_FAIL_THRESHOLD}): {len(large_gap_regressions)}"
+            )
+            large_gap_regressions.sort(
+                key=lambda r: -(r.primary_gap or 0)
+            )
+            for r in large_gap_regressions[:10]:
+                s = r.scenario
+                rv = r.rust.get(r.primary_metric or "r2")
+                mv = r.mgcv.get(r.primary_metric or "r2")
+                rs = f"{rv:.4f}" if rv is not None else "FAIL"
+                ms = f"{mv:.4f}" if mv is not None else "FAIL"
+                print(
+                    f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
+                    f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
+                    f"kn={s['knots']} :: {r.primary_metric}: "
+                    f"rust={rs} mgcv={ms} gap={r.primary_gap:+.4f}"
+                )
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
