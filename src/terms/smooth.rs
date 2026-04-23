@@ -10355,8 +10355,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     };
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only =
-        analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
+    let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
     if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
         log::info!(
             "[OUTER] aniso-psi joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
@@ -10650,8 +10649,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     };
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only =
-        analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
+    let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
     if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
         log::info!(
             "[OUTER] iso-kappa joint REML: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
@@ -12282,8 +12280,7 @@ where
     };
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
-    let prefer_gradient_only =
-        analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
+    let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
     if let Some(policy) = tau_tau_policy.filter(|policy| policy.prefer_gradient_only()) {
         log::info!(
             "[OUTER] n-block exact-joint spatial: disabling exact tau-tau Hessian by default; preferring gradient-only BFGS over Arc (implicit_tau={}, implicit_multidim_duchon={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",

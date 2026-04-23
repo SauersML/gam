@@ -3437,11 +3437,11 @@ impl UnifiedFitResult {
             }
         }
         if let Some(inf) = inference.as_ref() {
-            if inf.edf_by_block.len() != blocks.len() {
+            if !inf.edf_by_block.is_empty() && inf.edf_by_block.len() != lambdas.len() {
                 return Err(EstimationError::InvalidInput(format!(
-                    "UnifiedFitResult EDF block count mismatch: edf_by_block={}, blocks={}",
+                    "UnifiedFitResult EDF smoothing-parameter count mismatch: edf_by_block={}, lambdas={}",
                     inf.edf_by_block.len(),
-                    blocks.len()
+                    lambdas.len()
                 )));
             }
             if inf.working_weights.len() != inf.working_response.len() {
@@ -4850,7 +4850,7 @@ mod fd_policy_tests {
             covariance_conditional: Some(array![[1.0, 0.1], [0.1, 2.0]]),
             covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
             inference: Some(FitInference {
-                edf_by_block: vec![1.5],
+                edf_by_block: vec![0.6, 0.9],
                 edf_total: 1.5,
                 smoothing_correction: Some(array![[0.2, 0.0], [0.0, 0.2]]),
                 penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]],
@@ -4906,6 +4906,23 @@ mod fd_policy_tests {
         assert!(
             err.to_string()
                 .contains("decoded beta must match coefficient blocks"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unified_fit_validation_rejects_edf_smoothing_parameter_drift() {
+        let mut fit = decode_invariant_test_fit();
+        fit.inference
+            .as_mut()
+            .expect("test fit has inference")
+            .edf_by_block = vec![1.5];
+        let err = fit
+            .validate_numeric_finiteness()
+            .expect_err("EDF entries should align with smoothing parameters");
+        assert!(
+            err.to_string()
+                .contains("EDF smoothing-parameter count mismatch"),
             "unexpected error: {err}"
         );
     }
