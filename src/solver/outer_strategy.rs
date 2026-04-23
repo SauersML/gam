@@ -2472,14 +2472,26 @@ fn run_outer_with_plan(
     let bounds_template = (lower, upper);
 
     let mut best: Option<OuterResult> = None;
-    let mut last_seed_error: Option<String> = None;
+    // Accumulate every per-seed rejection with its 0-based seed index and the
+    // phase that rejected it (validation vs solver run). Previously only the
+    // LAST reason was retained via `Option<String>`; the final error then
+    // reported one message, masking earlier seeds' distinct failure modes.
+    // When all seeds fail systematically (bad analytic gradient, rank-deficient
+    // penalty, etc.) the first rejection's rho + error is often the most
+    // diagnostic — losing it forced users to re-run with RUST_LOG=warn and
+    // scrape stderr, which is not available from CI-captured error messages.
+    let mut rejection_reasons: Vec<(usize, &'static str, String)> = Vec::new();
     let layout = cap.theta_layout();
     let mut started_seeds = 0usize;
     let expensive_seed_limit =
         expensive_unsuccessful_seed_limit(the_plan.solver, config.seed_config.risk_profile);
     let mut unsuccessful_expensive_seeds = 0usize;
+    // Tracks whether the loop broke out early due to
+    // `expensive_unsuccessful_seed_limit` so the aggregate error can
+    // distinguish "all generated seeds tried" from "stopped early".
+    let mut stopped_early_due_to_limit = false;
 
-    'seed_attempts: for seed in &seeds {
+    'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
         if started_seeds == seed_budget {
             break;
         }
@@ -2503,8 +2515,10 @@ fn run_outer_with_plan(
                         if requests_immediate_first_order_fallback(&err.to_string()) {
                             return Err(err);
                         }
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                        last_seed_error = Some(err.to_string());
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
                 };
@@ -2518,8 +2532,10 @@ fn run_outer_with_plan(
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
                     Err(err) => {
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                        last_seed_error = Some(err.to_string());
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
                 };
@@ -2609,8 +2625,10 @@ fn run_outer_with_plan(
                                 EstimationError::RemlOptimizationFailed(message)
                             }
                         };
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                        last_seed_error = Some(err.to_string());
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
                 };
@@ -2623,8 +2641,10 @@ fn run_outer_with_plan(
                             }
                         });
                 if let Err(err) = seed_eval {
-                    log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                    last_seed_error = Some(err.to_string());
+                    log::warn!(
+                        "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                    );
+                    rejection_reasons.push((seed_idx, "validation", err.to_string()));
                     continue 'seed_attempts;
                 }
                 started_seeds += 1;
@@ -2669,8 +2689,10 @@ fn run_outer_with_plan(
                         if requests_immediate_first_order_fallback(&err.to_string()) {
                             return Err(err);
                         }
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                        last_seed_error = Some(err.to_string());
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
                 };
@@ -2687,8 +2709,10 @@ fn run_outer_with_plan(
                     if requests_immediate_first_order_fallback(&err.to_string()) {
                         return Err(err);
                     }
-                    log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                    last_seed_error = Some(err.to_string());
+                    log::warn!(
+                        "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                    );
+                    rejection_reasons.push((seed_idx, "validation", err.to_string()));
                     continue 'seed_attempts;
                 }
                 started_seeds += 1;
@@ -2734,8 +2758,10 @@ fn run_outer_with_plan(
                         if requests_immediate_first_order_fallback(&err.to_string()) {
                             return Err(err);
                         }
-                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                        last_seed_error = Some(err.to_string());
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
                 };
@@ -2752,8 +2778,10 @@ fn run_outer_with_plan(
                     if requests_immediate_first_order_fallback(&err.to_string()) {
                         return Err(err);
                     }
-                    log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
-                    last_seed_error = Some(err.to_string());
+                    log::warn!(
+                        "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                    );
+                    rejection_reasons.push((seed_idx, "validation", err.to_string()));
                     continue 'seed_attempts;
                 }
                 started_seeds += 1;
@@ -2793,8 +2821,10 @@ fn run_outer_with_plan(
                     ))
                 })?;
                 if !seed_cost.is_finite() {
-                    last_seed_error = Some(format!(
-                        "aux direct-search rejects non-finite seed cost ({seed_cost})"
+                    rejection_reasons.push((
+                        seed_idx,
+                        "validation",
+                        format!("aux direct-search rejects non-finite seed cost ({seed_cost})"),
                     ));
                     continue 'seed_attempts;
                 }
@@ -2868,6 +2898,7 @@ fn run_outer_with_plan(
                             unsuccessful_expensive_seeds,
                             the_plan.solver,
                         );
+                        stopped_early_due_to_limit = true;
                         break;
                     }
                 }
@@ -2884,7 +2915,7 @@ fn run_outer_with_plan(
                     seed_elapsed,
                     e,
                 );
-                last_seed_error = Some(e.to_string());
+                rejection_reasons.push((seed_idx, "solver", e.to_string()));
                 if let Some(limit) = expensive_seed_limit {
                     unsuccessful_expensive_seeds += 1;
                     if unsuccessful_expensive_seeds >= limit {
@@ -2893,6 +2924,7 @@ fn run_outer_with_plan(
                             unsuccessful_expensive_seeds,
                             the_plan.solver,
                         );
+                        stopped_early_due_to_limit = true;
                         break;
                     }
                 }
@@ -2901,25 +2933,47 @@ fn run_outer_with_plan(
     }
 
     best.ok_or_else(|| {
+        // Build a compact breakdown of why every attempted seed failed so the
+        // caller sees root causes, not just the last-written reason. Earlier
+        // behaviour stored only `Option<String>` and overwrote on every reject,
+        // which erased diagnostic context for the first k-1 seeds — a silent
+        // drift especially bad when analytic-gradient or penalty-rank bugs
+        // systematically break every seed with the same class of error, because
+        // then only the LAST occurrence was visible to the caller.
+        let n_generated = seeds.len();
+        let n_attempted = n_generated.min(seed_budget);
+        let n_rejected = rejection_reasons.len();
+        let breakdown = if rejection_reasons.is_empty() {
+            String::new()
+        } else {
+            let joined = rejection_reasons
+                .iter()
+                .map(|(idx, phase, msg)| format!("seed {idx} ({phase}): {msg}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("; reasons: [{joined}]")
+        };
+        let early_stop_note = if stopped_early_due_to_limit {
+            format!(
+                "; stopped early after {unsuccessful_expensive_seeds} consecutive \
+                 non-converged {:?} seed(s) (expensive_unsuccessful_seed_limit)",
+                the_plan.solver
+            )
+        } else {
+            String::new()
+        };
         if started_seeds == 0 {
-            return match last_seed_error {
-                Some(err) => EstimationError::RemlOptimizationFailed(format!(
-                    "no candidate seeds passed outer startup validation ({context}); last_error: {err}"
-                )),
-                None => EstimationError::RemlOptimizationFailed(format!(
-                    "no candidate seeds passed outer startup validation ({context})"
-                )),
-            };
-        }
-        match last_seed_error {
-            Some(err) => EstimationError::RemlOptimizationFailed(format!(
-                "all {} seed candidates failed ({context}); last_error: {err}",
-                started_seeds
-            )),
-            None => EstimationError::RemlOptimizationFailed(format!(
-                "all {} seed candidates failed ({context})",
-                started_seeds
-            )),
+            EstimationError::RemlOptimizationFailed(format!(
+                "no candidate seeds passed outer startup validation ({context}); \
+                 generated={n_generated}, attempted={n_attempted}, rejected={n_rejected}{breakdown}"
+            ))
+        } else {
+            EstimationError::RemlOptimizationFailed(format!(
+                "all {started_seeds} seed candidates failed ({context}); \
+                 generated={n_generated}, attempted={n_attempted}, \
+                 started_in_solver={started_seeds}, rejected={n_rejected}\
+                 {early_stop_note}{breakdown}"
+            ))
         }
     })
 }
