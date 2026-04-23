@@ -3498,6 +3498,7 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
 
 fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Result<(), String> {
     let n = spec.event_target.len();
+    let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     if n == 0 {
         return Err("fit_survival_location_scale: empty dataset".to_string());
     }
@@ -3519,7 +3520,12 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
             spec.derivative_guard
         ));
     }
-    validate_time_block(n, &spec.time_block, spec.derivative_guard)?;
+    validate_time_block(
+        n,
+        &spec.time_block,
+        spec.derivative_guard,
+        monotone_time_wiggle_ncols,
+    )?;
     validate_cov_block_kind("threshold_block", n, &spec.threshold_block)?;
     validate_cov_block_kind("log_sigma_block", n, &spec.log_sigma_block)?;
     if let Some(w) = spec.timewiggle_block.as_ref() {
@@ -3580,7 +3586,11 @@ fn prepare_survival_location_scale_model(
     validate_survival_location_scale_spec(spec)?;
     let n = spec.event_target.len();
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
-    let mut time_prepared = prepare_identified_time_block(&spec.time_block, spec.derivative_guard)?;
+    let mut time_prepared = prepare_identified_time_block(
+        &spec.time_block,
+        spec.derivative_guard,
+        protected_timewiggle_cols,
+    )?;
 
     if time_prepared.initial_beta.is_none() {
         time_prepared.initial_beta = structural_time_initial_beta_guess(
@@ -3972,7 +3982,12 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String
     Ok(())
 }
 
-fn validate_time_block(n: usize, b: &TimeBlockInput, derivative_guard: f64) -> Result<(), String> {
+fn validate_time_block(
+    n: usize,
+    b: &TimeBlockInput,
+    derivative_guard: f64,
+    monotone_time_wiggle_ncols: usize,
+) -> Result<(), String> {
     if b.design_entry.nrows() != n
         || b.design_exit.nrows() != n
         || b.design_derivative_exit.nrows() != n
@@ -3992,10 +4007,11 @@ fn validate_time_block(n: usize, b: &TimeBlockInput, derivative_guard: f64) -> R
                 .to_string(),
         );
     }
-    structural_time_coefficient_constraints(
+    structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &b.design_derivative_exit.to_dense(),
         &b.derivative_offset_exit,
         derivative_guard,
+        monotone_time_wiggle_ncols,
     )?;
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
@@ -4142,6 +4158,46 @@ fn structural_time_coefficient_lower_bounds(
     Ok(Some(lower_bounds))
 }
 
+fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
+    design_derivative_exit: &Array2<f64>,
+    derivative_offset_exit: &Array1<f64>,
+    lower_bound: f64,
+    monotone_time_wiggle_ncols: usize,
+) -> Result<Option<Array1<f64>>, String> {
+    let mut lower_bounds = structural_time_coefficient_lower_bounds(
+        design_derivative_exit,
+        derivative_offset_exit,
+        lower_bound,
+    )?;
+    let Some(bounds) = lower_bounds.as_mut() else {
+        return Ok(None);
+    };
+    if monotone_time_wiggle_ncols == 0 {
+        return Ok(lower_bounds);
+    }
+    if monotone_time_wiggle_ncols > bounds.len() {
+        return Err(format!(
+            "structural time coefficient bounds cannot reserve {monotone_time_wiggle_ncols} monotone wiggle columns from {} coefficients",
+            bounds.len()
+        ));
+    }
+
+    // Time wiggle columns are appended as zero-derivative tail columns in the
+    // linear time block, but they re-enter through a monotone I-spline
+    // composition h = h_base + I(h_base) @ beta_w. For that composition,
+    // beta_w >= 0 implies dq/dh_base = 1 + I'(h_base) @ beta_w >= 1 because
+    // I' is an M-spline and therefore non-negative. The sign of the baseline
+    // hazard trend does not change this requirement: negative beta_w is the
+    // wrong monotonicity direction for the time wiggle in every case.
+    let tail_start = bounds.len() - monotone_time_wiggle_ncols;
+    for col in tail_start..bounds.len() {
+        if !bounds[col].is_finite() || bounds[col] < 0.0 {
+            bounds[col] = 0.0;
+        }
+    }
+    Ok(lower_bounds)
+}
+
 pub(crate) fn project_onto_linear_constraints(
     dim: usize,
     constraints: &LinearInequalityConstraints,
@@ -4182,6 +4238,7 @@ pub(crate) fn project_onto_linear_constraints(
 fn prepare_identified_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
+    monotone_time_wiggle_ncols: usize,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.structural_monotonicity {
@@ -4196,10 +4253,11 @@ fn prepare_identified_time_block(
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
     let penalties = input.penalties.clone();
-    let coefficient_lower_bounds = structural_time_coefficient_lower_bounds(
+    let coefficient_lower_bounds = structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,
+        monotone_time_wiggle_ncols,
     )?
     .ok_or_else(|| {
         "structural time block requires derivative offsets to encode the derivative guard and a non-negative derivative basis"
@@ -10162,7 +10220,7 @@ mod tests {
             initial_beta: None,
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
@@ -10188,7 +10246,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -10239,7 +10297,7 @@ mod tests {
             initial_beta: Some(array![-0.5, 0.2, -1.5]),
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0])
@@ -10254,6 +10312,43 @@ mod tests {
         assert_eq!(constraints.a, array![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         assert_eq!(constraints.b, Array1::<f64>::zeros(2));
         assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0]));
+    }
+
+    #[test]
+    fn identified_time_block_constrains_monotone_timewiggle_tail_coefficients() {
+        let design_derivative_exit = array![
+            [0.0, 1.0, 0.2, 0.0],
+            [0.0, 1.0, 0.3, 0.0],
+            [0.0, 1.0, 0.4, 0.0]
+        ];
+        let time_block = TimeBlockInput {
+            design_entry: DesignMatrix::from(array![
+                [1.0, 0.0, 0.2, 0.0],
+                [1.0, 1.0, 0.5, 0.0],
+                [1.0, 2.0, 1.0, 0.0]
+            ]),
+            design_exit: DesignMatrix::from(array![
+                [1.0, 0.5, 0.3, 0.0],
+                [1.0, 1.5, 0.8, 0.0],
+                [1.0, 2.5, 1.4, 0.0]
+            ]),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
+            structural_monotonicity: true,
+            penalties: vec![Array2::eye(4)],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: Some(array![-0.5, 0.2, -1.5, -2.0]),
+        };
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6, 1).expect("prepare time block");
+        assert_eq!(
+            prepared.coefficient_lower_bounds,
+            Some(array![f64::NEG_INFINITY, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0, 0.0]));
     }
 
     #[test]
@@ -10280,7 +10375,7 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let err = match prepare_identified_time_block(&time_block, 1e-6) {
+        let err = match prepare_identified_time_block(&time_block, 1e-6, 0) {
             Ok(_) => panic!("offsets below the guard must be rejected"),
             Err(err) => err,
         };
@@ -10447,7 +10542,7 @@ mod tests {
             initial_beta: None,
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
