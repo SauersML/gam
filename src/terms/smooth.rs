@@ -1139,7 +1139,8 @@ impl SpatialLogKappaCoords {
     ) -> Self {
         debug_assert_eq!(self.values.len(), lower.values.len());
         debug_assert_eq!(self.values.len(), upper.values.len());
-        let mut any_projected = false;
+        let mut n_projected = 0usize;
+        let mut worst_delta = 0.0_f64;
         for idx in 0..self.values.len() {
             let lo = lower.values[idx];
             let hi = upper.values[idx];
@@ -1148,17 +1149,21 @@ impl SpatialLogKappaCoords {
             }
             let v = self.values[idx];
             if v < lo {
+                worst_delta = worst_delta.max(lo - v);
                 self.values[idx] = lo;
-                any_projected = true;
+                n_projected += 1;
             } else if v > hi {
+                worst_delta = worst_delta.max(v - hi);
                 self.values[idx] = hi;
-                any_projected = true;
+                n_projected += 1;
             }
         }
-        if any_projected {
+        if n_projected > 0 {
             log::info!(
-                "[spatial-kappa] projected ψ seed into data-derived bounds; \
-                 user length_scale falls outside [1e-2/r_max, 1e2/r_min] geometry window"
+                "[spatial-kappa] projected {n_projected}/{} ψ seed coords into data-derived bounds \
+                 (worst excess={worst_delta:.3} log units); user length_scale falls outside \
+                 [1e-2/r_max, 1e2/r_min] geometry window",
+                self.values.len()
             );
         }
         self
