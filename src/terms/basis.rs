@@ -293,6 +293,7 @@ pub fn create_basis<O: BasisOutputFormat>(
         }
     };
     validate_knots_for_degree(knotvec.view(), knot_degree)?;
+    validate_knot_spans_nondegenerate(knotvec.view(), knot_degree)?;
 
     match options.basis_family {
         BasisFamily::BSpline => O::build_basis(data, degree, eval_kind, knotvec),
@@ -588,6 +589,25 @@ fn validate_knots_for_degree(
         }
     }
 
+    Ok(())
+}
+
+/// Rejects knot vectors whose effective basis functions have zero support
+/// (i.e. `t[i+degree+1] == t[i]` for any `i`). This is stricter than the
+/// structural `validate_knots_for_degree` and is only appropriate at the
+/// user-facing top-level of basis construction — the recursive derivative
+/// evaluators repeatedly call `validate_knots_for_degree` with a reduced
+/// `degree` on the *same* (clamped) knot vector, where the outermost lower-
+/// degree "basis function" always collapses to zero support by construction
+/// and is harmless because the derivative recursion guards the matching
+/// `1/(t_{i+k}-t_i)` denominator with an absolute-value check.
+fn validate_knot_spans_nondegenerate(
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<(), BasisError> {
+    if knot_vector.len() <= degree + 1 {
+        return Ok(());
+    }
     let num_basis = knot_vector.len() - degree - 1;
     for i in 0..num_basis {
         let span = knot_vector[i + degree + 1] - knot_vector[i];
@@ -597,7 +617,6 @@ fn validate_knots_for_degree(
             )));
         }
     }
-
     Ok(())
 }
 
