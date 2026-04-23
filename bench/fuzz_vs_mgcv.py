@@ -958,6 +958,56 @@ class FuzzResult:
             self.primary_gap = mv + 1.0  # rust failed
 
 
+ABS_GAP_WARN_THRESHOLD = 0.05
+ABS_GAP_FAIL_THRESHOLD = 0.1
+GAUSSIAN_R2_WARN_FLOOR = 0.01
+GAUSSIAN_R2_FAIL_FLOOR = 0.02
+GAUSSIAN_RMSE_WARN_RATIO = 1.5
+GAUSSIAN_RMSE_FAIL_RATIO = 2.0
+
+
+def gaussian_rmse_ratio(result: FuzzResult) -> Optional[float]:
+    if result.scenario["family"] != "gaussian":
+        return None
+
+    rust_rmse = result.rust.get("rmse")
+    mgcv_rmse = result.mgcv.get("rmse")
+    if rust_rmse is None or mgcv_rmse is None:
+        return None
+
+    rust_rmse = float(rust_rmse)
+    mgcv_rmse = float(mgcv_rmse)
+    if not math.isfinite(rust_rmse) or not math.isfinite(mgcv_rmse):
+        return None
+    if rust_rmse < 0 or mgcv_rmse < 0:
+        return None
+    if mgcv_rmse <= 1e-12:
+        return math.inf if rust_rmse > 1e-12 else 1.0
+    return rust_rmse / mgcv_rmse
+
+
+def classify_primary_divergence(result: FuzzResult) -> tuple[str, str]:
+    gap = result.primary_gap
+    if gap is None or gap <= 0:
+        return "", ""
+
+    metric = result.primary_metric or "metric"
+    if gap > ABS_GAP_FAIL_THRESHOLD:
+        return "fail", f"{metric}_gap={gap:+.4f}"
+
+    if result.scenario["family"] == "gaussian":
+        rmse_ratio = gaussian_rmse_ratio(result)
+        if rmse_ratio is not None:
+            if gap > GAUSSIAN_R2_FAIL_FLOOR and rmse_ratio > GAUSSIAN_RMSE_FAIL_RATIO:
+                return "fail", f"r2_gap={gap:+.4f}, rmse_ratio={rmse_ratio:.2f}x"
+            if gap > GAUSSIAN_R2_WARN_FLOOR and rmse_ratio > GAUSSIAN_RMSE_WARN_RATIO:
+                return "warn", f"r2_gap={gap:+.4f}, rmse_ratio={rmse_ratio:.2f}x"
+
+    if gap > ABS_GAP_WARN_THRESHOLD:
+        return "warn", f"{metric}_gap={gap:+.4f}"
+    return "", ""
+
+
 def run_trial(sc, rust_timeout, r_timeout):
     train_df, test_df, cols = generate_data(sc)
     with tempfile.TemporaryDirectory(prefix="gam_fuzz_") as tmpdir:
@@ -1139,7 +1189,8 @@ def main():
             ms = f"{mv:.4f}" if mv is not None else " FAIL"
             err_r = " [R:ERR]" if result.rust.get("error") else ""
             err_m = " [M:ERR]" if result.mgcv.get("error") else ""
-            flag = " !!!" if (result.primary_gap or 0) > 0.1 else (" !!" if (result.primary_gap or 0) > 0.05 else "")
+            divergence_level, _ = classify_primary_divergence(result)
+            flag = " !!!" if divergence_level == "fail" else (" !!" if divergence_level == "warn" else "")
             t_rust = result.rust.get("time", 0) or 0
             t_mgcv = result.mgcv.get("time", 0) or 0
             time_s = f"  rust={t_rust:.1f}s mgcv={t_mgcv:.1f}s" if max(t_rust, t_mgcv) > 0.5 else ""
@@ -1186,25 +1237,25 @@ def main():
     #    separate bug to fix upstream, not a failure mode to tolerate.
     #
     # 2. **large correctness gap** — any trial where
-    #    `primary_gap > GAP_FAIL_THRESHOLD`. By the harness convention
-    #    (line 994 label, line 956 sign), `primary_gap = mgcv_metric -
-    #    rust_metric`, so a POSITIVE gap means rust is BELOW mgcv on the
-    #    primary metric (r2 for gaussian, auc for binomial). The threshold
-    #    is inherited verbatim from the same value the `!!!` marker
-    #    already uses at line 1142 — consistency over tuning per the
-    #    team-lead directive. A tighter threshold can be introduced later
-    #    if this proves noisy on small-n scenarios.
+    #    `classify_primary_divergence(r)[0] == "fail"`. Absolute primary-
+    #    metric gaps still block for both families, but gaussian trials get
+    #    one extra scale-aware check: when mgcv already has very low RMSE on
+    #    the shared test fold, even a modest `r2` gap can hide a several-fold
+    #    inflation in rust RMSE. Example: `r2=0.99` vs `r2=0.94` is only a
+    #    0.05 absolute gap, yet rust leaves 6x more unexplained variance.
+    #    The gaussian guard therefore requires both a nontrivial `r2` gap
+    #    and a materially worse RMSE ratio before escalating to `!!` / `!!!`.
     #
-    # The per-trial output (prints, jsonl writes) is unchanged; only the
-    # final exit policy changes.
-    GAP_FAIL_THRESHOLD = 0.1  # inherited from the `!!!` marker at line 1142
+    # The per-trial prints/jsonl payload stay the same; only the `!!` / `!!!`
+    # marker logic and final exit policy now share the same classifier.
     rust_only_failures = [
         r for r in results
         if r.rust.get("error") and not r.mgcv.get("error")
     ]
     large_gap_regressions = [
-        r for r in results
-        if r.primary_gap is not None and r.primary_gap > GAP_FAIL_THRESHOLD
+        (r, reason) for r in results
+        for level, reason in [classify_primary_divergence(r)]
+        if level == "fail"
     ]
     if rust_only_failures or large_gap_regressions:
         print(f"\n{'=' * 120}")
@@ -1225,13 +1276,18 @@ def main():
                 )
         if large_gap_regressions:
             print(
-                f"  large-gap regressions (mgcv_{{metric}} - rust_{{metric}} > "
-                f"{GAP_FAIL_THRESHOLD}): {len(large_gap_regressions)}"
+                "  large benchmark regressions "
+                "(absolute primary-metric gap, or gaussian RMSE inflation on the same fold): "
+                f"{len(large_gap_regressions)}"
             )
             large_gap_regressions.sort(
-                key=lambda r: -(r.primary_gap or 0)
+                key=lambda item: (
+                    item[0].primary_gap or 0,
+                    gaussian_rmse_ratio(item[0]) or 1.0,
+                ),
+                reverse=True,
             )
-            for r in large_gap_regressions[:10]:
+            for r, reason in large_gap_regressions[:10]:
                 s = r.scenario
                 rv = r.rust.get(r.primary_metric or "r2")
                 mv = r.mgcv.get(r.primary_metric or "r2")
@@ -1241,7 +1297,7 @@ def main():
                     f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
                     f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
                     f"kn={s['knots']} :: {r.primary_metric}: "
-                    f"rust={rs} mgcv={ms} gap={r.primary_gap:+.4f}"
+                    f"rust={rs} mgcv={ms} gap={r.primary_gap:+.4f} ({reason})"
                 )
         sys.exit(1)
 
