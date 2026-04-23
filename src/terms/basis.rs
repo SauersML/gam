@@ -8114,6 +8114,26 @@ fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
     r2.sqrt()
 }
 
+/// Return y-space points `y_{i,a} = exp(η_a) x_{i,a}` so Euclidean pairwise
+/// distances in y equal anisotropic kernel distances in x:
+///   |y_i - y_j|² = Σ_a exp(2 η_a) (x_{i,a} - x_{j,a})² = aniso_distance²(x_i, x_j, η).
+/// Use this before `pairwise_distance_bounds` whenever κ conditioning
+/// bounds must match the kernel's actual metric (anisotropic case). For
+/// isotropic terms, pass `None` and keep using the raw centers.
+pub(crate) fn points_in_aniso_y_space(points: ArrayView2<'_, f64>, eta: &[f64]) -> Array2<f64> {
+    assert_eq!(points.ncols(), eta.len());
+    let mut y = points.to_owned();
+    let weights: Vec<f64> = eta
+        .iter()
+        .map(|&e| e.clamp(-50.0, 50.0).exp())
+        .collect();
+    for a in 0..eta.len() {
+        let w_a = weights[a];
+        y.column_mut(a).mapv_inplace(|v| v * w_a);
+    }
+    y
+}
+
 /// Compute per-axis standard deviations of knot center coordinates.
 ///
 /// Returns σ_a for each axis column of `centers`. Axes with zero variance
@@ -8692,7 +8712,15 @@ pub fn create_matern_spline_basiswithworkspace(
     // Practical safe operating range for κ from center geometry (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min], with κ = 1/length_scale.
     // Warn rather than silently clamp so callers keep explicit control.
-    if let Some((r_min, r_max)) = pairwise_distance_bounds(centers) {
+    // Under anisotropy the kernel metric is y-space (y_a = exp(η_a) x_a), so
+    // the relevant r_min/r_max are y-space pairwise distances, not raw.
+    let warn_bounds = if let Some(eta) = aniso_log_scales {
+        let y_centers = points_in_aniso_y_space(centers, eta);
+        pairwise_distance_bounds(y_centers.view())
+    } else {
+        pairwise_distance_bounds(centers)
+    };
+    if let Some((r_min, r_max)) = warn_bounds {
         let kappa = 1.0 / length_scale.max(1e-300);
         let kappa_lo = 1e-2 / r_max;
         let kappa_hi = 1e2 / r_min;
@@ -11869,11 +11897,19 @@ fn build_duchon_basis_designwithworkspace(
 
     // Practical safe operating range (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min]
-    // where r_min/r_max are pairwise center distance extrema.
+    // where r_min/r_max are pairwise center distance extrema. Under
+    // anisotropy the kernel metric is y-space (y_a = exp(η_a) x_a), so
+    // the relevant r_min/r_max are y-space pairwise distances, not raw.
     // We keep user-provided κ but emit a warning outside this regime.
-    if let (Some(length_scale), Some((r_min, r_max))) =
-        (length_scale, pairwise_distance_bounds(centers))
-    {
+    let warn_bounds = match (length_scale, aniso_log_scales) {
+        (Some(_), Some(eta)) => {
+            let y_centers = points_in_aniso_y_space(centers, eta);
+            pairwise_distance_bounds(y_centers.view())
+        }
+        (Some(_), None) => pairwise_distance_bounds(centers),
+        (None, _) => None,
+    };
+    if let (Some(length_scale), Some((r_min, r_max))) = (length_scale, warn_bounds) {
         let kappa = 1.0 / length_scale.max(1e-300);
         let kappa_lo = 1e-2 / r_max;
         let kappa_hi = 1e2 / r_min;
