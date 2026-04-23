@@ -3823,6 +3823,33 @@ fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>(
         })?;
         states.push(ParameterBlockState { beta, eta });
     }
+    // After every block state is populated, pass each β through
+    // `post_update_block_beta` so the invariant "every `states[b].beta`
+    // in `inner_blockwise_fit` is feasible" holds from the first eval
+    // call onward — matching the same projection the warm-start seed
+    // path at 5932 already applies.  Defers projection to this second
+    // pass because some family overrides (e.g.
+    // `SurvivalMarginalSlopeFamily::post_update_block_beta`) read
+    // `block_states[block_idx]` during projection, and `block_idx == b`
+    // is only populated once the first pass has pushed all states.
+    //
+    // Without this, a caller that supplies `initial_beta = Some(infeasible)`
+    // — or leaves it `None` for a family whose zero vector violates the
+    // family's bounds — feeds an infeasible β into
+    // `exact_newton_joint_hessian` / `evaluate` before the first
+    // line-search trial, silently corrupting the fit or tripping
+    // `max_feasible_step_size` guards on iteration 1.  The warm-start
+    // path (5925-5938) projects on entry for exactly this reason; this
+    // extends the invariant to the cold-start path too.
+    for b in 0..specs.len() {
+        let raw = states[b].beta.clone();
+        let projected = family.post_update_block_beta(&states, b, &specs[b], raw)?;
+        states[b].beta.assign(&projected);
+    }
+    // Note: the caller (`inner_blockwise_fit`) calls `refresh_all_block_etas`
+    // immediately after this returns, so η is recomputed against the
+    // projected β before any family evaluation runs.  We don't duplicate
+    // the refresh here.
     Ok(states)
 }
 
