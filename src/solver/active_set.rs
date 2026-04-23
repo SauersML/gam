@@ -357,6 +357,17 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
     if rank >= k {
         return (a, b, groups);
     }
+    if rank == 0 {
+        log::debug!(
+            "rank-reduced active constraints from {} to 0 rows (all active rows numerically zero)",
+            k
+        );
+        return (
+            Array2::<f64>::zeros((0, p)),
+            Array1::<f64>::zeros(0),
+            Vec::new(),
+        );
+    }
 
     let (perm_fwd, _) = qr.P().arrays();
     let kept_orig: Vec<usize> = (0..rank).map(|j| perm_fwd[j].unbound()).collect();
@@ -869,7 +880,10 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 
 #[cfg(test)]
 mod tests {
-    use super::{LinearInequalityConstraints, solve_newton_direction_with_linear_constraints_impl};
+    use super::{
+        LinearInequalityConstraints, rank_reduce_rows_pivoted_qr,
+        solve_newton_direction_with_linear_constraints_impl,
+    };
     use approx::assert_relative_eq;
     use ndarray::{Array1, array};
 
@@ -898,5 +912,19 @@ mod tests {
 
         assert_relative_eq!(direction[0], 0.1, epsilon = 1e-12);
         assert_eq!(active_hint, vec![0]);
+    }
+
+    #[test]
+    fn rank_reduce_zero_rows_returns_empty_working_set() {
+        let a = array![[0.0, 0.0], [0.0, 0.0],];
+        let b = array![0.0, 0.0];
+        let groups = vec![vec![0], vec![1]];
+
+        let (a_out, b_out, groups_out) = rank_reduce_rows_pivoted_qr(a, b, groups);
+
+        assert_eq!(a_out.nrows(), 0);
+        assert_eq!(a_out.ncols(), 2);
+        assert_eq!(b_out.len(), 0);
+        assert!(groups_out.is_empty());
     }
 }

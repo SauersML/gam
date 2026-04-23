@@ -8945,6 +8945,30 @@ fn fit_score(fit: &UnifiedFitResult) -> f64 {
     }
 }
 
+fn require_successful_spatial_optimization_result<T>(
+    initial_score: f64,
+    result: Result<Option<(T, f64)>, EstimationError>,
+) -> Result<T, EstimationError> {
+    match result {
+        Ok(Some((value, exact_score))) => {
+            if exact_score <= initial_score + 1e-10 {
+                Ok(value)
+            } else {
+                Err(EstimationError::RemlOptimizationFailed(format!(
+                    "spatial kappa optimization made REML score worse ({initial_score:.6e} -> {exact_score:.6e})"
+                )))
+            }
+        }
+        Ok(None) => Err(EstimationError::RemlOptimizationFailed(
+            "spatial kappa optimization is unavailable for one or more eligible spatial terms"
+                .to_string(),
+        )),
+        Err(err) => Err(EstimationError::RemlOptimizationFailed(format!(
+            "spatial kappa optimization failed: {err}"
+        ))),
+    }
+}
+
 fn external_opts_for_design(
     family: LikelihoodFamily,
     design: &TermCollectionDesign,
@@ -12481,7 +12505,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             }
             Err(err) => {
                 log::warn!(
-                    "[spatial-kappa] pilot anisotropy optimization failed; continuing with the current geometry: {err}"
+                    "[spatial-kappa] pilot anisotropy optimization failed; proceeding with direct full-data optimization from the current geometry: {err}"
                 );
             }
         }
@@ -12506,48 +12530,29 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
     if !spatial_terms.is_empty() {
-        match try_exact_joint_spatial_length_scale_optimization(
-            data,
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &resolvedspec,
-            &best,
-            family,
-            options,
-            kappa_options,
-            &spatial_terms,
-        ) {
-            Ok(Some(exact_joint)) => {
-                let exact_score = fit_score(&exact_joint.fit);
-                if exact_score <= initial_score + 1e-10 {
-                    log_spatial_aniso_scales(&exact_joint.resolvedspec);
-                    return Ok(exact_joint);
-                }
-                log::warn!(
-                    "[spatial-kappa] --scale-dimensions optimization made REML score worse ({:.6e} -> {:.6e}); \
-                     discarding optimized spatial anisotropy and keeping the pre-optimized geometry.",
-                    initial_score,
-                    exact_score
-                );
-            }
-            Ok(None) => {
-                log::warn!(
-                    "[spatial-kappa] exact joint spatial optimization is unavailable for one or more eligible spatial terms; keeping the pre-optimized geometry"
-                );
-            }
-            Err(err) => {
-                log::warn!(
-                    "[spatial-kappa] exact joint spatial optimization failed; keeping the pre-optimized geometry: {err}"
-                );
-            }
-        }
-        return Ok(FittedTermCollectionWithSpec {
-            fit: best.fit,
-            design: best.design,
-            resolvedspec,
-            adaptive_diagnostics: best.adaptive_diagnostics,
-        });
+        let exact_joint = require_successful_spatial_optimization_result(
+            initial_score,
+            try_exact_joint_spatial_length_scale_optimization(
+                data,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                &best,
+                family,
+                options,
+                kappa_options,
+                &spatial_terms,
+            )
+            .map(|opt| {
+                opt.map(|fit| {
+                    let score = fit_score(&fit.fit);
+                    (fit, score)
+                })
+            }),
+        )?;
+        log_spatial_aniso_scales(&exact_joint.resolvedspec);
+        return Ok(exact_joint);
     }
 
     Ok(FittedTermCollectionWithSpec {
@@ -15958,6 +15963,42 @@ mod tests {
         };
         assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
         assert!(optimized.fit.beta.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn spatial_kappa_result_requires_exact_availability() {
+        let err = require_successful_spatial_optimization_result::<()>(0.0, Ok(None))
+            .expect_err("missing exact spatial result must be surfaced");
+        let msg = err.to_string();
+        assert!(msg.contains("unavailable"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn spatial_kappa_result_rejects_worse_exact_score() {
+        let err = require_successful_spatial_optimization_result(1.0, Ok(Some(((), 1.5))))
+            .expect_err("worse exact spatial result must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("made REML score worse"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("1.000000e0"), "unexpected error: {msg}");
+        assert!(msg.contains("1.500000e0"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn spatial_kappa_result_surfaces_optimizer_failure() {
+        let err = require_successful_spatial_optimization_result::<()>(
+            0.0,
+            Err(EstimationError::InvalidInput("boom".to_string())),
+        )
+        .expect_err("exact spatial optimizer failure must be surfaced");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("spatial kappa optimization failed"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("boom"), "unexpected error: {msg}");
     }
 
     #[test]

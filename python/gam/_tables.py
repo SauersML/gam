@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
+
 
 def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     columns, kind = table_columns(data)
@@ -10,6 +12,8 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     if not headers:
         raise ValueError("table must have at least one column")
     row_count = len(columns[headers[0]])
+    if row_count == 0:
+        raise ValueError("table data cannot be empty")
     rows = [
         [stringify_cell(columns[header][row_index]) for header in headers]
         for row_index in range(row_count)
@@ -62,6 +66,13 @@ def restore_output_table(
     training_kind: str | None,
 ) -> Any:
     target = requested or preferred_output_kind(input_kind, training_kind)
+    if target not in SUPPORTED_OUTPUT_KINDS:
+        allowed = ", ".join(sorted(SUPPORTED_OUTPUT_KINDS))
+        raise ValueError(
+            f"unsupported return_type '{target}'; use one of: {allowed}"
+        )
+    if target == "dict":
+        return columns
     if target == "pandas":
         import pandas as pd
 
@@ -75,13 +86,17 @@ def restore_output_table(
 
         ordered = list(columns)
         return np.column_stack([columns[name] for name in ordered])
-    return columns
+    if target == "pyarrow":
+        import pyarrow as pa
+
+        return pa.table(columns)
+    raise ValueError(f"unsupported return_type '{target}'")
 
 
 def preferred_output_kind(input_kind: str, training_kind: str | None) -> str:
-    if input_kind in {"pandas", "polars", "numpy"}:
+    if input_kind in {"pandas", "polars", "numpy", "pyarrow"}:
         return input_kind
-    if training_kind in {"pandas", "polars", "numpy"}:
+    if training_kind in {"pandas", "polars", "numpy", "pyarrow"}:
         return training_kind
     return "dict"
 
@@ -103,10 +118,14 @@ def detect_table_kind(data: Any) -> str:
 
 
 def response_column_name(formula: str) -> str | None:
+    if "~" not in formula:
+        return None
     candidate = formula.split("~", 1)[0].strip()
     if not candidate or candidate.startswith("Surv("):
         return None
-    return candidate
+    if candidate.replace("_", "").isalnum():
+        return candidate
+    return None
 
 
 def mapping_table_columns(data: Mapping[Any, Any]) -> dict[str, list[Any]]:

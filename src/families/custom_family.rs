@@ -3341,6 +3341,85 @@ impl ExactNewtonJointPsiTerms {
     }
 }
 
+const EXACT_JOINT_LOG_SIGMA_FD_STEP: f64 = 1e-6;
+
+pub(crate) fn exact_joint_psi_terms_from_log_sigma_fd<
+    F,
+    SetSigma,
+    ObjectiveEval,
+    GradientEval,
+    HessianEval,
+>(
+    family: &F,
+    sigma: Option<f64>,
+    block_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    family_label: &str,
+    mut set_sigma: SetSigma,
+    objective_eval: ObjectiveEval,
+    gradient_eval: GradientEval,
+    hessian_eval: HessianEval,
+) -> Result<Option<ExactNewtonJointPsiTerms>, String>
+where
+    F: Clone,
+    SetSigma: FnMut(&mut F, f64),
+    ObjectiveEval: Fn(&F, &[ParameterBlockState]) -> Result<f64, String>,
+    GradientEval: Fn(
+        &F,
+        &[ParameterBlockState],
+        &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String>,
+    HessianEval: Fn(&F, &[ParameterBlockState]) -> Result<Option<Array2<f64>>, String>,
+{
+    let Some(sigma) = sigma else {
+        return Ok(None);
+    };
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return Ok(None);
+    }
+
+    let log_sigma = sigma.ln();
+    let step = EXACT_JOINT_LOG_SIGMA_FD_STEP;
+    let scale = 1.0 / (2.0 * step);
+
+    let mut plus_family = family.clone();
+    set_sigma(&mut plus_family, (log_sigma + step).exp());
+
+    let mut minus_family = family.clone();
+    set_sigma(&mut minus_family, (log_sigma - step).exp());
+
+    let ll_plus = objective_eval(&plus_family, block_states)?;
+    let ll_minus = objective_eval(&minus_family, block_states)?;
+    let objective_psi = -(ll_plus - ll_minus) * scale;
+
+    let gradient_plus = gradient_eval(&plus_family, block_states, specs)?
+        .ok_or_else(|| {
+            format!("{family_label} sigma derivative requires exact joint gradient (plus step)")
+        })?
+        .gradient;
+    let gradient_minus = gradient_eval(&minus_family, block_states, specs)?
+        .ok_or_else(|| {
+            format!("{family_label} sigma derivative requires exact joint gradient (minus step)")
+        })?
+        .gradient;
+    let score_psi = -(&gradient_plus - &gradient_minus) * scale;
+
+    let hessian_plus = hessian_eval(&plus_family, block_states)?.ok_or_else(|| {
+        format!("{family_label} sigma derivative requires an exact joint Hessian (plus step)")
+    })?;
+    let hessian_minus = hessian_eval(&minus_family, block_states)?.ok_or_else(|| {
+        format!("{family_label} sigma derivative requires an exact joint Hessian (minus step)")
+    })?;
+    let hessian_psi = (&hessian_plus - &hessian_minus) * scale;
+
+    Ok(Some(ExactNewtonJointPsiTerms {
+        objective_psi,
+        score_psi,
+        hessian_psi,
+        hessian_psi_operator: None,
+    }))
+}
+
 pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
@@ -4570,7 +4649,15 @@ fn with_ridged_surrogate_reml_guard<T>(
     })
 }
 
-#[allow(dead_code)]
+fn ridged_surrogate_reml_warning_counter_suffix(
+    warning_idx: usize,
+    warning_limit: Option<usize>,
+) -> String {
+    match warning_limit {
+        Some(limit) => format!(", warning {warning_idx}/{limit}"),
+        None => String::new(),
+    }
+}
 fn record_ridged_surrogate_reml_warning(n_negative: usize, ridge: f64) -> Result<(), String> {
     let mut warning_idx = None;
     let mut warning_limit = None;
@@ -4584,15 +4671,16 @@ fn record_ridged_surrogate_reml_warning(n_negative: usize, ridge: f64) -> Result
     });
 
     let warning_idx = warning_idx.unwrap_or(1);
-    let warning_limit = warning_limit.unwrap_or(usize::MAX);
+    let counter_suffix = ridged_surrogate_reml_warning_counter_suffix(warning_idx, warning_limit);
     log::warn!(
         "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after ridging \
-         (ridge={:.2e}, warning {warning_idx}/{warning_limit}). The Laplace approximation \
+         (ridge={:.2e}{}). The Laplace approximation \
          is not valid in these directions; the surrogate objective ignores them.",
         n_negative,
         ridge,
+        counter_suffix,
     );
-    if warning_idx >= warning_limit {
+    if warning_limit.is_some_and(|limit| warning_idx >= limit) {
         return Err(format!(
             "{} custom-family EFS aborted after {warning_idx} repeated \
              surrogate positive-part Hessian warnings (ridge={ridge:.2e}); \
@@ -7076,6 +7164,9 @@ fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
         return coord;
     }
     coord.g *= scale;
+    if let Some(firth_g) = coord.firth_g.as_mut() {
+        *firth_g *= scale;
+    }
     coord.drift = scale_hypercoord_drift(coord.drift, scale);
     coord
 }
@@ -8521,6 +8612,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ld_s,
                 b_depends_on_beta: !hessian_beta_independent,
                 is_penalty_like: false,
+                firth_g: None,
             });
 
             psi_global += 1;
@@ -12381,6 +12473,19 @@ mod tests {
         assert!(
             (logdet - expected).abs() < 1e-10,
             "logdet={logdet}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn ridged_surrogate_warning_suffix_omits_unbounded_counter() {
+        assert_eq!(ridged_surrogate_reml_warning_counter_suffix(1, None), "");
+    }
+
+    #[test]
+    fn ridged_surrogate_warning_suffix_formats_bounded_counter() {
+        assert_eq!(
+            ridged_surrogate_reml_warning_counter_suffix(3, Some(8)),
+            ", warning 3/8"
         );
     }
 

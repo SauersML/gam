@@ -8,8 +8,8 @@ use crate::custom_family::{
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
-    slice_joint_into_block_working_sets,
+    exact_joint_psi_terms_from_log_sigma_fd, first_psi_linear_map, fit_custom_family,
+    second_psi_linear_map, slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
@@ -2262,16 +2262,6 @@ impl BernoulliMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    fn sigma_scale_factor(&self) -> Option<f64> {
-        let sigma = self.gaussian_frailty_sd?;
-        if !sigma.is_finite() || sigma <= 0.0 {
-            return None;
-        }
-        let jet =
-            crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
-        Some(jet.ds / jet.s)
-    }
-
     // `sigma_beta_linear_operator` and `add_sigma_hessian_linear_terms`
     // have been retired.  Their construction —
     //     direction[u] = (ṡ/s) · β[u] for u ∈ {logslope, H, W}
@@ -2395,18 +2385,13 @@ impl BernoulliMarginalSlopeFamily {
     // exhaustive to write out because it propagates through
     //   — f_{uv,t}, a_{uv,t}, the (a,a,a), (a,a,b)-style jets of the
     //     observed cell polynomial.  Rather than encode that full third-
-    //     order jet by hand, we obtain ∂H/∂t via second-order central
-    //     differences of the exact analytic `exact_newton_joint_hessian`
-    //     around t, evaluated at a tight step (eps_t = 5e-4).  This is a
-    //     purely analytic approach: the integrand is an analytic function
-    //     of t, and a central difference at eps_t gives the derivative to
-    //     O(eps_t²).  This captures the full chain rule (including all
-    //     third-order tensors) without requiring bespoke closed-form code
-    //     that the row-kernel infrastructure does not yet expose for
-    //     `∂H/∂t`.
+    //     order jet by hand, we obtain ∂H/∂t by central-differencing the
+    //     exact analytic objective/gradient/Hessian evaluators in log σ.
+    //     This captures the full chain rule (including all third-order
+    //     tensors) without bespoke closed-form code for `∂H/∂t`.
     //
     // The resulting triple (objective_psi, score_psi, hessian_psi) matches
-    // the test's external FD (which uses eps=1e-6) within the stated
+    // the test's external FD (which also differentiates in log σ) within the stated
     // tolerances (5e-4 / 2e-3 / 8e-3) because both are central differences
     // of the same analytic evaluators.
     // ─────────────────────────────────────────────────────────────────────
@@ -2415,215 +2400,19 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let Some(sigma) = self.gaussian_frailty_sd else {
-            return Ok(None);
-        };
-        if !sigma.is_finite() || sigma <= 0.0 {
-            return Ok(None);
-        }
-        // Objective and score via direct analytic chain rule through the
-        // per-row row-kernel; Hessian via central difference of the exact
-        // analytic `exact_newton_joint_hessian` at a narrow σ-step.
-        // TEMP: switch to central FD on log_likelihood_only for objective
-        // while we validate the chain rule / cell-scaling intuition.
-        let log_sigma_obj = sigma.ln();
-        let eps_obj = 5e-4f64;
-        let mut fp_obj = self.clone();
-        fp_obj.gaussian_frailty_sd = Some((log_sigma_obj + eps_obj).exp());
-        let mut fm_obj = self.clone();
-        fm_obj.gaussian_frailty_sd = Some((log_sigma_obj - eps_obj).exp());
-        let ll_p = fp_obj.log_likelihood_only(block_states)?;
-        let ll_m = fm_obj.log_likelihood_only(block_states)?;
-        let objective_psi_fd = -(ll_p - ll_m) / (2.0 * eps_obj);
-        let objective_psi = self.sigma_analytic_objective_psi(block_states)?;
-        eprintln!(
-            "obj_analytic={} obj_fd_self={}",
-            objective_psi, objective_psi_fd
-        );
-        let objective_psi = objective_psi_fd;
-        let score_psi = self.sigma_analytic_score_psi(block_states, specs)?;
-
-        let log_sigma = sigma.ln();
-        let eps_t = 5e-4f64;
-        let mut family_plus = self.clone();
-        family_plus.gaussian_frailty_sd = Some((log_sigma + eps_t).exp());
-        let mut family_minus = self.clone();
-        family_minus.gaussian_frailty_sd = Some((log_sigma - eps_t).exp());
-        let hess_plus = family_plus
-            .exact_newton_joint_hessian(block_states)?
-            .ok_or_else(|| {
-                "bernoulli marginal-slope sigma derivative requires an exact joint Hessian (plus step)".to_string()
-            })?;
-        let hess_minus = family_minus
-            .exact_newton_joint_hessian(block_states)?
-            .ok_or_else(|| {
-                "bernoulli marginal-slope sigma derivative requires an exact joint Hessian (minus step)".to_string()
-            })?;
-        let hessian_psi = (&hess_plus - &hess_minus) / (2.0 * eps_t);
-
-        Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi,
-            score_psi,
-            hessian_psi,
-            hessian_psi_operator: None,
-        }))
-    }
-
-    /// Analytic ∂(−L)/∂t (objective, where L = log-likelihood).  See the
-    /// `sigma_exact_joint_psi_terms` derivation above.
-    ///
-    /// Per-row contribution: d1_m · s_y · η_t, where
-    ///   η_t = (ṡ/s) · (η_r − χ_obs·μ_r/f_a_r)
-    /// and d1_m = −w_r·λ, s_y = 2y_r−1.  Equivalently
-    ///   obj_contrib = (w·λ·s_y) · (η̃ − χ_obs·μ_r/f_a_r) · (ṡ/s)·(−1)
-    /// with η̃ = η_r.  For the rigid path (no flex deviations) the
-    /// intercept equation is closed-form; s enters only through the
-    /// closed-form observed-η formula and no implicit a ever appears, so
-    /// the chain rule reduces to the rigid probit σ-derivative encoded by
-    /// RigidProbitKernel.
-    fn sigma_analytic_objective_psi(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
-        self.validate_exact_monotonicity(block_states)?;
-        let Some(ds_over_s) = self.sigma_scale_factor() else {
-            return Ok(0.0);
-        };
-        let flex_active = self.effective_flex_active(block_states)?;
-        let n = self.y.len();
-        let probit_scale = self.probit_frailty_scale();
-
-        if !flex_active {
-            // Rigid probit:  η_r = q·c + s·b·z, c = √(1 + (s·b)²).
-            // ∂η_r/∂t|_β = s'·(q·(s·b)²/(s·c) + b·z) = (ṡ/s)·(q·(s·b)²/c + s·b·z).
-            // objective_psi contribution per row = d1_m·s_y·∂η/∂t.
-            let b = &block_states[1].eta;
-            let mut obj_psi = 0.0f64;
-            for i in 0..n {
-                let q_internal = self.marginal_link_map(block_states[0].eta[i])?.q;
-                let eta_i = rigid_observed_eta(q_internal, b[i], self.z[i], probit_scale);
-                let signed = (2.0 * self.y[i] - 1.0) * eta_i;
-                let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed);
-                let d1_m = -self.weights[i] * lambda;
-                let s_y = 2.0 * self.y[i] - 1.0;
-                let sb = probit_scale * b[i];
-                let c_i = (1.0 + sb * sb).sqrt();
-                // ∂η/∂t|_β = (ṡ/s)·(q_internal·(s·b)²/c + s·b·z)
-                let deta_dt = ds_over_s * (q_internal * sb * sb / c_i + sb * self.z[i]);
-                obj_psi += d1_m * s_y * deta_dt;
-            }
-            return Ok(obj_psi);
-        }
-
-        // Flex path: full implicit-a chain rule.
-        //
-        // CRUCIAL DETAIL.  The per-row intercept equation
-        //     f_r(a, β, σ) = Σ_cells value_cell(poly(a,β;σ); z) − μ_r = 0
-        // has `value_cell = ∫ Φ(poly(z)) · φ(z) dz` with poly(z) = s·ĉ(a,β;z).
-        // `value_cell` is NOT linear in s (Φ is nonlinear), so ∂f/∂t|_{a,β}
-        // is NOT simply (ṡ/s)·μ.  The correct derivative is
-        //     ∂f/∂t|_{a,β} = Σ_cells ∂value_cell/∂t|_{a,β}
-        //                   = Σ_cells ∫ φ(poly)·(∂poly/∂t)·φ(z) dz
-        //                   = (ṡ/s) · Σ_cells ∫ poly(z)·φ(poly)·φ(z) dz,
-        // because ∂poly/∂t|_{a,β} = (ṡ/s)·poly.  The integral on the right
-        // is computable via `cell_first_derivative_from_moments` applied to
-        // the cell's OWN coefficient vector (not to a derivative thereof),
-        // since that helper returns Σ_k coeff_k·moments_k / (2π) and the
-        // cell's moments encode ∫ z^k · φ(z)·φ(poly) dz · (2π).  Summing
-        // over the denested partition and multiplying by (ṡ/s) yields
-        // ∂f/∂t|_{a,β} exactly.
-        //
-        // Note that the OBSERVED row argument η_r(a,β;z_obs) = s·η̂_obs(a,β)
-        // IS linear in s (no Φ at the observation), so
-        //     ∂η_r/∂t|_{a,β} = (ṡ/s)·η_r
-        // remains correct at the observation point.  The Φ-nonlinearity
-        // only matters inside the CELL integrals of the intercept equation.
-        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
-        let mut obj_psi = 0.0f64;
-        for row in 0..n {
-            let marginal_eta = block_states[0].eta[row];
-            let slope = block_states[1].eta[row];
-            let (a, f_a) = self.solve_row_intercept_base(marginal_eta, slope, beta_h, beta_w)?;
-            let obs = self.observed_denested_cell_partials(row, a, slope, beta_h, beta_w)?;
-            let z_obs = self.z[row];
-            let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
-            let chi_obs = eval_coeff4_at(&obs.dc_da, z_obs);
-            // Compute ∂f/∂t|_{a,β} = (ṡ/s)·Σ_cells ∫ poly·φ(poly)·φ(z) dz.
-            let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
-            let mut df_dt_raw = 0.0f64;
-            for partition_cell in &cells {
-                let cell = partition_cell.cell;
-                let state = exact::evaluate_cell_moments(cell, 9)?;
-                let cell_coeff_vec = [cell.c0, cell.c1, cell.c2, cell.c3];
-                df_dt_raw +=
-                    exact::cell_first_derivative_from_moments(&cell_coeff_vec, &state.moments)?;
-            }
-            let df_dt = ds_over_s * df_dt_raw;
-            // Implicit a derivative at fixed β:  a_σ = −(∂f/∂t)/(∂f/∂a).
-            let a_sigma = -df_dt / f_a;
-            // Observed η total σ-derivative (Φ NOT involved at the
-            // observation point, so (ṡ/s)·η_r is exact at fixed a):
-            //   η_t = (ṡ/s)·η_r  +  χ_obs·a_σ
-            let eta_t = ds_over_s * eta_val + chi_obs * a_sigma;
-            let signed = (2.0 * self.y[row] - 1.0) * eta_val;
-            let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed);
-            let d1_m = -self.weights[row] * lambda;
-            let s_y = 2.0 * self.y[row] - 1.0;
-            obj_psi += d1_m * s_y * eta_t;
-        }
-        Ok(obj_psi)
-    }
-
-    /// Analytic ∂(−∇_β L)/∂t = ∂(neglog_grad)/∂t (score ψ-term).  See the
-    /// `sigma_exact_joint_psi_terms` derivation above.
-    ///
-    /// Per-row primary-space contribution:
-    ///   (∂/∂t neglog_grad_primary)[u]  =  d2_m·η_t·η_u + d1_m·s_y·η_{u,t}
-    /// then projected through the per-block design matrices for marginal /
-    /// logslope, and directly summed for h / w primary slices.
-    fn sigma_analytic_score_psi(
-        &self,
-        block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-    ) -> Result<Array1<f64>, String> {
-        // Central difference of `exact_newton_joint_gradient_evaluation` w.r.t.
-        // t.  While the per-row analytic chain rule above is straightforward
-        // to write for η_{u,t}, accurately projecting the primary-space σ-
-        // cross partial back through the block designs (with the same row-
-        // level bookkeeping the gradient evaluator already performs) is best
-        // handled by differentiating the fully-analytic gradient evaluator at
-        // a narrow σ-step.  The evaluator is smooth in σ and the step below
-        // gives derivatives to O(eps²).
-        let slices = block_slices(self);
-        let Some(sigma) = self.gaussian_frailty_sd else {
-            return Ok(Array1::<f64>::zeros(slices.total));
-        };
-        if !sigma.is_finite() || sigma <= 0.0 {
-            return Ok(Array1::<f64>::zeros(slices.total));
-        }
-        let log_sigma = sigma.ln();
-        let eps_t = 5e-4f64;
-        let mut family_plus = self.clone();
-        family_plus.gaussian_frailty_sd = Some((log_sigma + eps_t).exp());
-        let mut family_minus = self.clone();
-        family_minus.gaussian_frailty_sd = Some((log_sigma - eps_t).exp());
-        let grad_plus = family_plus
-            .exact_newton_joint_gradient_evaluation(block_states, _specs)?
-            .ok_or_else(|| {
-                "bernoulli marginal-slope sigma derivative requires exact joint gradient (plus step)".to_string()
-            })?
-            .gradient;
-        let grad_minus = family_minus
-            .exact_newton_joint_gradient_evaluation(block_states, _specs)?
-            .ok_or_else(|| {
-                "bernoulli marginal-slope sigma derivative requires exact joint gradient (minus step)".to_string()
-            })?
-            .gradient;
-        // eval.gradient is the score = ∂L/∂β, so
-        //   score_psi = −∂(eval.gradient)/∂t = ∂(neglog_grad)/∂t.
-        Ok(-(&grad_plus - &grad_minus) / (2.0 * eps_t))
+        exact_joint_psi_terms_from_log_sigma_fd(
+            self,
+            self.gaussian_frailty_sd,
+            block_states,
+            specs,
+            "bernoulli marginal-slope",
+            |family, sigma| family.gaussian_frailty_sd = Some(sigma),
+            |family, states| family.log_likelihood_only(states),
+            |family, states, gradient_specs| {
+                family.exact_newton_joint_gradient_evaluation(states, gradient_specs)
+            },
+            |family, states| family.exact_newton_joint_hessian(states),
+        )
     }
 
     #[inline]

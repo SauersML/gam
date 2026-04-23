@@ -105,6 +105,28 @@ pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> b
     }
 }
 
+fn recover_converged_survival_inverse_link<R>(
+    result: crate::solver::outer_strategy::OuterResult,
+    context: &str,
+    recover: R,
+) -> Result<InverseLink, String>
+where
+    R: FnOnce(&Array1<f64>) -> Option<InverseLink>,
+{
+    if !result.converged {
+        return Err(format!(
+            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={:.3e})",
+            result.iterations, result.final_value, result.final_grad_norm
+        ));
+    }
+    recover(&result.rho).ok_or_else(|| {
+        format!(
+            "{context} produced an invalid inverse-link state at rho={:?}",
+            result.rho.to_vec()
+        )
+    })
+}
+
 pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: BernoulliMarginalSlopeTermSpec,
@@ -565,7 +587,7 @@ fn fit_survival_location_scale_model(
             final_wiggle: Option<LinkWiggleConfig>,
             objective: F,
             recover: R,
-        ) -> Result<Option<SurvivalLocationScaleProfile>, String>
+        ) -> Result<SurvivalLocationScaleProfile, String>
         where
             F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
             R: Fn(&Array1<f64>) -> Option<InverseLink>,
@@ -598,42 +620,25 @@ fn fit_survival_location_scale_model(
                         -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
                 >,
             );
-            match problem.run(&mut obj, &context) {
-                Ok(result) => {
-                    if let Some(link) = recover(&result.rho) {
-                        eprintln!(
-                            "[survival link opt] optimized {name} params: dim={} iters={} converged={} finalobj={:.6e}",
-                            result.rho.len(),
-                            result.iterations,
-                            result.converged,
-                            result.final_value
-                        );
-                        profile_survival_location_scale_with_inverse_link(
-                            data,
-                            spec,
-                            link,
-                            final_wiggle.clone(),
-                            kappa_options,
-                        )
-                        .map(Some)
-                    } else {
-                        Ok(None)
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[survival link opt] {name} optimization failed; using initial params: {err}"
-                    );
-                    Ok(None)
-                }
-            }
+            let result = problem
+                .run(&mut obj, &context)
+                .map_err(|err| format!("{context} failed: {err}"))?;
+            let link = recover_converged_survival_inverse_link(result, &context, recover)?;
+            profile_survival_location_scale_with_inverse_link(
+                data,
+                spec,
+                link,
+                final_wiggle,
+                kappa_options,
+            )
+            .map_err(|err| format!("{context} final profiling failed: {err}"))
         }
 
         match spec.inverse_link.clone() {
             InverseLink::Sas(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
                 let wiggle_cfg = wiggle.clone();
-                let optimized = optimize_link_parameters(
+                optimize_link_parameters(
                     data,
                     spec,
                     kappa_options,
@@ -664,17 +669,12 @@ fn fit_survival_location_scale_model(
                         .ok()
                         .map(InverseLink::Sas)
                     },
-                )?;
-                if let Some(profile) = optimized {
-                    Ok(profile)
-                } else {
-                    profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options)
-                }
+                )
             }
             InverseLink::BetaLogistic(state0) => {
                 let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
                 let wiggle_cfg = wiggle.clone();
-                let optimized = optimize_link_parameters(
+                optimize_link_parameters(
                     data,
                     spec,
                     kappa_options,
@@ -705,18 +705,13 @@ fn fit_survival_location_scale_model(
                         .ok()
                         .map(InverseLink::BetaLogistic)
                     },
-                )?;
-                if let Some(profile) = optimized {
-                    Ok(profile)
-                } else {
-                    profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options)
-                }
+                )
             }
             InverseLink::Mixture(state0) if !state0.rho.is_empty() => {
                 let components = state0.components.clone();
                 let components_recover = components.clone();
                 let wiggle_cfg = wiggle.clone();
-                let optimized = optimize_link_parameters(
+                optimize_link_parameters(
                     data,
                     spec,
                     kappa_options,
@@ -747,12 +742,7 @@ fn fit_survival_location_scale_model(
                         .ok()
                         .map(InverseLink::Mixture)
                     },
-                )?;
-                if let Some(profile) = optimized {
-                    Ok(profile)
-                } else {
-                    profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options)
-                }
+                )
             }
             _ => profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options),
         }
@@ -2143,6 +2133,7 @@ mod tests {
     use super::*;
     use crate::inference::data::load_dataset_projected;
     use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+    use crate::solver::outer_strategy::{HessianSource, OuterPlan, OuterResult, Solver};
     use ndarray::Array2;
     use std::fs;
     use tempfile::tempdir;
@@ -2271,6 +2262,22 @@ mod tests {
         }
     }
 
+    fn workflow_test_outer_result(converged: bool, rho: Array1<f64>) -> OuterResult {
+        OuterResult {
+            rho,
+            final_value: 1.25,
+            iterations: 7,
+            final_grad_norm: 0.5,
+            final_gradient: None,
+            final_hessian: None,
+            converged,
+            plan_used: OuterPlan {
+                solver: Solver::Bfgs,
+                hessian_source: HessianSource::BfgsApprox,
+            },
+        }
+    }
+
     #[test]
     fn workflow_survival_marginal_slope_routes_logslope_linkwiggle_into_score_warp_only() {
         let data = workflow_test_dataset();
@@ -2319,5 +2326,31 @@ mod tests {
                 .any(|note| note.contains("score-warp block")),
             "workflow notes should mention logslope_formula linkwiggle routing"
         );
+    }
+
+    #[test]
+    fn survival_inverse_link_result_requires_convergence() {
+        let err = recover_converged_survival_inverse_link(
+            workflow_test_outer_result(false, Array1::from_vec(vec![0.1, -0.2])),
+            "survival inverse-link optimization (SAS, dim=2)",
+            |_| Some(InverseLink::Standard(LinkFunction::Logit)),
+        )
+        .expect_err("non-converged inverse-link search should fail");
+
+        assert!(err.contains("did not converge"));
+        assert!(err.contains("final_objective"));
+    }
+
+    #[test]
+    fn survival_inverse_link_result_requires_recoverable_state() {
+        let err = recover_converged_survival_inverse_link(
+            workflow_test_outer_result(true, Array1::from_vec(vec![9.0, 8.0])),
+            "survival inverse-link optimization (mixture, dim=2)",
+            |_| None,
+        )
+        .expect_err("unrecoverable inverse-link state should fail");
+
+        assert!(err.contains("produced an invalid inverse-link state"));
+        assert!(err.contains("9.0"));
     }
 }

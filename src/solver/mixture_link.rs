@@ -1299,6 +1299,17 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
     let mu = beta_reg(a, b, u);
+    let mu_only = |d: f64, e: f64| -> f64 {
+        let aa = (d - e).exp();
+        let bb = (d + e).exp();
+        beta_reg(aa, bb, u)
+    };
+    let h_delta = 1e-6 * (1.0 + delta.abs());
+    let h_epsilon = 1e-6 * (1.0 + epsilon.abs());
+    let dmu_ddelta =
+        (mu_only(delta + h_delta, epsilon) - mu_only(delta - h_delta, epsilon)) / (2.0 * h_delta);
+    let dmu_depsilon = (mu_only(delta, epsilon + h_epsilon) - mu_only(delta, epsilon - h_epsilon))
+        / (2.0 * h_epsilon);
     if du == 0.0 {
         let zero = InverseLinkJet {
             mu,
@@ -1309,13 +1320,13 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
         return SasJetWithParamPartials {
             jet: zero,
             djet_depsilon: InverseLinkJet {
-                mu: 0.0,
+                mu: dmu_depsilon,
                 d1: 0.0,
                 d2: 0.0,
                 d3: 0.0,
             },
             djet_dlog_delta: InverseLinkJet {
-                mu: 0.0,
+                mu: dmu_ddelta,
                 d1: 0.0,
                 d2: 0.0,
                 d3: 0.0,
@@ -1350,18 +1361,6 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
             d3: d3_p,
         }
     };
-
-    let mu_only = |d: f64, e: f64| -> f64 {
-        let aa = (d - e).exp();
-        let bb = (d + e).exp();
-        beta_reg(aa, bb, u).clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS)
-    };
-    let h_delta = 1e-6 * (1.0 + delta.abs());
-    let h_epsilon = 1e-6 * (1.0 + epsilon.abs());
-    let dmu_ddelta =
-        (mu_only(delta + h_delta, epsilon) - mu_only(delta - h_delta, epsilon)) / (2.0 * h_delta);
-    let dmu_depsilon = (mu_only(delta, epsilon + h_epsilon) - mu_only(delta, epsilon - h_epsilon))
-        / (2.0 * h_epsilon);
     let djet_ddelta = partials_for(a, b, dmu_ddelta);
     let djet_depsilon = partials_for(-a, b, dmu_depsilon);
     SasJetWithParamPartials {
@@ -2102,6 +2101,68 @@ mod tests {
         assert!((out.djet_depsilon.d1 - fd_epsilon.d1).abs() < 5e-5);
         assert!((out.djet_depsilon.d2 - fd_epsilon.d2).abs() < 1.2e-4);
         assert!((out.djet_depsilon.d3 - fd_epsilon.d3).abs() < 4e-4);
+    }
+
+    #[test]
+    fn beta_logistic_param_partials_survive_eta_clamp() {
+        let eta = -1000.0;
+        let delta = -1.5;
+        let epsilon = 0.4;
+        let out = beta_logistic_inverse_link_jetwith_param_partials(eta, delta, epsilon);
+        let h = 1e-6;
+
+        assert_eq!(out.jet.d1, 0.0);
+        assert_eq!(out.jet.d2, 0.0);
+        assert_eq!(out.jet.d3, 0.0);
+
+        let dp = beta_logistic_inverse_link_jet(eta, delta + h, epsilon);
+        let dm = beta_logistic_inverse_link_jet(eta, delta - h, epsilon);
+        let fd_delta = InverseLinkJet {
+            mu: (dp.mu - dm.mu) / (2.0 * h),
+            d1: (dp.d1 - dm.d1) / (2.0 * h),
+            d2: (dp.d2 - dm.d2) / (2.0 * h),
+            d3: (dp.d3 - dm.d3) / (2.0 * h),
+        };
+        assert!((out.djet_dlog_delta.mu - fd_delta.mu).abs() < 5e-5);
+        assert_eq!(out.djet_dlog_delta.d1, 0.0);
+        assert_eq!(out.djet_dlog_delta.d2, 0.0);
+        assert_eq!(out.djet_dlog_delta.d3, 0.0);
+
+        let ep = beta_logistic_inverse_link_jet(eta, delta, epsilon + h);
+        let em = beta_logistic_inverse_link_jet(eta, delta, epsilon - h);
+        let fd_epsilon = InverseLinkJet {
+            mu: (ep.mu - em.mu) / (2.0 * h),
+            d1: (ep.d1 - em.d1) / (2.0 * h),
+            d2: (ep.d2 - em.d2) / (2.0 * h),
+            d3: (ep.d3 - em.d3) / (2.0 * h),
+        };
+        assert!((out.djet_depsilon.mu - fd_epsilon.mu).abs() < 5e-5);
+        assert_eq!(out.djet_depsilon.d1, 0.0);
+        assert_eq!(out.djet_depsilon.d2, 0.0);
+        assert_eq!(out.djet_depsilon.d3, 0.0);
+    }
+
+    #[test]
+    fn beta_logistic_param_partials_match_unclamped_mu_when_eta_clamps() {
+        let eta = -1000.0;
+        let delta = 0.01;
+        let epsilon = 0.0;
+        let out = beta_logistic_inverse_link_jetwith_param_partials(eta, delta, epsilon);
+        let h = 1e-6 * (1.0 + delta.abs());
+
+        assert!(out.jet.mu < BETA_LOGISTIC_U_EPS);
+
+        let dp = beta_logistic_inverse_link_jet(eta, delta + h, epsilon);
+        let dm = beta_logistic_inverse_link_jet(eta, delta - h, epsilon);
+        let fd_delta_mu = (dp.mu - dm.mu) / (2.0 * h);
+        assert!(fd_delta_mu != 0.0);
+        assert!((out.djet_dlog_delta.mu - fd_delta_mu).abs() < 1e-12);
+
+        let ep = beta_logistic_inverse_link_jet(eta, delta, epsilon + h);
+        let em = beta_logistic_inverse_link_jet(eta, delta, epsilon - h);
+        let fd_epsilon_mu = (ep.mu - em.mu) / (2.0 * h);
+        assert!(fd_epsilon_mu != 0.0);
+        assert!((out.djet_depsilon.mu - fd_epsilon_mu).abs() < 1e-12);
     }
 
     #[test]

@@ -424,6 +424,62 @@ mod tests {
         Ok(gradient[rho.len()])
     }
 
+    fn directional_tau_hessian_fd_reference(
+        y: &Array1<f64>,
+        w: &Array1<f64>,
+        x: &Array2<f64>,
+        s0: &Array2<f64>,
+        cfg: &RemlConfig,
+        rho: &Array1<f64>,
+        hyper_dirs: &[DirectionalHyperParam],
+        x_tau_mats: &[Array2<f64>],
+        s_tau_mats: &[Array2<f64>],
+    ) -> Array2<f64> {
+        assert_eq!(hyper_dirs.len(), x_tau_mats.len());
+        assert_eq!(hyper_dirs.len(), s_tau_mats.len());
+
+        const TARGET_PHYSICAL_STEP: f64 = 1e-5;
+
+        let n_dirs = hyper_dirs.len();
+        let mut h_ttfd = Array2::<f64>::zeros((n_dirs, n_dirs));
+        for j in 0..n_dirs {
+            let direction_scale = x_tau_mats[j]
+                .iter()
+                .chain(s_tau_mats[j].iter())
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+            let h = if direction_scale > 0.0 {
+                TARGET_PHYSICAL_STEP / direction_scale
+            } else {
+                TARGET_PHYSICAL_STEP
+            };
+
+            let x_plus = x + &x_tau_mats[j].mapv(|v| h * v);
+            let x_minus = x - &x_tau_mats[j].mapv(|v| h * v);
+            let s_plus = s0 + &s_tau_mats[j].mapv(|v| h * v);
+            let s_minus = s0 - &s_tau_mats[j].mapv(|v| h * v);
+
+            let state_plus = build_logit_state(y, w, &x_plus, &s_plus, cfg);
+            let state_minus = build_logit_state(y, w, &x_minus, &s_minus, cfg);
+            for i in 0..n_dirs {
+                let g_plus =
+                    single_directional_tau_gradient(&state_plus, rho, hyper_dirs[i].clone())
+                        .expect("g+ for FD");
+                let g_minus =
+                    single_directional_tau_gradient(&state_minus, rho, hyper_dirs[i].clone())
+                        .expect("g- for FD");
+                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
+            }
+        }
+        for i in 0..n_dirs {
+            for j in 0..i {
+                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
+                h_ttfd[[i, j]] = avg;
+                h_ttfd[[j, i]] = avg;
+            }
+        }
+        h_ttfd
+    }
+
     #[test]
     fn eval_cache_manager_stores_first_order_outer_eval() {
         let cache = EvalCacheManager::new();
@@ -1280,33 +1336,17 @@ mod tests {
             Array2::<f64>::zeros((x.ncols(), x.ncols())),
         ];
 
-        let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
-        let h = 1e-5;
-        for j in 0..hyper_dirs.len() {
-            let x_plus = &x + &x_tau_mats[j].mapv(|v| h * v);
-            let x_minus = &x - &x_tau_mats[j].mapv(|v| h * v);
-            let s_plus = &s0 + &s_tau_mats[j].mapv(|v| h * v);
-            let s_minus = &s0 - &s_tau_mats[j].mapv(|v| h * v);
-
-            let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
-            let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-            for i in 0..hyper_dirs.len() {
-                let g_plus =
-                    single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
-                        .expect("g+ for FD");
-                let g_minus =
-                    single_directional_tau_gradient(&state_minus, &rho, hyper_dirs[i].clone())
-                        .expect("g- for FD");
-                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
-            }
-        }
-        for i in 0..h_ttfd.nrows() {
-            for j in 0..i {
-                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
-                h_ttfd[[i, j]] = avg;
-                h_ttfd[[j, i]] = avg;
-            }
-        }
+        let h_ttfd = directional_tau_hessian_fd_reference(
+            &y,
+            &w,
+            &x,
+            &s0,
+            &cfg,
+            &rho,
+            &hyper_dirs,
+            &x_tau_mats,
+            &s_tau_mats,
+        );
 
         let num = (&h_tt_analytic - &h_ttfd)
             .iter()
@@ -1428,33 +1468,32 @@ mod tests {
             Array2::<f64>::zeros((x.ncols(), x.ncols())),
         ];
 
-        let mut h_ttfd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
-        let h = 1e-5;
-        for j in 0..hyper_dirs.len() {
-            let x_plus = &x + &x_tau_mats[j].mapv(|v| h * v);
-            let x_minus = &x - &x_tau_mats[j].mapv(|v| h * v);
-            let s_plus = &s0 + &s_tau_mats[j].mapv(|v| h * v);
-            let s_minus = &s0 - &s_tau_mats[j].mapv(|v| h * v);
+        let h_ttfd = directional_tau_hessian_fd_reference(
+            &y,
+            &w,
+            &x,
+            &s0,
+            &cfg,
+            &rho,
+            &hyper_dirs,
+            &x_tau_mats,
+            &s_tau_mats,
+        );
 
-            let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
-            let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-            for i in 0..hyper_dirs.len() {
-                let g_plus =
-                    single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
-                        .expect("g+ for FD");
-                let g_minus =
-                    single_directional_tau_gradient(&state_minus, &rho, hyper_dirs[i].clone())
-                        .expect("g- for FD");
-                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
-            }
-        }
-        for i in 0..h_ttfd.nrows() {
-            for j in 0..i {
-                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
-                h_ttfd[[i, j]] = avg;
-                h_ttfd[[j, i]] = avg;
-            }
-        }
+        let cfg_no_firth = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            1e-10,
+            false,
+        )
+        .with_max_iterations(500);
+        let state_no_firth = build_logit_state(&y, &w, &x, &s0, &cfg_no_firth);
+        let (_, _, h_full_no_firth) =
+            compute_joint_hypercostgradienthessian(&state_no_firth, &theta, rho.len(), &hyper_dirs)
+                .expect("joint hyper cost+gradient+hessian without firth");
+        let h_tt_no_firth = h_full_no_firth.slice(s![rho.len().., rho.len()..]).to_owned();
+        eprintln!(
+            "debug tau-tau analytic={h_tt_analytic:?} fd={h_ttfd:?} no_firth={h_tt_no_firth:?}"
+        );
 
         let num = (&h_tt_analytic - &h_ttfd)
             .iter()
@@ -1642,31 +1681,19 @@ mod tests {
 
         // Finite-difference Hessian: perturb each direction, re-evaluate
         // gradient of all directions at perturbed states.
-        let x_tau_mats = [&x_tau_0, &x_tau_1];
-        let s_tau_mats = [&s_tau_0, &s_tau_1];
-        let n_dirs = hyper_dirs.len();
-        let mut h_ttfd = Array2::<f64>::zeros((n_dirs, n_dirs));
-        let eps = 1e-5;
-        for j in 0..n_dirs {
-            let (state_plus, state_minus) = f.state_perturbed(x_tau_mats[j], s_tau_mats[j], eps);
-            for i in 0..n_dirs {
-                let g_plus =
-                    single_directional_tau_gradient(&state_plus, &f.rho, hyper_dirs[i].clone())
-                        .expect("g+ for FD");
-                let g_minus =
-                    single_directional_tau_gradient(&state_minus, &f.rho, hyper_dirs[i].clone())
-                        .expect("g- for FD");
-                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * eps);
-            }
-        }
-        // Symmetrize FD Hessian.
-        for i in 0..n_dirs {
-            for j in 0..i {
-                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
-                h_ttfd[[i, j]] = avg;
-                h_ttfd[[j, i]] = avg;
-            }
-        }
+        let x_tau_mats = vec![x_tau_0.clone(), x_tau_1.clone()];
+        let s_tau_mats = vec![s_tau_0.clone(), s_tau_1.clone()];
+        let h_ttfd = directional_tau_hessian_fd_reference(
+            &f.y,
+            &f.w,
+            &f.x,
+            &f.s0,
+            &f.cfg,
+            &f.rho,
+            &hyper_dirs,
+            &x_tau_mats,
+            &s_tau_mats,
+        );
 
         let num = (&h_tt_analytic - &h_ttfd)
             .iter()
@@ -1818,35 +1845,19 @@ mod tests {
                 .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
 
-        let x_tau_mats = [&x_tau_0, &x_tau_1];
-        let s_tau_mats = [&s_tau_0, &s_tau_1];
-        let n_dirs = hyper_dirs.len();
-        let mut h_ttfd = Array2::<f64>::zeros((n_dirs, n_dirs));
-        let eps = 1e-5;
-        for j in 0..n_dirs {
-            let x_plus = &x + &x_tau_mats[j].mapv(|v| eps * v);
-            let x_minus = &x - &x_tau_mats[j].mapv(|v| eps * v);
-            let s_plus = &s0 + &s_tau_mats[j].mapv(|v| eps * v);
-            let s_minus = &s0 - &s_tau_mats[j].mapv(|v| eps * v);
-            let state_plus = build_logit_state(&y, &w, &x_plus, &s_plus, &cfg);
-            let state_minus = build_logit_state(&y, &w, &x_minus, &s_minus, &cfg);
-            for i in 0..n_dirs {
-                let g_plus =
-                    single_directional_tau_gradient(&state_plus, &rho, hyper_dirs[i].clone())
-                        .expect("g+ for FD");
-                let g_minus =
-                    single_directional_tau_gradient(&state_minus, &rho, hyper_dirs[i].clone())
-                        .expect("g- for FD");
-                h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * eps);
-            }
-        }
-        for i in 0..n_dirs {
-            for j in 0..i {
-                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
-                h_ttfd[[i, j]] = avg;
-                h_ttfd[[j, i]] = avg;
-            }
-        }
+        let x_tau_mats = vec![x_tau_0.clone(), x_tau_1.clone()];
+        let s_tau_mats = vec![s_tau_0.clone(), s_tau_1.clone()];
+        let h_ttfd = directional_tau_hessian_fd_reference(
+            &y,
+            &w,
+            &x,
+            &s0,
+            &cfg,
+            &rho,
+            &hyper_dirs,
+            &x_tau_mats,
+            &s_tau_mats,
+        );
 
         let num = (&h_tt_analytic - &h_ttfd)
             .iter()
@@ -2141,31 +2152,19 @@ mod tests {
                 .expect("joint cost+gradient+hessian");
         let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
 
-        let x_tau_mats = [&x_tau_0, &x_tau_1];
-        let s_tau_mats = [&s_tau_0, &s_tau_1];
-        let n_dirs = hyper_dirs.len();
-        let mut h_tt_fd = Array2::<f64>::zeros((n_dirs, n_dirs));
-        let eps = 1e-5;
-        for j in 0..n_dirs {
-            let (state_plus, state_minus) = f.state_perturbed(x_tau_mats[j], s_tau_mats[j], eps);
-            for i in 0..n_dirs {
-                let g_plus =
-                    single_directional_tau_gradient(&state_plus, &f.rho, hyper_dirs[i].clone())
-                        .expect("g+ for FD");
-                let g_minus =
-                    single_directional_tau_gradient(&state_minus, &f.rho, hyper_dirs[i].clone())
-                        .expect("g- for FD");
-                h_tt_fd[[i, j]] = (g_plus - g_minus) / (2.0 * eps);
-            }
-        }
-        // Symmetrize FD Hessian.
-        for i in 0..n_dirs {
-            for j in 0..i {
-                let avg = 0.5 * (h_tt_fd[[i, j]] + h_tt_fd[[j, i]]);
-                h_tt_fd[[i, j]] = avg;
-                h_tt_fd[[j, i]] = avg;
-            }
-        }
+        let x_tau_mats = vec![x_tau_0.clone(), x_tau_1.clone()];
+        let s_tau_mats = vec![s_tau_0.clone(), s_tau_1.clone()];
+        let h_tt_fd = directional_tau_hessian_fd_reference(
+            &f.y,
+            &f.w,
+            &f.x,
+            &f.s0,
+            &f.cfg,
+            &f.rho,
+            &hyper_dirs,
+            &x_tau_mats,
+            &s_tau_mats,
+        );
 
         let num = (&h_tt_analytic - &h_tt_fd)
             .iter()
@@ -2852,6 +2851,7 @@ impl DirectionalHyperParam {
         x_tau_tau_original: Option<Vec<Option<HyperDesignDerivative>>>,
         penaltysecond_components: Option<Vec<Option<Vec<(usize, HyperPenaltyDerivative)>>>>,
     ) -> Result<Self, EstimationError> {
+        let is_penalty_like = !x_tau_original.any_nonzero();
         let penalty_first_components =
             Self::canonicalize_penalty_components(penalty_first_components)?;
         let penaltysecond_components = match penaltysecond_components {
@@ -2876,7 +2876,7 @@ impl DirectionalHyperParam {
             penaltysecond_components,
             penaltysecond_component_provider: None,
             penaltysecond_partner_indices: None,
-            is_penalty_like: true, // default: τ coords are penalty-like
+            is_penalty_like,
         })
     }
 
@@ -3141,12 +3141,14 @@ pub(crate) struct FirthDirection {
 
 #[derive(Clone)]
 pub(crate) struct FirthTauPartialKernel {
+    pub(super) deta_partial: Array1<f64>,
     dotw1: Array1<f64>,
     dotw2: Array1<f64>,
     dot_h_partial: Array1<f64>,
     // Reduced design drift X_{tau,r} = X_tau Q used in exact design-moving
     // Hadamard-Gram contractions.
     x_tau_reduced: Array2<f64>,
+    pub(super) dot_i_partial: Array2<f64>,
     // Reduced Fisher inverse drift:
     //   dot(K_r) = -K_r dot(I_r) K_r
     // where dot(I_r) includes explicit X_tau and weight drift at beta-fixed.
