@@ -12083,6 +12083,23 @@ mod tests {
                     "structural time coefficients must be non-negative after projection: {:?}",
                     result.beta_time(),
                 );
+                // Parallel invariant for BLOCK_LINK_WIGGLE: monotone-link
+                // wiggle coefficients are structurally non-negative and
+                // `post_update_block_beta` clamps them at zero
+                // (survival_location_scale.rs:8972-8979).  This test
+                // configures `linkwiggle_block: None`, so the block is
+                // absent — but if it is ever enabled here the same
+                // non-negativity invariant must hold.
+                if let Some(beta_link_wiggle) = result.beta_link_wiggle() {
+                    assert!(
+                        beta_link_wiggle.iter().all(|&b| b.is_finite()),
+                        "link-wiggle coefficients must be finite: {beta_link_wiggle:?}",
+                    );
+                    assert!(
+                        beta_link_wiggle.iter().all(|&b| b >= 0.0),
+                        "link-wiggle coefficients must be non-negative after projection: {beta_link_wiggle:?}",
+                    );
+                }
             }
             Err(e) => {
                 panic!("fit_survival_location_scale failed: {e}");
