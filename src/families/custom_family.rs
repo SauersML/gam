@@ -11019,9 +11019,6 @@ mod tests {
     }
 
     #[test]
-    fn psi_drift_deriv_workspace_preserves_block_local_operator() {
-        #[derive(Clone)]
-    #[test]
     fn screened_outer_warm_start_skips_far_seed_without_dropping_latest_solution() {
         let rho_far = array![2.25, -0.5];
         let mut cache = Some(ConstrainedWarmStart {
@@ -11047,6 +11044,9 @@ mod tests {
         assert_eq!(retained.active_sets[0], Some(vec![1]));
     }
 
+    #[test]
+    fn psi_drift_deriv_workspace_preserves_block_local_operator() {
+        #[derive(Clone)]
         struct ZeroFamily;
 
         impl CustomFamily for ZeroFamily {
