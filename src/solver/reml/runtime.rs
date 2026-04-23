@@ -1970,6 +1970,118 @@ impl<'a> RemlState<'a> {
         Ok((structural_rank, log_det))
     }
 
+    /// Compute `log|U_S^T · H · U_S|_+` where `U_S` spans the positive
+    /// eigenspace of `S(ρ) = E^T E`.
+    ///
+    /// Root cause this addresses: `DenseSpectralOperator::from_symmetric_with_mode`
+    /// under `PseudoLogdetMode::Smooth` reports `Σ_j ln r_ε(σ_j(H))` summed
+    /// over ALL p eigenvalues of H.  When `rank(X^T W X) + rank(S) < p`
+    /// (e.g. small-n high-dim Duchon at n=120, k=6), H has genuinely null
+    /// eigenvalues; the smooth floor contributes `(p − rank) · ln ε` —
+    /// very negative — to the reported logdet.  `log|S|_+` (from
+    /// `fixed_subspace_penalty_rank_and_logdet` above) is a pseudo-
+    /// logdet and excludes those same directions, so the LAML cost term
+    /// `½(log|H| − log|S|_+)` diverges to −∞ at rank-deficient optima.
+    ///
+    /// The correct LAML ratio is `|H_proj| / |S|_+` where both
+    /// determinants live on `range(S_+)` — the subspace where the
+    /// penalty is identified and the coefficients carry information.
+    /// Here we compute the scalar `log|H_proj|_+`; a caller uses the
+    /// difference
+    ///   hessian_logdet_correction = log|H_proj|_+ − hop.logdet()
+    /// so that `reml_laml_evaluate` (which already sums `hop.logdet()
+    /// + correction`) sees the paired value without any downstream
+    /// refactor of traces or solves.
+    ///
+    /// Gradient consistency: because `S_k = 0` on `null(S)` by
+    /// construction (`null(S) = ∩_k null(S_k)` for S(ρ) = Σ λ_k S_k),
+    /// the analytic gradient trace `tr(H⁻¹ ∂H/∂ρ_k) = λ_k tr(H⁻¹ S_k)`
+    /// only pairs H⁻¹ with directions in `range(S_+)`; the Smooth-mode
+    /// null-direction contributions `tr(H⁻¹ S_k)_null = 0` automatically
+    /// because S_k itself is zero there.  The scalar-only correction
+    /// therefore fixes the cost without disturbing gradients.
+    ///
+    /// This helper is unwired in this commit (audit-only); a follow-up
+    /// commit consumes it in the assembly path.
+    #[allow(dead_code)]
+    pub(super) fn fixed_subspace_hessian_logdet_projected(
+        &self,
+        h_total: &Array2<f64>,
+        e_transformed: &Array2<f64>,
+        ridge_passport: RidgePassport,
+    ) -> Result<f64, EstimationError> {
+        let p = h_total.ncols();
+        if p == 0 {
+            return Ok(0.0);
+        }
+        if h_total.nrows() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "fixed_subspace_hessian_logdet_projected: H must be square, got {}x{}",
+                h_total.nrows(),
+                p
+            )));
+        }
+        if e_transformed.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "fixed_subspace_hessian_logdet_projected: E cols {} do not match H dim {}",
+                e_transformed.ncols(),
+                p
+            )));
+        }
+
+        let mut s_lambda = e_transformed.t().dot(e_transformed);
+        let ridge = ridge_passport.penalty_logdet_ridge();
+        if ridge > 0.0 {
+            for i in 0..p {
+                s_lambda[[i, i]] += ridge;
+            }
+        }
+        let (s_evals, s_evecs) = s_lambda
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+
+        let s_thr = super::unified::positive_eigenvalue_threshold(s_evals.as_slice().unwrap());
+        let positive_cols: Vec<usize> = (0..p).filter(|&j| s_evals[j] > s_thr).collect();
+        let r = positive_cols.len();
+        if r == 0 {
+            // Penalty is structurally null → there is no identified
+            // subspace to project onto.  Returning 0.0 lets the caller
+            // leave the correction untouched; no penalty means there is
+            // no pair to balance in the LAML ratio.
+            return Ok(0.0);
+        }
+
+        // Build U_S: p × r basis of range(S_+).
+        let mut u_s = Array2::<f64>::zeros((p, r));
+        for (out_col, &src_col) in positive_cols.iter().enumerate() {
+            for row in 0..p {
+                u_s[[row, out_col]] = s_evecs[[row, src_col]];
+            }
+        }
+
+        // H_proj = U_S^T · H · U_S is r × r, symmetric in exact
+        // arithmetic.  Force exact symmetry before eigh — faer rejects
+        // visibly non-symmetric input, and the two halves should match
+        // up to roundoff.
+        let h_times_u = h_total.dot(&u_s);
+        let mut h_proj = u_s.t().dot(&h_times_u);
+        for i in 0..r {
+            for j in (i + 1)..r {
+                let avg = 0.5 * (h_proj[[i, j]] + h_proj[[j, i]]);
+                h_proj[[i, j]] = avg;
+                h_proj[[j, i]] = avg;
+            }
+        }
+
+        let (h_proj_evals, _) = h_proj
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let h_thr =
+            super::unified::positive_eigenvalue_threshold(h_proj_evals.as_slice().unwrap());
+        let log_det = super::unified::exact_pseudo_logdet(h_proj_evals.as_slice().unwrap(), h_thr);
+        Ok(log_det)
+    }
+
     /// Compute tr(S⁺ S_direction) — the first derivative of log|S|₊
     /// in the direction S_direction.
     ///
