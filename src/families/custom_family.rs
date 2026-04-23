@@ -1293,6 +1293,20 @@ struct ConstrainedWarmStart {
     active_sets: Vec<Option<Vec<usize>>>,
 }
 
+fn screened_outer_warm_start<'a>(
+    warm_start: Option<&'a ConstrainedWarmStart>,
+    rho: &Array1<f64>,
+) -> Option<&'a ConstrainedWarmStart> {
+    warm_start.filter(|seed| {
+        seed.rho.len() == rho.len()
+            && seed
+                .rho
+                .iter()
+                .zip(rho.iter())
+                .all(|(&a, &b)| (a - b).abs() <= 1.5)
+    })
+}
+
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
 pub struct BlockwiseFitResultParts {
     pub block_states: Vec<ParameterBlockState>,
@@ -10704,7 +10718,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        let warm_ref = outer.warm_cache.as_ref();
+        let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
         let request_hessian =
             matches!(order, OuterEvalOrder::ValueGradientHessian) && need_outer_hessian;
         let eval_result = match outerobjectivegradienthessian_internal(
@@ -10735,22 +10749,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                     } =>
             {
-                let seed_ok = outer
-                    .warm_cache
-                    .as_ref()
-                    .map(|c| {
-                        c.rho.len() == rho.len()
-                            && c.rho
-                                .iter()
-                                .zip(rho.iter())
-                                .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                    })
-                    .unwrap_or(true);
-                if seed_ok {
-                    outer.warm_cache = Some(eval.warm_start.clone());
-                } else {
-                    outer.warm_cache = None;
-                }
+                outer.warm_cache = Some(eval.warm_start.clone());
                 outer.last_error = None;
                 eval
             }
@@ -10783,7 +10782,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             // gives a much better starting point. This was previously disabled for
             // exact-Hessian families, forcing every inner solve to start from
             // scratch (5-10 Newton steps instead of 1-2 with warm start).
-            let warm_ref = outer.warm_cache.as_ref();
+            let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
             match outerobjectivegradienthessian(
                 family,
                 specs,
@@ -10822,7 +10821,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             outer.warm_cache = None;
         }),
         Some(|outer: &mut CustomOuterState, rho: &Array1<f64>| {
-            let warm_ref = outer.warm_cache.as_ref();
+            let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
             match outerobjectiveefs(
                 family,
                 specs,
@@ -10986,6 +10985,32 @@ mod tests {
     #[test]
     fn psi_drift_deriv_workspace_preserves_block_local_operator() {
         #[derive(Clone)]
+    #[test]
+    fn screened_outer_warm_start_skips_far_seed_without_dropping_latest_solution() {
+        let rho_far = array![2.25, -0.5];
+        let mut cache = Some(ConstrainedWarmStart {
+            rho: array![0.0, -0.5],
+            block_beta: vec![array![1.0, -1.0]],
+            active_sets: vec![None],
+        });
+
+        assert!(
+            screened_outer_warm_start(cache.as_ref(), &rho_far).is_none(),
+            "far-away warm seeds should be screened before reuse"
+        );
+
+        cache = Some(ConstrainedWarmStart {
+            rho: rho_far.clone(),
+            block_beta: vec![array![0.2, 0.1]],
+            active_sets: vec![Some(vec![1])],
+        });
+        let retained = screened_outer_warm_start(cache.as_ref(), &rho_far)
+            .expect("the freshly solved point should remain reusable");
+        assert_eq!(retained.rho, rho_far);
+        assert_eq!(retained.block_beta[0], array![0.2, 0.1]);
+        assert_eq!(retained.active_sets[0], Some(vec![1]));
+    }
+
         struct ZeroFamily;
 
         impl CustomFamily for ZeroFamily {

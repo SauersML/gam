@@ -240,6 +240,7 @@ impl TransformationNormalFamily {
         let initial_beta = compute_warm_start(
             response,
             weights,
+            offset,
             &covariate_design,
             &covariate_penalties,
             p_resp,
@@ -371,6 +372,7 @@ impl TransformationNormalFamily {
         let initial_beta = compute_warm_start(
             &response_approx,
             weights,
+            offset,
             &covariate_design,
             &covariate_penalties,
             p_resp,
@@ -1516,6 +1518,7 @@ fn build_tensor_penalties_kronecker(
 fn compute_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
+    offset: &Array1<f64>,
     covariate_design: &DesignMatrix,
     covariate_penalties: &[PenaltyMatrix],
     p_resp: usize,
@@ -1531,9 +1534,12 @@ fn compute_warm_start(
         ));
     }
 
-    // Target: for the intercept row (j=0), Θ[0,:] · cov[i,:] = -μ(x_i)/τ(x_i)
-    //         for the linear row (j=1),  Θ[1,:] · cov[i,:] = 1/τ(x_i)
-    //         for deviation rows (j≥2),  Θ[j,:] = 0
+    // Target: for the intercept row (j=0),
+    //         Θ[0,:] · cov[i,:] = -μ(x_i)/τ(x_i) - offset[i]
+    //         so h_i = offset[i] + Θ[0,:]·cov[i,:] + y_i Θ[1,:]·cov[i,:]
+    //         starts at (y_i - μ(x_i))/τ(x_i).
+    //         For the linear row (j=1), Θ[1,:] · cov[i,:] = 1/τ(x_i).
+    //         For deviation rows (j≥2), Θ[j,:] = 0.
 
     let default_ws;
     let ws = match warm_start {
@@ -1555,8 +1561,9 @@ fn compute_warm_start(
     let mut target_slope = Array1::zeros(n);
     for i in 0..n {
         let tau = ws.scale[i].max(1e-12);
-        target_intercept[i] = -ws.location[i] / tau;
-        target_slope[i] = 1.0 / tau;
+        let inv_tau = 1.0 / tau;
+        target_intercept[i] = -ws.location[i] * inv_tau - offset[i];
+        target_slope[i] = inv_tau;
     }
 
     let projection_log_lambdas = Array1::zeros(covariate_penalties.len());
@@ -2164,6 +2171,59 @@ mod tests {
             crate::seeding::SeedRiskProfile::Gaussian
         );
         assert_eq!(seed_config.num_auxiliary_trailing, 0);
+    }
+
+    #[test]
+    fn warm_start_absorbs_offset_into_affine_seed() {
+        let response = array![2.0, 5.0];
+        let response_val_basis = array![[1.0, 2.0], [1.0, 5.0]];
+        let response_deriv_basis = array![[0.0, 1.0], [0.0, 1.0]];
+        let weights = array![1.0, 1.0];
+        let offset = array![0.7, 0.7];
+        let covariate_design = DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [1.0]]));
+        let warm_start = TransformationWarmStart {
+            location: array![1.0, 1.0],
+            scale: array![2.0, 2.0],
+        };
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            response_val_basis,
+            response_deriv_basis,
+            vec![],
+            Array1::zeros(0),
+            1,
+            Array2::zeros((0, 0)),
+            &weights,
+            &offset,
+            covariate_design,
+            vec![],
+            &TransformationNormalConfig {
+                double_penalty: false,
+                ..TransformationNormalConfig::default()
+            },
+            Some(&warm_start),
+        )
+        .expect("transformation family");
+
+        let (h, h_prime) = family.compute_h_and_h_prime(&family.initial_beta);
+        let expected_h = array![0.5, 2.0];
+        let expected_h_prime = array![0.5, 0.5];
+
+        for i in 0..expected_h.len() {
+            assert!(
+                (h[i] - expected_h[i]).abs() < 1e-12,
+                "h[{i}] mismatch: got {}, expected {}",
+                h[i],
+                expected_h[i]
+            );
+            assert!(
+                (h_prime[i] - expected_h_prime[i]).abs() < 1e-12,
+                "h_prime[{i}] mismatch: got {}, expected {}",
+                h_prime[i],
+                expected_h_prime[i]
+            );
+        }
+
+        assert_eq!(response.len(), family.n_obs());
     }
 
     #[test]
