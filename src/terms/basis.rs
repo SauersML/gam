@@ -8202,7 +8202,7 @@ fn maybe_initialize_aniso_contrasts(
     }
 }
 
-fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
+pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
     let n = points.nrows();
     let d = points.ncols();
     if n < 2 || d == 0 {

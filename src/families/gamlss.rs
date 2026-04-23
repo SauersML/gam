@@ -40,7 +40,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -830,6 +830,7 @@ fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64
 }
 
 fn build_two_block_exact_joint_setup(
+    data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
     mean_penalties: usize,
@@ -855,21 +856,61 @@ fn build_two_block_exact_joint_setup(
     }
 
     // Use aniso-aware initialization: each aniso term gets d ψ entries.
+    // Re-seed ψ from data geometry when the spec does not pin a length_scale.
     let mean_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(meanspec, &mean_terms, kappa_options);
+        SpatialLogKappaCoords::from_length_scales_aniso(meanspec, &mean_terms, kappa_options)
+            .reseed_from_data(data, meanspec, &mean_terms, kappa_options);
     let noise_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(noisespec, &noise_terms, kappa_options);
+        SpatialLogKappaCoords::from_length_scales_aniso(noisespec, &noise_terms, kappa_options)
+            .reseed_from_data(data, noisespec, &noise_terms, kappa_options);
 
     // Concatenate mean and noise ψ values and dims.
     let mut all_values = mean_kappa.as_array().to_vec();
     all_values.extend(noise_kappa.as_array().iter());
-    let mut all_dims = mean_kappa.dims_per_term().to_vec();
-    all_dims.extend(noise_kappa.dims_per_term());
+    let mean_dims = mean_kappa.dims_per_term().to_vec();
+    let noise_dims = noise_kappa.dims_per_term().to_vec();
+    let mut all_dims = mean_dims.clone();
+    all_dims.extend(noise_dims.iter().copied());
 
     let log_kappa0 =
         SpatialLogKappaCoords::new_with_dims(Array1::from_vec(all_values), all_dims.clone());
-    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&all_dims, kappa_options);
-    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&all_dims, kappa_options);
+    // Bounds: concatenate per-block data-aware bounds in the same order.
+    let mean_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        meanspec,
+        &mean_terms,
+        &mean_dims,
+        kappa_options,
+    );
+    let noise_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        noisespec,
+        &noise_terms,
+        &noise_dims,
+        kappa_options,
+    );
+    let mut lower_vals = mean_lower.as_array().to_vec();
+    lower_vals.extend(noise_lower.as_array().iter());
+    let log_kappa_lower =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(lower_vals), all_dims.clone());
+    let mean_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        meanspec,
+        &mean_terms,
+        &mean_dims,
+        kappa_options,
+    );
+    let noise_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        noisespec,
+        &noise_terms,
+        &noise_dims,
+        kappa_options,
+    );
+    let mut upper_vals = mean_upper.as_array().to_vec();
+    upper_vals.extend(noise_upper.as_array().iter());
+    let log_kappa_upper =
+        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), all_dims);
 
     ExactJointHyperSetup::new(
         rho0vec,
@@ -1706,6 +1747,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     macro_rules! run_exact_joint_spatial {
         () => {{
             let joint_setup = build_two_block_exact_joint_setup(
+                data,
                 builder.meanspec(),
                 builder.noisespec(),
                 mean_penalty_count,
@@ -2888,9 +2930,22 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
 
     let dims_per_term = spatial_dims_per_term(pilot_spec, &spatial_terms);
     let log_kappa0 =
-        SpatialLogKappaCoords::from_length_scales_aniso(pilot_spec, &spatial_terms, kappa_options);
-    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options);
-    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options);
+        SpatialLogKappaCoords::from_length_scales_aniso(pilot_spec, &spatial_terms, kappa_options)
+            .reseed_from_data(data, pilot_spec, &spatial_terms, kappa_options);
+    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+        data,
+        pilot_spec,
+        &spatial_terms,
+        &dims_per_term,
+        kappa_options,
+    );
+    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+        data,
+        pilot_spec,
+        &spatial_terms,
+        &dims_per_term,
+        kappa_options,
+    );
 
     let eta_penalty_count = pilot_design.penalties.len();
     let wiggle_penalty_count = initial_log_lambdas_orzeros(&wiggle_block)?.len();
