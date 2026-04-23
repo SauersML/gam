@@ -495,30 +495,33 @@ where
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
         objective(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)
     };
-    let mut obj = problem.build_objective(
-        (),
-        cost_fn,
-        |_: &mut (), _: &ndarray::Array1<f64>| -> Result<
-            crate::solver::outer_strategy::OuterEval,
-            crate::estimate::EstimationError,
-        > {
-            Err(crate::estimate::EstimationError::InvalidInput(
-                "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \
-                 eval(gradient) is unreachable by construction"
-                    .to_string(),
-            ))
-        },
-        None::<fn(&mut ())>,
-        None::<
-            fn(
-                &mut (),
-                &ndarray::Array1<f64>,
-            ) -> Result<
-                crate::solver::outer_strategy::EfsEval,
+    let mut obj =
+        problem.build_objective(
+            (),
+            cost_fn,
+            |_: &mut (),
+             _: &ndarray::Array1<f64>|
+             -> Result<
+                crate::solver::outer_strategy::OuterEval,
                 crate::estimate::EstimationError,
+            > {
+                Err(crate::estimate::EstimationError::InvalidInput(
+                    "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \
+                 eval(gradient) is unreachable by construction"
+                        .to_string(),
+                ))
+            },
+            None::<fn(&mut ())>,
+            None::<
+                fn(
+                    &mut (),
+                    &ndarray::Array1<f64>,
+                ) -> Result<
+                    crate::solver::outer_strategy::EfsEval,
+                    crate::estimate::EstimationError,
+                >,
             >,
-        >,
-    );
+        );
     let result = problem
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
@@ -1294,8 +1297,12 @@ pub fn baseline_offset_theta_partials(
             //   ∂eta/∂log_scale  = −shape          ∂o_D/∂log_scale = 0
             //   ∂eta/∂log_shape  = shape·(log t − log scale) = eta
             //   ∂o_D/∂log_shape  = shape / t = o_D
-            let scale = cfg.scale.ok_or_else(|| "weibull missing scale".to_string())?;
-            let shape = cfg.shape.ok_or_else(|| "weibull missing shape".to_string())?;
+            let scale = cfg
+                .scale
+                .ok_or_else(|| "weibull missing scale".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "weibull missing shape".to_string())?;
             if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
                 return Err("weibull baseline requires finite positive scale and shape".to_string());
             }
@@ -1311,13 +1318,15 @@ pub fn baseline_offset_theta_partials(
             ]))
         }
         SurvivalBaselineTarget::Gompertz => {
-            let rate = cfg.rate.ok_or_else(|| "gompertz missing rate".to_string())?;
+            let rate = cfg
+                .rate
+                .ok_or_else(|| "gompertz missing rate".to_string())?;
             let shape = cfg
                 .shape
                 .ok_or_else(|| "gompertz missing shape".to_string())?;
             if !(rate.is_finite() && shape.is_finite() && rate > 0.0) {
                 return Err(
-                    "gompertz baseline requires finite positive rate and finite shape".to_string()
+                    "gompertz baseline requires finite positive rate and finite shape".to_string(),
                 );
             }
             // θ = (log_rate, shape):
@@ -1366,9 +1375,7 @@ pub fn baseline_offset_theta_partials(
             let (cum_g, inst_g) = gompertz_hazard_components(age, rate, shape);
             let cum_total = makeham * age + cum_g;
             if cum_total <= 0.0 || !cum_total.is_finite() {
-                return Err(
-                    "gm baseline produced non-positive cumulative hazard".to_string(),
-                );
+                return Err("gm baseline produced non-positive cumulative hazard".to_string());
             }
             let inst_total = makeham + inst_g;
             let o_d = inst_total / cum_total;
@@ -1922,11 +1929,7 @@ mod tests {
 
     /// Central-difference of (eta, o_D) at fixed age wrt each θ component in
     /// the theta layout defined by `survival_baseline_theta_from_config`.
-    fn fd_baseline_offset(
-        age: f64,
-        cfg: &SurvivalBaselineConfig,
-        h: f64,
-    ) -> Vec<(f64, f64)> {
+    fn fd_baseline_offset(age: f64, cfg: &SurvivalBaselineConfig, h: f64) -> Vec<(f64, f64)> {
         let theta = survival_baseline_theta_from_config(cfg)
             .expect("theta")
             .expect("non-linear baseline");
@@ -1936,8 +1939,8 @@ mod tests {
                 theta_plus[k] += h;
                 let mut theta_minus = theta.clone();
                 theta_minus[k] -= h;
-                let cfg_plus = survival_baseline_config_from_theta(cfg.target, &theta_plus)
-                    .expect("plus cfg");
+                let cfg_plus =
+                    survival_baseline_config_from_theta(cfg.target, &theta_plus).expect("plus cfg");
                 let cfg_minus = survival_baseline_config_from_theta(cfg.target, &theta_minus)
                     .expect("minus cfg");
                 let (eta_p, od_p) = evaluate_survival_baseline(age, &cfg_plus).expect("eta+");
@@ -2097,17 +2100,13 @@ mod tests {
                     analytic[k].0,
                     fd[k].0,
                     1e-7,
-                    &format!(
-                        "weibull ∂eta/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"
-                    ),
+                    &format!("weibull ∂eta/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"),
                 );
                 assert_close(
                     analytic[k].1,
                     fd[k].1,
                     1e-7,
-                    &format!(
-                        "weibull ∂o_D/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"
-                    ),
+                    &format!("weibull ∂o_D/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"),
                 );
             }
             // Weibull o_D = shape/t is independent of scale; verify exactly.
@@ -2182,5 +2181,4 @@ mod tests {
         assert!(baseline_offset_theta_partials(-1.0, &cfg).is_err());
         assert!(baseline_offset_theta_partials(f64::NAN, &cfg).is_err());
     }
-
 }

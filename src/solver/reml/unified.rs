@@ -4478,7 +4478,6 @@ fn compute_outer_hessian(
         );
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
-
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
