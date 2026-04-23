@@ -2001,9 +2001,9 @@ impl<'a> RemlState<'a> {
     /// because S_k itself is zero there.  The scalar-only correction
     /// therefore fixes the cost without disturbing gradients.
     ///
-    /// This helper is unwired in this commit (audit-only); a follow-up
-    /// commit consumes it in the assembly path.
-    #[allow(dead_code)]
+    /// Consumed by `build_dense_assembly` and `build_dense_original_assembly`
+    /// to supply the `hessian_logdet_correction` that pairs log|H| with
+    /// log|S|_+ on `range(S_+)`.
     pub(super) fn fixed_subspace_hessian_logdet_projected(
         &self,
         h_total: &Array2<f64>,
@@ -3311,6 +3311,7 @@ impl<'a> RemlState<'a> {
         beta: Array1<f64>,
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         nullspace_dim: f64,
+        hessian_logdet_correction: f64,
     ) -> super::assembly::InnerAssembly<'static> {
         super::assembly::InnerAssembly {
             log_likelihood: ctx.log_likelihood,
@@ -3322,7 +3323,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             dispersion: ctx.dispersion,
             rho_curvature_scale: 1.0,
-            hessian_logdet_correction: 0.0,
+            hessian_logdet_correction,
             deriv_provider: Some(ctx.deriv_provider),
             tk_correction: 0.0,
             tk_gradient: None,
@@ -3409,6 +3410,36 @@ impl<'a> RemlState<'a> {
 
         let nullspace_dim = h_for_operator.ncols().saturating_sub(penalty_rank) as f64;
 
+        // Rank-deficient LAML fix: under `Smooth` the spectral operator's
+        // cached logdet sums `ln r_ε(σ_j(H))` over ALL eigenvalues, so
+        // genuinely null directions contribute `(p − rank) · ln ε` — very
+        // negative — and make `½(log|H| − log|S|_+)` diverge to −∞
+        // whenever `rank(X'WX) + rank(S) < p`.  Project H onto
+        // `range(S_+)` and pass the scalar correction through
+        // `hessian_logdet_correction`; `reml_laml_evaluate` already sums
+        // `hop.logdet() + correction`, so the evaluator sees
+        // `log|H_proj|_+` paired with `log|S|_+` on the same rank-r
+        // identified subspace.  The operator's own `solve` / traces are
+        // untouched; gradient correctness holds because `S_k · u = 0`
+        // for `u ∈ null(S)` (`null(S) = ∩_k null(S_k)` by construction),
+        // so `tr(H⁻¹ S_k)` on the full operator equals
+        // `tr(H_proj⁻¹ · U_S^T S_k U_S)` up to null-direction terms
+        // that vanish.  Under `HardPseudo` the operator already masks
+        // null eigenpairs, so the correction is zero there.
+        let hessian_logdet_correction = if matches!(hessian_mode, PseudoLogdetMode::Smooth)
+            && penalty_rank < h_for_operator.ncols()
+        {
+            use super::unified::HessianOperator;
+            let log_det_h_proj = self.fixed_subspace_hessian_logdet_projected(
+                &h_for_operator,
+                &e_for_logdet,
+                ridge_passport,
+            )?;
+            log_det_h_proj - hessian_op.logdet()
+        } else {
+            0.0
+        };
+
         let ctx =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
         Ok(self.finish_assembly(
@@ -3418,6 +3449,7 @@ impl<'a> RemlState<'a> {
             beta,
             penalty_logdet,
             nullspace_dim,
+            hessian_logdet_correction,
         ))
     }
 
@@ -3471,7 +3503,17 @@ impl<'a> RemlState<'a> {
         };
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
-        Ok(self.finish_assembly(pirls_result, ctx, hessian_op, beta, penalty_logdet, mp))
+        // Sparse path uses a Cholesky-derived log|H| (no smooth-floor
+        // null-eigenvalue contribution), so no projection correction.
+        Ok(self.finish_assembly(
+            pirls_result,
+            ctx,
+            hessian_op,
+            beta,
+            penalty_logdet,
+            mp,
+            0.0,
+        ))
     }
 
     /// Build an `InnerAssembly` using the dense original-basis backend.
@@ -3608,6 +3650,40 @@ impl<'a> RemlState<'a> {
 
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
 
+        // Same rank-deficient LAML fix as `build_dense_assembly`, adapted
+        // to the original-basis Hessian.  Under `Smooth` the spectral
+        // operator's cached logdet sums `ln r_ε(σ_j(H))` over ALL
+        // eigenvalues; projecting H onto `range(S_+)` and passing the
+        // scalar difference through `hessian_logdet_correction` restores
+        // pairing with `log|S|_+`.  Under `HardPseudo` null eigenpairs
+        // are already masked consistently in logdet / solves / traces,
+        // so the correction is zero.
+        //
+        // `h_total_original` lives in the original basis; `e_for_logdet`
+        // lives in the transformed basis (carries the reparameterization
+        // that defines `range(S_+)`).  Rotate H into the transformed
+        // basis via `Qs` before projecting so both inputs agree on which
+        // subspace is "range(S_+)"; the scalar log-determinant is
+        // invariant under the orthogonal Qs rotation, and comparing with
+        // `hessian_op.logdet()` (original basis) is valid because the
+        // two logdets agree to roundoff for the same matrix under
+        // orthogonal change of basis.
+        let hessian_logdet_correction = if matches!(hessian_mode, PseudoLogdetMode::Smooth)
+            && penalty_rank < h_total_original.ncols()
+        {
+            use super::unified::HessianOperator;
+            let qs = &pirls_result.reparam_result.qs;
+            let h_transformed = qs.t().dot(&h_total_original).dot(qs);
+            let log_det_h_proj = self.fixed_subspace_hessian_logdet_projected(
+                &h_transformed,
+                &e_for_logdet,
+                ridge_passport,
+            )?;
+            log_det_h_proj - hessian_op.logdet()
+        } else {
+            0.0
+        };
+
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
         Ok(self.finish_assembly(
             pirls_result,
@@ -3616,6 +3692,7 @@ impl<'a> RemlState<'a> {
             beta,
             penalty_logdet,
             nullspace_dim,
+            hessian_logdet_correction,
         ))
     }
 
