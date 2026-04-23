@@ -1970,51 +1970,6 @@ impl<'a> RemlState<'a> {
         Ok((structural_rank, log_det))
     }
 
-    /// Compute `log|U_S^T · H · U_S|_+` where `U_S` spans the positive
-    /// eigenspace of `S(ρ) = E^T E`.
-    ///
-    /// Root cause this addresses: `DenseSpectralOperator::from_symmetric_with_mode`
-    /// under `PseudoLogdetMode::Smooth` reports `Σ_j ln r_ε(σ_j(H))` summed
-    /// over ALL p eigenvalues of H.  When `rank(X^T W X) + rank(S) < p`
-    /// (e.g. small-n high-dim Duchon at n=120, k=6), H has genuinely null
-    /// eigenvalues; the smooth floor contributes `(p − rank) · ln ε` —
-    /// very negative — to the reported logdet.  `log|S|_+` (from
-    /// `fixed_subspace_penalty_rank_and_logdet` above) is a pseudo-
-    /// logdet and excludes those same directions, so the LAML cost term
-    /// `½(log|H| − log|S|_+)` diverges to −∞ at rank-deficient optima.
-    ///
-    /// The correct LAML ratio is `|H_proj| / |S|_+` where both
-    /// determinants live on `range(S_+)` — the subspace where the
-    /// penalty is identified and the coefficients carry information.
-    /// Here we compute the scalar `log|H_proj|_+`; a caller uses the
-    /// difference
-    ///   hessian_logdet_correction = log|H_proj|_+ − hop.logdet()
-    /// so that `reml_laml_evaluate` (which already sums `hop.logdet()
-    /// + correction`) sees the paired value without any downstream
-    /// refactor of traces or solves.
-    ///
-    /// Gradient consistency: because `S_k = 0` on `null(S)` by
-    /// construction (`null(S) = ∩_k null(S_k)` for S(ρ) = Σ λ_k S_k),
-    /// the analytic gradient trace `tr(H⁻¹ ∂H/∂ρ_k) = λ_k tr(H⁻¹ S_k)`
-    /// only pairs H⁻¹ with directions in `range(S_+)`; the Smooth-mode
-    /// null-direction contributions `tr(H⁻¹ S_k)_null = 0` automatically
-    /// because S_k itself is zero there.  The scalar-only correction
-    /// therefore fixes the cost without disturbing gradients.
-    ///
-    /// Consumed by `build_dense_assembly` and `build_dense_original_assembly`
-    /// to supply the `hessian_logdet_correction` that pairs log|H| with
-    /// log|S|_+ on `range(S_+)`.
-    pub(super) fn fixed_subspace_hessian_logdet_projected(
-        &self,
-        h_total: &Array2<f64>,
-        e_transformed: &Array2<f64>,
-        ridge_passport: RidgePassport,
-    ) -> Result<f64, EstimationError> {
-        let (log_det, _kernel) =
-            self.fixed_subspace_hessian_projected_parts(h_total, e_transformed, ridge_passport)?;
-        Ok(log_det)
-    }
-
     /// Compute the projected logdet `log|U_Sᵀ H U_S|_+` together with the
     /// matching trace kernel `(U_S, (U_Sᵀ H U_S)⁻¹)` — the [`PenaltySubspaceTrace`]
     /// that pairs the rank-deficient LAML cost with a gradient-consistent
