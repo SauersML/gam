@@ -7294,6 +7294,7 @@ fn build_custom_family_inner_assembly<'dp>(
         },
         rho_curvature_scale,
         hessian_logdet_correction,
+        penalty_subspace_trace: None,
         deriv_provider: Some(deriv_provider),
         tk_correction: 0.0,
         tk_gradient: None,

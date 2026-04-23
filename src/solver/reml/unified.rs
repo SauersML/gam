@@ -6540,16 +6540,18 @@ impl SparseCholeskyOperator {
             }
 
             let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
-            let solved =
-                match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view) {
-                    Ok(sol) => sol,
-                    Err(e) => {
-                        log::warn!(
+            let solved = match crate::linalg::sparse_exact::solve_sparse_spdmulti(
+                &self.factor,
+                &rhs_view,
+            ) {
+                Ok(sol) => sol,
+                Err(e) => {
+                    log::warn!(
                         "SparseCholeskyOperator::trace_hinv_operator_exact multi-solve failed: {e}"
                     );
-                        return f64::NAN;
-                    }
-                };
+                    return f64::NAN;
+                }
+            };
             for local_col in 0..cols {
                 trace += solved[[start + local_col, local_col]];
             }
@@ -6579,13 +6581,15 @@ impl SparseCholeskyOperator {
             }
 
             let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
-            let solved =
-                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
-                    .map_err(|e| {
-                        format!(
+            let solved = crate::linalg::sparse_exact::solve_sparse_spdmulti(
+                &self.factor,
+                &rhs_view,
+            )
+            .map_err(|e| {
+                format!(
                     "SparseCholeskyOperator::solve_operator_columns_exact multi-solve failed: {e}"
                 )
-                    })?;
+            })?;
             solved_all
                 .slice_mut(ndarray::s![.., start..end])
                 .assign(&solved);
@@ -8274,10 +8278,11 @@ mod tests {
     fn test_gaussian_derivatives_has_no_corrections() {
         let g = GaussianDerivatives;
         assert!(!g.has_corrections());
-        assert!(g
-            .hessian_derivative_correction(&array![1.0, 2.0])
-            .unwrap()
-            .is_none());
+        assert!(
+            g.hessian_derivative_correction(&array![1.0, 2.0])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

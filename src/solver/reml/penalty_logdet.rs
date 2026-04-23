@@ -71,6 +71,47 @@ fn are_penalties_disjoint(penalties: &[crate::construction::CanonicalPenalty]) -
     true
 }
 
+fn infer_penalty_rank(penalty: &crate::construction::CanonicalPenalty) -> Result<usize, String> {
+    let block_dim = penalty.block_dim();
+    if penalty.positive_eigenvalues.len() + penalty.nullity == block_dim {
+        return Ok(penalty.positive_eigenvalues.len());
+    }
+    if block_dim == 0 {
+        return Ok(0);
+    }
+
+    let (evals, _) = penalty
+        .local
+        .eigh(Side::Lower)
+        .map_err(|e| format!("Penalty component eigendecomposition failed: {e}"))?;
+    let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+    Ok(evals.iter().filter(|&&e| e > threshold).count())
+}
+
+fn structural_nullity_from_penalties(
+    penalties: &[crate::construction::CanonicalPenalty],
+    p_total: usize,
+) -> Result<Option<usize>, String> {
+    if penalties.is_empty() {
+        return Ok(None);
+    }
+
+    let mut component_matrices = Vec::with_capacity(penalties.len());
+    let mut component_nullities = Vec::with_capacity(penalties.len());
+    for penalty in penalties {
+        let rank = infer_penalty_rank(penalty)?;
+        let mut component = Array2::<f64>::zeros((p_total, p_total));
+        penalty.accumulate_weighted(&mut component, 1.0);
+        component_matrices.push(component);
+        component_nullities.push(p_total.saturating_sub(rank));
+    }
+
+    Ok(Some(super::unified::exact_intersection_nullity(
+        &component_matrices,
+        &component_nullities,
+    )))
+}
+
 /// Result of a penalty pseudo-logdet computation.
 ///
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
@@ -142,6 +183,7 @@ impl PenaltyPseudologdet {
             // Group penalties by overlapping column ranges.
             Self::from_penalties_block_factored(penalties, lambdas, ridge, p_total)
         } else {
+            let structural_nullity = structural_nullity_from_penalties(penalties, p_total)?;
             // Fallback: assemble full p×p combined penalty.
             let mut s_total = Array2::<f64>::zeros((p_total, p_total));
             for (k, cp) in penalties.iter().enumerate() {
@@ -154,7 +196,7 @@ impl PenaltyPseudologdet {
                     s_total[[i, i]] += ridge;
                 }
             }
-            Self::from_assembled(s_total)
+            Self::from_assembled_with_nullity(s_total, structural_nullity)
         }
     }
 
@@ -176,6 +218,8 @@ impl PenaltyPseudologdet {
             start: usize,
             end: usize,
             local: Array2<f64>,
+            component_matrices: Vec<Array2<f64>>,
+            component_nullities: Vec<usize>,
         }
 
         // Group penalties by their exact block range.
@@ -183,12 +227,16 @@ impl PenaltyPseudologdet {
         for (k, cp) in penalties.iter().enumerate() {
             let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
             let r = &cp.col_range;
+            let local_rank = infer_penalty_rank(cp)?;
+            let local_nullity = cp.block_dim().saturating_sub(local_rank);
             // Find or create block with matching range.
             if let Some(bd) = blocks
                 .iter_mut()
                 .find(|bd| bd.start == r.start && bd.end == r.end)
             {
                 bd.local.scaled_add(lambda, &cp.local);
+                bd.component_matrices.push(cp.local.clone());
+                bd.component_nullities.push(local_nullity);
             } else {
                 let bd = cp.block_dim();
                 let mut local = Array2::<f64>::zeros((bd, bd));
@@ -197,6 +245,8 @@ impl PenaltyPseudologdet {
                     start: r.start,
                     end: r.end,
                     local,
+                    component_matrices: vec![cp.local.clone()],
+                    component_nullities: vec![local_nullity],
                 });
             }
         }
@@ -224,16 +274,23 @@ impl PenaltyPseudologdet {
 
         // Process each block.
         struct BlockResult {
-            w_cols: Array2<f64>, // p_total × block_rank
+            w_cols: Array2<f64>,      // p_total × block_rank
+            u_null_cols: Array2<f64>, // p_total × block_nullity
             inv_evals_sq: Vec<f64>,
             value: f64,
             rank: usize,
+            nullity: usize,
         }
 
         let mut block_results: Vec<BlockResult> = Vec::new();
 
         for bd in &blocks {
-            let block_pld = Self::from_assembled(bd.local.clone())?;
+            let structural_nullity = Some(super::unified::exact_intersection_nullity(
+                &bd.component_matrices,
+                &bd.component_nullities,
+            ));
+            let block_pld =
+                Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
             block_results.push(BlockResult {
                 w_cols: {
                     // Embed block W-factor into p_total space.
@@ -246,9 +303,20 @@ impl PenaltyPseudologdet {
                     }
                     embedded
                 },
+                u_null_cols: {
+                    let block_nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
+                    let mut embedded = Array2::<f64>::zeros((p_total, block_nullity));
+                    if let Some(block_u_null) = block_pld.u_null.as_ref() {
+                        embedded
+                            .slice_mut(s![bd.start..bd.end, ..])
+                            .assign(block_u_null);
+                    }
+                    embedded
+                },
                 inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
                 value: block_pld.value,
                 rank: block_pld.rank,
+                nullity: block_pld.u_null.as_ref().map_or(0, Array2::ncols),
             });
         }
 
@@ -262,9 +330,11 @@ impl PenaltyPseudologdet {
                     w_col[[idx, 0]] = scale;
                     block_results.push(BlockResult {
                         w_cols: w_col,
+                        u_null_cols: Array2::<f64>::zeros((p_total, 0)),
                         inv_evals_sq: vec![inv_ridge_sq],
                         value: ridge.ln(),
                         rank: 1,
+                        nullity: 0,
                     });
                 }
             }
@@ -290,26 +360,34 @@ impl PenaltyPseudologdet {
         }
 
         // Null space: the dimensions where eigenvalue == 0 (ridge == 0, no penalty).
-        let total_nullity = p_total - total_rank;
+        let block_nullity: usize = block_results.iter().map(|br| br.nullity).sum();
+        let uncovered_nullity = if ridge > 0.0 {
+            0
+        } else {
+            covered.iter().filter(|&&c| !c).count()
+        };
+        let total_nullity = block_nullity + uncovered_nullity;
         let u_null = if total_nullity > 0 {
             let mut u0 = Array2::<f64>::zeros((p_total, total_nullity));
             let mut null_col = 0;
+            for br in &block_results {
+                if br.nullity > 0 {
+                    u0.slice_mut(s![.., null_col..null_col + br.nullity])
+                        .assign(&br.u_null_cols);
+                    null_col += br.nullity;
+                }
+            }
             for (idx, &c) in covered.iter().enumerate() {
                 if !c && ridge <= 0.0 {
                     u0[[idx, null_col]] = 1.0;
                     null_col += 1;
                 }
             }
-            // Also add null dimensions from within blocks (if any block has nullity).
-            // For the block-factored case with disjoint blocks, the block's internal
-            // null dimensions are already captured by from_assembled. But we don't
-            // currently extract them. Return None for u_null to avoid
-            // incorrect null-space corrections (ρ-derivatives don't need it).
-            if null_col > 0 {
-                Some(u0.slice(s![.., ..null_col]).to_owned())
-            } else {
-                None
-            }
+            debug_assert_eq!(
+                null_col, total_nullity,
+                "block-factored pseudo-logdet nullspace assembly mismatch"
+            );
+            Some(u0)
         } else {
             None
         };
@@ -908,6 +986,101 @@ mod tests {
         assert!(
             grad.abs() < 1e-10,
             "nullspace-rotation gradient should be zero, got {grad}"
+        );
+    }
+
+    #[test]
+    fn test_block_factored_tau_hessian_preserves_internal_nullspace() {
+        let s1 = 3.0_f64;
+        let s2 = 1.0_f64;
+        let psi = 0.5_f64;
+        let c = psi.cos();
+        let s = psi.sin();
+
+        let r = array![[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]];
+        let d = array![[s1, 0.0, 0.0], [0.0, s2, 0.0], [0.0, 0.0, 0.0]];
+        let s_mat = r.dot(&d).dot(&r.t());
+
+        let r_psi = array![[-s, 0.0, -c], [0.0, 0.0, 0.0], [c, 0.0, -s]];
+        let s_psi = r_psi.dot(&d).dot(&r.t()) + r.dot(&d).dot(&r_psi.t());
+
+        let r_psi_psi = array![[-c, 0.0, s], [0.0, 0.0, 0.0], [-s, 0.0, -c]];
+        let s_psi_psi = r_psi_psi.dot(&d).dot(&r.t())
+            + 2.0 * r_psi.dot(&d).dot(&r_psi.t())
+            + r.dot(&d).dot(&r_psi_psi.t());
+
+        let root = super::unified::penalty_matrix_root(&s_mat).unwrap();
+        let penalty = crate::construction::CanonicalPenalty::from_dense_root(root, 3);
+        let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], 0.0, 3)
+            .expect("block-factored pseudo-logdet");
+        let assembled =
+            PenaltyPseudologdet::from_assembled(s_mat).expect("assembled pseudo-logdet");
+
+        let block_hess = block_factored.tau_hessian_component(&s_psi, &s_psi, Some(&s_psi_psi));
+        let assembled_hess = assembled.tau_hessian_component(&s_psi, &s_psi, Some(&s_psi_psi));
+
+        assert!(
+            assembled_hess.abs() < 1e-10,
+            "assembled reference should see zero curvature for a pure nullspace rotation, got {assembled_hess}"
+        );
+        assert!(
+            (block_hess - assembled_hess).abs() < 1e-10,
+            "block-factored tau hessian lost internal nullspace columns: block={block_hess}, assembled={assembled_hess}"
+        );
+    }
+
+    #[test]
+    fn test_block_factored_ridge_preserves_structural_nullspace_value() {
+        let s = array![[4.0, 2.0], [2.0, 1.0]];
+        let ridge = 1e-4_f64;
+
+        let root = super::unified::penalty_matrix_root(&s).unwrap();
+        let penalty = crate::construction::CanonicalPenalty::from_dense_root(root, 2);
+        let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], ridge, 2)
+            .expect("block-factored pseudo-logdet");
+
+        let mut s_ridged = s.clone();
+        for i in 0..2 {
+            s_ridged[[i, i]] += ridge;
+        }
+        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(1))
+            .expect("assembled pseudo-logdet with structural nullity");
+
+        assert_eq!(block_factored.rank(), assembled.rank());
+        assert!(
+            (block_factored.value() - assembled.value()).abs() < 1e-12,
+            "block-factored ridge path leaked structural nullspace logdet: block={}, assembled={}",
+            block_factored.value(),
+            assembled.value()
+        );
+    }
+
+    #[test]
+    fn test_overlapping_penalties_ridge_preserve_structural_nullspace_value() {
+        let ridge = 1e-4_f64;
+        let lambdas = [2.0_f64, 3.0_f64];
+        let penalties = [
+            crate::construction::CanonicalPenalty::from_dense_root(array![[1.0, 0.0, 0.0]], 3),
+            crate::construction::CanonicalPenalty::from_dense_root(array![[0.0, 1.0, 0.0]], 3),
+        ];
+
+        let overlapping = PenaltyPseudologdet::from_penalties(&penalties, &lambdas, ridge, 3)
+            .expect("overlapping pseudo-logdet");
+
+        let s_ridged = array![
+            [lambdas[0] + ridge, 0.0, 0.0],
+            [0.0, lambdas[1] + ridge, 0.0],
+            [0.0, 0.0, ridge]
+        ];
+        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(1))
+            .expect("assembled pseudo-logdet with structural nullity");
+
+        assert_eq!(overlapping.rank(), assembled.rank());
+        assert!(
+            (overlapping.value() - assembled.value()).abs() < 1e-12,
+            "assembled ridge path leaked structural nullspace logdet: overlap={}, assembled={}",
+            overlapping.value(),
+            assembled.value()
         );
     }
 }

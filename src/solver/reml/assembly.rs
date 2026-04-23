@@ -11,8 +11,8 @@ use super::FirthDenseOperator;
 use super::unified::{
     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
     HessianOperator, HyperCoord, HyperCoordPair, InnerSolution, InnerSolutionBuilder,
-    PenaltyCoordinate, PenaltyLogdetDerivs, RemlLamlResult, penalty_matrix_root,
-    reml_laml_evaluate,
+    PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, RemlLamlResult,
+    penalty_matrix_root, reml_laml_evaluate,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -38,6 +38,7 @@ pub struct InnerAssembly<'dp> {
     pub dispersion: DispersionHandling,
     pub rho_curvature_scale: f64,
     pub hessian_logdet_correction: f64,
+    pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
 
     // === Optional decorations (sensible defaults when None/zero) ===
     pub deriv_provider: Option<Box<dyn HessianDerivativeProvider + 'dp>>,
@@ -69,6 +70,7 @@ impl<'dp> InnerAssembly<'dp> {
         );
         builder = builder.rho_curvature_scale(self.rho_curvature_scale);
         builder = builder.hessian_logdet_correction(self.hessian_logdet_correction);
+        builder = builder.penalty_subspace_trace(self.penalty_subspace_trace);
 
         if let Some(dp) = self.deriv_provider {
             builder = builder.deriv_provider(dp);

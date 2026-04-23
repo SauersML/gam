@@ -1765,18 +1765,6 @@ fn run_fitwith_predict_noise(
                 SavedFitSummary::from_blockwise_fit(&fit)?
                     .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
-            let dense_mean_design = mean_design.design.to_dense();
-            let dense_noise_design = noise_design.design.to_dense();
-            let gaussian_noise_transform = build_scale_deviation_transform(
-                &dense_mean_design,
-                &dense_noise_design,
-                &weights,
-                noise_design
-                    .intercept_range
-                    .end
-                    .min(noise_design.design.ncols()),
-            )
-            .map_err(|e| format!("failed to encode Gaussian noise transform: {e}"))?;
             let mut model = build_location_scale_saved_model(
                 formula_text.to_string(),
                 FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
@@ -1789,7 +1777,7 @@ fn run_fitwith_predict_noise(
                 fit_result,
                 fit.block_by_role(BlockRole::Scale)
                     .map(|block| block.beta.to_vec()),
-                Some(&gaussian_noise_transform),
+                None,
                 Some(response_scale),
             );
             model.offset_column = args.offset_column.clone();
@@ -3557,22 +3545,37 @@ fn run_predict_survival(
         return Ok(());
     }
 
+    let saved_timewiggle = saved_baseline_timewiggle_components(
+        &eta_offset_entry,
+        &eta_offset_exit,
+        &derivative_offset_exit,
+        model,
+    )?;
     let p_time = time_build.x_exit_time.ncols();
-    let p_timewiggle = saved_timewiggle_runtime
+    let p_timewiggle = saved_timewiggle
         .as_ref()
-        .map_or(0, |w| w.beta.len());
+        .map(|(_, exit, _)| exit.ncols())
+        .unwrap_or(0);
     let p = p_time + p_timewiggle + p_cov;
     let x_exit_time_dense = time_build.x_exit_time.to_dense();
     let mut x_exit = Array2::<f64>::zeros((n, p));
-    x_exit
-        .slice_mut(s![.., ..p_time])
-        .assign(&x_exit_time_dense);
-    // Timewiggle columns are evaluated dynamically from the runtime
-    // (the old frozen-column approach was removed). For the generic
-    // survival path we do NOT support dynamic timewiggle — it is only
-    // available through the exact location-scale path. Pad with zeros
-    // so coefficient indexing stays consistent.
-    // (The location-scale predict path above handles timewiggle properly.)
+    if p_time > 0 {
+        x_exit
+            .slice_mut(s![.., ..p_time])
+            .assign(&x_exit_time_dense);
+    }
+    // Standard Royston-Parmar survival prediction must replay the saved
+    // baseline-timewiggle on the log cumulative hazard scale before the
+    // covariate offset is added. The location-scale branch handles its own
+    // dynamic timewiggle geometry above; this branch uses the saved fixed
+    // basis reconstruction for `predict_gam`.
+    if let Some((_, exit_w, _)) = saved_timewiggle.as_ref() {
+        if p_timewiggle > 0 {
+            x_exit
+                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+                .assign(exit_w);
+        }
+    }
     //
     // Materialize the covariate design once into dense form. Calling
     // `DesignMatrix::get(i, j)` in a per-cell loop would re-densify the
@@ -4372,6 +4375,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     parse_survival_distribution(&effective_survival_distribution)?;
     let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
+    if effective_linkwiggle.is_some()
+        && likelihood_mode == SurvivalLikelihoodMode::LocationScale
+        && !inverse_link_supports_joint_wiggle(&survival_inverse_link)
+    {
+        return Err(
+            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
+                .to_string(),
+        );
+    }
     if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         if !matches!(
             effective_args
@@ -8855,6 +8867,9 @@ fn compact_saved_survival_location_scale_fit_result(
         SavedFitSummary::from_blockwise_fit(fit)?,
     );
     apply_inverse_link_state_to_fit_result(&mut fit_result, inverse_link);
+    fit_result.artifacts.survival_link_wiggle_knots =
+        fit.artifacts.survival_link_wiggle_knots.clone();
+    fit_result.artifacts.survival_link_wiggle_degree = fit.artifacts.survival_link_wiggle_degree;
     Ok(fit_result)
 }
 
@@ -14409,7 +14424,7 @@ mod tests {
             &wiggle_cfg,
         )
         .expect("baseline-timewiggle build");
-        let beta = Array1::<f64>::zeros(built.ncols + 1);
+        let beta = Array1::from_iter((0..built.ncols).map(|j| 0.05 * (j as f64 + 1.0)));
         let p = beta.len();
         let fit_result = core_saved_fit_result(
             beta.clone(),
@@ -14463,7 +14478,7 @@ mod tests {
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
-            mode: PredictModeArg::PosteriorMean,
+            mode: PredictModeArg::Map,
         };
         let mut progress = gam::visualizer::VisualizerSession::new(false);
         super::run_predict_survival(
@@ -14482,10 +14497,42 @@ mod tests {
             None,
         )
         .expect("survival predict with timewiggle");
-        let csv = fs::read_to_string(&out_path).expect("prediction csv");
-        let lines = csv.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("mean"));
+        let (_, exit_w, _) = super::saved_baseline_timewiggle_components(
+            &eta_entry,
+            &eta_exit,
+            &derivative_exit,
+            &model,
+        )
+        .expect("rebuild saved baseline-timewiggle")
+        .expect("saved baseline-timewiggle metadata");
+        let expected = predict_gam(
+            exit_w,
+            beta.view(),
+            eta_exit.view(),
+            LikelihoodFamily::RoystonParmar,
+        )
+        .expect("expected survival predict");
+
+        let mut rdr = csv::Reader::from_path(&out_path).expect("open prediction csv");
+        let rows = rdr
+            .deserialize::<BTreeMap<String, String>>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse prediction csv");
+        assert_eq!(rows.len(), 2);
+        for i in 0..rows.len() {
+            let eta = rows[i]["eta"].parse::<f64>().expect("eta should parse");
+            let mean = rows[i]["mean"].parse::<f64>().expect("mean should parse");
+            assert!(
+                (eta - expected.eta[i]).abs() <= 1e-12,
+                "row {i}: eta mismatch: got {eta}, expected {}",
+                expected.eta[i]
+            );
+            assert!(
+                (mean - expected.mean[i]).abs() <= 1e-12,
+                "row {i}: mean mismatch: got {mean}, expected {}",
+                expected.mean[i]
+            );
+        }
     }
 
     #[test]
@@ -15837,6 +15884,148 @@ mod tests {
         assert_eq!(saved.survival_time_basis.as_deref(), Some("none"));
         assert!(saved.baseline_timewiggle_knots.is_some());
         assert!(saved.beta_baseline_timewiggle.is_some());
+    }
+
+    #[test]
+    fn survival_location_scale_rejects_linkwiggle_for_mixture_inverse_link() {
+        let dir = tempdir().expect("tempdir");
+        let csv_path = dir.path().join("small_surv_linkwiggle_reject.csv");
+        std::fs::write(
+            &csv_path,
+            "entry,exit,event\n\
+             10,15,1\n\
+             20,35,0\n\
+             40,60,1\n\
+             80,100,0\n\
+             120,150,1\n\
+             160,220,1\n",
+        )
+        .expect("write csv");
+        let err = super::run_survival(SurvivalArgs {
+            data: csv_path,
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1 + linkwiggle(degree=2, internal_knots=2)".to_string(),
+            predict_noise: None,
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("loglog".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 2,
+            time_num_internal_knots: 4,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            scale_dimensions: false,
+            pilot_subsample_threshold: 0,
+            out: None,
+            logslope_formula: None,
+            z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+        })
+        .expect_err("mixture-backed survival linkwiggle should be rejected before fitting");
+        assert!(
+            err.contains("linkwiggle(...) does not support SAS/BetaLogistic/Mixture links"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn survival_location_scale_saved_fit_preserves_linkwiggle_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let csv_path = dir.path().join("small_surv_linkwiggle.csv");
+        let out_path = dir.path().join("surv_linkwiggle.model.json");
+        std::fs::write(
+            &csv_path,
+            "entry,exit,event\n\
+             10,15,1\n\
+             20,35,0\n\
+             40,60,1\n\
+             80,100,0\n\
+             120,150,1\n\
+             160,220,1\n",
+        )
+        .expect("write csv");
+        super::run_survival(SurvivalArgs {
+            data: csv_path,
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1 + linkwiggle(degree=2, internal_knots=2)".to_string(),
+            predict_noise: None,
+            survival_likelihood: "location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: None,
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 2,
+            time_num_internal_knots: 4,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            threshold_time_k: None,
+            threshold_time_degree: 3,
+            sigma_time_k: None,
+            sigma_time_degree: 3,
+            scale_dimensions: false,
+            pilot_subsample_threshold: 0,
+            out: Some(out_path.clone()),
+            logslope_formula: None,
+            z_column: None,
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+        })
+        .expect("survival location-scale linkwiggle fit should succeed");
+
+        let saved = SavedModel::load_from_path(&out_path).expect("load fitted survival model");
+        let fit = saved
+            .fit_result
+            .as_ref()
+            .expect("saved survival fit_result should be present");
+        assert!(saved.linkwiggle_knots.is_some());
+        assert!(saved.linkwiggle_degree.is_some());
+        assert!(saved.beta_link_wiggle.is_some());
+        assert!(fit.block_by_role(BlockRole::LinkWiggle).is_some());
+        assert_eq!(
+            fit.artifacts.survival_link_wiggle_degree,
+            saved.linkwiggle_degree,
+        );
+        assert_eq!(
+            fit.artifacts
+                .survival_link_wiggle_knots
+                .as_ref()
+                .map(|knots| knots.to_vec()),
+            saved.linkwiggle_knots.clone(),
+        );
     }
 
     #[test]

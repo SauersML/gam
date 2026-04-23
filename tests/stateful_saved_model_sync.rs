@@ -3,8 +3,8 @@ use gam::estimate::{
 };
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, ModelKind, PredictModelClass,
-    MODEL_PAYLOAD_VERSION,
+    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    PredictModelClass,
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{

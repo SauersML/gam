@@ -2211,6 +2211,28 @@ fn projected_gradient_norm(
     sum_sq.sqrt()
 }
 
+fn constrained_stationarity_norm(
+    gradient: &Array1<f64>,
+    beta: &Array1<f64>,
+    lower_bounds: Option<&Array1<f64>>,
+    linear_constraints: Option<&LinearInequalityConstraints>,
+) -> f64 {
+    // `gradient`, `beta`, and `linear_constraints` are all represented in the
+    // current PIRLS coefficient basis (raw sparse-native or Qs-transformed).
+    // At an active inequality, the raw gradient can carry a valid KKT
+    // multiplier, so convergence must use the full KKT residual in that same
+    // frame rather than the unprojected gradient norm.
+    if let Some(constraints) = linear_constraints {
+        let kkt = compute_constraint_kkt_diagnostics(beta, gradient, constraints);
+        return kkt
+            .primal_feasibility
+            .max(kkt.dual_feasibility)
+            .max(kkt.complementarity)
+            .max(kkt.stationarity);
+    }
+    projected_gradient_norm(gradient, beta, lower_bounds)
+}
+
 fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
@@ -2228,6 +2250,7 @@ fn estimate_sparse_native_decision(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
     s_lambda: &Array2<f64>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
     linear_constraints_original: Option<&LinearInequalityConstraints>,
 ) -> SparsePirlsDecision {
     let p = x_original.ncols();
@@ -2244,7 +2267,10 @@ fn estimate_sparse_native_decision(
     };
 
     // Constrained solves require the dense active-set / projected Newton machinery.
-    if linear_constraints_original.is_some() {
+    let has_finite_lower_bounds = coefficient_lower_bounds
+        .map(|lb| lb.iter().any(|bound| bound.is_finite()))
+        .unwrap_or(false);
+    if has_finite_lower_bounds || linear_constraints_original.is_some() {
         return dense_reject("constraints_present", 0);
     }
 
@@ -2288,9 +2314,16 @@ fn should_use_sparse_native_pirls(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
     s_lambda: &Array2<f64>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
     linear_constraints_original: Option<&LinearInequalityConstraints>,
 ) -> SparsePirlsDecision {
-    estimate_sparse_native_decision(workspace, x_original, s_lambda, linear_constraints_original)
+    estimate_sparse_native_decision(
+        workspace,
+        x_original,
+        s_lambda,
+        coefficient_lower_bounds,
+        linear_constraints_original,
+    )
 }
 
 pub(crate) fn sparse_reml_penalized_hessian(
@@ -2992,6 +3025,7 @@ where
     let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
     let lambda_factor = 10.0;
     let lm_max_attempts = options.max_step_halving.max(1);
+    let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 10.0;
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -3351,16 +3385,16 @@ where
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
-                        // Early exit: deviance change negligible relative to
-                        // scale, even if gradient hasn't fully vanished. This
-                        // saves 5-15 iterations on well-conditioned problems
-                        // where the deviance plateaus before the gradient norm
-                        // reaches the tight tolerance.
+                        // Early exit: the objective has plateaued and the
+                        // projected gradient is already inside the same
+                        // near-stationary band we allow for stalled minima.
+                        // Do not mark this as exact convergence unless the
+                        // strict KKT tolerance has actually been met.
                         if deviance_change.abs() < dev_tol * 0.01
                             && deviance_change >= 0.0
-                            && convergence_grad_norm < grad_tol * 100.0
+                            && convergence_grad_norm <= near_stationary_tol
                         {
-                            status = PirlsStatus::Converged;
+                            status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
                         }
 
@@ -3391,7 +3425,6 @@ where
                             beta.as_ref(),
                             options.coefficient_lower_bounds.as_ref(),
                         );
-                        let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 50.0;
                         let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
 
                         // Near stationarity: the screening rejected all candidates, but the
@@ -3474,13 +3507,14 @@ where
     if matches!(status, PirlsStatus::MaxIterationsReached) {
         if final_projected_grad < options.convergence_tolerance {
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if last_deviance_change.abs()
-            < options.convergence_tolerance
-                * state.deviance.abs().max(state.penalty_term.abs()).max(1.0)
+        } else if final_projected_grad <= near_stationary_tol
+            && last_deviance_change.abs()
+                < options.convergence_tolerance
+                    * state.deviance.abs().max(state.penalty_term.abs()).max(1.0)
         {
-            // Deviance has converged even if the gradient is non-finite
-            // (e.g. overflow at extreme eta in an underdetermined system).
-            // Accept the solution — it is as good as the objective can get.
+            // The objective has plateaued and the projected gradient is
+            // already inside the near-stationary band, so accept this as a
+            // stalled but usable minimum.
             status = PirlsStatus::StalledAtValidMinimum;
         }
     }
@@ -4228,6 +4262,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             cheap_s_lambda
                 .as_ref()
                 .expect("cheap_s_lambda should be present outside Kronecker path"),
+            penalty.coefficient_lower_bounds,
             penalty.linear_constraints_original,
         )
     };
@@ -7171,7 +7206,7 @@ mod tests {
         ]));
         let s = array![[1.0, 0.0], [0.0, 1.0]];
         let mut workspace = PirlsWorkspace::new(2, 2, 0, 0);
-        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
     }
@@ -7194,7 +7229,7 @@ mod tests {
         let x = DesignMatrix::from(x);
         let s = Array2::from_diag(&Array1::ones(300));
         let mut workspace = PirlsWorkspace::new(300, 300, 0, 0);
-        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
         assert_eq!(decision.nnz_x, 300);
@@ -7211,7 +7246,7 @@ mod tests {
         let x = DesignMatrix::from(x);
         let s = Array2::from_diag(&Array1::ones(64));
         let mut workspace = PirlsWorkspace::new(64, 64, 0, 0);
-        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
         assert_eq!(decision.nnz_x, 64);
@@ -7791,18 +7826,27 @@ mod root_cause_tests {
     use super::*;
     use ndarray::array;
 
-    fn test_working_state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+    fn scalar_working_state(
+        beta: &Coefficients,
+        curvature: HessianCurvatureKind,
+        gradient: f64,
+        deviance: f64,
+    ) -> WorkingState {
         WorkingState {
             eta: LinearPredictor::new(array![beta.as_ref()[0]]),
-            gradient: array![1.0],
+            gradient: array![gradient],
             hessian: crate::linalg::matrix::SymmetricMatrix::Dense(array![[1.0]]),
             log_likelihood: 0.0,
-            deviance: 1.0,
+            deviance,
             penalty_term: 0.0,
             firth: FirthDiagnostics::Inactive,
             ridge_used: 0.0,
             hessian_curvature: curvature,
         }
+    }
+
+    fn test_working_state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+        scalar_working_state(beta, curvature, 1.0, 1.0)
     }
 
     #[derive(Default)]
@@ -7929,6 +7973,55 @@ mod root_cause_tests {
         }
     }
 
+    struct PlateauStatusModel {
+        gradient: f64,
+        current_deviance: f64,
+        candidate_deviance: f64,
+    }
+
+    impl PlateauStatusModel {
+        fn state(
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+            gradient: f64,
+            deviance: f64,
+        ) -> WorkingState {
+            scalar_working_state(beta, curvature, gradient, deviance)
+        }
+    }
+
+    impl WorkingModel for PlateauStatusModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(Self::state(
+                beta,
+                curvature,
+                self.gradient,
+                self.current_deviance,
+            ))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(Self::state(
+                beta,
+                curvature,
+                self.gradient,
+                self.candidate_deviance,
+            ))
+        }
+    }
+
     /// Hypothesis 1: `projected_gradient_norm` uses `bound_tol = 1e-10` which
     /// is too tight.  A coefficient at 1e-6 above its lower bound with a
     /// positive gradient (KKT multiplier) should be recognized as "at the
@@ -7986,6 +8079,41 @@ mod root_cause_tests {
             "direction should snap to bound (lb - beta = -1e-6), got {:.6e}",
             direction[0]
         );
+    }
+
+    #[test]
+    fn pirls_converges_at_active_linear_constraint_kkt_point() {
+        let mut model = ActiveConstraintKktModel;
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 3,
+            convergence_tolerance: 1e-8,
+            max_step_halving: 3,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: Some(LinearInequalityConstraints {
+                a: array![[1.0]],
+                b: array![0.0],
+            }),
+        };
+
+        let summary =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("active-constraint KKT point should be accepted as converged");
+
+        assert_eq!(summary.status, PirlsStatus::Converged);
+        assert!(
+            summary.lastgradient_norm <= 1e-12,
+            "KKT-aware stationarity norm should vanish at the constrained optimum, got {:.6e}",
+            summary.lastgradient_norm
+        );
+        let kkt = summary
+            .constraint_kkt
+            .expect("linear constraint run should report KKT diagnostics");
+        assert!(kkt.primal_feasibility <= 1e-12);
+        assert!(kkt.dual_feasibility <= 1e-12);
+        assert!(kkt.complementarity <= 1e-12);
+        assert!(kkt.stationarity <= 1e-12);
     }
 
     /// Hypothesis 3: LM gain-ratio fallback should accept when both predicted
@@ -8156,6 +8284,62 @@ mod root_cause_tests {
         assert_eq!(
             model.candidate_state_calls, options.max_step_halving,
             "Firth accepted-state reevaluation must stop at the configured LM retry budget"
+        );
+    }
+
+    #[test]
+    fn plateaued_accepted_step_does_not_report_converged_with_large_projected_gradient() {
+        let mut model = PlateauStatusModel {
+            gradient: 5e-5,
+            current_deviance: 1.0,
+            candidate_deviance: 1.0 - 1.25e-9,
+        };
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-6,
+            max_step_halving: 4,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+        };
+
+        let result =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("plateaued accepted step should still return a final state");
+
+        assert_eq!(
+            result.status,
+            PirlsStatus::MaxIterationsReached,
+            "projected gradient 5e-5 is well above the near-stationary band and must not be promoted to Converged/Stalled"
+        );
+    }
+
+    #[test]
+    fn rejected_noise_scale_step_requires_near_stationary_projected_gradient() {
+        let mut model = PlateauStatusModel {
+            gradient: 2e-5,
+            current_deviance: 1.0e6,
+            candidate_deviance: 1.0e6 + 1.0,
+        };
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-6,
+            max_step_halving: 1,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+        };
+
+        let result =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("noise-scale rejected step should still preserve the current state");
+
+        assert_eq!(
+            result.status,
+            PirlsStatus::MaxIterationsReached,
+            "projected gradient 2e-5 exceeds the near-stationary band and must not be accepted after a noise-scale rejection"
         );
     }
 
