@@ -950,7 +950,11 @@ impl<'a> RemlState<'a> {
             let p_total_dim = x_eff_dense.ncols();
             let mut s_total_base = Array2::<f64>::zeros((p_total_dim, p_total_dim));
             for (idx, pen) in tk_penalties.iter().enumerate() {
-                let lambda = if idx < lambdas.len() { lambdas[idx] } else { 0.0 };
+                let lambda = if idx < lambdas.len() {
+                    lambdas[idx]
+                } else {
+                    0.0
+                };
                 if lambda == 0.0 {
                     continue;
                 }
