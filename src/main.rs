@@ -10477,7 +10477,7 @@ mod tests {
         effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
         load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, pretty_familyname, required_columns_for_fit,
+        parse_survival_time_basis_config, predict_gam, pretty_familyname, required_columns_for_fit,
         summarizewiggle_domain, validate_cli_firth_configuration,
         write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
         write_survival_prediction_csv,

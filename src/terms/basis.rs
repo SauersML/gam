@@ -4676,6 +4676,8 @@ pub fn filter_active_penalty_candidates(
             None
         };
         let active = dropped_reason.is_none();
+        let kronecker_factors =
+            validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         if active {
             log::debug!(
                 "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={}",
@@ -4694,8 +4696,6 @@ pub fn filter_active_penalty_candidates(
                 dropped_reason
             );
         }
-        let kronecker_factors =
-            validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         penaltyinfo.push(PenaltyInfo {
             source: candidate.source,
             original_index,
