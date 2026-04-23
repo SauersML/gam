@@ -3646,14 +3646,15 @@ pub fn compute_firth_hessian_contribution(
         return firth_hess;
     }
 
-    // Reduced basis building block — `direction_from_deta(X·u)` returns a
-    // `FirthDirection` whose `g_u_reduced = Qᵀ (D_β I[u]) Q`.  We pass the
-    // *positive* δη so the direction represents D_β I[+u] literally; the
-    // d(v_k)/dρ sign bookkeeping is handled by the outer formula in ρ-space.
-    let mut dirs_positive: Vec<super::FirthDirection> = Vec::with_capacity(k);
-    for idx in 0..k {
-        let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[idx]);
-        dirs_positive.push(firth_op.direction_from_deta(deta_k));
+    let rho_dbeta: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|value| -value)).collect();
+    let mut firth_dirs: Vec<super::FirthDirection> = Vec::with_capacity(k);
+    let mut firth_dhphi: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for dbeta in &rho_dbeta {
+        let deta = firth_op.x_dense.dot(dbeta);
+        let dir = firth_op.direction_from_deta(deta);
+        let dhphi = firth_op.hphi_direction(&dir);
+        firth_dirs.push(dir);
+        firth_dhphi.push(dhphi);
     }
 
     for kk in 0..k {
@@ -3664,7 +3665,9 @@ pub fn compute_firth_hessian_contribution(
             // correction).  We pass +u_kl (not −u_kl) into the direction
             // builder because the outer formula already accounts for its
             // sign via `d²β̂/dρ_k dρ_l = +u_kl`.
-            let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
+            let mut total_h_l = h_k_matrices[ll].clone();
+            total_h_l -= &firth_dhphi[ll];
+            let mut rhs = total_h_l.dot(&v_ks[kk]);
             rhs += &penalty_coords[kk].scaled_matvec(&v_ks[ll], lambdas[kk]);
             if kk == ll {
                 rhs -= &a_k_betas[kk];
@@ -3682,16 +3685,16 @@ pub fn compute_firth_hessian_contribution(
             // built here directly so this function does not rely on extra
             // public surface from the Firth operator.  `w2` is w'' at the
             // current η.
-            let deta_k: Array1<f64> = firth_op.x_dense.dot(&v_ks[kk]);
-            let deta_l: Array1<f64> = firth_op.x_dense.dot(&v_ks[ll]);
+            let deta_k: Array1<f64> = firth_op.x_dense.dot(&rho_dbeta[kk]);
+            let deta_l: Array1<f64> = firth_op.x_dense.dot(&rho_dbeta[ll]);
             let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_k * &deta_l);
             let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
             let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
 
             // ── Term C:  −½ tr(I⁺ · D_β I[v_l] · I⁺ · D_β I[v_k])
             //          = −½ tr(K_r · g_v_l · K_r · g_v_k) ──
-            let k_g_vl = firth_op.k_reduced.dot(&dirs_positive[ll].g_u_reduced);
-            let k_g_vk = firth_op.k_reduced.dot(&dirs_positive[kk].g_u_reduced);
+            let k_g_vl = firth_op.k_reduced.dot(&firth_dirs[ll].g_u_reduced);
+            let k_g_vk = firth_op.k_reduced.dot(&firth_dirs[kk].g_u_reduced);
             let term_c = -0.5 * super::RemlState::trace_product(&k_g_vl, &k_g_vk);
 
             let j_kl = term_a + term_b + term_c;
@@ -6177,27 +6180,20 @@ impl DenseSpectralOperator {
         let epsilon = spectral_epsilon(eigenvalues.as_slice().unwrap());
 
         // `active[j]` selects which eigenpairs participate in every trace
-        // and in the cached logdet.  Under `Smooth` we retain every eigenpair
-        // that sits above the structural positive-eigenvalue threshold
-        // (the same threshold that `fixed_subspace_penalty_rank_and_logdet`
-        // uses for `log|S|_+`).  For a well-conditioned H this threshold is
-        // ~100·p·ε_mach·‖H‖, far below any genuine eigenvalue, so `active`
-        // is all-true and the mode reduces to its previous soft-floor
-        // behaviour.  In the rank-deficient regime (e.g. n=120, 16-D Duchon
-        // k=6, where `rank(X) + rank(S) < p`), H has eigenvalues inside the
-        // numerical noise band; those null directions are also structurally
-        // null in S, so excluding them from BOTH logdets keeps the LAML
-        // ratio `|H|_+ / |S|_+` well-defined on the identified subspace and
-        // prevents the `½ log|H| − ½ log|S|_+` term from diverging to −∞.
-        // Under `HardPseudo` eigenvalues ≤ ε (scaled by `spectral_epsilon`)
-        // are excluded — a tighter filter used when Firth-style Jeffreys
-        // penalties enforce identifiability exactly on the active subspace.
-        let structural_threshold = positive_eigenvalue_threshold(eigenvalues.as_slice().unwrap());
+        // and in the cached logdet.
+        //
+        // `Smooth` is the regularized full-spectrum mode: every eigenpair stays
+        // active and singular directions are handled only through
+        // `r_ε(σ)`. This is the documented default semantics used by the
+        // unified REML/LAML objective and by the finite-difference reference
+        // tests in this module.
+        //
+        // `HardPseudo` is the identified-subspace mode: eigenpairs with
+        // `σ_j ≤ ε` are excluded consistently from logdet, traces, and solves.
+        // Families that need exact pseudo-determinant behaviour opt into this
+        // mode explicitly through `pseudo_logdet_mode()`.
         let active: Vec<bool> = match mode {
-            PseudoLogdetMode::Smooth => eigenvalues
-                .iter()
-                .map(|&s| s > structural_threshold)
-                .collect(),
+            PseudoLogdetMode::Smooth => vec![true; n],
             PseudoLogdetMode::HardPseudo => eigenvalues.iter().map(|&s| s > epsilon).collect(),
         };
 
