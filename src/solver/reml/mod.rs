@@ -2359,6 +2359,127 @@ mod tests {
     }
 
     #[test]
+    fn binomial_logit_n30_rank_deficient_hessian_matches_cost_fd() {
+        // Regression lock for the `PenaltySubspaceTrace` projected-logdet
+        // kernel installed by the rank-deficient LAML fix (see
+        // `PenaltySubspaceTrace` and `fixed_subspace_hessian_projected_parts`).
+        //
+        // The sibling `binomial_logit_n30_design_moving_hessian_matches_fd`
+        // passes pre- AND post-fix because its FD reference differentiates
+        // the *analytic gradient* — any self-consistent (if wrong) gradient
+        // kernel gives a self-consistent Hessian under re-differentiation,
+        // so that test cannot distinguish full-space from projected traces.
+        // It passed under the buggy kernel because the same leakage entered
+        // both sides of the ratio and cancelled.
+        //
+        // Here we FD-differentiate `compute_cost` TWICE and compare against
+        // the analytic Hessian.  Central second differences expose every
+        // disagreement between `½ log|U_Sᵀ H U_S|_+` (used by the cost) and
+        // `½ tr(G_ε(H) · Ḣ)` / `−½ tr(G_ε Ḣ_i G_ε Ḣ_j)` (the full-space
+        // traces that the gradient and Hessian used before the projection
+        // fix).  Under the buggy kernel the IFT correction
+        // `D_β H[v] = X' diag(c ⊙ X v) X` leaks onto `null(S)` — X's
+        // all-ones intercept column sits there — and that leakage enters
+        // the analytic Hessian but not the cost's projected logdet.
+        //
+        // Direction mix chosen to maximise the null-space leakage pathway:
+        //   τ_0 = penalty-only (X_τ = 0, S_τ ≠ 0)  → v_0 = H⁻¹(−S_τ β̂) is
+        //         concentrated in range(S_+), but `D_β H[v_0]` has rows and
+        //         columns on the intercept because `X[:,0] = 1_n`.
+        //   τ_1 = design-moving (X_τ ≠ 0 on non-intercept columns, S_τ = 0)
+        //         → `v_1` also picks up the intercept via `X'WX_τβ̂`, and
+        //         the base drift `X_τᵀWX + XᵀWX_τ` straddles range(S_+) /
+        //         null(S).
+        // Both pure directions AND the mixed partial load the Schur correction,
+        // so any of the three entries can catch a regression.
+        let f = BinomialLogitDesignMotionFixture::new();
+        let x_tau_0 = Array2::<f64>::zeros(f.x.raw_dim());
+        let s_tau_0 = f.s_tau_penalty.clone();
+        let x_tau_1 = f.x_tau_design.clone();
+        let s_tau_1 = Array2::<f64>::zeros((5, 5));
+
+        let hyper_dirs = vec![
+            DirectionalHyperParam::single_penalty(0, x_tau_0.clone(), s_tau_0.clone(), None, None)
+                .expect("penalty-only direction"),
+            DirectionalHyperParam::single_penalty(0, x_tau_1.clone(), s_tau_1.clone(), None, None)
+                .expect("design-moving direction"),
+        ];
+
+        // Analytic Hessian block.
+        let state = f.state();
+        let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
+        theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
+        let (_, _, h_full) =
+            compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
+                .expect("joint cost+gradient+hessian");
+        let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
+
+        // Cost-level FD reference.  Central second differences give O(h²)
+        // accuracy; the step is sized so the physical perturbation on X / S
+        // stays near `1e-5` (same scale as the gradient tests).
+        const TARGET_PHYSICAL_STEP: f64 = 1e-5;
+        let x_tau_mats = [&x_tau_0, &x_tau_1];
+        let s_tau_mats = [&s_tau_0, &s_tau_1];
+        let steps: [f64; 2] = {
+            let mut steps = [0.0; 2];
+            for (j, step) in steps.iter_mut().enumerate() {
+                let scale = x_tau_mats[j]
+                    .iter()
+                    .chain(s_tau_mats[j].iter())
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+                *step = if scale > 0.0 {
+                    TARGET_PHYSICAL_STEP / scale
+                } else {
+                    TARGET_PHYSICAL_STEP
+                };
+            }
+            steps
+        };
+
+        // Evaluate `compute_cost` at `(a · τ_0, b · τ_1)` multipliers.
+        let eval_cost = |a: f64, b: f64| -> f64 {
+            let x_eval = &f.x
+                + &x_tau_mats[0].mapv(|v| a * steps[0] * v)
+                + &x_tau_mats[1].mapv(|v| b * steps[1] * v);
+            let s_eval = &f.s0
+                + &s_tau_mats[0].mapv(|v| a * steps[0] * v)
+                + &s_tau_mats[1].mapv(|v| b * steps[1] * v);
+            let st = build_logit_state(&f.y, &f.w, &x_eval, &s_eval, &f.cfg);
+            st.compute_cost(&f.rho).expect("cost eval")
+        };
+
+        let v_00 = eval_cost(0.0, 0.0);
+        let v_p0 = eval_cost(1.0, 0.0);
+        let v_m0 = eval_cost(-1.0, 0.0);
+        let v_0p = eval_cost(0.0, 1.0);
+        let v_0m = eval_cost(0.0, -1.0);
+        let v_pp = eval_cost(1.0, 1.0);
+        let v_pm = eval_cost(1.0, -1.0);
+        let v_mp = eval_cost(-1.0, 1.0);
+        let v_mm = eval_cost(-1.0, -1.0);
+
+        let h00_fd = (v_p0 - 2.0 * v_00 + v_m0) / (steps[0] * steps[0]);
+        let h11_fd = (v_0p - 2.0 * v_00 + v_0m) / (steps[1] * steps[1]);
+        let h01_fd = (v_pp - v_pm - v_mp + v_mm) / (4.0 * steps[0] * steps[1]);
+
+        let h_tt_fd = array![[h00_fd, h01_fd], [h01_fd, h11_fd]];
+
+        let num = (&h_tt_analytic - &h_tt_fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let den = h_tt_fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
+        let rel = num / den;
+
+        assert!(
+            rel < 3e-3,
+            "Binomial-logit n=30 rank-deficient Hessian vs cost-FD mismatch: rel={rel:.3e}, \
+             analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
+        );
+    }
+
+    #[test]
     #[ignore]
     fn debug_rank_deficient_penalty_only_trace_terms() {
         fn dense_inverse(h: &Array2<f64>) -> Array2<f64> {
