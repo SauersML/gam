@@ -4479,96 +4479,6 @@ fn compute_outer_hessian(
         let mut sl = hess.slice_mut(ndarray::s![..k, ..k]);
         sl += &fh;
 
-        // ── Firth Hessian: penalty-only ext coordinates ─────────────────
-        //
-        // The cost contains an additive +Φ(β̂(θ)) term (Firth/Jeffreys bias
-        // correction, Φ = ½ log|I_r|). Its second derivative in any outer
-        // coordinate θ composes through β̂(θ) as
-        //
-        //   d²Φ/dθ_i dθ_j = (∇²_β Φ) · β̂_i · β̂_j + (∇_β Φ) · β̂_{ij}
-        //
-        // The rho-rho call above handles θ = ρ. The ρ-ψ and ψ-ψ blocks of
-        // the outer Hessian for penalty-only ψ directions need the same
-        // chain rule, which is what the block below supplies.
-        let firth_op = firth.operator();
-        let active_ext: Vec<usize> = (0..solution.ext_coords.len())
-            .filter(|&ei| ext_h_matrices[ei].is_some())
-            .collect();
-
-        // Build β-direction vectors signed as +dβ̂/dθ for every coord we
-        // want to treat: this is −v_ks for rho, +ext_v for ext.
-        let rho_dbeta: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|x| -x)).collect();
-        let ext_dbeta: Vec<&Array1<f64>> = active_ext.iter().map(|&ei| &ext_v[ei]).collect();
-
-        // Cached positive-direction Firth directions for term_b/term_c: each
-        // `dirs[k]` represents D_β I[β-direction_k] in reduced form.
-        let rho_dirs: Vec<super::FirthDirection> = rho_dbeta
-            .iter()
-            .map(|v| firth_op.direction_from_deta(firth_op.x_dense.dot(v)))
-            .collect();
-        let ext_dirs: Vec<super::FirthDirection> = ext_dbeta
-            .iter()
-            .map(|v| firth_op.direction_from_deta(firth_op.x_dense.dot(*v)))
-            .collect();
-
-        // ── ext-ext block ── d²Φ/dτ_i dτ_j
-        for (ii, &ei_i) in active_ext.iter().enumerate() {
-            for (jj, &ei_j) in active_ext.iter().enumerate().skip(ii) {
-                let h_j = ext_h_matrices[ei_j].as_ref().unwrap();
-                let s_tau_i = solution.ext_coords[ei_i].drift.materialize();
-                let v_i = ext_dbeta[ii];
-                let v_j = ext_dbeta[jj];
-                // rhs = −(Ḣ_j v_i + S_τ_i v_j)
-                let mut rhs = h_j.dot(v_i);
-                rhs += &s_tau_i.dot(v_j);
-                rhs.mapv_inplace(|z| -z);
-                let u_ij = hop.solve(&rhs);
-                let dir_u = firth_op.direction_from_deta(firth_op.x_dense.dot(&u_ij));
-                let term_a = 0.5 * trace_reduced(&firth_op.k_reduced, &dir_u.g_u_reduced);
-                let deta_i: Array1<f64> = firth_op.x_dense.dot(v_i);
-                let deta_j: Array1<f64> = firth_op.x_dense.dot(v_j);
-                let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_i * &deta_j);
-                let g_uv_reduced =
-                    super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
-                let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
-                let k_g_vi = firth_op.k_reduced.dot(&ext_dirs[ii].g_u_reduced);
-                let k_g_vj = firth_op.k_reduced.dot(&ext_dirs[jj].g_u_reduced);
-                let term_c = -0.5 * super::RemlState::trace_product(&k_g_vj, &k_g_vi);
-                let j_ij = term_a + term_b + term_c;
-                hess[[k + ei_i, k + ei_j]] += j_ij;
-                if ei_i != ei_j {
-                    hess[[k + ei_j, k + ei_i]] += j_ij;
-                }
-            }
-        }
-
-        // ── rho-ext block ── d²Φ/dρ_k dτ_i
-        for (kk, v_rho_k) in rho_dbeta.iter().enumerate() {
-            for (ii, &ei_i) in active_ext.iter().enumerate() {
-                let a_k = &a_k_matrices[kk];
-                let h_i = ext_h_matrices[ei_i].as_ref().unwrap();
-                let v_ext_i = ext_dbeta[ii];
-                // rhs = Ḣ_i · v_rho_k − A_k · v_ext_i
-                //      (note: `v_rho_k` is already −v_ks[kk] = +dβ̂/dρ_k)
-                let mut rhs = h_i.dot(v_rho_k);
-                rhs -= &a_k.dot(v_ext_i);
-                let u_ki = hop.solve(&rhs);
-                let dir_u = firth_op.direction_from_deta(firth_op.x_dense.dot(&u_ki));
-                let term_a = 0.5 * trace_reduced(&firth_op.k_reduced, &dir_u.g_u_reduced);
-                let deta_k: Array1<f64> = firth_op.x_dense.dot(v_rho_k);
-                let deta_i: Array1<f64> = firth_op.x_dense.dot(v_ext_i);
-                let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_k * &deta_i);
-                let g_uv_reduced =
-                    super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
-                let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
-                let k_g_vk = firth_op.k_reduced.dot(&rho_dirs[kk].g_u_reduced);
-                let k_g_vi = firth_op.k_reduced.dot(&ext_dirs[ii].g_u_reduced);
-                let term_c = -0.5 * super::RemlState::trace_product(&k_g_vi, &k_g_vk);
-                let j_ki = term_a + term_b + term_c;
-                hess[[kk, k + ei_i]] += j_ki;
-                hess[[k + ei_i, kk]] += j_ki;
-            }
-        }
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
@@ -6101,8 +6011,14 @@ fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
 /// `sigma` this is approximately `sigma`; near zero it smoothly floors at `epsilon`.
 #[inline]
 pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
-    let four_eps_sq = 4.0 * epsilon * epsilon;
-    0.5 * (sigma + (sigma * sigma + four_eps_sq).sqrt())
+    let disc = sigma.hypot(2.0 * epsilon);
+    if sigma >= 0.0 {
+        0.5 * sigma + 0.5 * disc
+    } else {
+        // Avoid catastrophic cancellation in 0.5 * (σ + disc) when σ is
+        // large and negative: r_ε(σ) = 2 ε² / (disc - σ).
+        (2.0 * epsilon * epsilon) / (disc - sigma)
+    }
 }
 
 /// Compute the spectral regularization scale for a set of eigenvalues.
@@ -8421,6 +8337,23 @@ mod tests {
         // The regularized null direction must still yield a finite trace.
         let trace = op.trace_hinv_product(&Array2::eye(2));
         assert!(trace.is_finite());
+    }
+
+    #[test]
+    fn test_spectral_regularize_stays_finite_in_extreme_tails() {
+        let epsilon = 1e-8;
+
+        let large_negative = spectral_regularize(-1e16, epsilon);
+        assert!(
+            large_negative.is_finite() && large_negative > 0.0,
+            "large negative sigma should regularize to a positive finite value, got {large_negative}"
+        );
+
+        let large_positive = spectral_regularize(1e308, epsilon);
+        assert!(
+            large_positive.is_finite() && large_positive > 0.0,
+            "large positive sigma should stay finite, got {large_positive}"
+        );
     }
 
     #[test]
