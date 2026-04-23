@@ -16,10 +16,10 @@
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
-    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FirstOrderObjective,
-    FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective, FixedPointSample,
-    FixedPointStatus, MaxIterations, ObjectiveEvalError, SecondOrderObjective, SecondOrderSample,
-    Solution, Tolerance, ZerothOrderObjective,
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FirstOrderObjective, FirstOrderSample,
+    FixedPoint, FixedPointError, FixedPointObjective, FixedPointSample, FixedPointStatus,
+    MaxIterations, ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution,
+    Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -631,9 +631,7 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         // here so the error surfaces with context rather than as a panic on an
         // unmatched arm. The caller must supply an analytic gradient or use an
         // EFS-eligible capability.
-        (Analytic, FiniteDifference)
-        | (FiniteDifference, _)
-        | (Unavailable, _) => OuterPlan {
+        (Analytic, FiniteDifference) | (FiniteDifference, _) | (Unavailable, _) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
@@ -2350,24 +2348,19 @@ fn run_outer_with_plan(
                                 EstimationError::RemlOptimizationFailed(message)
                             }
                         };
-                        log::warn!(
-                            "[OUTER] {context}: rejecting seed before solver start: {err}"
-                        );
+                        log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                         last_seed_error = Some(err.to_string());
                         continue 'seed_attempts;
                     }
                 };
-                let seed_eval = finite_outer_first_order_eval_or_error(
-                    "outer eval failed",
-                    layout,
-                    seed_eval,
-                )
-                .map_err(|err| match err {
-                    ObjectiveEvalError::Recoverable { message }
-                    | ObjectiveEvalError::Fatal { message } => {
-                        EstimationError::RemlOptimizationFailed(message)
-                    }
-                });
+                let seed_eval =
+                    finite_outer_first_order_eval_or_error("outer eval failed", layout, seed_eval)
+                        .map_err(|err| match err {
+                            ObjectiveEvalError::Recoverable { message }
+                            | ObjectiveEvalError::Fatal { message } => {
+                                EstimationError::RemlOptimizationFailed(message)
+                            }
+                        });
                 if let Err(err) = seed_eval {
                     log::warn!("[OUTER] {context}: rejecting seed before solver start: {err}");
                     last_seed_error = Some(err.to_string());
@@ -3306,9 +3299,7 @@ mod tests {
         // spin was a footgun on large-n binomial biobank problems); the
         // cascade must stay on analytic-gradient attempts.
         assert!(
-            attempts
-                .iter()
-                .all(|c| c.gradient == Derivative::Analytic),
+            attempts.iter().all(|c| c.gradient == Derivative::Analytic),
             "fallback cascade must not introduce a finite-difference gradient",
         );
     }

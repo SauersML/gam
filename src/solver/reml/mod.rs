@@ -634,11 +634,13 @@ mod tests {
         );
         eprintln!(
             "[VTAU-TERM-BY-TERM] ldh_fd={:.12e}  (half_ldh_fd={:.12e})",
-            ldh_fd, 0.5 * ldh_fd,
+            ldh_fd,
+            0.5 * ldh_fd,
         );
         eprintln!(
             "[VTAU-TERM-BY-TERM] lds_fd={:.12e}  (half_lds_fd={:.12e})",
-            lds_fd, 0.5 * lds_fd,
+            lds_fd,
+            0.5 * lds_fd,
         );
         eprintln!(
             "[VTAU-TERM-BY-TERM] v_laml_reconstructed={:.12e} tk_fd_inferred={:.12e} total_fd={:.12e}",
@@ -938,7 +940,6 @@ mod tests {
             .compute_lamlhessian_diagnostic_numeric(&rho)
             .expect("diagnostic numeric hessian");
 
-
         assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
         assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
         for i in 0..h_exact.nrows() {
@@ -949,7 +950,6 @@ mod tests {
                 );
             }
         }
-
 
         let diff = &h_exact - &h_fallback;
         let num = diff.iter().map(|v| v * v).sum::<f64>().sqrt();

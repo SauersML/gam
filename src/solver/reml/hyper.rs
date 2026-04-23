@@ -826,7 +826,8 @@ impl<'a> RemlState<'a> {
                         .get(i)
                         .and_then(|o| o.as_ref())
                         .zip(x_tau_dense_list.get(j).and_then(|o| o.as_ref()));
-                    if let (Some(op), Some((x_i_dense, x_j_dense))) = (firth_op.as_ref(), both_dense)
+                    if let (Some(op), Some((x_i_dense, x_j_dense))) =
+                        (firth_op.as_ref(), both_dense)
                     {
                         let x_ij_dense = x_tau_tau_dense
                             .get(i)
@@ -1744,8 +1745,7 @@ impl<'a> RemlState<'a> {
                 })
                 .collect();
             let n_dirs = x_tau_tau.len();
-            let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
-                vec![vec![None; n_dirs]; n_dirs];
+            let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; n_dirs]; n_dirs];
             for ii in 0..n_dirs {
                 for jj in 0..n_dirs {
                     if let Some(t) = x_tau_tau[ii][jj].as_ref() {
@@ -1974,8 +1974,7 @@ impl<'a> RemlState<'a> {
                 })
                 .collect();
             let n_dirs = x_tau_tau.len();
-            let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> =
-                vec![vec![None; n_dirs]; n_dirs];
+            let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; n_dirs]; n_dirs];
             for ii in 0..n_dirs {
                 for jj in 0..n_dirs {
                     if let Some(t) = x_tau_tau[ii][jj].as_ref() {

@@ -2396,7 +2396,10 @@ impl BernoulliMarginalSlopeFamily {
         let ll_m = fm_obj.log_likelihood_only(block_states)?;
         let objective_psi_fd = -(ll_p - ll_m) / (2.0 * eps_obj);
         let objective_psi = self.sigma_analytic_objective_psi(block_states)?;
-        eprintln!("obj_analytic={} obj_fd_self={}", objective_psi, objective_psi_fd);
+        eprintln!(
+            "obj_analytic={} obj_fd_self={}",
+            objective_psi, objective_psi_fd
+        );
         let objective_psi = objective_psi_fd;
         let score_psi = self.sigma_analytic_score_psi(block_states, specs)?;
 
@@ -2503,8 +2506,7 @@ impl BernoulliMarginalSlopeFamily {
             let marginal_eta = block_states[0].eta[row];
             let slope = block_states[1].eta[row];
             let (a, f_a) = self.solve_row_intercept_base(marginal_eta, slope, beta_h, beta_w)?;
-            let obs =
-                self.observed_denested_cell_partials(row, a, slope, beta_h, beta_w)?;
+            let obs = self.observed_denested_cell_partials(row, a, slope, beta_h, beta_w)?;
             let z_obs = self.z[row];
             let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
             let chi_obs = eval_coeff4_at(&obs.dc_da, z_obs);

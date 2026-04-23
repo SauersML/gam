@@ -3083,8 +3083,8 @@ pub fn reml_laml_evaluate(
             let logdet_pair_h = if *include_logdet_h { log_det_h } else { 0.0 };
             let logdet_pair_s = if *include_logdet_s { log_det_s } else { 0.0 };
             let cost_logdet_diff = 0.5 * (logdet_pair_h - logdet_pair_s);
-            let mut cost = cost_logdet_diff + (-solution.log_likelihood)
-                + 0.5 * solution.penalty_quadratic;
+            let mut cost =
+                cost_logdet_diff + (-solution.log_likelihood) + 0.5 * solution.penalty_quadratic;
             if *include_logdet_h {
                 cost += solution.tk_correction
                     + solution
@@ -3449,7 +3449,6 @@ pub fn reml_laml_evaluate(
             incl_logdet_h,
             incl_logdet_s,
         );
-
     }
 
     // Add correction gradients (ρ-only).
@@ -4537,7 +4536,8 @@ fn compute_outer_hessian(
                 let deta_i: Array1<f64> = firth_op.x_dense.dot(v_i);
                 let deta_j: Array1<f64> = firth_op.x_dense.dot(v_j);
                 let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_i * &deta_j);
-                let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
+                let g_uv_reduced =
+                    super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
                 let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
                 // term_c = −½ tr(K · g_{v_j} · K · g_{v_i})
                 let k_g_vi = firth_op.k_reduced.dot(&ext_dirs[ii].g_u_reduced);
@@ -4567,7 +4567,8 @@ fn compute_outer_hessian(
                 let deta_k: Array1<f64> = firth_op.x_dense.dot(v_rho_k);
                 let deta_i: Array1<f64> = firth_op.x_dense.dot(v_ext_i);
                 let s_uv: Array1<f64> = &firth_op.w2 * &(&deta_k * &deta_i);
-                let g_uv_reduced = super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
+                let g_uv_reduced =
+                    super::RemlState::reducedweighted_gram(&firth_op.x_reduced, &s_uv);
                 let term_b = 0.5 * trace_reduced(&firth_op.k_reduced, &g_uv_reduced);
                 let k_g_vk = firth_op.k_reduced.dot(&rho_dirs[kk].g_u_reduced);
                 let k_g_vi = firth_op.k_reduced.dot(&ext_dirs[ii].g_u_reduced);
@@ -6302,8 +6303,7 @@ impl DenseSpectralOperator {
         // Under `HardPseudo` eigenvalues ≤ ε (scaled by `spectral_epsilon`)
         // are excluded — a tighter filter used when Firth-style Jeffreys
         // penalties enforce identifiability exactly on the active subspace.
-        let structural_threshold =
-            positive_eigenvalue_threshold(eigenvalues.as_slice().unwrap());
+        let structural_threshold = positive_eigenvalue_threshold(eigenvalues.as_slice().unwrap());
         let active: Vec<bool> = match mode {
             PseudoLogdetMode::Smooth => eigenvalues
                 .iter()

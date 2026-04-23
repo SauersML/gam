@@ -3568,7 +3568,10 @@ fn run_predict_survival(
     let cov_dense = cov_design.design.as_dense_cow();
     if p_cov > 0 {
         x_exit
-            .slice_mut(s![.., (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov)])
+            .slice_mut(s![
+                ..,
+                (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov)
+            ])
             .assign(&cov_dense);
     }
     if args.noise_offset_column.is_some() {
@@ -6333,7 +6336,9 @@ fn run_sample_survival(
         // which is catastrophic at biobank scale.
         let cov_dense = cov_design.design.as_dense_cow();
         let cov_range = (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov);
-        x_entry.slice_mut(s![.., cov_range.clone()]).assign(&cov_dense);
+        x_entry
+            .slice_mut(s![.., cov_range.clone()])
+            .assign(&cov_dense);
         x_exit.slice_mut(s![.., cov_range]).assign(&cov_dense);
     }
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();

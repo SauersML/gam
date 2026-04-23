@@ -614,7 +614,11 @@ fn symmetric_tridiagonal_eigen(
     let mut t_norm = 0.0_f64;
     for i in 0..N_POINTS {
         let l = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
-        let r = if i + 1 < N_POINTS { off_diag[i].abs() } else { 0.0 };
+        let r = if i + 1 < N_POINTS {
+            off_diag[i].abs()
+        } else {
+            0.0
+        };
         t_norm = t_norm.max(diag[i].abs() + l + r);
     }
     let mut n = N_POINTS;
@@ -717,11 +721,7 @@ fn symmetric_tridiagonal_eigen_dynamic(
     let mut t_norm = 0.0_f64;
     for i in 0..dim {
         let left = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
-        let right = if i + 1 < dim {
-            off_diag[i].abs()
-        } else {
-            0.0
-        };
+        let right = if i + 1 < dim { off_diag[i].abs() } else { 0.0 };
         let row_sum = diag[i].abs() + left + right;
         if row_sum > t_norm {
             t_norm = row_sum;
@@ -940,8 +940,7 @@ fn logistic_normal_tail_cutoff(mu: f64, sigma: f64, target_accuracy: f64) -> usi
     let m = mu.abs();
     let s = sigma;
     // Leading asymptotic coefficient of the k-th term magnitude.
-    let coeff = m * (2.0_f64 / std::f64::consts::PI).sqrt()
-        * (-(m * m) / (2.0 * s * s)).exp()
+    let coeff = m * (2.0_f64 / std::f64::consts::PI).sqrt() * (-(m * m) / (2.0 * s * s)).exp()
         / (s * s * s);
     // If the coefficient already underflows the accuracy target, the very first
     // term is sufficient; we still evaluate at least one pair to pick up the
@@ -1236,16 +1235,10 @@ fn logit_posterior_meanwith_deriv_exact_erfcx(
 /// `n_terms` exceeds the requested accuracy. Used to reject erfcx evaluations
 /// that cannot meet the documented contract.
 #[inline]
-fn tail_bound_exceeds_accuracy(
-    mu: f64,
-    sigma: f64,
-    n_terms: usize,
-    target_accuracy: f64,
-) -> bool {
+fn tail_bound_exceeds_accuracy(mu: f64, sigma: f64, n_terms: usize, target_accuracy: f64) -> bool {
     let m = mu.abs();
     let s = sigma;
-    let coeff = m * (2.0_f64 / std::f64::consts::PI).sqrt()
-        * (-(m * m) / (2.0 * s * s)).exp()
+    let coeff = m * (2.0_f64 / std::f64::consts::PI).sqrt() * (-(m * m) / (2.0 * s * s)).exp()
         / (s * s * s);
     if !coeff.is_finite() || coeff <= 0.0 {
         return false;
@@ -1590,11 +1583,9 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
     let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
     let f6 = surv * (ex - 31.0 * e2x + 90.0 * e3x - 65.0 * e4x + 15.0 * e5x - e6x);
-    let f7 = surv
-        * (ex - 63.0 * e2x + 301.0 * e3x - 350.0 * e4x + 140.0 * e5x - 21.0 * e6x + e7x);
+    let f7 = surv * (ex - 63.0 * e2x + 301.0 * e3x - 350.0 * e4x + 140.0 * e5x - 21.0 * e6x + e7x);
     let f8 = surv
-        * (ex - 127.0 * e2x + 966.0 * e3x - 1701.0 * e4x + 1050.0 * e5x - 266.0 * e6x
-            + 28.0 * e7x
+        * (ex - 127.0 * e2x + 966.0 * e3x - 1701.0 * e4x + 1050.0 * e5x - 266.0 * e6x + 28.0 * e7x
             - e8x);
     let f9 = surv
         * (ex - 255.0 * e2x + 3025.0 * e3x - 7770.0 * e4x + 6951.0 * e5x - 2646.0 * e6x
@@ -1605,16 +1596,8 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // k=4: 1/384. Truncation after sigma^8 leaves O(sigma^10) remainder,
     // comfortably below 1e-12 rel at sigma = 0.1 even in the negative tail.
     IntegratedMeanDerivative {
-        mean: f0
-            + 0.5 * s2 * f2
-            + (s4 / 8.0) * f4
-            + (s6 / 48.0) * f6
-            + (s8 / 384.0) * f8,
-        dmean_dmu: (f1
-            + 0.5 * s2 * f3
-            + (s4 / 8.0) * f5
-            + (s6 / 48.0) * f7
-            + (s8 / 384.0) * f9)
+        mean: f0 + 0.5 * s2 * f2 + (s4 / 8.0) * f4 + (s6 / 48.0) * f6 + (s8 / 384.0) * f8,
+        dmean_dmu: (f1 + 0.5 * s2 * f3 + (s4 / 8.0) * f5 + (s6 / 48.0) * f7 + (s8 / 384.0) * f9)
             .max(0.0),
         mode: IntegratedExpectationMode::ControlledAsymptotic,
     }
@@ -4792,8 +4775,7 @@ mod tests {
             IntegratedExpectationMode::ExactSpecialFunction
                 | IntegratedExpectationMode::QuadratureFallback
         ));
-        let (ref_mean, ref_d1, ref_d2, ref_d3) =
-            logit_reference_jet_highres_simpson(mu, sigma);
+        let (ref_mean, ref_d1, ref_d2, ref_d3) = logit_reference_jet_highres_simpson(mu, sigma);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
         assert_relative_eq!(out.d1, ref_d1, epsilon = 1e-11, max_relative = 1e-10);
         assert_relative_eq!(out.d2, ref_d2, epsilon = 1e-11, max_relative = 1e-10);
@@ -4887,17 +4869,12 @@ mod tests {
         // high-resolution Simpson reference for BOTH the mean and its
         // μ-derivative (d/dμ E[sigmoid] = E[sigmoid']).
         let ctx = QuadratureContext::new();
-        let out = logit_posterior_meanwith_deriv_controlled(&ctx, 1.1, 0.8)
-            .expect("controlled logit");
+        let out =
+            logit_posterior_meanwith_deriv_controlled(&ctx, 1.1, 0.8).expect("controlled logit");
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
         assert!(out.dmean_dmu > 0.0);
-        assert_relative_eq!(
-            out.dmean_dmu,
-            ref_d1,
-            epsilon = 1e-11,
-            max_relative = 1e-10
-        );
+        assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-11, max_relative = 1e-10);
     }
 
     #[test]
@@ -5251,12 +5228,7 @@ mod tests {
         assert!(out.dmean_dmu >= 0.0);
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
-        assert_relative_eq!(
-            out.dmean_dmu,
-            ref_d1,
-            epsilon = 1e-11,
-            max_relative = 1e-10
-        );
+        assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-11, max_relative = 1e-10);
     }
 
     #[test]
@@ -5291,12 +5263,7 @@ mod tests {
         ));
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
-        assert_relative_eq!(
-            out.dmean_dmu,
-            ref_d1,
-            epsilon = 1e-11,
-            max_relative = 1e-10
-        );
+        assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-11, max_relative = 1e-10);
     }
 
     #[test]
