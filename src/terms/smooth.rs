@@ -9181,7 +9181,24 @@ fn exact_joint_spatial_outer_hessian_available(
 }
 
 fn dense_joint_exact_design_prefers_gradient_only(design: &TermCollectionDesign) -> bool {
-    design.design.as_sparse().is_none()
+    // Historical heuristic: `design.design.as_sparse().is_none()` — i.e. any
+    // dense design was forced onto gradient-only BFGS. That throws away the
+    // analytic outer Hessian unconditionally (even on p ~ 50 problems where
+    // the Hessian is tens of KB) and drives ARC into BFGS+BfgsApprox, which
+    // needs ~p iterations of rank-2 updates to rebuild the curvature BFGS is
+    // approximating — each iteration a full biobank-scale PIRLS fit. That was
+    // the 40-minute timeout on `rust_margslope_aniso_matern16d_linkwiggle_
+    // scorewarp_fast`: ARC would have closed in <10 outer iterations with the
+    // declared Analytic Hessian instead.
+    //
+    // The memory-budget concern the old heuristic was gesturing at is
+    // properly handled by `spatial_tau_tau_hessian_policy` one branch over
+    // (`TauTauHessianPolicy::prefer_gradient_only`), which inspects actual
+    // byte counts for the Hessian plan vs. a configured budget. That check
+    // remains authoritative. This function no longer downgrades based on
+    // design sparsity alone.
+    let _ = design;
+    false
 }
 
 fn dense_joint_exact_designs_prefer_gradient_only(designs: &[TermCollectionDesign]) -> bool {
