@@ -25,13 +25,21 @@ pub struct AloDiagnostics {
 }
 
 #[inline]
-fn alo_eta_updatewith_offset(eta_hat: f64, z: f64, offset: f64, aii: f64) -> f64 {
-    let denom = 1.0 - aii;
-    // PIRLS solve is centered on offset:
-    //   eta - offset = A (z - offset)
+fn alo_eta_updatewith_offset(
+    eta_hat: f64,
+    z: f64,
+    offset: f64,
+    x_hinv_x: f64,
+    hessian_weight: f64,
+    score_weight: f64,
+) -> f64 {
+    let denom = 1.0 - hessian_weight * x_hinv_x;
+    // PIRLS working-response algebra is centered on offset, so the scalar
+    // score uses (eta - offset) - (z - offset).
     let eta_centered = eta_hat - offset;
     let z_centered = z - offset;
-    offset + (eta_centered - aii * z_centered) / denom
+    let score = score_weight * (eta_centered - z_centered);
+    offset + eta_centered + x_hinv_x * score / denom
 }
 
 #[inline]
@@ -141,13 +149,14 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let input = AloInput {
         design: x_dense,
         penalized_hessian: &h_dense_for_alo,
-        working_weights: &base.finalweights,
+        hessian_weights: &base.finalweights,
+        score_weights: &base.solveweights,
         working_response: &base.solveworking_response,
         eta: &base.final_eta,
         offset: &base.final_offset,
         link,
         phi,
-        penalty_null_space: if e.nrows() > 0 { Some(e) } else { None },
+        penalty_root: if e.nrows() > 0 { Some(e) } else { None },
         ridge,
     };
 
@@ -272,8 +281,10 @@ pub struct AloInput<'a> {
     pub design: &'a Array2<f64>,
     /// Penalized Hessian H = X'WX + S(λ) at convergence (p × p).
     pub penalized_hessian: &'a Array2<f64>,
-    /// IRLS working weights at convergence (n).
-    pub working_weights: &'a Array1<f64>,
+    /// Hessian-side IRLS weights W_H at convergence (n).
+    pub hessian_weights: &'a Array1<f64>,
+    /// Score-side IRLS weights W_S paired with `working_response` (n).
+    pub score_weights: &'a Array1<f64>,
     /// IRLS working response at convergence (n).
     pub working_response: &'a Array1<f64>,
     /// Fitted linear predictor η̂ (n).
@@ -284,9 +295,9 @@ pub struct AloInput<'a> {
     pub link: LinkFunction,
     /// Dispersion parameter φ. For non-Gaussian families this is 1.0.
     pub phi: f64,
-    /// Optional null-space projector E (rank × p) for sandwich SE.
+    /// Optional penalty square root E with E^T E = S(λ) (rank × p) for sandwich SE.
     /// When `None`, sandwich SE is set equal to Bayesian SE.
-    pub penalty_null_space: Option<&'a Array2<f64>>,
+    pub penalty_root: Option<&'a Array2<f64>>,
     /// Ridge added to the Hessian for logdet surface.
     pub ridge: f64,
 }
@@ -304,13 +315,16 @@ impl<'a> AloInput<'a> {
         Self {
             design,
             penalized_hessian: &geom.penalized_hessian,
-            working_weights: &geom.working_weights,
+            // FitGeometry stores one working-weight vector, so this constructor is
+            // exact only when the score- and Hessian-side IRLS weights coincide.
+            hessian_weights: &geom.working_weights,
+            score_weights: &geom.working_weights,
             working_response: &geom.working_response,
             eta,
             offset,
             link,
             phi,
-            penalty_null_space: None,
+            penalty_root: None,
             ridge: 0.0,
         }
     }
@@ -325,7 +339,8 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let x_dense = input.design;
     let n = x_dense.nrows();
     let p = x_dense.ncols();
-    let w = input.working_weights;
+    let w_h = input.hessian_weights;
+    let w_s = input.score_weights;
 
     let factor = StableSolver::new("alo penalized hessian")
         .factorize(input.penalized_hessian)
@@ -337,9 +352,10 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let phi = input.phi;
     let ridge = input.ridge;
 
-    let e_rank = input.penalty_null_space.map(|e| e.nrows()).unwrap_or(0);
+    let e_rank = input.penalty_root.map(|e| e.nrows()).unwrap_or(0);
 
     let mut aii = Array1::<f64>::zeros(n);
+    let mut x_hinv_x_diag = Array1::<f64>::zeros(n);
     let mut se_bayes = Array1::<f64>::zeros(n);
     let mut se_sandwich = Array1::<f64>::zeros(n);
 
@@ -360,7 +376,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
 
         let mut es_chunk_storage = FaerMat::<f64>::zeros(e_rank, width);
         if e_rank > 0 {
-            if let Some(e) = input.penalty_null_space {
+            if let Some(e) = input.penalty_root {
                 let eview = FaerArrayView::new(e);
                 matmul(
                     es_chunk_storage.as_mut(),
@@ -384,7 +400,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
                 x_hinv_x = sval.mul_add(xval, x_hinv_x);
                 s_norm2 = sval.mul_add(sval, s_norm2);
             }
-            let ai = w[obs].max(0.0) * x_hinv_x;
+            let ai = w_h[obs].max(0.0) * x_hinv_x;
             let mut es_norm2 = 0.0f64;
             if e_rank > 0 {
                 for r in 0..e_rank {
@@ -393,6 +409,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
                 }
             }
             aii[obs] = ai;
+            x_hinv_x_diag[obs] = x_hinv_x;
 
             let var_bayes = bayesvar_eta(phi, x_hinv_x);
             let var_sandwich = if e_rank > 0 {
@@ -441,7 +458,14 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
                 aii[i], denom_raw
             )));
         }
-        eta_tilde[i] = alo_eta_updatewith_offset(eta_hat[i], z[i], offset[i], aii[i]);
+        eta_tilde[i] = alo_eta_updatewith_offset(
+            eta_hat[i],
+            z[i],
+            offset[i],
+            x_hinv_x_diag[i],
+            w_h[i],
+            w_s[i],
+        );
         if !eta_tilde[i].is_finite() {
             return Err(EstimationError::InvalidInput(format!(
                 "ALO eta_tilde is not finite at row {i}: eta_tilde={}",
@@ -456,7 +480,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
         se_sandwich,
         pred_identity: eta_hat.clone(),
         leverage: aii,
-        fisherweights: w.clone(),
+        fisherweights: w_h.clone(),
     })
 }
 
@@ -1012,10 +1036,14 @@ mod tests {
         let eta_hat = 11.0;
         let z = 13.0;
         let offset = 10.0;
-        let aii = 0.2;
-        // centered: eta~=off + ((eta-off)-a(z-off))/(1-a)
-        let expected = offset + ((eta_hat - offset) - aii * (z - offset)) / (1.0 - aii);
-        let got = alo_eta_updatewith_offset(eta_hat, z, offset, aii);
+        let x_hinv_x = 0.2;
+        let hessian_weight = 1.0;
+        let score_weight = 1.0;
+        // centered: eta~=off + ((eta-off)-a(z-off))/(1-a) when W_S = W_H.
+        let leverage = hessian_weight * x_hinv_x;
+        let expected = offset + ((eta_hat - offset) - leverage * (z - offset)) / (1.0 - leverage);
+        let got =
+            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, hessian_weight, score_weight);
         assert!((got - expected).abs() < 1e-12);
     }
 
@@ -1023,9 +1051,46 @@ mod tests {
     fn alo_offset_update_reduces_to_classicwhen_offsetzero() {
         let eta_hat = 1.25;
         let z = -0.5;
-        let aii = 0.35;
-        let expected = (eta_hat - aii * z) / (1.0 - aii);
-        let got = alo_eta_updatewith_offset(eta_hat, z, 0.0, aii);
+        let x_hinv_x = 0.35;
+        let hessian_weight = 1.0;
+        let score_weight = 1.0;
+        let leverage = hessian_weight * x_hinv_x;
+        let expected = (eta_hat - leverage * z) / (1.0 - leverage);
+        let got =
+            alo_eta_updatewith_offset(eta_hat, z, 0.0, x_hinv_x, hessian_weight, score_weight);
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn alo_offset_update_uses_distinct_score_and_hessian_weights() {
+        let eta_hat = 1.7;
+        let z = 0.4;
+        let offset = -0.2;
+        let x_hinv_x = 0.15;
+        let hessian_weight = 3.0;
+        let score_weight = 5.0;
+        let expected = offset
+            + (eta_hat - offset)
+            + x_hinv_x * score_weight * ((eta_hat - offset) - (z - offset))
+                / (1.0 - hessian_weight * x_hinv_x);
+        let got =
+            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, hessian_weight, score_weight);
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn alo_offset_update_handles_zero_hessian_weight() {
+        let eta_hat = 0.8;
+        let z = -0.3;
+        let offset = 0.1;
+        let x_hinv_x = 0.4;
+        let hessian_weight = 0.0;
+        let score_weight = 2.5;
+        let expected = offset
+            + (eta_hat - offset)
+            + x_hinv_x * score_weight * ((eta_hat - offset) - (z - offset));
+        let got =
+            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, hessian_weight, score_weight);
         assert!((got - expected).abs() < 1e-12);
     }
 
