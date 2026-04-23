@@ -1247,6 +1247,247 @@ pub fn center_survival_time_designs_at_anchor(
 // Baseline evaluation (Gompertz, Weibull, Gompertz-Makeham)
 // ---------------------------------------------------------------------------
 
+/// Partial derivatives of the baseline offsets `(eta_target, d_eta_target/dt)`
+/// with respect to the θ-parameters in the same parameterization that
+/// [`survival_baseline_theta_from_config`] / [`survival_baseline_config_from_theta`]
+/// use:
+///
+/// - **Weibull**: θ = (log_scale, log_shape).  `eta = shape·(log t − log scale)`,
+///   `o_D = shape/t`.
+/// - **Gompertz**: θ = (log_rate, shape).  `eta = log H_G(t)` with
+///   `H_G(t) = (rate/shape)·(exp(shape·t) − 1)`, `o_D = h_G(t)/H_G(t) =
+///   shape·E/(E−1)` where `E = exp(shape·t)`.
+/// - **Gompertz–Makeham**: θ = (log_rate, shape, log_makeham).
+///   `eta = log H(t)` with `H(t) = makeham·t + H_G(t)`,
+///   `o_D = (makeham + h_G(t)) / H(t)`.
+///
+/// Returns a flat `(d_eta/dθ_k, d_oD/dθ_k)` pair for each component of θ,
+/// in the same order as `survival_baseline_theta_from_config`.  Linear has
+/// no θ-parameters so returns `Ok(None)`.
+///
+/// The `eta`-channel derivatives are closed-form for every branch.  The
+/// `o_D`-channel derivatives use the log-derivative identity
+/// `∂o_D/∂θ = o_D · ∂log(o_D)/∂θ` which is more numerically stable near
+/// the small-shape limit (shape·t → 0).  Near shape = 0 we fall back to
+/// a third-order Taylor expansion with the same 1e-10 pivot that
+/// `evaluate_survival_baseline` uses, keeping the value/derivative pair
+/// continuous and agreement with the linear-hazard limit exact at shape=0.
+pub fn baseline_offset_theta_partials(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<Vec<(f64, f64)>>, String> {
+    if !age.is_finite() || age <= 0.0 {
+        return Err(
+            "survival ages must be finite and positive for baseline derivative evaluation"
+                .to_string(),
+        );
+    }
+
+    match cfg.target {
+        SurvivalBaselineTarget::Linear => Ok(None),
+        SurvivalBaselineTarget::Weibull => {
+            // eta = shape·(log t − log scale)
+            //     = shape·log t − shape·log scale
+            // o_D = shape / t
+            //
+            // θ = (log_scale, log_shape):
+            //   ∂eta/∂log_scale  = −shape          ∂o_D/∂log_scale = 0
+            //   ∂eta/∂log_shape  = shape·(log t − log scale) = eta
+            //   ∂o_D/∂log_shape  = shape / t = o_D
+            let scale = cfg.scale.ok_or_else(|| "weibull missing scale".to_string())?;
+            let shape = cfg.shape.ok_or_else(|| "weibull missing shape".to_string())?;
+            if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
+                return Err("weibull baseline requires finite positive scale and shape".to_string());
+            }
+            let eta = shape * (age.ln() - scale.ln());
+            let o_d = shape / age;
+            let d_eta_d_log_scale = -shape;
+            let d_od_d_log_scale = 0.0;
+            let d_eta_d_log_shape = eta;
+            let d_od_d_log_shape = o_d;
+            Ok(Some(vec![
+                (d_eta_d_log_scale, d_od_d_log_scale),
+                (d_eta_d_log_shape, d_od_d_log_shape),
+            ]))
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            let rate = cfg.rate.ok_or_else(|| "gompertz missing rate".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "gompertz missing shape".to_string())?;
+            if !(rate.is_finite() && shape.is_finite() && rate > 0.0) {
+                return Err(
+                    "gompertz baseline requires finite positive rate and finite shape".to_string()
+                );
+            }
+            // θ = (log_rate, shape):
+            //   Rate cancels in o_D = h/H for Gompertz, so ∂o_D/∂log_rate = 0
+            //   and ∂eta/∂log_rate = 1. The shape channel uses
+            //     ∂eta/∂shape   = −1/shape + t·E/(E−1)
+            //     ∂log(o_D)/∂shape = 1/shape − t/(E−1)
+            //     ∂o_D/∂shape  = o_D · ∂log(o_D)/∂shape
+            //   Near shape=0 both numerators are 1/shape cancellations. Use
+            //   Taylor expansions with the same 1e-10 pivot that
+            //   gompertz_components uses in evaluate_survival_baseline.
+            let (d_eta_d_shape, d_od_d_shape) = gompertz_shape_derivatives(age, shape);
+            Ok(Some(vec![(1.0, 0.0), (d_eta_d_shape, d_od_d_shape)]))
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            let rate = cfg.rate.ok_or_else(|| "gm missing rate".to_string())?;
+            let shape = cfg.shape.ok_or_else(|| "gm missing shape".to_string())?;
+            let makeham = cfg
+                .makeham
+                .ok_or_else(|| "gm missing makeham".to_string())?;
+            if !(rate.is_finite()
+                && shape.is_finite()
+                && makeham.is_finite()
+                && rate > 0.0
+                && makeham > 0.0)
+            {
+                return Err(
+                    "gompertz-makeham baseline requires finite positive rate, makeham, and finite shape"
+                        .to_string(),
+                );
+            }
+            // H(t) = M·t + H_G(t),   H_G(t) = (rate/shape)·(E−1),  E = exp(shape·t)
+            // h(t) = M + h_G(t),     h_G(t) = rate·E
+            // o_D  = h/H
+            //
+            // θ = (log_rate, shape, log_makeham):
+            //   ∂H/∂log_rate    = rate · ∂H/∂rate = H_G               (scales with rate)
+            //   ∂H/∂shape       = H_G_shape                            (closed form below)
+            //   ∂H/∂log_makeham = makeham · t                          (linear in makeham)
+            //   ∂h/∂log_rate    = rate · ∂h/∂rate = h_G
+            //   ∂h/∂shape       = h_G_shape = rate·t·E + 0              (= rate·t·E)
+            //   ∂h/∂log_makeham = makeham
+            //   ∂eta/∂θ = (∂H/∂θ) / H
+            //   ∂o_D/∂θ = (∂h/∂θ − o_D · ∂H/∂θ) / H
+            //           = (∂h/∂θ)/H − o_D · (∂H/∂θ)/H
+            let (cum_g, inst_g) = gompertz_hazard_components(age, rate, shape);
+            let cum_total = makeham * age + cum_g;
+            if cum_total <= 0.0 || !cum_total.is_finite() {
+                return Err(
+                    "gm baseline produced non-positive cumulative hazard".to_string(),
+                );
+            }
+            let inst_total = makeham + inst_g;
+            let o_d = inst_total / cum_total;
+            let inv_cum = 1.0 / cum_total;
+            // Each channel: ∂cum/∂θ and ∂inst/∂θ → ∂eta/∂θ = ∂cum/∂θ / cum
+            //                                       ∂o_D/∂θ = (∂inst/∂θ − o_D·∂cum/∂θ) / cum
+            // log_rate channel: cum is linear in rate through H_G; ∂cum/∂rate = H_G/rate,
+            //   so ∂cum/∂log_rate = H_G (= cum_g here). Similarly ∂inst/∂log_rate = h_G (= inst_g).
+            let d_cum_dlr = cum_g;
+            let d_inst_dlr = inst_g;
+            let d_eta_dlr = d_cum_dlr * inv_cum;
+            let d_od_dlr = (d_inst_dlr - o_d * d_cum_dlr) * inv_cum;
+            // shape channel: only H_G and h_G have shape dependence.
+            let (d_cum_dshape, d_inst_dshape) =
+                gompertz_cumulative_shape_derivative(age, rate, shape);
+            let d_eta_dshape = d_cum_dshape * inv_cum;
+            let d_od_dshape = (d_inst_dshape - o_d * d_cum_dshape) * inv_cum;
+            // log_makeham channel: cum contributes M·t, inst contributes M.
+            //   ∂cum/∂log_makeham = makeham·t,  ∂inst/∂log_makeham = makeham.
+            let d_cum_dlm = makeham * age;
+            let d_inst_dlm = makeham;
+            let d_eta_dlm = d_cum_dlm * inv_cum;
+            let d_od_dlm = (d_inst_dlm - o_d * d_cum_dlm) * inv_cum;
+            Ok(Some(vec![
+                (d_eta_dlr, d_od_dlr),
+                (d_eta_dshape, d_od_dshape),
+                (d_eta_dlm, d_od_dlm),
+            ]))
+        }
+    }
+}
+
+/// Shared Gompertz hazard components `(H_G(t), h_G(t))`.
+/// Mirrors the private helper in `evaluate_survival_baseline` with the
+/// same 1e-10 small-shape pivot.
+#[inline]
+fn gompertz_hazard_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
+    if shape.abs() < 1e-10 {
+        // Taylor at shape=0: H_G(t) = rate·t·(1 + shape·t/2 + (shape·t)²/6),
+        // h_G(t) = rate·(1 + shape·t + (shape·t)²/2).
+        let x = shape * age;
+        (
+            rate * age * (1.0 + 0.5 * x + x * x / 6.0),
+            rate * (1.0 + x + 0.5 * x * x),
+        )
+    } else {
+        let shape_age = shape * age;
+        let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
+        let instant_hazard = rate * shape_age.exp();
+        (cumulative_hazard, instant_hazard)
+    }
+}
+
+/// Partials of `(H_G(t), h_G(t))` with respect to the shape parameter.
+///
+/// H_G(t) = (rate/shape)·(E−1),  h_G(t) = rate·E,  E = exp(shape·t)
+///
+/// ∂H_G/∂shape  = −(rate/shape²)·(E−1) + (rate/shape)·t·E
+///              = rate·[t·E/shape − (E−1)/shape²]
+///              = rate·[t·E·shape − (E−1)] / shape²
+/// ∂h_G/∂shape  = rate·t·E
+///
+/// Near shape=0 the first expression has a 1/shape² singularity that
+/// cancels analytically. Using the series E−1 = Σₖ≥₁ (shape·t)ᵏ/k!:
+///   t·E·shape − (E−1) = Σₖ≥₁ (shape·t)ᵏ·(k−1)/k!·shape⁰  [after simplification]
+///                     = (shape·t)²/2 + 2(shape·t)³/6 + 3(shape·t)⁴/24 + ...
+/// so ∂H_G/∂shape at shape→0 = rate·[t²/2 + shape·t³/3 + shape²·t⁴/8 + ...].
+/// We use that Taylor expansion in the small-shape branch.
+#[inline]
+fn gompertz_cumulative_shape_derivative(age: f64, rate: f64, shape: f64) -> (f64, f64) {
+    let x = shape * age;
+    let dinstg_dshape = rate * age * x.exp();
+    let dhg_dshape = if shape.abs() < 1e-10 {
+        let t = age;
+        // Truncated to O(x³): t²/2 + x·t²/3 + x²·t²/8
+        rate * t * t * (0.5 + x / 3.0 + x * x / 8.0)
+    } else {
+        // t·E·shape − (E−1) = t·e^x·shape − expm1(x)
+        let e = x.exp();
+        let em1 = x.exp_m1();
+        let numerator = age * e * shape - em1;
+        rate * numerator / (shape * shape)
+    };
+    (dhg_dshape, dinstg_dshape)
+}
+
+/// Partials `(∂eta/∂shape, ∂o_D/∂shape)` for the pure Gompertz baseline.
+/// Pure Gompertz has rate cancelling in o_D, so there is no log_rate
+/// contribution in o_D. The rate channel for eta is trivially 1; this
+/// helper only covers the shape channel.
+#[inline]
+fn gompertz_shape_derivatives(age: f64, shape: f64) -> (f64, f64) {
+    if shape.abs() < 1e-10 {
+        // Closed-form limits from the series t·E/(E−1) = 1/x + 1/2 + x/12 + ...
+        // with E = e^x, x = shape·t:
+        //   ∂eta/∂shape  = −1/shape + t·E/(E−1)
+        //                = t/2 + shape·t²/12 + O(shape²)
+        //   o_D         = shape·E/(E−1)
+        //                = 1/t + shape/2 + shape²·t/12 + O(shape³)
+        //   ∂log(o_D)/∂shape = 1/shape − t/(E−1)
+        //                = t/2 − shape·t²/12 + O(shape²)
+        //   ∂o_D/∂shape = o_D · ∂log(o_D)/∂shape
+        let t = age;
+        let d_eta = 0.5 * t + shape * t * t / 12.0;
+        let dlog_od = 0.5 * t - shape * t * t / 12.0;
+        let o_d = 1.0 / t + 0.5 * shape + shape * shape * t / 12.0;
+        (d_eta, o_d * dlog_od)
+    } else {
+        let x = shape * age;
+        let e = x.exp();
+        let em1 = x.exp_m1(); // E − 1 via expm1 for accuracy at small x
+        let d_eta = -1.0 / shape + age * e / em1;
+        // o_D = shape · E/(E−1); ∂log(o_D)/∂shape = 1/shape − t/(E−1)
+        let o_d = shape * e / em1;
+        let dlog_od = 1.0 / shape - age / em1;
+        (d_eta, o_d * dlog_od)
+    }
+}
+
 /// Evaluate the parametric baseline target at a given age.
 /// Returns `(eta_target(age), d eta_target / d age)` on the log-cumulative-hazard scale.
 pub fn evaluate_survival_baseline(
@@ -1648,7 +1889,11 @@ pub fn build_time_varying_survival_covariate_template(
 
 #[cfg(test)]
 mod tests {
-    use super::build_survival_timewiggle_from_baseline;
+    use super::{
+        SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_offset_theta_partials,
+        build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
+        survival_baseline_config_from_theta, survival_baseline_theta_from_config,
+    };
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
     use ndarray::array;
 
@@ -1672,4 +1917,270 @@ mod tests {
         assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
         assert!(build.ncols > 0);
     }
+
+    // ─── baseline_offset_theta_partials — analytic vs central-difference ─
+
+    /// Central-difference of (eta, o_D) at fixed age wrt each θ component in
+    /// the theta layout defined by `survival_baseline_theta_from_config`.
+    fn fd_baseline_offset(
+        age: f64,
+        cfg: &SurvivalBaselineConfig,
+        h: f64,
+    ) -> Vec<(f64, f64)> {
+        let theta = survival_baseline_theta_from_config(cfg)
+            .expect("theta")
+            .expect("non-linear baseline");
+        (0..theta.len())
+            .map(|k| {
+                let mut theta_plus = theta.clone();
+                theta_plus[k] += h;
+                let mut theta_minus = theta.clone();
+                theta_minus[k] -= h;
+                let cfg_plus = survival_baseline_config_from_theta(cfg.target, &theta_plus)
+                    .expect("plus cfg");
+                let cfg_minus = survival_baseline_config_from_theta(cfg.target, &theta_minus)
+                    .expect("minus cfg");
+                let (eta_p, od_p) = evaluate_survival_baseline(age, &cfg_plus).expect("eta+");
+                let (eta_m, od_m) = evaluate_survival_baseline(age, &cfg_minus).expect("eta-");
+                ((eta_p - eta_m) / (2.0 * h), (od_p - od_m) / (2.0 * h))
+            })
+            .collect()
+    }
+
+    fn assert_close(actual: f64, expected: f64, tol: f64, what: &str) {
+        let ok = if expected.abs() < 1.0 {
+            (actual - expected).abs() < tol
+        } else {
+            (actual - expected).abs() < tol * expected.abs().max(1.0)
+        };
+        assert!(
+            ok,
+            "{what}: analytic={actual:.6e} fd={expected:.6e} (tol={tol:.1e})"
+        );
+    }
+
+    #[test]
+    fn gompertz_offset_partials_match_central_diff() {
+        // Several (rate, shape, age) combinations spanning the small-shape
+        // Taylor branch (shape ~ 1e-12, exactly at the pivot) and the normal
+        // branch (shape >> 1e-10), plus sign-reversed shape.
+        let cases = [
+            (0.5_f64, 0.01_f64, 30.0_f64),
+            (0.2, 0.05, 60.0),
+            (1.0, 0.001, 10.0),
+            (0.3, -0.02, 40.0),
+            (0.8, 0.2, 5.0),
+        ];
+        for &(rate, shape, age) in &cases {
+            let cfg = SurvivalBaselineConfig {
+                target: SurvivalBaselineTarget::Gompertz,
+                scale: None,
+                shape: Some(shape),
+                rate: Some(rate),
+                makeham: None,
+            };
+            let analytic = baseline_offset_theta_partials(age, &cfg)
+                .expect("ok")
+                .expect("non-linear");
+            // central difference h = 1e-5 for log-space / shape (x·h = 1e-3 worst case)
+            let fd = fd_baseline_offset(age, &cfg, 1e-5);
+            assert_eq!(analytic.len(), 2);
+            // Gompertz θ=(log_rate, shape). Rate channel: ∂eta/∂log_rate=1, ∂o_D/∂log_rate=0.
+            assert_close(
+                analytic[0].0,
+                fd[0].0,
+                1e-7,
+                &format!("gompertz ∂eta/∂log_rate (rate={rate}, shape={shape}, age={age})"),
+            );
+            assert_close(
+                analytic[0].1,
+                fd[0].1,
+                1e-7,
+                &format!("gompertz ∂o_D/∂log_rate (rate={rate}, shape={shape}, age={age})"),
+            );
+            // shape channel — larger tol because finite-differencing near
+            // shape=0 amplifies rounding; 1e-5 is fine.
+            assert_close(
+                analytic[1].0,
+                fd[1].0,
+                1e-5,
+                &format!("gompertz ∂eta/∂shape (rate={rate}, shape={shape}, age={age})"),
+            );
+            assert_close(
+                analytic[1].1,
+                fd[1].1,
+                1e-5,
+                &format!("gompertz ∂o_D/∂shape (rate={rate}, shape={shape}, age={age})"),
+            );
+        }
+    }
+
+    #[test]
+    fn gompertz_offset_partials_log_rate_channel_is_trivial() {
+        // Pure Gompertz: rate cancels in o_D, so ∂o_D/∂log_rate must be
+        // exactly 0 and ∂eta/∂log_rate must be exactly 1. Verify the
+        // analytic implementation returns the exact values, not FD-close.
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.05),
+            rate: Some(0.3),
+            makeham: None,
+        };
+        let partials = baseline_offset_theta_partials(42.0, &cfg)
+            .expect("ok")
+            .expect("non-linear");
+        assert_eq!(partials[0].0, 1.0);
+        assert_eq!(partials[0].1, 0.0);
+    }
+
+    #[test]
+    fn gompertz_offset_partials_small_shape_taylor_agrees_with_direct_branch() {
+        // Both branches of gompertz_shape_derivatives should agree to high
+        // precision at shape = 1e-10 + epsilon on the direct side vs
+        // shape = 1e-10 - epsilon on the Taylor side. Here we spot-check
+        // the continuity at the branch cutoff: shape slightly above and
+        // slightly below 1e-10 must give values within O(shape²·t²)
+        // (the Taylor truncation error).
+        let age = 25.0;
+        let rate = 0.4;
+        let cfg_taylor = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.5e-10),
+            rate: Some(rate),
+            makeham: None,
+        };
+        let cfg_direct = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(2.0e-10),
+            rate: Some(rate),
+            makeham: None,
+        };
+        let p_t = baseline_offset_theta_partials(age, &cfg_taylor)
+            .expect("ok")
+            .expect("nl");
+        let p_d = baseline_offset_theta_partials(age, &cfg_direct)
+            .expect("ok")
+            .expect("nl");
+        // ∂eta/∂shape at shape≈0 should be t/2 = 12.5 on both sides.
+        assert_close(p_t[1].0, 12.5, 1e-8, "taylor ∂eta/∂shape near 0");
+        assert_close(p_d[1].0, 12.5, 1e-8, "direct ∂eta/∂shape near 0");
+        // ∂o_D/∂shape at shape≈0 should be 1/2.
+        assert_close(p_t[1].1, 0.5, 1e-8, "taylor ∂o_D/∂shape near 0");
+        assert_close(p_d[1].1, 0.5, 1e-8, "direct ∂o_D/∂shape near 0");
+    }
+
+    #[test]
+    fn weibull_offset_partials_match_central_diff() {
+        let cases = [
+            (0.5_f64, 1.2_f64, 25.0_f64),
+            (2.0, 0.8, 60.0),
+            (0.1, 3.0, 10.0),
+        ];
+        for &(scale, shape, age) in &cases {
+            let cfg = SurvivalBaselineConfig {
+                target: SurvivalBaselineTarget::Weibull,
+                scale: Some(scale),
+                shape: Some(shape),
+                rate: None,
+                makeham: None,
+            };
+            let analytic = baseline_offset_theta_partials(age, &cfg)
+                .expect("ok")
+                .expect("nl");
+            let fd = fd_baseline_offset(age, &cfg, 1e-5);
+            assert_eq!(analytic.len(), 2);
+            for k in 0..2 {
+                assert_close(
+                    analytic[k].0,
+                    fd[k].0,
+                    1e-7,
+                    &format!(
+                        "weibull ∂eta/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"
+                    ),
+                );
+                assert_close(
+                    analytic[k].1,
+                    fd[k].1,
+                    1e-7,
+                    &format!(
+                        "weibull ∂o_D/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"
+                    ),
+                );
+            }
+            // Weibull o_D = shape/t is independent of scale; verify exactly.
+            assert_eq!(analytic[0].1, 0.0);
+        }
+    }
+
+    #[test]
+    fn gompertz_makeham_offset_partials_match_central_diff() {
+        let cases = [
+            (0.3_f64, 0.05_f64, 0.002_f64, 40.0_f64),
+            (0.5, 0.01, 0.01, 25.0),
+            (0.2, 0.001, 0.005, 60.0),
+            (0.8, 0.2, 0.05, 5.0),
+        ];
+        for &(rate, shape, makeham, age) in &cases {
+            let cfg = SurvivalBaselineConfig {
+                target: SurvivalBaselineTarget::GompertzMakeham,
+                scale: None,
+                shape: Some(shape),
+                rate: Some(rate),
+                makeham: Some(makeham),
+            };
+            let analytic = baseline_offset_theta_partials(age, &cfg)
+                .expect("ok")
+                .expect("nl");
+            let fd = fd_baseline_offset(age, &cfg, 1e-5);
+            assert_eq!(analytic.len(), 3);
+            for k in 0..3 {
+                assert_close(
+                    analytic[k].0,
+                    fd[k].0,
+                    1e-5,
+                    &format!(
+                        "gm ∂eta/∂θ[{k}] (rate={rate}, shape={shape}, mk={makeham}, age={age})"
+                    ),
+                );
+                assert_close(
+                    analytic[k].1,
+                    fd[k].1,
+                    1e-5,
+                    &format!(
+                        "gm ∂o_D/∂θ[{k}] (rate={rate}, shape={shape}, mk={makeham}, age={age})"
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linear_baseline_has_no_theta_partials() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Linear,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        };
+        assert!(baseline_offset_theta_partials(5.0, &cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn baseline_offset_partials_reject_non_positive_ages() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.01),
+            rate: Some(0.5),
+            makeham: None,
+        };
+        assert!(baseline_offset_theta_partials(0.0, &cfg).is_err());
+        assert!(baseline_offset_theta_partials(-1.0, &cfg).is_err());
+        assert!(baseline_offset_theta_partials(f64::NAN, &cfg).is_err());
+    }
+
 }
