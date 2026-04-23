@@ -13,7 +13,8 @@ use crate::basis::{
     build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
     estimate_penalty_nullity, filter_active_penalty_candidates, orthogonality_transform_for_design,
-    pairwise_distance_bounds, pairwise_distance_bounds_sampled, select_centers_by_strategy,
+    pairwise_distance_bounds, pairwise_distance_bounds_sampled, points_in_aniso_y_space,
+    select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -1308,13 +1309,31 @@ fn spatial_term_psi_bounds(
     // with the capped-sample path (O(K²·d), K=1024) — the sample is
     // conservative for κ bounds (see `pairwise_distance_bounds_sampled`
     // docs): it never excludes a feasible κ the exact method would include.
+    //
+    // Under anisotropy the kernel metric is y-space (y_a = exp(η_a) x_a),
+    // so r_min/r_max must be y-space distances. This matters only when the
+    // spec already carries calibrated η_a at setup time (e.g., warm-start
+    // or refit paths); for fresh optimization η_a starts at 0 and y = x.
+    let aniso = get_spatial_aniso_log_scales(spec, term_idx);
     let r_bounds = match spatial_term_center_strategy(term) {
         Some(CenterStrategy::UserProvided(centers)) if centers.nrows() >= 2 => {
-            pairwise_distance_bounds(centers.view())
+            match aniso.as_deref() {
+                Some(eta) if eta.len() == centers.ncols() => {
+                    let y = points_in_aniso_y_space(centers.view(), eta);
+                    pairwise_distance_bounds(y.view())
+                }
+                _ => pairwise_distance_bounds(centers.view()),
+            }
         }
-        _ => standardized_spatial_term_data(data, term)
-            .ok()
-            .and_then(|x| pairwise_distance_bounds_sampled(x.view())),
+        _ => standardized_spatial_term_data(data, term).ok().and_then(|x| {
+            match aniso.as_deref() {
+                Some(eta) if eta.len() == x.ncols() => {
+                    let y = points_in_aniso_y_space(x.view(), eta);
+                    pairwise_distance_bounds_sampled(y.view())
+                }
+                _ => pairwise_distance_bounds_sampled(x.view()),
+            }
+        }),
     };
     let Some((r_min, r_max)) = r_bounds else {
         return fallback;
