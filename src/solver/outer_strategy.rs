@@ -1278,6 +1278,25 @@ fn finite_efs_eval_or_error(
 ) -> Result<EfsEval, ObjectiveEvalError> {
     layout.validate_efs_eval(&eval, context)?;
     finite_cost_or_error(context, eval.cost)?;
+    if let Some((idx, value)) = eval
+        .steps
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+    {
+        let coord_kind = match eval.psi_indices.as_deref() {
+            Some(indices) if indices.contains(&idx) => "ψ",
+            Some(_) => "ρ/τ",
+            None => "ρ",
+        };
+        return Err(ObjectiveEvalError::recoverable(format!(
+            "{context}: objective returned a non-finite {coord_kind} EFS step at \
+             coord {idx} (step[{idx}]={value}, rho_dim={}, psi_dim={}, n_params={})",
+            layout.rho_dim(),
+            layout.psi_dim,
+            layout.n_params,
+        )));
+    }
     Ok(eval)
 }
 
@@ -1396,6 +1415,36 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             return Err(ObjectiveEvalError::recoverable(
                 "outer EFS eval failed: objective returned a non-finite cost".to_string(),
             ));
+        }
+        // Reject non-finite EFS step components at the bridge boundary with
+        // full diagnostic context (which coord, its value, and whether it is
+        // a ρ or ψ coord). Without this, a NaN/Inf step flows into the
+        // hybrid-EFS backtrack loop, which halves it via `NaN * 0.5^k = NaN`
+        // until backtracking exhausts, then silently zeros the ψ block and
+        // applies only the ρ step — masking the analytic-gradient bug that
+        // produced the NaN. The opt crate's FixedPoint::run also detects
+        // this downstream (opt 0.2.2 lib.rs:4949) but surfaces only the bare
+        // `NonFiniteStep` variant with no context, which is not actionable.
+        if let Some((idx, value)) = eval
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite())
+        {
+            let psi_indices = eval.psi_indices.as_deref();
+            let coord_kind = match psi_indices {
+                Some(indices) if indices.contains(&idx) => "ψ",
+                Some(_) => "ρ/τ",
+                None => "ρ",
+            };
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "outer EFS eval failed: non-finite {coord_kind} step at coord {idx} \
+                 (step[{idx}]={value}, rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                self.layout.rho_dim(),
+                self.layout.psi_dim,
+                self.layout.n_params,
+                eval.cost,
+            )));
         }
         let status = if let Some(ref barrier_cfg) = self.barrier_config {
             if let Some(ref beta) = eval.beta {
