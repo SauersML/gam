@@ -1463,16 +1463,31 @@ pub fn blockwise_fit_from_parts(
 
     // Build unified blocks from the blockwise states.
     use crate::solver::estimate::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    let penalty_counts: Vec<usize> = specs.iter().map(|s| s.penalties.len()).collect();
+    let expected_rho: usize = penalty_counts.iter().sum();
+    if lambdas.len() != expected_rho {
+        return Err(format!(
+            "blockwise_fit.lambdas length ({}) does not match sum of per-block penalty counts ({})",
+            lambdas.len(),
+            expected_rho
+        ));
+    }
+    let mut lambda_offset = 0usize;
     let blocks: Vec<FittedBlock> = block_states
         .iter()
         .enumerate()
         .map(|(i, bs)| {
             let role = custom_family_block_role(&specs[i].name, i, block_states.len());
+            let k = penalty_counts[i];
+            let block_lambdas = lambdas
+                .slice(s![lambda_offset..lambda_offset + k])
+                .to_owned();
+            lambda_offset += k;
             FittedBlock {
                 beta: bs.beta.clone(),
                 role,
                 edf: 0.0,
-                lambdas: Array1::zeros(0),
+                lambdas: block_lambdas,
             }
         })
         .collect();
@@ -10937,12 +10952,14 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         "custom-family fit final outer refit",
     )
     .map_err(CustomFamilyError::Optimization)?;
+    let lambdas_final = rho_star.mapv(f64::exp);
+    let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());
     blockwise_fit_from_parts(
         BlockwiseFitResultParts {
             block_states: inner.block_states,
             log_likelihood: inner.log_likelihood,
-            log_lambdas: rho_star.clone(),
-            lambdas: rho_star.mapv(f64::exp),
+            log_lambdas: log_lambdas_final,
+            lambdas: lambdas_final,
             covariance_conditional,
             penalized_objective,
             outer_iterations: outer_iters,
