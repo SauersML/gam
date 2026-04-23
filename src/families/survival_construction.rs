@@ -24,7 +24,6 @@ use crate::families::survival_location_scale::{
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
-use crate::solver::outer_strategy::{EfsEval, HessianResult, OuterEval, OuterProblem};
 use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
@@ -473,7 +472,7 @@ fn survival_baseline_config_from_theta(
 pub fn optimize_survival_baseline_config<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,
-    objective: F,
+    mut objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<f64, String>,
@@ -481,48 +480,101 @@ where
     let Some(seed) = survival_baseline_theta_from_config(initial)? else {
         return Ok(initial.clone());
     };
-    let dim = seed.len();
-    // Baseline theta is not a log-smoothing rho; the Survival retreat seed
-    // at bounds.1=12 would overflow rate=exp(12). Pin as auxiliary and box
-    // tightly around the heuristic.
-    let mut seed_config = crate::seeding::SeedConfig::default();
-    seed_config.max_seeds = 1;
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = crate::seeding::SeedRiskProfile::Gaussian;
-    seed_config.num_auxiliary_trailing = dim;
+    let target = initial.target;
     let lower = seed.mapv(|v| v - 6.0);
     let upper = seed.mapv(|v| v + 6.0);
-    let problem = OuterProblem::new(dim)
-        .with_tolerance(1e-4)
-        .with_max_iter(30)
-        .with_seed_config(seed_config)
-        .with_bounds(lower, upper)
-        .with_heuristic_lambdas(seed.to_vec());
-    let target = initial.target;
-    let mut obj = problem.build_objective(
-        objective,
-        |f: &mut F, theta: &Array1<f64>| {
-            let cfg = survival_baseline_config_from_theta(target, theta)
-                .map_err(EstimationError::InvalidInput)?;
-            f(&cfg).map_err(EstimationError::InvalidInput)
-        },
-        |f: &mut F, theta: &Array1<f64>| {
-            let cfg = survival_baseline_config_from_theta(target, theta)
-                .map_err(EstimationError::InvalidInput)?;
-            let cost = f(&cfg).map_err(EstimationError::InvalidInput)?;
-            Ok(OuterEval {
-                cost,
-                gradient: Array1::zeros(theta.len()),
-                hessian: HessianResult::Unavailable,
-            })
-        },
-        None::<fn(&mut F)>,
-        None::<fn(&mut F, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
-    let result = problem
-        .run(&mut obj, context)
-        .map_err(|error| format!("{context} failed: {error}"))?;
-    survival_baseline_config_from_theta(target, &result.rho)
+    let init_step = 1.0;
+    let step_tol = 1e-4;
+    let max_polls = 240;
+    let mut cost_at_theta = |theta: &Array1<f64>| -> Option<f64> {
+        match survival_baseline_config_from_theta(target, theta) {
+            Ok(cfg) => objective(&cfg).ok().filter(|v| v.is_finite()),
+            Err(_) => None,
+        }
+    };
+    let theta = compass_search_auxiliary(
+        seed,
+        lower.view(),
+        upper.view(),
+        init_step,
+        step_tol,
+        max_polls,
+        &mut cost_at_theta,
+    )
+    .ok_or_else(|| format!("{context}: auxiliary cost was non-finite at the heuristic seed"))?;
+    survival_baseline_config_from_theta(target, &theta)
+}
+
+/// Coordinate-compass direct-search minimizer for low-dim auxiliary problems.
+///
+/// Why this helper exists: some survival auxiliary searches (baseline-theta
+/// for gompertz-makeham, SAS/BetaLogistic/Mixture inverse-link) have no
+/// analytic gradient available. The production outer-BFGS runner correctly
+/// refuses non-analytic-gradient capabilities to prevent silent FD-grad
+/// masking on the REML outer. For these 2–3 dim auxiliary searches we use a
+/// derivative-free method instead of degrading BFGS.
+///
+/// Method: opportunistic compass search with positive basis {±e_i} and
+/// step contraction. Given a continuously differentiable cost bounded below
+/// on the compact box [lower, upper], compass search converges to a
+/// stationary point (Kolda-Lewis-Torczon, SIAM Review 45:385, 2003, Thm 3.3).
+/// No finite differences are evaluated — the algorithm only compares cost
+/// values at polled points, so it is categorically distinct from the
+/// forbidden FD-gradient BFGS fallback.
+///
+/// Termination: `step < step_tol` or `polls >= max_polls`. Returns the
+/// best-seen theta, or None when the cost at the seed itself is non-finite.
+fn compass_search_auxiliary<C>(
+    mut x: Array1<f64>,
+    lower: ndarray::ArrayView1<'_, f64>,
+    upper: ndarray::ArrayView1<'_, f64>,
+    init_step: f64,
+    step_tol: f64,
+    max_polls: usize,
+    cost: &mut C,
+) -> Option<Array1<f64>>
+where
+    C: FnMut(&Array1<f64>) -> Option<f64>,
+{
+    for i in 0..x.len() {
+        x[i] = x[i].clamp(lower[i], upper[i]);
+    }
+    let mut best_cost = cost(&x)?;
+    let mut step = init_step;
+    let mut polls: usize = 0;
+    while step > step_tol && polls < max_polls {
+        let mut improved = false;
+        // Opportunistic coordinate sweep: first improvement at any (i, sign)
+        // moves the iterate and resets the sweep at the new point with the
+        // SAME step. Requires strict improvement (no tolerance ε), which is
+        // what the convergence theorem demands.
+        'sweep: for i in 0..x.len() {
+            for &sign in &[1.0, -1.0] {
+                if polls >= max_polls {
+                    break 'sweep;
+                }
+                polls += 1;
+                let candidate_i = (x[i] + sign * step).clamp(lower[i], upper[i]);
+                if (candidate_i - x[i]).abs() < step_tol {
+                    continue;
+                }
+                let mut candidate = x.clone();
+                candidate[i] = candidate_i;
+                if let Some(c) = cost(&candidate) {
+                    if c < best_cost {
+                        x = candidate;
+                        best_cost = c;
+                        improved = true;
+                        break 'sweep;
+                    }
+                }
+            }
+        }
+        if !improved {
+            step *= 0.5;
+        }
+    }
+    Some(x)
 }
 
 // ---------------------------------------------------------------------------
