@@ -1004,9 +1004,19 @@ impl SpatialLogKappaCoords {
     }
 
     /// Anisotropic-aware lower bounds derived from per-term data geometry.
-    /// Broadcasts the term's scalar ψ_lo bound across all of its anisotropy
-    /// axes — the η_a correction (aniso_log_scales) lives at the initializer
-    /// level and retains Ση_a = 0 by construction.
+    /// Broadcasts the term's scalar ψ_lo bound across all of its axes. The
+    /// ψ_a coordinates are parameterized as `ψ_a = ψ̄ + η_a` (see
+    /// `from_length_scales_aniso`), so they sit in the same log-κ units as
+    /// the scalar window and the same bound applies per axis.
+    ///
+    /// Pure Duchon anisotropy is structurally different: its stored
+    /// coordinates are (d-1) free η_a values representing log axis-scale
+    /// ratios, NOT log-κ. For those terms the κ-range geometry bound is
+    /// over-restrictive (η_a = ±5 is normal, but that corresponds to 7+
+    /// orders of magnitude in κ-space and would be rejected by the data
+    /// window). Fall back to the options window `[-ln(max_ls), -ln(min_ls)]`
+    /// for those coordinates — that's the same bound the pre-data-geometry
+    /// code used, which is calibrated to allow legitimate anisotropy.
     pub(crate) fn lower_bounds_aniso_from_data(
         data: ArrayView2<'_, f64>,
         spec: &TermCollectionSpec,
@@ -1017,10 +1027,15 @@ impl SpatialLogKappaCoords {
         debug_assert_eq!(term_indices.len(), dims_per_term.len());
         let total: usize = dims_per_term.iter().sum();
         let mut values = Array1::<f64>::zeros(total);
+        let options_lo = -options.max_length_scale.ln();
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
-            let (psi_lo, _) = spatial_term_psi_bounds(data, spec, term_idx, options);
             let d = dims_per_term[slot];
+            let psi_lo = if is_pure_duchon_aniso_term(spec, term_idx) {
+                options_lo
+            } else {
+                spatial_term_psi_bounds(data, spec, term_idx, options).0
+            };
             for offset in 0..d {
                 values[cursor + offset] = psi_lo;
             }
@@ -1033,6 +1048,8 @@ impl SpatialLogKappaCoords {
     }
 
     /// Anisotropic-aware upper bounds derived from per-term data geometry.
+    /// See `lower_bounds_aniso_from_data` for the pure-Duchon-aniso dispatch
+    /// rationale.
     pub(crate) fn upper_bounds_aniso_from_data(
         data: ArrayView2<'_, f64>,
         spec: &TermCollectionSpec,
@@ -1043,10 +1060,15 @@ impl SpatialLogKappaCoords {
         debug_assert_eq!(term_indices.len(), dims_per_term.len());
         let total: usize = dims_per_term.iter().sum();
         let mut values = Array1::<f64>::zeros(total);
+        let options_hi = -options.min_length_scale.ln();
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
-            let (_, psi_hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
             let d = dims_per_term[slot];
+            let psi_hi = if is_pure_duchon_aniso_term(spec, term_idx) {
+                options_hi
+            } else {
+                spatial_term_psi_bounds(data, spec, term_idx, options).1
+            };
             for offset in 0..d {
                 values[cursor + offset] = psi_hi;
             }
