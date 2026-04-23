@@ -347,6 +347,23 @@ impl SurvivalWorkspace {
     }
 }
 
+/// Per-observation gradients of the unpenalized survival NLL with respect
+/// to each of the three additive offset channels, at a given β. See
+/// [`WorkingModelSurvival::offset_channel_residuals`] for the algebra.
+///
+/// Contract: all three arrays have length `n` = number of observations.
+/// Rows with non-positive sampleweight are 0 in every channel. The
+/// `derivative` channel is 0 in all non-event rows.
+#[derive(Clone, Debug)]
+pub struct OffsetChannelResiduals {
+    /// ∂NLL/∂o_X: w·(exp(η_exit) − δ) per row.
+    pub exit: Array1<f64>,
+    /// ∂NLL/∂o_E: −w·exp(η_entry) if row has a positive entry interval else 0.
+    pub entry: Array1<f64>,
+    /// ∂NLL/∂o_D: −w·δ / s (event-row only).
+    pub derivative: Array1<f64>,
+}
+
 #[derive(Debug)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
@@ -1407,6 +1424,113 @@ impl WorkingModelSurvival {
         Ok(b_dir)
     }
 
+    /// Per-observation gradients of the unpenalized survival NLL with respect
+    /// to each additive offset channel, at the given β.
+    ///
+    /// Contract (Royston-Parmar, eta = log H(t)):
+    ///
+    ///   NLL_i(β; o_E, o_X, o_D) = w_i · [
+    ///       exp(η1_i) − 1{has_entry}·exp(η0_i)
+    ///       − δ_i · (η1_i + log s_i)
+    ///   ]
+    ///
+    /// with η1_i = a1_iᵀβ + o_X[i], η0_i = a0_iᵀβ + o_E[i],
+    ///      s_i  = d_iᵀβ + o_D[i].
+    ///
+    /// The additive offsets enter each of the three η channels linearly, so
+    ///   ∂NLL_i/∂o_X[i] = w_i · (exp(η1_i) − δ_i)
+    ///   ∂NLL_i/∂o_E[i] = −w_i · exp(η0_i) · 1{has_entry_interval}
+    ///   ∂NLL_i/∂o_D[i] = −w_i · δ_i / s_i         (event-row only)
+    ///
+    /// These three arrays are the sampleweight-scaled residuals used to chain
+    /// `∂NLL/∂offset` into `∂NLL/∂θ` via any closed-form `∂offset/∂θ` map
+    /// (see `baseline_offset_theta_partials` for parametric baselines). At
+    /// converged β*, the envelope theorem on the penalized objective gives
+    ///
+    ///   d[0.5·(deviance + β*ᵀS_λβ*)] / dθ
+    ///     = Σᵢ r_X_i·∂o_X_i/∂θ + r_E_i·∂o_E_i/∂θ + r_D_i·∂o_D_i/∂θ
+    ///
+    /// exactly (no IFT back-solve required), because β* is a stationary point
+    /// of the penalized objective wrt β and the penalty has no θ dependence.
+    ///
+    /// Rows with `sampleweight[i] ≤ 0` and non-event rows for `r_D` are
+    /// returned as exact 0.0 so the output can be dot-producted against a
+    /// per-obs baseline-partials array without a mask.
+    ///
+    /// Structural-monotonicity stabilization on `s_i` (see
+    /// `stabilized_structural_derivative`) is applied identically to the
+    /// existing `update_state` path so the residual agrees with the
+    /// NLL that `update_state` evaluates.
+    pub fn offset_channel_residuals(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<OffsetChannelResiduals, EstimationError> {
+        if beta.len() != self.coefficient_dim() {
+            return Err(EstimationError::InvalidInput(
+                "survival beta dimension mismatch in offset_channel_residuals".to_string(),
+            ));
+        }
+        let n = self.nrows();
+        let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.exit_dot(beta) + &self.offset_eta_exit;
+        let derivative_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
+
+        let derivative_guard_numerical = self.derivative_guard_numerical();
+        let mut r_exit = Array1::<f64>::zeros(n);
+        let mut r_entry = Array1::<f64>::zeros(n);
+        let mut r_deriv = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let w = self.sampleweight[i];
+            if w <= 0.0 {
+                continue;
+            }
+            let entry_age = self.age_entry[i];
+            let exit_age = self.age_exit[i];
+            if !entry_age.is_finite() || !exit_age.is_finite() || exit_age < entry_age {
+                return Err(EstimationError::InvalidInput(
+                    "survival ages must be finite with age_exit >= age_entry".to_string(),
+                ));
+            }
+            let has_entry_interval = !self.entry_at_origin[i];
+            let d = f64::from(self.event_target[i]);
+            // Phase-1 values matching update_state:
+            //   w_exit_i  = w · exp(eta_exit)                    → ∂NLL/∂o_X before − δ·w term
+            //   w_entry_i = w · exp(eta_entry) · 1{has_entry}    → matches −∂NLL/∂o_E sign
+            let w_exit_i = w * eta_exit[i].exp();
+            let w_entry_i = if has_entry_interval {
+                w * eta_entry[i].exp()
+            } else {
+                0.0
+            };
+            if !w_exit_i.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "offset_channel_residuals: w*exp(eta_exit)={w_exit_i:.3e} non-finite at row {i}"
+                )));
+            }
+            r_exit[i] = w_exit_i - d * w;
+            r_entry[i] = -w_entry_i;
+            if d > 0.0 {
+                let deriv_raw = derivative_raw[i];
+                let deriv = self
+                    .stabilized_structural_derivative(deriv_raw)
+                    .unwrap_or(deriv_raw);
+                if !deriv.is_finite() || deriv < derivative_guard_numerical {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "offset_channel_residuals: derivative ≤ numerical guard at row {i}: {deriv:.3e}"
+                    )));
+                }
+                r_deriv[i] = -w * d / deriv;
+            }
+        }
+
+        Ok(OffsetChannelResiduals {
+            exit: r_exit,
+            entry: r_entry,
+            derivative: r_deriv,
+        })
+    }
+
     /// Build an [`InnerSolution`](crate::estimate::reml::unified::InnerSolution) from
     /// the survival working state, suitable for the unified REML/LAML evaluator.
     ///
@@ -1943,6 +2067,222 @@ mod tests {
                 .zip(statezero.gradient.iter())
                 .all(|(a, b)| (a - b).abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn offset_channel_residuals_match_central_fd_of_nll() {
+        // Three observations: two events (non-origin entry and origin entry)
+        // and one censored row. This exercises every nonzero channel at least
+        // once: r_exit from all rows, r_entry only from the first (has entry
+        // interval), r_derivative only from events.
+        let age_entry = array![0.5_f64, 0.0, 0.3];
+        let age_exit = array![1.4_f64, 1.0, 2.0];
+        let event_target = array![1u8, 1u8, 0u8];
+        let event_competing = array![0u8, 0u8, 0u8];
+        let sampleweight = array![1.0_f64, 2.5, 0.7];
+        let x_entry = array![
+            [1.0, age_entry[0].ln()],
+            [1.0, age_entry[1].max(1e-8).ln()],
+            [1.0, age_entry[2].ln()]
+        ];
+        let x_exit = array![
+            [1.0, age_exit[0].ln()],
+            [1.0, age_exit[1].ln()],
+            [1.0, age_exit[2].ln()]
+        ];
+        let x_derivative = array![
+            [0.0, 1.0 / age_exit[0]],
+            [0.0, 1.0 / age_exit[1]],
+            [0.0, 1.0 / age_exit[2]]
+        ];
+        // Baseline offsets chosen so η_entry, η_exit, s are all comfortably
+        // away from overflow / monotonicity-violation boundaries.
+        let o_entry = array![0.2_f64, 0.0, 0.1];
+        let o_exit = array![0.4_f64, 0.5, 0.7];
+        let o_deriv = array![0.3_f64, 0.8, 0.5];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let beta = array![-0.7_f64, 0.6];
+
+        let build = |o_e: &Array1<f64>, o_x: &Array1<f64>, o_d: &Array1<f64>| {
+            survival_model_with_offsets(
+                survival_inputs(
+                    &age_entry,
+                    &age_exit,
+                    &event_target,
+                    &event_competing,
+                    &sampleweight,
+                    &x_entry,
+                    &x_exit,
+                    &x_derivative,
+                ),
+                Some(SurvivalBaselineOffsets {
+                    eta_entry: o_e.view(),
+                    eta_exit: o_x.view(),
+                    derivative_exit: o_d.view(),
+                }),
+                penalties.clone(),
+                mono,
+                SurvivalSpec::Net,
+            )
+            .expect("model build")
+        };
+
+        let base = build(&o_entry, &o_exit, &o_deriv);
+        let resid = base
+            .offset_channel_residuals(&beta)
+            .expect("offset residuals");
+        assert_eq!(resid.exit.len(), 3);
+        assert_eq!(resid.entry.len(), 3);
+        assert_eq!(resid.derivative.len(), 3);
+
+        // NLL equals half the deviance returned by update_state; that is the
+        // exact unpenalized loss whose offset partials r_{X,E,D} encode.
+        let nll = |m: &WorkingModelSurvival| 0.5 * m.update_state(&beta).expect("state").deviance;
+        let h = 1e-6;
+
+        // Row 1 (origin entry, event=1) has no entry interval, so r_entry[1]
+        // must be exactly 0. Row 2 (censored) has r_deriv[2] exactly 0. Check
+        // those identities before FD comparison on the nonzero elements.
+        assert_eq!(resid.entry[1], 0.0);
+        assert_eq!(resid.derivative[2], 0.0);
+
+        for i in 0..3 {
+            // exit channel: perturb o_exit[i] alone.
+            {
+                let mut op = o_exit.clone();
+                let mut om = o_exit.clone();
+                op[i] += h;
+                om[i] -= h;
+                let fd = (nll(&build(&o_entry, &op, &o_deriv))
+                    - nll(&build(&o_entry, &om, &o_deriv)))
+                    / (2.0 * h);
+                assert!(
+                    (resid.exit[i] - fd).abs() < 1e-6,
+                    "∂NLL/∂o_X[{i}]: analytic={:.6e} fd={:.6e}",
+                    resid.exit[i],
+                    fd
+                );
+            }
+            // entry channel: only row 0 has an entry interval; for rows with
+            // entry_at_origin the offset contributes nothing to NLL and FD
+            // must also be exactly 0 to numerical precision.
+            {
+                let mut op = o_entry.clone();
+                let mut om = o_entry.clone();
+                op[i] += h;
+                om[i] -= h;
+                let fd = (nll(&build(&op, &o_exit, &o_deriv))
+                    - nll(&build(&om, &o_exit, &o_deriv)))
+                    / (2.0 * h);
+                assert!(
+                    (resid.entry[i] - fd).abs() < 1e-6,
+                    "∂NLL/∂o_E[{i}]: analytic={:.6e} fd={:.6e}",
+                    resid.entry[i],
+                    fd
+                );
+            }
+            // derivative channel: only event rows contribute.
+            {
+                let mut op = o_deriv.clone();
+                let mut om = o_deriv.clone();
+                op[i] += h;
+                om[i] -= h;
+                let fd = (nll(&build(&o_entry, &o_exit, &op))
+                    - nll(&build(&o_entry, &o_exit, &om)))
+                    / (2.0 * h);
+                assert!(
+                    (resid.derivative[i] - fd).abs() < 1e-6,
+                    "∂NLL/∂o_D[{i}]: analytic={:.6e} fd={:.6e}",
+                    resid.derivative[i],
+                    fd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_channel_residuals_respect_zero_sampleweight() {
+        let age_entry = array![1.0_f64, 2.0];
+        let age_exit = array![2.0_f64, 3.5];
+        let event_target = array![1u8, 1u8];
+        let event_competing = array![0u8, 0u8];
+        let sampleweight = array![0.0_f64, 1.2]; // row 0 is excluded by weight
+        let x_entry = array![[1.0, age_entry[0].ln()], [1.0, age_entry[1].ln()]];
+        let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
+        let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let beta = array![-1.0_f64, 0.8];
+
+        let model = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            Some(SurvivalBaselineOffsets {
+                eta_entry: array![0.0_f64, 0.1].view(),
+                eta_exit: array![0.0_f64, 0.2].view(),
+                derivative_exit: array![0.0_f64, 0.1].view(),
+            }),
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("model");
+        let r = model.offset_channel_residuals(&beta).expect("resid");
+        // Row 0 (sampleweight=0) must contribute zero in every channel.
+        assert_eq!(r.exit[0], 0.0);
+        assert_eq!(r.entry[0], 0.0);
+        assert_eq!(r.derivative[0], 0.0);
+        // Row 1 must still carry a nonzero exit-channel residual.
+        assert!(r.exit[1] != 0.0);
+    }
+
+    #[test]
+    fn offset_channel_residuals_reject_beta_dim_mismatch() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sampleweight = array![1.0_f64];
+        let x_entry = array![[1.0, 0.0]];
+        let x_exit = array![[1.0, 0.7]];
+        let x_derivative = array![[0.0, 0.5]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("model");
+        let bad_beta = array![0.0_f64]; // should be length 2
+        let err = model
+            .offset_channel_residuals(&bad_beta)
+            .expect_err("mismatch must error");
+        match err {
+            EstimationError::InvalidInput(msg) => {
+                assert!(msg.contains("beta dimension mismatch"), "msg={msg}")
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]
