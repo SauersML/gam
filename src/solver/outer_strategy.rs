@@ -384,6 +384,53 @@ pub enum Solver {
     /// EFS already computes, so the cost is O(1) H⁻¹ solves per iteration
     /// (same as pure EFS), compared to O(dim(θ)) for full BFGS.
     HybridEfs,
+    /// Opportunistic coordinate compass search (positive basis {±e_i} with
+    /// step contraction). Derivative-free by construction — no gradient
+    /// and no finite differences — so categorically distinct from the
+    /// deprecated FD-BFGS degradation rung.
+    ///
+    /// Reserved for genuinely-derivative-free auxiliary searches
+    /// (baseline-theta for parametric survival baselines, SAS/BetaLogistic
+    /// /Mixture inverse-link parameters) where no analytic
+    /// ∂cost/∂θ is available and the dimension is small (≤ ~5).
+    ///
+    /// The planner only selects this variant when the caller has opted in
+    /// via [`SolverClass::AuxiliaryGradientFree`]; it is NEVER selected
+    /// for the main REML outer. This gate is explicit to prevent the
+    /// silent FD-grad masking failure mode that `automatic_fallback_attempts`
+    /// was tightened to avoid: for the big REML outer, declared-analytic
+    /// gradients must converge on their own merits.
+    ///
+    /// Convergence to a stationary point on any continuously-differentiable
+    /// cost bounded below on a compact box follows from
+    /// Kolda-Lewis-Torczon, SIAM Review 45:385, 2003, Thm 3.3. The theorem
+    /// requires that all 2·dim basis directions are polled before step
+    /// contraction; the dispatcher's sweep loop satisfies this by the
+    /// `!improved ⇒ step /= 2` branch.
+    CompassSearch,
+}
+
+/// Declares which "class" of outer optimization the caller is doing.
+///
+/// The default `Primary` class applies to the main REML outer — the
+/// canonical smoothing-parameter optimization — and has access to
+/// Arc/Bfgs/Efs/HybridEfs according to declared derivatives.
+///
+/// `AuxiliaryGradientFree` unlocks `Solver::CompassSearch` for small-dim
+/// auxiliary pre-optimizations where no analytic ∂cost/∂θ exists (survival
+/// baseline theta, non-standard inverse-link parameters). The planner gates
+/// selection of CompassSearch strictly on this flag; REML builders never
+/// set it, so REML can never be routed to compass search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SolverClass {
+    /// The main REML outer — smoothing parameters and ψ-coords where
+    /// analytic gradient (and typically analytic Hessian) is the contract.
+    #[default]
+    Primary,
+    /// A genuinely-derivative-free low-dim auxiliary search (e.g. survival
+    /// baseline theta). Opts into `Solver::CompassSearch` when gradient is
+    /// Unavailable. Must not be set by REML builders.
+    AuxiliaryGradientFree,
 }
 
 #[inline]
@@ -399,6 +446,9 @@ fn effective_seed_budget(
         (Solver::Arc, crate::seeding::SeedRiskProfile::Survival) => 1,
         (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) if screening_enabled => 1,
         (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) => 2,
+        // Aux direct-search is a single-start low-dim local method; restarting
+        // from another seed would just re-explore the same basin.
+        (Solver::CompassSearch, _) => 1,
         _ => requested_budget,
     };
     requested_budget.min(capped)
@@ -425,6 +475,7 @@ fn expensive_unsuccessful_seed_limit(
         (Solver::Efs | Solver::HybridEfs, _) => Some(1),
         (Solver::Arc, crate::seeding::SeedRiskProfile::Survival) => Some(1),
         (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) => Some(2),
+        (Solver::CompassSearch, _) => Some(1),
         _ => None,
     }
 }
@@ -636,6 +687,37 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             hessian_source: H::BfgsApprox,
         },
     }
+}
+
+/// Plan selection with an explicit [`SolverClass`] opt-in.
+///
+/// For `SolverClass::Primary` this is identical to [`plan`] — the main REML
+/// outer dispatch never changes behavior.
+///
+/// For `SolverClass::AuxiliaryGradientFree` with no declared gradient or
+/// Hessian capability, returns a `Solver::CompassSearch` plan. This is the
+/// sole path by which compass search can be dispatched; the primary REML
+/// builder never sets the aux class, so the direct-search variant cannot
+/// leak into the big REML outer or the automatic fallback cascade.
+///
+/// If the aux class is set but analytic gradient IS available, that is a
+/// caller error (the caller should have used `Primary` and let Arc/Bfgs
+/// handle it); we defer to the standard `plan` in that case so the caller
+/// still gets a well-formed plan rather than a silent mis-dispatch.
+pub fn plan_with_class(cap: &OuterCapability, class: SolverClass) -> OuterPlan {
+    use Derivative::*;
+    if class == SolverClass::AuxiliaryGradientFree
+        && cap.gradient == Unavailable
+        && cap.declared_hessian_for_planning() == Unavailable
+        && !cap.efs_plan_eligible()
+        && !cap.hybrid_efs_plan_eligible()
+    {
+        return OuterPlan {
+            solver: Solver::CompassSearch,
+            hessian_source: HessianSource::BfgsApprox,
+        };
+    }
+    plan(cap)
 }
 
 /// Log the outer optimization plan. Called once per fit at the start of
@@ -1426,6 +1508,91 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
     }
 }
 
+/// Outcome of an auxiliary compass-search run.
+enum CompassSearchOutcome {
+    /// The step length contracted below tolerance with no further improvement
+    /// — i.e. the iterate is a step-minimizer over the positive basis
+    /// {±step·e_i} at scale < step_tol. By Kolda-Lewis-Torczon Thm 3.3 this
+    /// implies first-order stationarity up to the step-tol grid.
+    Converged { point: Array1<f64>, cost: f64, polls: usize },
+    /// The poll budget was exhausted before step contraction reached the
+    /// tolerance. Return the best-seen iterate; caller treats as
+    /// non-converged so log/diagnostics surface the truncation.
+    BudgetExhausted { point: Array1<f64>, cost: f64, polls: usize },
+}
+
+/// Coordinate compass search with bound clamping.
+///
+/// Why this method is correct for derivative-free aux optimization:
+/// the algorithm only compares cost values at polled points. It never
+/// finite-differences a gradient and never feeds approximations into a
+/// gradient-based optimizer. For any continuously differentiable cost
+/// bounded below on the compact box [lower, upper], compass search
+/// converges to a stationary point (Kolda-Lewis-Torczon, SIAM Review
+/// 45:385, 2003, Thm 3.3). The theorem's polling requirement — that
+/// all 2·dim directions ±step·e_i are evaluated before the step
+/// contracts — is satisfied explicitly by the `!improved ⇒ step /= 2`
+/// branch below: if no coordinate probe improved, every probe was
+/// evaluated and rejected.
+///
+/// Error policy: `obj.eval_cost` errors at a probe are treated as
+/// infeasible (the search simply does not accept that point). A genuine
+/// error at the seed itself is surfaced by the caller via the initial
+/// `eval_cost` check, so the helper only runs against a finite seed cost.
+fn compass_search_outer(
+    obj: &mut dyn OuterObjective,
+    mut x: Array1<f64>,
+    mut best_cost: f64,
+    lower: ndarray::ArrayView1<'_, f64>,
+    upper: ndarray::ArrayView1<'_, f64>,
+    init_step: f64,
+    step_tol: f64,
+    max_polls: usize,
+) -> CompassSearchOutcome {
+    for i in 0..x.len() {
+        x[i] = x[i].clamp(lower[i], upper[i]);
+    }
+    let mut step = init_step;
+    let mut polls: usize = 0;
+    while step > step_tol && polls < max_polls {
+        let mut improved = false;
+        'sweep: for i in 0..x.len() {
+            for &sign in &[1.0, -1.0] {
+                if polls >= max_polls {
+                    break 'sweep;
+                }
+                polls += 1;
+                let candidate_i = (x[i] + sign * step).clamp(lower[i], upper[i]);
+                if (candidate_i - x[i]).abs() < step_tol {
+                    continue;
+                }
+                let mut candidate = x.clone();
+                candidate[i] = candidate_i;
+                let probe = obj
+                    .eval_cost(&candidate)
+                    .ok()
+                    .filter(|v| v.is_finite());
+                if let Some(c) = probe
+                    && c < best_cost
+                {
+                    x = candidate;
+                    best_cost = c;
+                    improved = true;
+                    break 'sweep;
+                }
+            }
+        }
+        if !improved {
+            step *= 0.5;
+        }
+    }
+    if step <= step_tol {
+        CompassSearchOutcome::Converged { point: x, cost: best_cost, polls }
+    } else {
+        CompassSearchOutcome::BudgetExhausted { point: x, cost: best_cost, polls }
+    }
+}
+
 fn solution_into_outer_result(
     solution: Solution,
     converged: bool,
@@ -1459,6 +1626,7 @@ struct OuterConfig {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
+    solver_class: SolverClass,
 }
 
 impl Default for OuterConfig {
@@ -1473,6 +1641,7 @@ impl Default for OuterConfig {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+            solver_class: SolverClass::Primary,
         }
     }
 }
@@ -1505,6 +1674,7 @@ pub struct OuterProblem {
     initial_rho: Option<Array1<f64>>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
+    solver_class: SolverClass,
 }
 
 impl OuterProblem {
@@ -1526,6 +1696,7 @@ impl OuterProblem {
             initial_rho: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
+            solver_class: SolverClass::Primary,
         }
     }
 
@@ -1593,6 +1764,16 @@ impl OuterProblem {
         self.screening_cap = Some(screening_cap);
         self
     }
+    /// Opt into a specific solver class. The default is
+    /// [`SolverClass::Primary`] (the main REML outer). Setting
+    /// [`SolverClass::AuxiliaryGradientFree`] unlocks
+    /// [`Solver::CompassSearch`] dispatch for small-dim problems with no
+    /// analytic gradient (survival baseline theta, inverse-link params).
+    /// REML builders must not set this.
+    pub fn with_solver_class(mut self, class: SolverClass) -> Self {
+        self.solver_class = class;
+        self
+    }
 
     /// Derive the capability flags from the builder state.
     /// `fixed_point_available` is set to `false` here; `build_objective`
@@ -1622,6 +1803,7 @@ impl OuterProblem {
             initial_rho: self.initial_rho.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
+            solver_class: self.solver_class,
         }
     }
 
@@ -2075,7 +2257,7 @@ fn run_outer(
 
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
-        let the_plan = plan(&cap);
+        let the_plan = plan_with_class(&cap, config.solver_class);
         return Ok(OuterResult {
             rho: Array1::zeros(0),
             final_value: cost,
@@ -2089,10 +2271,13 @@ fn run_outer(
     }
 
     // Build the ordered list of capabilities to attempt: primary first, then
-    // any centrally-derived degraded capabilities.
-    let fallback_attempts = match config.fallback_policy {
-        FallbackPolicy::Automatic => automatic_fallback_attempts(&cap),
-        FallbackPolicy::Disabled => Vec::new(),
+    // any centrally-derived degraded capabilities. Aux direct-search has no
+    // degraded ladder — a single attempt either succeeds or the failure is
+    // surfaced to the caller.
+    let fallback_attempts = match (config.fallback_policy, config.solver_class) {
+        (FallbackPolicy::Automatic, SolverClass::Primary) => automatic_fallback_attempts(&cap),
+        (FallbackPolicy::Automatic, SolverClass::AuxiliaryGradientFree)
+        | (FallbackPolicy::Disabled, _) => Vec::new(),
     };
     let mut attempts: Vec<OuterCapability> = Vec::with_capacity(1 + fallback_attempts.len());
     attempts.push(cap.clone());
@@ -2103,7 +2288,7 @@ fn run_outer(
     let mut last_error: Option<EstimationError> = None;
 
     for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
-        let the_plan = plan(attempt_cap);
+        let the_plan = plan_with_class(attempt_cap, config.solver_class);
         if attempt_idx > 0 {
             log::info!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
         }
@@ -2520,6 +2705,61 @@ fn run_outer_with_plan(
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                         "hybrid EFS solver failed: {e:?}"
                     ))),
+                }
+            }
+            Solver::CompassSearch => {
+                // Aux direct-search: uses cost values only, never queries
+                // gradient or Hessian. config.tolerance is the step-length
+                // floor, config.max_iter is the total-poll budget.
+                let seed_cost = obj
+                    .eval_cost(&seed)
+                    .map_err(|err| EstimationError::RemlOptimizationFailed(
+                        format!("aux direct-search seed cost failed ({context}): {err}")
+                    ))?;
+                if !seed_cost.is_finite() {
+                    last_seed_error = Some(format!(
+                        "aux direct-search rejects non-finite seed cost ({seed_cost})"
+                    ));
+                    continue 'seed_attempts;
+                }
+                started_seeds += 1;
+                seed_slot = started_seeds;
+                let (lo, hi) = &bounds_template;
+                let outcome = compass_search_outer(
+                    obj,
+                    seed.clone(),
+                    seed_cost,
+                    lo.view(),
+                    hi.view(),
+                    1.0,
+                    config.tolerance,
+                    config.max_iter,
+                );
+                match outcome {
+                    CompassSearchOutcome::Converged { point, cost, polls } => {
+                        Ok(OuterResult {
+                            rho: point,
+                            final_value: cost,
+                            iterations: polls,
+                            final_grad_norm: 0.0,
+                            final_gradient: None,
+                            final_hessian: None,
+                            converged: true,
+                            plan_used: *the_plan,
+                        })
+                    }
+                    CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
+                        Ok(OuterResult {
+                            rho: point,
+                            final_value: cost,
+                            iterations: polls,
+                            final_grad_norm: 0.0,
+                            final_gradient: None,
+                            final_hessian: None,
+                            converged: false,
+                            plan_used: *the_plan,
+                        })
+                    }
                 }
             }
         };
@@ -4025,5 +4265,110 @@ mod tests {
             ),
             3
         );
+    }
+
+    // ─── Gated SolverClass / CompassSearch dispatch ──────────────────────
+
+    fn aux_cap_unavailable(n_params: usize) -> OuterCapability {
+        OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: Derivative::Unavailable,
+            n_params,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        }
+    }
+
+    #[test]
+    fn plan_with_class_primary_is_identical_to_plan_for_unavailable_grad() {
+        // Unavailable-grad capability must still route to BFGS for the
+        // primary class (the runner will then hard-error on the missing
+        // analytic gradient — that behavior is tested elsewhere).
+        let cap = aux_cap_unavailable(3);
+        assert_eq!(plan_with_class(&cap, SolverClass::Primary), plan(&cap));
+    }
+
+    #[test]
+    fn plan_with_class_aux_unavailable_routes_to_compass_search() {
+        let cap = aux_cap_unavailable(3);
+        let p = plan_with_class(&cap, SolverClass::AuxiliaryGradientFree);
+        assert_eq!(p.solver, Solver::CompassSearch);
+    }
+
+    #[test]
+    fn plan_with_class_aux_analytic_grad_defers_to_primary_plan() {
+        // Aux class + analytic gradient is a misuse: the caller should
+        // have used Primary. We defer to the standard plan so the caller
+        // still gets a well-formed result rather than silently being
+        // routed to direct search when a derivative-based solver exists.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 3,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan_with_class(&cap, SolverClass::AuxiliaryGradientFree);
+        assert_eq!(p.solver, Solver::Arc);
+    }
+
+    #[test]
+    fn plan_with_class_aux_efs_eligible_defers_to_primary() {
+        // If the coordinate structure is EFS-eligible, use EFS even if
+        // the caller set Auxiliary — EFS is strictly better than compass
+        // search whenever it applies.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 12,
+            psi_dim: 0,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan_with_class(&cap, SolverClass::AuxiliaryGradientFree);
+        assert_eq!(p.solver, Solver::Efs);
+    }
+
+    #[test]
+    fn automatic_fallback_never_includes_compass_search() {
+        // The fallback cascade must not introduce direct-search for the
+        // primary REML path. Aux direct-search is a single-attempt
+        // method; its dispatch is orthogonal to the fallback ladder.
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Analytic,
+            n_params: 5,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let attempts = automatic_fallback_attempts(&cap);
+        for attempt_cap in &attempts {
+            let p = plan_with_class(attempt_cap, SolverClass::Primary);
+            assert_ne!(p.solver, Solver::CompassSearch);
+        }
+    }
+
+    #[test]
+    fn compass_search_budget_accounts_for_single_seed() {
+        // Aux direct-search is intrinsically a single-seed local method;
+        // generating extra seeds would just duplicate cost.
+        let b = effective_seed_budget(
+            8,
+            Solver::CompassSearch,
+            crate::seeding::SeedRiskProfile::Survival,
+            false,
+        );
+        assert_eq!(b, 1);
     }
 }
