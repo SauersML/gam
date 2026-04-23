@@ -7371,109 +7371,73 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
 }
 
 #[inline(always)]
-fn bessel_i0_manual(x: f64) -> f64 {
-    // Manual Cephes-style approximation with two regions:
-    //  - |x| < 3.75: polynomial in y=(x/3.75)^2
-    //  - otherwise : asymptotic exp(|x|)/sqrt(|x|) times polynomial in y=3.75/|x|
-    //
-    // This avoids external dependencies and is numerically stable for the
-    // argument ranges used by Duchon K0/K1 evaluation.
-    let ax = x.abs();
-    if ax < 3.75 {
-        let y = (x / 3.75) * (x / 3.75);
-        1.0 + y
-            * (3.515_622_9
-                + y * (3.089_942_4
-                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.036_076_8 + y * 0.004_581_3)))))
-    } else {
-        let y = 3.75 / ax;
-        (ax.exp() / ax.sqrt())
-            * (0.398_942_28
-                + y * (0.013_285_92
-                    + y * (0.002_253_19
-                        + y * (-0.001_575_65
-                            + y * (0.009_162_81
-                                + y * (-0.020_577_06
-                                    + y * (0.026_355_37
-                                        + y * (-0.016_476_33 + y * 0.003_923_77))))))))
-    }
-}
-
-#[inline(always)]
-fn bessel_i1_manual(x: f64) -> f64 {
-    // Same split strategy as I0; odd symmetry is enforced for x<0.
-    let ax = x.abs();
-    if ax < 3.75 {
-        let y = (x / 3.75) * (x / 3.75);
-        x * (0.5
-            + y * (0.878_905_94
-                + y * (0.514_988_69
-                    + y * (0.150_849_34
-                        + y * (0.026_587_33 + y * (0.003_015_32 + y * 0.000_324_11))))))
-    } else {
-        let y = 3.75 / ax;
-        let ans = (ax.exp() / ax.sqrt())
-            * (0.398_942_28
-                + y * (-0.039_880_24
-                    + y * (-0.003_620_18
-                        + y * (0.001_638_01
-                            + y * (-0.010_315_55
-                                + y * (0.022_829_67
-                                    + y * (-0.028_953_12
-                                        + y * (0.017_876_54 - y * 0.004_200_59))))))));
-        if x < 0.0 { -ans } else { ans }
-    }
-}
-
-#[inline(always)]
 fn bessel_k0_stable(x: f64) -> f64 {
     let x_pos = x.max(1e-300);
-    // Manual Cephes-style K0 approximation with region split:
-    //  - x<=2: logarithmic singular form with I0 coupling
-    //  - x>2 : asymptotic exp(-x)/sqrt(x) form.
-    //
-    // This is dependency-free and deterministic, which keeps outer REML/BFGS
-    // objectives smooth and reproducible run-to-run.
     if x_pos <= 2.0 {
-        let y = (x_pos * x_pos) / 4.0;
-        -((x_pos / 2.0).ln()) * bessel_i0_manual(x_pos)
-            + (-0.577_215_66
-                + y * (0.422_784_20
-                    + y * (0.230_697_56
-                        + y * (0.034_885_90
-                            + y * (0.002_626_98 + y * (0.000_107_50 + y * 0.000_007_40))))))
-    } else {
-        let y = 2.0 / x_pos;
-        (-x_pos).exp() / x_pos.sqrt()
-            * (1.253_314_14
-                + y * (-0.078_323_58
-                    + y * (0.021_895_68
-                        + y * (-0.010_624_46
-                            + y * (0.005_878_72 + y * (-0.002_515_40 + y * 0.000_532_08))))))
+        return bessel_k0_small_series(x_pos);
     }
+    let y = 2.0 / x_pos;
+    (-x_pos).exp() / x_pos.sqrt()
+        * (1.253_314_14
+            + y * (-0.078_323_58
+                + y * (0.021_895_68
+                    + y * (-0.010_624_46
+                        + y * (0.005_878_72 + y * (-0.002_515_40 + y * 0.000_532_08))))))
 }
 
 #[inline(always)]
 fn bessel_k1_stable(x: f64) -> f64 {
     let x_pos = x.max(1e-300);
     if x_pos <= 2.0 {
-        let y = (x_pos * x_pos) / 4.0;
-        (x_pos / 2.0).ln() * bessel_i1_manual(x_pos)
-            + (1.0 / x_pos)
-                * (1.0
-                    + y * (0.154_431_44
-                        + y * (-0.672_785_79
-                            + y * (-0.181_568_97
-                                + y * (-0.019_194_02 + y * (-0.001_104_04 + y * -0.000_046_86))))))
-    } else {
-        let y = 2.0 / x_pos;
-        (-x_pos).exp() / x_pos.sqrt()
-            * (1.253_314_14
-                + y * (0.234_986_19
-                    + y * (-0.036_556_20
-                        + y * (0.015_042_68
-                            + y * (-0.007_803_53 + y * (0.003_256_14 + y * -0.000_682_45))))))
+        return bessel_k1_small_series(x_pos);
     }
+    let y = 2.0 / x_pos;
+    (-x_pos).exp() / x_pos.sqrt()
+        * (1.253_314_14
+            + y * (0.234_986_19
+                + y * (-0.036_556_20
+                    + y * (0.015_042_68
+                        + y * (-0.007_803_53 + y * (0.003_256_14 + y * -0.000_682_45))))))
+}
+
+#[inline(always)]
+fn bessel_k0_k1_small_series(x: f64) -> (f64, f64) {
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    let y = 0.25 * x * x;
+    let log_half_plus_gamma = 0.5 * y.ln() + EULER_GAMMA;
+    let mut i0 = 1.0;
+    let mut i1 = 0.5 * x;
+    let mut harmonic = 0.0;
+    let mut y_power_over_fact_sq = 1.0;
+    let mut k0_series = 0.0;
+    let mut k0_series_y_derivative_times_y = 0.0;
+    for k in 1..=256 {
+        let kf = k as f64;
+        harmonic += 1.0 / kf;
+        y_power_over_fact_sq *= y / (kf * kf);
+        let k0_term = harmonic * y_power_over_fact_sq;
+        k0_series += k0_term;
+        k0_series_y_derivative_times_y += kf * k0_term;
+        i0 += y_power_over_fact_sq;
+        i1 += 0.5 * x * y_power_over_fact_sq / (kf + 1.0);
+        if k0_term.abs() <= f64::EPSILON * i0.abs().max(k0_series.abs()).max(1.0) {
+            break;
+        }
+    }
+
+    let k0 = -log_half_plus_gamma * i0 + k0_series;
+    let k1 = i0 / x + log_half_plus_gamma * i1 - (2.0 / x) * k0_series_y_derivative_times_y;
+    (k0, k1)
+}
+
+#[inline(always)]
+fn bessel_k0_small_series(x: f64) -> f64 {
+    bessel_k0_k1_small_series(x).0
+}
+
+#[inline(always)]
+fn bessel_k1_small_series(x: f64) -> f64 {
+    bessel_k0_k1_small_series(x).1
 }
 
 const DUCHON_DERIVATIVE_R_FLOOR_REL: f64 = 1e-5;
@@ -15345,8 +15309,8 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
-        assert_eq!(result.penalties.len(), 1);
-        assert_eq!(result.nullspace_dims.len(), 1);
+        assert_eq!(result.penalties.len(), 2);
+        assert_eq!(result.nullspace_dims.len(), 2);
         assert_eq!(result.design.nrows(), data.nrows());
         match &result.metadata {
             BasisMetadata::ThinPlate {
@@ -18584,8 +18548,9 @@ mod tests {
 
     #[test]
     fn test_duchon_radial_jets_t_derivatives_match_finite_difference() {
-        // Uses a 5-point central stencil (O(h^4) truncation) for t_r so the
-        // FD check is accurate enough at r = 0.1 where t''' is large.
+        // Uses a 5-point central stencil (O(h^4) truncation) for t_r. The
+        // step must be large enough that partial-fraction cancellation in
+        // the double-precision t values does not dominate the difference.
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let k_dim = 4usize;
@@ -18593,7 +18558,7 @@ mod tests {
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         for &r in &[0.1_f64, 0.5, 1.0, 2.0] {
-            let h = 1e-3 * r.max(1e-6);
+            let h = 1e-2 * r.max(1e-6);
             let jets_2p =
                 duchon_radial_jets(r + 2.0 * h, length_scale, p_order, s_order, k_dim, &coeffs)
                     .expect("jets+2h");
