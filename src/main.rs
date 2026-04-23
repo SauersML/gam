@@ -77,8 +77,8 @@ use gam::survival_construction::{
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_baseline,
     evaluate_survival_time_basis_row, normalize_survival_time_pair,
-    optimize_survival_baseline_config, parse_survival_baseline_config,
-    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    optimize_survival_baseline_config, parse_survival_baseline_config, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
     survival_likelihood_modename,
@@ -13391,8 +13391,7 @@ mod tests {
         let text = fs::read_to_string(&path).expect("read csv");
         let header = text.lines().next().unwrap_or("");
         assert_eq!(
-            header,
-            "eta,mean,survival_prob,risk_score,failure_prob,mean_lower,mean_upper",
+            header, "eta,mean,survival_prob,risk_score,failure_prob,mean_lower,mean_upper",
             "survival output must include bounds when supplied without effective_se",
         );
 
