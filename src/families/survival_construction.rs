@@ -1408,6 +1408,105 @@ pub fn baseline_offset_theta_partials(
     }
 }
 
+/// Contract `OffsetChannelResiduals` against `baseline_offset_theta_partials`
+/// to produce the closed-form θ-gradient of the unpenalized NLL at converged β.
+///
+/// Derivation (envelope theorem on the penalized objective, β* minimizes the
+/// same cost wrt β and the penalty has no θ dependence):
+///
+///   d[0.5·deviance + 0.5·βᵀS_λβ] / dθ_k
+///     = d[NLL(β*; o(θ))] / dθ_k
+///     = Σᵢ (∂NLL_i/∂o_X[i])·(∂o_X_i/∂θ_k)
+///       + (∂NLL_i/∂o_E[i])·(∂o_E_i/∂θ_k)
+///       + (∂NLL_i/∂o_D[i])·(∂o_D_i/∂θ_k)
+///
+/// The three `∂NLL_i/∂o_channel` terms are the `exit`, `entry`, `derivative`
+/// fields of [`OffsetChannelResiduals`] (sampleweight-scaled already). The
+/// `∂o/∂θ_k` terms come from [`baseline_offset_theta_partials`] per obs at
+/// the appropriate age.
+///
+/// Per the RP offset convention:
+///   o_E[i] = eta_target(age_entry[i])
+///   o_X[i] = eta_target(age_exit[i])
+///   o_D[i] = d/dt eta_target(t) |_{t=age_exit[i]}
+///
+/// so the exit and derivative partials are both evaluated at `age_exit[i]`
+/// and the entry partial at `age_entry[i]`. The origin-entry case
+/// (`entry_at_origin[i]`) has `r_entry[i] = 0` exactly, so we skip the
+/// `baseline_offset_theta_partials(age_entry, ..)` call for those rows
+/// (avoiding the `age > 0` precondition failure when age_entry is 0).
+///
+/// Returns `Ok(None)` when `cfg.target == Linear` (no θ-parameters).
+pub fn baseline_chain_rule_gradient(
+    age_entry: ndarray::ArrayView1<'_, f64>,
+    age_exit: ndarray::ArrayView1<'_, f64>,
+    cfg: &SurvivalBaselineConfig,
+    residuals: &crate::families::survival::OffsetChannelResiduals,
+) -> Result<Option<Array1<f64>>, String> {
+    let n = age_exit.len();
+    if age_entry.len() != n
+        || residuals.exit.len() != n
+        || residuals.entry.len() != n
+        || residuals.derivative.len() != n
+    {
+        return Err(format!(
+            "baseline_chain_rule_gradient: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={})",
+            age_entry.len(),
+            n,
+            residuals.exit.len(),
+            residuals.entry.len(),
+            residuals.derivative.len(),
+        ));
+    }
+    // Probe θ-dim via any valid age. If cfg is Linear the probe returns None
+    // and we short-circuit with no θ-gradient.
+    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
+    let theta_dim = match probe_age {
+        Some(t) => match baseline_offset_theta_partials(t, cfg)? {
+            None => return Ok(None),
+            Some(v) => v.len(),
+        },
+        None => {
+            return Err(
+                "baseline_chain_rule_gradient: no valid positive age for dim probe".to_string(),
+            );
+        }
+    };
+    let mut grad = Array1::<f64>::zeros(theta_dim);
+    for i in 0..n {
+        let t_exit = age_exit[i];
+        // Exit + derivative partials both come from the age_exit evaluation.
+        let partials_exit = baseline_offset_theta_partials(t_exit, cfg)?
+            .ok_or_else(|| "unexpected None from baseline partials at exit".to_string())?;
+        if partials_exit.len() != theta_dim {
+            return Err(format!(
+                "baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
+                partials_exit.len(),
+                theta_dim
+            ));
+        }
+        let r_x = residuals.exit[i];
+        let r_d = residuals.derivative[i];
+        for k in 0..theta_dim {
+            let (d_eta_dk, d_od_dk) = partials_exit[k];
+            grad[k] += r_x * d_eta_dk + r_d * d_od_dk;
+        }
+        // Entry channel is nonzero only for rows with a positive entry
+        // interval; for origin-entry rows age_entry may be 0 and calling
+        // baseline_offset_theta_partials would error. Gate on residual==0.
+        let r_e = residuals.entry[i];
+        if r_e != 0.0 {
+            let t_entry = age_entry[i];
+            let partials_entry = baseline_offset_theta_partials(t_entry, cfg)?
+                .ok_or_else(|| "unexpected None from baseline partials at entry".to_string())?;
+            for k in 0..theta_dim {
+                grad[k] += r_e * partials_entry[k].0;
+            }
+        }
+    }
+    Ok(Some(grad))
+}
+
 /// Shared Gompertz hazard components `(H_G(t), h_G(t))`.
 /// Mirrors the private helper in `evaluate_survival_baseline` with the
 /// same 1e-10 small-shape pivot.
@@ -1897,12 +1996,14 @@ pub fn build_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_offset_theta_partials,
-        build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
-        survival_baseline_config_from_theta, survival_baseline_theta_from_config,
+        SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_chain_rule_gradient,
+        baseline_offset_theta_partials, build_survival_timewiggle_from_baseline,
+        evaluate_survival_baseline, survival_baseline_config_from_theta,
+        survival_baseline_theta_from_config,
     };
+    use crate::families::survival::OffsetChannelResiduals;
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
-    use ndarray::array;
+    use ndarray::{Array1, array};
 
     #[test]
     fn survival_timewiggle_keeps_requested_order_one_penalty() {
@@ -2180,5 +2281,276 @@ mod tests {
         assert!(baseline_offset_theta_partials(0.0, &cfg).is_err());
         assert!(baseline_offset_theta_partials(-1.0, &cfg).is_err());
         assert!(baseline_offset_theta_partials(f64::NAN, &cfg).is_err());
+    }
+
+    // ─── baseline_chain_rule_gradient — mechanical and FD-vs-θ tests ─────
+
+    /// Mechanical sanity check: with only one event observation at known
+    /// (r_X, r_E, r_D, age_exit, age_entry), the Gompertz chain-rule gradient
+    /// reduces to the analytic linear combination of `baseline_offset_theta_partials`.
+    #[test]
+    fn chain_rule_gradient_single_obs_reduces_to_pointwise_contract() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.05),
+            rate: Some(0.3),
+            makeham: None,
+        };
+        let age_entry = array![10.0_f64];
+        let age_exit = array![25.0_f64];
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.7_f64],
+            entry: array![-0.2_f64],
+            derivative: array![-0.4_f64],
+        };
+        let grad = baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("ok")
+        .expect("non-linear");
+        // Hand-compute: grad[k] = r_X·∂eta_exit/∂θ_k + r_D·∂o_D_exit/∂θ_k + r_E·∂eta_entry/∂θ_k.
+        let p_exit = baseline_offset_theta_partials(age_exit[0], &cfg)
+            .unwrap()
+            .unwrap();
+        let p_entry = baseline_offset_theta_partials(age_entry[0], &cfg)
+            .unwrap()
+            .unwrap();
+        for k in 0..p_exit.len() {
+            let expected = 0.7 * p_exit[k].0 + (-0.4) * p_exit[k].1 + (-0.2) * p_entry[k].0;
+            assert!(
+                (grad[k] - expected).abs() < 1e-12,
+                "chain-rule contract mismatch at k={k}: got={:.6e} expected={:.6e}",
+                grad[k],
+                expected
+            );
+        }
+    }
+
+    /// Origin-entry rows (r_entry == 0) must skip the baseline partials call at
+    /// `age_entry = 0`, which would otherwise fail the positive-age precondition.
+    #[test]
+    fn chain_rule_gradient_skips_entry_call_for_origin_entry_rows() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.05),
+            rate: Some(0.3),
+            makeham: None,
+        };
+        let age_entry = array![0.0_f64, 5.0_f64];
+        let age_exit = array![10.0_f64, 20.0_f64];
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.5_f64, 0.3_f64],
+            entry: array![0.0_f64, -0.1_f64], // row 0 is origin-entry (r_E = 0)
+            derivative: array![-0.2_f64, 0.0_f64],
+        };
+        // Must not error despite age_entry[0] == 0.
+        let grad = baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("must not fail on origin-entry row with r_entry=0")
+        .expect("non-linear");
+        assert_eq!(grad.len(), 2);
+        // Row 1's entry channel contributes, row 0's does not.
+        let p_exit_0 = baseline_offset_theta_partials(10.0, &cfg).unwrap().unwrap();
+        let p_exit_1 = baseline_offset_theta_partials(20.0, &cfg).unwrap().unwrap();
+        let p_entry_1 = baseline_offset_theta_partials(5.0, &cfg).unwrap().unwrap();
+        for k in 0..2 {
+            let expected = 0.5 * p_exit_0[k].0
+                + (-0.2) * p_exit_0[k].1
+                + 0.3 * p_exit_1[k].0
+                + (-0.1) * p_entry_1[k].0;
+            assert!(
+                (grad[k] - expected).abs() < 1e-12,
+                "origin-entry contract at k={k}: got={:.6e} expected={:.6e}",
+                grad[k],
+                expected
+            );
+        }
+    }
+
+    /// Linear target has no θ-parameters; contractor returns None.
+    #[test]
+    fn chain_rule_gradient_linear_target_returns_none() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Linear,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        };
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.1_f64],
+            entry: array![0.0_f64],
+            derivative: array![0.0_f64],
+        };
+        let grad = baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("ok");
+        assert!(grad.is_none());
+    }
+
+    /// End-to-end envelope-theorem check: the chain-rule gradient at
+    /// residuals-evaluated-at-β-fixed matches the central FD of the
+    /// unpenalized NLL with respect to θ when the OFFSETS are recomputed
+    /// from the perturbed cfg and β is held at its base value.
+    ///
+    /// This is the mathematical content of the envelope theorem applied to
+    /// the penalized-deviance cost at fixed β: if β solves ∂C/∂β = 0 at
+    /// (θ, β*), then the total derivative of C at (θ±h) when β is held at
+    /// β* equals the partial derivative of C wrt θ at the base — up to
+    /// O(h²) in the truncation error of central differences. For THIS test
+    /// we're directly differencing NLL (the unpenalized piece that carries
+    /// all the θ dependence), so the envelope identity is exact up to FD
+    /// truncation.
+    ///
+    /// The test synthesizes a plausible residual set by hand rather than
+    /// running PIRLS — what we're validating is the chain-rule contractor,
+    /// not the fit. A PIRLS-based end-to-end check belongs in an
+    /// integration test, not this unit-test module.
+    #[test]
+    fn chain_rule_gradient_matches_fd_of_nll_through_offset_perturbation() {
+        // Toy 3-observation case with two events (one origin-entry, one not)
+        // and one censored row at large age.
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.03),
+            rate: Some(0.25),
+            makeham: None,
+        };
+        let age_entry = array![0.0_f64, 5.0, 8.0];
+        let age_exit = array![4.0_f64, 12.0, 20.0];
+        // Weighted residuals at a notional β*. Values chosen in a plausible
+        // range (~same order as w·exp(η)).
+        let weights = array![1.0_f64, 2.0, 0.5];
+        let events = [1.0_f64, 1.0, 0.0];
+        // Fake a β* that yields finite eta_entry ± eta_exit ± s values by
+        // directly specifying eta quantities. Contractor only consumes the
+        // residuals, so the fake is sufficient.
+        let eta_entry_vals = [-100.0_f64, 0.5, 0.8]; // row 0 doesn't matter (origin entry)
+        let eta_exit_vals = [0.4_f64, 0.9, 1.3];
+        let s_vals = [0.7_f64, 1.1, 1.5];
+        let (r_x, r_e, r_d) = {
+            let mut rx = Array1::<f64>::zeros(3);
+            let mut re = Array1::<f64>::zeros(3);
+            let mut rd = Array1::<f64>::zeros(3);
+            for i in 0..3 {
+                let w = weights[i];
+                let d = events[i];
+                rx[i] = w * (eta_exit_vals[i].exp() - d);
+                re[i] = if i == 0 {
+                    0.0 // origin entry
+                } else {
+                    -w * eta_entry_vals[i].exp()
+                };
+                rd[i] = if d > 0.0 { -w * d / s_vals[i] } else { 0.0 };
+            }
+            (rx, re, rd)
+        };
+        let residuals = OffsetChannelResiduals {
+            exit: r_x.clone(),
+            entry: r_e.clone(),
+            derivative: r_d.clone(),
+        };
+        let grad = baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("ok")
+        .expect("non-linear");
+
+        // Construct NLL(θ) with β* held to the same eta/s values by treating
+        // eta_i, s_i as fixed "linear predictor" samples and shifting by
+        // (offset(θ) - offset(θ_base)). That's exactly the RP NLL with β*
+        // held constant and offsets varied through θ.
+        let nll = |theta_plus: &Array1<f64>| -> f64 {
+            let cfg_p =
+                survival_baseline_config_from_theta(cfg.target, theta_plus).expect("cfg_p");
+            let mut sum = 0.0_f64;
+            for i in 0..3 {
+                let (eta_x_p, d_x_p) = evaluate_survival_baseline(age_exit[i], &cfg_p).unwrap();
+                let base = evaluate_survival_baseline(age_exit[i], &cfg).unwrap();
+                let d_eta_x = eta_x_p - base.0;
+                let d_d_x = d_x_p - base.1;
+                let eta_exit_new = eta_exit_vals[i] + d_eta_x;
+                let s_new = s_vals[i] + d_d_x;
+                let interval_entry = if i == 0 {
+                    0.0_f64
+                } else {
+                    let (eta_e_p, _) = evaluate_survival_baseline(age_entry[i], &cfg_p).unwrap();
+                    let base_e = evaluate_survival_baseline(age_entry[i], &cfg).unwrap();
+                    let d_eta_e = eta_e_p - base_e.0;
+                    let eta_entry_new = eta_entry_vals[i] + d_eta_e;
+                    eta_entry_new.exp()
+                };
+                let w = weights[i];
+                let d = events[i];
+                let nll_i =
+                    w * (eta_exit_new.exp() - interval_entry - d * (eta_exit_new + s_new.ln()));
+                sum += nll_i;
+            }
+            sum
+        };
+
+        let theta_base = survival_baseline_theta_from_config(&cfg)
+            .unwrap()
+            .unwrap();
+        let h = 1e-6;
+        for k in 0..theta_base.len() {
+            let mut tp = theta_base.clone();
+            let mut tm = theta_base.clone();
+            tp[k] += h;
+            tm[k] -= h;
+            let fd = (nll(&tp) - nll(&tm)) / (2.0 * h);
+            assert!(
+                (grad[k] - fd).abs() < 1e-5 * grad[k].abs().max(1.0),
+                "chain-rule θ[{k}]: analytic={:.6e} fd={:.6e}",
+                grad[k],
+                fd
+            );
+        }
+    }
+
+    /// Length-mismatch surfaces as an error, not a silent contraction.
+    #[test]
+    fn chain_rule_gradient_rejects_length_mismatch() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.05),
+            rate: Some(0.3),
+            makeham: None,
+        };
+        let age_entry = array![1.0_f64, 2.0]; // length 2
+        let age_exit = array![5.0_f64, 6.0, 7.0]; // length 3
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.1_f64, 0.2, 0.3],
+            entry: array![0.0_f64, 0.0, 0.0],
+            derivative: array![0.0_f64, 0.0, 0.0],
+        };
+        let err = baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect_err("length mismatch must error");
+        assert!(err.contains("length mismatch"), "err={err}");
     }
 }
