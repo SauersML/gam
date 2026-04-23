@@ -940,29 +940,8 @@ impl SpatialLogKappaCoords {
         }
     }
 
-    /// Isotropic lower bounds (backward-compatible): one bound per term.
-    pub(crate) fn lower_bounds(
-        dim: usize,
-        options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
-        Self {
-            values: Array1::<f64>::from_elem(dim, -options.max_length_scale.ln()),
-            dims_per_term: vec![1; dim],
-        }
-    }
-
-    /// Isotropic upper bounds (backward-compatible): one bound per term.
-    pub(crate) fn upper_bounds(
-        dim: usize,
-        options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
-        Self {
-            values: Array1::<f64>::from_elem(dim, -options.min_length_scale.ln()),
-            dims_per_term: vec![1; dim],
-        }
-    }
-
     /// Anisotropic-aware lower bounds: one bound per stored ψ coordinate.
+    #[cfg(test)]
     pub(crate) fn lower_bounds_aniso(
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
@@ -975,6 +954,7 @@ impl SpatialLogKappaCoords {
     }
 
     /// Anisotropic-aware upper bounds: one bound per stored ψ coordinate.
+    #[cfg(test)]
     pub(crate) fn upper_bounds_aniso(
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,

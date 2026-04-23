@@ -25,7 +25,6 @@ use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::any::Any;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4612,85 +4611,6 @@ fn total_quadratic_penalty(
     total
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RidgedSurrogateRemlGuardState {
-    warning_limit: usize,
-    warning_count: usize,
-}
-
-thread_local! {
-    static RIDGED_SURROGATE_REML_GUARD: RefCell<Option<RidgedSurrogateRemlGuardState>> =
-        const { RefCell::new(None) };
-}
-
-const RIDGED_SURROGATE_REML_WARNING_ABORT_LIMIT: usize = 8;
-
-fn with_ridged_surrogate_reml_guard<T>(
-    warning_limit: usize,
-    f: impl FnOnce() -> Result<T, String>,
-) -> Result<(T, usize), String> {
-    RIDGED_SURROGATE_REML_GUARD.with(|guard| {
-        let previous = {
-            let mut slot = guard.borrow_mut();
-            (*slot).replace(RidgedSurrogateRemlGuardState {
-                warning_limit,
-                warning_count: 0,
-            })
-        };
-
-        let result = f();
-        let warning_count = guard
-            .borrow()
-            .as_ref()
-            .map(|state| state.warning_count)
-            .unwrap_or(0);
-        *guard.borrow_mut() = previous;
-        result.map(|value| (value, warning_count))
-    })
-}
-
-fn ridged_surrogate_reml_warning_counter_suffix(
-    warning_idx: usize,
-    warning_limit: Option<usize>,
-) -> String {
-    match warning_limit {
-        Some(limit) => format!(", warning {warning_idx}/{limit}"),
-        None => String::new(),
-    }
-}
-fn record_ridged_surrogate_reml_warning(n_negative: usize, ridge: f64) -> Result<(), String> {
-    let mut warning_idx = None;
-    let mut warning_limit = None;
-    RIDGED_SURROGATE_REML_GUARD.with(|guard| {
-        let mut slot = guard.borrow_mut();
-        if let Some(state) = slot.as_mut() {
-            state.warning_count += 1;
-            warning_idx = Some(state.warning_count);
-            warning_limit = Some(state.warning_limit);
-        }
-    });
-
-    let warning_idx = warning_idx.unwrap_or(1);
-    let counter_suffix = ridged_surrogate_reml_warning_counter_suffix(warning_idx, warning_limit);
-    log::warn!(
-        "[RidgedSurrogateReml] Hessian has {} negative eigenvalue(s) after ridging \
-         (ridge={:.2e}{}). The Laplace approximation \
-         is not valid in these directions; the surrogate objective ignores them.",
-        n_negative,
-        ridge,
-        counter_suffix,
-    );
-    if warning_limit.is_some_and(|limit| warning_idx >= limit) {
-        return Err(format!(
-            "{} custom-family EFS aborted after {warning_idx} repeated \
-             surrogate positive-part Hessian warnings (ridge={ridge:.2e}); \
-             degrade to a first-order outer plan",
-            crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER,
-        ));
-    }
-    Ok(())
-}
-
 fn stable_logdet_with_ridge_policy(
     matrix: &Array2<f64>,
     ridge_floor: f64,
@@ -4749,8 +4669,7 @@ fn stable_logdet_with_ridge_policy(
                         .map(|sl| sl.to_vec())
                         .unwrap_or_else(|| evals.iter().copied().collect());
                     let eps = spectral_epsilon(&eval_vec).max(ridge.max(1e-14));
-                    let n_negative =
-                        eval_vec.iter().filter(|&&ev| ev < -eps).count();
+                    let n_negative = eval_vec.iter().filter(|&&ev| ev < -eps).count();
                     if n_negative > 0 {
                         // Diagnostic only: indefiniteness is now handled
                         // correctly by the smooth regularizer, not ignored.
@@ -8089,169 +8008,163 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
-    let (efs_eval, surrogate_warning_count) = with_ridged_surrogate_reml_guard(
-        RIDGED_SURROGATE_REML_WARNING_ABORT_LIMIT,
-        || {
-            if let Some(joint_bundle) =
-                build_joint_hessian_closures(family, &inner.block_states, specs, total)?
-            {
-                let JointHessianBundle {
-                    source: h_joint_unpen,
-                    beta_flat,
-                    compute_dh,
-                    compute_d2h,
-                    rho_curvature_scale,
-                    hessian_logdet_correction,
-                } = joint_bundle;
-                joint_outer_evaluate_efs(
-                    &inner,
-                    specs,
-                    &per_block,
-                    rho,
-                    &beta_flat,
-                    h_joint_unpen,
-                    &ranges,
-                    total,
-                    ridge,
-                    moderidge,
-                    extra_logdet_ridge,
-                    rho_curvature_scale,
-                    hessian_logdet_correction,
-                    include_logdet_h,
-                    include_logdet_s,
-                    strict_spd,
-                    options,
-                    family.pseudo_logdet_mode(),
-                    compute_dh.as_ref(),
-                    compute_d2h.as_ref(),
-                    None,
-                    None,
-                    None,
-                )
-            } else {
-                if family.requires_joint_outer_hyper_path() {
-                    return Err(
+    let efs_eval = {
+        if let Some(joint_bundle) =
+            build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+        {
+            let JointHessianBundle {
+                source: h_joint_unpen,
+                beta_flat,
+                compute_dh,
+                compute_d2h,
+                rho_curvature_scale,
+                hessian_logdet_correction,
+            } = joint_bundle;
+            joint_outer_evaluate_efs(
+                &inner,
+                specs,
+                &per_block,
+                rho,
+                &beta_flat,
+                h_joint_unpen,
+                &ranges,
+                total,
+                ridge,
+                moderidge,
+                extra_logdet_ridge,
+                rho_curvature_scale,
+                hessian_logdet_correction,
+                include_logdet_h,
+                include_logdet_s,
+                strict_spd,
+                options,
+                family.pseudo_logdet_mode(),
+                compute_dh.as_ref(),
+                compute_d2h.as_ref(),
+                None,
+                None,
+                None,
+            )
+        } else {
+            if family.requires_joint_outer_hyper_path() {
+                return Err(
                         "outer hyper fixed-point evaluation requires a joint exact path for this family"
                             .to_string(),
                     );
-                }
-                if specs.len() != 1 {
-                    return Err(
+            }
+            if specs.len() != 1 {
+                return Err(
                         "generic fixed-point outer fallback is only valid for single-block families; multi-block families must provide a joint outer path"
                             .to_string(),
                     );
-                }
+            }
 
-                let eval = family.evaluate(&inner.block_states)?;
-                let block_idx = 0;
-                let spec = &specs[block_idx];
-                let work = &eval.blockworking_sets[block_idx];
-                let p = spec.design.ncols();
-                let mut diagonal_design = None::<DesignMatrix>;
-                let h_joint_unpen = match work {
+            let eval = family.evaluate(&inner.block_states)?;
+            let block_idx = 0;
+            let spec = &specs[block_idx];
+            let work = &eval.blockworking_sets[block_idx];
+            let p = spec.design.ncols();
+            let mut diagonal_design = None::<DesignMatrix>;
+            let h_joint_unpen = match work {
+                BlockWorkingSet::Diagonal {
+                    working_response: _,
+                    working_weights,
+                } => with_block_geometry(
+                    family,
+                    &inner.block_states,
+                    spec,
+                    block_idx,
+                    |x_dyn, _| {
+                        let w = floor_positiveworking_weights(working_weights, options.minweight);
+                        let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+                        diagonal_design = Some(x_dyn.clone());
+                        Ok(xtwx)
+                    },
+                )?,
+                BlockWorkingSet::ExactNewton {
+                    gradient: _,
+                    hessian,
+                } => {
+                    if hessian.nrows() != p || hessian.ncols() != p {
+                        return Err(format!(
+                            "block {block_idx} exact-newton Hessian shape mismatch in fixed-point outer evaluation: got {}x{}, expected {}x{}",
+                            hessian.nrows(),
+                            hessian.ncols(),
+                            p,
+                            p
+                        ));
+                    }
+                    hessian.to_dense()
+                }
+            };
+            let beta_flat = inner.block_states[block_idx].beta.clone();
+            let compute_dh = |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                if !include_logdet_h {
+                    return Ok(None);
+                }
+                match work {
+                    BlockWorkingSet::ExactNewton { .. } => {
+                        match family.exact_newton_hessian_directional_derivative(
+                            &inner.block_states,
+                            block_idx,
+                            direction,
+                        )? {
+                            Some(h_exact) => {
+                                Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                                    h_exact,
+                                    p,
+                                    &format!(
+                                        "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
+                                    ),
+                                )?)))
+                            }
+                            None => Err(format!(
+                                "missing exact-newton dH callback for block {block_idx} while fixed-point evaluation requires H_beta term"
+                            )),
+                        }
+                    }
                     BlockWorkingSet::Diagonal {
                         working_response: _,
                         working_weights,
-                    } => with_block_geometry(
-                        family,
-                        &inner.block_states,
-                        spec,
-                        block_idx,
-                        |x_dyn, _| {
-                            let w =
-                                floor_positiveworking_weights(working_weights, options.minweight);
-                            let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
-                            diagonal_design = Some(x_dyn.clone());
-                            Ok(xtwx)
-                        },
-                    )?,
-                    BlockWorkingSet::ExactNewton {
-                        gradient: _,
-                        hessian,
                     } => {
-                        if hessian.nrows() != p || hessian.ncols() != p {
-                            return Err(format!(
-                                "block {block_idx} exact-newton Hessian shape mismatch in fixed-point outer evaluation: got {}x{}, expected {}x{}",
-                                hessian.nrows(),
-                                hessian.ncols(),
-                                p,
-                                p
-                            ));
-                        }
-                        hessian.to_dense()
-                    }
-                };
-                let beta_flat = inner.block_states[block_idx].beta.clone();
-                let compute_dh =
-                    |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-                        if !include_logdet_h {
-                            return Ok(None);
-                        }
-                        match work {
-                            BlockWorkingSet::ExactNewton { .. } => {
-                                match family.exact_newton_hessian_directional_derivative(
-                                    &inner.block_states,
-                                    block_idx,
-                                    direction,
-                                )? {
-                                    Some(h_exact) => Ok(Some(DriftDerivResult::Dense(
-                                        symmetrized_square_matrix(
-                                            h_exact,
-                                            p,
-                                            &format!(
-                                                "block {block_idx} exact-newton dH shape mismatch in fixed-point outer evaluation"
-                                            ),
-                                        )?,
-                                    ))),
-                                    None => Err(format!(
-                                        "missing exact-newton dH callback for block {block_idx} while fixed-point evaluation requires H_beta term"
-                                    )),
-                                }
-                            }
-                            BlockWorkingSet::Diagonal {
-                                working_response: _,
-                                working_weights,
-                            } => {
-                                let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                        let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                                     format!(
                                         "missing dynamic design for block {block_idx} diagonal fixed-point correction"
                                     )
                                 })?;
-                                let wwork = floor_positiveworking_weights(
-                                    working_weights,
-                                    options.minweight,
-                                );
-                                let x_dense = x_dyn.to_dense();
-                                let n = x_dense.nrows();
+                        let wwork =
+                            floor_positiveworking_weights(working_weights, options.minweight);
+                        let x_dense = x_dyn.to_dense();
+                        let n = x_dense.nrows();
 
-                                let mut d_eta = x_dyn.matrixvectormultiply(direction);
-                                let geom = family.block_geometry_directional_derivative(
-                                    &inner.block_states,
-                                    block_idx,
-                                    spec,
-                                    direction,
-                                )?;
-                                let mut correction_mat = Array2::<f64>::zeros((p, p));
+                        let mut d_eta = x_dyn.matrixvectormultiply(direction);
+                        let geom = family.block_geometry_directional_derivative(
+                            &inner.block_states,
+                            block_idx,
+                            spec,
+                            direction,
+                        )?;
+                        let mut correction_mat = Array2::<f64>::zeros((p, p));
 
-                                if let Some(geom_dir) = geom {
-                                    d_eta += &geom_dir.d_offset;
-                                    if let Some(dx) = geom_dir.d_design {
-                                        d_eta += &dx.dot(&beta_flat);
-                                        let mut wx = x_dense.clone();
-                                        let mut wdx = dx.clone();
-                                        for i in 0..n {
-                                            let wi = wwork[i];
-                                            if wi != 1.0 {
-                                                wx.row_mut(i).mapv_inplace(|v| v * wi);
-                                                wdx.row_mut(i).mapv_inplace(|v| v * wi);
-                                            }
-                                        }
-                                        correction_mat += &dx.t().dot(&wx);
-                                        correction_mat += &x_dense.t().dot(&wdx);
+                        if let Some(geom_dir) = geom {
+                            d_eta += &geom_dir.d_offset;
+                            if let Some(dx) = geom_dir.d_design {
+                                d_eta += &dx.dot(&beta_flat);
+                                let mut wx = x_dense.clone();
+                                let mut wdx = dx.clone();
+                                for i in 0..n {
+                                    let wi = wwork[i];
+                                    if wi != 1.0 {
+                                        wx.row_mut(i).mapv_inplace(|v| v * wi);
+                                        wdx.row_mut(i).mapv_inplace(|v| v * wi);
                                     }
                                 }
+                                correction_mat += &dx.t().dot(&wx);
+                                correction_mat += &x_dense.t().dot(&wdx);
+                            }
+                        }
 
-                                let dw = family
+                        let dw = family
                                     .diagonalworking_weights_directional_derivative(
                                         &inner.block_states,
                                         block_idx,
@@ -8262,61 +8175,53 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                                             "missing diagonal dW callback for block {block_idx} while fixed-point evaluation requires H_beta term"
                                         )
                                     })?;
-                                if dw.len() != n {
-                                    return Err(format!(
-                                        "block {block_idx} diagonal dW length mismatch in fixed-point outer evaluation: got {}, expected {}",
-                                        dw.len(),
-                                        n
-                                    ));
-                                }
-                                let mut scaled_x = x_dense.clone();
-                                for i in 0..n {
-                                    scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
-                                }
-                                correction_mat += &x_dense.t().dot(&scaled_x);
-
-                                Ok(Some(DriftDerivResult::Dense(correction_mat)))
-                            }
+                        if dw.len() != n {
+                            return Err(format!(
+                                "block {block_idx} diagonal dW length mismatch in fixed-point outer evaluation: got {}, expected {}",
+                                dw.len(),
+                                n
+                            ));
                         }
-                    };
-                let compute_d2h =
-                    |_: &Array1<f64>,
-                     _: &Array1<f64>|
-                     -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-                joint_outer_evaluate_efs(
-                    &inner,
-                    specs,
-                    &per_block,
-                    rho,
-                    &beta_flat,
-                    JointHessianSource::Dense(h_joint_unpen),
-                    &ranges,
-                    total,
-                    ridge,
-                    moderidge,
-                    extra_logdet_ridge,
-                    1.0,
-                    0.0,
-                    include_logdet_h,
-                    include_logdet_s,
-                    strict_spd,
-                    options,
-                    family.pseudo_logdet_mode(),
-                    &compute_dh,
-                    &compute_d2h,
-                    None,
-                    None,
-                    None,
-                )
-            }
-        },
-    )?;
-    if surrogate_warning_count > 0 {
-        log::info!(
-            "[custom-family outer] rho-only EFS evaluation encountered \
-             {surrogate_warning_count} surrogate positive-part Hessian warning(s)"
-        );
-    }
+                        let mut scaled_x = x_dense.clone();
+                        for i in 0..n {
+                            scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
+                        }
+                        correction_mat += &x_dense.t().dot(&scaled_x);
+
+                        Ok(Some(DriftDerivResult::Dense(correction_mat)))
+                    }
+                }
+            };
+            let compute_d2h = |_: &Array1<f64>,
+                               _: &Array1<f64>|
+             -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+            joint_outer_evaluate_efs(
+                &inner,
+                specs,
+                &per_block,
+                rho,
+                &beta_flat,
+                JointHessianSource::Dense(h_joint_unpen),
+                &ranges,
+                total,
+                ridge,
+                moderidge,
+                extra_logdet_ridge,
+                1.0,
+                0.0,
+                include_logdet_h,
+                include_logdet_s,
+                strict_spd,
+                options,
+                family.pseudo_logdet_mode(),
+                &compute_dh,
+                &compute_d2h,
+                None,
+                None,
+                None,
+            )
+        }
+    }?;
 
     let warm = ConstrainedWarmStart {
         rho: rho.clone(),
@@ -9919,41 +9824,32 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         hessian_workspace,
     );
 
-    let (efs_eval, surrogate_warning_count) =
-        with_ridged_surrogate_reml_guard(RIDGED_SURROGATE_REML_WARNING_ABORT_LIMIT, || {
-            joint_outer_evaluate_efs(
-                &inner,
-                specs,
-                &per_block,
-                rho_current,
-                &beta_flat,
-                h_joint_unpen,
-                &ranges,
-                total,
-                ridge,
-                moderidge,
-                extra_logdet_ridge,
-                rho_curvature_scale,
-                hessian_logdet_correction,
-                include_logdet_h,
-                include_logdet_s,
-                strict_spd,
-                options,
-                family.pseudo_logdet_mode(),
-                &compute_dh,
-                &compute_d2h,
-                Some(owned_compute_dh),
-                Some(owned_compute_d2h),
-                Some(ext_bundle),
-            )
-        })
-        .map_err(CustomFamilyError::from)?;
-    if surrogate_warning_count > 0 {
-        log::info!(
-            "[custom-family outer] joint EFS evaluation encountered \
-             {surrogate_warning_count} surrogate positive-part Hessian warning(s)"
-        );
-    }
+    let efs_eval = joint_outer_evaluate_efs(
+        &inner,
+        specs,
+        &per_block,
+        rho_current,
+        &beta_flat,
+        h_joint_unpen,
+        &ranges,
+        total,
+        ridge,
+        moderidge,
+        extra_logdet_ridge,
+        rho_curvature_scale,
+        hessian_logdet_correction,
+        include_logdet_h,
+        include_logdet_s,
+        strict_spd,
+        options,
+        family.pseudo_logdet_mode(),
+        &compute_dh,
+        &compute_d2h,
+        Some(owned_compute_dh),
+        Some(owned_compute_d2h),
+        Some(ext_bundle),
+    )
+    .map_err(CustomFamilyError::from)?;
 
     let warm = ConstrainedWarmStart {
         rho: rho_current.clone(),
@@ -12473,19 +12369,6 @@ mod tests {
         assert!(
             (logdet - expected).abs() < 1e-10,
             "logdet={logdet}, expected={expected}"
-        );
-    }
-
-    #[test]
-    fn ridged_surrogate_warning_suffix_omits_unbounded_counter() {
-        assert_eq!(ridged_surrogate_reml_warning_counter_suffix(1, None), "");
-    }
-
-    #[test]
-    fn ridged_surrogate_warning_suffix_formats_bounded_counter() {
-        assert_eq!(
-            ridged_surrogate_reml_warning_counter_suffix(3, Some(8)),
-            ", warning 3/8"
         );
     }
 

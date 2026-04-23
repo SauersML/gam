@@ -1480,21 +1480,6 @@ mod tests {
             &s_tau_mats,
         );
 
-        let cfg_no_firth = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
-            1e-10,
-            false,
-        )
-        .with_max_iterations(500);
-        let state_no_firth = build_logit_state(&y, &w, &x, &s0, &cfg_no_firth);
-        let (_, _, h_full_no_firth) =
-            compute_joint_hypercostgradienthessian(&state_no_firth, &theta, rho.len(), &hyper_dirs)
-                .expect("joint hyper cost+gradient+hessian without firth");
-        let h_tt_no_firth = h_full_no_firth.slice(s![rho.len().., rho.len()..]).to_owned();
-        eprintln!(
-            "debug tau-tau analytic={h_tt_analytic:?} fd={h_ttfd:?} no_firth={h_tt_no_firth:?}"
-        );
-
         let num = (&h_tt_analytic - &h_ttfd)
             .iter()
             .map(|v| v * v)

@@ -2729,7 +2729,12 @@ pub fn fit_transformation_normal(
         &spatial_terms,
         kappa_options,
     )
-    .reseed_from_data(covariate_data, covariate_spec, &spatial_terms, kappa_options);
+    .reseed_from_data(
+        covariate_data,
+        covariate_spec,
+        &spatial_terms,
+        kappa_options,
+    );
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         covariate_data,

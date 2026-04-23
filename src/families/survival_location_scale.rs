@@ -9197,6 +9197,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             .assign(&wiggle_rho0);
     }
     let joint_setup = build_survival_two_block_exact_joint_setup(
+        data.view(),
         &spec.thresholdspec,
         &spec.log_sigmaspec,
         rho0,
