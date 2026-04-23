@@ -1195,6 +1195,42 @@ mod tests {
     }
 
     #[test]
+    fn run_nuts_sampling_rejects_invalid_target_accept() {
+        let x = array![[1.0], [1.0], [1.0]];
+        let y = array![0.5, -0.5, 1.0];
+        let weights = array![1.0, 1.0, 1.0];
+        let penalty = array![[0.25]];
+        let mode = array![0.0];
+        let hessian = array![[1.25]];
+        let cfg = NutsConfig {
+            n_samples: 10,
+            nwarmup: 10,
+            n_chains: 1,
+            target_accept: 1.0,
+            seed: 222,
+        };
+
+        let err = super::run_nuts_sampling(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            hessian.view(),
+            NutsFamily::Gaussian,
+            1.0,
+            false,
+            &cfg,
+        )
+        .expect_err("invalid target_accept should be rejected before sampling");
+
+        assert!(
+            err.contains("target_accept must be finite and lie in (0, 1)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn joint_hmc_boundary_rejects_nonlogit_firth_family() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 2.0, 0.0, 3.0];
@@ -2063,6 +2099,16 @@ fn default_nuts_seed() -> u64 {
     42
 }
 
+fn validate_nuts_target_accept(target_accept: f64) -> Result<(), String> {
+    if target_accept.is_finite() && target_accept > 0.0 && target_accept < 1.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "NUTS target_accept must be finite and lie in (0, 1), got {target_accept}"
+        ))
+    }
+}
+
 fn robust_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig {
     if nwarmup < 80 {
         return NUTSMassMatrixConfig::disabled();
@@ -2559,6 +2605,7 @@ pub(crate) fn run_nuts_sampling(
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     validate_firth_support(nuts_family, firth_bias_reduction)?;
+    validate_nuts_target_accept(config.target_accept)?;
     let dim = mode.len();
 
     // Create posterior target with analytical gradients. When Firth is enabled,
@@ -3219,6 +3266,7 @@ pub fn run_link_wiggle_nuts_sampling(
     scale: f64,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
+    validate_nuts_target_accept(config.target_accept)?;
     let dim = mode_beta.len() + mode_theta.len();
     let target = LinkWigglePosterior::new(
         x,
@@ -4011,6 +4059,7 @@ pub fn run_joint_beta_rho_sampling(
     config: &NutsConfig,
 ) -> Result<JointBetaRhoResult, String> {
     validate_firth_likelihood_support(inputs.likelihood_family, inputs.firth_bias_reduction)?;
+    validate_nuts_target_accept(config.target_accept)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();
     let total_dim = n_beta + n_rho;
@@ -4310,6 +4359,7 @@ mod survival_hmc {
         hessian: ArrayView2<f64>,
         config: &NutsConfig,
     ) -> Result<NutsResult, String> {
+        validate_nuts_target_accept(config.target_accept)?;
         // Create posterior target
         let target = SurvivalPosterior::new(
             age_entry,
