@@ -9974,11 +9974,15 @@ fn prediction_backend_from_model<'a>(
         return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
     }
     if let Some(hessian) = fit.penalized_hessian() {
-        if let Ok(backend) = PredictionCovarianceBackend::from_factorized_hessian(
-            SymmetricMatrix::Dense(hessian.clone()),
-        ) {
-            return Ok(backend);
-        }
+        // Surface the factorization error directly rather than swallowing it
+        // and reporting the generic "model is missing either ..." message.
+        // When the saved Hessian exists but cannot be factored (indefinite,
+        // numerically degenerate, etc.) the user needs to see *why*, not a
+        // confused "refit" instruction that doesn't match the real fault.
+        return PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
+            hessian.clone(),
+        ))
+        .map_err(|e| format!("failed to factor saved penalized Hessian for prediction: {e}"));
     }
     Err(
         "nonlinear posterior-mean prediction requires either covariance or a saved penalized Hessian; refit model with current CLI"
