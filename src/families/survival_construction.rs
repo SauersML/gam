@@ -2020,12 +2020,30 @@ mod tests {
 
     /// Central-difference of (eta, o_D) at fixed age wrt each θ component in
     /// the theta layout defined by `survival_baseline_theta_from_config`.
-    fn fd_baseline_offset(age: f64, cfg: &SurvivalBaselineConfig, h: f64) -> Vec<(f64, f64)> {
+    ///
+    /// `steps` is per-θ-component: the caller picks the step size appropriate
+    /// for each channel. Gompertz / Gompertz–Makeham need a tiny step on the
+    /// shape channel near the Taylor pivot |shape| < 1e-10 (so θ±h stays on
+    /// the same branch), but a normal-scale step on log_rate / log_makeham;
+    /// using the tiny shape-step on every channel corrupts the log_rate
+    /// channel with `eps/(2h)` cancellation noise and has nothing to do with
+    /// correctness of the analytic derivative.
+    fn fd_baseline_offset(
+        age: f64,
+        cfg: &SurvivalBaselineConfig,
+        steps: &[f64],
+    ) -> Vec<(f64, f64)> {
         let theta = survival_baseline_theta_from_config(cfg)
             .expect("theta")
             .expect("non-linear baseline");
+        assert_eq!(
+            steps.len(),
+            theta.len(),
+            "fd_baseline_offset: step vector length must match θ dimension"
+        );
         (0..theta.len())
             .map(|k| {
+                let h = steps[k];
                 let mut theta_plus = theta.clone();
                 theta_plus[k] += h;
                 let mut theta_minus = theta.clone();
@@ -2080,9 +2098,11 @@ mod tests {
                 .expect("non-linear");
             // Keep the FD probe inside the Taylor branch for tiny |shape| so
             // the numeric derivative matches the same small-shape map as the
-            // analytic helper.
-            let h = if shape.abs() < 1e-9 { 1e-11 } else { 1e-5 };
-            let fd = fd_baseline_offset(age, &cfg, h);
+            // analytic helper. log_rate always uses the normal step — rate
+            // is a moderate-scale parameter and a 1e-11 step would swamp the
+            // FD with cancellation noise.
+            let h_shape = if shape.abs() < 1e-9 { 1e-11 } else { 1e-5 };
+            let fd = fd_baseline_offset(age, &cfg, &[1e-5, h_shape]);
             assert_eq!(analytic.len(), 2);
             // Gompertz θ=(log_rate, shape). Rate channel: ∂eta/∂log_rate=1, ∂o_D/∂log_rate=0.
             assert_close(
@@ -2189,7 +2209,7 @@ mod tests {
             let analytic = baseline_offset_theta_partials(age, &cfg)
                 .expect("ok")
                 .expect("nl");
-            let fd = fd_baseline_offset(age, &cfg, 1e-5);
+            let fd = fd_baseline_offset(age, &cfg, &[1e-5, 1e-5]);
             assert_eq!(analytic.len(), 2);
             for k in 0..2 {
                 assert_close(
@@ -2231,8 +2251,11 @@ mod tests {
             let analytic = baseline_offset_theta_partials(age, &cfg)
                 .expect("ok")
                 .expect("nl");
-            let h = if shape.abs() < 1e-9 { 1e-11 } else { 1e-5 };
-            let fd = fd_baseline_offset(age, &cfg, h);
+            // See gompertz_offset_partials_match_central_diff: tiny shape-step
+            // is only needed for the shape component; log_rate and
+            // log_makeham take the normal-scale step.
+            let h_shape = if shape.abs() < 1e-9 { 1e-11 } else { 1e-5 };
+            let fd = fd_baseline_offset(age, &cfg, &[1e-5, h_shape, 1e-5]);
             assert_eq!(analytic.len(), 3);
             for k in 0..3 {
                 assert_close(
