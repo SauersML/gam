@@ -13,7 +13,6 @@ use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
     KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
-use crate::estimate::EstimationError;
 use crate::families::gamlss::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
