@@ -9032,12 +9032,26 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx == Self::BLOCK_TIME
             && let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref()
         {
-            if beta.len() == lower_bounds.len() {
-                for j in 0..beta.len() {
-                    let lb = lower_bounds[j];
-                    if lb.is_finite() && beta[j] < lb {
-                        beta[j] = lb;
-                    }
+            // Dim mismatch here means the caller and the structural bound
+            // vector disagree about the block's coefficient count — the
+            // projection has no consistent interpretation in that state.
+            // Silently skipping would turn the structural lower-bound
+            // guarantee into a no-op and let β drift below the bound on
+            // the very next line-search step, which downstream
+            // `max_feasible_time_step` then rejects with an opaque
+            // "current time coefficient violates structural lower bound"
+            // error.  Fail fast with a precise, actionable message.
+            if beta.len() != lower_bounds.len() {
+                return Err(format!(
+                    "survival location-scale time post-update dimension mismatch: beta={}, bounds={}",
+                    beta.len(),
+                    lower_bounds.len()
+                ));
+            }
+            for j in 0..beta.len() {
+                let lb = lower_bounds[j];
+                if lb.is_finite() && beta[j] < lb {
+                    beta[j] = lb;
                 }
             }
         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
