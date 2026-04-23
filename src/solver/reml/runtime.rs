@@ -4226,16 +4226,19 @@ impl<'a> RemlState<'a> {
     ///
     /// Scalars (`a`, `ld_s`) and semantic flags (`b_depends_on_beta`,
     /// `is_penalty_like`) are basis-invariant by construction.  The
-    /// `HyperCoordDrift::block_local` and `operator` variants are never
-    /// emitted by the link-ext builders (they use only `from_dense`), so
-    /// only `drift.dense` needs rotation.
+    /// `HyperCoordDrift::block_local` and `operator` variants are not
+    /// handled by this helper — the link-ext builders must emit only
+    /// the `dense` variant (`HyperCoordDrift::from_dense`), and the
+    /// helper returns an error if that invariant is broken so a future
+    /// builder change trips it immediately rather than silently
+    /// regressing SAS/mixture optimisation.
     fn rotate_link_ext_coords_to_original(
         &self,
         bundle: &EvalShared,
         coords: &mut [super::unified::HyperCoord],
-    ) {
+    ) -> Result<(), EstimationError> {
         if coords.is_empty() {
-            return;
+            return Ok(());
         }
         let pirls_result = bundle.pirls_result.as_ref();
         let needs_rotation = matches!(
@@ -4243,13 +4246,33 @@ impl<'a> RemlState<'a> {
             pirls::PirlsCoordinateFrame::TransformedQs
         ) && self.active_constraint_free_basis(pirls_result).is_none();
         if !needs_rotation {
-            return;
+            return Ok(());
         }
         let qs = &pirls_result.reparam_result.qs;
         let qs_t = qs.t();
-        for coord in coords.iter_mut() {
+        for (coord_idx, coord) in coords.iter_mut().enumerate() {
             if coord.g.len() == qs.nrows() {
                 coord.g = qs.dot(&coord.g);
+            }
+            // Invariant guard: link-ext builders must emit ONLY the
+            // `dense` variant of `HyperCoordDrift`.  `block_local` and
+            // `operator` variants would require distinct rotations
+            // (block-local would lose its block structure under
+            // arbitrary `Qs`; operator-backed drifts would need a
+            // wrapping `RotatedHyperOperator`).  If a future link-ext
+            // builder ever populates either variant, this guard
+            // refuses rather than silently running a partial rotation
+            // that regresses SAS/mixture optimisation.
+            if coord.drift.block_local.is_some() || coord.drift.operator.is_some() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "link-ext HyperCoord[{coord_idx}] carries a non-dense drift \
+                     variant (block_local={} operator={}); the coord-frame rotation \
+                     helper only handles `HyperCoordDrift::from_dense`.  Update the \
+                     link-ext builder (or extend `rotate_link_ext_coords_to_original`) \
+                     before attaching non-dense drifts to original-basis assemblies.",
+                    coord.drift.block_local.is_some(),
+                    coord.drift.operator.is_some(),
+                )));
             }
             if let Some(b) = coord.drift.dense.as_mut() {
                 if b.nrows() == qs.nrows() && b.ncols() == qs.nrows() {
@@ -4259,6 +4282,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn evaluate_unified_with_link_ext(
@@ -4277,7 +4301,7 @@ impl<'a> RemlState<'a> {
         // Rotate link-ext coords to match the basis `build_auto_assembly`
         // will pick for the assembly (original basis under TransformedQs +
         // no active constraints).  See `rotate_link_ext_coords_to_original`.
-        self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords);
+        self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, true)?;
         assembly.ext_coords = ext_coords;
@@ -4301,7 +4325,7 @@ impl<'a> RemlState<'a> {
         // path eventually builds its assembly via `build_auto_assembly`
         // inside `evaluate_efs`, which picks original basis under the same
         // predicate.
-        self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords);
+        self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
         self.evaluate_efs(rho, &bundle, ext_coords)
     }
