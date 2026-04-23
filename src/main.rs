@@ -4486,6 +4486,27 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     } else {
         requested_likelihood_mode
     };
+    // linkwiggle(...) is a nonparametric anchored correction to the inverse
+    // link g^{-1}: eta -> mu. It is defined only for modes that expose such a
+    // map. LocationScale uses a standard inverse link for the residual
+    // distribution (Gaussian/SAS/BetaLogistic/Mixture) that linkwiggle can
+    // correct; MarginalSlope routes it into its anchored internal link-
+    // deviation/score-warp blocks (handled below). The remaining survival
+    // modes — Transformation, Weibull, Latent, LatentBinary — parameterize
+    // eta = log H(t|x) directly (Royston-Parmar) and therefore have no
+    // separate eta -> mu inverse link to wiggle. Reject rather than silently
+    // drop, so the user's published feature is not quietly ignored.
+    if effective_linkwiggle.is_some()
+        && !matches!(
+            likelihood_mode,
+            SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+        )
+    {
+        return Err(format!(
+            "linkwiggle(...) is not defined for --survival-likelihood={}; it corrects the inverse link eta -> mu, but Royston-Parmar parameterizes eta = log H(t|x) directly with no such map. Use --survival-likelihood=location-scale for a linkwiggle-corrected residual distribution, or --survival-likelihood=marginal-slope to route linkwiggle(...) into the anchored internal link-deviation block",
+            survival_likelihood_modename(likelihood_mode),
+        ));
+    }
     if matches!(
         survival_link_choice.as_ref().map(|choice| &choice.mode),
         Some(LinkMode::Flexible)
