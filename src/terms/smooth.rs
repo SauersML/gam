@@ -2783,21 +2783,11 @@ fn build_tensor_bspline_basis(
                 let matrix = zt_s.dot(z);
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale * c_new,
                     kronecker_factors: candidate.kronecker_factors.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    } else {
-        candidates = candidates
-            .into_iter()
-            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&candidate.matrix)?,
-                    ..candidate
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3244,7 +3234,7 @@ pub fn build_smooth_design_withworkspace(
             .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
@@ -4082,7 +4072,7 @@ fn apply_global_smooth_identifiability(
             .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
@@ -10185,11 +10175,19 @@ fn try_exact_joint_spatial_length_scale_optimization(
         )?
     };
 
+    let baseline_score = fit_score(&best.fit);
+    let baseline_result = FittedTermCollectionWithSpec {
+        fit: best.fit.clone(),
+        design: best.design.clone(),
+        resolvedspec: resolvedspec.clone(),
+        adaptive_diagnostics: best.adaptive_diagnostics.clone(),
+    };
+
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
     let resolvedspec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
-    let best = fit_term_collection_forspecwith_heuristic_lambdas(
+    let optimized = fit_term_collection_forspecwith_heuristic_lambdas(
         data,
         y,
         weights,
@@ -10200,12 +10198,20 @@ fn try_exact_joint_spatial_length_scale_optimization(
         options,
     )?;
 
-    Ok(Some(FittedTermCollectionWithSpec {
-        fit: best.fit,
-        design: best.design,
+    let optimized_result = FittedTermCollectionWithSpec {
+        fit: optimized.fit,
+        design: optimized.design,
         resolvedspec,
-        adaptive_diagnostics: best.adaptive_diagnostics,
-    }))
+        adaptive_diagnostics: optimized.adaptive_diagnostics,
+    };
+    if fit_score(&optimized_result.fit) > baseline_score + 1e-10 {
+        log::info!(
+            "[spatial-kappa] exact joint spatial candidate worsened the profiled score; keeping the frozen baseline geometry"
+        );
+        return Ok(Some(baseline_result));
+    }
+
+    Ok(Some(optimized_result))
 }
 
 /// Joint [ρ, ψ] optimization for anisotropic spatial terms using analytic

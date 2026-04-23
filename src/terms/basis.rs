@@ -4371,7 +4371,7 @@ pub fn build_bspline_basis_1d(
                     .into_iter()
                     .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                         Ok(PenaltyCandidate {
-                            nullspace_dim_hint: estimate_penalty_nullity(&candidate.matrix)?,
+                            nullspace_dim_hint: candidate.nullspace_dim_hint,
                             matrix: candidate.matrix,
                             source: candidate.source,
                             normalization_scale: candidate.normalization_scale,
@@ -4396,7 +4396,7 @@ pub fn build_bspline_basis_1d(
                         let zt_s = fast_atb(&z, &candidate.matrix);
                         let matrix = fast_ab(&zt_s, &z);
                         Ok(PenaltyCandidate {
-                            nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                            nullspace_dim_hint: candidate.nullspace_dim_hint,
                             matrix,
                             source: candidate.source,
                             normalization_scale: candidate.normalization_scale,
@@ -4426,7 +4426,7 @@ pub fn build_bspline_basis_1d(
             .map(
                 |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
                     Ok(PenaltyCandidate {
-                        nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                        nullspace_dim_hint: candidate.nullspace_dim_hint,
                         matrix,
                         source: candidate.source,
                         normalization_scale: candidate.normalization_scale,
@@ -4668,7 +4668,7 @@ pub fn filter_active_penalty_candidates(
                 candidate.source,
                 original_index,
                 analysis.rank,
-                candidate.nullspace_dim_hint
+                analysis.nullity
             );
             penalties.push(analysis.sym_penalty);
             nullspace_dims.push(analysis.nullity);
@@ -4686,7 +4686,7 @@ pub fn filter_active_penalty_candidates(
             active,
             effective_rank: analysis.rank,
             dropped_reason,
-            nullspace_dim_hint: candidate.nullspace_dim_hint,
+            nullspace_dim_hint: analysis.nullity,
             normalization_scale: candidate.normalization_scale,
             kronecker_factors: candidate.kronecker_factors,
         });
@@ -4836,6 +4836,7 @@ pub fn build_thin_plate_basiswithworkspace(
             centers.view(),
             spec.length_scale,
             &internal_kernel_transform,
+            spec.double_penalty,
         )?;
         let mut candidates = vec![PenaltyCandidate {
             matrix: penalty_bending,
@@ -4844,7 +4845,7 @@ pub fn build_thin_plate_basiswithworkspace(
             normalization_scale: 1.0,
             kronecker_factors: None,
         }];
-        if spec.double_penalty {
+        if let Some(penalty_ridge) = penalty_ridge {
             candidates.push(PenaltyCandidate {
                 matrix: penalty_ridge,
                 nullspace_dim_hint: 0,
@@ -4899,7 +4900,7 @@ pub fn build_thin_plate_basiswithworkspace(
                 let zt_s = z.t().dot(&candidate.matrix);
                 let matrix = zt_s.dot(z);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
@@ -6889,7 +6890,8 @@ fn build_thin_plate_penalty_matrices(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
     kernel_transform: &Array2<f64>,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    double_penalty: bool,
+) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
     let k = centers.nrows();
     let d = centers.ncols();
     let kernel_cols = kernel_transform.ncols();
@@ -6910,20 +6912,21 @@ fn build_thin_plate_penalty_matrices(
     }
     let omega_constrained = {
         let zt_o = fast_atb(kernel_transform, &omega);
-        fast_ab(&zt_o, kernel_transform)
+        // `kernel_transform` spans the side-constraint nullspace, so the
+        // congruence transform preserves the thin-plate PSD construction.
+        // Symmetrize to remove roundoff asymmetry without paying for a full EVD
+        // on the large lazy-path penalty.
+        symmetrize_penalty(&fast_ab(&zt_o, kernel_transform))
     };
-    validate_psd_penalty(
-        &omega_constrained,
-        &format!("thin_plate bending penalty (dimension={d})"),
-        "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
-    )?;
     let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
     penalty_bending
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega_constrained);
-    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_bending)?
-        .map(|block| block.sym_penalty)
-        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
+    let penalty_ridge = if double_penalty {
+        build_nullspace_shrinkage_penalty(&penalty_bending)?.map(|block| block.sym_penalty)
+    } else {
+        None
+    };
     Ok((penalty_bending, penalty_ridge))
 }
 
@@ -10380,16 +10383,14 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_kernel =
         kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
-    let identifiability_transform = frozen_spatial_identifiability_transform(
-        &spec.identifiability,
-        z_kernel.ncols(),
-        "Duchon",
-    )?;
     let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+    let p_padded = z_kernel.ncols() + poly_cols;
+    let identifiability_transform =
+        frozen_spatial_identifiability_transform(&spec.identifiability, p_padded, "Duchon")?;
     let p_final = identifiability_transform
         .as_ref()
         .map(|transform| transform.ncols())
-        .unwrap_or_else(|| z_kernel.ncols() + poly_cols);
+        .unwrap_or(p_padded);
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
     let block_order = pure_duchon_block_order(p_order, s_order);
@@ -12580,7 +12581,7 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
     let kernel_constrained = fast_ab(&kernel_block, &z);
     let omega_constrained = {
         let zt_o = fast_atb(&z, &omega);
-        fast_ab(&zt_o, &z)
+        symmetrize_penalty(&fast_ab(&zt_o, &z))
     };
     let omega_psd = validate_psd_penalty(
         &omega_constrained,
