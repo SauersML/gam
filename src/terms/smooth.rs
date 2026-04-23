@@ -75,7 +75,8 @@ fn rewrite_thin_plate_knots_error(
 ) -> BasisError {
     match err {
         BasisError::InvalidInput(msg)
-            if msg.contains("thin-plate spline requires at least d+1 knots") =>
+            if msg.contains("thin-plate spline requires at least")
+                && (msg.contains("centers to span") || msg.contains("knots to span")) =>
         {
             let min_centers = feature_count + 1;
             let requested = describe_thin_plate_center_request(&spec.center_strategy);
