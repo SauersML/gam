@@ -3274,6 +3274,40 @@ impl FitInference {
     }
 }
 
+fn array1_values_equal(lhs: &Array1<f64>, rhs: &Array1<f64>) -> bool {
+    lhs.len() == rhs.len() && lhs.iter().zip(rhs.iter()).all(|(a, b)| a == b)
+}
+
+fn array2_values_equal(lhs: &Array2<f64>, rhs: &Array2<f64>) -> bool {
+    lhs.dim() == rhs.dim() && lhs.iter().zip(rhs.iter()).all(|(a, b)| a == b)
+}
+
+fn flatten_block_betas(blocks: &[FittedBlock]) -> Array1<f64> {
+    let total: usize = blocks.iter().map(|b| b.beta.len()).sum();
+    let mut flat = Array1::zeros(total);
+    let mut off = 0;
+    for block in blocks {
+        let p = block.beta.len();
+        flat.slice_mut(ndarray::s![off..off + p])
+            .assign(&block.beta);
+        off += p;
+    }
+    flat
+}
+
+fn flatten_block_lambdas(blocks: &[FittedBlock]) -> Array1<f64> {
+    let total: usize = blocks.iter().map(|b| b.lambdas.len()).sum();
+    let mut flat = Array1::zeros(total);
+    let mut off = 0;
+    for block in blocks {
+        let p = block.lambdas.len();
+        flat.slice_mut(ndarray::s![off..off + p])
+            .assign(&block.lambdas);
+        off += p;
+    }
+    flat
+}
+
 impl UnifiedFitResult {
     pub fn try_from_parts(parts: UnifiedFitResultParts) -> Result<Self, EstimationError> {
         let UnifiedFitResultParts {
@@ -3328,8 +3362,22 @@ impl UnifiedFitResult {
                 block.lambdas.iter().copied(),
             )?;
         }
+        let beta = flatten_block_betas(&blocks);
+        let block_lambdas = flatten_block_lambdas(&blocks);
+        if !array1_values_equal(&block_lambdas, &lambdas) {
+            return Err(EstimationError::InvalidInput(
+                "UnifiedFitResult top-level lambdas must match block lambdas concatenated in block order"
+                    .to_string(),
+            ));
+        }
         validate_all_finite_estimation("fit_result.log_lambdas", log_lambdas.iter().copied())?;
         validate_all_finite_estimation("fit_result.lambdas", lambdas.iter().copied())?;
+        let canonical_log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        if !array1_values_equal(&canonical_log_lambdas, &log_lambdas) {
+            return Err(EstimationError::InvalidInput(
+                "UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise".to_string(),
+            ));
+        }
         validate_likelihood_scale_estimation(likelihood_scale)?;
         ensure_finite_scalar_estimation("fit_result.log_likelihood", log_likelihood)?;
         ensure_finite_scalar_estimation("fit_result.deviance", deviance)?;
@@ -3365,18 +3413,6 @@ impl UnifiedFitResult {
         }
         validate_fitted_link_estimation(&fitted_link)?;
 
-        // Build the flat beta vector from all blocks.
-        let beta = {
-            let total: usize = blocks.iter().map(|b| b.beta.len()).sum();
-            let mut flat = Array1::zeros(total);
-            let mut off = 0;
-            for b in &blocks {
-                let p = b.beta.len();
-                flat.slice_mut(ndarray::s![off..off + p]).assign(&b.beta);
-                off += p;
-            }
-            flat
-        };
         let p = beta.len();
         if let Some(cov) = covariance_conditional.as_ref() {
             if cov.nrows() != p || cov.ncols() != p {
@@ -3401,6 +3437,20 @@ impl UnifiedFitResult {
             }
         }
         if let Some(inf) = inference.as_ref() {
+            if inf.edf_by_block.len() != blocks.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult EDF block count mismatch: edf_by_block={}, blocks={}",
+                    inf.edf_by_block.len(),
+                    blocks.len()
+                )));
+            }
+            if inf.working_weights.len() != inf.working_response.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult working vector length mismatch: working_weights={}, working_response={}",
+                    inf.working_weights.len(),
+                    inf.working_response.len()
+                )));
+            }
             if inf.penalized_hessian.nrows() != p || inf.penalized_hessian.ncols() != p {
                 return Err(EstimationError::InvalidInput(format!(
                     "UnifiedFitResult penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
@@ -3409,6 +3459,136 @@ impl UnifiedFitResult {
                     p,
                     p
                 )));
+            }
+            if let Some(cov) = inf.beta_covariance.as_ref() {
+                if cov.nrows() != p || cov.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "UnifiedFitResult inference conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+                        cov.nrows(),
+                        cov.ncols(),
+                        p,
+                        p
+                    )));
+                }
+                match covariance_conditional.as_ref() {
+                    Some(top) if array2_values_equal(cov, top) => {}
+                    Some(_) => {
+                        return Err(EstimationError::InvalidInput(
+                            "UnifiedFitResult inference conditional covariance must match top-level covariance_conditional"
+                                .to_string(),
+                        ));
+                    }
+                    None => {
+                        return Err(EstimationError::InvalidInput(
+                            "UnifiedFitResult inference conditional covariance requires top-level covariance_conditional"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(se) = inf.beta_standard_errors.as_ref()
+                && se.len() != p
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult beta standard error length mismatch: got {}, expected {}",
+                    se.len(),
+                    p
+                )));
+            }
+            if let Some(cov) = inf.beta_covariance_corrected.as_ref() {
+                if cov.nrows() != p || cov.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "UnifiedFitResult inference corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+                        cov.nrows(),
+                        cov.ncols(),
+                        p,
+                        p
+                    )));
+                }
+                match covariance_corrected.as_ref() {
+                    Some(top) if array2_values_equal(cov, top) => {}
+                    Some(_) => {
+                        return Err(EstimationError::InvalidInput(
+                            "UnifiedFitResult inference corrected covariance must match top-level covariance_corrected"
+                                .to_string(),
+                        ));
+                    }
+                    None => {
+                        return Err(EstimationError::InvalidInput(
+                            "UnifiedFitResult inference corrected covariance requires top-level covariance_corrected"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(se) = inf.beta_standard_errors_corrected.as_ref()
+                && se.len() != p
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult corrected beta standard error length mismatch: got {}, expected {}",
+                    se.len(),
+                    p
+                )));
+            }
+            if let Some(corr) = inf.smoothing_correction.as_ref()
+                && (corr.nrows() != p || corr.ncols() != p)
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult smoothing correction shape mismatch: got {}x{}, expected {}x{}",
+                    corr.nrows(),
+                    corr.ncols(),
+                    p,
+                    p
+                )));
+            }
+            if let Some(qs) = inf.reparam_qs.as_ref()
+                && (qs.nrows() != p || qs.ncols() != p)
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult reparam_qs shape mismatch: got {}x{}, expected {}x{}",
+                    qs.nrows(),
+                    qs.ncols(),
+                    p,
+                    p
+                )));
+            }
+        }
+        if let Some(geom) = geometry.as_ref() {
+            if geom.penalized_hessian.nrows() != p || geom.penalized_hessian.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult geometry penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    geom.penalized_hessian.nrows(),
+                    geom.penalized_hessian.ncols(),
+                    p,
+                    p
+                )));
+            }
+            if geom.working_weights.len() != geom.working_response.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult geometry working vector length mismatch: working_weights={}, working_response={}",
+                    geom.working_weights.len(),
+                    geom.working_response.len()
+                )));
+            }
+            if let Some(inf) = inference.as_ref() {
+                if !array2_values_equal(&geom.penalized_hessian, &inf.penalized_hessian) {
+                    return Err(EstimationError::InvalidInput(
+                        "UnifiedFitResult geometry penalized Hessian must match inference.penalized_hessian"
+                            .to_string(),
+                    ));
+                }
+                if !array1_values_equal(&geom.working_weights, &inf.working_weights) {
+                    return Err(EstimationError::InvalidInput(
+                        "UnifiedFitResult geometry working_weights must match inference.working_weights"
+                            .to_string(),
+                    ));
+                }
+                if !array1_values_equal(&geom.working_response, &inf.working_response) {
+                    return Err(EstimationError::InvalidInput(
+                        "UnifiedFitResult geometry working_response must match inference.working_response"
+                            .to_string(),
+                    ));
+                }
             }
         }
         if !block_states.is_empty() && block_states.len() != blocks.len() {
@@ -3451,6 +3631,13 @@ impl UnifiedFitResult {
     }
 
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        let expected_beta = flatten_block_betas(&self.blocks);
+        if !array1_values_equal(&self.beta, &expected_beta) {
+            return Err(EstimationError::InvalidInput(
+                "UnifiedFitResult decoded beta must match coefficient blocks concatenated in block order"
+                    .to_string(),
+            ));
+        }
         Self::try_from_parts(UnifiedFitResultParts {
             blocks: self.blocks.clone(),
             log_lambdas: self.log_lambdas.clone(),
@@ -4637,6 +4824,60 @@ mod fd_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
+    use serde_json::json;
+
+    fn decode_invariant_test_fit() -> UnifiedFitResult {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: array![0.25, -0.5],
+                role: BlockRole::Mean,
+                edf: 1.5,
+                lambdas: array![0.2, 0.8],
+            }],
+            log_lambdas: array![0.2_f64.max(1e-300).ln(), 0.8_f64.max(1e-300).ln()],
+            lambdas: array![0.2, 0.8],
+            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: -1.2,
+            deviance: 2.4,
+            reml_score: 0.7,
+            stable_penalty_term: 0.3,
+            penalized_objective: 2.2,
+            outer_iterations: 3,
+            outer_converged: true,
+            outer_gradient_norm: 0.05,
+            standard_deviation: 1.1,
+            covariance_conditional: Some(array![[1.0, 0.1], [0.1, 2.0]]),
+            covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
+            inference: Some(FitInference {
+                edf_by_block: vec![1.5],
+                edf_total: 1.5,
+                smoothing_correction: Some(array![[0.2, 0.0], [0.0, 0.2]]),
+                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]],
+                working_weights: array![1.0, 0.5, 0.75],
+                working_response: array![0.1, 0.2, 0.3],
+                reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
+                beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]]),
+                beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
+                beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
+                beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: Some(FitGeometry {
+                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]],
+                working_weights: array![1.0, 0.5, 0.75],
+                working_response: array![0.1, 0.2, 0.3],
+            }),
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 1.25,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        })
+        .expect("construct decode invariant test fit")
+    }
 
     #[test]
     fn resolve_external_family_rejects_unsupported_firth_request() {
@@ -4645,6 +4886,40 @@ mod fd_policy_tests {
         assert!(
             err.to_string()
                 .contains("firth_bias_reduction is currently implemented only for"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unified_fit_decode_validation_rejects_beta_drift_from_blocks() {
+        let fit = decode_invariant_test_fit();
+        let mut payload = serde_json::to_value(&fit).expect("serialize fit");
+        payload["beta"] = json!([9.0, 8.0]);
+        let decoded: UnifiedFitResult =
+            serde_json::from_value(payload).expect("deserialize corrupted fit");
+        let err = decoded
+            .validate_numeric_finiteness()
+            .expect_err("beta drift should fail validation");
+        assert!(
+            err.to_string()
+                .contains("decoded beta must match coefficient blocks"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unified_fit_decode_validation_rejects_geometry_drift_from_inference() {
+        let fit = decode_invariant_test_fit();
+        let mut payload = serde_json::to_value(&fit).expect("serialize fit");
+        payload["geometry"]["penalized_hessian"] = json!([[4.0, 0.0], [0.0, 5.0]]);
+        let decoded: UnifiedFitResult =
+            serde_json::from_value(payload).expect("deserialize corrupted fit");
+        let err = decoded
+            .validate_numeric_finiteness()
+            .expect_err("geometry drift should fail validation");
+        assert!(
+            err.to_string()
+                .contains("geometry penalized Hessian must match inference.penalized_hessian"),
             "unexpected error: {err}"
         );
     }

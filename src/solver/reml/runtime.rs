@@ -2010,20 +2010,44 @@ impl<'a> RemlState<'a> {
         e_transformed: &Array2<f64>,
         ridge_passport: RidgePassport,
     ) -> Result<f64, EstimationError> {
+        let (log_det, _kernel) =
+            self.fixed_subspace_hessian_projected_parts(h_total, e_transformed, ridge_passport)?;
+        Ok(log_det)
+    }
+
+    /// Compute the projected logdet `log|U_Sᵀ H U_S|_+` together with the
+    /// matching trace kernel `(U_S, (U_Sᵀ H U_S)⁻¹)` — the [`PenaltySubspaceTrace`]
+    /// that pairs the rank-deficient LAML cost with a gradient-consistent
+    /// `tr(U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ · Ḣ)` on the identified subspace.
+    ///
+    /// Computing both in one pass amortises the `U_S` + `H_proj` work that
+    /// otherwise has to be redone separately in the cost path and the
+    /// gradient trace path.  The kernel is `None` only when the penalty is
+    /// structurally null (no identified subspace to project onto).
+    ///
+    /// See [`PenaltySubspaceTrace`] for the full Schur-complement derivation
+    /// of why the full-space `G_ε(H)` kernel mismatches the projected cost
+    /// for non-Gaussian families.
+    pub(super) fn fixed_subspace_hessian_projected_parts(
+        &self,
+        h_total: &Array2<f64>,
+        e_transformed: &Array2<f64>,
+        ridge_passport: RidgePassport,
+    ) -> Result<(f64, Option<super::unified::PenaltySubspaceTrace>), EstimationError> {
         let p = h_total.ncols();
         if p == 0 {
-            return Ok(0.0);
+            return Ok((0.0, None));
         }
         if h_total.nrows() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "fixed_subspace_hessian_logdet_projected: H must be square, got {}x{}",
+                "fixed_subspace_hessian_projected_parts: H must be square, got {}x{}",
                 h_total.nrows(),
                 p
             )));
         }
         if e_transformed.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "fixed_subspace_hessian_logdet_projected: E cols {} do not match H dim {}",
+                "fixed_subspace_hessian_projected_parts: E cols {} do not match H dim {}",
                 e_transformed.ncols(),
                 p
             )));
@@ -2048,7 +2072,7 @@ impl<'a> RemlState<'a> {
             // subspace to project onto.  Returning 0.0 lets the caller
             // leave the correction untouched; no penalty means there is
             // no pair to balance in the LAML ratio.
-            return Ok(0.0);
+            return Ok((0.0, None));
         }
 
         // Build U_S: p × r basis of range(S_+).
@@ -2073,13 +2097,37 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let (h_proj_evals, _) = h_proj
+        let (h_proj_evals, h_proj_evecs) = h_proj
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let h_thr =
-            super::unified::positive_eigenvalue_threshold(h_proj_evals.as_slice().unwrap());
+        let h_thr = super::unified::positive_eigenvalue_threshold(h_proj_evals.as_slice().unwrap());
         let log_det = super::unified::exact_pseudo_logdet(h_proj_evals.as_slice().unwrap(), h_thr);
-        Ok(log_det)
+
+        // H_proj⁻¹ on the positive eigenspace.  Directions whose eigenvalue
+        // sits at or below the pseudo-determinant threshold are excluded so
+        // the kernel does not pick up divergent contributions from numerical
+        // zeros — matching the filter applied to `log_det`.
+        let mut h_proj_inverse = Array2::<f64>::zeros((r, r));
+        for a in 0..r {
+            let sigma = h_proj_evals[a];
+            if sigma <= h_thr {
+                continue;
+            }
+            let inv = 1.0 / sigma;
+            for i in 0..r {
+                for j in 0..r {
+                    h_proj_inverse[[i, j]] += inv * h_proj_evecs[[i, a]] * h_proj_evecs[[j, a]];
+                }
+            }
+        }
+
+        Ok((
+            log_det,
+            Some(super::unified::PenaltySubspaceTrace {
+                u_s,
+                h_proj_inverse,
+            }),
+        ))
     }
 
     /// Compute tr(S⁺ S_direction) — the first derivative of log|S|₊
@@ -3287,6 +3335,7 @@ impl<'a> RemlState<'a> {
         penalty_logdet: super::unified::PenaltyLogdetDerivs,
         nullspace_dim: f64,
         hessian_logdet_correction: f64,
+        penalty_subspace_trace: Option<std::sync::Arc<super::unified::PenaltySubspaceTrace>>,
     ) -> super::assembly::InnerAssembly<'static> {
         super::assembly::InnerAssembly {
             log_likelihood: ctx.log_likelihood,
@@ -3299,6 +3348,7 @@ impl<'a> RemlState<'a> {
             dispersion: ctx.dispersion,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction,
+            penalty_subspace_trace,
             deriv_provider: Some(ctx.deriv_provider),
             tk_correction: 0.0,
             tk_gradient: None,
@@ -3394,26 +3444,41 @@ impl<'a> RemlState<'a> {
         // `hessian_logdet_correction`; `reml_laml_evaluate` already sums
         // `hop.logdet() + correction`, so the evaluator sees
         // `log|H_proj|_+` paired with `log|S|_+` on the same rank-r
-        // identified subspace.  The operator's own `solve` / traces are
-        // untouched; gradient correctness holds because `S_k · u = 0`
-        // for `u ∈ null(S)` (`null(S) = ∩_k null(S_k)` by construction),
-        // so `tr(H⁻¹ S_k)` on the full operator equals
-        // `tr(H_proj⁻¹ · U_S^T S_k U_S)` up to null-direction terms
-        // that vanish.  Under `HardPseudo` the operator already masks
-        // null eigenpairs, so the correction is zero there.
-        let hessian_logdet_correction = if matches!(hessian_mode, PseudoLogdetMode::Smooth)
-            && penalty_rank < h_for_operator.ncols()
-        {
-            use super::unified::HessianOperator;
-            let log_det_h_proj = self.fixed_subspace_hessian_logdet_projected(
-                &h_for_operator,
-                &e_for_logdet,
-                ridge_passport,
-            )?;
-            log_det_h_proj - hessian_op.logdet()
-        } else {
-            0.0
-        };
+        // identified subspace.
+        //
+        // The gradient trace kernel must pair with the **projected** logdet,
+        // not the full-space `G_ε(H)`: for non-Gaussian families the IFT
+        // correction `D_β H[v] = X' diag(c ⊙ X v) X` does NOT vanish on
+        // `null(S)` (the intercept column of X is all-ones, typically in
+        // `null(S)`), so `tr(G_ε · Ḣ)` picks up a spurious null-direction
+        // contribution that is absent from `d log|U_Sᵀ H U_S|/dτ`.  Carry
+        // the `PenaltySubspaceTrace { U_S, (U_Sᵀ H U_S)⁻¹ }` alongside the
+        // scalar correction so `reml_laml_evaluate` can trace through the
+        // identified subspace via `tr(U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ · Ḣ)`.
+        // For Gaussian identity `c = 0`, so `D_β H = 0` and the leakage
+        // does not arise — setting this kernel for Gaussian is still
+        // correct (the traces agree) but strictly unnecessary.
+        //
+        // Under `HardPseudo` the operator already masks null eigenpairs
+        // consistently in `logdet`, `trace_logdet_*`, and `solve`, so the
+        // correction is zero there and no projected-trace kernel is needed.
+        let (hessian_logdet_correction, penalty_subspace_trace) =
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth)
+                && penalty_rank < h_for_operator.ncols()
+            {
+                use super::unified::HessianOperator;
+                let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
+                    &h_for_operator,
+                    &e_for_logdet,
+                    ridge_passport,
+                )?;
+                (
+                    log_det_h_proj - hessian_op.logdet(),
+                    kernel.map(std::sync::Arc::new),
+                )
+            } else {
+                (0.0, None)
+            };
 
         let ctx =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
@@ -3425,6 +3490,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             nullspace_dim,
             hessian_logdet_correction,
+            penalty_subspace_trace,
         ))
     }
 
@@ -3516,6 +3582,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             mp,
             0.0,
+            None,
         ))
     }
 
@@ -3671,21 +3738,37 @@ impl<'a> RemlState<'a> {
         // `hessian_op.logdet()` (original basis) is valid because the
         // two logdets agree to roundoff for the same matrix under
         // orthogonal change of basis.
-        let hessian_logdet_correction = if matches!(hessian_mode, PseudoLogdetMode::Smooth)
-            && penalty_rank < h_total_original.ncols()
-        {
-            use super::unified::HessianOperator;
-            let qs = &pirls_result.reparam_result.qs;
-            let h_transformed = qs.t().dot(&h_total_original).dot(qs);
-            let log_det_h_proj = self.fixed_subspace_hessian_logdet_projected(
-                &h_transformed,
-                &e_for_logdet,
-                ridge_passport,
-            )?;
-            log_det_h_proj - hessian_op.logdet()
-        } else {
-            0.0
-        };
+        // As in `build_dense_assembly`: the gradient trace kernel must pair
+        // with the projected cost `log|U_Sᵀ H U_S|_+`, not the full-space
+        // `G_ε(H)`, on non-Gaussian families where the IFT correction
+        // `D_β H[v] = X' diag(c ⊙ X v) X` leaks onto `null(S)`.  Build the
+        // projected kernel in the transformed basis (where `e_for_logdet`
+        // lives) and rotate `U_S` back into the original basis via `Qs`
+        // since the ψ/τ drift matrices consumed by the trace are produced
+        // in the original basis by this assembly path.
+        let (hessian_logdet_correction, penalty_subspace_trace) =
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth)
+                && penalty_rank < h_total_original.ncols()
+            {
+                use super::unified::HessianOperator;
+                let qs = &pirls_result.reparam_result.qs;
+                let h_transformed = qs.t().dot(&h_total_original).dot(qs);
+                let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
+                    &h_transformed,
+                    &e_for_logdet,
+                    ridge_passport,
+                )?;
+                let kernel_orig = kernel_trans.map(|kernel_trans| {
+                    let u_s_orig = qs.dot(&kernel_trans.u_s);
+                    std::sync::Arc::new(super::unified::PenaltySubspaceTrace {
+                        u_s: u_s_orig,
+                        h_proj_inverse: kernel_trans.h_proj_inverse,
+                    })
+                });
+                (log_det_h_proj - hessian_op.logdet(), kernel_orig)
+            } else {
+                (0.0, None)
+            };
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
         Ok(self.finish_assembly(
@@ -3696,6 +3779,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             nullspace_dim,
             hessian_logdet_correction,
+            penalty_subspace_trace,
         ))
     }
 
