@@ -2007,7 +2007,6 @@ where
             ))
             .with_tolerance(reml_tol)
             .with_max_iter(reml_max_iter)
-            .with_fd_step(1e-3)
             .with_seed_config(reml_seed_config.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_rho_bound(crate::estimate::RHO_BOUND);
@@ -2107,7 +2106,6 @@ where
             ))
             .with_tolerance(reml_tol)
             .with_max_iter(reml_max_iter)
-            .with_fd_step(1e-3)
             .with_seed_config(reml_seed_config_mix.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_rho_bound(crate::estimate::RHO_BOUND);
