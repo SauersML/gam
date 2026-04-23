@@ -1,10 +1,10 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
-use crate::solver::pirls::{sparse_reml_penalized_hessian, PirlsWorkspace};
+use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
+use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -743,9 +743,9 @@ pub fn build_sparse_penalty_blocks_from_canonical(
 
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::cholesky::llt::factor::LltRegularization;
+use faer::sparse::SymbolicSparseColMat;
 use faer::sparse::linalg::amd;
 use faer::sparse::linalg::cholesky::simplicial;
-use faer::sparse::SymbolicSparseColMat;
 
 /// A simplicial Cholesky factorization with raw access to L's CSC pattern and
 /// values, plus the AMD permutation.  Built using faer's low-level simplicial
