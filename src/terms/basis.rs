@@ -8126,10 +8126,7 @@ fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
 pub(crate) fn points_in_aniso_y_space(points: ArrayView2<'_, f64>, eta: &[f64]) -> Array2<f64> {
     assert_eq!(points.ncols(), eta.len());
     let mut y = points.to_owned();
-    let weights: Vec<f64> = eta
-        .iter()
-        .map(|&e| e.clamp(-50.0, 50.0).exp())
-        .collect();
+    let weights: Vec<f64> = eta.iter().map(|&e| e.clamp(-50.0, 50.0).exp()).collect();
     for a in 0..eta.len() {
         let w_a = weights[a];
         y.column_mut(a).mapv_inplace(|v| v * w_a);
