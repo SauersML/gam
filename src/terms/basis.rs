@@ -52,7 +52,7 @@ pub enum BasisError {
     InvalidRange(f64, f64),
 
     #[error(
-        "Data range has zero width (min equals max) but {0} internal knots were requested, which would create coincident knots."
+        "Data range has zero width (min equals max), which collapses the B-spline knot domain; requested {0} internal knots."
     )]
     DegenerateRange(usize),
 
@@ -278,10 +278,7 @@ pub fn create_basis<O: BasisOutputFormat>(
     };
 
     let knotvec: Array1<f64> = match knot_source {
-        KnotSource::Provided(view) => {
-            validate_knots_for_degree(view, knot_degree)?;
-            view.to_owned()
-        }
+        KnotSource::Provided(view) => view.to_owned(),
         KnotSource::Generate {
             data_range,
             num_internal_knots,
@@ -289,12 +286,13 @@ pub fn create_basis<O: BasisOutputFormat>(
             if data_range.0 > data_range.1 {
                 return Err(BasisError::InvalidRange(data_range.0, data_range.1));
             }
-            if data_range.0 == data_range.1 && num_internal_knots > 0 {
+            if data_range.0 == data_range.1 {
                 return Err(BasisError::DegenerateRange(num_internal_knots));
             }
             internal::generate_full_knot_vector(data_range, num_internal_knots, knot_degree)?
         }
     };
+    validate_knots_for_degree(knotvec.view(), knot_degree)?;
 
     match options.basis_family {
         BasisFamily::BSpline => O::build_basis(data, degree, eval_kind, knotvec),
@@ -587,6 +585,16 @@ fn validate_knots_for_degree(
                     "knot vector is not non-decreasing".to_string(),
                 ));
             }
+        }
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    for i in 0..num_basis {
+        let span = knot_vector[i + degree + 1] - knot_vector[i];
+        if span <= 1e-12 {
+            return Err(BasisError::InvalidKnotVector(format!(
+                "basis function {i} has zero support: t[i+degree+1]-t[i]={span:.3e} must be > 0"
+            )));
         }
     }
 
@@ -1215,7 +1223,9 @@ pub fn penalty_greville_abscissae_for_knots(
 /// The returned basis has columns `[K_c | P]` where:
 /// - `K_c` is the constrained radial basis block (`K * Z`) with
 ///   `P(knots)^T * α = 0` enforced via nullspace projection
-/// - `P` is the polynomial null-space block `[1, x_1, ..., x_d]`
+/// - `P` is the TPS polynomial null-space block containing all monomials of
+///   total degree `< m`, where `m = thin_plate_penalty_order(d)` (so `P` is
+///   just `[1, x_1, ..., x_d]` for `d <= 3`)
 ///
 /// The returned penalty matrix is block-diagonal with:
 /// - upper-left `Omega_c = Z^T Omega Z` for the constrained radial block
@@ -1572,8 +1582,9 @@ impl Default for MaternIdentifiability {
     }
 }
 
-/// Duchon null-space order. `0` removes the explicit polynomial block,
-/// `1` keeps `[1, x_1, ..., x_d]` unpenalized by the primary curvature penalty.
+/// Duchon null-space polynomial degree.
+/// `0` keeps the constant null space (`m=1`), `1` keeps
+/// `[1, x_1, ..., x_d]` (`m=2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DuchonNullspaceOrder {
     Zero,
@@ -3768,12 +3779,9 @@ fn build_scalar_design_psi_derivatives_shared(
                             aniso_distance_and_components(&data_row_buf, &center_buf, eta);
                         (r, components.into_iter().sum::<f64>())
                     } else {
-                        let mut dist2 = 0.0;
-                        for a in 0..dim {
-                            let delta = data[[i, a]] - centers[[j, a]];
-                            dist2 += delta * delta;
-                        }
-                        (dist2.sqrt(), dist2)
+                        let r =
+                            stable_euclidean_norm((0..dim).map(|a| data[[i, a]] - centers[[j, a]]));
+                        (r, r * r)
                     };
                     let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
                         Ok(p) => p,
@@ -4554,7 +4562,9 @@ fn spectral_tolerance(sym: &Array2<f64>, evals: &Array1<f64>) -> f64 {
         .iter()
         .copied()
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    (sym.nrows().max(1) as f64) * 1e-10 * max_abs_ev.max(1.0)
+    // Keep the cutoff in eigenvalue units so uniform penalty scaling does not
+    // change PSD/rank decisions for the same spectrum shape.
+    (sym.nrows().max(1) as f64) * 1e-10 * max_abs_ev
 }
 
 fn spectral_summary(
@@ -4814,12 +4824,9 @@ pub fn build_thin_plate_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let internal_kernel_transform = kernel_constraint_nullspace(
-        centers.view(),
-        DuchonNullspaceOrder::Linear,
-        &mut workspace.cache,
-    )?;
-    let poly_cols = centers.ncols() + 1;
+    let internal_kernel_transform =
+        thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)?;
+    let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let base_cols = internal_kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
@@ -4833,7 +4840,7 @@ pub fn build_thin_plate_basiswithworkspace(
         );
     }
     let (design, identifiability_transform, mut candidates) = if use_lazy {
-        let poly_block = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear);
+        let poly_block = thin_plate_polynomial_block(data);
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
         let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
@@ -6930,7 +6937,7 @@ fn build_thin_plate_penalty_matrices(
     let k = centers.nrows();
     let d = centers.ncols();
     let kernel_cols = kernel_transform.ncols();
-    let poly_cols = d + 1;
+    let poly_cols = thin_plate_polynomial_basis_dimension(d);
     let total_cols = kernel_cols + poly_cols;
     let mut omega = Array2::<f64>::zeros((k, k));
     for i in 0..k {
@@ -7128,12 +7135,7 @@ pub fn build_matern_collocation_operator_matrices(
                     eta,
                 )
             } else {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = centers[[k, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
-                dist2.sqrt()
+                stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
             };
             if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
                 return Err(BasisError::InvalidInput(
@@ -7274,12 +7276,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
                 let row_j: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
                 aniso_distance(&row_k, &row_j, eta)
             } else {
-                let mut dist2 = 0.0;
-                for axis in 0..dim {
-                    let delta = centers[[k, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                dist2.sqrt()
+                stable_euclidean_norm((0..dim).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
             };
             let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
                 r,
@@ -7466,8 +7463,12 @@ const DUCHON_COLLISION_TAYLOR_REL: f64 = 1e-4;
 #[inline(always)]
 fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
     match order {
-        DuchonNullspaceOrder::Zero => 0,
-        DuchonNullspaceOrder::Linear => 1,
+        // Duchon null spaces contain all polynomials of degree < m.
+        // The public `order` knob chooses that polynomial degree cutoff:
+        //   order=0 -> constants only  -> m=1
+        //   order=1 -> constants+linear -> m=2
+        DuchonNullspaceOrder::Zero => 1,
+        DuchonNullspaceOrder::Linear => 2,
     }
 }
 
@@ -8092,6 +8093,43 @@ fn duchon_matern_kernel_general_from_distance(
     Ok(val.sum())
 }
 
+#[inline(always)]
+fn stable_euclidean_norm<I>(components: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut scale = 0.0_f64;
+    let mut sumsq = 1.0_f64;
+    let mut has_nonzero = false;
+    for component in components {
+        let abs = component.abs();
+        if abs == 0.0 {
+            continue;
+        }
+        if !abs.is_finite() {
+            return f64::INFINITY;
+        }
+        if !has_nonzero {
+            scale = abs;
+            has_nonzero = true;
+            continue;
+        }
+        if scale < abs {
+            let ratio = scale / abs;
+            sumsq = 1.0 + sumsq * ratio * ratio;
+            scale = abs;
+        } else {
+            let ratio = abs / scale;
+            sumsq += ratio * ratio;
+        }
+    }
+    if has_nonzero {
+        scale * sumsq.sqrt()
+    } else {
+        0.0
+    }
+}
+
 /// Compute anisotropic squared distance components and total distance.
 ///
 /// This is the core of **geometric anisotropy**: a linear warp Λ = diag(κ_a)
@@ -8123,16 +8161,17 @@ fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) 
     assert_eq!(data_row.len(), eta.len());
     let d = data_row.len();
     let mut s_vec = Vec::with_capacity(d);
-    let mut r2 = 0.0;
+    let mut scaled_components = Vec::with_capacity(d);
     for a in 0..d {
         let h_a = data_row[a] - center[a];
         // Clamp exp(2η) to avoid overflow/underflow: η ∈ [-50, 50] → exp(2η) ∈ [~1e-44, ~1e43].
-        let w_a = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
-        let s_a = w_a * h_a * h_a;
+        let scale_a = eta[a].clamp(-50.0, 50.0).exp();
+        let scaled_h_a = scale_a * h_a;
+        let s_a = scaled_h_a * scaled_h_a;
+        scaled_components.push(scaled_h_a);
         s_vec.push(s_a);
-        r2 += s_a;
     }
-    (r2.sqrt(), s_vec)
+    (stable_euclidean_norm(scaled_components), s_vec)
 }
 
 /// Compute anisotropic distance without returning per-axis components.
@@ -8143,13 +8182,9 @@ fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) 
 fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
     assert_eq!(data_row.len(), center.len());
     assert_eq!(data_row.len(), eta.len());
-    let mut r2 = 0.0;
-    for a in 0..data_row.len() {
-        let h_a = data_row[a] - center[a];
-        let w_a = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
-        r2 += w_a * h_a * h_a;
-    }
-    r2.sqrt()
+    stable_euclidean_norm(
+        (0..data_row.len()).map(|a| eta[a].clamp(-50.0, 50.0).exp() * (data_row[a] - center[a])),
+    )
 }
 
 /// Return y-space points `y_{i,a} = exp(η_a) x_{i,a}` so Euclidean pairwise
@@ -8267,12 +8302,7 @@ pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f
     let mut r_max = 0.0_f64;
     for i in 0..n {
         for j in (i + 1)..n {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = points[[i, c]] - points[[j, c]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = stable_euclidean_norm((0..d).map(|c| points[[i, c]] - points[[j, c]]));
             if r.is_finite() && r > 0.0 {
                 r_min = r_min.min(r);
                 r_max = r_max.max(r);
@@ -8327,12 +8357,7 @@ pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> O
         let i = i_idx * stride;
         for j_idx in (i_idx + 1)..k {
             let j = j_idx * stride;
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = points[[i, c]] - points[[j, c]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = stable_euclidean_norm((0..d).map(|c| points[[i, c]] - points[[j, c]]));
             if r.is_finite() && r > 0.0 {
                 r_min = r_min.min(r);
                 r_max = r_max.max(r);
@@ -8452,12 +8477,7 @@ fn compute_data_center_distances(
         .enumerate()
         .try_for_each(|(i, mut row)| {
             for j in 0..k {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = data[[i, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
-                row[j] = dist2.sqrt();
+                row[j] = stable_euclidean_norm((0..d).map(|c| data[[i, c]] - centers[[j, c]]));
             }
             Ok(())
         });
@@ -8471,12 +8491,7 @@ fn compute_center_center_distances(centers: ArrayView2<'_, f64>) -> Array2<f64> 
     let mut distances = Array2::<f64>::zeros((k, k));
     for i in 0..k {
         for j in i..k {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = centers[[i, c]] - centers[[j, c]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
+            let r = stable_euclidean_norm((0..d).map(|c| centers[[i, c]] - centers[[j, c]]));
             distances[[i, j]] = r;
             distances[[j, i]] = r;
         }
@@ -8543,6 +8558,11 @@ fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
     }
 }
 
+#[inline(always)]
+fn thin_plate_constraint_nullspace_order_code() -> u8 {
+    16
+}
+
 fn shared_owned_data_matrix(
     data: ArrayView2<'_, f64>,
     cache: &mut BasisCacheContext,
@@ -8592,7 +8612,69 @@ fn kernel_constraint_nullspace(
     }
 
     let p_k = polynomial_block_from_order(centers, order);
+    if centers.nrows() < p_k.ncols() {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon basis requires at least {} centers to span the order={:?} null space in dimension {}; got {}",
+            p_k.ncols(),
+            order,
+            centers.ncols(),
+            centers.nrows()
+        )));
+    }
     let z = Arc::new(kernel_constraint_nullspace_from_matrix(p_k.view())?);
+
+    if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
+        return Ok((**hit).clone());
+    }
+    cache.constraint_nullspace.map.insert(key, z.clone());
+    cache.constraint_nullspace.order.push(key);
+    while cache.constraint_nullspace.map.len() > CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES {
+        if cache.constraint_nullspace.order.is_empty() {
+            break;
+        }
+        let oldkey = cache.constraint_nullspace.order.remove(0);
+        cache.constraint_nullspace.map.remove(&oldkey);
+    }
+
+    Ok((*z).clone())
+}
+
+fn thin_plate_kernel_constraint_nullspace(
+    centers: ArrayView2<'_, f64>,
+    cache: &mut BasisCacheContext,
+) -> Result<Array2<f64>, BasisError> {
+    let key = ConstraintNullspaceCacheKey {
+        centersrows: centers.nrows(),
+        centers_cols: centers.ncols(),
+        centers_hash: hash_arrayview2(centers),
+        order_code: thin_plate_constraint_nullspace_order_code(),
+    };
+
+    if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
+        return Ok((**hit).clone());
+    }
+
+    let p_k = thin_plate_polynomial_block(centers);
+    if centers.nrows() < p_k.ncols() {
+        return Err(BasisError::InvalidInput(format!(
+            "thin-plate spline requires at least {} centers to span the degree-{} polynomial null space in dimension {}; got {}",
+            p_k.ncols(),
+            thin_plate_polynomial_degree(centers.ncols()),
+            centers.ncols(),
+            centers.nrows()
+        )));
+    }
+    let (z, rank) =
+        rrqr_nullspace_basis(&p_k, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if rank != p_k.ncols() {
+        return Err(BasisError::InvalidInput(format!(
+            "thin-plate spline polynomial block is rank deficient at the selected centers: expected rank {}, got {}; choose geometrically independent centers for dimension {}",
+            p_k.ncols(),
+            rank,
+            centers.ncols()
+        )));
+    }
+    let z = Arc::new(z);
 
     if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
         return Ok((**hit).clone());
@@ -8906,25 +8988,22 @@ pub fn build_matern_basiswithworkspace(
         let d = data.ncols();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
-        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> =
-            if let Some(eta) = aniso.as_ref() {
-                let eta = eta.clone();
-                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let r = aniso_distance(data_row, center_row, &eta);
-                    matern_kernel_from_distance(r, length_scale, nu)
-                        .expect("validated Matérn inputs should not fail")
-                })
-            } else {
-                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let mut dist2 = 0.0;
-                    for axis in 0..d {
-                        let delta = data_row[axis] - center_row[axis];
-                        dist2 += delta * delta;
-                    }
-                    matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)
-                        .expect("validated Matérn inputs should not fail")
-                })
-            };
+        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> = if let Some(eta) =
+            aniso.as_ref()
+        {
+            let eta = eta.clone();
+            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = aniso_distance(data_row, center_row, &eta);
+                matern_kernel_from_distance(r, length_scale, nu)
+                    .expect("validated Matérn inputs should not fail")
+            })
+        } else {
+            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
+                matern_kernel_from_distance(r, length_scale, nu)
+                    .expect("validated Matérn inputs should not fail")
+            })
+        };
         let poly_basis = if spec.include_intercept {
             Some(Arc::new(Array2::<f64>::ones((data.nrows(), 1))))
         } else {
@@ -9408,12 +9487,7 @@ fn build_matern_operator_penalty_psi_derivatives(
                     eta,
                 )
             } else {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = centers[[k, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
-                dist2.sqrt()
+                stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
             };
             let (
                 phi,
@@ -9586,12 +9660,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 let row_j: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
                 aniso_distance(&row_k, &row_j, eta)
             } else {
-                let mut dist2 = 0.0;
-                for axis in 0..d {
-                    let delta = centers[[k, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                dist2.sqrt()
+                stable_euclidean_norm((0..d).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
             };
             let core =
                 duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)?;
@@ -9848,12 +9917,9 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
                     eta,
                 )
             } else {
-                let mut dist2 = 0.0;
-                for axis in 0..centers.ncols() {
-                    let delta = centers[[i, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                dist2.sqrt()
+                stable_euclidean_norm(
+                    (0..centers.ncols()).map(|axis| centers[[i, axis]] - centers[[j, axis]]),
+                )
             };
             let value = matern_kernel_from_distance(r, length_scale, nu)?;
             let d1 = matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
@@ -11764,12 +11830,13 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
 /// - integer-parameter partial-fraction decomposition in spectral space,
 /// - finite spatial kernel sum of polyharmonic + Matérn blocks,
 /// - explicit polynomial null-space block determined by `nullspace_order`,
-/// - side-constraint projection `P(centers)^T alpha = 0` for `p > 0`.
+/// - side-constraint projection `P(centers)^T alpha = 0` for the selected
+///   null-space degree.
 ///
 /// API mapping:
-/// - `p` is determined by `nullspace_order`:
-///   - `Zero`   -> p = 0
-///   - `Linear` -> p = 1
+/// - `p` is the Duchon smoothness order `m`, determined by `nullspace_order`:
+///   - `Zero`   -> m = 1 (constants)
+///   - `Linear` -> m = 2 (constants + linear terms)
 /// - `s` is determined directly by `power`
 ///
 pub fn create_duchon_spline_basis(
@@ -12004,12 +12071,9 @@ fn build_duchon_basis_designwithworkspace(
                         }
                         aniso_distance(&data_row_buf, &center_buf, eta)
                     } else {
-                        let mut dist2 = 0.0;
-                        for axis in 0..d {
-                            let delta = data[[i, axis]] - centers[[j, axis]];
-                            dist2 += delta * delta;
-                        }
-                        dist2.sqrt()
+                        stable_euclidean_norm(
+                            (0..d).map(|axis| data[[i, axis]] - centers[[j, axis]]),
+                        )
                     };
                     kernel_row[j] = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
@@ -12109,58 +12173,54 @@ pub fn build_duchon_basiswithworkspace(
         } else {
             None
         };
-        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> =
-            if let Some(eta) = aniso.as_ref() {
-                let eta = eta.clone();
-                let coeffs = coeffs.clone();
-                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let r = aniso_distance(data_row, center_row, &eta);
-                    if let Some(ppc) = pure_poly_coeff {
-                        if r == 0.0 && p_order > 0 {
-                            0.0
-                        } else {
-                            ppc.eval(r)
-                        }
+        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> = if let Some(eta) =
+            aniso.as_ref()
+        {
+            let eta = eta.clone();
+            let coeffs = coeffs.clone();
+            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = aniso_distance(data_row, center_row, &eta);
+                if let Some(ppc) = pure_poly_coeff {
+                    if r == 0.0 && p_order > 0 {
+                        0.0
                     } else {
-                        duchon_matern_kernel_general_from_distance(
-                            r,
-                            length_scale,
-                            p_order,
-                            s_order,
-                            d,
-                            coeffs.as_ref(),
-                        )
-                        .expect("validated Duchon inputs should not fail")
+                        ppc.eval(r)
                     }
-                })
-            } else {
-                let coeffs = coeffs.clone();
-                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let mut dist2 = 0.0;
-                    for axis in 0..d {
-                        let delta = data_row[axis] - center_row[axis];
-                        dist2 += delta * delta;
-                    }
-                    let r = dist2.sqrt();
-                    if let Some(ppc) = pure_poly_coeff {
-                        if r == 0.0 && p_order > 0 {
-                            0.0
-                        } else {
-                            ppc.eval(r)
-                        }
+                } else {
+                    duchon_matern_kernel_general_from_distance(
+                        r,
+                        length_scale,
+                        p_order,
+                        s_order,
+                        d,
+                        coeffs.as_ref(),
+                    )
+                    .expect("validated Duchon inputs should not fail")
+                }
+            })
+        } else {
+            let coeffs = coeffs.clone();
+            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
+                if let Some(ppc) = pure_poly_coeff {
+                    if r == 0.0 && p_order > 0 {
+                        0.0
                     } else {
-                        duchon_matern_kernel_general_from_distance(
-                            r,
-                            length_scale,
-                            p_order,
-                            s_order,
-                            d,
-                            coeffs.as_ref(),
-                        )
-                        .expect("validated Duchon inputs should not fail")
+                        ppc.eval(r)
                     }
-                })
-            };
+                } else {
+                    duchon_matern_kernel_general_from_distance(
+                        r,
+                        length_scale,
+                        p_order,
+                        s_order,
+                        d,
+                        coeffs.as_ref(),
+                    )
+                    .expect("validated Duchon inputs should not fail")
+                }
+            })
+        };
         let poly_block = polynomial_block_from_order(data, spec.nullspace_order);
         let base_op = ChunkedKernelDesignOperator::new(
             shared_data,
@@ -12245,7 +12305,7 @@ fn polynomial_block_from_order(
     let n = points.nrows();
     let d = points.ncols();
     match order {
-        DuchonNullspaceOrder::Zero => Array2::<f64>::zeros((n, 0)),
+        DuchonNullspaceOrder::Zero => Array2::<f64>::ones((n, 1)),
         DuchonNullspaceOrder::Linear => {
             let mut poly = Array2::<f64>::zeros((n, d + 1));
             poly.column_mut(0).fill(1.0);
@@ -12255,6 +12315,68 @@ fn polynomial_block_from_order(
             poly
         }
     }
+}
+
+fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
+    fn recurse(
+        axis: usize,
+        remaining_degree: usize,
+        current: &mut [usize],
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if axis + 1 == current.len() {
+            current[axis] = remaining_degree;
+            out.push(current.to_vec());
+            return;
+        }
+        for exponent in (0..=remaining_degree).rev() {
+            current[axis] = exponent;
+            recurse(axis + 1, remaining_degree - exponent, current, out);
+        }
+    }
+
+    if dimension == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = vec![0usize; dimension];
+    for total_degree in 0..=max_total_degree {
+        recurse(0, total_degree, &mut current, &mut out);
+    }
+    out
+}
+
+fn monomial_basis_block(points: ArrayView2<'_, f64>, max_total_degree: usize) -> Array2<f64> {
+    let n = points.nrows();
+    let exponents = monomial_exponents(points.ncols(), max_total_degree);
+    let mut block = Array2::<f64>::zeros((n, exponents.len()));
+    for (col, exponents) in exponents.iter().enumerate() {
+        for row in 0..n {
+            let mut value = 1.0;
+            for axis in 0..points.ncols() {
+                let exponent = exponents[axis];
+                if exponent != 0 {
+                    value *= points[[row, axis]].powi(exponent as i32);
+                }
+            }
+            block[[row, col]] = value;
+        }
+    }
+    block
+}
+
+#[inline(always)]
+fn thin_plate_polynomial_degree(dimension: usize) -> usize {
+    thin_plate_penalty_order(dimension).saturating_sub(1)
+}
+
+fn thin_plate_polynomial_block(points: ArrayView2<'_, f64>) -> Array2<f64> {
+    monomial_basis_block(points, thin_plate_polynomial_degree(points.ncols()))
+}
+
+fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
+    monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
 fn kernel_constraint_nullspace_from_matrix(
@@ -12503,7 +12625,7 @@ fn thin_plate_kernel_psi_triplet_from_distance(
     Ok((value, psi, psi_psi))
 }
 
-/// Creates a thin-plate regression spline basis (m=2) from data and knot locations.
+/// Creates a thin-plate regression spline basis from data and knot locations.
 ///
 /// # Arguments
 /// * `data` - `n x d` matrix of evaluation points
@@ -12511,7 +12633,8 @@ fn thin_plate_kernel_psi_triplet_from_distance(
 ///
 /// # Returns
 /// `ThinPlateSplineBasis` containing:
-/// - `basis`: `n x (k + d + 1)` matrix (`[K | P]`)
+/// - `basis`: `n x (k_c + M)` matrix (`[K_c | P]`) where `M` is the TPS
+///   polynomial null-space dimension for the selected ambient dimension
 /// - `penalty_bending`: constrained TPS curvature penalty
 /// - `penalty_ridge`: identity penalty for null-space shrinkage
 pub fn create_thin_plate_spline_basis(
@@ -12552,10 +12675,13 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
             knots.ncols()
         )));
     }
-    if k < d + 1 {
+    let poly_cols = thin_plate_polynomial_basis_dimension(d);
+    if k < poly_cols {
         return Err(BasisError::InvalidInput(format!(
-            "thin-plate spline requires at least d+1 knots ({}), got {}",
-            d + 1,
+            "thin-plate spline requires at least {} knots to span the degree-{} polynomial null space in dimension {}; got {}",
+            poly_cols,
+            thin_plate_polynomial_degree(d),
+            d,
             k
         )));
     }
@@ -12569,8 +12695,6 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
             "thin-plate length_scale must be finite and positive".to_string(),
         ));
     }
-
-    let poly_cols = d + 1;
 
     // K block: radial basis evaluations data -> knots
     let mut kernel_block = Array2::<f64>::zeros((n, k));
@@ -12591,8 +12715,8 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
         });
     kernel_result?;
 
-    // P block: [1, x_1, ..., x_d]
-    let poly_block = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear);
+    // P block: all TPS null-space monomials of total degree < m.
+    let poly_block = thin_plate_polynomial_block(data);
 
     // Omega block on knots
     let mut omega = Array2::<f64>::zeros((k, k));
@@ -12611,7 +12735,7 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
-    let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear, &mut workspace.cache)?;
+    let z = thin_plate_kernel_constraint_nullspace(knots, &mut workspace.cache)?;
     let kernel_constrained = fast_ab(&kernel_block, &z);
     let omega_constrained = {
         let zt_o = fast_atb(&z, &omega);
@@ -12678,12 +12802,11 @@ fn build_thin_plate_design_psi_derivativeswithworkspace(
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let z_kernel =
-        kernel_constraint_nullspace(centers, DuchonNullspaceOrder::Linear, &mut workspace.cache)?;
+    let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
     let n = data.nrows();
     let k = centers.nrows();
     let kernel_cols = z_kernel.ncols();
-    let poly_cols = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear).ncols();
+    let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
     let total_cols = kernel_cols + poly_cols;
     let mut out_psi = Array2::<f64>::zeros((n, total_cols));
     let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
@@ -12701,10 +12824,10 @@ fn build_thin_plate_design_psi_derivativeswithworkspace(
     //   K_ij,psi     = phi_r(r_ij) * r_ij
     //   K_ij,psipsi  = phi_rr(r_ij) * r_ij^2 + phi_r(r_ij) * r_ij.
     //
-    // The polynomial block [1, x_1, ..., x_d] is psi-independent, so its
-    // derivatives are identically zero. After differentiating the raw kernel
-    // block, the same frozen nullspace projection Z_kernel and frozen
-    // identifiability transform Z are applied:
+    // The TPS polynomial null-space block is psi-independent, so its derivatives
+    // are identically zero. After differentiating the raw kernel block, the
+    // same frozen nullspace projection Z_kernel and frozen identifiability
+    // transform Z are applied:
     //   K_c,psi     = K_psi Z_kernel
     //   K_c,psipsi  = K_psipsi Z_kernel
     //   X_psi       = [K_c,psi | 0] Z
@@ -12766,10 +12889,9 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let z_kernel =
-        kernel_constraint_nullspace(centers, DuchonNullspaceOrder::Linear, &mut workspace.cache)?;
+    let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
     let kernel_cols = z_kernel.ncols();
-    let poly_cols = polynomial_block_from_order(centers, DuchonNullspaceOrder::Linear).ncols();
+    let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let total_cols = kernel_cols + poly_cols;
     let k = centers.nrows();
     let d = centers.ncols();
@@ -13379,7 +13501,7 @@ pub(crate) mod internal {
 
         // Double-check for degenerate range - this should be caught by the public function
         // but we add it here as a defensive measure
-        if minval == maxval && num_internal_knots > 0 {
+        if minval == maxval {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
 
@@ -13427,7 +13549,7 @@ pub(crate) mod internal {
         sorted.sort_by(f64::total_cmp);
         let minval = sorted[0];
         let maxval = *sorted.last().unwrap_or(&minval);
-        if minval == maxval && num_internal_knots > 0 {
+        if minval == maxval {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
         let scale = (maxval - minval).abs().max(1.0);
@@ -15098,6 +15220,29 @@ mod tests {
     }
 
     #[test]
+    fn testvalidate_psd_penalty_keeps_rank_for_uniformly_scaled_psd_penalty() {
+        let penalty = array![[4.0, 0.0], [0.0, 1.0]];
+        let scaled_penalty = penalty.mapv(|v| v * 1e-12);
+
+        let summary = validate_psd_penalty(
+            &penalty,
+            "unit test penalty",
+            "uniform scaling should not change the positive eigenspace",
+        )
+        .unwrap();
+        let scaled_summary = validate_psd_penalty(
+            &scaled_penalty,
+            "unit test penalty",
+            "uniform scaling should not change the positive eigenspace",
+        )
+        .unwrap();
+
+        assert_eq!(summary.effective_rank, 2);
+        assert_eq!(scaled_summary.effective_rank, summary.effective_rank);
+        assert!(scaled_summary.max_abs_eigenvalue > scaled_summary.tolerance);
+    }
+
+    #[test]
     fn test_thin_plate_3d_bending_penalty_is_psdwith_positive_rank() {
         let knots = array![
             [0.0, 0.0, 0.0],
@@ -16387,6 +16532,24 @@ mod tests {
     }
 
     #[test]
+    fn testvalidate_knots_for_degree_rejectszero_support_boundary_basis() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let err = create_basis::<Dense>(
+            array![0.5].view(),
+            KnotSource::Provided(knots.view()),
+            3,
+            BasisOptions::value(),
+        )
+        .expect_err("over-repeated boundary knots should be rejected");
+        match err {
+            BasisError::InvalidKnotVector(msg) => {
+                assert!(msg.contains("zero support"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_densesecond_derivativezeroes_outside_domain_even_on_sparse_heuristic_path() {
         let degree = 3usize;
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0];
@@ -16520,7 +16683,7 @@ mod tests {
             BasisOptions::m_spline(),
         )
         .expect_err("degenerate M-spline normalization spans should be rejected");
-        assert!(matches!(err, BasisError::InvalidInput(_)));
+        assert!(matches!(err, BasisError::InvalidKnotVector(_)));
     }
 
     #[test]
@@ -16814,9 +16977,7 @@ mod tests {
             err => panic!("Expected DegenerateRange error, got {:?}", err),
         }
 
-        // Special case: Zero-width range is allowed when num_internal_knots = 0
-        // This creates a valid but trivial basis
-        let result = create_basis::<Dense>(
+        match create_basis::<Dense>(
             array![].view(),
             KnotSource::Generate {
                 data_range: (5.0, 5.0),
@@ -16824,11 +16985,14 @@ mod tests {
             },
             1,
             BasisOptions::value(),
-        );
-        assert!(
-            result.is_ok(),
-            "Zero-width range with no internal knots should be valid"
-        );
+        )
+        .unwrap_err()
+        {
+            BasisError::DegenerateRange(num_knots) => {
+                assert_eq!(num_knots, 0);
+            }
+            err => panic!("Expected DegenerateRange error, got {:?}", err),
+        }
 
         // Test uniform fallback (quantile knots are disabled for P-splines)
         let (_, knots_uniform) = create_basis::<Dense>(
@@ -17253,26 +17417,20 @@ mod tests {
             aniso_log_scales: None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 2);
+        assert_eq!(out.penalties.len(), 3);
         assert_eq!(out.penaltyinfo.len(), 3);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
             out.penaltyinfo[0].source,
             PenaltySource::OperatorMass
         ));
-        assert!(out.penaltyinfo[0].active);
         assert!(matches!(
             out.penaltyinfo[1].source,
             PenaltySource::OperatorTension
         ));
-        assert!(out.penaltyinfo[1].active);
         assert!(matches!(
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
-        ));
-        assert!(!out.penaltyinfo[2].active);
-        assert!(matches!(
-            out.penaltyinfo[2].dropped_reason,
-            Some(PenaltyDropReason::ZeroMatrix)
         ));
     }
 
@@ -17357,6 +17515,15 @@ mod tests {
     }
 
     #[test]
+    fn test_pairwise_distance_bounds_handles_large_finite_coordinates() {
+        let pts = array![[0.0], [3.0e200], [6.0e200]];
+        let (r_min, r_max) =
+            pairwise_distance_bounds(pts.view()).expect("large finite bounds should exist");
+        assert!((r_min - 3.0e200).abs() / 3.0e200 < 1e-12);
+        assert!((r_max - 6.0e200).abs() / 6.0e200 < 1e-12);
+    }
+
+    #[test]
     fn test_pairwise_distance_bounds_sampled_matches_exact_small() {
         // For n <= K_CAP (=1024), sampled path delegates to the exact path.
         let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0], [-1.0, 1.0]];
@@ -17401,6 +17568,19 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_data_center_distances_preserves_tiny_nonzero_separations() {
+        let data = array![[0.0, 0.0, 0.0]];
+        let centers = array![[1.0e-200, 0.0, 0.0]];
+        let distances = compute_data_center_distances(data.view(), centers.view())
+            .expect("distance matrix should build");
+        assert!(
+            distances[[0, 0]] > 0.0,
+            "tiny finite separations should not collapse to an exact collision"
+        );
+        assert!((distances[[0, 0]] - 1.0e-200).abs() / 1.0e-200 < 1e-12);
+    }
+
+    #[test]
     fn test_duchon_general_kernel_symmetric_and_finite() {
         let n = 7usize;
         let d = 5usize;
@@ -17422,7 +17602,7 @@ mod tests {
             centers.view(),
             Some(0.9),
             5,
-            DuchonNullspaceOrder::Linear, // p=1
+            DuchonNullspaceOrder::Linear, // order=1 => m=2
         )
         .expect("general Duchon basis should build");
         assert!(out.basis.iter().all(|v| v.is_finite()));
@@ -18746,7 +18926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_general_p0_case_builds() {
+    fn test_duchon_order_zero_builds_constant_nullspace() {
         let data = array![
             [0.0, 0.1, 0.2, 0.3],
             [0.2, 0.0, 0.1, 0.5],
@@ -18760,15 +18940,21 @@ mod tests {
             centers.view(),
             Some(1.2),
             4,
-            DuchonNullspaceOrder::Zero, // p=0
+            DuchonNullspaceOrder::Zero,
         )
-        .expect("p=0 Duchon case should build");
-        assert_eq!(out.num_polynomial_basis, 0);
+        .expect("order=0 Duchon case should build");
+        assert_eq!(out.num_polynomial_basis, 1);
+        assert!(
+            out.basis
+                .column(out.basis.ncols() - 1)
+                .iter()
+                .all(|&v| v == 1.0)
+        );
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
     }
 
     #[test]
-    fn test_duchon_general_p0_16d_case_builds_with_collision_points() {
+    fn test_duchon_order_zero_16d_case_builds_with_constant_nullspace() {
         let data = array![
             [
                 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30,
@@ -18805,7 +18991,7 @@ mod tests {
         )
         .expect("16D rough Duchon case should build");
 
-        assert_eq!(out.num_polynomial_basis, 0);
+        assert_eq!(out.num_polynomial_basis, 1);
         assert!(out.basis.iter().all(|v| v.is_finite()));
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
         assert!(out.penalty_ridge.iter().all(|v| v.is_finite()));
@@ -18836,7 +19022,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_general_p1_s0_case_builds() {
+    fn test_duchon_order_one_builds_linear_nullspace() {
         let data = array![
             [0.0, 0.1, 0.2],
             [0.2, 0.0, 0.1],
@@ -18852,14 +19038,14 @@ mod tests {
             0,
             DuchonNullspaceOrder::Linear,
         )
-        .expect("p=1, s=0 Duchon case should build");
+        .expect("order=1, s=0 Duchon case should build");
         assert_eq!(out.num_polynomial_basis, data.ncols() + 1);
         assert!(out.basis.iter().all(|v| v.is_finite()));
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
     }
 
     #[test]
-    fn test_duchon_general_p0_s0_case_builds() {
+    fn test_duchon_order_zero_s0_case_builds_constant_nullspace() {
         let data = array![
             [0.0, 0.1, 0.2],
             [0.2, 0.0, 0.1],
@@ -18875,8 +19061,8 @@ mod tests {
             0,
             DuchonNullspaceOrder::Zero,
         )
-        .expect("p=0, s=0 Duchon case should build");
-        assert_eq!(out.num_polynomial_basis, 0);
+        .expect("order=0, s=0 Duchon case should build");
+        assert_eq!(out.num_polynomial_basis, 1);
         assert!(out.basis.iter().all(|v| v.is_finite()));
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
     }
