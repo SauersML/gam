@@ -2021,6 +2021,26 @@ impl FittedModel {
             validate_survival_location_scale_saved_fit(self.payload(), saved_link_wiggle.as_ref())?;
         }
 
+        // Validate anchored-deviation replay contracts at LOAD/SAVE time rather
+        // than waiting for first predict call. Previously these contracts
+        // (span table dimensions, coefficient matrices, etc.) were only
+        // asserted inside `saved_prediction_runtime`, which runs on the first
+        // predict invocation. A corrupted runtime would therefore pass
+        // `load_from_path` silently and fail later under a different error
+        // surface. Enforcing the same check here makes the model self-
+        // diagnostic: `gam fit` catches its own bad output at save, and
+        // `gam predict` catches bad input at load rather than mid-pipeline.
+        if let Some(runtime) = self.score_warp_runtime.as_ref() {
+            runtime.validate_exact_replay_contract().map_err(|err| {
+                format!("saved anchored score-warp runtime is invalid: {err}")
+            })?;
+        }
+        if let Some(runtime) = self.link_deviation_runtime.as_ref() {
+            runtime.validate_exact_replay_contract().map_err(|err| {
+                format!("saved anchored link-deviation runtime is invalid: {err}")
+            })?;
+        }
+
         // Structural invariant: nonlinear saved models must retain a usable
         // posterior-mean backend. We prefer persisted covariance, but a saved
         // penalized Hessian is also sufficient because prediction can
