@@ -65,6 +65,36 @@ pub fn init_logging() {
     }
 }
 
+/// Env-gated diagnostic: returns `true` when `GAM_LOG_PIRLS_INFO` is set to any
+/// non-empty value in the process environment.
+///
+/// Why this exists: the inner PIRLS / blockwise iteration loops emit their
+/// per-cycle progress at `log::debug!` (or not at all for the custom-family
+/// blockwise path), but the default `log::max_level` is `Info` and CI logs
+/// run at `Info` too. When a production benchmark hangs inside the first
+/// outer-eval call, that pattern produces exactly three outer-plan log lines
+/// followed by tens of minutes of CPU-pinned silence — no diagnostic signal
+/// at all about whether the inner solver is iterating, stalling, or stuck in
+/// assembly.
+///
+/// Setting `GAM_LOG_PIRLS_INFO=1` in the benchmark workflow promotes the
+/// inner iteration emissions to `info` so the timeout signature becomes
+/// "thousands of PIRLS iter lines with monotone deviance" (inner spin) vs
+/// "zero PIRLS lines" (spin is outside the inner solve). Default behaviour
+/// is unchanged — production fits don't pay any extra log cost.
+///
+/// The env lookup is memoized via `OnceLock`, so hot-path callers can
+/// evaluate the predicate per-cycle without re-entering the process
+/// environment.
+pub fn pirls_iter_info_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("GAM_LOG_PIRLS_INFO")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 fn install_multiprogress(mp: Option<MultiProgress>) {
     if let Ok(mut guard) = active_multiprogress().lock() {
         *guard = mp;

@@ -4612,15 +4612,33 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         linear_constraints: linear_constraints.clone(),
     };
 
+    let iter_log_info = crate::solver::visualizer::pirls_iter_info_enabled();
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
-        log::debug!(
-            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
-            info.iteration,
-            info.deviance,
-            info.gradient_norm,
-            info.step_size,
-            info.step_halving
-        );
+        // Default behaviour: emit at debug so production fits don't flood logs
+        // with per-cycle noise. When GAM_LOG_PIRLS_INFO is set, promote the
+        // same payload to info so benchmark-timeout signatures can be
+        // distinguished from outer-layer spin (see
+        // visualizer::pirls_iter_info_enabled docs for the diagnostic
+        // motivation).
+        if iter_log_info {
+            log::info!(
+                "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
+                info.iteration,
+                info.deviance,
+                info.gradient_norm,
+                info.step_size,
+                info.step_halving
+            );
+        } else {
+            log::debug!(
+                "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
+                info.iteration,
+                info.deviance,
+                info.gradient_norm,
+                info.step_size,
+                info.step_halving
+            );
+        }
     };
 
     let mut working_summary = runworking_model_pirls(

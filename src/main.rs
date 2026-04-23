@@ -5650,17 +5650,30 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         linear_constraints: None,
     };
     let pirls_start = std::time::Instant::now();
+    let pirls_iter_info = gam::visualizer::pirls_iter_info_enabled();
     let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
         let elapsed = pirls_start.elapsed().as_secs_f64();
-        log::debug!(
-            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
-            info.iteration,
-            info.deviance,
-            info.gradient_norm,
-            info.step_size,
-            info.step_halving,
-            elapsed,
-        );
+        if pirls_iter_info {
+            log::info!(
+                "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
+                info.iteration,
+                info.deviance,
+                info.gradient_norm,
+                info.step_size,
+                info.step_halving,
+                elapsed,
+            );
+        } else {
+            log::debug!(
+                "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
+                info.iteration,
+                info.deviance,
+                info.gradient_norm,
+                info.step_size,
+                info.step_halving,
+                elapsed,
+            );
+        }
     };
     let (summary, beta, state, constraint_mode, surv_model) =
         if likelihood_mode == SurvivalLikelihoodMode::Weibull {
