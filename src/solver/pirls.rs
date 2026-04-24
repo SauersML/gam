@@ -5629,7 +5629,7 @@ fn integrated_inverse_link_from_family(
 ///
 /// Link-specific exact replacements:
 /// - Probit:
-///     E[Phi(eta)] = Phi(mu / sqrt(1 + sigma^2))
+///     E[Phi(eta + eps)] = Phi(eta / sqrt(1 + sigma^2))
 ///   exactly, with equally simple derivative. Integrated probit updates should
 ///   never need GHQ once they are routed through a dedicated family dispatch.
 /// - Logit:
@@ -6149,24 +6149,23 @@ fn compute_observed_hessian_curvature_arrays(
             h4,
         );
         let fisher_weight = fisher_weights[i].max(0.0);
-        // Store the exact observed-information weight.  The SPD floor for
-        // solver conditioning is applied separately when assembling the
-        // penalized Hessian for the linear solve (see `solver_hessian_weights`),
-        // so `lasthessian_weights` / `finalweights` always carry the true
-        // curvature that the REML outer objective should differentiate.
-        //
-        // Only fall back to the Fisher weight when the observed correction
-        // makes the weight non-positive or non-finite — that is a validity
-        // issue, not a conditioning one.
-        if w_obs.is_finite() && w_obs > 0.0 {
-            hessian_weights[i] = w_obs;
-            hessian_c[i] = if c_obs.is_finite() { c_obs } else { 0.0 };
-            hessian_d[i] = if d_obs.is_finite() { d_obs } else { 0.0 };
-        } else {
-            hessian_weights[i] = fisher_weight;
-            hessian_c[i] = 0.0;
-            hessian_d[i] = 0.0;
+        // Store exact observed-information curvature.  Solver conditioning
+        // floors are applied separately by `solver_hessian_weights`; replacing
+        // invalid observed rows with Fisher rows here would silently turn the
+        // advertised observed-LAML objective into a mixed surrogate.
+        if !(w_obs.is_finite() && w_obs > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
+            )));
         }
+        if !c_obs.is_finite() || !d_obs.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
+            )));
+        }
+        hessian_weights[i] = w_obs;
+        hessian_c[i] = c_obs;
+        hessian_d[i] = d_obs;
     }
     Ok((hessian_weights, hessian_c, hessian_d))
 }

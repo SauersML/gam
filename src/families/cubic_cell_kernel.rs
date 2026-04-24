@@ -1894,6 +1894,55 @@ mod tests {
     }
 
     #[test]
+    fn higher_derivative_moment_helpers_reject_empty_first_coefficients() {
+        let cell = DenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 1.0,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        let moments = [1.0; 16];
+
+        let third_err = cell_third_derivative_from_moments(
+            cell,
+            &[],
+            &[1.0],
+            &[1.0],
+            &[],
+            &[],
+            &[],
+            &[],
+            &moments,
+        )
+        .expect_err("empty first coefficients should be rejected");
+        assert!(third_err.contains("r first-derivative coefficients must be non-empty"));
+
+        let fourth_err = cell_fourth_derivative_from_moments(
+            cell,
+            &[1.0],
+            &[],
+            &[1.0],
+            &[1.0],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &moments,
+        )
+        .expect_err("empty first coefficients should be rejected");
+        assert!(fourth_err.contains("s first-derivative coefficients must be non-empty"));
+    }
+
+    #[test]
     fn score_and_link_basis_cell_coefficients_match_direct_construction() {
         let score_basis_span = LocalSpanCubic {
             left: -0.7,

@@ -6381,6 +6381,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
+    validate_duchon_collocation_orders(length_scale, p_order, s_order, d)?;
     let coeffs = length_scale
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let pure_block_order = pure_duchon_block_order(p_order, s_order);
@@ -7257,10 +7258,28 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    let coeffs = length_scale
-        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let p_colloc = centers.nrows();
     let dim = centers.ncols();
+    validate_duchon_collocation_orders(length_scale, p_order, s_order, dim)?;
+    if let Some(eta) = aniso_log_scales {
+        if eta.len() != dim {
+            return Err(BasisError::DimensionMismatch(format!(
+                "Duchon anisotropy dimension mismatch: got {}, expected {dim}",
+                eta.len()
+            )));
+        }
+    }
+    let coeffs = length_scale
+        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
+    let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(|eta| {
+        eta.iter()
+            .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
+            .collect()
+    });
+    let sum_metric_weights = metric_weights
+        .as_ref()
+        .map(|w| w.iter().sum::<f64>())
+        .unwrap_or(dim as f64);
     let row_scales = if let Some(w) = collocationweights {
         if w.len() != p_colloc {
             return Err(BasisError::DimensionMismatch(format!(
@@ -7290,10 +7309,13 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         let scale_k = row_scales[k];
         for j in k..p_colloc {
             let scale_j = row_scales[j];
+            let mut s_vec = Vec::new();
             let r = if let Some(eta) = aniso_log_scales {
                 let row_k: Vec<f64> = (0..dim).map(|a| centers[[k, a]]).collect();
                 let row_j: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-                aniso_distance(&row_k, &row_j, eta)
+                let (r, components) = aniso_distance_and_components(&row_k, &row_j, eta);
+                s_vec = components;
+                r
             } else {
                 stable_euclidean_norm((0..dim).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
             };
@@ -7313,9 +7335,16 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             d0_raw[[k, j]] = scale_k * phi;
             d0_raw[[j, k]] = scale_j * phi;
             let lap = if r > R_EPS {
-                phi_rr + ((dim as f64 - 1.0) * phi_r / r)
+                let q = phi_r / r;
+                if let Some(weights) = metric_weights.as_ref() {
+                    let t = (phi_rr - q) / (r * r);
+                    let sum_wb_sb: f64 = (0..dim).map(|axis| weights[axis] * s_vec[axis]).sum();
+                    q * sum_metric_weights + t * sum_wb_sb
+                } else {
+                    phi_rr + ((dim as f64 - 1.0) * q)
+                }
             } else {
-                dim as f64 * phi_rr
+                sum_metric_weights * phi_rr
             };
             d2_raw[[k, j]] = scale_k * lap;
             d2_raw[[j, k]] = scale_j * lap;
@@ -7323,8 +7352,12 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
                 let grad_scale = phi_r / r;
                 for axis in 0..dim {
                     let delta = centers[[k, axis]] - centers[[j, axis]];
-                    d1_raw[[k * dim + axis, j]] = scale_k * grad_scale * delta;
-                    d1_raw[[j * dim + axis, k]] = -scale_j * grad_scale * delta;
+                    let axis_scale = metric_weights
+                        .as_ref()
+                        .map(|weights| weights[axis])
+                        .unwrap_or(1.0);
+                    d1_raw[[k * dim + axis, j]] = scale_k * grad_scale * axis_scale * delta;
+                    d1_raw[[j * dim + axis, k]] = -scale_j * grad_scale * axis_scale * delta;
                 }
             }
         }
@@ -7645,8 +7678,8 @@ fn duchon_matern_block(
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
     if r <= 0.0 {
         if nu_abs > 0.0 && nu > 0.0 {
-            // lim_{z->0} z^nu K_nu(z) = 2^{nu-1} Γ(nu), nu>0.
-            return Ok(c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu));
+            // r^nu K_nu(kappa r) ~ 2^(nu-1) Γ(nu) kappa^(-nu).
+            return Ok(c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu) * kappa.powf(-nu));
         }
         // Center-collision diagonal: zero by convention for nu <= 0 Matérn blocks.
         return Ok(0.0);
@@ -7927,15 +7960,19 @@ fn duchon_matern_block_jet4(
             "Duchon Matérn-block kappa must be finite and positive".to_string(),
         ));
     }
-    if r <= 0.0 {
-        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
-    }
-
     let n = n_order as f64;
     let k_half = 0.5 * k_dim as f64;
     let nu = n - k_half;
     let c = kappa.powf(k_half - n)
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+    if r <= 0.0 {
+        let value = if nu > 0.0 {
+            c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu) * kappa.powf(-nu)
+        } else {
+            0.0
+        };
+        return Ok((value, 0.0, 0.0, 0.0, 0.0));
+    }
 
     duchon_matern_family_jet4(r, kappa, c, nu)
 }
@@ -7975,6 +8012,52 @@ fn duchon_matern_operator_block_jets(
 #[inline(always)]
 fn pure_duchon_block_order(p_order: usize, s_order: usize) -> usize {
     p_order + s_order
+}
+
+fn validate_duchon_kernel_orders(
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+) -> Result<(), BasisError> {
+    if k_dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if length_scale.is_none() && 2 * s_order >= k_dim {
+        return Err(BasisError::InvalidInput(format!(
+            "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
+        )));
+    }
+    let spectral_order = 2 * (p_order + s_order);
+    if spectral_order <= k_dim {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon pointwise kernel values require 2*(p+s) > dimension; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_duchon_collocation_orders(
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+) -> Result<(), BasisError> {
+    validate_duchon_kernel_orders(length_scale, p_order, s_order, k_dim)?;
+    let spectral_order = 2 * (p_order + s_order);
+    if spectral_order <= k_dim + 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon D1 collocation requires 2*(p+s) > dimension+1; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    if spectral_order <= k_dim + 2 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon D2 collocation requires 2*(p+s) > dimension+2; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -8034,11 +8117,6 @@ fn duchon_matern_kernel_general_from_distance(
             "Duchon kernel distance must be finite and non-negative".to_string(),
         ));
     }
-    // For p>0 kernels the diagonal (r=0) is zero: the polyharmonic blocks
-    // vanish at the origin by construction.
-    if r == 0.0 && p_order > 0 {
-        return Ok(0.0);
-    }
     let Some(length_scale) = length_scale else {
         return Ok(polyharmonic_kernel(
             r,
@@ -8060,6 +8138,15 @@ fn duchon_matern_kernel_general_from_distance(
         coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         &coeffs_local
     };
+    if r == 0.0 {
+        return duchon_hybrid_kernel_collision_value(
+            length_scale,
+            p_order,
+            s_order,
+            k_dim,
+            coeffs_ref,
+        );
+    }
     let mut val = KahanSum::default();
     for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
@@ -8074,6 +8161,54 @@ fn duchon_matern_kernel_general_from_distance(
         val.add(coeff * duchon_matern_block(r, kappa, n, k_dim)?);
     }
     Ok(val.sum())
+}
+
+fn duchon_hybrid_kernel_collision_value(
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<f64, BasisError> {
+    let spectral_order = 2 * (p_order + s_order);
+    if spectral_order <= k_dim {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon hybrid diagonal is not finite when 2*(p+s) <= dimension; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let mut pure = KahanSum::default();
+    let mut log_part = KahanSum::default();
+    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+        if a_m == 0.0 {
+            continue;
+        }
+        let (block_pure, block_log) = duchon_polyharmonic_block_taylor_r2j(m, k_dim, 0);
+        pure.add(a_m * block_pure);
+        log_part.add(a_m * block_log);
+    }
+    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+        if b_n == 0.0 {
+            continue;
+        }
+        let (block_pure, block_log) = duchon_matern_block_taylor_r2j(kappa, n, k_dim, 0);
+        pure.add(b_n * block_pure);
+        log_part.add(b_n * block_log);
+    }
+    let value = pure.sum();
+    let log_value = log_part.sum();
+    if log_value.abs() > 1e-8 * value.abs().max(1e-30) {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon hybrid diagonal log terms did not cancel: log={log_value:.6e}, value={value:.6e}; p={p_order}, s={s_order}, d={k_dim}"
+        )));
+    }
+    if !value.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Duchon hybrid diagonal value for p={p_order}, s={s_order}, d={k_dim}"
+        )));
+    }
+    Ok(value)
 }
 
 #[inline(always)]
@@ -9620,6 +9755,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     })?;
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
+    validate_duchon_collocation_orders(Some(length_scale), p_order, s_order, centers.ncols())?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z_kernel =
         kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
@@ -10475,6 +10611,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         .unwrap_or(p_padded);
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
+    validate_duchon_collocation_orders(None, p_order, s_order, dim)?;
     let block_order = pure_duchon_block_order(p_order, s_order);
     let mut design_result = build_aniso_design_psi_derivatives_shared(
         data,
@@ -11944,6 +12081,9 @@ fn build_duchon_basis_designwithworkspace(
             "Duchon basis requires finite data and center values".to_string(),
         ));
     }
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let s_order = power;
+    validate_duchon_kernel_orders(length_scale, p_order, s_order, d)?;
 
     let poly_block = polynomial_block_from_order(data, nullspace_order);
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
@@ -11951,8 +12091,6 @@ fn build_duchon_basis_designwithworkspace(
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
 
-    let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = power;
     let coeffs = if let Some(ls) = length_scale {
         Some(duchon_partial_fraction_coeffs(
             p_order,
@@ -12124,6 +12262,8 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    validate_duchon_collocation_orders(spec.length_scale, p_order, spec.power, data.ncols())?;
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
