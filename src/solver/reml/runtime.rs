@@ -532,6 +532,12 @@ impl<'a> RemlState<'a> {
                 gradient: None,
             });
         }
+        if !self.config.firth_bias_reduction {
+            return Ok(TkCorrectionTerms {
+                value: 0.0,
+                gradient: None,
+            });
+        }
 
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
@@ -3216,11 +3222,9 @@ impl<'a> RemlState<'a> {
         use super::unified::{compute_efs_update, compute_hybrid_efs_update};
 
         let beta_for_barrier = assembly.beta.clone();
+        let has_ext = !assembly.ext_coords.is_empty();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
-        if has_psi
-            && self.config.link_function() != LinkFunction::Identity
-            && self.config.firth_bias_reduction
-        {
+        if has_ext && self.config.link_function() != LinkFunction::Identity {
             return Err(EstimationError::InvalidInput(
                 "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate EFS psi gradients".to_string(),
             ));
@@ -3392,10 +3396,9 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
-        let has_firth_psi_ext = ext_coords.iter().any(|coord| !coord.is_penalty_like)
-            && self.config.firth_bias_reduction;
+        let has_ext = !ext_coords.is_empty();
         if compute_gradient_for_tk(mode)
-            && has_firth_psi_ext
+            && has_ext
             && self.config.link_function() != LinkFunction::Identity
         {
             return Err(EstimationError::InvalidInput(
