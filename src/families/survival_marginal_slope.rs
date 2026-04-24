@@ -76,6 +76,9 @@ pub struct SurvivalMarginalSlopeTermSpec {
 }
 
 pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
+const SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL: f64 = 1e-12;
+const SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL: f64 = 1e-8;
+const SURVIVAL_INTERCEPT_LOG_SURVIVAL_THRESHOLD: f64 = 1e-8;
 
 #[inline]
 fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
@@ -3432,7 +3435,45 @@ impl SurvivalMarginalSlopeFamily {
         };
         let probit_scale = self.probit_frailty_scale();
         let a_init = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
-        super::monotone_root::solve_monotone_root(eval, a_init, "survival intercept", 1e-12, 64, 64)
+        let (a, abs_deriv) = super::monotone_root::solve_monotone_root(
+            eval,
+            a_init,
+            "survival intercept",
+            1e-12,
+            64,
+            64,
+        )?;
+
+        let (residual, _, _) = eval(a)?;
+        let target_survival = crate::probability::normal_cdf(-q);
+        let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
+        let probability_tol = SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL
+            .max(SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL * tail_mass);
+        let mut residual_ok = residual.abs() <= probability_tol;
+
+        if target_survival < SURVIVAL_INTERCEPT_LOG_SURVIVAL_THRESHOLD {
+            let achieved_survival = target_survival + residual;
+            let (target_log_survival, _) = signed_probit_logcdf_and_mills_ratio(-q);
+            residual_ok = if target_log_survival.is_finite()
+                && achieved_survival.is_finite()
+                && achieved_survival > 0.0
+            {
+                (achieved_survival.ln() - target_log_survival).abs()
+                    <= SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL
+            } else {
+                residual_ok
+            };
+        }
+
+        if !residual_ok {
+            return Err(format!(
+                "survival marginal-slope intercept solve failed: \
+                 residual={residual:.3e} at a={a:.6}, target survival={target_survival:.6e}, \
+                 probability_tol={probability_tol:.3e}"
+            ));
+        }
+
+        Ok((a, abs_deriv))
     }
 
     fn max_feasible_time_step(
@@ -12412,12 +12453,16 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
-            if let Some(sigma) = sigma_fixed {
-                if !sigma.is_finite() || *sigma < 0.0 {
-                    return Err(format!(
-                        "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                    ));
-                }
+            let Some(sigma) = sigma_fixed else {
+                return Err(
+                    "survival-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
+                        .to_string(),
+                );
+            };
+            if !sigma.is_finite() || *sigma < 0.0 {
+                return Err(format!(
+                    "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                ));
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
@@ -12684,17 +12729,14 @@ pub fn fit_survival_marginal_slope_terms(
         standardize_latent_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
     spec.z = z_standardized;
     let n = spec.age_entry.len();
-    let sigma_learnable = matches!(
-        &spec.frailty,
-        FrailtySpec::GaussianShift { sigma_fixed: None }
-    );
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
             sigma_fixed: Some(s),
         } => Some(*s),
-        FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
         FrailtySpec::None => None,
-        _ => None,
+        FrailtySpec::GaussianShift { sigma_fixed: None } | FrailtySpec::HazardMultiplier { .. } => {
+            unreachable!("validate_spec rejects unsupported marginal-slope frailty")
+        }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
     let baseline_slope = pooled_survival_baseline(
@@ -12755,19 +12797,9 @@ pub fn fit_survival_marginal_slope_terms(
         &extra_rho0,
         kappa_options,
     );
-    let setup = if sigma_learnable {
-        setup.with_auxiliary(
-            Array1::from_vec(vec![initial_sigma.unwrap_or(0.5).ln()]),
-            Array1::from_vec(vec![0.01_f64.ln()]),
-            Array1::from_vec(vec![5.0_f64.ln()]),
-        )
-    } else {
-        setup
-    };
 
     let hints = RefCell::new(ThetaHints::default());
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
-    let final_sigma_cell = std::cell::Cell::new(initial_sigma);
 
     let event = Arc::new(spec.event_target.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -12962,20 +12994,11 @@ pub fn fit_survival_marginal_slope_terms(
             joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    let analytic_joint_hessian_available = !sigma_learnable
-        && analytic_joint_derivatives_available
+    let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && matches!(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-
-    let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
-        if sigma_learnable {
-            Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
-        } else {
-            initial_sigma
-        }
-    };
     let derivative_block_cache = RefCell::new(
         None::<(
             Array1<f64>,
@@ -13031,20 +13054,6 @@ pub fn fit_survival_marginal_slope_terms(
         if link_dev_runtime.is_some() {
             derivative_blocks.push(Vec::new());
         }
-        if sigma_learnable {
-            derivative_blocks
-                .last_mut()
-                .expect("survival marginal-slope derivative blocks")
-                .push(crate::custom_family::CustomFamilyBlockPsiDerivative::new(
-                    None,
-                    Array2::zeros((0, 0)),
-                    Array2::zeros((0, 0)),
-                    None,
-                    None,
-                    None,
-                    None,
-                ));
-        }
         let derivative_blocks = Arc::new(derivative_blocks);
         derivative_block_cache.replace(Some((theta.clone(), Arc::clone(&derivative_blocks))));
         Ok(derivative_blocks)
@@ -13066,10 +13075,8 @@ pub fn fit_survival_marginal_slope_terms(
         true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let sigma = sigma_from_theta(theta);
-            final_sigma_cell.set(sigma);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], initial_sigma);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.get(0) {
@@ -13096,9 +13103,8 @@ pub fn fit_survival_marginal_slope_terms(
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], initial_sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
@@ -13125,9 +13131,8 @@ pub fn fit_survival_marginal_slope_terms(
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], initial_sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
@@ -13141,7 +13146,6 @@ pub fn fit_survival_marginal_slope_terms(
             Ok(eval.efs_eval)
         },
     )?;
-    let final_sigma = final_sigma_cell.get();
 
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
@@ -13151,7 +13155,7 @@ pub fn fit_survival_marginal_slope_terms(
         logslopespec_resolved: resolved_specs.remove(0),
         marginal_design: designs[0].clone(),
         logslope_design: designs[1].clone(),
-        gaussian_frailty_sd: final_sigma,
+        gaussian_frailty_sd: initial_sigma,
         baseline_slope,
         z_normalization,
         time_block_penalties_len: time_penalties_len,
