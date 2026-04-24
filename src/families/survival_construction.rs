@@ -36,11 +36,20 @@ pub enum SurvivalBaselineTarget {
     /// eta_target(t) = 0, so regularized model defaults to linear log-cumulative
     /// hazard from the existing time basis.
     Linear,
-    /// Parametric target: Weibull baseline encoded in eta_target(t) = log(H0(t)).
+    /// Parametric target: Weibull baseline.
+    ///
+    /// Transformation/cloglog survival uses `eta_target(t) = log(H0(t))`;
+    /// marginal-slope probit survival uses `q(t) = -Phi^-1(exp(-H0(t)))`.
     Weibull,
-    /// Parametric target: Gompertz baseline encoded in eta_target(t) = log(H0(t)).
+    /// Parametric target: Gompertz baseline.
+    ///
+    /// Transformation/cloglog survival uses `eta_target(t) = log(H0(t))`;
+    /// marginal-slope probit survival uses `q(t) = -Phi^-1(exp(-H0(t)))`.
     Gompertz,
-    /// Parametric target: Gompertz-Makeham baseline encoded in eta_target(t) = log(H0(t)).
+    /// Parametric target: Gompertz-Makeham baseline.
+    ///
+    /// Transformation/cloglog survival uses `eta_target(t) = log(H0(t))`;
+    /// marginal-slope probit survival uses `q(t) = -Phi^-1(exp(-H0(t)))`.
     GompertzMakeham,
 }
 
@@ -532,7 +541,7 @@ where
 pub fn optimize_survival_baseline_config_with_gradient<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,
-    mut objective: F,
+    objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
@@ -561,8 +570,8 @@ where
     let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient) =
-            cost_objective.borrow_mut()(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let (cost, gradient) = cost_objective.borrow_mut()(&cfg)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
         if gradient.len() != dim {
             return Err(crate::estimate::EstimationError::InvalidInput(format!(
                 "{context}: baseline gradient dimension mismatch: got {}, expected {dim}",
@@ -575,8 +584,7 @@ where
     let eval_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient) = eval_objective
-            .borrow_mut()(&cfg)
+        let (cost, gradient) = eval_objective.borrow_mut()(&cfg)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
         if gradient.len() != dim {
             return Err(crate::estimate::EstimationError::InvalidInput(format!(
@@ -599,7 +607,8 @@ where
             fn(
                 &mut (),
                 &ndarray::Array1<f64>,
-            ) -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
+            )
+                -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
         >,
     );
     let result = problem

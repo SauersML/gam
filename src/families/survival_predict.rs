@@ -17,9 +17,9 @@ use crate::families::survival_construction::{
     build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
     build_survival_time_basis, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_baseline_config,
-    parse_survival_likelihood_mode, require_structural_survival_time_basis,
-    resolved_survival_time_basis_config_from_build, survival_likelihood_modename,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_likelihood_mode,
+    require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
+    survival_likelihood_modename,
 };
 use crate::families::survival_location_scale::{
     SurvivalLocationScalePredictInput, predict_survival_location_scale,
@@ -64,9 +64,7 @@ pub struct SurvivalPredictResult {
 /// Pure library function: no progress bars, no file I/O, no uncertainty
 /// bounds. The CLI wraps this with progress updates + CSV writes; the
 /// FFI wraps it with JSON serialization.
-pub fn predict_survival(
-    req: SurvivalPredictRequest<'_>,
-) -> Result<SurvivalPredictResult, String> {
+pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredictResult, String> {
     let SurvivalPredictRequest {
         model,
         data,
@@ -161,8 +159,7 @@ pub fn predict_survival(
         )?;
         time_anchor_row_cached = Some(time_anchor_row);
     }
-    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && !model.has_baseline_time_wiggle()
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
@@ -205,12 +202,8 @@ pub fn predict_survival(
             let t_entry = age_entry[i].min(t_query);
             let single_entry = Array1::from_elem(1, t_entry);
             let single_exit = Array1::from_elem(1, t_query);
-            let mut row_time = build_survival_time_basis(
-                &single_entry,
-                &single_exit,
-                time_cfg.clone(),
-                None,
-            )?;
+            let mut row_time =
+                build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
             if let Some(anchor_row) = time_anchor_row_cached.as_ref() {
                 center_survival_time_designs_at_anchor(
                     &mut row_time.x_entry_time,
@@ -218,13 +211,12 @@ pub fn predict_survival(
                     anchor_row,
                 )?;
             }
-            let (r_eta_entry, r_eta_exit, r_deriv_exit) =
-                build_baseline_offsets_by_mode(
-                    &single_entry,
-                    &single_exit,
-                    &baseline_cfg,
-                    saved_likelihood_mode,
-                )?;
+            let (r_eta_entry, r_eta_exit, r_deriv_exit) = build_baseline_offsets_by_mode(
+                &single_entry,
+                &single_exit,
+                &baseline_cfg,
+                saved_likelihood_mode,
+            )?;
 
             let cov_row = cov_design.design.as_dense_cow().row(i).to_owned();
 
@@ -249,13 +241,14 @@ pub fn predict_survival(
                     training_headers,
                     i,
                 )?,
-                SurvivalLikelihoodMode::Transformation
-                | SurvivalLikelihoodMode::Weibull => evaluate_rp_row(
-                    model,
-                    &row_time,
-                    &cov_row,
-                    r_eta_exit[0] + primary_offset[i],
-                )?,
+                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                    evaluate_rp_row(
+                        model,
+                        &row_time,
+                        &cov_row,
+                        r_eta_exit[0] + primary_offset[i],
+                    )?
+                }
                 SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary => {
                     return Err("latent modes cannot reach evaluate_row".to_string());
                 }
@@ -279,12 +272,8 @@ pub fn predict_survival(
             let t_entry = age_entry[i].min(t_exit);
             let single_entry = Array1::from_elem(1, t_entry);
             let single_exit = Array1::from_elem(1, t_exit);
-            let mut row_time = build_survival_time_basis(
-                &single_entry,
-                &single_exit,
-                time_cfg.clone(),
-                None,
-            )?;
+            let mut row_time =
+                build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
             if let Some(anchor_row) = time_anchor_row_cached.as_ref() {
                 center_survival_time_designs_at_anchor(
                     &mut row_time.x_entry_time,
@@ -320,13 +309,14 @@ pub fn predict_survival(
                     training_headers,
                     i,
                 )?,
-                SurvivalLikelihoodMode::Transformation
-                | SurvivalLikelihoodMode::Weibull => evaluate_rp_row(
-                    model,
-                    &row_time,
-                    &cov_row,
-                    r_eta_exit[0] + primary_offset[i],
-                )?,
+                SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                    evaluate_rp_row(
+                        model,
+                        &row_time,
+                        &cov_row,
+                        r_eta_exit[0] + primary_offset[i],
+                    )?
+                }
                 SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary => {
                     return Err("latent modes cannot reach evaluate_row".to_string());
                 }
@@ -474,8 +464,7 @@ fn evaluate_location_scale_row(
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
     let x_time_exit_dense = row_time.x_exit_time.to_dense();
     let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
-        let mut full =
-            Array2::<f64>::zeros((1, x_time_exit_dense.ncols() + runtime.beta.len()));
+        let mut full = Array2::<f64>::zeros((1, x_time_exit_dense.ncols() + runtime.beta.len()));
         full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
             .assign(&x_time_exit_dense);
         full
@@ -500,11 +489,7 @@ fn evaluate_location_scale_row(
         Array2::from_shape_vec((1, dense_raw_sigma.ncols()), single_raw_sigma.to_vec())
             .map_err(|e| format!("single-row sigma reshape failed: {e}"))?;
     let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-        apply_scale_deviation_transform(
-            &survival_primary_design,
-            &single_raw_sigma_mat,
-            transform,
-        )?
+        apply_scale_deviation_transform(&survival_primary_design, &single_raw_sigma_mat, transform)?
     } else {
         single_raw_sigma_mat
     };
@@ -646,8 +631,7 @@ pub fn saved_survival_runtime_baseline_config(
     model: &SavedModel,
     likelihood_mode: SurvivalLikelihoodMode,
 ) -> Result<SurvivalBaselineConfig, String> {
-    if likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
-    {
+    if likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle() {
         return parse_survival_baseline_config("linear", None, None, None, None);
     }
     survival_baseline_config_from_model(model)
@@ -743,10 +727,7 @@ pub fn fit_result_from_saved_model_for_prediction(
 /// Resolve the saved survival location-scale fit result.
 pub fn saved_survival_location_scale_fit_result(
     model: &SavedModel,
-) -> Result<
-    crate::families::survival_location_scale::SurvivalLocationScaleFitResult,
-    String,
-> {
+) -> Result<crate::families::survival_location_scale::SurvivalLocationScaleFitResult, String> {
     let fit = model.fit_result.as_ref().ok_or_else(|| {
         "saved location-scale survival model missing canonical fit_result; refit with current CLI"
             .to_string()
@@ -757,9 +738,7 @@ pub fn saved_survival_location_scale_fit_result(
 
 /// Resolve the saved survival inverse-link, with a probit fallback for
 /// payloads that stored an identity link by mistake.
-pub fn resolve_survival_inverse_link_from_saved(
-    model: &SavedModel,
-) -> Result<InverseLink, String> {
+pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, String> {
     model
         .resolved_inverse_link()?
         .ok_or_else(|| {

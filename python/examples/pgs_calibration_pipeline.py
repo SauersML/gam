@@ -8,18 +8,18 @@ normal model ``h(PGS | PCs) ~ N(0, 1)`` using a Duchon spline with triple
 penalty operators on the PC manifold. The anchored deviation invariant is
 that, after the fitted conditional-Gaussianization map is applied, the
 predicted z-scores are (a) marginally standard normal and (b) uncorrelated
-with every PC coordinate. The fitted residual, ``PGS_cal``, is an
+with every PC coordinate. The fitted residual, ``pgs_ctn_z``, is an
 ancestry-corrected score that can be reused across downstream analyses
 without re-fitting the calibration map.
 
-Stage 2a — binary outcome via Bernoulli marginal-slope. With ``PGS_cal``
+Stage 2a — binary outcome via Bernoulli marginal-slope. With ``pgs_ctn_z``
 as the exposure ``z``, we fit ``disease ~ z + duchon(PCs) + linkwiggle``
 under a probit link. The logslope formula ``duchon(PCs) + linkwiggle``
 folds the PC manifold and an I-spline-based score-warp into the exposure
 slope so that effect-size heterogeneity across ancestry is expressed as
 an anchored monotone deviation from the identity slope.
 
-Stage 2b — survival marginal-slope. The same ``PGS_cal`` exposure drives
+Stage 2b — survival marginal-slope. The same ``pgs_ctn_z`` exposure drives
 a left-truncated survival fit ``Surv(age_entry, age_exit, event) ~ z +
 duchon(PCs) + linkwiggle + timewiggle`` with a Gompertz-Makeham baseline
 hazard. The timewiggle lets us depart from proportional hazards while
@@ -92,16 +92,14 @@ def _pc_duchon(centers: int) -> str:
 
 
 def stage1_calibrate(df: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
-    """Fit h(PGS | PCs) ~ N(0, 1) and return (calibration_model, df_with_PGS_cal)."""
-    calibration = PgsCalibration.fit(
-        df,
+    """Fit h(PGS | PCs) ~ N(0, 1) and return (calibration_model, df_with_pgs_ctn_z)."""
+    calibration = PgsCalibration(
         pgs_column="PGS",
         pc_columns=PC_COLUMNS,
-        centers=N_PCS + 20,
-    )
-    augmented = df.copy()
-    augmented["PGS_cal"] = calibration.transform(df)
-    return calibration, augmented
+        duchon_centers=N_PCS + 20,
+        out_column="pgs_ctn_z",
+    ).fit(df)
+    return calibration, calibration.transform(df)
 
 
 def stage2_binary(df: pd.DataFrame) -> Any:
@@ -114,7 +112,7 @@ def stage2_binary(df: pd.DataFrame) -> Any:
         main_formula,
         family="bernoulli-marginal-slope",
         link="probit",
-        z_column="PGS_cal",
+        z_column="pgs_ctn_z",
         logslope_formula=logslope_formula,
     )
 
@@ -134,7 +132,7 @@ def stage2_survival(df: pd.DataFrame) -> Any:
         family="survival",
         survival_likelihood="marginal-slope",
         baseline_target="gompertz-makeham",
-        z_column="PGS_cal",
+        z_column="pgs_ctn_z",
         logslope_formula=logslope_formula,
     )
 
@@ -154,7 +152,7 @@ def evaluate(model: Any, df: pd.DataFrame, kind: str) -> dict[str, float]:
             )
         }
     if kind == "calibration":
-        z = np.asarray(model.transform(df), float)
+        z = np.asarray(model.predict(df), float)
         return {"z_mean": float(z.mean()), "z_std": float(z.std(ddof=0))}
     raise ValueError(f"unknown evaluation kind: {kind}")
 
@@ -195,10 +193,9 @@ def main() -> None:
     print(f"[stage 1] fitting h(PGS | PCs) ~ N(0, 1) on n={len(train)}")
 
     calibration, train_cal = stage1_calibrate(train)
-    test_cal = test.copy()
-    test_cal["PGS_cal"] = calibration.transform(test)
-    print(f"  train z: mean={float(train_cal['PGS_cal'].mean()):+.3f}, "
-          f"sd={float(train_cal['PGS_cal'].std(ddof=0)):.3f}")
+    test_cal = calibration.transform(test)
+    print(f"  train z: mean={float(train_cal['pgs_ctn_z'].mean()):+.3f}, "
+          f"sd={float(train_cal['pgs_ctn_z'].std(ddof=0)):.3f}")
 
     print("[stage 2a] fitting Bernoulli marginal-slope + linkwiggle + score-warp")
     disease_model = stage2_binary(train_cal)
@@ -209,8 +206,8 @@ def main() -> None:
     survival = evaluate(surv_model, test_cal, kind="survival")
 
     print("\n=== pipeline summary ===")
-    print(f"  Stage 1  z-mean = {float(test_cal['PGS_cal'].mean()):+.3f}")
-    print(f"  Stage 1  z-std  = {float(test_cal['PGS_cal'].std(ddof=0)):.3f}")
+    print(f"  Stage 1  z-mean = {float(test_cal['pgs_ctn_z'].mean()):+.3f}")
+    print(f"  Stage 1  z-std  = {float(test_cal['pgs_ctn_z'].std(ddof=0)):.3f}")
     print(f"  Stage 2a AUC    = {binary['auc']:.3f}")
     print(f"  Stage 2b C-idx  = {survival['c_index']:.3f}")
 

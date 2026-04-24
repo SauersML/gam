@@ -74,6 +74,7 @@ struct PyFitConfig {
 #[serde(deny_unknown_fields)]
 struct PyPredictOptions {
     interval: Option<f64>,
+    time_grid: Option<Vec<f64>>,
 }
 
 #[derive(Serialize)]
@@ -110,6 +111,19 @@ struct SchemaCheckPayload {
 
 #[derive(Serialize)]
 struct PredictionPayload {
+    columns: BTreeMap<String, Vec<f64>>,
+}
+
+#[derive(Serialize)]
+struct SurvivalPredictionPayload {
+    class: &'static str,
+    model_class: String,
+    likelihood_mode: String,
+    times: Vec<f64>,
+    hazard: Vec<Vec<f64>>,
+    survival: Vec<Vec<f64>>,
+    cumulative_hazard: Vec<Vec<f64>>,
+    linear_predictor: Vec<f64>,
     columns: BTreeMap<String, Vec<f64>>,
 }
 
@@ -414,6 +428,10 @@ fn predict_table_impl(
     let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
     let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let options = parse_predict_options(options_json)?;
+    if matches!(model_class, PredictModelClass::Survival) {
+        return predict_table_survival(&model, &dataset, &options);
+    }
     let predict_input = match model_class {
         PredictModelClass::Standard => build_standard_predict_input(&model, &dataset)?,
         PredictModelClass::BernoulliMarginalSlope => {
@@ -422,12 +440,7 @@ fn predict_table_impl(
         PredictModelClass::TransformationNormal => {
             build_transformation_normal_predict_input(&model, &dataset)?
         }
-        PredictModelClass::Survival => {
-            return Err(
-                "survival prediction is not yet plumbed through the Python FFI; use the gam CLI predict command"
-                    .to_string(),
-            );
-        }
+        PredictModelClass::Survival => unreachable!("survival handled above"),
         PredictModelClass::GaussianLocationScale => {
             return Err(
                 "gaussian location-scale prediction is not yet plumbed through the Python FFI"
@@ -445,7 +458,6 @@ fn predict_table_impl(
         .predictor()
         .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let options = parse_predict_options(options_json)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     if let Some(interval) = options.interval {
@@ -1366,6 +1378,98 @@ fn build_transformation_normal_predict_input(
         auxiliary_scalar: None,
     })
 }
+
+fn predict_table_survival(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+    options: &PyPredictOptions,
+) -> Result<String, String> {
+    use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+
+    let col_map = build_col_map(dataset);
+    let payload = model.payload();
+    let training_headers = payload.training_headers.as_ref();
+    let primary_offset =
+        resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
+    let supports_noise_offset = matches!(
+        gam::survival_predict::require_saved_survival_likelihood_mode(model)?,
+        gam::survival_construction::SurvivalLikelihoodMode::LocationScale
+            | gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope
+    );
+    let noise_offset = if supports_noise_offset {
+        resolve_offset_column(dataset, &col_map, payload.noise_offset_column.as_deref())?
+    } else {
+        ndarray::Array1::<f64>::zeros(dataset.values.nrows())
+    };
+    let time_grid_slice: Option<&[f64]> = options.time_grid.as_deref();
+    let request = SurvivalPredictRequest {
+        model,
+        data: dataset.values.view(),
+        col_map: &col_map,
+        training_headers,
+        primary_offset: &primary_offset,
+        noise_offset: &noise_offset,
+        time_grid: time_grid_slice,
+    };
+    let result = predict_survival(request)?;
+
+    // Rowwise flatten for JSON transport.
+    let n = result.hazard.nrows();
+    let t = result.hazard.ncols();
+    let mut hazard_rows = Vec::with_capacity(n);
+    let mut survival_rows = Vec::with_capacity(n);
+    let mut cumulative_rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut hrow = Vec::with_capacity(t);
+        let mut srow = Vec::with_capacity(t);
+        let mut crow = Vec::with_capacity(t);
+        for j in 0..t {
+            hrow.push(result.hazard[[i, j]]);
+            srow.push(result.survival[[i, j]]);
+            crow.push(result.cumulative_hazard[[i, j]]);
+        }
+        hazard_rows.push(hrow);
+        survival_rows.push(srow);
+        cumulative_rows.push(crow);
+    }
+
+    // Always populate a columns block for the backward-compatible
+    // Python path. `mean` tracks the per-row survival at exit time
+    // (column 0 when time_grid=None, otherwise derived from the last
+    // evaluated grid point in the same row). `eta` carries the
+    // linear_predictor.
+    let mut columns = BTreeMap::<String, Vec<f64>>::new();
+    columns.insert("eta".to_string(), result.linear_predictor.to_vec());
+    let mean_col: Vec<f64> = (0..n)
+        .map(|i| result.survival[[i, t.saturating_sub(1)]])
+        .collect();
+    columns.insert("mean".to_string(), mean_col);
+
+    let likelihood_mode_str = match result.likelihood_mode {
+        gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
+        gam::survival_construction::SurvivalLikelihoodMode::LocationScale => "location-scale",
+        gam::survival_construction::SurvivalLikelihoodMode::Transformation => "transformation",
+        gam::survival_construction::SurvivalLikelihoodMode::Weibull => "weibull",
+        gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent",
+        gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
+    };
+    let survival_payload = SurvivalPredictionPayload {
+        class: "survival_prediction",
+        model_class: predict_model_class_name(model.predict_model_class()).to_string(),
+        likelihood_mode: likelihood_mode_str.to_string(),
+        times: result.times.clone(),
+        hazard: hazard_rows,
+        survival: survival_rows,
+        cumulative_hazard: cumulative_rows,
+        linear_predictor: result.linear_predictor.to_vec(),
+        columns,
+    };
+    let _ = _options_reference(options);
+    serde_json::to_string(&survival_payload)
+        .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
+}
+
+fn _options_reference(_options: &PyPredictOptions) -> () {}
 
 fn build_col_map(dataset: &EncodedDataset) -> HashMap<String, usize> {
     dataset

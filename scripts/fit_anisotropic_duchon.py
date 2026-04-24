@@ -180,7 +180,7 @@ def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float 
 def resolved_order(args: argparse.Namespace, num_features: int, length_scale: float | None) -> int:
     if args.order is not None:
         return args.order
-    if length_scale is not None and num_features >= 6:
+    if length_scale is not None and num_features >= 2:
         return 1
     return 0
 
@@ -188,8 +188,8 @@ def resolved_order(args: argparse.Namespace, num_features: int, length_scale: fl
 def resolved_power(args: argparse.Namespace, num_features: int, length_scale: float | None) -> int:
     if args.power is not None:
         return args.power
-    if length_scale is not None and num_features >= 6:
-        return 8
+    if length_scale is not None and num_features >= 2:
+        return max(1, num_features // 2)
     return 1
 
 

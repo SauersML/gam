@@ -55,7 +55,7 @@ That marginal-slope lane is the 16-PC anisotropic Duchon regime:
 - `family = binomial`
 - `marginal_slope = true`
 - `scale_dimensions = true`
-- `z_column = pgs_std`
+- `z_column = pgs_ctn_z` (train-only conditional transformation-normal PGS warp)
 
 Rebuild the method matrix locally with:
 

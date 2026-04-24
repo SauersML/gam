@@ -46,11 +46,11 @@ _TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
 class SurvivalPrediction:
     """Per-row survival functions evaluated on demand.
 
-    The FFI returns a per-row parameter vector describing the fitted hazard
-    surface (e.g. a log-hazard anchor plus auxiliary parameters). This object
-    carries those parameters alongside the model class string so the three
-    ``*_at(times)`` helpers can construct the requested curves in Python
-    without having to re-enter the Rust predictor for every time grid.
+    When the FFI produced a dense ``(n_samples, n_times)`` grid of
+    hazard / survival / cumulative hazard values, the ``*_at`` helpers
+    linearly interpolate against that grid. Otherwise they fall back to
+    the legacy plug-in piecewise-constant hazard reconstructed from
+    ``parameters`` so bare-dataclass construction keeps working.
 
     Attributes
     ----------
@@ -65,12 +65,27 @@ class SurvivalPrediction:
         Column names corresponding to ``parameters``, in order.
     baseline_times:
         Optional per-sample baseline evaluation grid (if the FFI reports one).
+    times:
+        Shared 1-D time grid at which the hazard surfaces were evaluated.
+    hazard:
+        ``(n_samples, len(times))`` dense hazard surface from the FFI.
+    survival:
+        ``(n_samples, len(times))`` dense survival surface from the FFI.
+    cumulative_hazard:
+        ``(n_samples, len(times))`` dense cumulative-hazard surface from the FFI.
+    linear_predictor:
+        ``(n_samples,)`` per-row linear predictor at each row's own exit time.
     """
 
     model_class: str
     parameters: Any
     parameter_names: Sequence[str] = field(default_factory=tuple)
     baseline_times: Any | None = None
+    times: Any | None = None
+    hazard: Any | None = None
+    survival: Any | None = None
+    cumulative_hazard: Any | None = None
+    linear_predictor: Any | None = None
 
     def _coerce_times(self, times: Any) -> Any:
         import numpy as np
@@ -109,22 +124,33 @@ class SurvivalPrediction:
         import numpy as np
 
         times_arr = self._coerce_times(times)
+        grid, hazard = self._ffi_surface("hazard")
+        if grid is not None and hazard is not None:
+            self._check_dense_size(hazard.shape[0], times_arr.size)
+            return _interpolate_rows(grid, hazard, times_arr, clip=(0.0, None))
+
         self._check_dense_size(self._parameters_array().shape[0], times_arr.size)
         cumulative = self.cumulative_hazard_at(times_arr)
         if times_arr.size <= 1:
             return cumulative
-        grid = np.concatenate([[0.0], times_arr])
+        grid_full = np.concatenate([[0.0], times_arr])
         cumulative_full = np.concatenate(
             [np.zeros((cumulative.shape[0], 1)), cumulative], axis=1
         )
         diffs = np.diff(cumulative_full, axis=1)
-        widths = np.diff(grid)
+        widths = np.diff(grid_full)
         widths = np.where(widths <= 0.0, 1.0, widths)
         return diffs / widths
 
     def cumulative_hazard_at(self, times: Any) -> Any:
         """Cumulative hazard ``H(t) = -log S(t)`` for diagnostic-sized grids."""
         import numpy as np
+
+        times_arr = self._coerce_times(times)
+        grid, cumulative = self._ffi_surface("cumulative_hazard")
+        if grid is not None and cumulative is not None:
+            self._check_dense_size(cumulative.shape[0], times_arr.size)
+            return _interpolate_rows(grid, cumulative, times_arr, clip=(0.0, None))
 
         survival = self.survival_at(times)
         survival = np.clip(survival, 1e-12, 1.0)
@@ -133,20 +159,44 @@ class SurvivalPrediction:
     def survival_at(self, times: Any) -> Any:
         """Survival probability ``S(t)`` at each requested time.
 
-        The Python binding does not yet re-enter the Rust baseline evaluator,
-        so this implements the plug-in identity ``S(t) = exp(-H(t))`` using a
-        per-row piecewise-constant hazard whose coefficients are the returned
-        ``parameters``. When the FFI exposes a richer contract this method
-        should be replaced with the richer evaluator.
+        When the FFI produced a dense hazard/survival surface we
+        linearly interpolate against the returned grid. Otherwise we
+        fall back to the plug-in identity ``S(t) = exp(-H(t))`` using a
+        per-row piecewise-constant hazard derived from ``parameters``
+        for backward compatibility with bare-dataclass construction.
         Dense output is intentionally bounded. Use ``survival_at_chunks`` or
         ``write_survival_at_csv`` for biobank-scale prediction.
         """
         import numpy as np
 
         times_arr = self._coerce_times(times)
+        grid, surv = self._ffi_surface("survival")
+        if grid is not None and surv is not None:
+            self._check_dense_size(surv.shape[0], times_arr.size)
+            interpolated = _interpolate_rows(grid, surv, times_arr, clip=(0.0, 1.0))
+            return interpolated
+
         params = self._parameters_array()
         self._check_dense_size(params.shape[0], times_arr.size)
         return self._survival_block(params, times_arr)
+
+    def _ffi_surface(self, kind: str) -> tuple[Any, Any]:
+        """Return ``(grid, surface)`` for the FFI-provided surface or
+        ``(None, None)`` when the caller constructed this object manually."""
+        import numpy as np
+
+        if self.times is None:
+            return (None, None)
+        grid = np.asarray(self.times, dtype=float).reshape(-1)
+        if grid.size == 0:
+            return (None, None)
+        surface = getattr(self, kind, None)
+        if surface is None:
+            return (None, None)
+        surface_arr = np.asarray(surface, dtype=float)
+        if surface_arr.ndim != 2 or surface_arr.shape[1] != grid.size:
+            return (None, None)
+        return (grid, surface_arr)
 
     def survival_at_chunks(
         self,
