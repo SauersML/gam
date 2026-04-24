@@ -46,9 +46,9 @@ class PgsCalibration:
     duchon_centers:
         Number of Duchon basis centers. Defaults to ``len(pc_columns) + 20``.
     duchon_order:
-        Duchon spline order (``m``). Defaults to ``1``.
+        Duchon radial-basis order (``m``). Defaults to ``1``.
     duchon_power:
-        Duchon spline power (``s``). Defaults to ``1``.
+        Duchon radial-basis power (``s``). Defaults to ``1``.
     duchon_length_scale:
         Fixed Duchon radial length scale. Defaults to ``1.0`` so anisotropic
         PC scaling is active but does not duplicate the global smoothing scale.

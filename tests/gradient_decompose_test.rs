@@ -510,16 +510,19 @@ fn test_single_penalty_logit_gradient() {
         kronecker_factored: None,
     };
     let rho = array![2.0];
-    let (analytic, fd) = evaluate_externalgradients(
+    let w = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let analytic = evaluate_externalgradient(
         y.view(),
-        Array1::ones(n).view(),
+        w.view(),
         x.view(),
-        Array1::zeros(n).view(),
+        offset.view(),
         &s_list,
         &opts,
         &rho,
     )
     .unwrap();
+    let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
     eprintln!("=== SINGLE PENALTY: logit ===");
@@ -565,16 +568,19 @@ fn test_two_overlapping_penalties_logit_gradient() {
         kronecker_factored: None,
     };
     let rho = array![2.0, -1.0];
-    let (analytic, fd) = evaluate_externalgradients(
+    let w = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let analytic = evaluate_externalgradient(
         y.view(),
-        Array1::ones(n).view(),
+        w.view(),
         x.view(),
-        Array1::zeros(n).view(),
+        offset.view(),
         &s_list,
         &opts,
         &rho,
     )
     .unwrap();
+    let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
     eprintln!("=== OVERLAPPING PENALTIES: logit ===");
@@ -623,16 +629,19 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
         kronecker_factored: None,
     };
     let rho = array![2.0, -1.0];
-    let (analytic, fd) = evaluate_externalgradients(
+    let w = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let analytic = evaluate_externalgradient(
         y.view(),
-        Array1::ones(n).view(),
+        w.view(),
         x.view(),
-        Array1::zeros(n).view(),
+        offset.view(),
         &s_list,
         &opts,
         &rho,
     )
     .unwrap();
+    let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
     eprintln!("=== NON-OVERLAPPING PENALTIES: logit ===");
@@ -696,16 +705,19 @@ fn test_gaussian_gradient_vs_fd() {
         kronecker_factored: None,
     };
     let rho = array![1.5, 0.8];
-    let (analytic, fd) = evaluate_externalgradients(
+    let w = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let analytic = evaluate_externalgradient(
         y.view(),
-        Array1::ones(n).view(),
+        w.view(),
         x.view(),
-        Array1::zeros(n).view(),
+        offset.view(),
         &s_list,
         &opts,
         &rho,
     )
     .unwrap();
+    let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
     eprintln!("=== GAUSSIAN (overlapping penalties) ===");
@@ -748,16 +760,19 @@ fn test_probit_single_penalty_gradient() {
         kronecker_factored: None,
     };
     let rho = array![2.0];
-    let (analytic, fd) = evaluate_externalgradients(
+    let w = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let analytic = evaluate_externalgradient(
         y.view(),
-        Array1::ones(n).view(),
+        w.view(),
         x.view(),
-        Array1::zeros(n).view(),
+        offset.view(),
         &s_list,
         &opts,
         &rho,
     )
     .unwrap();
+    let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
     eprintln!("=== PROBIT (single penalty) ===");
@@ -801,16 +816,19 @@ fn test_probit_overlapping_penalties_gradient() {
         kronecker_factored: None,
     };
     let rho = array![2.0, -1.0];
-    let (analytic, fd) = evaluate_externalgradients(
+    let w = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let analytic = evaluate_externalgradient(
         y.view(),
-        Array1::ones(n).view(),
+        w.view(),
         x.view(),
-        Array1::zeros(n).view(),
+        offset.view(),
         &s_list,
         &opts,
         &rho,
     )
     .unwrap();
+    let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
     eprintln!("=== PROBIT (overlapping penalties) ===");

@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, array};
 
-use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalgradient};
 use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 
@@ -132,7 +132,7 @@ fn lamlgradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f6
         kronecker_factored: None,
     };
     let rho_arr = array![rho];
-    let (analytic_grad, _) = evaluate_externalgradients(
+    let analytic_grad = evaluate_externalgradient(
         y.view(),
         w.view(),
         x.clone(),
@@ -329,100 +329,3 @@ fn test_lamlgradient_firth_exact_formula_ground_truth() {
     );
 }
 
-#[test]
-fn test_externalgradient_adapter_isolated_matchesfd_direction() {
-    let n = 96usize;
-    let p = 7usize;
-    let mut x = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        let t = (i as f64) / ((n - 1) as f64);
-        x[[i, 0]] = 1.0;
-        x[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
-        x[[i, 2]] = (2.0 * std::f64::consts::PI * t).cos();
-        x[[i, 3]] = t;
-        x[[i, 4]] = t * t;
-        x[[i, 5]] = (3.0 * std::f64::consts::PI * t).sin();
-        x[[i, 6]] = (3.0 * std::f64::consts::PI * t).cos();
-    }
-    let beta_true = array![0.1, 0.8, -0.4, 0.5, -0.3, 0.2, -0.1];
-    let eta = x.dot(&beta_true);
-    let y = eta.mapv(|e| {
-        if 1.0 / (1.0 + (-e).exp()) > 0.5 {
-            1.0
-        } else {
-            0.0
-        }
-    });
-    let w = Array1::ones(n);
-    let offset = Array1::zeros(n);
-
-    let mut s1 = Array2::<f64>::zeros((p, p));
-    let mut s2 = Array2::<f64>::zeros((p, p));
-    for j in 1..p {
-        s1[[j, j]] = 1.0;
-    }
-    for j in 3..p {
-        s2[[j, j]] = 1.0;
-    }
-    let s_list = vec![
-        BlockwisePenalty::new(0..p, s1),
-        BlockwisePenalty::new(0..p, s2),
-    ];
-
-    let opts = ExternalOptimOptions {
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
-        compute_inference: true,
-        max_iter: 120,
-        tol: 1e-10,
-        nullspace_dims: vec![1, 0],
-        linear_constraints: None,
-        firth_bias_reduction: None,
-        penalty_shrinkage_floor: None,
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-    };
-    let rho = array![1.5, 0.8];
-    let (analytic, fd) = evaluate_externalgradients(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        &s_list,
-        &opts,
-        &rho,
-    )
-    .expect("external gradient evaluation should succeed");
-    for i in 0..analytic.len() {
-        assert_eq!(
-            analytic[i].signum(),
-            fd[i].signum(),
-            "adapter sign mismatch at i={i}: analytic={} fd={}",
-            analytic[i],
-            fd[i]
-        );
-    }
-
-    let dot = analytic.dot(&fd);
-    let na = analytic.dot(&analytic).sqrt();
-    let nf = fd.dot(&fd).sqrt();
-    let cosine = if na * nf > 1e-12 {
-        dot / (na * nf)
-    } else {
-        1.0
-    };
-    let rel_l2 = (&analytic - &fd).dot(&(&analytic - &fd)).sqrt() / na.max(nf).max(1e-12);
-    assert!(
-        cosine > 0.99,
-        "isolation mismatch: cosine={cosine:.6}, analytic={analytic:?}, fd={fd:?}"
-    );
-    assert!(
-        rel_l2 < 3e-1,
-        "isolation mismatch: rel_l2={rel_l2:.3e}, analytic={analytic:?}, fd={fd:?}"
-    );
-}

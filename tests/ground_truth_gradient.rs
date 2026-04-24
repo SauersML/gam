@@ -1,5 +1,5 @@
 use gam::estimate::{
-    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
@@ -189,7 +189,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
         kronecker_factored: None,
     };
     let rho = array![0.0];
-    let (analytic, _) = evaluate_externalgradients(
+    let analytic = evaluate_externalgradient(
         y.view(),
         w.view(),
         x.view(),
@@ -263,7 +263,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
         kronecker_factored: None,
     };
     let rho = array![0.0];
-    let (analytic, _) = evaluate_externalgradients(
+    let analytic = evaluate_externalgradient(
         y.view(),
         w.view(),
         x.view(),
@@ -338,7 +338,7 @@ fn stress_test_firthgradientvs_conditioning() {
             kronecker_factored: None,
         };
         let rho = array![0.0];
-        let Ok((analytic, _)) = evaluate_externalgradients(
+        let Ok(analytic) = evaluate_externalgradient(
             y.view(),
             w.view(),
             x.view(),
