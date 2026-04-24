@@ -5,7 +5,7 @@ use pest::iterators::Pair;
 use pest_derive::Parser;
 
 use crate::smooth::BoundedCoefficientPriorSpec;
-use crate::types::{InverseLink, LinkComponent, LinkFunction};
+use crate::types::{InverseLink, LinkComponent, LinkFunction, WigglePenaltyConfig};
 
 #[derive(Parser)]
 #[grammar_inline = r#"
@@ -346,11 +346,12 @@ pub struct LinkWiggleFormulaSpec {
 }
 
 pub fn default_linkwiggle_formulaspec() -> LinkWiggleFormulaSpec {
+    let cfg = WigglePenaltyConfig::cubic_triple_operator_default();
     LinkWiggleFormulaSpec {
-        degree: 3,
-        num_internal_knots: 10,
-        penalty_orders: vec![1, 2, 3],
-        double_penalty: true,
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_orders: cfg.penalty_orders,
+        double_penalty: cfg.double_penalty,
     }
 }
 
@@ -628,10 +629,10 @@ fn parse_optional_f64_option_alias(
 
 fn parse_linkwiggle_penalty_orders(raw: Option<&str>) -> Result<Vec<usize>, String> {
     let Some(raw) = raw.map(str::trim) else {
-        return Ok(vec![1, 2, 3]);
+        return Ok(WigglePenaltyConfig::cubic_triple_operator_default().penalty_orders);
     };
     if raw.is_empty() {
-        return Ok(vec![1, 2, 3]);
+        return Ok(WigglePenaltyConfig::cubic_triple_operator_default().penalty_orders);
     }
     let mut out = Vec::<usize>::new();
     for token in raw.split(',') {
@@ -654,7 +655,7 @@ fn parse_linkwiggle_penalty_orders(raw: Option<&str>) -> Result<Vec<usize>, Stri
         }
     }
     if out.is_empty() {
-        out.extend([1, 2, 3]);
+        out.extend(WigglePenaltyConfig::cubic_triple_operator_default().penalty_orders);
     }
     out.sort_unstable();
     out.dedup();
@@ -684,17 +685,19 @@ pub fn parse_linkwiggle_formulaspec(
             unknown.join(", ")
         ));
     }
-    let degree = option_usize(options, "degree").unwrap_or(3);
+    let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
+    let degree = option_usize(options, "degree").unwrap_or(defaults.degree);
     if degree < 1 {
         return Err(format!("linkwiggle() requires degree >= 1: {raw}"));
     }
-    let num_internal_knots = option_usize(options, "internal_knots").unwrap_or(7);
+    let num_internal_knots =
+        option_usize(options, "internal_knots").unwrap_or(defaults.num_internal_knots);
     if num_internal_knots == 0 {
         return Err(format!("linkwiggle() requires internal_knots > 0: {raw}"));
     }
     let penalty_orders =
         parse_linkwiggle_penalty_orders(options.get("penalty_order").map(String::as_str))?;
-    let double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
+    let double_penalty = option_bool(options, "double_penalty").unwrap_or(defaults.double_penalty);
     Ok(LinkWiggleFormulaSpec {
         degree,
         num_internal_knots,

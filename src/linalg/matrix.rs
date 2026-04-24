@@ -19,9 +19,10 @@ use std::sync::{Arc, OnceLock};
 const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
+const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_SPARSE_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
-const MAX_DENSE_OPERATOR_TO_DENSE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
+const MAX_DENSE_OPERATOR_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
 /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
@@ -81,6 +82,38 @@ pub fn panic_or_error_if_derivative_dense_alloc_called(
         ));
     }
     Ok(())
+}
+
+fn weighted_crossprod_dense(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != weights.len() || right.nrows() != weights.len() {
+        return Err(format!(
+            "weighted_crossprod_dense row mismatch: left={}, weights={}, right={}",
+            left.nrows(),
+            weights.len(),
+            right.nrows()
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+    for i in 0..weights.len() {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..left.ncols() {
+            let scaled = wi * left[[i, a]];
+            if scaled == 0.0 {
+                continue;
+            }
+            for b in 0..right.ncols() {
+                out[[a, b]] += scaled * right[[i, b]];
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub struct DenseRightProductView<'a> {
@@ -4962,24 +4995,20 @@ impl DesignMatrix {
         }
         match (self, other) {
             (Self::Dense(lhs), Self::Dense(rhs)) => {
-                let lhs_owned;
-                let lhs_ref: &Array2<f64> = match lhs.as_dense_ref() {
-                    Some(r) => r,
-                    None => {
-                        lhs_owned = lhs.to_dense_arc();
-                        lhs_owned.as_ref()
-                    }
+                let lhs_chunk;
+                let rhs_chunk;
+                let x = if let Some(lhs_dense) = lhs.as_dense_ref() {
+                    lhs_dense.row(row)
+                } else {
+                    lhs_chunk = lhs.row_chunk(row..row + 1);
+                    lhs_chunk.row(0)
                 };
-                let rhs_owned;
-                let rhs_ref: &Array2<f64> = match rhs.as_dense_ref() {
-                    Some(r) => r,
-                    None => {
-                        rhs_owned = rhs.to_dense_arc();
-                        rhs_owned.as_ref()
-                    }
+                let y = if let Some(rhs_dense) = rhs.as_dense_ref() {
+                    rhs_dense.row(row)
+                } else {
+                    rhs_chunk = rhs.row_chunk(row..row + 1);
+                    rhs_chunk.row(0)
                 };
-                let x = lhs_ref.row(row);
-                let y = rhs_ref.row(row);
                 for (dst, (&xi, &yi)) in out.iter_mut().zip(x.iter().zip(y.iter())) {
                     *dst += alpha * xi * yi;
                 }
@@ -5032,15 +5061,13 @@ impl DesignMatrix {
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();
                 let vals = csr.val();
-                let dense_owned;
-                let dense_ref: &Array2<f64> = match dense_mat.as_dense_ref() {
-                    Some(r) => r,
-                    None => {
-                        dense_owned = dense_mat.to_dense_arc();
-                        dense_owned.as_ref()
-                    }
+                let dense_chunk;
+                let dense_row = if let Some(dense_ref) = dense_mat.as_dense_ref() {
+                    dense_ref.row(row)
+                } else {
+                    dense_chunk = dense_mat.row_chunk(row..row + 1);
+                    dense_chunk.row(0)
                 };
-                let dense_row = dense_ref.row(row);
                 for ptr in row_ptr[row]..row_ptr[row + 1] {
                     let c = col_idx[ptr];
                     out[c] += alpha * vals[ptr] * dense_row[c];
@@ -5164,26 +5191,20 @@ impl DesignMatrix {
         }
         match (self, other) {
             (Self::Dense(lhs), Self::Dense(rhs)) => {
-                // Zero-copy borrow for materialized matrices; only Arc-clone
-                // (not data-clone) for lazy operators.
-                let lhs_owned;
-                let lhs_ref: &Array2<f64> = match lhs.as_dense_ref() {
-                    Some(r) => r,
-                    None => {
-                        lhs_owned = lhs.to_dense_arc();
-                        lhs_owned.as_ref()
-                    }
+                let lhs_chunk;
+                let rhs_chunk;
+                let x = if let Some(lhs_dense) = lhs.as_dense_ref() {
+                    lhs_dense.row(row)
+                } else {
+                    lhs_chunk = lhs.row_chunk(row..row + 1);
+                    lhs_chunk.row(0)
                 };
-                let rhs_owned;
-                let rhs_ref: &Array2<f64> = match rhs.as_dense_ref() {
-                    Some(r) => r,
-                    None => {
-                        rhs_owned = rhs.to_dense_arc();
-                        rhs_owned.as_ref()
-                    }
+                let y = if let Some(rhs_dense) = rhs.as_dense_ref() {
+                    rhs_dense.row(row)
+                } else {
+                    rhs_chunk = rhs.row_chunk(row..row + 1);
+                    rhs_chunk.row(0)
                 };
-                let x = lhs_ref.row(row);
-                let y = rhs_ref.row(row);
                 for i in 0..x.len() {
                     let xi = x[i];
                     if xi == 0.0 {

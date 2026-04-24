@@ -35,6 +35,7 @@ use crate::families::transformation_normal::{
     TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
     fit_transformation_normal,
 };
+use crate::inference::formula_dsl::ParsedTerm;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
@@ -42,6 +43,7 @@ use crate::smooth::{
 };
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
+    WigglePenaltyConfig,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::HashMap;
@@ -264,13 +266,14 @@ fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<()
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> DeviationBlockConfig {
+    let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
     DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
-        penalty_order: 2,
+        penalty_order: *wiggle.penalty_orders.iter().max().unwrap_or(&2),
         penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
-        monotonicity_eps: 1e-4,
+        monotonicity_eps: defaults.monotonicity_eps,
     }
 }
 
@@ -912,7 +915,7 @@ use crate::families::survival_location_scale::{
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
-    LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, effectivelinkwiggle_formulaspec,
+    LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, effectivelinkwiggle_formulaspec,
     parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
     validate_marginal_slope_z_column_exclusion,
 };
@@ -1067,6 +1070,8 @@ pub fn materialize<'a>(
             return Err("transformation_normal cannot be combined with noise_formula".to_string());
         }
         materialize_transformation_normal(&parsed, data, &col_map, config)
+    } else if config.logslope_formula.is_some() || config.z_column.is_some() {
+        materialize_bernoulli_marginal_slope(&parsed, data, &col_map, config)
     } else if config.noise_formula.is_some() {
         materialize_location_scale(&parsed, data, &col_map, config)
     } else {
@@ -1155,6 +1160,41 @@ fn build_col_map(data: &Dataset) -> HashMap<String, usize> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect()
+}
+
+fn build_termspec_with_geometry(
+    terms: &[ParsedTerm],
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    inference_notes: &mut Vec<String>,
+    scale_dimensions: bool,
+) -> Result<TermCollectionSpec, String> {
+    let mut spec = build_termspec(terms, data, col_map, inference_notes)?;
+    if scale_dimensions {
+        enable_scale_dimensions(&mut spec);
+    }
+    Ok(spec)
+}
+
+fn resolve_survival_marginal_slope_base_link(
+    linkspec: Option<&crate::inference::formula_dsl::LinkFormulaSpec>,
+) -> Result<InverseLink, String> {
+    let Some(linkspec) = linkspec else {
+        return Ok(InverseLink::Standard(LinkFunction::Probit));
+    };
+    let choice = parse_link_choice(Some(&linkspec.link), false)?
+        .ok_or_else(|| "invalid survival marginal-slope link".to_string())?;
+    if choice.mixture_components.is_some() {
+        return Err(
+            "survival marginal-slope currently supports only link(type=probit)".to_string(),
+        );
+    }
+    match choice.link {
+        LinkFunction::Probit => Ok(InverseLink::Standard(LinkFunction::Probit)),
+        other => Err(format!(
+            "survival marginal-slope currently supports only link(type=probit), got {other:?}"
+        )),
+    }
 }
 
 struct PreparedWorkflowSurvivalTimeStack {
@@ -1385,10 +1425,13 @@ fn materialize_standard<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let mut spec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
-    if config.scale_dimensions {
-        enable_scale_dimensions(&mut spec);
-    }
+    let spec = build_termspec_with_geometry(
+        &parsed.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+    )?;
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
@@ -1496,6 +1539,106 @@ fn materialize_standard<'a>(
             kappa_options,
             wiggle,
             wiggle_options: None,
+        }),
+        inference_notes,
+    })
+}
+
+fn materialize_bernoulli_marginal_slope<'a>(
+    parsed: &ParsedFormula,
+    data: &'a Dataset,
+    col_map: &HashMap<String, usize>,
+    config: &FitConfig,
+) -> Result<MaterializedModel<'a>, String> {
+    let y_col = *col_map
+        .get(&parsed.response)
+        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y = data.values.column(y_col).to_owned();
+
+    if !is_binary_response(y.view()) {
+        return Err("Bernoulli marginal-slope requires a binary {0,1} response".to_string());
+    }
+    if config.noise_formula.is_some() {
+        return Err("Bernoulli marginal-slope cannot also use noise_formula".to_string());
+    }
+
+    let logslope_formula = config
+        .logslope_formula
+        .as_deref()
+        .ok_or_else(|| "Bernoulli marginal-slope requires logslope_formula".to_string())?;
+    let z_column = config
+        .z_column
+        .as_deref()
+        .ok_or_else(|| "Bernoulli marginal-slope requires z_column".to_string())?;
+
+    let (_, parsed_logslope) =
+        parse_matching_auxiliary_formula(logslope_formula, &parsed.response, "logslope_formula")?;
+    if parsed_logslope.linkspec.is_some() {
+        return Err("link(...) is not supported inside logslope_formula".to_string());
+    }
+    validate_marginal_slope_z_column_exclusion(
+        parsed,
+        &parsed_logslope,
+        z_column,
+        "Bernoulli marginal-slope",
+        "logslope_formula",
+    )?;
+
+    let mut inference_notes = Vec::new();
+    let marginalspec = build_termspec_with_geometry(
+        &parsed.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+    )?;
+    let logslopespec = build_termspec_with_geometry(
+        &parsed_logslope.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+    )?;
+    let z_idx = *col_map
+        .get(z_column)
+        .ok_or_else(|| format!("z column '{z_column}' not found"))?;
+    let z = data.values.column(z_idx).to_owned();
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
+    let logslope_offset =
+        resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
+    let routing = route_marginal_slope_deviation_blocks(
+        parsed.linkwiggle.as_ref(),
+        parsed_logslope.linkwiggle.as_ref(),
+        config.disable_link_dev,
+        config.disable_score_warp,
+        "Bernoulli marginal-slope",
+        "logslope_formula",
+    )?;
+    let spec = BernoulliMarginalSlopeTermSpec {
+        y,
+        weights,
+        z,
+        base_link: InverseLink::Standard(LinkFunction::Probit),
+        marginalspec,
+        logslopespec,
+        marginal_offset,
+        logslope_offset,
+        frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+        score_warp: routing.score_warp,
+        link_dev: routing.link_dev,
+        latent_z_policy: Default::default(),
+    };
+
+    Ok(MaterializedModel {
+        request: FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
+            data: data.values.view(),
+            spec,
+            options: BlockwiseFitOptions {
+                compute_covariance: true,
+                ..Default::default()
+            },
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
         }),
         inference_notes,
     })
@@ -1618,10 +1761,13 @@ fn materialize_survival<'a>(
         );
     }
 
-    let mut termspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
-    if config.scale_dimensions {
-        enable_scale_dimensions(&mut termspec);
-    }
+    let termspec = build_termspec_with_geometry(
+        &parsed.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+    )?;
 
     let residual_dist = parse_survival_distribution(&config.survival_distribution)?;
     let survival_inverse_link = residual_distribution_inverse_link(residual_dist);
@@ -1663,7 +1809,13 @@ fn materialize_survival<'a>(
     };
     let log_sigmaspec = if let Some(noise) = config.noise_formula.as_deref() {
         let noise_parsed = parse_formula(&format!("{} ~ {noise}", parsed.response))?;
-        build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?
+        build_termspec_with_geometry(
+            &noise_parsed.terms,
+            data,
+            col_map,
+            &mut inference_notes,
+            config.scale_dimensions,
+        )?
     } else {
         TermCollectionSpec {
             linear_terms: vec![],
@@ -1680,11 +1832,7 @@ fn materialize_survival<'a>(
             None
         };
     let marginal_z = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        if parsed.linkspec.is_some() {
-            return Err(
-                "link(...) is not implemented for the survival marginal-slope family".to_string(),
-            );
-        }
+        let _base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
         let z_col_name = marginal_z_column_name
             .expect("marginal-slope z column should be validated before materialization");
         let z_idx = *col_map
@@ -1726,11 +1874,12 @@ fn materialize_survival<'a>(
                 "logslope_formula",
             )?;
             (
-                Some(build_termspec(
+                Some(build_termspec_with_geometry(
                     &ls_parsed.terms,
                     data,
                     col_map,
                     &mut inference_notes,
+                    config.scale_dimensions,
                 )?),
                 route_marginal_slope_deviation_blocks(
                     parsed.linkwiggle.as_ref(),
@@ -1915,6 +2064,7 @@ fn materialize_survival<'a>(
                     z: marginal_z.clone().ok_or_else(|| {
                         "marginal-slope survival requires z_column in FitConfig".to_string()
                     })?,
+                    base_link: resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?,
                     marginalspec: termspec.clone(),
                     marginal_offset: threshold_offset.clone(),
                     frailty: marginal_slope_frailty.clone().ok_or_else(|| {
@@ -1929,6 +2079,7 @@ fn materialize_survival<'a>(
                     logslope_offset: log_sigma_offset.clone(),
                     score_warp: marginal_slope_score_warp.clone(),
                     link_dev: marginal_slope_link_dev.clone(),
+                    latent_z_policy: Default::default(),
                 },
                 options: BlockwiseFitOptions {
                     compute_covariance: true,

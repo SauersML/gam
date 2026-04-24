@@ -11,11 +11,12 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
-    DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization,
+    DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     build_link_deviation_block_from_knots_design_seed_and_weights,
-    build_score_warp_deviation_block_from_seed, project_monotone_feasible_beta,
+    build_score_warp_deviation_block_from_seed, padded_deviation_seed,
+    project_monotone_feasible_beta,
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
-    standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    standardize_latent_z_with_policy, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
@@ -38,6 +39,7 @@ use crate::smooth::{
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
+use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -52,6 +54,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub event_target: Array1<f64>,
     pub weights: Array1<f64>,
     pub z: Array1<f64>,
+    pub base_link: InverseLink,
     pub marginalspec: TermCollectionSpec,
     pub marginal_offset: Array1<f64>,
     /// GaussianShift frailty on the final probit index: U ~ N(0, σ²) added
@@ -75,6 +78,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub logslope_offset: Array1<f64>,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
+    pub latent_z_policy: LatentZPolicy,
 }
 
 pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
@@ -3438,14 +3442,22 @@ impl SurvivalMarginalSlopeFamily {
         };
         let probit_scale = self.probit_frailty_scale();
         let a_init = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
-        let (a, abs_deriv, residual) = super::monotone_root::solve_monotone_root(
-            eval,
+        let (a, _, _) = super::monotone_root::solve_monotone_root(
+            &eval,
             a_init,
             "survival intercept",
             1e-12,
             64,
             64,
         )?;
+        let (residual, final_deriv, _) = eval(a)?;
+        let abs_deriv = final_deriv.abs();
+        if !abs_deriv.is_finite() || abs_deriv == 0.0 {
+            return Err(format!(
+                "survival marginal-slope intercept solve failed: \
+                 zero or non-finite derivative at a={a:.6}"
+            ));
+        }
 
         let target_survival = crate::probability::normal_cdf(-q);
         let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
@@ -12015,9 +12027,11 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(Some(
-            self.evaluate_exact_newton_joint_dense(block_states)?.2,
-        ))
+        let total = block_states.iter().map(|state| state.beta.len()).sum::<usize>();
+        if total >= 512 {
+            return Ok(None);
+        }
+        Ok(Some(self.evaluate_exact_newton_joint_dense(block_states)?.2))
     }
 
     fn exact_newton_joint_gradient_evaluation(
@@ -12770,8 +12784,18 @@ pub fn fit_survival_marginal_slope_terms(
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
     let mut spec = spec;
     validate_spec(&spec)?;
-    let (z_standardized, z_normalization) =
-        standardize_latent_z(&spec.z, &spec.weights, "survival-marginal-slope")?;
+    if spec.base_link != InverseLink::Standard(LinkFunction::Probit) {
+        return Err(format!(
+            "survival-marginal-slope currently supports only probit base_link, got {:?}",
+            spec.base_link
+        ));
+    }
+    let (z_standardized, z_normalization) = standardize_latent_z_with_policy(
+        &spec.z,
+        &spec.weights,
+        "survival-marginal-slope",
+        &spec.latent_z_policy,
+    )?;
     spec.z = z_standardized;
     let n = spec.age_entry.len();
     let initial_sigma = match &spec.frailty {
@@ -12819,8 +12843,9 @@ pub fn fit_survival_marginal_slope_terms(
                 let slope = baseline_slope + spec.logslope_offset[row];
                 rigid_observed_eta(q_exit, slope, spec.z[row], probit_scale)
             }));
+            let padded_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
             build_link_deviation_block_from_knots_design_seed_and_weights(
-                &q0_seed,
+                &padded_seed,
                 &q0_seed,
                 &spec.weights,
                 cfg,
@@ -13408,6 +13433,7 @@ mod tests {
             event_target: array![0.0, 1.0],
             weights: array![1.0, 1.0],
             z: array![-1.0, 1.0],
+            base_link: InverseLink::Standard(LinkFunction::Probit),
             marginalspec: empty_termspec(),
             marginal_offset: Array1::zeros(2),
             frailty: FrailtySpec::None,
@@ -13427,6 +13453,7 @@ mod tests {
             logslope_offset: Array1::zeros(2),
             score_warp: None,
             link_dev: None,
+            latent_z_policy: LatentZPolicy::default(),
         };
 
         let err = validate_spec(&spec).expect_err("non-structural time block should fail");
@@ -13444,6 +13471,7 @@ mod tests {
             event_target: array![0.0, 1.0],
             weights: array![1.0, 1.0],
             z: array![-1.0, 1.0],
+            base_link: InverseLink::Standard(LinkFunction::Probit),
             marginalspec: empty_termspec(),
             marginal_offset: Array1::zeros(2),
             frailty: FrailtySpec::GaussianShift { sigma_fixed: None },
@@ -13454,6 +13482,7 @@ mod tests {
             logslope_offset: Array1::zeros(2),
             score_warp: None,
             link_dev: None,
+            latent_z_policy: LatentZPolicy::default(),
         };
 
         let err =
