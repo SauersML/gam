@@ -2944,8 +2944,9 @@ impl ImplicitDesignPsiDerivative {
                         .iter()
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
+                    let overlap_s = Self::transformed_combo_overlap_streaming(combo, combo, sb);
                     Self::transformed_second_kernel_value(
-                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, c,
+                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, overlap_s, c,
                     )
                 })?;
                 return Ok(self.project_and_pad(&raw));
@@ -2953,6 +2954,7 @@ impl ImplicitDesignPsiDerivative {
             let c = self.psi_scale_share;
             let raw = self.accumulate_knot_vector(v, |idx| {
                 let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                let overlap_s = self.transformed_combo_overlap_materialized(idx, combo, combo);
                 Self::transformed_second_kernel_value(
                     self.phi_values[idx],
                     self.q_values[idx],
@@ -2961,6 +2963,7 @@ impl ImplicitDesignPsiDerivative {
                     combo_sum,
                     s_combo,
                     combo_sum,
+                    overlap_s,
                     c,
                 )
             });
@@ -3013,7 +3016,10 @@ impl ImplicitDesignPsiDerivative {
                         .iter()
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
-                    Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, c)
+                    let overlap_s = Self::transformed_combo_overlap_streaming(combo_d, combo_e, sb);
+                    Self::transformed_second_kernel_value(
+                        phi, q, t, s_d, sum_d, s_e, sum_e, overlap_s, c,
+                    )
                 })?;
                 return Ok(self.project_and_pad(&raw));
             }
@@ -3021,6 +3027,7 @@ impl ImplicitDesignPsiDerivative {
             let raw = self.accumulate_knot_vector(v, |idx| {
                 let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
                 let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
+                let overlap_s = self.transformed_combo_overlap_materialized(idx, combo_d, combo_e);
                 Self::transformed_second_kernel_value(
                     self.phi_values[idx],
                     self.q_values[idx],
@@ -3029,6 +3036,7 @@ impl ImplicitDesignPsiDerivative {
                     sum_d,
                     s_e,
                     sum_e,
+                    overlap_s,
                     c,
                 )
             });
@@ -3073,8 +3081,9 @@ impl ImplicitDesignPsiDerivative {
                         .iter()
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
+                    let overlap_s = Self::transformed_combo_overlap_streaming(combo, combo, sb);
                     Self::transformed_second_kernel_value(
-                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, c,
+                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, overlap_s, c,
                     )
                 });
             }
@@ -3087,6 +3096,7 @@ impl ImplicitDesignPsiDerivative {
                 for j in 0..k {
                     let idx = base + j;
                     let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                    let overlap_s = self.transformed_combo_overlap_materialized(idx, combo, combo);
                     val += Self::transformed_second_kernel_value(
                         self.phi_values[idx],
                         self.q_values[idx],
@@ -3095,6 +3105,7 @@ impl ImplicitDesignPsiDerivative {
                         combo_sum,
                         s_combo,
                         combo_sum,
+                        overlap_s,
                         c,
                     ) * u_knot[j];
                 }
@@ -3200,7 +3211,10 @@ impl ImplicitDesignPsiDerivative {
                         .iter()
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
-                    Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, c)
+                    let overlap_s = Self::transformed_combo_overlap_streaming(combo_d, combo_e, sb);
+                    Self::transformed_second_kernel_value(
+                        phi, q, t, s_d, sum_d, s_e, sum_e, overlap_s, c,
+                    )
                 });
             }
             let n = self.n;
@@ -3213,6 +3227,8 @@ impl ImplicitDesignPsiDerivative {
                     let idx = base + j;
                     let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
                     let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
+                    let overlap_s =
+                        self.transformed_combo_overlap_materialized(idx, combo_d, combo_e);
                     val += Self::transformed_second_kernel_value(
                         self.phi_values[idx],
                         self.q_values[idx],
@@ -3221,6 +3237,7 @@ impl ImplicitDesignPsiDerivative {
                         sum_d,
                         s_e,
                         sum_e,
+                        overlap_s,
                         c,
                     ) * u_knot[j];
                 }
@@ -3367,8 +3384,9 @@ impl ImplicitDesignPsiDerivative {
                         .iter()
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
+                    let overlap_s = Self::transformed_combo_overlap_streaming(combo, combo, sb);
                     Self::transformed_second_kernel_value(
-                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, c,
+                        phi, q, t, s_combo, combo_sum, s_combo, combo_sum, overlap_s, c,
                     )
                 });
             }
@@ -3381,6 +3399,7 @@ impl ImplicitDesignPsiDerivative {
                 for j in 0..k {
                     let idx = base + j;
                     let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
+                    let overlap_s = self.transformed_combo_overlap_materialized(idx, combo, combo);
                     raw[[i, j]] = Self::transformed_second_kernel_value(
                         self.phi_values[idx],
                         self.q_values[idx],
@@ -3389,6 +3408,7 @@ impl ImplicitDesignPsiDerivative {
                         combo_sum,
                         s_combo,
                         combo_sum,
+                        overlap_s,
                         c,
                     );
                 }
@@ -3446,7 +3466,10 @@ impl ImplicitDesignPsiDerivative {
                         .iter()
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
-                    Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, c)
+                    let overlap_s = Self::transformed_combo_overlap_streaming(combo_d, combo_e, sb);
+                    Self::transformed_second_kernel_value(
+                        phi, q, t, s_d, sum_d, s_e, sum_e, overlap_s, c,
+                    )
                 });
             }
             let n = self.n;
@@ -3459,6 +3482,8 @@ impl ImplicitDesignPsiDerivative {
                     let idx = base + j;
                     let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
                     let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
+                    let overlap_s =
+                        self.transformed_combo_overlap_materialized(idx, combo_d, combo_e);
                     raw[[i, j]] = Self::transformed_second_kernel_value(
                         self.phi_values[idx],
                         self.q_values[idx],
@@ -3467,6 +3492,7 @@ impl ImplicitDesignPsiDerivative {
                         sum_d,
                         s_e,
                         sum_e,
+                        overlap_s,
                         c,
                     );
                 }
@@ -3547,6 +3573,41 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
+    fn transformed_combo_overlap_streaming(
+        combo_left: &[(usize, f64)],
+        combo_right: &[(usize, f64)],
+        sb: &[f64],
+    ) -> f64 {
+        let mut overlap = 0.0;
+        for &(left_axis, left_coeff) in combo_left {
+            for &(right_axis, right_coeff) in combo_right {
+                if left_axis == right_axis {
+                    overlap += left_coeff * right_coeff * sb[left_axis];
+                }
+            }
+        }
+        overlap
+    }
+
+    #[inline]
+    fn transformed_combo_overlap_materialized(
+        &self,
+        idx: usize,
+        combo_left: &[(usize, f64)],
+        combo_right: &[(usize, f64)],
+    ) -> f64 {
+        let mut overlap = 0.0;
+        for &(left_axis, left_coeff) in combo_left {
+            for &(right_axis, right_coeff) in combo_right {
+                if left_axis == right_axis {
+                    overlap += left_coeff * right_coeff * self.axis_components[[idx, left_axis]];
+                }
+            }
+        }
+        overlap
+    }
+
+    #[inline]
     fn transformed_first_kernel_value(
         phi: f64,
         q: f64,
@@ -3566,9 +3627,11 @@ impl ImplicitDesignPsiDerivative {
         left_sum: f64,
         s_right: f64,
         right_sum: f64,
+        overlap_s: f64,
         psi_scale_share: f64,
     ) -> f64 {
         t * s_left * s_right
+            + 2.0 * q * overlap_s
             + psi_scale_share * q * (right_sum * s_left + left_sum * s_right)
             + psi_scale_share * psi_scale_share * left_sum * right_sum * phi
     }
@@ -7514,10 +7577,7 @@ fn duchon_effective_nullspace_order(
         > = std::sync::OnceLock::new();
         let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         let key = (centers.nrows(), centers.ncols(), order);
-        let fresh = seen
-            .lock()
-            .map(|mut s| s.insert(key))
-            .unwrap_or(true);
+        let fresh = seen.lock().map(|mut s| s.insert(key)).unwrap_or(true);
         if fresh {
             log::warn!(
                 "Duchon nullspace order={:?} needs >={} centers in dim={}; got {} — degrading to Zero",
@@ -9846,8 +9906,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 .to_string(),
         )
     })?;
-    let effective_nullspace_order =
-        duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     validate_duchon_collocation_orders(Some(length_scale), p_order, s_order, centers.ncols())?;
@@ -10590,8 +10649,7 @@ fn build_duchon_design_psi_aniso_derivatives(
         )));
     }
 
-    let effective_nullspace_order =
-        duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     let kappa = 1.0 / length_scale.max(1e-300);
@@ -10749,8 +10807,11 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let effective_nullspace_order =
         duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
-    let z_kernel =
-        kernel_constraint_nullspace(centers.view(), effective_nullspace_order, &mut workspace.cache)?;
+    let z_kernel = kernel_constraint_nullspace(
+        centers.view(),
+        effective_nullspace_order,
+        &mut workspace.cache,
+    )?;
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let p_padded = z_kernel.ncols() + poly_cols;
     let identifiability_transform =
@@ -11990,8 +12051,7 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     // 2. project the kernel block with the same nullspace constraint used by the basis
     // 3. append polynomial columns; their psi derivatives are zero because p and s are fixed
     // 4. apply any frozen identifiability transform
-    let effective_nullspace_order =
-        duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     let kappa = 1.0 / length_scale;
@@ -12418,8 +12478,11 @@ pub fn build_duchon_basiswithworkspace(
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
-    let kernel_transform =
-        kernel_constraint_nullspace(centers.view(), effective_nullspace_order, &mut workspace.cache)?;
+    let kernel_transform = kernel_constraint_nullspace(
+        centers.view(),
+        effective_nullspace_order,
+        &mut workspace.cache,
+    )?;
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let base_cols = kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
@@ -19479,6 +19542,220 @@ mod tests {
             .evaluate(0, 1)
             .expect("pure Duchon cross penalties");
         assert!(!cross_penalties.is_empty());
+    }
+
+    fn pure_duchon_design_for_eta(
+        data: &Array2<f64>,
+        centers: &Array2<f64>,
+        eta: Vec<f64>,
+    ) -> Array2<f64> {
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: Some(eta),
+        };
+        build_duchon_basis(data.view(), &spec)
+            .expect("pure Duchon basis")
+            .design
+    }
+
+    fn perturb_contrast_eta(base_eta: &[f64], perturbations: &[(usize, f64)]) -> Vec<f64> {
+        let mut eta = base_eta.to_vec();
+        let last = eta.len() - 1;
+        for &(axis, amount) in perturbations {
+            eta[axis] += amount;
+            eta[last] -= amount;
+        }
+        eta
+    }
+
+    fn assert_matrix_close(actual: &Array2<f64>, expected: &Array2<f64>, tolerance: f64) {
+        assert_eq!(actual.dim(), expected.dim());
+        let max_abs = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            max_abs <= tolerance,
+            "matrix mismatch: max_abs={max_abs:.3e}, tolerance={tolerance:.3e}"
+        );
+    }
+
+    fn assert_pure_duchon_contrast_hessian_matches_finite_difference(
+        data: Array2<f64>,
+        centers: Array2<f64>,
+        eta: Vec<f64>,
+    ) {
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: Some(eta.clone()),
+        };
+        let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
+            .expect("pure Duchon anisotropic derivatives");
+        let op = derivs
+            .implicit_operator
+            .as_ref()
+            .expect("pure Duchon contrast operator");
+        let h = 1e-4;
+        let x0 = pure_duchon_design_for_eta(&data, &centers, eta.clone());
+
+        for axis in 0..op.n_axes() {
+            let x_plus = pure_duchon_design_for_eta(
+                &data,
+                &centers,
+                perturb_contrast_eta(&eta, &[(axis, h)]),
+            );
+            let x_minus = pure_duchon_design_for_eta(
+                &data,
+                &centers,
+                perturb_contrast_eta(&eta, &[(axis, -h)]),
+            );
+            let finite_diff = (&x_plus - &(x0.mapv(|value| 2.0 * value)) + &x_minus)
+                .mapv(|value| value / (h * h));
+            let analytic = op
+                .materialize_second_diag(axis)
+                .expect("contrast diagonal Hessian");
+            assert_matrix_close(&analytic, &finite_diff, 2e-5);
+        }
+
+        if op.n_axes() >= 2 {
+            let x_pp = pure_duchon_design_for_eta(
+                &data,
+                &centers,
+                perturb_contrast_eta(&eta, &[(0, h), (1, h)]),
+            );
+            let x_pm = pure_duchon_design_for_eta(
+                &data,
+                &centers,
+                perturb_contrast_eta(&eta, &[(0, h), (1, -h)]),
+            );
+            let x_mp = pure_duchon_design_for_eta(
+                &data,
+                &centers,
+                perturb_contrast_eta(&eta, &[(0, -h), (1, h)]),
+            );
+            let x_mm = pure_duchon_design_for_eta(
+                &data,
+                &centers,
+                perturb_contrast_eta(&eta, &[(0, -h), (1, -h)]),
+            );
+            let finite_diff = (&x_pp - &x_pm - &x_mp + &x_mm).mapv(|value| value / (4.0 * h * h));
+            let analytic = op
+                .materialize_second_cross(0, 1)
+                .expect("contrast cross Hessian");
+            assert_matrix_close(&analytic, &finite_diff, 2e-5);
+        }
+    }
+
+    #[test]
+    fn test_pure_duchon_dim2_contrast_hessian_matches_finite_difference() {
+        let data = array![[0.1, 0.2], [0.4, 0.8], [0.9, 0.3], [1.2, 0.7]];
+        let centers = array![[0.0, 0.0], [0.8, 0.1], [0.2, 1.0], [1.1, 0.9]];
+        assert_pure_duchon_contrast_hessian_matches_finite_difference(
+            data,
+            centers,
+            vec![0.17, -0.17],
+        );
+    }
+
+    #[test]
+    fn test_pure_duchon_dim3_contrast_hessian_matches_finite_difference() {
+        let data = array![
+            [0.1, 0.2, 0.3],
+            [0.4, 0.8, 0.2],
+            [0.9, 0.3, 0.7],
+            [1.2, 0.7, 0.4],
+            [0.6, 1.1, 0.9]
+        ];
+        let centers = array![
+            [0.0, 0.0, 0.0],
+            [0.8, 0.1, 0.2],
+            [0.2, 1.0, 0.4],
+            [1.1, 0.9, 0.8],
+            [0.5, 0.6, 1.2]
+        ];
+        assert_pure_duchon_contrast_hessian_matches_finite_difference(
+            data,
+            centers,
+            vec![0.2, -0.05, -0.15],
+        );
+    }
+
+    #[test]
+    fn test_pure_duchon_contrast_hessian_matches_raw_axis_reparameterization() {
+        let data = array![
+            [0.1, 0.2, 0.3],
+            [0.4, 0.8, 0.2],
+            [0.9, 0.3, 0.7],
+            [1.2, 0.7, 0.4],
+            [0.6, 1.1, 0.9]
+        ];
+        let centers = array![
+            [0.0, 0.0, 0.0],
+            [0.8, 0.1, 0.2],
+            [0.2, 1.0, 0.4],
+            [1.1, 0.9, 0.8],
+            [0.5, 0.6, 1.2]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: Some(vec![0.2, -0.05, -0.15]),
+        };
+        let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
+            .expect("pure Duchon anisotropic derivatives");
+        let contrast_op = derivs
+            .implicit_operator
+            .as_ref()
+            .expect("pure Duchon contrast operator");
+        let mut raw_op = contrast_op.clone();
+        raw_op.axis_combinations = None;
+        let last = 2;
+
+        for axis in 0..2 {
+            let contrast = contrast_op
+                .materialize_second_diag(axis)
+                .expect("contrast diagonal Hessian");
+            let expected = raw_op
+                .materialize_second_diag(axis)
+                .expect("raw diagonal Hessian")
+                - raw_op
+                    .materialize_second_cross(axis, last)
+                    .expect("raw axis/last Hessian")
+                    .mapv(|value| 2.0 * value)
+                + raw_op
+                    .materialize_second_diag(last)
+                    .expect("raw last diagonal Hessian");
+            assert_matrix_close(&contrast, &expected, 1e-12);
+        }
+
+        let contrast_cross = contrast_op
+            .materialize_second_cross(0, 1)
+            .expect("contrast cross Hessian");
+        let expected_cross = raw_op
+            .materialize_second_cross(0, 1)
+            .expect("raw cross Hessian")
+            - raw_op
+                .materialize_second_cross(0, last)
+                .expect("raw first/last Hessian")
+            - raw_op
+                .materialize_second_cross(1, last)
+                .expect("raw second/last Hessian")
+            + raw_op
+                .materialize_second_diag(last)
+                .expect("raw last diagonal Hessian");
+        assert_matrix_close(&contrast_cross, &expected_cross, 1e-12);
     }
 
     #[test]
