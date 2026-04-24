@@ -196,11 +196,13 @@ impl<'a> RemlState<'a> {
         let mut t1_sum = 0.0_f64;
         for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
             let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+            let z_block = z.slice(s![.., j0..j1]);
             let c_j = c_array.slice(s![j0..j1]);
             for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+                let x_block = x_dense.slice(s![i0..i1, ..]);
                 let c_i = c_array.slice(s![i0..i1]);
-                let gram = Self::tk_gram_block(x_dense, z, i0, i1, j0, j1);
+                let gram = x_block.dot(&z_block);
                 let mut block_sum = 0.0_f64;
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
@@ -227,30 +229,6 @@ impl<'a> RemlState<'a> {
             )));
         }
         Ok(value)
-    }
-
-    fn tk_gram_block(
-        x_dense: &Array2<f64>,
-        z: &Array2<f64>,
-        i0: usize,
-        i1: usize,
-        j0: usize,
-        j1: usize,
-    ) -> Array2<f64> {
-        let p = x_dense.ncols();
-        let mut gram = Array2::<f64>::zeros((i1 - i0, j1 - j0));
-        for bi in 0..(i1 - i0) {
-            let row = i0 + bi;
-            for bj in 0..(j1 - j0) {
-                let col = j0 + bj;
-                let mut value = 0.0;
-                for a in 0..p {
-                    value += x_dense[[row, a]] * z[[a, col]];
-                }
-                gram[[bi, bj]] = value;
-            }
-        }
-        gram
     }
 
     fn tk_gradient_from_shared(
@@ -432,8 +410,7 @@ impl<'a> RemlState<'a> {
             "Tierney-Kadane correction",
             h_inv_solve,
         )?;
-        let value =
-            Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &h_diag, &x_m, &y)?;
+        let value = Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &h_diag, &x_m, &y)?;
         if !compute_gradient {
             return Ok(TkCorrectionTerms {
                 value,
