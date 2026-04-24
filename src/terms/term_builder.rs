@@ -540,12 +540,9 @@ pub fn parse_duchon_order(
         Some(raw) => match raw.parse::<usize>() {
             Ok(0) => Ok(DuchonNullspaceOrder::Zero),
             Ok(1) => Ok(DuchonNullspaceOrder::Linear),
-            Ok(other) => Err(format!(
-                "invalid Duchon order '{}'; supported values are order=0 and order=1",
-                other
-            )),
+            Ok(other) => Ok(DuchonNullspaceOrder::Degree(other)),
             Err(_) => Err(format!(
-                "invalid Duchon order '{}'; expected an integer such as order=0 or order=1",
+                "invalid Duchon order '{}'; expected a non-negative integer such as order=0, order=1, or order=2",
                 raw
             )),
         },

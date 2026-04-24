@@ -1606,11 +1606,13 @@ impl Default for MaternIdentifiability {
 
 /// Duchon null-space polynomial degree.
 /// `0` keeps the constant null space (`m=1`), `1` keeps
-/// `[1, x_1, ..., x_d]` (`m=2`).
+/// `[1, x_1, ..., x_d]` (`m=2`), and `Degree(k)` keeps all monomials
+/// with total degree <= k.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DuchonNullspaceOrder {
     Zero,
     Linear,
+    Degree(usize),
 }
 
 /// Duchon-like basis configuration with explicit low-frequency null-space
@@ -6321,11 +6323,7 @@ impl DuchonCrossPenaltyContext {
         let p = self.centers.nrows();
         let d = self.centers.ncols();
         let z_cols = self.z_kernel.ncols();
-        let metric_weights: Vec<f64> = self
-            .aniso_log_scales
-            .iter()
-            .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
-            .collect();
+        let metric_weights = centered_aniso_metric_weights(&self.aniso_log_scales);
         let sum_metric_weights: f64 = metric_weights.iter().sum();
 
         let mut d0_raw_eta_cross = Array2::<f64>::zeros((p, z_cols));
@@ -6542,10 +6540,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     // Precompute metric weights w_b = exp(2ψ_b) for each axis.
     // These are needed for the correct anisotropic gradient operator D₁
     // and anisotropic Laplacian operator D₂.
-    let metric_weights: Vec<f64> = aniso_log_scales
-        .iter()
-        .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
-        .collect();
+    let metric_weights = centered_aniso_metric_weights(aniso_log_scales);
     let sum_metric_weights: f64 = metric_weights.iter().sum();
 
     for k in 0..p {
@@ -7400,11 +7395,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     }
     let coeffs = length_scale
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
-    let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(|eta| {
-        eta.iter()
-            .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
-            .collect()
-    });
+    let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(centered_aniso_metric_weights);
     let sum_metric_weights = metric_weights
         .as_ref()
         .map(|w| w.iter().sum::<f64>())
@@ -7614,6 +7605,7 @@ fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
         //   order=1 -> constants+linear -> m=2
         DuchonNullspaceOrder::Zero => 1,
         DuchonNullspaceOrder::Linear => 2,
+        DuchonNullspaceOrder::Degree(degree) => degree + 1,
     }
 }
 
@@ -8452,6 +8444,37 @@ where
     }
 }
 
+#[inline]
+fn centered_aniso_log_scale_mean(eta: &[f64]) -> f64 {
+    if eta.len() <= 1 {
+        0.0
+    } else {
+        eta.iter().sum::<f64>() / eta.len() as f64
+    }
+}
+
+#[inline]
+fn centered_aniso_log_scale(value: f64, mean: f64) -> f64 {
+    (value - mean).clamp(-50.0, 50.0)
+}
+
+#[inline]
+fn aniso_axis_scale(value: f64, mean: f64) -> f64 {
+    centered_aniso_log_scale(value, mean).exp()
+}
+
+#[inline]
+fn aniso_metric_weight(value: f64, mean: f64) -> f64 {
+    (2.0 * centered_aniso_log_scale(value, mean)).exp()
+}
+
+fn centered_aniso_metric_weights(eta: &[f64]) -> Vec<f64> {
+    let mean = centered_aniso_log_scale_mean(eta);
+    eta.iter()
+        .map(|&value| aniso_metric_weight(value, mean))
+        .collect()
+}
+
 /// Compute anisotropic squared distance components and total distance.
 ///
 /// This is the core of **geometric anisotropy**: a linear warp Λ = diag(κ_a)
@@ -8464,12 +8487,13 @@ where
 /// contrasts. This separates scale from shape and preserves the Duchon scaling
 /// law φ(r;κ) = κ^δ H(κr) for the global part.
 ///
-/// Given per-axis log-scales `eta` (with the convention Σ eta_a = 0 for
-/// identifiability), the anisotropic distance is:
+/// Given per-axis log-scales `eta`, the identifiable centered contrasts are
+/// ψ_a = eta_a - mean(eta). The metric uses those contrasts so Σ_a ψ_a = 0
+/// even when a caller passes an uncentered vector:
 ///
-///   r = √( Σ_a exp(2·eta_a) · (x_a - c_a)² )
+///   r = √( Σ_a exp(2·ψ_a) · (x_a - c_a)² )
 ///
-/// Returns `(r, s_vec)` where `s_vec[a] = exp(2·eta_a) · h_a²` is the
+/// Returns `(r, s_vec)` where `s_vec[a] = exp(2·ψ_a) · h_a²` is the
 /// per-axis weighted squared displacement. These components are needed for
 /// per-axis derivatives: `∂φ/∂ψ_a = q · s_a`.
 ///
@@ -8482,12 +8506,13 @@ fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) 
     assert_eq!(data_row.len(), center.len());
     assert_eq!(data_row.len(), eta.len());
     let d = data_row.len();
+    let eta_mean = centered_aniso_log_scale_mean(eta);
     let mut s_vec = Vec::with_capacity(d);
     let mut scaled_components = Vec::with_capacity(d);
     for a in 0..d {
         let h_a = data_row[a] - center[a];
-        // Clamp exp(2η) to avoid overflow/underflow: η ∈ [-50, 50] → exp(2η) ∈ [~1e-44, ~1e43].
-        let scale_a = eta[a].clamp(-50.0, 50.0).exp();
+        // Clamp exp(2ψ) to avoid overflow/underflow: ψ in [-50, 50].
+        let scale_a = aniso_axis_scale(eta[a], eta_mean);
         let scaled_h_a = scale_a * h_a;
         let s_a = scaled_h_a * scaled_h_a;
         scaled_components.push(scaled_h_a);
@@ -8504,21 +8529,24 @@ fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) 
 fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f64 {
     assert_eq!(data_row.len(), center.len());
     assert_eq!(data_row.len(), eta.len());
+    let eta_mean = centered_aniso_log_scale_mean(eta);
     stable_euclidean_norm(
-        (0..data_row.len()).map(|a| eta[a].clamp(-50.0, 50.0).exp() * (data_row[a] - center[a])),
+        (0..data_row.len()).map(|a| aniso_axis_scale(eta[a], eta_mean) * (data_row[a] - center[a])),
     )
 }
 
-/// Return y-space points `y_{i,a} = exp(η_a) x_{i,a}` so Euclidean pairwise
+/// Return y-space points `y_{i,a} = exp(ψ_a) x_{i,a}` with
+/// `ψ_a = η_a - mean(η)` so Euclidean pairwise
 /// distances in y equal anisotropic kernel distances in x:
-///   |y_i - y_j|² = Σ_a exp(2 η_a) (x_{i,a} - x_{j,a})² = aniso_distance²(x_i, x_j, η).
+///   |y_i - y_j|² = Σ_a exp(2 ψ_a) (x_{i,a} - x_{j,a})² = aniso_distance²(x_i, x_j, η).
 /// Use this before `pairwise_distance_bounds` whenever κ conditioning
 /// bounds must match the kernel's actual metric (anisotropic case). For
 /// isotropic terms, pass `None` and keep using the raw centers.
 pub(crate) fn points_in_aniso_y_space(points: ArrayView2<'_, f64>, eta: &[f64]) -> Array2<f64> {
     assert_eq!(points.ncols(), eta.len());
     let mut y = points.to_owned();
-    let weights: Vec<f64> = eta.iter().map(|&e| e.clamp(-50.0, 50.0).exp()).collect();
+    let eta_mean = centered_aniso_log_scale_mean(eta);
+    let weights: Vec<f64> = eta.iter().map(|&e| aniso_axis_scale(e, eta_mean)).collect();
     for a in 0..eta.len() {
         let w_a = weights[a];
         y.column_mut(a).mapv_inplace(|v| v * w_a);
@@ -8915,6 +8943,7 @@ fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
     match order {
         DuchonNullspaceOrder::Zero => 0,
         DuchonNullspaceOrder::Linear => 1,
+        DuchonNullspaceOrder::Degree(degree) => degree.min(u8::MAX as usize) as u8,
     }
 }
 
@@ -10035,11 +10064,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
             eta.len()
         )));
     }
-    let metric_weights: Option<Vec<f64>> = aniso.map(|eta| {
-        eta.iter()
-            .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
-            .collect()
-    });
+    let metric_weights: Option<Vec<f64>> = aniso.map(centered_aniso_metric_weights);
     let sum_metric_weights = metric_weights
         .as_ref()
         .map(|weights| weights.iter().sum::<f64>())
@@ -12746,6 +12771,7 @@ fn polynomial_block_from_order(
             }
             poly
         }
+        DuchonNullspaceOrder::Degree(degree) => monomial_basis_block(points, degree),
     }
 }
 
@@ -12777,6 +12803,10 @@ fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usiz
         recurse(0, total_degree, &mut current, &mut out);
     }
     out
+}
+
+pub fn duchon_nullspace_dimension(dimension: usize, max_total_degree: usize) -> usize {
+    monomial_exponents(dimension, max_total_degree).len()
 }
 
 fn monomial_basis_block(points: ArrayView2<'_, f64>, max_total_degree: usize) -> Array2<f64> {

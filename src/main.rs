@@ -2270,9 +2270,7 @@ fn build_predict_input_for_model(
                     "saved transformation-normal model has no finite response knots".to_string(),
                 );
             }
-            derivative_grid.sort_by(|a, b| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let min_grid = derivative_grid[0];
             let max_grid = derivative_grid[derivative_grid.len() - 1];
             let grid_span = (max_grid - min_grid).abs().max(1.0);
@@ -2292,9 +2290,7 @@ fn build_predict_input_for_model(
             let grid_guard = 0.25 * grid_span;
             derivative_grid.push(min_grid - grid_guard);
             derivative_grid.push(max_grid + grid_guard);
-            derivative_grid.sort_by(|a, b| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             derivative_grid.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12 * grid_span);
             let derivative_grid = ndarray::Array1::from_vec(derivative_grid);
             let (raw_deriv_basis, _) = gam::basis::create_basis::<gam::basis::Dense>(
@@ -13463,12 +13459,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_duchon_order_rejects_unsupported_or_malformedvalues() {
-        let mut unsupported = BTreeMap::new();
-        unsupported.insert("order".to_string(), "2".to_string());
-        let unsupported_err =
-            parse_duchon_order(&unsupported).expect_err("unsupported Duchon order should fail");
-        assert!(unsupported_err.contains("supported values are order=0 and order=1"));
+    fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedvalues() {
+        let mut quadratic = BTreeMap::new();
+        quadratic.insert("order".to_string(), "2".to_string());
+        assert_eq!(
+            parse_duchon_order(&quadratic).expect("quadratic Duchon order"),
+            DuchonNullspaceOrder::Degree(2)
+        );
 
         let mut malformed = BTreeMap::new();
         malformed.insert("order".to_string(), "linear".to_string());

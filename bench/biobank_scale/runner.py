@@ -52,6 +52,15 @@ BIOBANK_PREFLIGHT_DEFAULT_MAX_PEAK_BYTES = int(0.80 * DEFAULT_BIOBANK_RAM_BUDGET
 BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
 BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
 BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
+BIOBANK_DUCHON16D_ORDER = 1
+BIOBANK_DUCHON16D_POWER = 8
+BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
+PGS_RAW_COLUMN = "pgs_raw"
+PGS_CTN_Z_COLUMN = "pgs_ctn_z"
+PGS_CTN_DIAGNOSTIC_MIN_N = 40
+PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN = 0.30
+PGS_CTN_DIAGNOSTIC_MIN_VAR = 0.50
+PGS_CTN_DIAGNOSTIC_MAX_VAR = 1.75
 SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale"}
 SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS = {
     "gaussian",
@@ -144,6 +153,7 @@ def preflight_marginal_slope_biobank(
         f"n_train: {n_train:,}",
         f"d_pc: {d_pc}",
         f"K_pc: {centers}",
+        f"Duchon tuple: order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g}",
         "Duchon smooth: lazy chunked",
         "anisotropy derivatives: implicit streaming",
         "CTN Kronecker: n/a",
@@ -238,6 +248,11 @@ def load_config(path: Path) -> dict[str, Any]:
 def validate_method_spec(spec: MethodSpec) -> None:
     if spec.pc_count <= 0 or spec.pc_count > 16:
         raise RuntimeError(f"method '{spec.name}' must set pc_count in [1, 16]")
+    if spec.marginal_slope and spec.z_column != PGS_CTN_Z_COLUMN:
+        raise RuntimeError(
+            f"method '{spec.name}' is a marginal-slope lane and must use "
+            f"z_column='{PGS_CTN_Z_COLUMN}', not '{spec.z_column or 'unset'}'"
+        )
     for key, value in (
         ("mean_linkwiggle_knots", spec.mean_linkwiggle_knots),
         ("logslope_linkwiggle_knots", spec.logslope_linkwiggle_knots),
@@ -1203,7 +1218,11 @@ def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -
     """Build mean and logslope formulas for biobank marginal-slope classification."""
     pc_cols = ", ".join(f"pc{i}_std" for i in range(1, int(spec.pc_count) + 1))
     if spec.spatial_basis == "duchon":
-        spatial = f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
+        spatial = (
+            f"duchon({pc_cols}, centers={centers}, "
+            f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
+            f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
+        )
     elif spec.spatial_basis == "matern":
         spatial = f"matern({pc_cols}, centers={centers})"
     else:

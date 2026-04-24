@@ -333,11 +333,12 @@ fn append_deviation_function_penalty(
     runtime: &DeviationRuntime,
     derivative_order: usize,
 ) -> Result<(), String> {
-    let penalty = runtime.integrated_derivative_penalty(derivative_order)?;
+    let (penalty, nullity) =
+        runtime.integrated_derivative_penalty_with_nullity(derivative_order)?;
     block
         .penalties
         .push(crate::solver::estimate::PenaltySpec::Dense(penalty));
-    block.nullspace_dims.push(0);
+    block.nullspace_dims.push(nullity);
     Ok(())
 }
 
@@ -441,16 +442,12 @@ fn validate_spec(
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
-            let Some(sigma) = sigma_fixed else {
-                return Err(
-                    "bernoulli-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
-                        .to_string(),
-                );
-            };
-            if !sigma.is_finite() || *sigma < 0.0 {
-                return Err(format!(
-                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                ));
+            if let Some(sigma) = sigma_fixed {
+                if !sigma.is_finite() || *sigma < 0.0 {
+                    return Err(format!(
+                        "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                    ));
+                }
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
@@ -1686,6 +1683,11 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
     ]
 }
 
+#[inline]
+fn cell_coeff4(cell: exact_kernel::DenestedCubicCell) -> [f64; 4] {
+    [cell.c0, cell.c1, cell.c2, cell.c3]
+}
+
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     let sigma = gaussian_frailty_sd.unwrap_or(0.0);
     if sigma <= 0.0 {
@@ -2351,14 +2353,79 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let _ = (block_states, specs);
-        if self.gaussian_frailty_sd.is_some() {
-            return Err(
-                "bernoulli marginal-slope log-sigma hyperderivatives require an analytic implementation; production finite differences are disabled"
-                    .to_string(),
-            );
+        let _ = specs;
+        let Some(sigma) = self.gaussian_frailty_sd else {
+            return Ok(None);
+        };
+        if sigma <= 0.0 {
+            return Ok(Some(ExactNewtonJointPsiTerms::zeros(
+                block_slices(self).total,
+            )));
         }
-        Ok(None)
+        let cache = self.build_exact_eval_cache(block_states)?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let log_scale_slope =
+            -crate::families::lognormal_kernel::ProbitFrailtyScaleJet::new(sigma).alpha;
+        let n = self.y.len();
+        let (objective_psi, score_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
+            / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0f64,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(slices),
+                    )
+                },
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let row_ctx = Self::row_ctx(&cache, row);
+                        let (obj_tau, score_primary_tau, hessian_primary_tau) = self
+                            .compute_row_sigma_primary_terms(
+                                row,
+                                block_states,
+                                primary,
+                                row_ctx,
+                                log_scale_slope,
+                            )?;
+                        acc.0 += obj_tau;
+                        acc.1 += &self.pullback_primary_vector(
+                            row,
+                            slices,
+                            primary,
+                            &score_primary_tau,
+                        )?;
+                        acc.2.add_pullback(self, row, slices, primary, &hessian_primary_tau);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0f64,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(slices),
+                    )
+                },
+                |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2.add(&right.2);
+                    Ok(left)
+                },
+            )?;
+
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(std::sync::Arc::new(block_acc.into_operator(slices))),
+        }))
     }
 
     #[inline]
@@ -8629,6 +8696,47 @@ mod tests {
     }
 
     #[test]
+    fn structural_deviation_runtime_is_c2_at_internal_breakpoints() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("structural deviation basis");
+        let dim = prepared.block.design.ncols();
+        let beta = Array1::from_iter((0..dim).map(|idx| 0.015 * (idx as f64 + 1.0)));
+        let n_spans = prepared.runtime.breakpoints().len().saturating_sub(1);
+        for span_idx in 1..n_spans {
+            let left_cubic = prepared
+                .runtime
+                .local_cubic_on_span(&beta, span_idx - 1)
+                .expect("left span cubic");
+            let right_cubic = prepared
+                .runtime
+                .local_cubic_on_span(&beta, span_idx)
+                .expect("right span cubic");
+            let knot = prepared.runtime.breakpoints()[span_idx];
+            assert!(
+                (left_cubic.evaluate(knot) - right_cubic.evaluate(knot)).abs() <= 1e-10,
+                "deviation value should be continuous at breakpoint {span_idx}"
+            );
+            assert!(
+                (left_cubic.first_derivative(knot) - right_cubic.first_derivative(knot)).abs()
+                    <= 1e-10,
+                "deviation first derivative should be continuous at breakpoint {span_idx}"
+            );
+            assert!(
+                (left_cubic.second_derivative(knot) - right_cubic.second_derivative(knot)).abs()
+                    <= 1e-10,
+                "deviation second derivative should be continuous at breakpoint {span_idx}"
+            );
+        }
+    }
+
+    #[test]
     fn structural_deviation_rejects_noncubic_degree() {
         let seed = array![-1.0, 0.0, 1.0];
         let err = build_deviation_block_from_seed(
@@ -8713,19 +8821,22 @@ mod tests {
 
         let expected_orders = [1, 0, 2, 3];
         assert_eq!(prepared.block.penalties.len(), expected_orders.len());
-        assert_eq!(
-            prepared.block.nullspace_dims,
-            vec![0; expected_orders.len()]
-        );
 
-        for (penalty, &order) in prepared.block.penalties.iter().zip(expected_orders.iter()) {
+        for ((penalty, &nullity), &order) in prepared
+            .block
+            .penalties
+            .iter()
+            .zip(prepared.block.nullspace_dims.iter())
+            .zip(expected_orders.iter())
+        {
             let crate::solver::estimate::PenaltySpec::Dense(actual) = penalty else {
                 panic!("deviation penalties should be dense local Gram matrices");
             };
-            let expected = prepared
+            let (expected, expected_nullity) = prepared
                 .runtime
-                .integrated_derivative_penalty(order)
+                .integrated_derivative_penalty_with_nullity(order)
                 .expect("integrated function penalty");
+            assert_eq!(nullity, expected_nullity);
             assert_eq!(actual.dim(), expected.dim());
             for i in 0..actual.nrows() {
                 for j in 0..actual.ncols() {

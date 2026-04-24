@@ -83,7 +83,7 @@
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
-      "z_column": "pgs_std",
+      "z_column": "pgs_ctn_z",
       "max_centers": 24
     },
     {
@@ -97,7 +97,7 @@
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
-      "z_column": "pgs_std",
+      "z_column": "pgs_ctn_z",
       "logslope_linkwiggle_knots": 8,
       "max_centers": 24
     },
@@ -112,7 +112,7 @@
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
-      "z_column": "pgs_std",
+      "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
       "logslope_linkwiggle_knots": 8,
       "max_centers": 22
