@@ -411,6 +411,7 @@ impl<'a> RemlState<'a> {
         }
         Ok(gradient)
     }
+
     fn tierney_kadane_analytic_core(
         &self,
         x_dense: &Array2<f64>,
@@ -512,7 +513,6 @@ impl<'a> RemlState<'a> {
                 },
             });
         }
-
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
         let dense_work = n_x.saturating_mul(p_x);
@@ -3147,11 +3147,6 @@ impl<'a> RemlState<'a> {
 
         let beta_for_barrier = assembly.beta.clone();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
-        if has_psi && self.config.link_function() != LinkFunction::Identity {
-            return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate EFS psi gradients".to_string(),
-            ));
-        }
         let eval_mode = if has_psi {
             super::unified::EvalMode::ValueAndGradient
         } else {
@@ -3318,15 +3313,6 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
-        let has_psi = ext_coords.iter().any(|c| !c.is_penalty_like);
-        if compute_gradient_for_tk(mode)
-            && has_psi
-            && self.config.link_function() != LinkFunction::Identity
-        {
-            return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
-            ));
-        }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
