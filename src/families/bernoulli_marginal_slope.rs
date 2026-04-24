@@ -3475,83 +3475,26 @@ impl BernoulliMarginalSlopeFamily {
         None
     }
 
-    fn psi_design_row_vector(
+    fn row_primary_psi_direction_from_map(
         &self,
         row: usize,
-        deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-        total_rows: usize,
-        p: usize,
-        label: &str,
-    ) -> Result<Array1<f64>, String> {
-        let action = CustomFamilyPsiDesignAction::from_first_derivative(
-            deriv,
-            total_rows,
-            p,
-            0..total_rows,
-            label,
-        )
-        .ok();
-        first_psi_linear_map(action.as_ref(), Some(&deriv.x_psi), total_rows, p).row_vector(row)
-    }
-
-    fn psi_second_design_row_vector(
-        &self,
-        row: usize,
-        deriv_i: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-        deriv_j: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-        local_j: usize,
-        total_rows: usize,
-        p: usize,
-        label: &str,
-    ) -> Result<Array1<f64>, String> {
-        let action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
-            deriv_i,
-            deriv_j,
-            total_rows,
-            p,
-            0..total_rows,
-            label,
-        )?;
-        let dense = deriv_i
-            .x_psi_psi
-            .as_ref()
-            .and_then(|rows| rows.get(local_j));
-        second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
-    }
-
-    fn row_primary_psi_direction(
-        &self,
-        row: usize,
+        block_idx: usize,
+        psi_map: &crate::families::custom_family::PsiDesignMap,
         block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
         primary: &PrimarySlices,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
-            return Ok(None);
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
+    ) -> Result<Array1<f64>, String> {
         let mut out = Array1::<f64>::zeros(primary.total);
         match block_idx {
             0 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.y.len(),
-                    self.marginal_design.ncols(),
-                    "BernoulliMarginalSlopeFamily marginal",
-                )?;
+                let x_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                 out[primary.q] = x_row.dot(&block_states[0].beta);
             }
             1 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.y.len(),
-                    self.logslope_design.ncols(),
-                    "BernoulliMarginalSlopeFamily log-slope",
-                )?;
+                let x_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                 out[primary.logslope] = x_row.dot(&block_states[1].beta);
             }
             _ => {
@@ -3560,44 +3503,31 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
-    fn row_primary_psi_action_on_direction(
+    fn row_primary_psi_action_on_direction_from_map(
         &self,
         row: usize,
+        block_idx: usize,
+        psi_map: &crate::families::custom_family::PsiDesignMap,
         slices: &BlockSlices,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
         d_beta_flat: &Array1<f64>,
         primary: &PrimarySlices,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
-            return Ok(None);
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
+    ) -> Result<Array1<f64>, String> {
         let mut out = Array1::<f64>::zeros(primary.total);
         match block_idx {
             0 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.y.len(),
-                    self.marginal_design.ncols(),
-                    "BernoulliMarginalSlopeFamily marginal",
-                )?;
+                let x_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                 out[primary.q] =
                     x_row.dot(&d_beta_flat.slice(s![slices.marginal.clone()]).to_owned())
             }
             1 => {
-                let x_row = self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.y.len(),
-                    self.logslope_design.ncols(),
-                    "BernoulliMarginalSlopeFamily log-slope",
-                )?;
+                let x_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                 out[primary.logslope] =
                     x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned())
             }
@@ -3607,52 +3537,35 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
-    fn row_primary_psi_second_direction(
+    fn row_primary_psi_second_direction_from_map(
         &self,
         row: usize,
+        block_i: usize,
+        block_j: usize,
+        psi_map_ij: Option<&crate::families::custom_family::PsiDesignMap>,
         block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_i: usize,
-        psi_j: usize,
         primary: &PrimarySlices,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let Some((block_i, local_i)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
-            return Ok(None);
-        };
-        let Some((block_j, local_j)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
-            return Ok(None);
-        };
+    ) -> Result<Array1<f64>, String> {
         if block_i != block_j {
-            return Ok(Some(Array1::<f64>::zeros(primary.total)));
+            return Ok(Array1::<f64>::zeros(primary.total));
         }
-        let deriv_i = &derivative_blocks[block_i][local_i];
+        let psi_map_ij = psi_map_ij
+            .expect("psi_map_ij must be provided when block_i == block_j");
         let mut out = Array1::<f64>::zeros(primary.total);
         match block_i {
             0 => {
-                let x_row = self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.y.len(),
-                    self.marginal_design.ncols(),
-                    "BernoulliMarginalSlopeFamily marginal",
-                )?;
+                let x_row = psi_map_ij
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                 out[primary.q] = x_row.dot(&block_states[0].beta);
             }
             1 => {
-                let x_row = self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.y.len(),
-                    self.logslope_design.ncols(),
-                    "BernoulliMarginalSlopeFamily log-slope",
-                )?;
+                let x_row = psi_map_ij
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                 out[primary.logslope] = x_row.dot(&block_states[1].beta);
             }
             _ => {
@@ -3661,7 +3574,7 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     fn pullback_primary_vector(
@@ -3706,37 +3619,24 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn block_psi_row(
+    fn block_psi_row_from_map(
         &self,
         row: usize,
+        block_idx: usize,
+        psi_map: &crate::families::custom_family::PsiDesignMap,
         slices: &BlockSlices,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-    ) -> Result<Option<BlockPsiRow>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
-            return Ok(None);
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
+    ) -> Result<BlockPsiRow, String> {
         let (local_vec, range) = match block_idx {
             0 => (
-                self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.y.len(),
-                    self.marginal_design.ncols(),
-                    "BernoulliMarginalSlopeFamily marginal",
-                )?,
+                psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?,
                 slices.marginal.clone(),
             ),
             1 => (
-                self.psi_design_row_vector(
-                    row,
-                    deriv,
-                    self.y.len(),
-                    self.logslope_design.ncols(),
-                    "BernoulliMarginalSlopeFamily log-slope",
-                )?,
+                psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?,
                 slices.logslope.clone(),
             ),
             _ => {
@@ -3745,54 +3645,37 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
         };
-        Ok(Some(BlockPsiRow {
+        Ok(BlockPsiRow {
             block_idx,
             range,
             local_vec,
-        }))
+        })
     }
 
-    fn block_psi_second_row(
+    fn block_psi_second_row_from_map(
         &self,
         row: usize,
+        block_i: usize,
+        block_j: usize,
+        psi_map_ij: Option<&crate::families::custom_family::PsiDesignMap>,
         slices: &BlockSlices,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_i: usize,
-        psi_j: usize,
     ) -> Result<Option<BlockPsiRow>, String> {
-        let Some((block_i, local_i)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
-            return Ok(None);
-        };
-        let Some((block_j, local_j)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
-            return Ok(None);
-        };
         if block_i != block_j {
             return Ok(None);
         }
-        let deriv_i = &derivative_blocks[block_i][local_i];
+        let psi_map_ij = psi_map_ij
+            .expect("psi_map_ij must be provided when block_i == block_j");
         let (local_vec, range) = match block_i {
             0 => (
-                self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.y.len(),
-                    self.marginal_design.ncols(),
-                    "BernoulliMarginalSlopeFamily marginal",
-                )?,
+                psi_map_ij
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?,
                 slices.marginal.clone(),
             ),
             1 => (
-                self.psi_second_design_row_vector(
-                    row,
-                    deriv_i,
-                    &derivative_blocks[block_j][local_j],
-                    local_j,
-                    self.y.len(),
-                    self.logslope_design.ncols(),
-                    "BernoulliMarginalSlopeFamily log-slope",
-                )?,
+                psi_map_ij
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?,
                 slices.logslope.clone(),
             ),
             _ => {
@@ -6137,11 +6020,34 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, _)) = self.resolve_psi_location(derivative_blocks, psi_index) else {
+        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        else {
             return Ok(None);
         };
         let idx_primary = if block_idx == 0 { 0 } else { 1 };
         let n = self.y.len();
+        let deriv = &derivative_blocks[block_idx][local_idx];
+        let (p_psi, psi_label) = match block_idx {
+            0 => (
+                self.marginal_design.ncols(),
+                "BernoulliMarginalSlopeFamily marginal",
+            ),
+            1 => (
+                self.logslope_design.ncols(),
+                "BernoulliMarginalSlopeFamily log-slope",
+            ),
+            _ => {
+                return Err(format!(
+                    "bernoulli marginal-slope psi terms only support marginal/logslope blocks, got block {block_idx}"
+                ));
+            }
+        };
+
+        // Build the psi design map once; per-row calls use direct row_vector(row).
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv, n, p_psi, 0..n, psi_label, &policy,
+        )?;
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
         let (objective_psi, score_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
@@ -6159,16 +6065,13 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                        let Some(dir) = self.row_primary_psi_direction(
+                        let dir = self.row_primary_psi_direction_from_map(
                             row,
+                            block_idx,
+                            &psi_map,
                             block_states,
-                            derivative_blocks,
-                            psi_index,
                             primary,
-                        )?
-                        else {
-                            continue;
-                        };
+                        )?;
                         let row_ctx = Self::row_ctx(cache, row);
                         let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                             row,
@@ -6183,11 +6086,9 @@ impl BernoulliMarginalSlopeFamily {
                             row_ctx,
                             &dir,
                         )?;
-                        let psi_row = self
-                            .block_psi_row(row, slices, derivative_blocks, psi_index)?
-                            .ok_or_else(|| {
-                                "missing bernoulli marginal-slope psi vector".to_string()
-                            })?;
+                        let psi_row = self.block_psi_row_from_map(
+                            row, block_idx, &psi_map, slices,
+                        )?;
                         acc.0 += f_pi.dot(&dir);
                         acc.1
                             .slice_mut(s![psi_row.range.clone()])
@@ -9944,7 +9845,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
+    fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
         let data = Array2::<f64>::zeros((3, 0));
         let mut spec = base_spec(
             array![0.0, 1.0, 0.0],
@@ -9953,9 +9854,7 @@ mod tests {
         );
         spec.frailty = FrailtySpec::GaussianShift { sigma_fixed: None };
 
-        let err = validate_spec(data.view(), &spec)
-            .expect_err("learnable GaussianShift sigma should be rejected");
-        assert!(err.contains("learnable GaussianShift sigma is not implemented"));
+        validate_spec(data.view(), &spec).expect("learnable GaussianShift sigma should validate");
     }
 
     #[test]
@@ -14126,29 +14025,12 @@ mod tests {
     }
 
     #[test]
-    fn sigma_exact_joint_psi_terms_rejects_production_finite_differences() {
+    fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
         let sigma = 0.7;
-        let family =
+        let make_family = |sigma: f64| {
             BernoulliMarginalSlopeFamily {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
@@ -14161,15 +14043,11 @@ mod tests {
                 logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-            };
-        let beta_h = Array1::from_iter(
-            (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-        );
-        let beta_w = Array1::from_iter(
-            (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-        );
+                score_warp: None,
+                link_dev: None,
+            }
+        };
+        let family = make_family(sigma);
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -14179,28 +14057,49 @@ mod tests {
                 beta: array![0.6],
                 eta: Array1::from_elem(z.len(), 0.6),
             },
-            ParameterBlockState {
-                beta: beta_h.clone(),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: beta_w.clone(),
-                eta: Array1::zeros(z.len()),
-            },
         ];
-        let specs = vec![
-            dummy_blockspec(1, z.len()),
-            dummy_blockspec(1, z.len()),
-            dummy_blockspec(score_prepared.block.design.ncols(), z.len()),
-            dummy_blockspec(link_prepared.block.design.ncols(), z.len()),
-        ];
+        let specs = vec![dummy_blockspec(1, z.len()), dummy_blockspec(1, z.len())];
 
-        let error = family
+        let terms = family
             .sigma_exact_joint_psi_terms(&block_states, &specs)
-            .expect_err("sigma psi terms should require analytic derivatives");
-        assert!(
-            error.contains("production finite differences are disabled"),
-            "{error}"
+            .expect("analytic sigma psi terms")
+            .expect("sigma terms present");
+        assert!(terms.objective_psi.is_finite());
+        assert_eq!(terms.score_psi.len(), 2);
+        assert!(terms.score_psi.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            terms
+                .hessian_psi_operator
+                .as_ref()
+                .expect("sigma Hessian operator")
+                .to_dense()
+                .dim(),
+            (2, 2)
         );
+
+        let second = family
+            .sigma_exact_joint_psisecond_order_terms(&block_states)
+            .expect("analytic second sigma terms")
+            .expect("second sigma terms present");
+        assert!(second.objective_psi_psi.is_finite());
+        assert_eq!(second.score_psi_psi.len(), 2);
+
+        let drift = family
+            .sigma_exact_joint_psihessian_directional_derivative(&block_states, &array![0.1, -0.2])
+            .expect("analytic sigma Hessian directional derivative")
+            .expect("sigma drift present");
+        assert_eq!(drift.dim(), (2, 2));
+        assert!(drift.iter().all(|value| value.is_finite()));
+
+        let tau = sigma.ln();
+        let eps = 1e-5;
+        let ll_plus = make_family((tau + eps).exp())
+            .log_likelihood_only(&block_states)
+            .expect("ll plus sigma");
+        let ll_minus = make_family((tau - eps).exp())
+            .log_likelihood_only(&block_states)
+            .expect("ll minus sigma");
+        let objective_fd = -(ll_plus - ll_minus) / (2.0 * eps);
+        assert!((terms.objective_psi - objective_fd).abs() < 1e-5);
     }
 }
