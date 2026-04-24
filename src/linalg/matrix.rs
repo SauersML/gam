@@ -856,8 +856,23 @@ impl DenseDesignOperator for DenseDesignMatrix {
         DenseDesignMatrix::as_dense_ref(self)
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        DenseDesignMatrix::row_chunk(self, rows)
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "DenseDesignMatrix::row_chunk_into shape mismatch",
+            });
+        }
+        match self {
+            Self::Materialized(matrix) => {
+                out.assign(&matrix.slice(s![rows, ..]));
+                Ok(())
+            }
+            Self::Lazy(op) => op.row_chunk_into(rows, out),
+        }
     }
 
     fn to_dense(&self) -> Array2<f64> {

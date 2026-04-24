@@ -8,7 +8,7 @@ use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
-use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
