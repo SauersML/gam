@@ -2,6 +2,8 @@ use csv::StringRecord;
 use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, DeviationRuntime};
 use gam::estimate::{BlockRole, PredictInput};
 use gam::families::family_meta::{family_to_link, pretty_familyname};
+use gam::families::scale_design::{ScaleDeviationTransform, build_scale_deviation_transform};
+use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
     encode_recordswith_schema,
@@ -22,6 +24,7 @@ use gam::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkState,
 };
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
+use ndarray::Array1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
