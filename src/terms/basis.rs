@@ -19445,13 +19445,7 @@ mod tests {
 
     #[test]
     fn test_duchon_order_zero_s0_case_builds_constant_nullspace() {
-        let data = array![
-            [0.0, 0.1, 0.2],
-            [0.2, 0.0, 0.1],
-            [0.4, 0.2, 0.3],
-            [0.6, 0.4, 0.5],
-            [0.8, 0.5, 0.7]
-        ];
+        let data = array![[0.0], [0.2], [0.4], [0.6], [0.8]];
         let centers = data.slice(s![0..4, ..]).to_owned();
         let out = create_duchon_spline_basis(
             data.view(),
