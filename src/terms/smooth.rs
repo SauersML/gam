@@ -10558,7 +10558,10 @@ fn try_exact_joint_spatial_aniso_optimization(
                     hessian: hess,
                 })
             }
-            Err(_) => Ok(OuterEval::infeasible(theta.len())),
+            Err(err) => {
+                log::warn!("[spatial-iso-joint] evaluator rejected theta: {err}");
+                Ok(OuterEval::infeasible(theta.len()))
+            }
         }
     };
 
@@ -14578,7 +14581,7 @@ mod tests {
             linear_constraints: None,
             firth_bias_reduction: false,
             adaptive_regularization: None,
-            penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: Some(1e-6),
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -16062,7 +16065,7 @@ mod tests {
             linear_constraints: None,
             firth_bias_reduction: false,
             adaptive_regularization: None,
-            penalty_shrinkage_floor: None,
+            penalty_shrinkage_floor: Some(1e-6),
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
