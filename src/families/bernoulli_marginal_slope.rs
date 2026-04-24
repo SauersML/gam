@@ -1858,6 +1858,126 @@ fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     }
 }
 
+fn jet_subset_partitions(mask: usize) -> Vec<Vec<usize>> {
+    if mask == 0 {
+        return vec![Vec::new()];
+    }
+    let first = mask & mask.wrapping_neg();
+    let rest = mask ^ first;
+    let mut out = Vec::new();
+    let mut subset = rest;
+    loop {
+        let block = first | subset;
+        for mut remainder in jet_subset_partitions(rest ^ subset) {
+            remainder.push(block);
+            out.push(remainder);
+        }
+        if subset == 0 {
+            break;
+        }
+        subset = (subset - 1) & rest;
+    }
+    out
+}
+
+#[derive(Clone)]
+struct MultiDirJet {
+    coeffs: Vec<f64>,
+}
+
+impl MultiDirJet {
+    fn zero(n_dirs: usize) -> Self {
+        Self {
+            coeffs: vec![0.0; 1usize << n_dirs],
+        }
+    }
+
+    fn constant(n_dirs: usize, value: f64) -> Self {
+        let mut out = Self::zero(n_dirs);
+        out.coeffs[0] = value;
+        out
+    }
+
+    fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
+        let mut out = Self::constant(n_dirs, base);
+        for (idx, &value) in first.iter().take(n_dirs).enumerate() {
+            out.coeffs[1usize << idx] = value;
+        }
+        out
+    }
+
+    fn with_coeffs(n_dirs: usize, coeffs: &[(usize, f64)]) -> Self {
+        let mut out = Self::zero(n_dirs);
+        for &(mask, value) in coeffs {
+            if mask < out.coeffs.len() {
+                out.coeffs[mask] = value;
+            }
+        }
+        out
+    }
+
+    fn coeff(&self, mask: usize) -> f64 {
+        self.coeffs[mask]
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            coeffs: self
+                .coeffs
+                .iter()
+                .zip(other.coeffs.iter())
+                .map(|(lhs, rhs)| lhs + rhs)
+                .collect(),
+        }
+    }
+
+    fn scale(&self, scalar: f64) -> Self {
+        Self {
+            coeffs: self.coeffs.iter().map(|value| scalar * value).collect(),
+        }
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        let count = self.coeffs.len();
+        let mut out = vec![0.0; count];
+        for mask in 0..count {
+            let mut total = 0.0;
+            let mut submask = mask;
+            loop {
+                total += self.coeffs[submask] * other.coeffs[mask ^ submask];
+                if submask == 0 {
+                    break;
+                }
+                submask = (submask - 1) & mask;
+            }
+            out[mask] = total;
+        }
+        Self { coeffs: out }
+    }
+
+    fn compose_unary(&self, derivs: [f64; 5]) -> Self {
+        let count = self.coeffs.len();
+        let mut out = vec![0.0; count];
+        out[0] = derivs[0];
+        for (mask, value) in out.iter_mut().enumerate().skip(1) {
+            let mut total = 0.0;
+            for partition in jet_subset_partitions(mask) {
+                let order = partition.len();
+                if order == 0 || order >= derivs.len() {
+                    continue;
+                }
+                let mut prod = 1.0;
+                for block in partition {
+                    prod *= self.coeffs[block];
+                }
+                total += derivs[order] * prod;
+            }
+            *value = total;
+        }
+        Self { coeffs: out }
+    }
+}
+
 #[inline]
 fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
@@ -13550,7 +13670,7 @@ mod tests {
             "bernoulli-marginal-slope",
             &LatentZPolicy::default(),
         )
-            .expect_err("expected non-gaussian rejection");
+        .expect_err("expected non-gaussian rejection");
         assert!(err.contains("approximately latent N(0,1)"));
     }
 

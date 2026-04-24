@@ -21195,7 +21195,7 @@ mod tests {
                 MaternNu::NineHalves => 3.0 * r / length_scale,
                 _ => unreachable!("test only covers nu >= 5/2"),
             };
-            let (expected_phi, expected_ratio, expected_lap) = match nu {
+            let (expected_phi, expected_ratio, expected_second) = match nu {
                 MaternNu::FiveHalves => (
                     (1.0 + a + a * a / 3.0) * (-a).exp(),
                     -(5.0 / 3.0) * (-a).exp() * (a + 1.0),
@@ -21231,9 +21231,15 @@ mod tests {
                 ops.d1[[1, 0]]
             );
             assert!(
-                (ops.d2[[1, 0]] - expected_lap).abs() < 1e-14,
-                "D2 off-diagonal mismatch for nu={nu:?}: got {} vs {expected_lap}",
-                ops.d2[[1, 0]]
+                (ops.d2[[4, 0]] - expected_second).abs() < 1e-14,
+                "D2 xx off-diagonal mismatch for nu={nu:?}: got {} vs {expected_second}",
+                ops.d2[[4, 0]]
+            );
+            assert!(
+                ops.d2[[5, 0]].abs() < 1e-14
+                    && ops.d2[[6, 0]].abs() < 1e-14
+                    && ops.d2[[7, 0]].abs() < 1e-14,
+                "D2 must expose full Hessian rows with zero transverse/off-diagonal components on x-axis"
             );
         }
     }
