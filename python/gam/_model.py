@@ -466,6 +466,61 @@ class Model:
                 value = metadata.get("model_class")
         return str(value) if value is not None else "standard"
 
+    def _default_survival_time_grid(
+        self, headers: list[str], rows: list[list[str]]
+    ) -> list[float] | None:
+        """Build a default time grid spanning the data's survival window.
+
+        Only triggered for survival-family models. Parses the response
+        expression from the formula (``Surv(entry, exit, event)``) to
+        locate the entry/exit columns, then returns a uniform grid of
+        64 points between the observed min entry and max exit times.
+        Returns ``None`` if the model is not a survival model, the
+        formula cannot be parsed, or the required columns aren't
+        present in ``headers``.
+        """
+        import re
+        import numpy as np
+
+        if not self.is_survival:
+            return None
+        formula = self.formula
+        match = re.match(
+            r"\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)",
+            formula,
+        )
+        if not match:
+            return None
+        entry_name = match.group(1)
+        exit_name = match.group(2)
+        header_to_index = {name: i for i, name in enumerate(headers)}
+        entry_idx = header_to_index.get(entry_name)
+        exit_idx = header_to_index.get(exit_name)
+        if entry_idx is None or exit_idx is None:
+            return None
+        entry_vals: list[float] = []
+        exit_vals: list[float] = []
+        for row in rows:
+            try:
+                entry_vals.append(float(row[entry_idx]))
+            except (TypeError, ValueError):
+                continue
+            try:
+                exit_vals.append(float(row[exit_idx]))
+            except (TypeError, ValueError):
+                continue
+        if not entry_vals or not exit_vals:
+            return None
+        lo = float(np.min(entry_vals))
+        hi = float(np.max(exit_vals))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return None
+        # Pad by a hair so interpolation queries at the exact max stay
+        # inside the grid rather than clipping to the boundary.
+        span = hi - lo
+        hi_padded = hi + max(span * 1e-6, 1e-9)
+        return list(np.linspace(lo, hi_padded, 64))
+
     def diagnose(
         self,
         data: Any,

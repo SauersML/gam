@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Disable the wrapper's large-data hybrid default. When not set, "
-            "fits with >=6 features default to length_scale=1.0 because the "
+            "multidimensional fits default to length_scale=1.0 because the "
             "hybrid Duchon path is much faster and more stable."
         ),
     )
@@ -172,7 +172,7 @@ def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float 
         return None
     if args.length_scale is not None:
         return args.length_scale
-    if num_features >= 6:
+    if num_features >= 2:
         return 1.0
     return None
 
