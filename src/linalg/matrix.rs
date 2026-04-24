@@ -2598,10 +2598,10 @@ where
 
 impl<F> SpatialKernelEvaluator for Arc<F>
 where
-    F: Fn(&[f64], &[f64]) -> f64 + Send + Sync + 'static + ?Sized,
+    F: SpatialKernelEvaluator + ?Sized,
 {
     fn eval(&self, x: &[f64], c: &[f64]) -> f64 {
-        self.as_ref()(x, c)
+        self.as_ref().eval(x, c)
     }
 }
 
