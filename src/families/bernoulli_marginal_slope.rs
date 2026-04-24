@@ -265,24 +265,40 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
+    build_deviation_block_from_knots_design_seed_and_anchor_weights(
+        knot_seed,
+        design_seed,
+        None,
+        cfg,
+    )
+}
+
+pub(crate) fn build_deviation_block_from_knots_design_seed_and_anchor_weights(
+    knot_seed: &Array1<f64>,
+    design_seed: &Array1<f64>,
+    anchor_weights: Option<&Array1<f64>>,
+    cfg: &DeviationBlockConfig,
+) -> Result<DeviationPrepared, String> {
     build_deviation_block_from_knots_and_design_seed_with_anchor(
         knot_seed,
         design_seed,
         cfg,
-        DeviationAnchorKind::EmpiricalDesign,
+        DeviationAnchorKind::EmpiricalDesign { anchor_weights },
     )
 }
 
-enum DeviationAnchorKind {
+enum DeviationAnchorKind<'a> {
     StandardNormal,
-    EmpiricalDesign,
+    EmpiricalDesign {
+        anchor_weights: Option<&'a Array1<f64>>,
+    },
 }
 
 fn build_deviation_block_from_knots_and_design_seed_with_anchor(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
-    anchor: DeviationAnchorKind,
+    anchor: DeviationAnchorKind<'_>,
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
         return Err(format!(
@@ -301,8 +317,13 @@ fn build_deviation_block_from_knots_and_design_seed_with_anchor(
         DeviationAnchorKind::StandardNormal => {
             DeviationRuntime::try_new_standard_normal_anchor(knots, cfg.monotonicity_eps)?
         }
-        DeviationAnchorKind::EmpiricalDesign => {
-            DeviationRuntime::try_new_empirical_anchor(knots, cfg.monotonicity_eps, design_seed)?
+        DeviationAnchorKind::EmpiricalDesign { anchor_weights } => {
+            DeviationRuntime::try_new_weighted_empirical_anchor(
+                knots,
+                cfg.monotonicity_eps,
+                design_seed,
+                anchor_weights,
+            )?
         }
     };
     let design = runtime.design(design_seed)?;

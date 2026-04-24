@@ -332,6 +332,176 @@ def write_csv_rows(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]
         writer.writerows(rows)
 
 
+def _prediction_z_values(prediction_csv: Path) -> list[float]:
+    rows = read_csv_rows(prediction_csv)
+    if not rows:
+        raise RuntimeError(f"empty transformation-normal prediction file: {prediction_csv}")
+    for key in ("z", "z_score", "transformed", "eta", "mean"):
+        if key in rows[0]:
+            return [float(row[key]) for row in rows]
+    raise RuntimeError(
+        f"transformation-normal prediction file {prediction_csv} is missing a z-score column"
+    )
+
+
+def _write_rows_like(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        raise RuntimeError(f"cannot write empty CSV to {path}")
+    write_csv_rows(path, rows, list(rows[0].keys()))
+
+
+def _pc_std_columns(pc_count: int) -> list[str]:
+    return [f"pc{i}_std" for i in range(1, int(pc_count) + 1)]
+
+
+def _ctn_formula(pc_count: int, centers: int) -> str:
+    pc_cols = ", ".join(_pc_std_columns(pc_count))
+    return (
+        f"{PGS_RAW_COLUMN} ~ "
+        f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
+    )
+
+
+def _attach_column(rows: list[dict[str, str]], column: str, values: list[float]) -> list[dict[str, Any]]:
+    if len(rows) != len(values):
+        raise RuntimeError(
+            f"cannot attach {column}: {len(values)} values for {len(rows)} rows"
+        )
+    out = []
+    for row, value in zip(rows, values):
+        enriched = dict(row)
+        enriched[column] = float(value)
+        out.append(enriched)
+    return out
+
+
+def _z_moment_report(
+    rows: list[dict[str, Any]],
+    *,
+    z_column: str,
+    pc_columns: list[str],
+    split_label: str,
+) -> list[str]:
+    z = np.array([float(row[z_column]) for row in rows], dtype=float)
+    if z.size == 0:
+        raise RuntimeError(f"{split_label}: no rows available for {z_column} diagnostics")
+    if not np.all(np.isfinite(z)):
+        raise RuntimeError(f"{split_label}: {z_column} contains non-finite values")
+    reports: list[str] = []
+
+    def check_group(label: str, values: np.ndarray) -> None:
+        if values.size < PGS_CTN_DIAGNOSTIC_MIN_N:
+            return
+        mean = float(np.mean(values))
+        var = float(np.var(values))
+        reports.append(f"{split_label}: {label} n={values.size:,} mean={mean:+.4f} var={var:.4f}")
+        if abs(mean) > PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN:
+            raise RuntimeError(
+                f"{split_label}: {label} has E[{z_column}|A] too far from 0: {mean:+.4f}"
+            )
+        if var < PGS_CTN_DIAGNOSTIC_MIN_VAR or var > PGS_CTN_DIAGNOSTIC_MAX_VAR:
+            raise RuntimeError(
+                f"{split_label}: {label} has Var({z_column}|A) outside "
+                f"[{PGS_CTN_DIAGNOSTIC_MIN_VAR}, {PGS_CTN_DIAGNOSTIC_MAX_VAR}]: {var:.4f}"
+            )
+
+    check_group("overall", z)
+    for categorical in ("subpopulation", "superpopulation", "continent"):
+        if categorical not in rows[0]:
+            continue
+        groups: dict[str, list[float]] = defaultdict(list)
+        for row in rows:
+            groups[str(row[categorical])].append(float(row[z_column]))
+        for group_name, vals in sorted(groups.items()):
+            check_group(f"{categorical}={group_name}", np.array(vals, dtype=float))
+
+    for pc in pc_columns:
+        coords = np.array([float(row[pc]) for row in rows], dtype=float)
+        if coords.size < 4 * PGS_CTN_DIAGNOSTIC_MIN_N or not np.all(np.isfinite(coords)):
+            continue
+        cuts = np.quantile(coords, [0.25, 0.50, 0.75])
+        lower = np.concatenate(([-np.inf], cuts))
+        upper = np.concatenate((cuts, [np.inf]))
+        for idx, (left, right) in enumerate(zip(lower, upper), start=1):
+            if idx == 4:
+                mask = (coords >= left) & (coords <= right)
+            else:
+                mask = (coords >= left) & (coords < right)
+            check_group(f"{pc}_quartile={idx}", z[mask])
+    return reports
+
+
+def fit_conditional_pgs_ctn_for_marginal_slope(
+    *,
+    rust_bin: Path,
+    spec: MethodSpec,
+    train_csv: Path,
+    test_csv: Path,
+    out_dir: Path,
+    centers: int,
+) -> tuple[Path, Path, list[str]]:
+    train_rows = read_csv_rows(train_csv)
+    test_rows = read_csv_rows(test_csv)
+    if not train_rows or not test_rows:
+        raise RuntimeError(f"{spec.name} requires non-empty train and test CSVs")
+    required = {PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)}
+    missing = sorted(c for c in required if c not in train_rows[0] or c not in test_rows[0])
+    if missing:
+        raise RuntimeError(
+            f"{spec.name} cannot fit conditional PGS CTN; missing columns: {', '.join(missing)}"
+        )
+
+    ctn_model_path = out_dir / f"{spec.name}.pgs_ctn.model.json"
+    ctn_train_pred_path = out_dir / f"{spec.name}.pgs_ctn.train_pred.csv"
+    ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
+    formula = _ctn_formula(spec.pc_count, centers)
+    fit_cmd = [
+        str(rust_bin),
+        "fit",
+        "--transformation-normal",
+        "--scale-dimensions",
+        "--out",
+        str(ctn_model_path),
+        str(train_csv),
+        formula,
+    ]
+    rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
+    if rc != 0:
+        raise RuntimeError(
+            err.strip() or out.strip() or f"{spec.name} conditional PGS CTN fit failed"
+        )
+    for input_path, output_path in (
+        (train_csv, ctn_train_pred_path),
+        (test_csv, ctn_test_pred_path),
+    ):
+        pred_cmd = [str(rust_bin), "predict", str(ctn_model_path), str(input_path), "--out", str(output_path)]
+        rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
+        if rc != 0:
+            raise RuntimeError(
+                err.strip() or out.strip() or f"{spec.name} conditional PGS CTN prediction failed"
+            )
+
+    train_aug = _attach_column(train_rows, PGS_CTN_Z_COLUMN, _prediction_z_values(ctn_train_pred_path))
+    test_aug = _attach_column(test_rows, PGS_CTN_Z_COLUMN, _prediction_z_values(ctn_test_pred_path))
+    pc_cols = _pc_std_columns(spec.pc_count)
+    diagnostics = [
+        f"conditional PGS CTN formula: {formula}",
+        f"conditional PGS CTN fit is phenotype-blind and train-only; downstream z column: {PGS_CTN_Z_COLUMN}",
+    ]
+    diagnostics.extend(
+        _z_moment_report(train_aug, z_column=PGS_CTN_Z_COLUMN, pc_columns=pc_cols, split_label="train")
+    )
+    diagnostics.extend(
+        _z_moment_report(test_aug, z_column=PGS_CTN_Z_COLUMN, pc_columns=pc_cols, split_label="heldout")
+    )
+
+    train_aug_path = out_dir / f"{spec.name}.pgs_ctn.train.csv"
+    test_aug_path = out_dir / f"{spec.name}.pgs_ctn.test.csv"
+    _write_rows_like(train_aug_path, train_aug)
+    _write_rows_like(test_aug_path, test_aug)
+    return train_aug_path, test_aug_path, diagnostics
+
+
 def logistic(x: np.ndarray) -> np.ndarray:
     x_clip = np.clip(np.asarray(x, dtype=float), -40.0, 40.0)
     return 1.0 / (1.0 + np.exp(-x_clip))
