@@ -8,6 +8,10 @@ pub struct ResourcePolicy {
     pub derivative_storage_mode: DerivativeStorageMode,
 }
 
+pub const SPATIAL_DISTANCE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+pub const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
+pub const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DerivativeStorageMode {
     /// Production exact-math: operator-backed, no dense fallback.
@@ -60,9 +64,9 @@ impl ResourcePolicy {
         Self {
             max_single_materialization_bytes: 256 * 1024 * 1024, // 256 MB
             max_operator_cache_bytes: 1024 * 1024 * 1024,        // 1 GB
-            max_spatial_distance_cache_bytes: 512 * 1024 * 1024, // 512 MB
-            max_owned_data_cache_bytes: 512 * 1024 * 1024,       // 512 MB
-            row_chunk_target_bytes: 8 * 1024 * 1024,             // 8 MB per chunk
+            max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
+            max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MB
+            row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MB per chunk
             derivative_storage_mode: DerivativeStorageMode::AnalyticOperatorRequired,
         }
     }
@@ -72,8 +76,8 @@ impl ResourcePolicy {
         Self {
             max_single_materialization_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
             max_operator_cache_bytes: 2 * 1024 * 1024 * 1024,
-            max_spatial_distance_cache_bytes: 1024 * 1024 * 1024,
-            max_owned_data_cache_bytes: 1024 * 1024 * 1024,
+            max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
+            max_owned_data_cache_bytes: 512 * 1024 * 1024,
             row_chunk_target_bytes: 64 * 1024 * 1024,
             derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
         }
@@ -118,6 +122,7 @@ use std::sync::{Arc, Mutex};
 pub struct ByteLruCache<K: Eq + Hash + Clone, V> {
     inner: Mutex<ByteLruInner<K, V>>,
     max_bytes: usize,
+    max_entries: Option<usize>,
 }
 
 struct ByteLruInner<K, V> {
@@ -135,6 +140,19 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
                 resident_bytes: 0,
             }),
             max_bytes,
+            max_entries: None,
+        }
+    }
+
+    pub fn with_max_entries(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            inner: Mutex::new(ByteLruInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                resident_bytes: 0,
+            }),
+            max_bytes,
+            max_entries: Some(max_entries),
         }
     }
 
@@ -167,6 +185,21 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             return;
         }
 
+        if let Some(max_entries) = self.max_entries {
+            if max_entries == 0 {
+                return;
+            }
+            while g.map.len() >= max_entries {
+                if let Some(evict_key) = g.order.pop_front() {
+                    if let Some((_v, c)) = g.map.remove(&evict_key) {
+                        g.resident_bytes = g.resident_bytes.saturating_sub(c);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
         while g.resident_bytes + charge > self.max_bytes {
             if let Some(evict_key) = g.order.pop_front() {
                 if let Some((_v, c)) = g.map.remove(&evict_key) {
@@ -190,6 +223,10 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
         self.max_bytes
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().map.len()
+    }
+
     pub fn clear(&self) {
         let mut g = self.inner.lock().unwrap();
         g.map.clear();
@@ -203,6 +240,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> std::fmt::Debug for ByteLru
         f.debug_struct("ByteLruCache")
             .field("resident_bytes", &self.resident_bytes())
             .field("max_bytes", &self.max_bytes)
+            .field("max_entries", &self.max_entries)
             .finish()
     }
 }

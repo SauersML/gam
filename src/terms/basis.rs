@@ -9263,7 +9263,6 @@ impl crate::resource::ResidentBytes for SpatialDistanceCacheEntry {
     }
 }
 
-const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9306,7 +9305,10 @@ impl BasisCacheContext {
                 policy.max_spatial_distance_cache_bytes,
             ),
             constraint_nullspace: ConstraintNullspaceCache::default(),
-            owned_data: crate::resource::ByteLruCache::new(policy.max_owned_data_cache_bytes),
+            owned_data: crate::resource::ByteLruCache::with_max_entries(
+                policy.max_owned_data_cache_bytes,
+                crate::resource::OWNED_DATA_CACHE_MAX_ENTRIES,
+            ),
         }
     }
 }
@@ -9414,7 +9416,8 @@ fn spatial_distance_data_center_bytes(n: usize, k: usize) -> usize {
 
 #[inline(always)]
 fn spatial_distance_cacheable_entry(n: usize, k: usize) -> bool {
-    spatial_distance_data_center_bytes(n, k) <= SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
+    spatial_distance_data_center_bytes(n, k)
+        <= crate::resource::SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
 }
 
 fn spatial_distance_matrices(
@@ -16074,6 +16077,38 @@ mod tests {
 
         // At most one 2x2 f64 matrix (32 bytes) resident.
         assert!(cache.owned_data.resident_bytes() <= 8 * 2 * 2);
+    }
+
+    #[test]
+    fn owned_data_cache_respects_entry_cap() {
+        let cache = BasisCacheContext::default();
+
+        let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).expect("first data");
+        let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).expect("second data");
+        let third =
+            Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
+
+        let first_cached = shared_owned_data_matrix(first.view(), &cache);
+        let second_cached = shared_owned_data_matrix(second.view(), &cache);
+        let third_cached = shared_owned_data_matrix(third.view(), &cache);
+
+        assert_eq!(cache.owned_data.len(), crate::resource::OWNED_DATA_CACHE_MAX_ENTRIES);
+        assert!(cache.owned_data.get(&OwnedDataCacheKey {
+            rows: first.nrows(),
+            cols: first.ncols(),
+            ptr: first.as_ptr() as usize,
+            stride0: first.strides()[0],
+            stride1: first.strides()[1],
+        }).is_none());
+        assert!(Arc::ptr_eq(
+            &second_cached,
+            &shared_owned_data_matrix(second.view(), &cache)
+        ));
+        assert!(Arc::ptr_eq(
+            &third_cached,
+            &shared_owned_data_matrix(third.view(), &cache)
+        ));
+        drop(first_cached);
     }
 
     #[test]

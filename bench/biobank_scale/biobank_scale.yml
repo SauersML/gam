@@ -73,7 +73,7 @@
       "include_sigma": false
     },
     {
-      "name": "rust_margslope_aniso_duchon16d_50",
+      "name": "rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
@@ -84,38 +84,9 @@
       "marginal_slope": true,
       "scale_dimensions": true,
       "z_column": "pgs_ctn_z",
-      "max_centers": 24
-    },
-    {
-      "name": "rust_margslope_aniso_matern16d_scorewarp_fast",
-      "dataset": "disease",
-      "backend": "rust_gam",
-      "family": "binomial",
-      "spatial_basis": "matern",
-      "centers": 40,
-      "smooth_kind": "joint",
-      "include_sigma": false,
-      "marginal_slope": true,
-      "scale_dimensions": true,
-      "z_column": "pgs_ctn_z",
-      "logslope_linkwiggle_knots": 8,
-      "max_centers": 24
-    },
-    {
-      "name": "rust_margslope_aniso_matern16d_linkwiggle_scorewarp_fast",
-      "dataset": "disease",
-      "backend": "rust_gam",
-      "family": "binomial",
-      "spatial_basis": "matern",
-      "centers": 36,
-      "smooth_kind": "joint",
-      "include_sigma": false,
-      "marginal_slope": true,
-      "scale_dimensions": true,
-      "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
       "logslope_linkwiggle_knots": 8,
-      "max_centers": 22
+      "max_centers": 24
     },
     {
       "name": "r_mgcv_matern60",
@@ -128,28 +99,22 @@
       "include_sigma": false
     },
     {
-      "name": "rust_survival_transform_ps",
+      "name": "rust_survival_margslope_aniso_duchon16d_gm_linkwiggle_scorewarp_timewiggle_fast",
       "dataset": "survival",
       "backend": "rust_survival",
       "family": "survival",
-      "spatial_basis": "ps",
-      "smooth_kind": "separate",
+      "spatial_basis": "duchon",
+      "centers": 24,
+      "smooth_kind": "joint",
       "include_sigma": false,
-      "survival_likelihood": "transformation",
-      "survival_distribution": "gaussian"
-    },
-    {
-      "name": "rust_survival_locscale_ps_link_timewiggle_fast",
-      "dataset": "survival",
-      "backend": "rust_survival",
-      "family": "survival",
-      "spatial_basis": "ps",
-      "smooth_kind": "separate",
-      "include_sigma": false,
-      "survival_likelihood": "location-scale",
-      "survival_distribution": "gaussian",
+      "survival_likelihood": "marginal-slope",
+      "marginal_slope": true,
+      "scale_dimensions": true,
+      "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
-      "timewiggle_knots": 8
+      "logslope_linkwiggle_knots": 8,
+      "timewiggle_knots": 8,
+      "max_centers": 24
     },
     {
       "name": "r_mgcv_survival_ps",

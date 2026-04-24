@@ -5190,7 +5190,6 @@ impl GaussianLocationScaleFamily {
         }
         Ok(None)
     }
-
     fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
@@ -10140,8 +10139,7 @@ impl BinomialLocationScaleFamily {
     fn exact_joint_supported(&self) -> bool {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
+
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
@@ -10159,6 +10157,7 @@ impl BinomialLocationScaleFamily {
         };
         Ok((xt, x_ls))
     }
+
     fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
