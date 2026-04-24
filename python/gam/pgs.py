@@ -9,8 +9,8 @@ to population-calibrated z-scores.
 The helper encodes the following default choices, each of which can be
 overridden at construction time:
 
-* A Duchon spline basis over the PC columns with ``len(pc_columns) + 20``
-  centers, order ``1``, power ``1``.
+* A Duchon radial basis over the PC columns with ``len(pc_columns) + 20``
+  centers, order ``1``, power ``1``, and triple operator regularization.
 * A fixed Duchon ``length_scale`` so per-axis anisotropy is identifiable
   separately from the global smoothing scale.
 * Per-axis anisotropic scaling (``scale_dimensions="auto"``).

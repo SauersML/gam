@@ -379,9 +379,7 @@ pub enum Solver {
     /// (same as pure EFS), compared to O(dim(θ)) for full BFGS.
     HybridEfs,
     /// Opportunistic coordinate compass search (positive basis {±e_i} with
-    /// step contraction). Derivative-free by construction — no gradient
-    /// and no finite differences — so categorically distinct from the
-    /// deprecated FD-BFGS degradation rung.
+    /// step contraction). Derivative-free by construction — no gradient.
     ///
     /// Reserved for genuinely-derivative-free auxiliary searches
     /// (baseline-theta for parametric survival baselines, SAS/BetaLogistic
@@ -390,9 +388,7 @@ pub enum Solver {
     ///
     /// The planner only selects this variant when the caller has opted in
     /// via [`SolverClass::AuxiliaryGradientFree`]; it is NEVER selected
-    /// for the main REML outer. This gate is explicit to prevent the
-    /// silent FD-grad masking failure mode that `automatic_fallback_attempts`
-    /// was tightened to avoid: for the big REML outer, declared-analytic
+    /// for the main REML outer. For the big REML outer, declared-analytic
     /// gradients must converge on their own merits.
     ///
     /// Convergence to a stationary point on any continuously-differentiable
@@ -765,15 +761,7 @@ fn disable_fixed_point(cap: &OuterCapability) -> Option<OuterCapability> {
 fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     // Production fallback ladder is strictly analytic-gradient.
     //
-    // Silently degrading an `Analytic` gradient capability to
-    // `FiniteDifference` was a loaded footgun: the FD path costs 2k inner
-    // PIRLS solves per outer gradient evaluation, and for large-n binomial
-    // biobank problems (n=320k, p≈71) it would burn the entire benchmark
-    // budget spinning on warm-started PIRLS (`iters=1 max_eta=5.9`) without
-    // ever reporting failure. The primary analytic path must converge on its
-    // own merits — masking non-convergence with FD just hid the real problem.
-    //
-    // The cascade is now:
+    // The cascade is:
     //   1. If the primary plan is EFS/HybridEFS AND an analytic gradient is
     //      available, retry with fixed-point disabled so BFGS can use that
     //      declared analytic gradient directly.
@@ -2589,18 +2577,15 @@ fn run_outer_with_plan(
                 }
             }
             Solver::Bfgs => {
-                // Production invariant: the outer BFGS runner never accepts a
-                // non-analytic gradient capability. The FD-BFGS wrapping path
-                // was a silent footgun that could spin for the entire benchmark
-                // budget on large-n binomial problems (~2k PIRLS solves per
-                // outer gradient at n=320k, masking a non-converging primary
-                // analytic path). Fail loudly at the top of the seed loop so
-                // the caller surfaces the underlying capability/plan mismatch
-                // instead of degrading correctness behind the scenes.
+                // Production invariant: the outer BFGS runner requires an
+                // analytic gradient capability. Fail loudly at the top of the
+                // seed loop so the caller surfaces the underlying
+                // capability/plan mismatch instead of degrading correctness
+                // behind the scenes.
                 if cap.gradient != Derivative::Analytic {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
                         "{context}: outer BFGS requires an analytic gradient capability; \
-                         FD-gradient fallback is disabled in production (plan={the_plan}, \
+                         no non-analytic fallback is available (plan={the_plan}, \
                          declared gradient={:?})",
                         cap.gradient,
                     )));
@@ -3671,12 +3656,9 @@ mod tests {
         assert!(attempts[0].disable_fixed_point);
         assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
 
-        // FD-gradient fallback was removed in production (silent BFGS-FD
-        // spin was a footgun on large-n binomial biobank problems); the
-        // cascade must stay on analytic-gradient attempts.
         assert!(
             attempts.iter().all(|c| c.gradient == Derivative::Analytic),
-            "fallback cascade must not introduce a finite-difference gradient",
+            "fallback cascade must stay on analytic-gradient attempts",
         );
     }
 
