@@ -151,34 +151,6 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    /// Compute the frozen-curvature Tierney-Kadane surrogate value from pre-built intermediates.
-    ///
-    /// `TK = Q + T1/12 + T2` where
-    ///   Q  = −⅛ Σ_i d_i · h_i²
-    ///   T1 = Σ_{i,j} c_i c_j G_ij³
-    ///   T2 = ⅛ · w^T H⁻¹ w,   w = X^T(c⊙h)
-    /// and h_i = x_i^T H⁻¹ x_i,  G_ij = x_i^T H⁻¹ x_j,  Z = H⁻¹ X^T.
-    ///
-    /// The function takes the (X, Z, c, d) tuple plus a `h_inv_solve` closure
-    /// used exclusively for the T2 term's `y = H⁻¹ w` step.  Both the analytic
-    /// gradient core share this.
-    fn tk_scalar_from_intermediates(
-        x_dense: &Array2<f64>,
-        z: &Array2<f64>,
-        c_array: &Array1<f64>,
-        d_array: &Array1<f64>,
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    ) -> Result<f64, EstimationError> {
-        let (h_diag, x_m, y) = Self::tk_shared_intermediates(
-            x_dense,
-            z,
-            c_array,
-            "Tierney-Kadane correction",
-            h_inv_solve,
-        )?;
-        Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &h_diag, &x_m, &y)
-    }
-
     fn tk_shared_intermediates(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -219,18 +191,16 @@ impl<'a> RemlState<'a> {
                 .zip(h_diag.iter())
                 .map(|(&d_i, &h_i)| d_i * h_i * h_i)
                 .sum::<f64>();
-        let t2_term = 0.125 * x_m.dot(&y);
+        let t2_term = 0.125 * x_m.dot(y);
 
         let mut t1_sum = 0.0_f64;
         for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
             let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block = z.slice(s![.., j0..j1]);
             let c_j = c_array.slice(s![j0..j1]);
             for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                let x_block = x_dense.slice(s![i0..i1, ..]);
                 let c_i = c_array.slice(s![i0..i1]);
-                let gram = x_block.dot(&z_block);
+                let gram = Self::tk_gram_block(x_dense, z, i0, i1, j0, j1);
                 let mut block_sum = 0.0_f64;
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
@@ -259,68 +229,28 @@ impl<'a> RemlState<'a> {
         Ok(value)
     }
 
-    /// Analytic frozen-curvature TK surrogate value + gradient given Z = H⁻¹ X^T.
-    ///
-    /// The implemented TK term is a Firth-only frozen-curvature surrogate:
-    /// `c = dW/dη` and `d = d²W/dη²` are evaluated at the current PIRLS mode
-    /// and then held fixed while differentiating through `Σ = H⁻¹` and explicit
-    /// penalty-like drifts. It is not the full derivative
-    /// of a TK objective that also differentiates `c(η(θ))` and `d(η(θ))`.
-    ///
-    ///   ∂TK/∂ρ_k = tr(Ḣ_k · P_total)
-    ///
-    /// where P_total is computed once from value intermediates:
-    ///
-    ///   P_total = ¼ P_Q - ¼ P_{T1} - ¼ P_{T2a} - ⅛ P_{T2b}
-    ///   P_Q     = Z diag(d⊙h) Z^T
-    ///   P_{T1}  = Z · [(cc^T) ⊙ G²] · Z^T
-    ///   P_{T2a} = Z diag(c⊙(Xy)) Z^T
-    ///   P_{T2b} = y y^T
-    ///
-    /// and Ḣ_k = A_k − X^T diag(c⊙Xv_k) X is the total Hessian drift under
-    /// the same response-mode convention as `SinglePredictorGlmDerivatives`.
-    /// Analytic frozen-curvature TK value + gradient given Z = H⁻¹ X^T.
-    ///
-    /// This is the shared core for both dense and sparse paths.
-    /// The caller is responsible for computing Z from whichever factorization
-    /// is available (dense Cholesky/eigen, or sparse Cholesky).
-    ///
-    /// For the gradient, also needs a solver for H⁻¹ v (used to compute
-    /// mode responses v_k = H⁻¹(A_k β̂)). The `h_inv_solve` closure
-    /// provides this.
-    /// Compute the TK gradient given Z, precomputed v_ks and x_vks.
-    ///
-    /// Returns the k-vector of gradient entries.
-    fn tk_gradient_from_intermediates(
+    fn tk_gram_block(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
-        c_array: &Array1<f64>,
-        d_array: &Array1<f64>,
-        tk_penalties: &[crate::construction::CanonicalPenalty],
-        lambdas: &[f64],
-        ext_drifts: &[Array2<f64>],
-        x_vks: &[Array1<f64>],
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        let (h_diag, _x_m, y) = Self::tk_shared_intermediates(
-            x_dense,
-            z,
-            c_array,
-            "Tierney-Kadane gradient",
-            h_inv_solve,
-        )?;
-        Self::tk_gradient_from_shared(
-            x_dense,
-            z,
-            c_array,
-            d_array,
-            tk_penalties,
-            lambdas,
-            ext_drifts,
-            x_vks,
-            &h_diag,
-            &y,
-        )
+        i0: usize,
+        i1: usize,
+        j0: usize,
+        j1: usize,
+    ) -> Array2<f64> {
+        let p = x_dense.ncols();
+        let mut gram = Array2::<f64>::zeros((i1 - i0, j1 - j0));
+        for bi in 0..(i1 - i0) {
+            let row = i0 + bi;
+            for bj in 0..(j1 - j0) {
+                let col = j0 + bj;
+                let mut value = 0.0;
+                for a in 0..p {
+                    value += x_dense[[row, a]] * z[[a, col]];
+                }
+                gram[[bi, bj]] = value;
+            }
+        }
+        gram
     }
 
     fn tk_gradient_from_shared(
@@ -346,7 +276,7 @@ impl<'a> RemlState<'a> {
                 total_k
             )));
         }
-        let x_y = x_dense.dot(&y);
+        let x_y = x_dense.dot(y);
 
         let mut diag_combined = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -379,13 +309,11 @@ impl<'a> RemlState<'a> {
 
         for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
             let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block_j = z.slice(s![.., j0..j1]);
             let c_j = c_array.slice(s![j0..j1]);
             for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                let x_block_i = x_dense.slice(s![i0..i1, ..]);
                 let c_i = c_array.slice(s![i0..i1]);
-                let gram = x_block_i.dot(&z_block_j);
+                let gram = Self::tk_gram_block(x_dense, z, i0, i1, j0, j1);
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
                     if ci == 0.0 {

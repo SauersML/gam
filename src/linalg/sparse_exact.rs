@@ -90,8 +90,7 @@ impl SparseTraceWorkspace {
             for j in 0..block_dim {
                 rhs[[p_start + j, j]] = 1.0;
             }
-            let solved = solve_sparse_spdmulti(factor, &rhs)?;
-            let block = solved.slice(ndarray::s![p_start..p_end, ..]).to_owned();
+            let block = solve_sparse_spdmulti_row_range(factor, &rhs, p_start, p_end)?;
             self.selected_block_inv_cache.insert(key, block);
         }
         self.selected_block_inv_cache.get(&key).ok_or_else(|| {
@@ -128,13 +127,7 @@ impl SparseTraceWorkspace {
             for (j, &idx) in key.iter().enumerate() {
                 rhs[[idx, j]] = 1.0;
             }
-            let solved = solve_sparse_spdmulti(factor, &rhs)?;
-            let mut sub = Array2::<f64>::zeros((m, m));
-            for (i_local, &i_global) in key.iter().enumerate() {
-                for j_local in 0..m {
-                    sub[[i_local, j_local]] = solved[[i_global, j_local]];
-                }
-            }
+            let sub = solve_sparse_spdmulti_selected_rows(factor, &rhs, &key)?;
             self.selected_support_inv_cache.insert(key.clone(), sub);
         }
         self.selected_support_inv_cache.get(&key).ok_or_else(|| {
@@ -508,6 +501,69 @@ where
         sum += value;
     }
     Ok(sum)
+}
+
+pub fn solve_sparse_spdmulti_row_range<S>(
+    factor: &SparseExactFactor,
+    rhs: &ArrayBase<S, Ix2>,
+    row_start: usize,
+    row_end: usize,
+) -> Result<Array2<f64>, EstimationError>
+where
+    S: Data<Elem = f64>,
+{
+    if row_end < row_start || row_end > rhs.nrows() {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD selected row range out of bounds: [{row_start},{row_end}) for {} rows",
+            rhs.nrows()
+        )));
+    }
+    let rhsview = FaerArrayView::new(rhs);
+    let out = factor.factor.solve(rhsview.as_ref());
+    let mut selected = Array2::<f64>::zeros((row_end - row_start, rhs.ncols()));
+    for row in row_start..row_end {
+        for col in 0..rhs.ncols() {
+            let value = out[(row, col)];
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "sparse SPD selected row solve produced non-finite values".to_string(),
+                ));
+            }
+            selected[[row - row_start, col]] = value;
+        }
+    }
+    Ok(selected)
+}
+
+pub fn solve_sparse_spdmulti_selected_rows<S>(
+    factor: &SparseExactFactor,
+    rhs: &ArrayBase<S, Ix2>,
+    rows: &[usize],
+) -> Result<Array2<f64>, EstimationError>
+where
+    S: Data<Elem = f64>,
+{
+    if let Some(&bad) = rows.iter().find(|&&row| row >= rhs.nrows()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD selected row out of bounds: row={bad}, rows={}",
+            rhs.nrows()
+        )));
+    }
+    let rhsview = FaerArrayView::new(rhs);
+    let out = factor.factor.solve(rhsview.as_ref());
+    let mut selected = Array2::<f64>::zeros((rows.len(), rhs.ncols()));
+    for (local_row, &row) in rows.iter().enumerate() {
+        for col in 0..rhs.ncols() {
+            let value = out[(row, col)];
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "sparse SPD selected row solve produced non-finite values".to_string(),
+                ));
+            }
+            selected[[local_row, col]] = value;
+        }
+    }
+    Ok(selected)
 }
 
 pub fn trace_hinv_sk(
