@@ -1,12 +1,11 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyPsiDesignAction,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
+    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
     slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
@@ -1113,7 +1112,7 @@ fn poly_coeff_mask(poly: &[MultiDirJet], mask: usize) -> Vec<f64> {
 }
 
 /// Derive a primary-space direction from a precomputed psi design row and beta,
-/// avoiding a redundant `psi_design_row_vector` call inside `row_primary_psi_direction`.
+/// avoiding a redundant psi design row build inside `row_primary_psi_direction`.
 fn primary_direction_from_psi_row(
     block_idx: usize,
     psi_row: &Array1<f64>,
@@ -8450,50 +8449,6 @@ impl SurvivalMarginalSlopeFamily {
         None
     }
 
-    fn psi_design_row_vector(
-        &self,
-        row: usize,
-        deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-        total_rows: usize,
-        p: usize,
-        label: &str,
-    ) -> Result<Array1<f64>, String> {
-        let action = CustomFamilyPsiDesignAction::from_first_derivative(
-            deriv,
-            total_rows,
-            p,
-            0..total_rows,
-            label,
-        )
-        .ok();
-        first_psi_linear_map(action.as_ref(), Some(&deriv.x_psi), total_rows, p).row_vector(row)
-    }
-
-    fn psi_second_design_row_vector(
-        &self,
-        row: usize,
-        deriv_i: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-        deriv_j: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-        local_j: usize,
-        total_rows: usize,
-        p: usize,
-        label: &str,
-    ) -> Result<Array1<f64>, String> {
-        let action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
-            deriv_i,
-            deriv_j,
-            total_rows,
-            p,
-            0..total_rows,
-            label,
-        )?;
-        let dense = deriv_i
-            .x_psi_psi
-            .as_ref()
-            .and_then(|rows| rows.get(local_j));
-        second_psi_linear_map(action.as_ref(), dense, total_rows, p).row_vector(row)
-    }
-
     // ── Psi terms (first and second order) ────────────────────────────
     //
     // All three psi methods (first-order, second-order, directional derivative)
@@ -8720,6 +8675,18 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
 
+        // Build the psi design map once; rowwise loop does direct row_vector(row)
+        // calls via the PsiDesignMap API.
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv,
+            self.n,
+            p_psi,
+            0..self.n,
+            psi_label,
+            &policy,
+        )?;
+
         // Parallel accumulation: each worker gets its own block-local accumulators.
         type Acc = (
             f64,                     // objective_psi
@@ -8745,7 +8712,9 @@ impl SurvivalMarginalSlopeFamily {
         let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
-                let psi_row = self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                let psi_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
 
                 let q_geom = if timewiggle_active {
                     Some(self.row_dynamic_q_geometry(row, block_states)?)
@@ -8954,6 +8923,42 @@ impl SurvivalMarginalSlopeFamily {
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let same_block = block_idx_i == block_idx_j;
 
+        // Build psi design maps once outside the row loop; rowwise calls use
+        // the direct row_vector(row) API.
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map_i = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv_i,
+            self.n,
+            p_psi_i,
+            0..self.n,
+            label_i,
+            &policy,
+        )?;
+        let psi_map_j = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv_j,
+            self.n,
+            p_psi_j,
+            0..self.n,
+            label_j,
+            &policy,
+        )?;
+        let psi_map_ij = if same_block {
+            Some(
+                crate::families::custom_family::resolve_custom_family_x_psi_psi_map(
+                    deriv_i,
+                    deriv_j,
+                    local_idx_j,
+                    self.n,
+                    p_psi_i,
+                    0..self.n,
+                    label_i,
+                    &policy,
+                )?,
+            )
+        } else {
+            None
+        };
+
         type Acc = (
             f64,
             Array1<f64>,
@@ -8979,10 +8984,12 @@ impl SurvivalMarginalSlopeFamily {
             .into_par_iter()
             .try_fold(make_acc, |mut a, row| -> Result<Acc, String> {
                 // Compute psi design rows once; derive directions from them.
-                let psi_row_i =
-                    self.psi_design_row_vector(row, deriv_i, self.n, p_psi_i, label_i)?;
-                let psi_row_j =
-                    self.psi_design_row_vector(row, deriv_j, self.n, p_psi_j, label_j)?;
+                let psi_row_i = psi_map_i
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
+                let psi_row_j = psi_map_j
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
 
                 let q_geom = if timewiggle_active {
                     Some(self.row_dynamic_q_geometry(row, block_states)?)
@@ -9029,15 +9036,11 @@ impl SurvivalMarginalSlopeFamily {
                 };
 
                 let (psi_row_ij, dir_ij) = if same_block {
-                    let r = self.psi_second_design_row_vector(
-                        row,
-                        deriv_i,
-                        deriv_j,
-                        local_idx_j,
-                        self.n,
-                        p_psi_i,
-                        label_i,
-                    )?;
+                    let r = psi_map_ij
+                        .as_ref()
+                        .expect("psi_map_ij built when same_block")
+                        .row_vector(row)
+                        .map_err(|e| format!("survival rowwise psi map: {e}"))?;
                     let d = if let Some(primary) = flex_primary.as_ref() {
                         primary_second_direction_from_psi_row_flex(primary, block_idx_i, &r, beta_i)
                     } else {
@@ -9315,13 +9318,25 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
 
+        // Build the psi design map once; rowwise calls use direct row_vector(row).
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv,
+            self.n,
+            p_psi,
+            0..self.n,
+            psi_label,
+            &policy,
+        )?;
+
         let acc = (0..self.n)
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
                 |mut acc, row| -> Result<BlockHessianAccumulator, String> {
-                    let psi_row =
-                        self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                    let psi_row = psi_map
+                        .row_vector(row)
+                        .map_err(|e| format!("survival rowwise psi map: {e}"))?;
 
                     let q_geom = if timewiggle_active {
                         Some(self.row_dynamic_q_geometry(row, block_states)?)
@@ -9494,13 +9509,25 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
 
+        // Build the psi design map once; rowwise calls use direct row_vector(row).
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv,
+            self.n,
+            p_psi,
+            0..self.n,
+            psi_label,
+            &policy,
+        )?;
+
         let acc = (0..self.n)
             .into_par_iter()
             .try_fold(
                 || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
                 |mut acc, row| -> Result<BlockHessianAccumulator, String> {
-                    let psi_row =
-                        self.psi_design_row_vector(row, deriv, self.n, p_psi, psi_label)?;
+                    let psi_row = psi_map
+                        .row_vector(row)
+                        .map_err(|e| format!("survival rowwise psi map: {e}"))?;
 
                     let q_geom = if timewiggle_active {
                         Some(self.row_dynamic_q_geometry(row, block_states)?)

@@ -1580,7 +1580,6 @@ pub struct MaternBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -1645,7 +1644,6 @@ pub struct DuchonBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     #[serde(default)]
     pub operator_penalties: DuchonOperatorPenaltySpec,
 }
@@ -1723,7 +1721,6 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     },
     Duchon {
         centers: Array2<f64>,
@@ -1735,7 +1732,6 @@ pub enum BasisMetadata {
         input_scales: Option<Vec<f64>>,
         /// Per-axis anisotropy log-scales η_a, stored for prediction.
         aniso_log_scales: Option<Vec<f64>>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     },
     TensorBSpline {
         feature_cols: Vec<usize>,
@@ -6102,7 +6098,6 @@ fn matern_aniso_extended_radial_scalars(
 struct MaternCrossPenaltyContext {
     centers: Array2<f64>,
     aniso_log_scales: Vec<f64>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     length_scale: f64,
     nu: MaternNu,
     z_transform: Option<Array2<f64>>,
@@ -6523,7 +6518,6 @@ fn build_matern_operator_penalty_aniso_derivatives(
     let cross_ctx = std::sync::Arc::new(MaternCrossPenaltyContext {
         centers: centers.to_owned(),
         aniso_log_scales: eta.to_vec(),
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         length_scale,
         nu,
         z_transform: z_opt.cloned(),
@@ -6575,7 +6569,6 @@ struct DuchonCrossPenaltyContext {
     pure_block_order: usize,
     coeffs: Option<DuchonPartialFractionCoeffs>,
     aniso_log_scales: Vec<f64>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     z_kernel: Array2<f64>,
     poly_cols: usize,
     identifiability_transform: Option<Array2<f64>>,
@@ -6778,7 +6771,6 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<
@@ -7186,7 +7178,6 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         pure_block_order,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         z_kernel,
         poly_cols,
         identifiability_transform: identifiability_transform.cloned(),
@@ -7433,7 +7424,6 @@ fn build_matern_kernel_penalty(
     nu: MaternNu,
     include_intercept: bool,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<Array2<f64>, BasisError> {
     let k = centers.nrows();
     let total_cols = k + usize::from(include_intercept);
@@ -7549,7 +7539,6 @@ pub fn build_matern_collocation_operator_matrices(
     include_intercept: bool,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     // Specialized Matérn operator assembly using explicit half-integer formulas:
     // - one exp(-a) and small polynomials per pair,
@@ -7692,7 +7681,6 @@ pub fn build_duchon_collocation_operator_matrices(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let mut workspace = BasisWorkspace::default();
@@ -7715,7 +7703,6 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
@@ -9143,7 +9130,8 @@ struct OwnedDataCacheKey {
 
 #[derive(Debug)]
 struct BasisCacheContext {
-    spatial_distance: crate::resource::ByteLruCache<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
+    spatial_distance:
+        crate::resource::ByteLruCache<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
     constraint_nullspace: ConstraintNullspaceCache,
     owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
@@ -9513,7 +9501,6 @@ fn build_matern_operator_penalty_candidates(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let ops = build_matern_collocation_operator_matrices(
         centers,
@@ -9571,7 +9558,6 @@ pub fn create_matern_spline_basiswithworkspace(
     nu: MaternNu,
     include_intercept: bool,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
     let n = data.nrows();
@@ -9899,7 +9885,6 @@ pub fn build_matern_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         },
         kronecker_factored: None,
     })
@@ -10256,7 +10241,6 @@ fn build_matern_operator_penalty_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
     // Full operator-to-penalty derivative pipeline in constrained coordinates:
     //
@@ -10731,7 +10715,6 @@ fn build_matern_design_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
@@ -10756,7 +10739,6 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, f64), BasisError> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
@@ -12812,7 +12794,6 @@ fn build_duchon_basis_designwithworkspace(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonBasisDesign, BasisError> {
     let n = data.nrows();
@@ -13180,7 +13161,6 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         },
         kronecker_factored: None,
     })
@@ -18424,7 +18404,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         match &out.metadata {
@@ -18453,7 +18433,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         let out_design = out.design.to_dense();
@@ -18496,7 +18476,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 3);
@@ -18526,7 +18506,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penaltyinfo.len(), 3);
@@ -18951,7 +18931,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -18985,7 +18964,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -19006,7 +18984,6 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -19028,7 +19005,6 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -19054,7 +19030,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -19124,7 +19099,6 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -19287,7 +19261,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let mut workspace = BasisWorkspace::default();
         let derivative = build_duchon_basis_log_kappa_derivativewithworkspace(
@@ -19358,7 +19332,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let mut workspace = BasisWorkspace::default();
         let second_derivative = build_duchon_basis_log_kappasecond_derivativewithworkspace(
@@ -20039,7 +20013,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -20132,7 +20105,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let analytic = build_duchon_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Duchon second derivative should build");
@@ -20289,7 +20262,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta),
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         build_duchon_basis(data.view(), &spec)
             .expect("pure Duchon basis")
@@ -20332,7 +20305,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta.clone()),
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
             .expect("pure Duchon anisotropic derivatives");
@@ -20578,7 +20551,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let err = match build_duchon_basis(data.view(), &spec) {
             Ok(_) => panic!("pure Duchon default tuple violates the nullspace-order condition"),
@@ -20610,7 +20583,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::default(),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let err = match build_duchon_basis(centers.view(), &spec) {
             Ok(_) => panic!("indefinite pure Duchon counterexample should be rejected"),
@@ -21541,5 +21514,171 @@ mod tests {
             Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let result = maybe_initialize_aniso_contrasts(centers.view(), None);
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Duchon anisotropic exposed-axis second-derivative kernel tests.
+    //
+    // These tests target the `2 q G_{LR}` overlap term in
+    // `ImplicitDesignPsiDerivative::transformed_second_kernel_value`. A bug
+    // in that term (e.g. missing the overlap contribution) would be silently
+    // masked by finite-difference probes because the radial kernel still
+    // produces smooth output — the overlap only shows up as an additive
+    // correction in the exact analytic second derivative.
+    //
+    // The full formula for linear combinations
+    //   L = Σ_a l_a ∂/∂ψ_a,   R = Σ_a r_a ∂/∂ψ_a
+    // applied to the radial kernel φ (which depends on the distance shaped
+    // by per-axis scales s_a = exp(2 η_a)) is
+    //
+    //   D²_{L,R} φ = t S_L S_R + 2 q G_{LR}
+    //                + c q (C_R S_L + C_L S_R)
+    //                + c² C_L C_R φ
+    //
+    // where S_L = Σ l_a s_a, C_L = Σ l_a, G_{LR} = Σ l_a r_a s_a, and
+    // c = psi_scale_share. The closed-form values below pin each piece of
+    // the formula — in particular the overlap contribution 2 q G_{LR}.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overlap_diag_contrast_e0_minus_elast_matches_closed_form() {
+        // Pure Duchon contrast L = R = e_0 - e_last in d = 3:
+        //   C_L = 0, so the `cq` and `c²` terms vanish.
+        //   S_L = s_0 - s_last, G_LL = s_0 + s_last.
+        //   Correct kernel value = t (s_0 - s_last)² + 2 q (s_0 + s_last).
+        // The `2 q (s_0 + s_last)` piece is the overlap term — missing it
+        // would leave only the first summand.
+        let s = [1.3_f64, 0.7, 2.1];
+        let phi = 3.0;
+        let q = -0.5;
+        let t = 0.9;
+        let c = 0.0;
+        let l: &[(usize, f64)] = &[(0, 1.0), (2, -1.0)];
+        let r = l;
+
+        let s_l: f64 = l.iter().map(|&(a, la)| la * s[a]).sum();
+        let s_r: f64 = r.iter().map(|&(a, ra)| ra * s[a]).sum();
+        let c_l: f64 = l.iter().map(|&(_, la)| la).sum();
+        let c_r: f64 = r.iter().map(|&(_, ra)| ra).sum();
+        let overlap = ImplicitDesignPsiDerivative::transformed_combo_overlap_streaming(l, r, &s);
+
+        let got = ImplicitDesignPsiDerivative::transformed_second_kernel_value(
+            phi, q, t, s_l, c_l, s_r, c_r, overlap, c,
+        );
+        let expected = t * (s[0] - s[2]).powi(2) + 2.0 * q * (s[0] + s[2]);
+
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "diag overlap mismatch: got={got} expected={expected}"
+        );
+
+        // Buggy "no-overlap" value misses the `2 q G_LL` correction. Pin
+        // that the correction is non-trivial and equals the overlap term.
+        let no_overlap = t * (s[0] - s[2]).powi(2);
+        assert!(
+            (got - no_overlap).abs() > 1e-6,
+            "overlap term contributes no correction: got={got} no_overlap={no_overlap}"
+        );
+        assert!(
+            (got - no_overlap - 2.0 * q * (s[0] + s[2])).abs() < 1e-12,
+            "overlap correction should equal 2 q (s_0 + s_last) exactly"
+        );
+    }
+
+    #[test]
+    fn overlap_cross_contrast_matches_closed_form() {
+        // Pure Duchon cross contrast L = e_0 - e_last, R = e_1 - e_last.
+        //   C_L = C_R = 0, so only the first two terms of the formula
+        //   survive. Only the `last` axis is shared between L and R:
+        //     G_{LR} = l_last * r_last * s_last = (-1)(-1) s_last = s_last.
+        //   Correct kernel value = t (s_0 - s_last)(s_1 - s_last) + 2 q s_last.
+        // The `2 q s_last` piece is the overlap term.
+        let s = [1.3_f64, 0.7, 2.1];
+        let phi = 3.0;
+        let q = -0.5;
+        let t = 0.9;
+        let c = 0.0;
+        let l: &[(usize, f64)] = &[(0, 1.0), (2, -1.0)];
+        let r: &[(usize, f64)] = &[(1, 1.0), (2, -1.0)];
+
+        let s_l: f64 = l.iter().map(|&(a, la)| la * s[a]).sum();
+        let s_r: f64 = r.iter().map(|&(a, ra)| ra * s[a]).sum();
+        let c_l: f64 = l.iter().map(|&(_, la)| la).sum();
+        let c_r: f64 = r.iter().map(|&(_, ra)| ra).sum();
+        let overlap = ImplicitDesignPsiDerivative::transformed_combo_overlap_streaming(l, r, &s);
+
+        let got = ImplicitDesignPsiDerivative::transformed_second_kernel_value(
+            phi, q, t, s_l, c_l, s_r, c_r, overlap, c,
+        );
+        let expected = t * (s[0] - s[2]) * (s[1] - s[2]) + 2.0 * q * s[2];
+
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "cross overlap mismatch: got={got} expected={expected}"
+        );
+
+        // Confirm the overlap term is exactly what separates the correct
+        // value from the buggy "no-overlap" version: 2 q s_last.
+        let no_overlap = t * (s[0] - s[2]) * (s[1] - s[2]);
+        assert!(
+            (got - no_overlap - 2.0 * q * s[2]).abs() < 1e-12,
+            "overlap correction should equal 2 q s_last exactly"
+        );
+    }
+
+    #[test]
+    fn overlap_vs_no_overlap_diag_differs_by_2q_sum() {
+        // Pin the streaming-overlap helper itself: for L = R = e_0 - e_last,
+        // each l_a² ∈ {0, 1}, so overlap = Σ_a l_a² s_a = s_0 + s_last.
+        let s = [1.3_f64, 0.7, 2.1];
+        let q = -0.5;
+        let l: &[(usize, f64)] = &[(0, 1.0), (2, -1.0)];
+
+        let overlap = ImplicitDesignPsiDerivative::transformed_combo_overlap_streaming(l, l, &s);
+        let expected_overlap = s[0] + s[2];
+        assert!(
+            (overlap - expected_overlap).abs() < 1e-14,
+            "overlap helper mismatch: got={overlap} expected={expected_overlap}"
+        );
+
+        let overlap_contribution = 2.0 * q * overlap;
+        let expected = 2.0 * q * (s[0] + s[2]);
+        assert!(
+            (overlap_contribution - expected).abs() < 1e-14,
+            "overlap contribution mismatch: got={overlap_contribution} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn overlap_psi_scale_share_nonzero_matches_full_formula() {
+        // With c ≠ 0 and L = R = e_0 + e_1 (so C_L = C_R = 2), every term
+        // of the full formula is active. Pin the helper against the
+        // hand-written expression.
+        let s = [1.3_f64, 0.7];
+        let phi = 3.0;
+        let q = -0.5;
+        let t = 0.9;
+        let c = 0.25;
+        let l: &[(usize, f64)] = &[(0, 1.0), (1, 1.0)];
+
+        let s_l: f64 = l.iter().map(|&(a, la)| la * s[a]).sum();
+        let c_l: f64 = l.iter().map(|&(_, la)| la).sum();
+        let overlap = ImplicitDesignPsiDerivative::transformed_combo_overlap_streaming(l, l, &s);
+
+        // G_LL = Σ l_a² s_a = s_0 + s_1 for all-ones combo.
+        assert!((overlap - (s[0] + s[1])).abs() < 1e-14);
+
+        let got = ImplicitDesignPsiDerivative::transformed_second_kernel_value(
+            phi, q, t, s_l, c_l, s_l, c_l, overlap, c,
+        );
+        let expected = t * s_l * s_l
+            + 2.0 * q * overlap
+            + c * q * (c_l * s_l + c_l * s_l)
+            + c * c * c_l * c_l * phi;
+
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "psi-scale-share full-formula mismatch: got={got} expected={expected}"
+        );
     }
 }
