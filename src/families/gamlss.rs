@@ -11553,97 +11553,115 @@ impl BinomialLocationScaleFamily {
             x_t_ab_map,
             h_tt.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
-        )? + &weighted_crossprod_psi_maps(x_t_i_map, h_tt.view(), x_t_j_map)?
-            + &weighted_crossprod_psi_maps(x_t_j_map, h_tt.view(), x_t_i_map)?
+            &policy,
+        )? + &weighted_crossprod_psi_maps(x_t_i_map, h_tt.view(), x_t_j_map, &policy)?
+            + &weighted_crossprod_psi_maps(x_t_j_map, h_tt.view(), x_t_i_map, &policy)?
             + &weighted_crossprod_psi_maps(
                 x_t_i_map,
                 dh_tt_j.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 x_t_j_map,
                 dh_tt_i.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 dh_tt_i.view(),
                 x_t_j_map,
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 dh_tt_j.view(),
                 x_t_i_map,
+                &policy,
             )?
             + &xt_diag_x_dense(x_t, &d2h_tt)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tt.view(),
                 x_t_ab_map,
+                &policy,
             )?;
         let h_tl_block = weighted_crossprod_psi_maps(
             x_t_ab_map,
             h_tl.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        )? + &weighted_crossprod_psi_maps(x_t_i_map, h_tl.view(), x_ls_j_map)?
-            + &weighted_crossprod_psi_maps(x_t_j_map, h_tl.view(), x_ls_i_map)?
+            &policy,
+        )? + &weighted_crossprod_psi_maps(x_t_i_map, h_tl.view(), x_ls_j_map, &policy)?
+            + &weighted_crossprod_psi_maps(x_t_j_map, h_tl.view(), x_ls_i_map, &policy)?
             + &weighted_crossprod_psi_maps(
                 x_t_i_map,
                 dh_tl_j.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 x_t_j_map,
                 dh_tl_i.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 dh_tl_i.view(),
                 x_ls_j_map,
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 dh_tl_j.view(),
                 x_ls_i_map,
+                &policy,
             )?
             + &xt_diag_y_dense(x_t, &d2h_tl, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tl.view(),
                 x_ls_ab_map,
+                &policy,
             )?;
         let h_ll_block = weighted_crossprod_psi_maps(
             x_ls_ab_map,
             h_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        )? + &weighted_crossprod_psi_maps(x_ls_i_map, h_ll.view(), x_ls_j_map)?
-            + &weighted_crossprod_psi_maps(x_ls_j_map, h_ll.view(), x_ls_i_map)?
+            &policy,
+        )? + &weighted_crossprod_psi_maps(x_ls_i_map, h_ll.view(), x_ls_j_map, &policy)?
+            + &weighted_crossprod_psi_maps(x_ls_j_map, h_ll.view(), x_ls_i_map, &policy)?
             + &weighted_crossprod_psi_maps(
                 x_ls_i_map,
                 dh_ll_j.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 x_ls_j_map,
                 dh_ll_i.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
                 dh_ll_i.view(),
                 x_ls_j_map,
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
                 dh_ll_j.view(),
                 x_ls_i_map,
+                &policy,
             )?
             + &xt_diag_x_dense(x_ls, &d2h_ll)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
                 h_ll.view(),
                 x_ls_ab_map,
+                &policy,
             )?;
 
         let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
