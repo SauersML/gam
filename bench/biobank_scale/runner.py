@@ -925,9 +925,13 @@ def _survival_probability_column(rows: list[dict[str, str]], *, method_name: str
     key = "survival_prob" if "survival_prob" in rows[0] else "mean"
     values = np.array([float(r[key]) for r in rows], dtype=float)
     if not np.all(np.isfinite(values)):
-        raise RuntimeError(f"{method_name} survival prediction column '{key}' contains non-finite values")
+        raise RuntimeError(
+            f"{method_name} survival prediction column '{key}' contains non-finite values"
+        )
     if np.any(values < -1e-9) or np.any(values > 1.0 + 1e-9):
-        raise RuntimeError(f"{method_name} survival prediction column '{key}' is outside [0,1]")
+        raise RuntimeError(
+            f"{method_name} survival prediction column '{key}' is outside [0,1]"
+        )
     return np.clip(values, 0.0, 1.0)
 
 
@@ -1880,14 +1884,22 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             prediction_horizon=horizon,
         )
         fit_cmd = [
-            str(rust_bin), "fit",
-            "--survival-likelihood", likelihood_mode,
-            "--time-basis", "ispline",
-            "--time-degree", "3",
-            "--time-num-internal-knots", "8",
-            "--time-smooth-lambda", "0.01",
-            "--ridge-lambda", "1e-6",
-            "--out", str(model_path),
+            str(rust_bin),
+            "fit",
+            "--survival-likelihood",
+            likelihood_mode,
+            "--time-basis",
+            "ispline",
+            "--time-degree",
+            "3",
+            "--time-num-internal-knots",
+            "8",
+            "--time-smooth-lambda",
+            "0.01",
+            "--ridge-lambda",
+            "1e-6",
+            "--out",
+            str(model_path),
         ]
         if likelihood_mode == "marginal-slope":
             fit_cmd.extend(["--logslope-formula", logslope_formula or "1"])
@@ -1903,7 +1915,14 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         fit_sec = ctn_fit_sec + survival_fit_sec
         if rc != 0:
             raise RuntimeError(err.strip() or out.strip() or f"{spec.name} fit failed")
-        pred_cmd = [str(rust_bin), "predict", str(model_path), str(test_pred_input_path), "--out", str(pred_path)]
+        pred_cmd = [
+            str(rust_bin),
+            "predict",
+            str(model_path),
+            str(test_pred_input_path),
+            "--out",
+            str(pred_path),
+        ]
         t1 = time.perf_counter()
         rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
         predict_sec = time.perf_counter() - t1

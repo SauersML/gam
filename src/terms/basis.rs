@@ -2051,7 +2051,6 @@ impl AnisoPenaltyCrossProvider {
 //  Implicit derivative operator for scalable anisotropic REML gradients
 // ═══════════════════════════════════════════════════════════════════════════
 
-const SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
 
@@ -2133,11 +2132,11 @@ pub fn assert_spatial_centers_below_biobank_cap(
         SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
     );
     assert!(
-        data_center_bytes <= SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES
+        data_center_bytes <= crate::resource::SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
             || !spatial_distance_cacheable_entry(n, k),
         "spatial PC n*K distance cache cap mismatch: n={n}, K={k}, d_pc={d_pc}, optional n*K cache={:.1} MiB, cap={:.1} MiB",
         data_center_bytes as f64 / (1024.0 * 1024.0),
-        SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES as f64 / (1024.0 * 1024.0),
+        crate::resource::SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES as f64 / (1024.0 * 1024.0),
     );
 }
 
@@ -16092,14 +16091,22 @@ mod tests {
         let second_cached = shared_owned_data_matrix(second.view(), &cache);
         let third_cached = shared_owned_data_matrix(third.view(), &cache);
 
-        assert_eq!(cache.owned_data.len(), crate::resource::OWNED_DATA_CACHE_MAX_ENTRIES);
-        assert!(cache.owned_data.get(&OwnedDataCacheKey {
-            rows: first.nrows(),
-            cols: first.ncols(),
-            ptr: first.as_ptr() as usize,
-            stride0: first.strides()[0],
-            stride1: first.strides()[1],
-        }).is_none());
+        assert_eq!(
+            cache.owned_data.len(),
+            crate::resource::OWNED_DATA_CACHE_MAX_ENTRIES
+        );
+        assert!(
+            cache
+                .owned_data
+                .get(&OwnedDataCacheKey {
+                    rows: first.nrows(),
+                    cols: first.ncols(),
+                    ptr: first.as_ptr() as usize,
+                    stride0: first.strides()[0],
+                    stride1: first.strides()[1],
+                })
+                .is_none()
+        );
         assert!(Arc::ptr_eq(
             &second_cached,
             &shared_owned_data_matrix(second.view(), &cache)
