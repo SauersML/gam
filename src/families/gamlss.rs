@@ -151,6 +151,138 @@ fn exact_design_row_chunks(n: usize, p: usize) -> impl Iterator<Item = std::ops:
         .map(move |start| start..(start + rows).min(n))
 }
 
+/// Operator-preserving view of a per-block GAMLSS design matrix.
+///
+/// `Dense` borrows already-materialized storage (zero-cost), while `Operator`
+/// holds a borrow of the underlying `DesignMatrix` so chunked access stays
+/// lazy. This enables shape-only queries (`nrows`/`ncols`) and operator-friendly
+/// matvec / row-chunked weighted cross products without forcing an n×p
+/// allocation up front.
+///
+/// Prefer this over `dense_block_designs_*` helpers (which return
+/// `Cow<'_, Array2<f64>>` and unconditionally densify lazy operators).
+pub(crate) enum BlockDesignView<'a> {
+    Dense(&'a Array2<f64>),
+    Operator(&'a DesignMatrix),
+}
+
+impl<'a> BlockDesignView<'a> {
+    /// Build a view from a `DesignMatrix`, preserving operator laziness when
+    /// possible. If the matrix is already dense and exposes a borrowed array,
+    /// we take the zero-copy `Dense` path; otherwise the operator handle is
+    /// retained for chunked / matvec access.
+    pub(crate) fn from_design(design: &'a DesignMatrix) -> Self {
+        match design {
+            DesignMatrix::Dense(dm) => match dm.as_dense_ref() {
+                Some(arr) => Self::Dense(arr),
+                None => Self::Operator(design),
+            },
+            DesignMatrix::Sparse(_) => Self::Operator(design),
+        }
+    }
+
+    pub(crate) fn nrows(&self) -> usize {
+        match self {
+            Self::Dense(m) => m.nrows(),
+            Self::Operator(dm) => dm.nrows(),
+        }
+    }
+
+    pub(crate) fn ncols(&self) -> usize {
+        match self {
+            Self::Dense(m) => m.ncols(),
+            Self::Operator(dm) => dm.ncols(),
+        }
+    }
+
+    /// `X * beta` without forcing materialization of `X` when it is operator-backed.
+    pub(crate) fn forward_mul(&self, beta: ArrayView1<'_, f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(m) => m.dot(&beta),
+            Self::Operator(dm) => {
+                use crate::matrix::LinearOperator;
+                LinearOperator::apply(*dm, &beta.to_owned())
+            }
+        }
+    }
+
+    /// `X^T * v` without forcing materialization.
+    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(m) => m.t().dot(&v),
+            Self::Operator(dm) => {
+                use crate::matrix::LinearOperator;
+                LinearOperator::apply_transpose(*dm, &v.to_owned())
+            }
+        }
+    }
+
+    /// Owned dense row chunk `X[rows, :]`. Cheap for `Dense` (a slice copy);
+    /// goes through the operator's `try_row_chunk` for `Operator`.
+    pub(crate) fn row_chunk(&self, rows: std::ops::Range<usize>) -> Result<Array2<f64>, String> {
+        match self {
+            Self::Dense(m) => Ok(m.slice(s![rows, ..]).to_owned()),
+            Self::Operator(dm) => {
+                use crate::matrix::DenseDesignOperator;
+                DenseDesignOperator::try_row_chunk(*dm, rows).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// Compute `self.t() * diag(weights) * other` row-chunked, preserving
+    /// operator laziness for both sides. Allocates only the `(p_l, p_r)` Gram
+    /// output and per-chunk `(rows_per_chunk, p_*)` working buffers.
+    pub(crate) fn weighted_cross(
+        &self,
+        weights: ArrayView1<'_, f64>,
+        other: &BlockDesignView<'_>,
+        policy: &crate::resource::ResourcePolicy,
+    ) -> Result<Array2<f64>, String> {
+        let n = weights.len();
+        if self.nrows() != n {
+            return Err(format!(
+                "BlockDesignView::weighted_cross: lhs nrows={} != weights len={}",
+                self.nrows(),
+                n
+            ));
+        }
+        if other.nrows() != n {
+            return Err(format!(
+                "BlockDesignView::weighted_cross: rhs nrows={} != weights len={}",
+                other.nrows(),
+                n
+            ));
+        }
+        let p_l = self.ncols();
+        let p_r = other.ncols();
+        let mut out = Array2::<f64>::zeros((p_l, p_r));
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            p_l + p_r,
+        )
+        .max(1);
+
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let xl = self.row_chunk(rows.clone())?;
+            let mut xr = other.row_chunk(rows.clone())?;
+            for local in 0..xr.nrows() {
+                let w = weights[start + local];
+                if w != 1.0 {
+                    for j in 0..p_r {
+                        xr[[local, j]] *= w;
+                    }
+                }
+            }
+            out += &xl.t().dot(&xr);
+            start = end;
+        }
+        Ok(out)
+    }
+}
+
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
     if !rawweight.is_finite() || rawweight <= 0.0 {
@@ -5481,6 +5613,7 @@ impl GaussianLocationScaleFamily {
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleFamily mu",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
                                 format!("GaussianLocationScaleFamily mu forward_mul: {e}")
@@ -5498,6 +5631,7 @@ impl GaussianLocationScaleFamily {
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleFamily log-sigma",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
@@ -6856,6 +6990,7 @@ impl GaussianLocationScaleWiggleFamily {
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily mu",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
                                 format!("GaussianLocationScaleWiggleFamily mu forward_mul: {e}")
@@ -6873,6 +7008,7 @@ impl GaussianLocationScaleWiggleFamily {
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily log-sigma",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!(
@@ -10756,6 +10892,7 @@ impl BinomialLocationScaleFamily {
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleFamily threshold",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
                                 format!("BinomialLocationScaleFamily threshold forward_mul: {e}")
@@ -10773,6 +10910,7 @@ impl BinomialLocationScaleFamily {
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleFamily log-sigma",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!("BinomialLocationScaleFamily log-sigma forward_mul: {e}")
@@ -12430,6 +12568,7 @@ impl BinomialLocationScaleWiggleFamily {
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleWiggleFamily threshold",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
                                 format!(
@@ -12449,6 +12588,7 @@ impl BinomialLocationScaleWiggleFamily {
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleWiggleFamily log-sigma",
+                                &crate::resource::ResourcePolicy::default_library(),
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!(

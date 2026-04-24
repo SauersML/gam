@@ -26,10 +26,10 @@ use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nulls
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
+    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -2965,6 +2965,42 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         self.lifted_forward_second(&self.response_val_basis, axis_d, axis_e, u)
     }
 
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mat = MaterializablePsiDerivativeOperator::materialize_first(self, axis)?;
+        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mat = MaterializablePsiDerivativeOperator::materialize_second_diag(self, axis)?;
+        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mat = MaterializablePsiDerivativeOperator::materialize_second_cross(
+            self, axis_d, axis_e,
+        )?;
+        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+    }
+
+    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
+        Some(self)
+    }
+}
+
+impl MaterializablePsiDerivativeOperator for TensorKroneckerPsiOperator {
     fn materialize_first(
         &self,
         axis: usize,
