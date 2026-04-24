@@ -444,12 +444,13 @@ where
     let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array1::<f64>::zeros(rhs.len());
     for i in 0..rhs.len() {
-        result[i] = out[(i, 0)];
-    }
-    if !result.iter().all(|v| v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "sparse SPD solve produced non-finite values".to_string(),
-        ));
+        let value = out[(i, 0)];
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "sparse SPD solve produced non-finite values".to_string(),
+            ));
+        }
+        result[i] = value;
     }
     Ok(result)
 }
@@ -464,17 +465,49 @@ where
     let rhsview = FaerArrayView::new(rhs);
     let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array2::<f64>::zeros(rhs.raw_dim());
-    for j in 0..rhs.ncols() {
-        for i in 0..rhs.nrows() {
-            result[[i, j]] = out[(i, j)];
+    for i in 0..rhs.nrows() {
+        for j in 0..rhs.ncols() {
+            let value = out[(i, j)];
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "sparse SPD multi-solve produced non-finite values".to_string(),
+                ));
+            }
+            result[[i, j]] = value;
         }
     }
-    if !result.iter().all(|v| v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "sparse SPD multi-solve produced non-finite values".to_string(),
-        ));
-    }
     Ok(result)
+}
+
+pub fn solve_sparse_spdmulti_diagonal_sum<S>(
+    factor: &SparseExactFactor,
+    rhs: &ArrayBase<S, Ix2>,
+    row_start: usize,
+) -> Result<f64, EstimationError>
+where
+    S: Data<Elem = f64>,
+{
+    if row_start.saturating_add(rhs.ncols()) > rhs.nrows() {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD selected diagonal out of bounds: row_start={}, rows={}, cols={}",
+            row_start,
+            rhs.nrows(),
+            rhs.ncols()
+        )));
+    }
+    let rhsview = FaerArrayView::new(rhs);
+    let out = factor.factor.solve(rhsview.as_ref());
+    let mut sum = 0.0;
+    for col in 0..rhs.ncols() {
+        let value = out[(row_start + col, col)];
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "sparse SPD selected diagonal solve produced non-finite values".to_string(),
+            ));
+        }
+        sum += value;
+    }
+    Ok(sum)
 }
 
 pub fn trace_hinv_sk(

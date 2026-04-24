@@ -7520,23 +7520,30 @@ impl SparseCholeskyOperator {
                 basis[global_col] = 0.0;
             }
 
-            let solved = if cols == chunk {
-                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)
+            let diagonal_sum = if cols == chunk {
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
+                    &self.factor,
+                    &rhs_block,
+                    start,
+                )
             } else {
                 let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
-                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
+                    &self.factor,
+                    &rhs_view,
+                    start,
+                )
             };
-            let solved = match solved {
-                Ok(sol) => sol,
+            match diagonal_sum {
+                Ok(value) => {
+                    trace += value;
+                }
                 Err(e) => {
                     log::warn!(
                         "SparseCholeskyOperator::trace_hinv_operator_exact multi-solve failed: {e}"
                     );
                     return f64::NAN;
                 }
-            };
-            for local_col in 0..cols {
-                trace += solved[[start + local_col, local_col]];
             }
             start = end;
         }
