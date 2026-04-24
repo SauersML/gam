@@ -7758,10 +7758,20 @@ impl SparseCholeskyOperator {
             op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
             let solved_block = if cols == chunk {
-                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_rows(
+                    &self.factor,
+                    &rhs_block,
+                    row_start,
+                    row_end,
+                )
             } else {
                 let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
-                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_rows(
+                    &self.factor,
+                    &rhs_view,
+                    row_start,
+                    row_end,
+                )
             }
             .map_err(|e| {
                 format!(
@@ -7770,7 +7780,7 @@ impl SparseCholeskyOperator {
             })?;
             solved
                 .slice_mut(ndarray::s![.., start - col_start..end - col_start])
-                .assign(&solved_block.slice(ndarray::s![row_start..row_end, ..]));
+                .assign(&solved_block);
             start = end;
         }
 
@@ -7903,10 +7913,14 @@ impl HessianOperator for SparseCholeskyOperator {
         if let Some(ref taka) = self.takahashi {
             let mut trace = 0.0;
             for i in 0..a.nrows() {
-                for j in 0..a.ncols() {
-                    let a_ij = a[[i, j]];
-                    if a_ij.abs() > 1e-30 {
-                        trace += taka.get(i, j) * a_ij;
+                let a_ii = a[[i, i]];
+                if a_ii.abs() > 1e-30 {
+                    trace += taka.get(i, i) * a_ii;
+                }
+                for j in (i + 1)..a.ncols() {
+                    let pair = a[[i, j]] + a[[j, i]];
+                    if pair.abs() > 1e-30 {
+                        trace += taka.get(i, j) * pair;
                     }
                 }
             }
@@ -10455,6 +10469,30 @@ mod tests {
         assert_relative_eq!(
             sparse.trace_hinv_operator_cross(&op, &op),
             dense.trace_hinv_product_cross(&full, &full),
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+    }
+
+    #[test]
+    fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
+        let h = array![[4.0, 0.2, 0.1], [0.2, 3.0, 0.4], [0.1, 0.4, 2.5],];
+        let h_sparse =
+            crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
+        let factor = std::sync::Arc::new(
+            crate::linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
+        );
+        let sfactor = crate::linalg::sparse_exact::factorize_simplicial(&h_sparse).unwrap();
+        let taka = std::sync::Arc::new(crate::linalg::sparse_exact::TakahashiInverse::compute(
+            &sfactor,
+        ));
+        let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows()).with_takahashi(taka);
+        let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let a = array![[1.0, 0.7, -0.2], [0.1, 0.5, 0.9], [0.4, -0.3, 0.2],];
+        assert_relative_eq!(
+            sparse.trace_hinv_product(&a),
+            dense.trace_hinv_product(&a),
             epsilon = 1e-10,
             max_relative = 1e-10
         );

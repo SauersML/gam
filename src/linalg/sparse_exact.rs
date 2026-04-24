@@ -344,6 +344,45 @@ where
     Ok(result)
 }
 
+pub fn solve_sparse_spdmulti_rows<S>(
+    factor: &SparseExactFactor,
+    rhs: &ArrayBase<S, Ix2>,
+    row_start: usize,
+    row_end: usize,
+) -> Result<Array2<f64>, EstimationError>
+where
+    S: Data<Elem = f64>,
+{
+    if rhs.nrows() != factor.n {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD multi-solve row mismatch: rhs has {}, factor has {}",
+            rhs.nrows(),
+            factor.n
+        )));
+    }
+    if row_start > row_end || row_end > factor.n {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD selected rows out of bounds: row_start={}, row_end={}, factor={}",
+            row_start, row_end, factor.n
+        )));
+    }
+    let rhsview = FaerArrayView::new(rhs);
+    let out = factor.factor.solve(rhsview.as_ref());
+    let mut result = Array2::<f64>::zeros((row_end - row_start, rhs.ncols()));
+    for i in row_start..row_end {
+        for j in 0..rhs.ncols() {
+            let value = out[(i, j)];
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "sparse SPD selected-row solve produced non-finite values".to_string(),
+                ));
+            }
+            result[[i - row_start, j]] = value;
+        }
+    }
+    Ok(result)
+}
+
 pub fn solve_sparse_spdmulti_diagonal_sum<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix2>,
