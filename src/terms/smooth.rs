@@ -12146,6 +12146,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_hessian(hessian)
         .with_prefer_gradient_only(prefer_gradient_only)
         .with_disable_fixed_point(disable_fixed_point)
+        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
