@@ -3665,26 +3665,42 @@ pub fn reml_laml_evaluate(
             && hessian_kernel.is_some()
             && solution.penalty_subspace_trace.is_none();
         if use_operator {
-            let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
-                build_outer_hessian_operator(
-                    solution,
-                    &lambdas,
-                    effective_deriv,
-                    hessian_kernel.expect("checked is_some above"),
-                )?,
-            ));
-            if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
-                hessian.add_rho_block_dense(ph)?;
+            match build_outer_hessian_operator(
+                solution,
+                &lambdas,
+                effective_deriv,
+                hessian_kernel.expect("checked is_some above"),
+            ) {
+                Ok(op) => {
+                    let mut hessian =
+                        crate::solver::outer_strategy::HessianResult::Operator(Arc::new(op));
+                    if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
+                        hessian.add_rho_block_dense(ph)?;
+                    }
+                    hessian
+                }
+                Err(err) if is_hessian_unavailable(&err) => {
+                    log::warn!("{err}");
+                    crate::solver::outer_strategy::HessianResult::Unavailable
+                }
+                Err(err) => return Err(err),
             }
-            hessian
         } else {
-            let mut h = compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv)?;
-            // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
-            if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
-                let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
-                sl += ph;
+            match compute_outer_hessian(solution, rho, &lambdas, hop, effective_deriv) {
+                Ok(mut h) => {
+                    // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
+                    if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
+                        let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+                        sl += ph;
+                    }
+                    crate::solver::outer_strategy::HessianResult::Analytic(h)
+                }
+                Err(err) if is_hessian_unavailable(&err) => {
+                    log::warn!("{err}");
+                    crate::solver::outer_strategy::HessianResult::Unavailable
+                }
+                Err(err) => return Err(err),
             }
-            crate::solver::outer_strategy::HessianResult::Analytic(h)
         }
     } else {
         crate::solver::outer_strategy::HessianResult::Unavailable
@@ -4076,9 +4092,10 @@ fn compute_outer_hessian(
     // the hat diagonal). The net saving is large when k >> 1.
     let glm_ingredients = effective_deriv.scalar_glm_ingredients();
     let adjoint_z_c = if incl_logdet_h {
-        glm_ingredients
-            .as_ref()
-            .map(|ing| compute_adjoint_z_c(ing, hop))
+        match glm_ingredients.as_ref() {
+            Some(ing) => Some(compute_adjoint_z_c(ing, hop)?),
+            None => None,
+        }
     } else {
         None
     };
@@ -4728,19 +4745,6 @@ impl UnifiedOuterHessianOperator {
         (dense, dense_rotated, operator)
     }
 
-    fn pair_vector_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.hop.dim());
-        for j in 0..alpha.len() {
-            if alpha[j] == 0.0 {
-                continue;
-            }
-            if let Some(g) = self.pair_g[idx][j].as_ref() {
-                out.scaled_add(alpha[j], g);
-            }
-        }
-        out
-    }
-
     fn signed_mode_combo_for_correction(&self, alpha: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.hop.dim());
         for (j, coord) in self.coords.iter().enumerate() {
@@ -4823,13 +4827,9 @@ impl UnifiedOuterHessianOperator {
                     x,
                 };
                 let c_trace = rhs.dot(z_c);
-                let d_trace = compute_fourth_derivative_trace(
-                    &ingredients,
-                    v_i,
-                    m_alpha,
-                    self.hop.as_ref(),
-                )?
-                .unwrap_or(0.0);
+                let d_trace =
+                    compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())?
+                        .unwrap_or(0.0);
                 Ok(c_trace + d_trace)
             }
             OuterHessianDerivativeKernel::Callback { first, second } => {
@@ -8448,8 +8448,9 @@ mod tests {
         };
         let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(p)).unwrap();
 
-        let z_c = compute_adjoint_z_c(&ing, &hop);
-        assert_eq!(z_c, Array1::<f64>::zeros(p));
+        let err = compute_adjoint_z_c(&ing, &hop)
+            .expect_err("oversized adjoint trace should make the Hessian unavailable");
+        assert!(is_hessian_unavailable(&err));
     }
 
     #[test]
@@ -8468,13 +8469,14 @@ mod tests {
         };
         let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(p)).unwrap();
 
-        let trace = compute_fourth_derivative_trace(
+        let err = compute_fourth_derivative_trace(
             &ing,
             &Array1::<f64>::zeros(p),
             &Array1::<f64>::zeros(p),
             &hop,
-        );
-        assert_eq!(trace, Some(0.0));
+        )
+        .expect_err("oversized fourth-derivative trace should make the Hessian unavailable");
+        assert!(is_hessian_unavailable(&err));
     }
 
     #[test]
