@@ -1332,6 +1332,11 @@ impl HyperOperator for CompositeHyperOperator {
     }
 
     fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            self.operators[0].mul_vec_into(v, out);
+            return;
+        }
+
         out.fill(0.0);
         if let Some(dense) = self.dense.as_ref() {
             dense_matvec_into(dense, v, out.view_mut());
@@ -1557,19 +1562,41 @@ impl HyperCoordDrift {
 
     pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::zeros(v.len());
+        self.scaled_add_apply(v.view(), 1.0, &mut out);
+        out
+    }
+
+    pub fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
+        debug_assert_eq!(v.len(), out.len());
+        if scale == 0.0 {
+            return;
+        }
         if let Some(dense) = &self.dense {
-            out += &dense.dot(v);
+            debug_assert_eq!(dense.ncols(), v.len());
+            debug_assert_eq!(dense.nrows(), out.len());
+            for row in 0..dense.nrows() {
+                let mut value = 0.0;
+                for col in 0..dense.ncols() {
+                    value += dense[[row, col]] * v[col];
+                }
+                out[row] += scale * value;
+            }
         }
         if let Some(bl) = &self.block_local {
             let v_block = v.slice(ndarray::s![bl.start..bl.end]);
-            let local_result = bl.local.dot(&v_block);
-            out.slice_mut(ndarray::s![bl.start..bl.end])
-                .scaled_add(1.0, &local_result);
+            for local_row in 0..bl.local.nrows() {
+                let mut value = 0.0;
+                for local_col in 0..bl.local.ncols() {
+                    value += bl.local[[local_row, local_col]] * v_block[local_col];
+                }
+                out[bl.start + local_row] += scale * value;
+            }
         }
         if let Some(op) = &self.operator {
-            out += &op.mul_vec(v);
+            let mut applied = Array1::<f64>::zeros(out.len());
+            op.mul_vec_into(v, applied.view_mut());
+            out.scaled_add(scale, &applied);
         }
-        out
     }
 
     fn infer_dim(&self) -> usize {
@@ -4765,15 +4792,18 @@ fn compute_outer_hessian(
                     // yields:
                     //   H β_{rho,ext} = g_{rho,ext} - A_k β_ext - Ḣ_ext β_rho
                     // with β_rho = -v_rho and β_ext = +v_ext.
-                    let ext_h_v_rho = if let Some(h_i) = ext_h_matrices[ext_idx].as_ref() {
-                        h_i.dot(&v_ks[rho_idx])
-                    } else {
-                        solution.ext_coords[ext_idx].drift.apply(&v_ks[rho_idx])
-                    };
                     let mut rhs = pair.g.clone();
                     rhs -= &solution.penalty_coords[rho_idx]
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
-                    rhs -= &ext_h_v_rho;
+                    if let Some(h_i) = ext_h_matrices[ext_idx].as_ref() {
+                        rhs -= &h_i.dot(&v_ks[rho_idx]);
+                    } else {
+                        solution.ext_coords[ext_idx].drift.scaled_add_apply(
+                            v_ks[rho_idx].view(),
+                            -1.0,
+                            &mut rhs,
+                        );
+                    }
 
                     let base = compute_base_h2_trace(
                         hop,
@@ -4863,14 +4893,17 @@ fn compute_outer_hessian(
                     // differentiating `H β_i = g_i` along coord `j` gives:
                     //   H β_{ij} = g_{ij} - B_i β_j - Ḣ_j β_i
                     // with β_i = +v_i and β_j = +v_j.
-                    let hj_vi = if let Some(h_j) = ext_h_matrices[jj].as_ref() {
-                        h_j.dot(&ext_v[ii])
-                    } else {
-                        coord_j.drift.apply(&ext_v[ii])
-                    };
                     let mut rhs = pair.g.clone();
-                    rhs -= &coord_i.drift.apply(&ext_v[jj]);
-                    rhs -= &hj_vi;
+                    coord_i
+                        .drift
+                        .scaled_add_apply(ext_v[jj].view(), -1.0, &mut rhs);
+                    if let Some(h_j) = ext_h_matrices[jj].as_ref() {
+                        rhs -= &h_j.dot(&ext_v[ii]);
+                    } else {
+                        coord_j
+                            .drift
+                            .scaled_add_apply(ext_v[ii].view(), -1.0, &mut rhs);
+                    }
 
                     let base = compute_base_h2_trace(
                         hop,
@@ -4964,13 +4997,33 @@ impl StoredFirstDrift {
 
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
-        if let Some(matrix) = self.dense.as_ref() {
-            out += &matrix.dot(v);
-        }
-        for op in &self.operators {
-            out += &op.mul_vec(v);
-        }
+        self.scaled_add_apply(v.view(), 1.0, &mut out);
         out
+    }
+
+    fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
+        debug_assert_eq!(v.len(), out.len());
+        if scale == 0.0 {
+            return;
+        }
+        if let Some(matrix) = self.dense.as_ref() {
+            debug_assert_eq!(matrix.ncols(), v.len());
+            debug_assert_eq!(matrix.nrows(), out.len());
+            for row in 0..matrix.nrows() {
+                let mut value = 0.0;
+                for col in 0..matrix.ncols() {
+                    value += matrix[[row, col]] * v[col];
+                }
+                out[row] += scale * value;
+            }
+        }
+        if !self.operators.is_empty() {
+            let mut work = Array1::<f64>::zeros(out.len());
+            for op in &self.operators {
+                op.mul_vec_into(v, work.view_mut());
+                out.scaled_add(scale, &work);
+            }
+        }
     }
 
     fn accumulate(
@@ -5018,10 +5071,18 @@ impl HyperOperator for WeightedHyperOperator {
     }
 
     fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
-        out.fill(0.0);
-        if self.terms.is_empty() {
+        let mut nonzero_terms = self.terms.iter().filter(|(weight, _)| *weight != 0.0);
+        if let Some((weight, op)) = nonzero_terms.next()
+            && nonzero_terms.next().is_none()
+        {
+            op.mul_vec_into(v, out.view_mut());
+            if *weight != 1.0 {
+                out.mapv_inplace(|value| *weight * value);
+            }
             return;
         }
+
+        out.fill(0.0);
         let mut work = Array1::<f64>::zeros(out.len());
         for (weight, op) in &self.terms {
             if *weight != 0.0 {
@@ -5163,27 +5224,44 @@ impl UnifiedOuterHessianOperator {
 
         match (row_coord.is_ext(), col_coord.is_ext()) {
             (false, false) => {
-                let mut rhs = col_coord.total_drift.apply(&row_coord.v);
-                rhs += &row_coord.base_drift.apply(&col_coord.v);
+                let mut rhs = Array1::<f64>::zeros(self.hop.dim());
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), 1.0, &mut rhs);
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), 1.0, &mut rhs);
                 rhs -= &pair_g;
                 rhs
             }
             (false, true) => {
                 let mut rhs = pair_g;
-                rhs -= &row_coord.base_drift.apply(&col_coord.v);
-                rhs -= &col_coord.total_drift.apply(&row_coord.v);
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), -1.0, &mut rhs);
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), -1.0, &mut rhs);
                 rhs
             }
             (true, false) => {
                 let mut rhs = pair_g;
-                rhs -= &col_coord.base_drift.apply(&row_coord.v);
-                rhs -= &row_coord.total_drift.apply(&col_coord.v);
+                col_coord
+                    .base_drift
+                    .scaled_add_apply(row_coord.v.view(), -1.0, &mut rhs);
+                row_coord
+                    .total_drift
+                    .scaled_add_apply(col_coord.v.view(), -1.0, &mut rhs);
                 rhs
             }
             (true, true) => {
                 let mut rhs = pair_g;
-                rhs -= &row_coord.base_drift.apply(&col_coord.v);
-                rhs -= &col_coord.total_drift.apply(&row_coord.v);
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), -1.0, &mut rhs);
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), -1.0, &mut rhs);
                 rhs
             }
         }
@@ -7188,8 +7266,10 @@ impl SparseCholeskyOperator {
             for local_col in 0..cols {
                 let global_col = start + local_col;
                 basis[global_col] = 1.0;
-                let col = op.mul_vec(&basis);
-                rhs_block.slice_mut(ndarray::s![.., local_col]).assign(&col);
+                op.mul_vec_into(
+                    basis.view(),
+                    rhs_block.slice_mut(ndarray::s![.., local_col]),
+                );
                 basis[global_col] = 0.0;
             }
 
@@ -7231,8 +7311,10 @@ impl SparseCholeskyOperator {
             for local_col in 0..cols {
                 let global_col = start + local_col;
                 basis[global_col] = 1.0;
-                let col = op.mul_vec(&basis);
-                rhs_block.slice_mut(ndarray::s![.., local_col]).assign(&col);
+                op.mul_vec_into(
+                    basis.view(),
+                    rhs_block.slice_mut(ndarray::s![.., local_col]),
+                );
                 basis[global_col] = 0.0;
             }
 
