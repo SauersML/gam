@@ -1461,6 +1461,7 @@ def run_rust_marginal_slope_classification(
     )
     print("\n".join(preflight.lines), file=sys.stderr, flush=True)
     preflight.require_pass()
+    ctn_t0 = time.perf_counter()
     ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
         rust_bin=rust_bin,
         spec=spec,
@@ -1469,6 +1470,7 @@ def run_rust_marginal_slope_classification(
         out_dir=out_dir,
         centers=centers,
     )
+    ctn_fit_sec = time.perf_counter() - ctn_t0
     print("\n".join(ctn_diagnostics), file=sys.stderr, flush=True)
     mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec, centers)
     z_column = spec.z_column or PGS_CTN_Z_COLUMN
@@ -1489,7 +1491,8 @@ def run_rust_marginal_slope_classification(
     fit_cmd.extend([str(ctn_train_csv), mean_formula])
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
-    fit_sec = time.perf_counter() - t0
+    disease_fit_sec = time.perf_counter() - t0
+    fit_sec = ctn_fit_sec + disease_fit_sec
     if rc != 0:
         raise RuntimeError(err.strip() or out.strip() or f"{spec.name} marginal-slope fit failed")
     pred_cmd = [str(rust_bin), "predict", str(model_path), str(ctn_test_csv), "--out", str(pred_path)]
@@ -1505,6 +1508,8 @@ def run_rust_marginal_slope_classification(
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
     return {
         "fit_sec": fit_sec,
+        "ctn_fit_sec": ctn_fit_sec,
+        "disease_fit_sec": disease_fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),

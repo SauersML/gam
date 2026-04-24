@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ndarray::{Array1, Array2, ArrayView2, s};
 
-use crate::families::scale_design::{ScaleDeviationTransform, apply_scale_deviation_transform};
+use crate::families::scale_design::ScaleDeviationTransform;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
     build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
@@ -21,16 +21,13 @@ use crate::families::survival_construction::{
     require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
     survival_likelihood_modename,
 };
-use crate::families::survival_location_scale::{
-    SurvivalLocationScalePredictInput, predict_survival_location_scale,
-};
 use crate::gamlss::buildwiggle_block_input_from_knots;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, load_survival_time_basis_config_from_model,
     survival_baseline_config_from_model,
 };
 use crate::inference::predict::predict_gam;
-use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+use crate::linalg::matrix::DesignMatrix;
 use crate::probability::normal_cdf;
 use crate::solver::estimate::UnifiedFitResult;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
@@ -234,18 +231,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     &r_deriv_exit,
                     primary_offset[i],
                 )?,
-                SurvivalLikelihoodMode::LocationScale => evaluate_location_scale_row(
-                    model,
-                    &row_time,
-                    &cov_row,
-                    &r_eta_exit,
-                    primary_offset[i],
-                    noise_offset[i],
-                    data,
-                    col_map,
-                    training_headers,
-                    i,
-                )?,
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
                     evaluate_rp_row(
                         model,
@@ -254,8 +239,10 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                         r_eta_exit[0] + primary_offset[i],
                     )?
                 }
-                SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary => {
-                    return Err("latent modes cannot reach evaluate_row".to_string());
+                SurvivalLikelihoodMode::Latent
+                | SurvivalLikelihoodMode::LatentBinary
+                | SurvivalLikelihoodMode::LocationScale => {
+                    return Err("unreachable: unsupported likelihood_mode filtered earlier".to_string());
                 }
             };
             if per_row_eval {
@@ -302,18 +289,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     &r_deriv_exit,
                     primary_offset[i],
                 )?,
-                SurvivalLikelihoodMode::LocationScale => evaluate_location_scale_row(
-                    model,
-                    &row_time,
-                    &cov_row,
-                    &r_eta_exit,
-                    primary_offset[i],
-                    noise_offset[i],
-                    data,
-                    col_map,
-                    training_headers,
-                    i,
-                )?,
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
                     evaluate_rp_row(
                         model,
@@ -322,8 +297,10 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                         r_eta_exit[0] + primary_offset[i],
                     )?
                 }
-                SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary => {
-                    return Err("latent modes cannot reach evaluate_row".to_string());
+                SurvivalLikelihoodMode::Latent
+                | SurvivalLikelihoodMode::LatentBinary
+                | SurvivalLikelihoodMode::LocationScale => {
+                    return Err("unreachable: unsupported likelihood_mode filtered earlier".to_string());
                 }
             };
             linear_predictor[i] = eta_t;
@@ -427,116 +404,6 @@ fn evaluate_marginal_slope_row(
         haz = 1e-12;
     }
     Ok((eta, cum, haz))
-}
-
-fn evaluate_location_scale_row(
-    model: &SavedModel,
-    row_time: &SurvivalTimeBuildOutput,
-    _cov_row: &Array1<f64>,
-    r_eta_exit: &Array1<f64>,
-    primary_offset_row: f64,
-    noise_offset_row: f64,
-    data: ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    row: usize,
-) -> Result<(f64, f64, f64), String> {
-    let saved_fit = saved_survival_location_scale_fit_result(model)?;
-    let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
-
-    let thresholdspec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    let threshold_design = build_term_collection_design(data, &thresholdspec)
-        .map_err(|e| format!("failed to build survival threshold design: {e}"))?;
-    let log_sigmaspec = resolve_termspec_for_prediction(
-        &model.resolved_termspec_noise,
-        training_headers,
-        col_map,
-        "resolved_termspec_noise",
-    )?;
-    let raw_sigma_design = build_term_collection_design(data, &log_sigmaspec)
-        .map_err(|e| format!("failed to build survival log-sigma design: {e}"))?;
-    let survival_noise_transform = scale_transform_from_payload(
-        &model.survival_noise_projection,
-        &model.survival_noise_center,
-        &model.survival_noise_scale,
-        model.survival_noise_non_intercept_start,
-    )?;
-    let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
-    let x_time_exit_dense = row_time.x_exit_time.to_dense();
-    let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
-        let mut full = Array2::<f64>::zeros((1, x_time_exit_dense.ncols() + runtime.beta.len()));
-        full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
-            .assign(&x_time_exit_dense);
-        full
-    } else {
-        x_time_exit_dense
-    };
-    let n = data.nrows();
-    let dense_threshold_design = threshold_design.design.to_dense();
-    let single_threshold_row = dense_threshold_design.row(row).to_owned();
-    let mut survival_primary_design =
-        Array2::<f64>::zeros((1, x_time_exit.ncols() + dense_threshold_design.ncols()));
-    survival_primary_design
-        .slice_mut(s![.., 0..x_time_exit.ncols()])
-        .assign(&x_time_exit);
-    survival_primary_design
-        .slice_mut(s![.., x_time_exit.ncols()..])
-        .row_mut(0)
-        .assign(&single_threshold_row);
-    let dense_raw_sigma = raw_sigma_design.design.to_dense();
-    let single_raw_sigma = dense_raw_sigma.row(row).to_owned();
-    let single_raw_sigma_mat =
-        Array2::from_shape_vec((1, dense_raw_sigma.ncols()), single_raw_sigma.to_vec())
-            .map_err(|e| format!("single-row sigma reshape failed: {e}"))?;
-    let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-        apply_scale_deviation_transform(&survival_primary_design, &single_raw_sigma_mat, transform)?
-    } else {
-        single_raw_sigma_mat
-    };
-
-    let link_wiggle_knots = model
-        .linkwiggle_knots
-        .as_ref()
-        .map(|k| Array1::from_vec(k.clone()));
-    let link_wiggle_degree = model.linkwiggle_degree;
-
-    let single_threshold_design = Array2::from_shape_vec(
-        (1, dense_threshold_design.ncols()),
-        single_threshold_row.to_vec(),
-    )
-    .map_err(|e| format!("single-row threshold reshape failed: {e}"))?;
-
-    let pred_input = SurvivalLocationScalePredictInput {
-        x_time_exit,
-        eta_time_offset_exit: Array1::from_elem(1, r_eta_exit[0]),
-        time_wiggle_knots: saved_timewiggle_runtime
-            .as_ref()
-            .map(|w| Array1::from_vec(w.knots.clone())),
-        time_wiggle_degree: saved_timewiggle_runtime.as_ref().map(|w| w.degree),
-        time_wiggle_ncols: saved_timewiggle_runtime
-            .as_ref()
-            .map_or(0, |w| w.beta.len()),
-        x_threshold: DesignMatrix::Dense(DenseDesignMatrix::from(single_threshold_design)),
-        eta_threshold_offset: Array1::from_elem(1, primary_offset_row),
-        x_log_sigma: DesignMatrix::Dense(DenseDesignMatrix::from(prepared_sigma_design)),
-        eta_log_sigma_offset: Array1::from_elem(1, noise_offset_row),
-        x_link_wiggle: None,
-        link_wiggle_knots,
-        link_wiggle_degree,
-        inverse_link: survival_inverse_link,
-    };
-    let pred = predict_survival_location_scale(&pred_input, &saved_fit)
-        .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
-    let eta = pred.eta[0];
-    let surv = pred.survival_prob[0].clamp(1e-300, 1.0);
-    let cum = -surv.ln();
-    let _ = n;
-    Ok((eta, cum, cum.max(1e-12)))
 }
 
 fn evaluate_rp_row(

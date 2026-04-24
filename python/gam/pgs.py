@@ -102,8 +102,8 @@ class PgsCalibration:
         """The Wilkinson-style formula used for the Stage-1 fit."""
         pc_args = ", ".join(self.pc_columns)
         duchon = (
-            f"duchon({pc_args}, k={self._resolved_centers}, "
-            f"m={self.duchon_order}, s={self.duchon_power}, "
+            f"duchon({pc_args}, centers={self._resolved_centers}, "
+            f"order={self.duchon_order}, power={self.duchon_power}, "
             f"length_scale={self.duchon_length_scale:g})"
         )
         return f"{self.pgs_column} ~ {duchon}"
@@ -224,7 +224,7 @@ def _to_1d_list(values: Any) -> list[float]:
     if np is not None and isinstance(values, np.ndarray):
         return [float(v) for v in values.reshape(-1).tolist()]
     if isinstance(values, dict):
-        for key in ("z", "z_score", "transformed", "mean"):
+        for key in ("z", "z_score", "transformed", "eta", "mean"):
             if key in values:
                 return [float(v) for v in values[key]]
         raise KeyError(

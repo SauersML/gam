@@ -1245,8 +1245,6 @@ fn transformation_monotonicity_response_grid(
     }
     let mut min_y = f64::INFINITY;
     let mut max_y = f64::NEG_INFINITY;
-    let mut sorted_response = response.to_vec();
-    sorted_response.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mut values = Vec::with_capacity(
         TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES
             + knots.len() * (TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS + 1)
@@ -1259,6 +1257,8 @@ fn transformation_monotonicity_response_grid(
         min_y = min_y.min(value);
         max_y = max_y.max(value);
     }
+    let mut sorted_response = response.to_vec();
+    sorted_response.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     if sorted_response.len() == 1 {
         values.push(sorted_response[0]);
     } else {

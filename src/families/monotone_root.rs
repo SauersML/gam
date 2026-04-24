@@ -4,8 +4,10 @@
 /// `eval(a)` must return `(F(a), F'(a), F''(a))`.  The second derivative is
 /// carried through for the caller but is not used by the solver itself.
 ///
-/// Returns `(root, |F'(root)|)`.  The absolute derivative is always positive
-/// and can be used directly as the density-normalising calibration derivative.
+/// Returns `(root, |F'(root)|, F(root))`.  The absolute derivative is always
+/// positive and can be used directly as the density-normalising calibration
+/// derivative.  Callers must validate the residual against the scale of their
+/// calibration equation.
 ///
 /// The monotone direction (increasing vs decreasing) is inferred from the
 /// sign of F'(a) at the initial point, so the same code handles both the
@@ -17,7 +19,7 @@ pub fn solve_monotone_root(
     convergence_tol: f64,
     max_bracket_iters: usize,
     max_refine_iters: usize,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64, f64), String> {
     let (f_init, f_deriv_init, _) = eval(a_init)?;
 
     // Exact root — rare but handle correctly.
@@ -28,7 +30,7 @@ pub fn solve_monotone_root(
                 "{label}: zero or non-finite derivative at exact root a={a_init:.6}"
             ));
         }
-        return Ok((a_init, abs_d));
+        return Ok((a_init, abs_d, f_init));
     }
 
     if !f_deriv_init.is_finite() || f_deriv_init == 0.0 {
@@ -208,7 +210,7 @@ pub fn solve_monotone_root(
         ));
     }
 
-    Ok((best_a, best_abs_deriv))
+    Ok((best_a, best_abs_deriv, best_f))
 }
 
 #[cfg(test)]
@@ -218,7 +220,7 @@ mod tests {
 
     #[test]
     fn solve_monotone_root_converges_for_increasing_function() {
-        let (root, abs_deriv) = solve_monotone_root(
+        let (root, abs_deriv, residual) = solve_monotone_root(
             |a| {
                 let ea = a.exp();
                 Ok((ea - 2.0, ea, ea))
@@ -233,12 +235,13 @@ mod tests {
 
         assert!((root - std::f64::consts::LN_2).abs() < 1e-10);
         assert!((abs_deriv - 2.0).abs() < 1e-10);
+        assert!(residual.abs() < 1e-12);
     }
 
     #[test]
     fn solve_monotone_root_accepts_halley_probe_for_decreasing_function() {
         let eval_points = RefCell::new(Vec::new());
-        let (root, abs_deriv) = solve_monotone_root(
+        let (root, abs_deriv, residual) = solve_monotone_root(
             |a| {
                 eval_points.borrow_mut().push(a);
                 let ea = (-a).exp();
@@ -259,6 +262,7 @@ mod tests {
             0.5 - (2.0 * f_mid * f_a_mid) / (2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid);
         assert!((root - std::f64::consts::LN_2).abs() < 1e-10);
         assert!((abs_deriv - 0.5).abs() < 1e-10);
+        assert!(residual.abs() < 1e-12);
         assert!(
             eval_points
                 .borrow()
