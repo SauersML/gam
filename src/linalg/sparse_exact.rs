@@ -824,13 +824,29 @@ impl TakahashiInverse {
         cache.entry(col).or_insert_with(|| solution.clone()).clone()
     }
 
+    fn selected_value(
+        z_values: &[f64],
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        row: usize,
+        col: usize,
+    ) -> Result<f64, EstimationError> {
+        let (lower_row, lower_col) = if row >= col { (row, col) } else { (col, row) };
+        Self::find_entry(col_ptr, row_idx, lower_row, lower_col)
+            .map(|idx| z_values[idx])
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "simplicial selected-inverse pattern is missing entry ({lower_row},{lower_col})"
+                ))
+            })
+    }
+
     /// Compute the selected inverse from a simplicial Cholesky factor.
     ///
-    /// Given H = LLᵀ in the permuted basis, this solves for the exact inverse
-    /// columns and stores the entries that live in the sparsity pattern of L.
-    /// Off-pattern exact entries are recovered later by cached column solves
-    /// from the same simplicial factor.
-    pub fn compute(factor: &SimplicialFactor) -> Self {
+    /// Given H = LLᵀ in the permuted basis, this applies the Takahashi
+    /// recurrence on the filled Cholesky pattern. Off-pattern exact entries are
+    /// recovered later by cached column solves from the same simplicial factor.
+    pub fn compute(factor: &SimplicialFactor) -> Result<Self, EstimationError> {
         let n = factor.n;
         let col_ptr = factor.l_col_ptr.clone();
         let row_idx = factor.l_row_idx.clone();
@@ -846,26 +862,35 @@ impl TakahashiInverse {
             }
         }
 
-        // Compute the exact inverse columns in the permuted basis and store the
-        // entries that live in the sparsity pattern of L. This preserves the
-        // public selected-inverse interface while avoiding recursion drift.
-        for j in 0..n {
-            let solution = Self::solve_permuted_column_from_cholesky(
-                n,
-                &col_ptr,
-                &row_idx,
-                &factor.l_values,
-                &rows_lower,
-                j,
-            );
-
+        for j in (0..n).rev() {
+            let diag_idx = col_ptr[j];
+            let diag = factor.l_values[diag_idx];
+            if !(diag.is_finite() && diag > 0.0) {
+                return Err(EstimationError::HessianNotPositiveDefinite {
+                    min_eigenvalue: f64::NAN,
+                });
+            }
             for idx in col_ptr[j]..col_ptr[j + 1] {
-                let row = row_idx[idx];
-                z_values[idx] = solution[row];
+                let i = row_idx[idx];
+                let rhs = if i == j { 1.0 / diag } else { 0.0 };
+                let mut correction = 0.0;
+                for off_idx in (diag_idx + 1)..col_ptr[j + 1] {
+                    let k = row_idx[off_idx];
+                    let l_kj = factor.l_values[off_idx];
+                    let z_ik = Self::selected_value(&z_values, &col_ptr, &row_idx, i, k)?;
+                    correction += l_kj * z_ik;
+                }
+                let value = (rhs - correction) / diag;
+                if !value.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "Takahashi selected inverse produced non-finite entry ({i},{j})"
+                    )));
+                }
+                z_values[idx] = value;
             }
         }
 
-        TakahashiInverse {
+        Ok(TakahashiInverse {
             z_values,
             col_ptr,
             row_idx,
@@ -874,7 +899,7 @@ impl TakahashiInverse {
             exact_columns: Mutex::new(BTreeMap::new()),
             perm_inv: factor.perm_inv.clone(),
             n,
-        }
+        })
     }
 
     /// Get H⁻¹[i,j] in ORIGINAL (unpermuted) coordinates.
@@ -909,11 +934,11 @@ impl TakahashiInverse {
     pub fn block(&self, start: usize, end: usize) -> Array2<f64> {
         let dim = end - start;
         let mut out = Array2::zeros((dim, dim));
-        let permuted_rows: Vec<usize> = (start..end).map(|idx| self.perm_inv[idx]).collect();
-        for (j_local, &pj) in permuted_rows.iter().enumerate() {
-            let column = self.exact_permuted_column(pj);
-            for (i_local, &pi) in permuted_rows.iter().enumerate() {
-                out[[i_local, j_local]] = column[pi];
+        for j_local in 0..dim {
+            let j = start + j_local;
+            for i_local in 0..dim {
+                let i = start + i_local;
+                out[[i_local, j_local]] = self.get(i, j);
             }
         }
         out
@@ -1021,7 +1046,7 @@ mod tests {
         }
 
         let sfactor = factorize_simplicial(&h_sparse).unwrap();
-        let taka = TakahashiInverse::compute(&sfactor);
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
         let diag = taka.diagonal();
 
         // Diagonal of selected inverse should match dense inverse diagonal
@@ -1078,7 +1103,7 @@ mod tests {
         let reference = h_inv[[1, 1]] * 2.0 + h_inv[[2, 2]] * 3.0;
 
         let sfactor = factorize_simplicial(&h_sparse).unwrap();
-        let taka = TakahashiInverse::compute(&sfactor);
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
         let taka_result = trace_hinv_sk_takahashi(&taka, &blocks[0]);
 
         approx_eq(taka_result, reference, 1e-10);
@@ -1106,7 +1131,7 @@ mod tests {
         }
 
         let sfactor = factorize_simplicial(&h_sparse).unwrap();
-        let taka = TakahashiInverse::compute(&sfactor);
+        let taka = TakahashiInverse::compute(&sfactor).unwrap();
 
         assert!(
             h_inv[[0, 2]].abs() > 1e-8,
