@@ -10973,6 +10973,67 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     .map_err(CustomFamilyError::Optimization)
 }
 
+pub(crate) fn fit_custom_family_fixed_log_lambdas<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    warm_start: Option<&CustomFamilyWarmStart>,
+    outer_iterations: usize,
+    outer_gradient_norm: f64,
+    outer_converged: bool,
+) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
+    let penalty_counts = validate_blockspecs(specs)?;
+    let rho = flatten_log_lambdas(specs);
+    let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    let mut inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        options,
+        warm_start.map(|warm| &warm.inner),
+    )?;
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let covariance_conditional =
+        compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block);
+    let penalized_objective = checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        if include_exact_newton_logdet_h(family, options) {
+            0.5 * inner.block_logdet_h
+        } else {
+            0.0
+        } - if include_exact_newton_logdet_s(family, options) {
+            0.5 * inner.block_logdet_s
+        } else {
+            0.0
+        },
+        "custom-family fixed-log-lambda fit",
+    )
+    .map_err(CustomFamilyError::Optimization)?;
+    let lambdas = rho.mapv(f64::exp);
+    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+    blockwise_fit_from_parts(
+        BlockwiseFitResultParts {
+            block_states: inner.block_states,
+            log_likelihood: inner.log_likelihood,
+            log_lambdas,
+            lambdas,
+            covariance_conditional,
+            penalized_objective,
+            outer_iterations,
+            outer_gradient_norm,
+            inner_cycles: inner.cycles,
+            outer_converged,
+            geometry,
+        },
+        specs,
+    )
+    .map_err(CustomFamilyError::Optimization)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
