@@ -1553,7 +1553,9 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
     let mut grad = Array1::<f64>::zeros(theta_dim);
     for i in 0..n {
         let partials_exit = marginal_slope_baseline_offset_theta_partials(age_exit[i], cfg)?
-            .ok_or_else(|| "unexpected None from marginal-slope baseline partials at exit".to_string())?;
+            .ok_or_else(|| {
+                "unexpected None from marginal-slope baseline partials at exit".to_string()
+            })?;
         if partials_exit.len() != theta_dim {
             return Err(format!(
                 "marginal_slope_baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
@@ -1570,13 +1572,10 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
 
         let r_e = residuals.entry[i];
         if r_e != 0.0 {
-            let partials_entry =
-                marginal_slope_baseline_offset_theta_partials(age_entry[i], cfg)?.ok_or_else(
-                    || {
-                        "unexpected None from marginal-slope baseline partials at entry"
-                            .to_string()
-                    },
-                )?;
+            let partials_entry = marginal_slope_baseline_offset_theta_partials(age_entry[i], cfg)?
+                .ok_or_else(|| {
+                    "unexpected None from marginal-slope baseline partials at entry".to_string()
+                })?;
             for k in 0..theta_dim {
                 grad[k] += r_e * partials_entry[k].0;
             }
@@ -2334,6 +2333,7 @@ mod tests {
         baseline_chain_rule_gradient, baseline_offset_theta_partials,
         build_survival_marginal_slope_baseline_offsets, build_survival_timewiggle_from_baseline,
         evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline,
+        marginal_slope_baseline_chain_rule_gradient,
         marginal_slope_baseline_offset_theta_partials, survival_baseline_config_from_theta,
         survival_baseline_theta_from_config, SurvivalBaselineConfig, SurvivalBaselineTarget,
     };
@@ -2499,6 +2499,57 @@ mod tests {
                 *fqt,
                 1e-5,
                 &format!("near-zero gm-probit q' theta[{k}]"),
+            );
+        }
+    }
+
+    #[test]
+    fn marginal_slope_baseline_chain_rule_gradient_contracts_probit_partials() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.03),
+            rate: Some(0.01),
+            makeham: Some(0.002),
+        };
+        let age_entry = array![3.0, 6.0];
+        let age_exit = array![8.0, 12.0];
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.7, -0.2],
+            entry: array![0.1, 0.4],
+            derivative: array![1.3, -0.6],
+        };
+        let grad = marginal_slope_baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("gradient")
+        .expect("nonlinear");
+
+        let mut expected = Array1::<f64>::zeros(3);
+        for i in 0..age_exit.len() {
+            let exit_partials =
+                marginal_slope_baseline_offset_theta_partials(age_exit[i], &cfg)
+                    .expect("exit partials")
+                    .expect("nonlinear");
+            let entry_partials =
+                marginal_slope_baseline_offset_theta_partials(age_entry[i], &cfg)
+                    .expect("entry partials")
+                    .expect("nonlinear");
+            for k in 0..3 {
+                expected[k] += residuals.exit[i] * exit_partials[k].0
+                    + residuals.derivative[i] * exit_partials[k].1
+                    + residuals.entry[i] * entry_partials[k].0;
+            }
+        }
+        for k in 0..3 {
+            assert_close(
+                grad[k],
+                expected[k],
+                1e-12,
+                &format!("gm-probit chain gradient theta[{k}]"),
             );
         }
     }

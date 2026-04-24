@@ -92,6 +92,8 @@ const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
 const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 const TRANSFORMATION_TAIL_GUARD_FRACTION: f64 = 0.25;
+const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
+const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
 
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
@@ -1242,14 +1244,34 @@ fn transformation_monotonicity_response_grid(
     }
     let mut min_y = f64::INFINITY;
     let mut max_y = f64::NEG_INFINITY;
-    let mut values = Vec::with_capacity(response.len() + knots.len() + 4);
+    let mut sorted_response = response.to_vec();
+    sorted_response.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut values = Vec::with_capacity(
+        TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES
+            + knots.len() * (TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS + 1)
+            + 4,
+    );
     for (i, &value) in response.iter().enumerate() {
         if !value.is_finite() {
             return Err(format!("response[{i}] is not finite: {value}"));
         }
         min_y = min_y.min(value);
         max_y = max_y.max(value);
-        values.push(value);
+    }
+    if sorted_response.len() == 1 {
+        values.push(sorted_response[0]);
+    } else {
+        let quantiles = sorted_response
+            .len()
+            .min(TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES);
+        for q in 0..quantiles {
+            let idx = if quantiles == 1 {
+                0
+            } else {
+                q * (sorted_response.len() - 1) / (quantiles - 1)
+            };
+            values.push(sorted_response[idx]);
+        }
     }
     for &knot in knots.iter() {
         if knot.is_finite() {
@@ -1259,6 +1281,20 @@ fn transformation_monotonicity_response_grid(
         }
     }
     let span = (max_y - min_y).abs().max(1.0);
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let base_values = values.clone();
+    for window in base_values.windows(2) {
+        let left = window[0];
+        let right = window[1];
+        let width = right - left;
+        if width <= 1.0e-12 * span {
+            continue;
+        }
+        for sidx in 1..TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS {
+            let frac = sidx as f64 / TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS as f64;
+            values.push(left + frac * width);
+        }
+    }
     let guard = TRANSFORMATION_TAIL_GUARD_FRACTION * span;
     values.push(min_y - guard);
     values.push(max_y + guard);
