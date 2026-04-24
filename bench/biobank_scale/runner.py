@@ -1527,6 +1527,7 @@ def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -
             f"unsupported marginal-slope spatial basis '{spec.spatial_basis}' (use duchon or matern)"
         )
     mean_terms = [
+        "link(type=probit)",
         "sex",
         "smooth(age_entry_std)",
         spatial,
@@ -1805,7 +1806,6 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
 
 def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir: Path) -> dict[str, Any]:
     rust_bin = load_or_build_rust_binary()
-    fit_formula = rust_survival_formula(spec)
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
     likelihood_mode = spec.survival_likelihood
@@ -1815,8 +1815,51 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         )
     train_rows_raw = read_csv_rows(train_csv)
     test_rows_raw = read_csv_rows(test_csv)
+    centers = int(spec.centers or 24)
+    ctn_fit_sec = 0.0
+    logslope_formula = None
+    fit_csv = train_csv
+    prediction_rows_raw = test_rows_raw
+    train_metric_rows_raw = train_rows_raw
+    if likelihood_mode == "marginal-slope":
+        centers = effective_marginal_slope_centers(spec, len(train_rows_raw))
+        preflight = preflight_marginal_slope_biobank(
+            n_train=len(train_rows_raw),
+            d_pc=int(spec.pc_count),
+            centers=centers,
+            linkwiggle_knots=spec.mean_linkwiggle_knots,
+            scorewarp_knots=spec.logslope_linkwiggle_knots,
+        )
+        print("\n".join(preflight.lines), file=sys.stderr, flush=True)
+        preflight.require_pass()
+        ctn_t0 = time.perf_counter()
+        ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
+            rust_bin=rust_bin,
+            spec=spec,
+            train_csv=train_csv,
+            test_csv=test_csv,
+            out_dir=out_dir,
+            centers=centers,
+        )
+        ctn_fit_sec = time.perf_counter() - ctn_t0
+        print("\n".join(ctn_diagnostics), file=sys.stderr, flush=True)
+        fit_csv = ctn_train_csv
+        train_metric_rows_raw = read_csv_rows(ctn_train_csv)
+        prediction_rows_raw = read_csv_rows(ctn_test_csv)
+        spatial = _biobank_duchon_pc_term(int(spec.pc_count), centers)
+        mean_terms = ["sex", "smooth(age_entry_std)", spatial]
+        if spec.timewiggle_knots is not None:
+            mean_terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
+        if spec.mean_linkwiggle_knots is not None:
+            mean_terms.append(f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})")
+        fit_formula = (
+            f"Surv({SURVIVAL_ENTRY_COLUMN}, time, event) ~ " + " + ".join(mean_terms)
+        )
+        logslope_formula = rust_survival_marginal_slope_logslope_formula(spec, centers)
+    else:
+        fit_formula = rust_survival_formula(spec)
     prediction_preflight = preflight_survival_prediction(
-        n_rows=max(len(train_rows_raw), len(test_rows_raw)),
+        n_rows=len(prediction_rows_raw),
         grid_points=len(
             _survival_score_grid(
                 np.array([float(r["time"]) for r in train_rows_raw], dtype=float)
@@ -1829,18 +1872,11 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     with tempfile.TemporaryDirectory(prefix="gam_biobank_survival_", dir=out_dir) as td:
         td_path = Path(td)
         train_fit_path = td_path / "train_fit.csv"
-        train_pred_input_path = td_path / "train_predict.csv"
         test_pred_input_path = td_path / "test_predict.csv"
-        train_pred_path = td_path / "trainpred.csv"
-        write_survival_benchmark_csv(train_fit_path, train_rows_raw)
-        write_survival_benchmark_csv(
-            train_pred_input_path,
-            train_rows_raw,
-            prediction_horizon=horizon,
-        )
+        write_survival_benchmark_csv(train_fit_path, read_csv_rows(fit_csv))
         write_survival_benchmark_csv(
             test_pred_input_path,
-            test_rows_raw,
+            prediction_rows_raw,
             prediction_horizon=horizon,
         )
         fit_cmd = [
@@ -1852,14 +1888,19 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             "--time-smooth-lambda", "0.01",
             "--ridge-lambda", "1e-6",
             "--out", str(model_path),
-            str(train_fit_path),
-            fit_formula,
         ]
-        if spec.timewiggle_knots is not None:
+        if likelihood_mode == "marginal-slope":
+            fit_cmd.extend(["--logslope-formula", logslope_formula or "1"])
+            fit_cmd.extend(["--z-column", spec.z_column or PGS_CTN_Z_COLUMN])
+            if spec.scale_dimensions:
+                fit_cmd.append("--scale-dimensions")
+        if spec.timewiggle_knots is not None or likelihood_mode == "marginal-slope":
             fit_cmd.extend(["--baseline-target", "gompertz-makeham"])
+        fit_cmd.extend([str(train_fit_path), fit_formula])
         t0 = time.perf_counter()
         rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
-        fit_sec = time.perf_counter() - t0
+        survival_fit_sec = time.perf_counter() - t0
+        fit_sec = ctn_fit_sec + survival_fit_sec
         if rc != 0:
             raise RuntimeError(err.strip() or out.strip() or f"{spec.name} fit failed")
         pred_cmd = [str(rust_bin), "predict", str(model_path), str(test_pred_input_path), "--out", str(pred_path)]
@@ -1868,27 +1909,50 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         predict_sec = time.perf_counter() - t1
         if rc != 0:
             raise RuntimeError(err.strip() or out.strip() or f"{spec.name} predict failed")
-        pred_rows = read_csv_rows(pred_path)
-        risk_cols = ["failure_prob", "risk_score", "eta"]
-        risk_key = next((k for k in risk_cols if k in pred_rows[0]), None)
-        if risk_key is None:
-            raise RuntimeError(f"{spec.name} prediction output missing risk column")
-        test_risk = np.array([float(r[risk_key]) for r in pred_rows], dtype=float)
-        pred_train_cmd = [str(rust_bin), "predict", str(model_path), str(train_pred_input_path), "--out", str(train_pred_path)]
-        rc, out, err = run_cmd_stream(pred_train_cmd, cwd=ROOT)
-        if rc != 0:
-            raise RuntimeError(err.strip() or out.strip() or f"{spec.name} train predict failed")
-        train_pred_rows = read_csv_rows(train_pred_path)
-        train_risk = np.array([float(r[risk_key]) for r in train_pred_rows], dtype=float)
-    train_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in train_rows_raw]
-    test_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in test_rows_raw]
-    metrics = survival_metrics(train_rows, test_rows, train_risk, test_risk)
+        survival_grid = _survival_score_grid(
+            np.array([float(r["time"]) for r in train_rows_raw], dtype=float)
+        )
+        native_t0 = time.perf_counter()
+        native_survival, native_pred_path = predict_native_survival_matrix(
+            rust_bin=rust_bin,
+            spec=spec,
+            model_path=model_path,
+            base_rows=prediction_rows_raw,
+            grid=survival_grid,
+            out_dir=out_dir,
+        )
+        predict_sec += time.perf_counter() - native_t0
+    train_rows = [
+        {k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()}
+        for r in train_metric_rows_raw
+    ]
+    test_rows = [
+        {k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()}
+        for r in prediction_rows_raw
+    ]
+    metrics = survival_metrics_from_native_probabilities(
+        train_rows,
+        test_rows,
+        survival_grid,
+        native_survival,
+    )
     return {
         "fit_sec": fit_sec,
+        "ctn_fit_sec": ctn_fit_sec,
+        "survival_fit_sec": survival_fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),
-        "model_spec": f"{fit_formula} [survival-likelihood={likelihood_mode}; predict_horizon={horizon:.6g}]",
+        "native_grid_prediction_path": str(native_pred_path),
+        "model_spec": (
+            f"{fit_formula} [survival-likelihood={likelihood_mode}; "
+            + (
+                f"logslope={logslope_formula}; z={spec.z_column or PGS_CTN_Z_COLUMN}; "
+                if likelihood_mode == "marginal-slope"
+                else ""
+            )
+            + f"native survival probability scoring; predict_horizon={horizon:.6g}; centers={centers}]"
+        ),
     }
 
 
