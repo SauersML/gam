@@ -4995,12 +4995,6 @@ impl StoredFirstDrift {
         }
     }
 
-    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(v.len());
-        self.scaled_add_apply(v.view(), 1.0, &mut out);
-        out
-    }
-
     fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
         debug_assert_eq!(v.len(), out.len());
         if scale == 0.0 {
