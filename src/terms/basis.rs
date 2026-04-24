@@ -6361,6 +6361,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     ),
     BasisError,
 > {
+    let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     // Notation and conventions:
     //   ψ_b = aniso_log_scales[b] (log-scale parameter for axis b)
     //   w_b = exp(2ψ_b)  (metric weight for axis b)
@@ -7257,6 +7258,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
+    let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
     let p_colloc = centers.nrows();
@@ -9825,12 +9827,14 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 .to_string(),
         )
     })?;
-    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     validate_duchon_collocation_orders(Some(length_scale), p_order, s_order, centers.ncols())?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z_kernel =
-        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
+        kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let p = centers.nrows();
     let d = centers.ncols();
     let mut d0_raw = Array2::<f64>::zeros((p, z_kernel.ncols()));
@@ -9980,7 +9984,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
         }
     }
 
-    let poly = polynomial_block_from_order(centers, spec.nullspace_order);
+    let poly = polynomial_block_from_order(centers, effective_nullspace_order);
     let kernel_cols = d0_raw.ncols();
     let poly_cols = poly.ncols();
     let total_cols = kernel_cols + poly_cols;
@@ -10567,15 +10571,17 @@ fn build_duchon_design_psi_aniso_derivatives(
         )));
     }
 
-    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     let kappa = 1.0 / length_scale.max(1e-300);
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
 
     // Z_kernel: null-space constraint projection for Duchon polynomial conditions.
     let z_kernel =
-        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
-    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+        kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
 
     // Determine output dimension to decide dense vs implicit.
     let p_constrained = z_kernel.ncols();
@@ -10722,9 +10728,11 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     }
     let mut workspace = BasisWorkspace::default();
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let z_kernel =
-        kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
-    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+        kernel_constraint_nullspace(centers.view(), effective_nullspace_order, &mut workspace.cache)?;
+    let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let p_padded = z_kernel.ncols() + poly_cols;
     let identifiability_transform =
         frozen_spatial_identifiability_transform(&spec.identifiability, p_padded, "Duchon")?;
@@ -10732,7 +10740,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         .as_ref()
         .map(|transform| transform.ncols())
         .unwrap_or(p_padded);
-    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     validate_duchon_collocation_orders(None, p_order, s_order, dim)?;
     let block_order = pure_duchon_block_order(p_order, s_order);
@@ -10765,7 +10773,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         centers.view(),
         None,
         spec.power,
-        spec.nullspace_order,
+        effective_nullspace_order,
         raw_eta,
         identifiability_transform.as_ref(),
         &mut workspace,
@@ -10809,6 +10817,8 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
     let mut workspace = BasisWorkspace::default();
     let (centers, identifiability_transform) =
         prepare_duchon_derivative_contextwithworkspace(data, spec, &mut workspace)?;
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
 
     let mut result = build_duchon_design_psi_aniso_derivatives(
         data,
@@ -10824,7 +10834,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         centers.view(),
         Some(length_scale),
         spec.power,
-        spec.nullspace_order,
+        effective_nullspace_order,
         eta,
         identifiability_transform.as_ref(),
         &mut workspace,
@@ -11961,13 +11971,15 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     // 2. project the kernel block with the same nullspace constraint used by the basis
     // 3. append polynomial columns; their psi derivatives are zero because p and s are fixed
     // 4. apply any frozen identifiability transform
-    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
     let kappa = 1.0 / length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel =
-        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
-    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+        kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let p_padded = z_kernel.ncols() + poly_cols;
     if let Some(zf) = identifiability_transform
         && p_padded != zf.nrows()
