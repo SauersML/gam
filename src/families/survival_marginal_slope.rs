@@ -2918,12 +2918,18 @@ impl SurvivalMarginalSlopeFamily {
             && deriv.s_psi_psi.is_none()
     }
 
-    fn sigma_scale_jet(&self, n_dirs: usize, first_masks: &[usize], second_masks: &[usize]) -> Result<MultiDirJet, String> {
+    fn sigma_scale_jet(
+        &self,
+        n_dirs: usize,
+        first_masks: &[usize],
+        second_masks: &[usize],
+    ) -> Result<MultiDirJet, String> {
         let sigma = self.gaussian_frailty_sd.ok_or_else(|| {
             "survival marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
                 .to_string()
         })?;
-        let jet = crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
+        let jet =
+            crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
         let mut coeffs = Vec::with_capacity(1 + first_masks.len() + second_masks.len());
         coeffs.push((0usize, jet.s));
         coeffs.extend(first_masks.iter().copied().map(|mask| (mask, jet.ds)));
@@ -3100,7 +3106,7 @@ impl SurvivalMarginalSlopeFamily {
     fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if self.flex_active() {
             return Err(
@@ -3129,7 +3135,8 @@ impl SurvivalMarginalSlopeFamily {
                     )
                 },
                 |mut a, row| -> Result<_, String> {
-                    let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, false)?;
+                    let (obj, grad, hess) =
+                        self.row_sigma_primary_terms(row, block_states, false)?;
                     a.0 += obj;
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                     self.accumulate_score_with_q_geometry(
@@ -3164,7 +3171,9 @@ impl SurvivalMarginalSlopeFamily {
             )?;
 
         let mut score_psi = Array1::zeros(slices.total);
-        score_psi.slice_mut(s![slices.time.clone()]).assign(&score_t);
+        score_psi
+            .slice_mut(s![slices.time.clone()])
+            .assign(&score_t);
         score_psi
             .slice_mut(s![slices.marginal.clone()])
             .assign(&score_m);
@@ -3214,7 +3223,8 @@ impl SurvivalMarginalSlopeFamily {
                     )
                 },
                 |mut a, row| -> Result<_, String> {
-                    let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, true)?;
+                    let (obj, grad, hess) =
+                        self.row_sigma_primary_terms(row, block_states, true)?;
                     a.0 += obj;
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                     self.accumulate_score_with_q_geometry(
@@ -12621,10 +12631,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return self.sigma_exact_joint_psihessian_directional_derivative(
-                block_states,
-                d_beta_flat,
-            );
+            return self
+                .sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat);
         }
         self.psi_hessian_directional_derivative(
             block_states,
@@ -13649,7 +13657,9 @@ pub fn fit_survival_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma_from_theta(theta));
+            let sigma = sigma_from_theta(theta);
+            sigma_hint.replace(sigma);
+            let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
@@ -13677,7 +13687,9 @@ pub fn fit_survival_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma_from_theta(theta));
+            let sigma = sigma_from_theta(theta);
+            sigma_hint.replace(sigma);
+            let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
@@ -13693,7 +13705,8 @@ pub fn fit_survival_marginal_slope_terms(
     )?;
 
     let baseline_offset_residuals = {
-        let final_family = make_family(&solved.designs[0], &solved.designs[1], *sigma_hint.borrow());
+        let final_family =
+            make_family(&solved.designs[0], &solved.designs[1], *sigma_hint.borrow());
         final_family.offset_channel_residuals(&solved.fit.block_states)?
     };
     let mut resolved_specs = solved.resolved_specs;
@@ -14635,8 +14648,6 @@ mod tests {
 
     #[test]
     fn link_flex_marginal_psi_terms_return_finite_joint_terms() {
-        let score_runtime = test_deviation_runtime();
-        let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
         let logslope_beta = array![0.2];
@@ -14655,8 +14666,8 @@ mod tests {
             derivative_offset_exit: Arc::new(array![0.9]),
             marginal_design: DesignMatrix::from(marginal_design.clone()),
             logslope_design: DesignMatrix::from(array![[1.0]]),
-            score_warp: Some(score_runtime.clone()),
-            link_dev: Some(link_runtime.clone()),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -15183,7 +15194,7 @@ mod tests {
     }
 
     #[test]
-    fn sigma_exact_joint_psi_terms_rejects_production_finite_differences() {
+    fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
@@ -15225,34 +15236,21 @@ mod tests {
                 beta: logslope_beta.clone(),
                 eta: logslope_beta.clone(),
             },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_runtime.basis_dim()).map(|idx| 0.02 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(1),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_runtime.basis_dim()).map(|idx| -0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(1),
-            },
         ];
         let specs = vec![
             dummy_blockspec(1),
             dummy_blockspec(marginal_design.ncols()),
             dummy_blockspec(1),
-            dummy_blockspec(score_runtime.basis_dim()),
-            dummy_blockspec(link_runtime.basis_dim()),
         ];
 
-        let error = family
+        let terms = family
             .sigma_exact_joint_psi_terms(&block_states, &specs)
-            .expect_err("sigma psi terms should require analytic derivatives");
-        assert!(
-            error.contains("production finite differences are disabled"),
-            "{error}"
-        );
+            .expect("sigma psi terms should evaluate analytically")
+            .expect("sigma psi terms should be present");
+        assert!(terms.objective_psi.is_finite());
+        assert_eq!(terms.score_psi.len(), block_slices(&family, &block_states).total);
+        assert!(terms.score_psi.iter().all(|value| value.is_finite()));
+        assert!(terms.hessian_psi_operator.is_some());
     }
 
     #[test]

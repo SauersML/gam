@@ -38,7 +38,7 @@ use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::resource::ResourcePolicy;
+use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -47,7 +47,7 @@ use crate::smooth::{
     sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
-use ndarray::{Array1, Array2, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -112,7 +112,6 @@ pub struct TransformationWarmStart {
 // TODO(tensor-psi-map-migration): wire PsiDesignMap for covariate once sibling
 // agent lands; currently the covariate factor is held as an owned Array2 so
 // the type compiles standalone.
-#[allow(dead_code)]
 pub(crate) enum TensorPsiKronMap {
     Zero {
         nrows: usize,
@@ -573,10 +572,7 @@ fn factored_weighted_cross(
                 pair_weights[r] = weights[r] * a_col[r] * c_col[r];
             }
             let block = chunked_weighted_bt_d(b, pair_weights.view(), d, policy);
-            let mut slice = out.slice_mut(s![
-                ia * pb..(ia + 1) * pb,
-                ic * pd..(ic + 1) * pd
-            ]);
+            let mut slice = out.slice_mut(s![ia * pb..(ia + 1) * pb, ic * pd..(ic + 1) * pd]);
             slice.assign(&block);
         }
     }
@@ -595,10 +591,8 @@ fn chunked_weighted_bt_d(
     let n = weights.len();
     let pb = b.ncols();
     let pd = d.ncols();
-    let rows_per_chunk = crate::resource::rows_for_target_bytes(
-        policy.row_chunk_target_bytes,
-        pb + pd,
-    );
+    let rows_per_chunk =
+        crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
     let mut out = Array2::<f64>::zeros((pb, pd));
     for start in (0..n).step_by(rows_per_chunk) {
         let end = (start + rows_per_chunk).min(n);
@@ -1091,69 +1085,113 @@ impl CustomFamily for TransformationNormalFamily {
             // TODO(ctn-factored-migration): thread ResourcePolicy through this
             // API rather than defaulting per call site.
             let policy = ResourcePolicy::default_library();
-            let cov_design_dense = op
-                .covariate_design
-                .as_dense_ref()
-                .ok_or_else(|| {
-                    "TransformationNormalFamily exact Hessian requires dense covariate design"
-                        .to_string()
-                })?;
-            let cov_i = op
-                .materialize_cov_first(axis_i)
-                .map_err(|e| format!("tensor psi second-order materialize_cov_first(i) failed: {e}"))?;
-            let cov_j = op
-                .materialize_cov_first(axis_j)
-                .map_err(|e| format!("tensor psi second-order materialize_cov_first(j) failed: {e}"))?;
-            let cov_ij = op
-                .materialize_cov_second(axis_i, axis_j)
-                .map_err(|e| format!("tensor psi second-order materialize_cov_second failed: {e}"))?;
+            let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
+                "TransformationNormalFamily exact Hessian requires dense covariate design"
+                    .to_string()
+            })?;
+            let cov_i = op.materialize_cov_first(axis_i).map_err(|e| {
+                format!("tensor psi second-order materialize_cov_first(i) failed: {e}")
+            })?;
+            let cov_j = op.materialize_cov_first(axis_j).map_err(|e| {
+                format!("tensor psi second-order materialize_cov_first(j) failed: {e}")
+            })?;
+            let cov_ij = op.materialize_cov_second(axis_i, axis_j).map_err(|e| {
+                format!("tensor psi second-order materialize_cov_second failed: {e}")
+            })?;
 
             let resp_val = op.response_val_basis.as_ref();
             let resp_deriv = op.response_deriv_basis.as_ref();
             let w_view = self.weights.view();
             let w_inv_h2_view = weighted_inv_h_prime_sq.view();
 
-            let mut hess = factored_weighted_cross(
-                resp_val, &cov_i, w_view, resp_val, &cov_j, &policy,
+            let mut hess =
+                factored_weighted_cross(resp_val, &cov_i, w_view, resp_val, &cov_j, &policy)?;
+            hess += &factored_weighted_cross(resp_val, &cov_j, w_view, resp_val, &cov_i, &policy)?;
+            hess += &factored_weighted_cross(
+                resp_val,
+                &cov_ij,
+                w_view,
+                resp_val,
+                cov_design_dense,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_val, &cov_j, w_view, resp_val, &cov_i, &policy,
+                resp_val,
+                cov_design_dense,
+                w_view,
+                resp_val,
+                &cov_ij,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_val, &cov_ij, w_view, resp_val, cov_design_dense, &policy,
+                resp_deriv,
+                &cov_i,
+                w_inv_h2_view,
+                resp_deriv,
+                &cov_j,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_val, cov_design_dense, w_view, resp_val, &cov_ij, &policy,
+                resp_deriv,
+                &cov_j,
+                w_inv_h2_view,
+                resp_deriv,
+                &cov_i,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_deriv, &cov_i, w_inv_h2_view, resp_deriv, &cov_j, &policy,
+                resp_deriv,
+                &cov_ij,
+                w_inv_h2_view,
+                resp_deriv,
+                cov_design_dense,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_deriv, &cov_j, w_inv_h2_view, resp_deriv, &cov_i, &policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv, &cov_ij, w_inv_h2_view, resp_deriv, cov_design_dense, &policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv, cov_design_dense, w_inv_h2_view, resp_deriv, &cov_ij, &policy,
+                resp_deriv,
+                cov_design_dense,
+                w_inv_h2_view,
+                resp_deriv,
+                &cov_ij,
+                &policy,
             )?;
 
             let cubic_i =
                 ((&v_j_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
-                resp_deriv, &cov_i, cubic_i.view(), resp_deriv, cov_design_dense, &policy,
+                resp_deriv,
+                &cov_i,
+                cubic_i.view(),
+                resp_deriv,
+                cov_design_dense,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_deriv, cov_design_dense, cubic_i.view(), resp_deriv, &cov_i, &policy,
+                resp_deriv,
+                cov_design_dense,
+                cubic_i.view(),
+                resp_deriv,
+                &cov_i,
+                &policy,
             )?;
 
             let cubic_j =
                 ((&v_i_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
-                resp_deriv, &cov_j, cubic_j.view(), resp_deriv, cov_design_dense, &policy,
+                resp_deriv,
+                &cov_j,
+                cubic_j.view(),
+                resp_deriv,
+                cov_design_dense,
+                &policy,
             )?;
             hess += &factored_weighted_cross(
-                resp_deriv, cov_design_dense, cubic_j.view(), resp_deriv, &cov_j, &policy,
+                resp_deriv,
+                cov_design_dense,
+                cubic_j.view(),
+                resp_deriv,
+                &cov_j,
+                &policy,
             )?;
 
             let cubic_second =
@@ -1213,24 +1251,30 @@ impl CustomFamily for TransformationNormalFamily {
         // covariate_factor) pairs instead of materializing n x p_out.
         // TODO(ctn-factored-migration): thread ResourcePolicy through this API.
         let policy = ResourcePolicy::default_library();
-        let cov_design_dense = op
-            .covariate_design
-            .as_dense_ref()
-            .ok_or_else(|| {
-                "TransformationNormalFamily hessian drift requires dense covariate design"
-                    .to_string()
-            })?;
-        let cov_psi = op.materialize_cov_first(axis).map_err(|e| {
-            format!("tensor psi hessian drift materialize_cov_first failed: {e}")
+        let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
+            "TransformationNormalFamily hessian drift requires dense covariate design".to_string()
         })?;
+        let cov_psi = op
+            .materialize_cov_first(axis)
+            .map_err(|e| format!("tensor psi hessian drift materialize_cov_first failed: {e}"))?;
         let resp_deriv = op.response_deriv_basis.as_ref();
 
         let cubic_h = ((&d_h_prime * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
         let mut hess = factored_weighted_cross(
-            resp_deriv, &cov_psi, cubic_h.view(), resp_deriv, cov_design_dense, &policy,
+            resp_deriv,
+            &cov_psi,
+            cubic_h.view(),
+            resp_deriv,
+            cov_design_dense,
+            &policy,
         )?;
         hess += &factored_weighted_cross(
-            resp_deriv, cov_design_dense, cubic_h.view(), resp_deriv, &cov_psi, &policy,
+            resp_deriv,
+            cov_design_dense,
+            cubic_h.view(),
+            resp_deriv,
+            &cov_psi,
+            &policy,
         )?;
 
         let cubic_v = ((&d_v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
@@ -1810,11 +1854,8 @@ impl KroneckerDesign {
                             pair_weights[r] = weights[r] * a_col[r] * c_col[r];
                         }
                         let block = weighted_crossprod_operator(b, &pair_weights, d)?;
-                        out.slice_mut(s![
-                            ia * pb..(ia + 1) * pb,
-                            ic * pd..(ic + 1) * pd
-                        ])
-                        .assign(&block);
+                        out.slice_mut(s![ia * pb..(ia + 1) * pb, ic * pd..(ic + 1) * pd])
+                            .assign(&block);
                     }
                 }
                 // TODO(ctn-factored-migration): chunk the operator fallback once
@@ -1861,7 +1902,16 @@ unsafe impl Send for KroneckerDesign {}
 unsafe impl Sync for KroneckerDesign {}
 
 impl DenseDesignOperator for KroneckerDesign {
-    fn row_chunk(&self, rows: std::ops::Range<usize>) -> Array2<f64> {
+    fn row_chunk_into(
+        &self,
+        rows: std::ops::Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "KroneckerDesign::row_chunk_into shape mismatch",
+            });
+        }
         match self {
             KroneckerDesign::Factored { left, right } => {
                 assert_rowwise_kronecker_dimensions(
@@ -1872,9 +1922,10 @@ impl DenseDesignOperator for KroneckerDesign {
                 );
                 let left_chunk = left.slice(s![rows.clone(), ..]).to_owned();
                 let right_chunk = right.row_chunk(rows);
-                rowwise_kronecker(&left_chunk, &right_chunk)
+                out.assign(&rowwise_kronecker(&left_chunk, &right_chunk));
             }
         }
+        Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
