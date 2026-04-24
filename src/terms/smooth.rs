@@ -4550,7 +4550,6 @@ fn with_identifiability_transform(
             )?,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
         }),
         BasisMetadata::Duchon {
             centers,
@@ -10107,7 +10106,7 @@ fn has_aniso_terms(resolvedspec: &TermCollectionSpec, spatial_terms: &[usize]) -
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SingleBlockExactJointDesignCache<'d> {
     realizer: FrozenTermCollectionIncrementalRealizer<'d>,
     current_theta: Option<Array1<f64>>,

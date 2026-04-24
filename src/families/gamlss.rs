@@ -4846,7 +4846,6 @@ fn gaussian_joint_psihessian_fromweights(
     x_ls_psi: CustomFamilyPsiLinearMapRef<'_>,
     weights: &GaussianJointPsiFirstWeights,
 ) -> Result<Array2<f64>, String> {
-    let policy = crate::resource::ResourcePolicy::default_library();
     // For the symmetric blocks (hmumu, h_ls_ls), the pair
     //   X_psi^T D X  and  X^T D X_psi
     // are transposes of each other, so compute one and add its transpose.
@@ -4854,25 +4853,21 @@ fn gaussian_joint_psihessian_fromweights(
         xmu_psi,
         weights.hmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let hmumu = &a_mu + &a_mu.t() + &xt_diag_x_dense(xmu, &weights.dhmumu)?;
     let hmu_ls = weighted_crossprod_psi_maps(
         xmu_psi,
         weights.hmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         CustomFamilyPsiLinearMapRef::Dense(xmu),
         weights.hmu_ls.view(),
         x_ls_psi,
-        &policy,
     )? + &xt_diag_y_dense(xmu, &weights.dhmu_ls, x_ls)?;
     let a_ls = weighted_crossprod_psi_maps(
         x_ls_psi,
         weights.h_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
     let h_ls_ls = &a_ls + &a_ls.t() + &xt_diag_x_dense(x_ls, &weights.dh_ls_ls)?;
     Ok(gaussian_pack_joint_symmetrichessian(
@@ -4953,7 +4948,6 @@ fn gaussian_joint_psisecondhessian_fromweights(
     weights_j: &GaussianJointPsiFirstWeights,
     secondweights: &GaussianJointPsiSecondWeights,
 ) -> Result<Array2<f64>, String> {
-    let policy = crate::resource::ResourcePolicy::default_library();
     // Exploit transpose symmetry: X_a^T D X_b and X_b^T D X_a are transposes.
     // For each such pair in the symmetric blocks (hmumu, h_ls_ls), compute one
     // and add its transpose, halving the number of O(np²) products.
@@ -4961,20 +4955,17 @@ fn gaussian_joint_psisecondhessian_fromweights(
         xmu_ab,
         weights_i.hmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
-    let a_ij_mu = weighted_crossprod_psi_maps(xmu_i, weights_i.hmumu.view(), xmu_j, &policy)?;
+    let a_ij_mu = weighted_crossprod_psi_maps(xmu_i, weights_i.hmumu.view(), xmu_j)?;
     let a_iwj_mu = weighted_crossprod_psi_maps(
         xmu_i,
         weights_j.dhmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let a_jwi_mu = weighted_crossprod_psi_maps(
         xmu_j,
         weights_i.dhmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let hmumu = &a_ab_mu
         + &a_ab_mu.t()
@@ -4989,64 +4980,51 @@ fn gaussian_joint_psisecondhessian_fromweights(
         xmu_ab,
         weights_i.hmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         xmu_i,
         weights_i.hmu_ls.view(),
         x_ls_j,
-        &policy,
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         xmu_j,
         weights_i.hmu_ls.view(),
         x_ls_i,
-        &policy,
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         xmu_i,
         weights_j.dhmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         xmu_j,
         weights_i.dhmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         CustomFamilyPsiLinearMapRef::Dense(xmu),
         weights_i.dhmu_ls.view(),
         x_ls_j,
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         CustomFamilyPsiLinearMapRef::Dense(xmu),
         weights_j.dhmu_ls.view(),
         x_ls_i,
-        &policy,
     )? + &xt_diag_y_dense(xmu, &secondweights.d2hmu_ls, x_ls)?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_i.hmu_ls.view(),
             x_ls_ab,
-            &policy,
         )?;
     let a_ab_ls = weighted_crossprod_psi_maps(
         x_ls_ab,
         weights_i.h_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
-    let a_ij_ls = weighted_crossprod_psi_maps(x_ls_i, weights_i.h_ls_ls.view(), x_ls_j, &policy)?;
+    let a_ij_ls = weighted_crossprod_psi_maps(x_ls_i, weights_i.h_ls_ls.view(), x_ls_j)?;
     let a_iwj_ls = weighted_crossprod_psi_maps(
         x_ls_i,
         weights_j.dh_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
     let a_jwi_ls = weighted_crossprod_psi_maps(
         x_ls_j,
         weights_i.dh_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
     let h_ls_ls = &a_ab_ls
         + &a_ab_ls.t()
@@ -5069,30 +5047,25 @@ fn gaussian_joint_psi_mixedhessian_drift_fromweights(
     x_ls_psi: CustomFamilyPsiLinearMapRef<'_>,
     mixedweights: &GaussianJointPsiMixedDriftWeights,
 ) -> Result<Array2<f64>, String> {
-    let policy = crate::resource::ResourcePolicy::default_library();
     let a_mu = weighted_crossprod_psi_maps(
         xmu_psi,
         mixedweights.dhmumu_u.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let hmumu = &a_mu + &a_mu.t() + &xt_diag_x_dense(xmu, &mixedweights.d2hmumu)?;
     let hmu_ls = weighted_crossprod_psi_maps(
         xmu_psi,
         mixedweights.dhmu_ls_u.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )? + &weighted_crossprod_psi_maps(
         CustomFamilyPsiLinearMapRef::Dense(xmu),
         mixedweights.dhmu_ls_u.view(),
         x_ls_psi,
-        &policy,
     )? + &xt_diag_y_dense(xmu, &mixedweights.d2hmu_ls, x_ls)?;
     let a_ls = weighted_crossprod_psi_maps(
         x_ls_psi,
         mixedweights.dh_ls_ls_u.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
     let h_ls_ls = &a_ls + &a_ls.t() + &xt_diag_x_dense(x_ls, &mixedweights.d2h_ls_ls)?;
     Ok(gaussian_pack_joint_symmetrichessian(
@@ -5495,7 +5468,6 @@ impl GaussianLocationScaleFamily {
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
 
         let mut global = 0usize;
-        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
@@ -5511,7 +5483,6 @@ impl GaussianLocationScaleFamily {
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleFamily mu",
-                                &policy,
                             )?;
                             zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
                                 format!("GaussianLocationScaleFamily mu forward_mul: {e}")
@@ -5529,7 +5500,6 @@ impl GaussianLocationScaleFamily {
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleFamily log-sigma",
-                                &policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
@@ -6873,7 +6843,6 @@ impl GaussianLocationScaleWiggleFamily {
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
 
         let mut global = 0usize;
-        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
@@ -6889,7 +6858,6 @@ impl GaussianLocationScaleWiggleFamily {
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily mu",
-                                &policy,
                             )?;
                             zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
                                 format!("GaussianLocationScaleWiggleFamily mu forward_mul: {e}")
@@ -6907,7 +6875,6 @@ impl GaussianLocationScaleWiggleFamily {
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily log-sigma",
-                                &policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!(
@@ -7352,45 +7319,37 @@ impl GaussianLocationScaleWiggleFamily {
         let c_a = -&dm_a;
         let l = 2.0 * &rows.m;
         let l_a = 2.0 * &dm_a;
-
-        let policy = crate::resource::ResourcePolicy::default_library();
         let h_mm_a1 = weighted_crossprod_psi_maps(
             xmu_map,
             coeff_mm.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
         let h_mm = &h_mm_a1 + &h_mm_a1.t() + &xt_diag_x_dense(xmu, &coeff_mm_a)?;
         let h_ml = weighted_crossprod_psi_maps(
             xmu_map,
             coeff_ml.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             coeff_ml.view(),
             x_ls_map,
-            &policy,
         )? + &xt_diag_y_dense(xmu, &coeff_ml_a, x_ls)?;
         let h_ll_a1 = weighted_crossprod_psi_maps(
             x_ls_map,
             coeff_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
         let h_ll = &h_ll_a1 + &h_ll_a1.t() + &xt_diag_x_dense(x_ls, &coeff_ll_a)?;
         let h_mw = weighted_crossprod_psi_maps(
             xmu_map,
             a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &xt_diag_y_dense(xmu, &a_a, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a, &basis_a)?
             + &weighted_crossprod_psi_maps(
                 xmu_map,
                 c.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&geom.basis_d1),
-                &policy,
             )?
             + &xt_diag_y_dense(xmu, &c_a, &geom.basis_d1)?
             + &xt_diag_y_dense(xmu, &c, &basis1_a)?;
@@ -7398,7 +7357,6 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls_map,
             l.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &xt_diag_y_dense(x_ls, &l_a, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l, &basis_a)?;
         let h_ww_a1 = xt_diag_y_dense(&basis_a, &rows.w, &geom.basis)?;
@@ -7464,7 +7422,6 @@ impl GaussianLocationScaleWiggleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
-        let policy = crate::resource::ResourcePolicy::default_library();
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -7617,20 +7574,17 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_ab_map,
             coeff_mm.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
-        let hmm_ij = weighted_crossprod_psi_maps(xmu_a_map, coeff_mm.view(), xmu_b_map, &policy)?;
+        let hmm_ij = weighted_crossprod_psi_maps(xmu_a_map, coeff_mm.view(), xmu_b_map)?;
         let hmm_iwj = weighted_crossprod_psi_maps(
             xmu_a_map,
             coeff_mm_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
         let hmm_jwi = weighted_crossprod_psi_maps(
             xmu_b_map,
             coeff_mm_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
         let h_mm = &hmm_ab
             + &hmm_ab.t()
@@ -7645,64 +7599,51 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_ab_map,
             coeff_ml.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_a_map,
             coeff_ml.view(),
             x_ls_b_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_b_map,
             coeff_ml.view(),
             x_ls_a_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_a_map,
             coeff_ml_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_b_map,
             coeff_ml_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             coeff_ml_a.view(),
             x_ls_b_map,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             coeff_ml_b.view(),
             x_ls_a_map,
-            &policy,
         )? + &xt_diag_y_dense(xmu, &coeff_ml_ab, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml.view(),
                 x_ls_ab_map,
-                &policy,
             )?;
         let hll_ab = weighted_crossprod_psi_maps(
             x_ls_ab_map,
             coeff_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
-        let hll_ij = weighted_crossprod_psi_maps(x_ls_a_map, coeff_ll.view(), x_ls_b_map, &policy)?;
+        let hll_ij = weighted_crossprod_psi_maps(x_ls_a_map, coeff_ll.view(), x_ls_b_map)?;
         let hll_iwj = weighted_crossprod_psi_maps(
             x_ls_a_map,
             coeff_ll_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
         let hll_jwi = weighted_crossprod_psi_maps(
             x_ls_b_map,
             coeff_ll_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
         let h_ll = &hll_ab
             + &hll_ab.t()
@@ -7717,29 +7658,24 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_ab_map,
             a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_a_map,
             a_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_a_map,
             a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&basis_b),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_b_map,
             a_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &xt_diag_y_dense(xmu, &a_ab, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a_a, &basis_b)?
             + &weighted_crossprod_psi_maps(
                 xmu_b_map,
                 a.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&basis_a),
-                &policy,
             )?
             + &xt_diag_y_dense(xmu, &a_b, &basis_a)?
             + &xt_diag_y_dense(xmu, &a, &basis_ab)?
@@ -7747,25 +7683,21 @@ impl GaussianLocationScaleWiggleFamily {
                 xmu_ab_map,
                 c.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&geom.basis_d1),
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 xmu_a_map,
                 c_b.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&geom.basis_d1),
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 xmu_a_map,
                 c.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&basis1_b),
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 xmu_b_map,
                 c_a.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&geom.basis_d1),
-                &policy,
             )?
             + &xt_diag_y_dense(xmu, &c_ab, &geom.basis_d1)?
             + &xt_diag_y_dense(xmu, &c_a, &basis1_b)?
@@ -7773,7 +7705,6 @@ impl GaussianLocationScaleWiggleFamily {
                 xmu_b_map,
                 c.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&basis1_a),
-                &policy,
             )?
             + &xt_diag_y_dense(xmu, &c_b, &basis1_a)?
             + &xt_diag_y_dense(xmu, &c, &basis1_ab)?;
@@ -7781,29 +7712,24 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls_ab_map,
             l.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_a_map,
             l_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_a_map,
             l.view(),
             CustomFamilyPsiLinearMapRef::Dense(&basis_b),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_b_map,
             l_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &xt_diag_y_dense(x_ls, &l_ab, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_a, &basis_b)?
             + &weighted_crossprod_psi_maps(
                 x_ls_b_map,
                 l.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&basis_a),
-                &policy,
             )?
             + &xt_diag_y_dense(x_ls, &l_b, &basis_a)?
             + &xt_diag_y_dense(x_ls, &l, &basis_ab)?;
@@ -7869,7 +7795,6 @@ impl GaussianLocationScaleWiggleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Array2<f64>, String> {
-        let policy = crate::resource::ResourcePolicy::default_library();
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
         let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
@@ -7968,37 +7893,31 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_map,
             coeff_mm_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
         let h_mm = &hmm_a1 + &hmm_a1.t() + &xt_diag_x_dense(xmu, &coeff_mm_a_u)?;
         let h_ml = weighted_crossprod_psi_maps(
             xmu_map,
             coeff_ml_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             coeff_ml_u.view(),
             x_ls_map,
-            &policy,
         )? + &xt_diag_y_dense(xmu, &coeff_ml_a_u, x_ls)?;
         let hll_a1 = weighted_crossprod_psi_maps(
             x_ls_map,
             coeff_ll_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
         let h_ll = &hll_a1 + &hll_a1.t() + &xt_diag_x_dense(x_ls, &coeff_ll_a_u)?;
         let h_mw = weighted_crossprod_psi_maps(
             xmu_map,
             a_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             xmu_map,
             a.view(),
             CustomFamilyPsiLinearMapRef::Dense(&basis_u),
-            &policy,
         )? + &xt_diag_y_dense(xmu, &a_a_u, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a_a, &basis_u)?
             + &xt_diag_y_dense(xmu, &a_u, &basis_a)?
@@ -8007,13 +7926,11 @@ impl GaussianLocationScaleWiggleFamily {
                 xmu_map,
                 c_u.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&geom.basis_d1),
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 xmu_map,
                 c.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&basis1_u),
-                &policy,
             )?
             + &xt_diag_y_dense(xmu, &c_a_u, &geom.basis_d1)?
             + &xt_diag_y_dense(xmu, &c_a, &basis1_u)?
@@ -8023,12 +7940,10 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls_map,
             l_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_map,
             l.view(),
             CustomFamilyPsiLinearMapRef::Dense(&basis_u),
-            &policy,
         )? + &xt_diag_y_dense(x_ls, &l_a_u, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_a, &basis_u)?
             + &xt_diag_y_dense(x_ls, &l_u, &basis_a)?
@@ -10830,7 +10745,6 @@ impl BinomialLocationScaleFamily {
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
 
         let mut global = 0usize;
-        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
@@ -10846,7 +10760,6 @@ impl BinomialLocationScaleFamily {
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleFamily threshold",
-                                &policy,
                             )?;
                             z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
                                 format!("BinomialLocationScaleFamily threshold forward_mul: {e}")
@@ -10864,7 +10777,6 @@ impl BinomialLocationScaleFamily {
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleFamily log-sigma",
-                                &policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!("BinomialLocationScaleFamily log-sigma forward_mul: {e}")
@@ -11189,39 +11101,32 @@ impl BinomialLocationScaleFamily {
         let hessian_psi = if hessian_psi_operator.is_some() {
             Array2::zeros((0, 0))
         } else {
-            let policy = crate::resource::ResourcePolicy::default_library();
             let h_tt_block = weighted_crossprod_psi_maps(
                 x_t_map,
                 h_tt.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
-                &policy,
             )? + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tt.view(),
                 x_t_map,
-                &policy,
             )? + &xt_diag_x_dense(x_t, &dh_tt)?;
             let h_tl_block = weighted_crossprod_psi_maps(
                 x_t_map,
                 h_tl.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
             )? + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tl.view(),
                 x_ls_map,
-                &policy,
             )? + &xt_diag_y_dense(x_t, &dh_tl, x_ls)?;
             let h_ll_block = weighted_crossprod_psi_maps(
                 x_ls_map,
                 h_ll.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
             )? + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
                 h_ll.view(),
                 x_ls_map,
-                &policy,
             )? + &xt_diag_x_dense(x_ls, &dh_ll)?;
 
             let mut hessian_psi = Array2::<f64>::zeros((total, total));
@@ -11294,7 +11199,6 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
-        let policy = crate::resource::ResourcePolicy::default_library();
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -11557,133 +11461,103 @@ impl BinomialLocationScaleFamily {
             x_t_ab_map,
             h_tt.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_i_map,
             h_tt.view(),
             x_t_j_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_j_map,
             h_tt.view(),
             x_t_i_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_i_map,
             dh_tt_j.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_j_map,
             dh_tt_i.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             dh_tt_i.view(),
             x_t_j_map,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             dh_tt_j.view(),
             x_t_i_map,
-            &policy,
         )? + &xt_diag_x_dense(x_t, &d2h_tt)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tt.view(),
                 x_t_ab_map,
-                &policy,
             )?;
         let h_tl_block = weighted_crossprod_psi_maps(
             x_t_ab_map,
             h_tl.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_i_map,
             h_tl.view(),
             x_ls_j_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_j_map,
             h_tl.view(),
             x_ls_i_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_i_map,
             dh_tl_j.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_t_j_map,
             dh_tl_i.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             dh_tl_i.view(),
             x_ls_j_map,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             dh_tl_j.view(),
             x_ls_i_map,
-            &policy,
         )? + &xt_diag_y_dense(x_t, &d2h_tl, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tl.view(),
                 x_ls_ab_map,
-                &policy,
             )?;
         let h_ll_block = weighted_crossprod_psi_maps(
             x_ls_ab_map,
             h_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_i_map,
             h_ll.view(),
             x_ls_j_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_j_map,
             h_ll.view(),
             x_ls_i_map,
-            &policy,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_i_map,
             dh_ll_j.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             x_ls_j_map,
             dh_ll_i.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             dh_ll_i.view(),
             x_ls_j_map,
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             dh_ll_j.view(),
             x_ls_i_map,
-            &policy,
         )? + &xt_diag_x_dense(x_ls, &d2h_ll)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
                 h_ll.view(),
                 x_ls_ab_map,
-                &policy,
             )?;
 
         let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
@@ -11744,7 +11618,6 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Array2<f64>, String> {
-        let policy = crate::resource::ResourcePolicy::default_library();
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -11876,34 +11749,28 @@ impl BinomialLocationScaleFamily {
             x_t_map,
             h_tt_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             h_tt_u.view(),
             x_t_map,
-            &policy,
         )? + &xt_diag_x_dense(x_t, &dh_tt_u)?;
         let tl_block = weighted_crossprod_psi_maps(
             x_t_map,
             h_tl_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             h_tl_u.view(),
             x_ls_map,
-            &policy,
         )? + &xt_diag_y_dense(x_t, &dh_tl_u, x_ls)?;
         let ll_block = weighted_crossprod_psi_maps(
             x_ls_map,
             h_ll_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             h_ll_u.view(),
             x_ls_map,
-            &policy,
         )? + &xt_diag_x_dense(x_ls, &dh_ll_u)?;
         let mut out = Array2::<f64>::zeros((total, total));
         out.slice_mut(s![0..pt, 0..pt]).assign(&tt_block);
@@ -12558,7 +12425,6 @@ impl BinomialLocationScaleWiggleFamily {
         let beta_t = &block_states[Self::BLOCK_T].beta;
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
         let mut global = 0usize;
-        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
@@ -12574,7 +12440,6 @@ impl BinomialLocationScaleWiggleFamily {
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleWiggleFamily threshold",
-                                &policy,
                             )?;
                             z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
                                 format!(
@@ -12594,7 +12459,6 @@ impl BinomialLocationScaleWiggleFamily {
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleWiggleFamily log-sigma",
-                                &policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!(
@@ -12712,7 +12576,6 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        let policy = crate::resource::ResourcePolicy::default_library();
         if self
             .exact_newton_joint_psi_direction(
                 block_states,
@@ -13089,46 +12952,38 @@ impl BinomialLocationScaleWiggleFamily {
             x_t_map,
             coeff_tt_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             coeff_tt_w.view(),
             x_t_map,
-            &policy,
         )? + &xt_diag_x_dense(x_t, &coeff_tt_d)?;
         let h_tl_block = weighted_crossprod_psi_maps(
             x_t_map,
             coeff_tl_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             coeff_tl_w.view(),
             x_ls_map,
-            &policy,
         )? + &xt_diag_y_dense(x_t, &coeff_tl_d, x_ls)?;
         let h_ll_block = weighted_crossprod_psi_maps(
             x_ls_map,
             coeff_ll_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             coeff_ll_w.view(),
             x_ls_map,
-            &policy,
         )? + &xt_diag_x_dense(x_ls, &coeff_ll_d)?;
         let h_tw = weighted_crossprod_psi_maps(
             x_t_map,
             coeff_tw_b_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(&b0),
-            &policy,
         )? + &xt_diag_y_dense(x_t, &coeff_tw_b_d, &b0)?
             + &weighted_crossprod_psi_maps(
                 x_t_map,
                 coeff_tw_d1_w.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&d0),
-                &policy,
             )?
             + &xt_diag_y_dense(x_t, &coeff_tw_d1_d, &d0)?
             + &xt_diag_y_dense(x_t, &coeff_tw_d2_d, &dd0)?;
@@ -13136,13 +12991,11 @@ impl BinomialLocationScaleWiggleFamily {
             x_ls_map,
             coeff_lw_b_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(&b0),
-            &policy,
         )? + &xt_diag_y_dense(x_ls, &coeff_lw_b_d, &b0)?
             + &weighted_crossprod_psi_maps(
                 x_ls_map,
                 coeff_lw_d1_w.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&d0),
-                &policy,
             )?
             + &xt_diag_y_dense(x_ls, &coeff_lw_d1_d, &d0)?
             + &xt_diag_y_dense(x_ls, &coeff_lw_d2_d, &dd0)?;
