@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_allows_penalty_only_tk_gradient() {
+    fn firth_logit_directional_hypergradient_rejects_penalty_only_without_full_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1145,11 +1145,15 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect("Firth penalty-only directional gradient should not require psi calculus");
+        let err = single_directional_tau_gradient(&state, &rho, hyper).expect_err(
+            "Firth penalty-only directional gradient must reject incomplete TK psi calculus",
+        );
+        let msg = err.to_string();
         assert!(
-            gradient.is_finite(),
-            "penalty-only directional gradient must be finite: {gradient}"
+            msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected penalty-only directional-gradient error: {msg}"
         );
 
         let efs_hyper = DirectionalHyperParam::single_penalty(
@@ -1160,13 +1164,15 @@ mod tests {
             None,
         )
         .expect("single-penalty EFS hyper direction");
-        let efs_eval = state
+        let efs_err = state
             .compute_efs_steps_with_psi_ext(&rho, &[efs_hyper])
-            .expect("Firth penalty-only EFS should not require psi calculus");
+            .expect_err("Firth penalty-only EFS must reject incomplete TK ext-coordinate calculus");
+        let efs_msg = efs_err.to_string();
         assert!(
-            efs_eval.steps.iter().all(|value| value.is_finite()),
-            "penalty-only EFS step must be finite: {:?}",
-            efs_eval.steps
+            efs_msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected penalty-only EFS error: {efs_msg}"
         );
     }
 
@@ -1290,7 +1296,7 @@ mod tests {
         let cfg = RemlConfig::external(
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
-            true,
+            false,
         )
         .with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
@@ -1357,7 +1363,7 @@ mod tests {
         let cfg = RemlConfig::external(
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
-            true,
+            false,
         )
         .with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
@@ -1482,7 +1488,7 @@ mod tests {
         let cfg = RemlConfig::external(
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
-            true,
+            false,
         )
         .with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
