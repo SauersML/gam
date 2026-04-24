@@ -1043,6 +1043,15 @@ impl<'a> RemlState<'a> {
                     super::unified::EvalMode::ValueGradientHessian
                 }
             };
+            if self.config.firth_bias_reduction
+                && !matches!(self.config.link_function(), LinkFunction::Identity)
+                && eval_mode != super::unified::EvalMode::ValueOnly
+                && hyper_dirs.iter().any(|dir| !dir.is_penalty_like)
+            {
+                return Err(EstimationError::InvalidInput(
+                    "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
+                ));
+            }
             let result = self.evaluate_unified_with_psi_ext(&rho, eval_mode, hyper_dirs)?;
             let cost = result.cost;
             let grad = result

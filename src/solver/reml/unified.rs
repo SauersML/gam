@@ -1307,7 +1307,12 @@ impl HyperOperator for DenseMatrixHyperOperator {
         dense_matvec_into(&self.matrix, v, out);
     }
 
-    fn scaled_add_mul_vec(&self, v: ArrayView1<'_, f64>, scale: f64, out: ArrayViewMut1<'_, f64>) {
+    fn scaled_add_mul_vec(
+        &self,
+        v: ArrayView1<'_, f64>,
+        scale: f64,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) {
         dense_matvec_scaled_add_into(&self.matrix, v, scale, out);
     }
 
@@ -1618,30 +1623,15 @@ impl HyperCoordDrift {
             return;
         }
         if let Some(dense) = &self.dense {
-            debug_assert_eq!(dense.ncols(), v.len());
-            debug_assert_eq!(dense.nrows(), out.len());
-            for row in 0..dense.nrows() {
-                let mut value = 0.0;
-                for col in 0..dense.ncols() {
-                    value += dense[[row, col]] * v[col];
-                }
-                out[row] += scale * value;
-            }
+            dense_matvec_scaled_add_into(dense, v, scale, out.view_mut());
         }
         if let Some(bl) = &self.block_local {
             let v_block = v.slice(ndarray::s![bl.start..bl.end]);
-            for local_row in 0..bl.local.nrows() {
-                let mut value = 0.0;
-                for local_col in 0..bl.local.ncols() {
-                    value += bl.local[[local_row, local_col]] * v_block[local_col];
-                }
-                out[bl.start + local_row] += scale * value;
-            }
+            let out_block = out.slice_mut(ndarray::s![bl.start..bl.end]);
+            dense_matvec_scaled_add_into(&bl.local, v_block, scale, out_block);
         }
         if let Some(op) = &self.operator {
-            let mut applied = Array1::<f64>::zeros(out.len());
-            op.mul_vec_into(v, applied.view_mut());
-            out.scaled_add(scale, &applied);
+            op.scaled_add_mul_vec(v, scale, out.view_mut());
         }
     }
 
@@ -2517,10 +2507,8 @@ impl HyperOperator for PenaltyHyperOperator<'_> {
         if scale == 0.0 {
             return;
         }
-        let mut work = Array1::<f64>::zeros(out.len());
         self.coord
-            .apply_penalty_view_into(v, self.scale, work.view_mut());
-        out.scaled_add(scale, &work);
+            .scaled_add_penalty_view(v, scale * self.scale, out.view_mut());
         if let Some(correction) = self.dense_correction {
             dense_matvec_scaled_add_into(correction, v, scale, out.view_mut());
         }
@@ -3182,15 +3170,13 @@ fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn Hy
             &self,
             v: ArrayView1<'_, f64>,
             scale: f64,
-            mut out: ArrayViewMut1<'_, f64>,
+            out: ArrayViewMut1<'_, f64>,
         ) {
             if scale == 0.0 {
                 return;
             }
-            let mut work = Array1::<f64>::zeros(out.len());
             self.coord
-                .apply_penalty_view_into(v, self.scale, work.view_mut());
-            out.scaled_add(scale, &work);
+                .scaled_add_penalty_view(v, scale * self.scale, out);
         }
 
         fn to_dense(&self) -> Array2<f64> {
@@ -5239,11 +5225,26 @@ impl HyperOperator for WeightedHyperOperator {
         }
 
         out.fill(0.0);
-        let mut work = Array1::<f64>::zeros(out.len());
         for (weight, op) in &self.terms {
             if *weight != 0.0 {
-                op.mul_vec_into(v, work.view_mut());
-                out.scaled_add(*weight, &work);
+                op.scaled_add_mul_vec(v, *weight, out.view_mut());
+            }
+        }
+    }
+
+    fn scaled_add_mul_vec(
+        &self,
+        v: ArrayView1<'_, f64>,
+        scale: f64,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) {
+        if scale == 0.0 {
+            return;
+        }
+        for (weight, op) in &self.terms {
+            let combined = scale * *weight;
+            if combined != 0.0 {
+                op.scaled_add_mul_vec(v, combined, out.view_mut());
             }
         }
     }
