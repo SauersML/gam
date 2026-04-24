@@ -103,7 +103,7 @@ Input data `biobank.csv` has columns `PGS`, `pc1`..`pc4`, `disease`,
 `age_entry`, `age_exit`, `event`.
 
 **Stage 1: conditional Gaussianisation.** Fit `h(PGS | PCs) ~ N(0, 1)` with a
-Duchon smooth over the four PCs, then predict to append `pgs_ctn_z`:
+Duchon radial-basis regularizer over the four PCs, then predict to append `pgs_ctn_z`:
 
 ```bash
 gam fit biobank.csv \

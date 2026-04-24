@@ -25,7 +25,7 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
-use crate::types::{InverseLink, LinkFunction};
+use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use statrs::function::erf::erfc;
@@ -47,13 +47,26 @@ pub struct DeviationBlockConfig {
 
 impl Default for DeviationBlockConfig {
     fn default() -> Self {
+        WigglePenaltyConfig::cubic_triple_operator_default().into()
+    }
+}
+
+impl DeviationBlockConfig {
+    pub fn triple_penalty_default() -> Self {
+        Self::default()
+    }
+}
+
+impl From<WigglePenaltyConfig> for DeviationBlockConfig {
+    fn from(cfg: WigglePenaltyConfig) -> Self {
+        let penalty_order = *cfg.penalty_orders.iter().max().unwrap_or(&2);
         Self {
-            degree: 3,
-            num_internal_knots: 8,
-            penalty_order: 2,
-            penalty_orders: vec![1, 2, 3],
-            double_penalty: true,
-            monotonicity_eps: 1e-4,
+            degree: cfg.degree,
+            num_internal_knots: cfg.num_internal_knots,
+            penalty_order,
+            penalty_orders: cfg.penalty_orders,
+            double_penalty: cfg.double_penalty,
+            monotonicity_eps: cfg.monotonicity_eps,
         }
     }
 }
@@ -94,6 +107,36 @@ pub struct BernoulliMarginalSlopeTermSpec {
     pub frailty: FrailtySpec,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
+    pub latent_z_policy: LatentZPolicy,
+}
+
+impl BernoulliMarginalSlopeTermSpec {
+    pub fn calibrated_probit(
+        y: Array1<f64>,
+        weights: Array1<f64>,
+        z: Array1<f64>,
+        marginalspec: TermCollectionSpec,
+        logslopespec: TermCollectionSpec,
+        marginal_offset: Array1<f64>,
+        logslope_offset: Array1<f64>,
+        frailty: FrailtySpec,
+        protocol: crate::solver::protocol::MarginalSlopeCalibrationProtocol,
+    ) -> Self {
+        Self {
+            y,
+            weights,
+            z,
+            base_link: protocol.base_link,
+            marginalspec,
+            logslopespec,
+            marginal_offset,
+            logslope_offset,
+            frailty,
+            score_warp: Some(protocol.score_warp),
+            link_dev: Some(protocol.link_deviation),
+            latent_z_policy: protocol.latent_score.into_policy(),
+        }
+    }
 }
 
 pub struct BernoulliMarginalSlopeFitResult {
@@ -109,6 +152,60 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub link_dev_runtime: Option<DeviationRuntime>,
     /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
     pub gaussian_frailty_sd: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub enum LatentZCheckMode {
+    Strict,
+    WarnOnly,
+    Off,
+}
+
+#[derive(Clone, Debug)]
+pub enum LatentZNormalizationMode {
+    None,
+    FitWeighted,
+    Frozen { mean: f64, sd: f64 },
+}
+
+#[derive(Clone, Debug)]
+pub struct LatentZPolicy {
+    pub check_mode: LatentZCheckMode,
+    pub normalization: LatentZNormalizationMode,
+    pub mean_tol_multiplier: f64,
+    pub sd_tol_multiplier: f64,
+    pub max_abs_skew: f64,
+    pub max_abs_excess_kurtosis: f64,
+}
+
+impl LatentZPolicy {
+    pub fn frozen_transformation_normal() -> Self {
+        Self {
+            check_mode: LatentZCheckMode::Strict,
+            normalization: LatentZNormalizationMode::Frozen { mean: 0.0, sd: 1.0 },
+            mean_tol_multiplier: 4.0,
+            sd_tol_multiplier: 4.0,
+            max_abs_skew: 2.0,
+            max_abs_excess_kurtosis: 7.0,
+        }
+    }
+
+    pub fn exploratory_fit_weighted() -> Self {
+        Self {
+            check_mode: LatentZCheckMode::WarnOnly,
+            normalization: LatentZNormalizationMode::FitWeighted,
+            mean_tol_multiplier: 8.0,
+            sd_tol_multiplier: 8.0,
+            max_abs_skew: 4.0,
+            max_abs_excess_kurtosis: 20.0,
+        }
+    }
+}
+
+impl Default for LatentZPolicy {
+    fn default() -> Self {
+        Self::frozen_transformation_normal()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -491,6 +588,15 @@ pub(crate) fn standardize_latent_z(
     weights: &Array1<f64>,
     context: &str,
 ) -> Result<(Array1<f64>, LatentZNormalization), String> {
+    standardize_latent_z_with_policy(z, weights, context, &LatentZPolicy::default())
+}
+
+pub(crate) fn standardize_latent_z_with_policy(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    context: &str,
+    policy: &LatentZPolicy,
+) -> Result<(Array1<f64>, LatentZNormalization), String> {
     if z.len() != weights.len() {
         return Err(format!(
             "{context} latent-score normalization length mismatch: z={}, weights={}",
@@ -531,15 +637,34 @@ pub(crate) fn standardize_latent_z(
             "{context} requires z with positive finite weighted standard deviation"
         ));
     }
-    let mean_tol = 4.0 / effective_n.sqrt();
-    let sd_tol = 4.0 / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
-    if mean.abs() > mean_tol || (sd - 1.0).abs() > sd_tol {
-        return Err(format!(
+    let target_norm = match policy.normalization {
+        LatentZNormalizationMode::None | LatentZNormalizationMode::FitWeighted => {
+            LatentZNormalization { mean, sd }
+        }
+        LatentZNormalizationMode::Frozen {
+            mean: frozen_mean,
+            sd: frozen_sd,
+        } => LatentZNormalization {
+            mean: frozen_mean,
+            sd: frozen_sd,
+        },
+    };
+    let mean_tol = policy.mean_tol_multiplier / effective_n.sqrt();
+    let sd_tol = policy.sd_tol_multiplier / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
+    let check_msg = || {
+        format!(
             "{context} requires z to already be approximately latent N(0,1) before identification normalization; got mean={mean:.6e}, sd={sd:.6e}, effective_n={effective_n:.1}, allowed_mean={mean_tol:.3e}, allowed_sd={sd_tol:.3e}"
-        ));
+        )
+    };
+    if mean.abs() > mean_tol || (sd - 1.0).abs() > sd_tol {
+        match policy.check_mode {
+            LatentZCheckMode::Strict => return Err(check_msg()),
+            LatentZCheckMode::WarnOnly => log::warn!("{}", check_msg()),
+            LatentZCheckMode::Off => {}
+        }
     }
 
-    let normalization = LatentZNormalization { mean, sd };
+    let normalization = target_norm;
     let z_std = normalization.apply(z, context)?;
     let skew = z_std
         .iter()
@@ -554,10 +679,15 @@ pub(crate) fn standardize_latent_z(
         .sum::<f64>()
         / weight_sum
         - 3.0;
-    if skew.abs() > 2.0 || kurt.abs() > 7.0 {
-        return Err(format!(
+    if skew.abs() > policy.max_abs_skew || kurt.abs() > policy.max_abs_excess_kurtosis {
+        let msg = format!(
             "{context} requires z to be approximately Gaussian after identification normalization; got skewness={skew:.3}, excess_kurtosis={kurt:.3}"
-        ));
+        );
+        match policy.check_mode {
+            LatentZCheckMode::Strict => return Err(msg),
+            LatentZCheckMode::WarnOnly => log::warn!("{}", msg),
+            LatentZCheckMode::Off => {}
+        }
     }
     if skew.abs() > 0.75 || kurt.abs() > 2.0 {
         log::warn!(
@@ -565,6 +695,26 @@ pub(crate) fn standardize_latent_z(
         );
     }
     Ok((z_std, normalization))
+}
+
+pub fn padded_deviation_seed(seed: &Array1<f64>, min_iqr: f64, pad_fraction: f64) -> Array1<f64> {
+    let mut sorted = seed.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    if sorted.len() < 4 {
+        return seed.clone();
+    }
+
+    let n = sorted.len();
+    let q1 = sorted[n / 4];
+    let q3 = sorted[3 * n / 4];
+    let iqr = (q3 - q1).max(min_iqr);
+    let pad = pad_fraction * iqr;
+
+    let mut out = seed.to_vec();
+    out.push(sorted[0] - pad);
+    out.push(sorted[n - 1] + pad);
+    Array1::from_vec(out)
 }
 
 fn pooled_probit_baseline(
@@ -5379,17 +5529,20 @@ impl BernoulliMarginalSlopeFamily {
                 |mut chunk_out, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
+                        self.compute_row_analytic_flex_into(
                             row,
                             block_states,
                             primary,
                             row_ctx,
+                            true,
+                            &mut scratch,
                         )?;
-                        let row_action = row_hessian.dot(&row_dir);
+                        let row_action = scratch.hess.dot(&row_dir);
                         chunk_out +=
                             &self.pullback_primary_vector(row, slices, primary, &row_action)?;
                     }
@@ -5468,13 +5621,16 @@ impl BernoulliMarginalSlopeFamily {
                 |mut chunk_diag, chunk_idx| -> Result<_, String> {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
+                        self.compute_row_analytic_flex_into(
                             row,
                             block_states,
                             primary,
                             row_ctx,
+                            true,
+                            &mut scratch,
                         )?;
 
                         {
@@ -5482,7 +5638,7 @@ impl BernoulliMarginalSlopeFamily {
                                 chunk_diag.slice_mut(s![slices.marginal.clone()]);
                             self.marginal_design.squared_axpy_row_into(
                                 row,
-                                row_hessian[[0, 0]],
+                                scratch.hess[[0, 0]],
                                 &mut marginal_diag,
                             )?;
                         }
@@ -5491,7 +5647,7 @@ impl BernoulliMarginalSlopeFamily {
                                 chunk_diag.slice_mut(s![slices.logslope.clone()]);
                             self.logslope_design.squared_axpy_row_into(
                                 row,
-                                row_hessian[[1, 1]],
+                                scratch.hess[[1, 1]],
                                 &mut logslope_diag,
                             )?;
                         }
@@ -5500,7 +5656,7 @@ impl BernoulliMarginalSlopeFamily {
                             (primary.h.as_ref(), slices.h.as_ref())
                         {
                             for (local_idx, global_idx) in block_h.clone().enumerate() {
-                                chunk_diag[global_idx] += row_hessian
+                                chunk_diag[global_idx] += scratch.hess
                                     [[primary_h.start + local_idx, primary_h.start + local_idx]];
                             }
                         }
@@ -5508,7 +5664,7 @@ impl BernoulliMarginalSlopeFamily {
                             (primary.w.as_ref(), slices.w.as_ref())
                         {
                             for (local_idx, global_idx) in block_w.clone().enumerate() {
-                                chunk_diag[global_idx] += row_hessian
+                                chunk_diag[global_idx] += scratch.hess
                                     [[primary_w.start + local_idx, primary_w.start + local_idx]];
                             }
                         }
@@ -6976,20 +7132,25 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
                 let start = chunk_idx * ROW_CHUNK_SIZE;
                 let end = (start + ROW_CHUNK_SIZE).min(n);
+                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                 for row in start..end {
                     let row_ctx = Self::row_ctx(&cache, row);
-                    let (neglog, gradient, _) = self.compute_row_primary_gradient_hessian(
+                    let neglog = self.compute_row_analytic_flex_into(
                         row,
                         block_states,
                         primary,
                         row_ctx,
+                        false,
+                        &mut scratch,
                     )?;
                     acc.0 -= neglog;
                     {
                         let mut marginal = acc.1.view_mut();
                         self.marginal_design.axpy_row_into(
                             row,
-                            Self::exact_newton_score_component_from_objective_gradient(gradient[0]),
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                scratch.grad[0],
+                            ),
                             &mut marginal,
                         )?;
                     }
@@ -6997,7 +7158,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         let mut logslope = acc.2.view_mut();
                         self.logslope_design.axpy_row_into(
                             row,
-                            Self::exact_newton_score_component_from_objective_gradient(gradient[1]),
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                scratch.grad[1],
+                            ),
                             &mut logslope,
                         )?;
                     }
@@ -7005,7 +7168,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         for idx in 0..primary_h.len() {
                             grad_h[idx] +=
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    gradient[primary_h.start + idx],
+                                    scratch.grad[primary_h.start + idx],
                                 );
                         }
                     }
@@ -7013,7 +7176,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         for idx in 0..primary_w.len() {
                             grad_w[idx] +=
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    gradient[primary_w.start + idx],
+                                    scratch.grad[primary_w.start + idx],
                                 );
                         }
                     }
@@ -7499,8 +7662,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let mut spec = spec;
     let data_view = data;
     validate_spec(data_view, &spec)?;
-    let (z_standardized, z_normalization) =
-        standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
+    let (z_standardized, z_normalization) = standardize_latent_z_with_policy(
+        &spec.z,
+        &spec.weights,
+        "bernoulli-marginal-slope",
+        &spec.latent_z_policy,
+    )?;
     spec.z = z_standardized;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(

@@ -29,7 +29,9 @@ pub struct MaterializationPolicy {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MatrixMaterializationError {
-    #[error("{context}: dense materialization of {nrows}x{ncols} requires {bytes} bytes (limit {limit_bytes})")]
+    #[error(
+        "{context}: dense materialization of {nrows}x{ncols} requires {bytes} bytes (limit {limit_bytes})"
+    )]
     TooLarge {
         context: &'static str,
         nrows: usize,
@@ -39,9 +41,7 @@ pub enum MatrixMaterializationError {
     },
 
     #[error("{context}: operator does not implement chunked row access")]
-    MissingRowChunk {
-        context: &'static str,
-    },
+    MissingRowChunk { context: &'static str },
 
     #[error("{context}: materialization forbidden by policy (mode={mode:?})")]
     Forbidden {

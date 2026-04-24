@@ -45,3 +45,6 @@ pub use solver::workflow::{
     SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_from_formula, fit_model,
     is_binary_response, materialize, resolve_family, resolve_offset_column, resolve_weight_column,
 };
+pub use solver::protocol::{
+    LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
+};

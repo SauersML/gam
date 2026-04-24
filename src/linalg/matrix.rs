@@ -2,6 +2,7 @@ use crate::faer_ndarray::{
     FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
     fast_av_into, fast_xt_diag_x,
 };
+use crate::resource::{MaterializationPolicy, MatrixMaterializationError};
 use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::linalg::matmul::matmul;
@@ -500,33 +501,32 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         Ok(out)
     }
 
-    /// Extract a dense row chunk without materializing the full matrix.
-    ///
-    /// Returns a `(rows.len(), ncols())` dense matrix containing only the
-    /// requested rows.  Concrete operators should override this with O(chunk)
-    /// implementations; the default falls back through `to_dense()`.
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        // Fallback: materializes the full dense matrix.  Every concrete operator
-        // should override this with an O(chunk) implementation.
-        let dense_elems = self.nrows().saturating_mul(self.ncols());
-        const DENSE_FALLBACK_WARN: usize = 10_000_000; // ~76 MiB at f64
-        if dense_elems > DENSE_FALLBACK_WARN {
-            log::warn!(
-                "DenseDesignOperator::row_chunk default fallback materializing {}x{} ({:.1} MiB) — \
-                 operator should implement a chunked override",
-                self.nrows(),
-                self.ncols(),
-                (dense_elems * 8) as f64 / (1024.0 * 1024.0),
-            );
-        } else {
-            log::debug!(
-                "DenseDesignOperator::row_chunk default fallback (full materialization) for {}x{} operator",
-                self.nrows(),
-                self.ncols()
-            );
+    /// Fill a dense row chunk without materializing the full matrix.
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "DenseDesignOperator::row_chunk_into shape mismatch",
+            });
         }
-        self.to_dense().slice(s![rows, ..]).to_owned()
+        let chunk = self.row_chunk(rows);
+        out.assign(&chunk);
+        Ok(())
     }
+
+    /// Extract a dense row chunk without materializing the full matrix.
+    fn try_row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, MatrixMaterializationError> {
+        let mut out = Array2::<f64>::zeros((rows.end - rows.start, self.ncols()));
+        self.row_chunk_into(rows, out.view_mut())?;
+        Ok(out)
+    }
+
+    /// Extract a dense row chunk. Implementations must provide true row-local
+    /// access; there is intentionally no default full-dense fallback.
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64>;
 
     /// Borrow dense storage when this operator already owns it.
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
@@ -537,6 +537,36 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     /// avoid materialization should still support this for fallback paths,
     /// diagnostics, and prediction.
     fn to_dense(&self) -> Array2<f64>;
+
+    fn estimated_dense_bytes(&self) -> usize {
+        self.nrows()
+            .saturating_mul(self.ncols())
+            .saturating_mul(std::mem::size_of::<f64>())
+    }
+
+    fn try_to_dense_with_policy(
+        &self,
+        policy: &MaterializationPolicy,
+        context: &'static str,
+    ) -> Result<Arc<Array2<f64>>, MatrixMaterializationError> {
+        let bytes = self.estimated_dense_bytes();
+        if !policy.allow_operator_materialization {
+            return Err(MatrixMaterializationError::Forbidden {
+                context,
+                mode: crate::resource::DerivativeStorageMode::AnalyticOperatorRequired,
+            });
+        }
+        if bytes > policy.max_single_dense_bytes {
+            return Err(MatrixMaterializationError::TooLarge {
+                context,
+                nrows: self.nrows(),
+                ncols: self.ncols(),
+                bytes,
+                limit_bytes: policy.max_single_dense_bytes,
+            });
+        }
+        Ok(self.to_dense_arc())
+    }
 
     /// Shared dense materialization. Implementations that already own an
     /// `Arc<Array2<_>>` should override this to return it directly.
@@ -826,10 +856,6 @@ pub struct ReparamOperator {
     qs: Arc<Array2<f64>>,
     n: usize,
     p: usize,
-    /// Cached dense materialization of X·Qs.  Populated on first `to_dense()`
-    /// call so that repeated outer-loop access (REML hyper derivatives, ALO,
-    /// HMC) pays the O(n·p²) cost only once per PIRLS result.
-    dense_cache: OnceLock<Arc<Array2<f64>>>,
 }
 
 impl ReparamOperator {
@@ -848,7 +874,6 @@ impl ReparamOperator {
             qs,
             n,
             p,
-            dense_cache: OnceLock::new(),
         }
     }
 
@@ -862,17 +887,6 @@ impl ReparamOperator {
         &self.qs
     }
 
-    fn dense_arc(&self) -> Arc<Array2<f64>> {
-        Arc::clone(self.dense_cache.get_or_init(|| {
-            Arc::new(match &self.x_original {
-                DesignMatrix::Dense(x) => fast_ab(x.to_dense_arc().as_ref(), &self.qs),
-                _ => {
-                    let x_dense = self.x_original.to_dense();
-                    fast_ab(&x_dense, &self.qs)
-                }
-            })
-        }))
-    }
 }
 
 impl LinearOperator for ReparamOperator {
@@ -946,24 +960,24 @@ impl DenseDesignOperator for ReparamOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        // Cached materialization: pay the O(n·p²) cost at most once.
-        self.dense_arc().as_ref().clone()
+        match &self.x_original {
+            DesignMatrix::Dense(x) => fast_ab(x.to_dense_arc().as_ref(), &self.qs),
+            _ => {
+                let x_dense = self.x_original.to_dense();
+                fast_ab(&x_dense, &self.qs)
+            }
+        }
     }
 
     fn to_dense_arc(&self) -> Arc<Array2<f64>> {
-        self.dense_arc()
+        Arc::new(self.to_dense())
     }
 
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
-        self.dense_cache.get().map(Arc::as_ref)
+        None
     }
 
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        // If the full dense product is already cached, just slice it.
-        if let Some(cached) = self.dense_cache.get() {
-            return cached.as_ref().slice(s![rows, ..]).to_owned();
-        }
-        // Otherwise materialize only the requested rows: X[rows, :] · Qs
         match &self.x_original {
             DesignMatrix::Dense(x) => {
                 let chunk = x.row_chunk(rows);
@@ -1409,27 +1423,11 @@ impl BlockDesignOperator {
         match (&self.blocks[i], &self.blocks[j]) {
             // ── Dense × Dense ───────────────────────────────────────────
             (DesignBlock::Dense(d_i), DesignBlock::Dense(d_j)) => {
-                let d_i = d_i.to_dense_arc();
-                let d_j = d_j.to_dense_arc();
-                let pi = d_i.ncols();
-                let pj = d_j.ncols();
-                let mut cross = Array2::<f64>::zeros((pi, pj));
-                for obs in 0..self.n {
-                    let wi = weights[obs].max(0.0);
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    for a in 0..pi {
-                        let scaled = wi * d_i[[obs, a]];
-                        if scaled == 0.0 {
-                            continue;
-                        }
-                        for b in 0..pj {
-                            cross[[a, b]] += scaled * d_j[[obs, b]];
-                        }
-                    }
+                if let (Some(xi), Some(xj)) = (d_i.as_dense_ref(), d_j.as_dense_ref()) {
+                    weighted_crossprod_dense(xi, weights, xj)
+                } else {
+                    self.weighted_cross_chunked(&self.blocks[i], &self.blocks[j], weights)
                 }
-                Ok(cross)
             }
             (DesignBlock::Dense(_), DesignBlock::Sparse(_))
             | (DesignBlock::Sparse(_), DesignBlock::Dense(_))
@@ -1441,13 +1439,19 @@ impl BlockDesignOperator {
 
             // ── Dense × RandomEffect ────────────────────────────────────
             (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
-                let dense = d.to_dense_arc();
-                Ok(re.weighted_cross_with_dense(dense.as_ref(), weights))
+                if let Some(dense) = d.as_dense_ref() {
+                    Ok(re.weighted_cross_with_dense(dense, weights))
+                } else {
+                    self.weighted_cross_chunked(&self.blocks[i], &self.blocks[j], weights)
+                }
             }
             (DesignBlock::RandomEffect(re), DesignBlock::Dense(d)) => {
-                let dense = d.to_dense_arc();
-                let cross_t = re.weighted_cross_with_dense(dense.as_ref(), weights);
-                Ok(cross_t.t().to_owned())
+                if let Some(dense) = d.as_dense_ref() {
+                    let cross_t = re.weighted_cross_with_dense(dense, weights);
+                    Ok(cross_t.t().to_owned())
+                } else {
+                    self.weighted_cross_chunked(&self.blocks[i], &self.blocks[j], weights)
+                }
             }
 
             // ── RandomEffect × RandomEffect ─────────────────────────────
@@ -1484,13 +1488,16 @@ impl BlockDesignOperator {
     ) -> Result<Array1<f64>, String> {
         match block {
             DesignBlock::Dense(d) => {
-                let dense = d.to_dense_arc();
-                let xm = fast_ab(dense.as_ref(), m_kk);
-                let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    out[i] = dense.row(i).dot(&xm.row(i));
+                if let Some(dense) = d.as_dense_ref() {
+                    let xm = fast_ab(dense, m_kk);
+                    let mut out = Array1::<f64>::zeros(self.n);
+                    for i in 0..self.n {
+                        out[i] = dense.row(i).dot(&xm.row(i));
+                    }
+                    Ok(out)
+                } else {
+                    d.quadratic_form_diag(m_kk)
                 }
-                Ok(out)
             }
             DesignBlock::Sparse(s) => {
                 let sparse = DesignMatrix::Sparse(s.clone());
@@ -1521,14 +1528,16 @@ impl BlockDesignOperator {
     ) -> Result<Array1<f64>, String> {
         match (block_a, block_b) {
             (DesignBlock::Dense(da), DesignBlock::Dense(db)) => {
-                let da = da.to_dense_arc();
-                let db = db.to_dense_arc();
-                let da_m = fast_ab(da.as_ref(), m_ab);
-                let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    out[i] = da_m.row(i).dot(&db.row(i));
+                if let (Some(da), Some(db)) = (da.as_dense_ref(), db.as_dense_ref()) {
+                    let da_m = fast_ab(da, m_ab);
+                    let mut out = Array1::<f64>::zeros(self.n);
+                    for i in 0..self.n {
+                        out[i] = da_m.row(i).dot(&db.row(i));
+                    }
+                    Ok(out)
+                } else {
+                    self.quadratic_form_diag_cross_chunked(block_a, block_b, m_ab)
                 }
-                Ok(out)
             }
             (DesignBlock::Dense(_), DesignBlock::Sparse(_))
             | (DesignBlock::Sparse(_), DesignBlock::Dense(_))
@@ -1538,29 +1547,37 @@ impl BlockDesignOperator {
                 self.quadratic_form_diag_cross_chunked(block_a, block_b, m_ab)
             }
             (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
-                let d = d.to_dense_arc();
                 let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    if let Some(g) = re.group_ids[i] {
-                        let mut val = 0.0;
-                        for j in 0..d.ncols() {
-                            val += d[[i, j]] * m_ab[[j, g]];
+                for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+                    let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+                    let chunk = d.row_chunk(start..end);
+                    for local in 0..chunk.nrows() {
+                        let i = start + local;
+                        if let Some(g) = re.group_ids[i] {
+                            let mut val = 0.0;
+                            for j in 0..chunk.ncols() {
+                                val += chunk[[local, j]] * m_ab[[j, g]];
+                            }
+                            out[i] = val;
                         }
-                        out[i] = val;
                     }
                 }
                 Ok(out)
             }
             (DesignBlock::RandomEffect(re), DesignBlock::Dense(d)) => {
-                let d = d.to_dense_arc();
                 let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    if let Some(g) = re.group_ids[i] {
-                        let mut val = 0.0;
-                        for j in 0..d.ncols() {
-                            val += m_ab[[g, j]] * d[[i, j]];
+                for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
+                    let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+                    let chunk = d.row_chunk(start..end);
+                    for local in 0..chunk.nrows() {
+                        let i = start + local;
+                        if let Some(g) = re.group_ids[i] {
+                            let mut val = 0.0;
+                            for j in 0..chunk.ncols() {
+                                val += m_ab[[g, j]] * chunk[[local, j]];
+                            }
+                            out[i] = val;
                         }
-                        out[i] = val;
                     }
                 }
                 Ok(out)

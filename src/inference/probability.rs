@@ -63,7 +63,7 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
     const P_LOW: f64 = 0.02425;
     const P_HIGH: f64 = 1.0 - P_LOW;
 
-    let x = if p < P_LOW {
+    let mut x = if p < P_LOW {
         let q = (-2.0 * p.ln()).sqrt();
         (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
             / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
@@ -77,6 +77,25 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
         -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
             / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
     };
+    for _ in 0..2 {
+        let density = normal_pdf(x);
+        if !(density.is_finite() && density > 0.0) {
+            break;
+        }
+        let correction = (normal_cdf(x) - p) / density;
+        let denominator = 1.0 + 0.5 * x * correction;
+        if !(correction.is_finite() && denominator.is_finite() && denominator != 0.0) {
+            break;
+        }
+        let step = correction / denominator;
+        if !step.is_finite() {
+            break;
+        }
+        x -= step;
+        if step.abs() <= 2.0 * f64::EPSILON * x.abs().max(1.0) {
+            break;
+        }
+    }
     Ok(x)
 }
 
