@@ -11506,7 +11506,6 @@ fn spatial_length_scale_matches(left: Option<f64>, right: Option<f64>) -> bool {
     }
 }
 
-#[derive(Clone)]
 struct FrozenTermCollectionIncrementalRealizer<'d> {
     data: ArrayView2<'d, f64>,
     spec: TermCollectionSpec,
