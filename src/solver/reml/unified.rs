@@ -5495,50 +5495,28 @@ impl UnifiedOuterHessianOperator {
         Ok(c_trace + v_i_sign * d_trace)
     }
 
-    fn correction_trace(
+    fn callback_correction_trace(
         &self,
         rhs: &Array1<f64>,
-        v_i: &Array1<f64>,
-        m_alpha: &Array1<f64>,
+        second_v: &Array1<f64>,
+        neg_m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
-        match &self.kernel {
-            OuterHessianDerivativeKernel::ScalarGlm {
-                c_array,
-                d_array,
-                x,
-            } => {
-                let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
-                    "missing adjoint trace cache for scalar outer Hessian operator".to_string()
-                })?;
-                let ingredients = ScalarGlmIngredients {
-                    c_array,
-                    d_array: d_array.as_ref(),
-                    x,
-                };
-                let c_trace = rhs.dot(z_c);
-                let d_trace =
-                    compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())?
-                        .unwrap_or(0.0);
-                Ok(c_trace + d_trace)
-            }
-            OuterHessianDerivativeKernel::Callback { first, second } => {
-                let u = self.hop.solve(rhs);
-                let Some(term1) = first(&u)? else {
-                    return Ok(0.0);
-                };
-                let neg_m = -m_alpha;
-                let neg_v = -v_i;
-                let Some(term2) = second(&neg_m, &neg_v)? else {
-                    return Ok(0.0);
-                };
-                let combined = CompositeHyperOperator {
-                    dense: None,
-                    operators: vec![term1.into_operator(), term2.into_operator()],
-                    dim_hint: self.hop.dim(),
-                };
-                Ok(self.hop.trace_logdet_operator(&combined))
-            }
-        }
+        let OuterHessianDerivativeKernel::Callback { first, second } = &self.kernel else {
+            return Err("callback correction requested for non-callback kernel".to_string());
+        };
+        let u = self.hop.solve(rhs);
+        let Some(term1) = first(&u)? else {
+            return Ok(0.0);
+        };
+        let Some(term2) = second(neg_m_alpha, second_v)? else {
+            return Ok(0.0);
+        };
+        let combined = CompositeHyperOperator {
+            dense: None,
+            operators: vec![term1.into_operator(), term2.into_operator()],
+            dim_hint: self.hop.dim(),
+        };
+        Ok(self.hop.trace_logdet_operator(&combined))
     }
 }
 
@@ -5562,6 +5540,9 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             }
         }
         let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
+        let callback_neg_m_alpha =
+            matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
+                .then(|| -&correction_m_alpha);
         let (alpha_dense, alpha_dense_rotated, alpha_op) = self.combined_drift(alpha);
         let mut out = Array1::<f64>::zeros(self.coords.len());
 
@@ -5620,13 +5601,19 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                             &correction_m_alpha,
                         )?,
                     OuterHessianDerivativeKernel::Callback { .. } => {
-                        let correction_v = if coord.is_ext() {
-                            -&coord.v
-                        } else {
+                        let second_v = if coord.is_ext() {
                             coord.v.clone()
+                        } else {
+                            -&coord.v
                         };
                         let rhs = self.pair_rhs_combo(idx, alpha);
-                        self.correction_trace(&rhs, &correction_v, &correction_m_alpha)?
+                        self.callback_correction_trace(
+                            &rhs,
+                            &second_v,
+                            callback_neg_m_alpha
+                                .as_ref()
+                                .expect("callback negated mode"),
+                        )?
                     }
                 }
             } else {
