@@ -1,20 +1,20 @@
-// Tests to find and prove math mistakes in the REML gradient code.
+// Component checks for the base REML/LAML gradient algebra.
 //
-// Strategy: decompose the LAML gradient into independent components and
-// verify each against finite differences. The LAML cost is:
+// Strategy: decompose the non-TK LAML gradient into independent components and
+// verify each against finite differences. TK-specific diagnostics live with the
+// runtime TK tests because production TK is a frozen-curvature surrogate rather
+// than the textbook full chain-rule objective. The base cost here is:
 //
 //   V(ρ) = -ℓ(β̂) + 0.5*β̂ᵀSβ̂          [penalised fit, term A]
 //        + 0.5*log|H|                    [Hessian logdet, term B]
 //        - 0.5*log|S|_+                  [penalty logdet, term C]
 //        + optional normalizing constants       [runtime fixed-dispersion omits these]
-//        + TK(ρ)                         [Tierney-Kadane correction]
 //        + prior(ρ)                      [soft prior on ρ]
 //
 // The analytic gradient should be:
 //   gₖ = 0.5*β̂ᵀAₖβ̂                    [A: envelope theorem]
 //      + 0.5*tr(H⁻¹Hₖ)                  [B: with third-derivative contraction]
 //      - 0.5*det1[k]                     [C: penalty logdet derivative]
-//      + dTK/dρₖ                         [runtime TK path]
 //      + dprior/dρₖ                      [included]
 
 use faer::Side;

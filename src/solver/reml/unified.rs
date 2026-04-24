@@ -2528,10 +2528,13 @@ pub struct InnerSolution<'dp> {
     pub deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
 
     // === Corrections ===
-    /// Tierney-Kadane correction to the Laplace approximation.
+    /// Frozen-curvature Tierney-Kadane surrogate correction to the Laplace approximation.
+    /// The runtime evaluates the TK scalar at the current PIRLS mode and holds
+    /// the observed-information derivative arrays fixed for its gradient.
     pub tk_correction: f64,
 
-    /// Gradient of the TK correction with respect to ρ.
+    /// Gradient of the frozen-curvature TK surrogate with respect to active
+    /// outer coordinates.
     pub tk_gradient: Option<Array1<f64>>,
 
     /// Optional exact Jeffreys/Firth term in the active coefficient basis.
@@ -3206,7 +3209,7 @@ pub fn reml_laml_evaluate(
         } => {
             // Fixed-dispersion Laplace / maximum penalized likelihood:
             //   V(ρ) = −ℓ(β̂) + ½ β̂ᵀSβ̂
-            //         + [½ log|H| + TK − Firth]  if include_logdet_h
+            //         + [½ log|H| + frozen-curvature TK − Firth]  if include_logdet_h
             //         − [½ log|S|₊]               if include_logdet_s
             //
             // The additive Gaussian normalization constant 0.5 * M * log(2πφ)
@@ -8479,6 +8482,111 @@ mod tests {
         )
         .expect_err("oversized fourth-derivative trace should make the Hessian unavailable");
         assert!(is_hessian_unavailable(&err));
+    }
+
+    #[test]
+    fn operator_hessian_matches_dense_with_extended_glm_corrections() {
+        let h = array![[4.0, 0.35], [0.35, 2.7]];
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
+        let beta = array![0.4, -0.7];
+        let penalty_root = array![[1.2, 0.1], [0.0, 0.8]];
+        let ext_drift = array![[0.45, -0.15], [-0.15, 0.35]];
+        let x = array![[1.0, 0.2], [-0.4, 1.1], [0.7, -0.8]];
+        let c_array = array![0.31, -0.27, 0.19];
+        let d_array = array![0.17, -0.11, 0.23];
+        let deriv_provider = SinglePredictorGlmDerivatives {
+            c_array,
+            d_array: Some(d_array),
+            x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
+        };
+
+        let solution = InnerSolution {
+            log_likelihood: -2.3,
+            penalty_quadratic: 0.6,
+            hessian_op: hop.clone(),
+            beta,
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(penalty_root)],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![0.4],
+                second: Some(array![[0.13]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            n_observations: 3,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: vec![HyperCoord {
+                a: -0.21,
+                g: array![0.33, -0.42],
+                drift: HyperCoordDrift::from_dense(ext_drift),
+                ld_s: 0.07,
+                b_depends_on_beta: false,
+                is_penalty_like: false,
+                firth_g: None,
+            }],
+            ext_coord_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+                a: 0.09,
+                g: array![0.16, -0.12],
+                b_mat: array![[0.08, 0.03], [0.03, -0.04]],
+                b_operator: None,
+                ld_s: -0.05,
+            })),
+            rho_ext_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+                a: -0.14,
+                g: array![-0.18, 0.22],
+                b_mat: array![[0.05, -0.02], [-0.02, 0.07]],
+                b_operator: None,
+                ld_s: 0.04,
+            })),
+            fixed_drift_deriv: None,
+            barrier_config: None,
+        };
+        let rho: Vec<f64> = vec![0.2_f64];
+        let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
+
+        let dense = compute_outer_hessian(
+            &solution,
+            &rho,
+            &lambdas,
+            solution.hessian_op.as_ref(),
+            solution.deriv_provider.as_ref(),
+        )
+        .unwrap();
+        let kernel = solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let operator = build_outer_hessian_operator(
+            &solution,
+            &lambdas,
+            solution.deriv_provider.as_ref(),
+            kernel,
+        )
+        .unwrap();
+        let materialized =
+            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
+                .unwrap();
+
+        for row in 0..dense.nrows() {
+            for col in 0..dense.ncols() {
+                assert_relative_eq!(
+                    materialized[[row, col]],
+                    dense[[row, col]],
+                    epsilon = 1e-10,
+                    max_relative = 1e-10
+                );
+            }
+        }
     }
 
     #[test]
