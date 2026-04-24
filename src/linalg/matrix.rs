@@ -5570,26 +5570,30 @@ mod tests {
         let bad_constraint = Arc::new(Array2::<f64>::zeros((2, 1)));
         let bad_poly = Arc::new(Array2::<f64>::zeros((3, 1)));
 
-        let constraint_err = ChunkedKernelDesignOperator::new(
+        let constraint_err = match ChunkedKernelDesignOperator::new(
             data.clone(),
             centers.clone(),
             kernel.clone(),
             Some(bad_constraint),
             None,
-        )
-        .expect_err("constraint rows should match centers rows");
+        ) {
+            Ok(_) => panic!("constraint rows should match centers rows"),
+            Err(err) => err,
+        };
         assert!(constraint_err.contains("constraint_transform rows 2 != centers rows 3"));
 
         let poly_err =
-            ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly))
-                .expect_err("poly rows should match data rows");
+            match ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly)) {
+                Ok(_) => panic!("poly rows should match data rows"),
+                Err(err) => err,
+            };
         assert!(poly_err.contains("poly_basis rows 3 != data rows 2"));
     }
 
     #[test]
     fn chunked_kernel_operator_canonicalizes_non_contiguous_inputs() {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]].reversed_axes());
-        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]].reversed_axes());
+        let centers = Arc::new(array![[0.0, 1.0, 2.0], [0.0, 1.0, -1.0]].reversed_axes());
         assert!(!data.is_standard_layout());
         assert!(!centers.is_standard_layout());
 
