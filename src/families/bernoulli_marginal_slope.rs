@@ -2587,17 +2587,6 @@ impl BernoulliMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    // Learnable GaussianShift sigma is intentionally not an outer coordinate
-    // for this family yet. The cell coefficients scale by
-    // s(log sigma) = 1 / sqrt(1 + sigma^2), but the probit cell integral is
-    // not linear in s. The analytic implementation must differentiate exact
-    // cell moments by coefficient direction:
-    //     F_tau = integral phi(c(z)) c_tau(z) phi(z) dz,
-    //     c_tau(z) = d(log s)/d tau * c(z),
-    // with row intercept derivatives supplied by F(a, beta, tau) - mu = 0.
-    // Until that tensor path exists, public validation accepts only fixed
-    // GaussianShift sigma or no frailty, and this branch remains defensive.
-
     fn is_sigma_aux_index(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -2620,19 +2609,368 @@ impl BernoulliMarginalSlopeFamily {
             && deriv.s_psi_psi.is_none()
     }
 
+    fn sigma_scale_jet(
+        &self,
+        n_dirs: usize,
+        first_masks: &[usize],
+        second_masks: &[usize],
+    ) -> Result<MultiDirJet, String> {
+        let sigma = self.gaussian_frailty_sd.ok_or_else(|| {
+            "bernoulli marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
+                .to_string()
+        })?;
+        let jet =
+            crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
+        let mut coeffs = Vec::with_capacity(1 + first_masks.len() + second_masks.len());
+        coeffs.push((0usize, jet.s));
+        coeffs.extend(first_masks.iter().copied().map(|mask| (mask, jet.ds)));
+        coeffs.extend(second_masks.iter().copied().map(|mask| (mask, jet.d2s)));
+        Ok(MultiDirJet::with_coeffs(n_dirs, &coeffs))
+    }
+
+    fn row_neglog_directional_with_scale_jet(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dirs: &[Array1<f64>],
+        scale_jet: &MultiDirJet,
+    ) -> Result<f64, String> {
+        let k = dirs.len();
+        if k > 4 {
+            return Err(format!(
+                "bernoulli marginal-slope sigma row directional expects 0..=4 directions, got {k}"
+            ));
+        }
+        if scale_jet.coeffs.len() != (1usize << k) {
+            return Err(format!(
+                "bernoulli marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
+                scale_jet.coeffs.len()
+            ));
+        }
+
+        let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
+        let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+        let eta_jet = MultiDirJet::linear(k, block_states[0].eta[row], &first(0));
+        let q_jet =
+            eta_jet.compose_unary([marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4]);
+        let g_jet = MultiDirJet::linear(k, block_states[1].eta[row], &first(1));
+        let observed_g_jet = g_jet.mul(scale_jet);
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
+        let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
+        let z_jet = MultiDirJet::constant(k, self.z[row]);
+        let eta_observed_jet = q_jet.mul(&c_jet).add(&observed_g_jet.mul(&z_jet));
+        let signed_jet = eta_observed_jet.scale(2.0 * self.y[row] - 1.0);
+        Ok(signed_jet
+            .compose_unary(unary_derivatives_neglog_phi(
+                signed_jet.coeff(0),
+                self.weights[row],
+            ))
+            .coeff((1usize << k) - 1))
+    }
+
+    fn row_sigma_primary_terms(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        second_sigma: bool,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let primary_dim = 2usize;
+        let zero = Array1::<f64>::zeros(primary_dim);
+        let objective = if second_sigma {
+            let scale = self.sigma_scale_jet(2, &[1, 2], &[3])?;
+            self.row_neglog_directional_with_scale_jet(
+                row,
+                block_states,
+                &[zero.clone(), zero.clone()],
+                &scale,
+            )?
+        } else {
+            let scale = self.sigma_scale_jet(1, &[1], &[])?;
+            self.row_neglog_directional_with_scale_jet(row, block_states, &[zero.clone()], &scale)?
+        };
+
+        let mut grad = Array1::<f64>::zeros(primary_dim);
+        for a in 0..primary_dim {
+            let mut da = Array1::<f64>::zeros(primary_dim);
+            da[a] = 1.0;
+            grad[a] = if second_sigma {
+                let scale = self.sigma_scale_jet(3, &[1, 2], &[3])?;
+                self.row_neglog_directional_with_scale_jet(
+                    row,
+                    block_states,
+                    &[zero.clone(), zero.clone(), da],
+                    &scale,
+                )?
+            } else {
+                let scale = self.sigma_scale_jet(2, &[1], &[])?;
+                self.row_neglog_directional_with_scale_jet(
+                    row,
+                    block_states,
+                    &[zero.clone(), da],
+                    &scale,
+                )?
+            };
+        }
+
+        let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
+        for a in 0..primary_dim {
+            let mut da = Array1::<f64>::zeros(primary_dim);
+            da[a] = 1.0;
+            for b in a..primary_dim {
+                let mut db = Array1::<f64>::zeros(primary_dim);
+                db[b] = 1.0;
+                let value = if second_sigma {
+                    let scale = self.sigma_scale_jet(4, &[1, 2], &[3])?;
+                    self.row_neglog_directional_with_scale_jet(
+                        row,
+                        block_states,
+                        &[zero.clone(), zero.clone(), da.clone(), db],
+                        &scale,
+                    )?
+                } else {
+                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                    self.row_neglog_directional_with_scale_jet(
+                        row,
+                        block_states,
+                        &[zero.clone(), da.clone(), db],
+                        &scale,
+                    )?
+                };
+                hess[[a, b]] = value;
+                hess[[b, a]] = value;
+            }
+        }
+
+        Ok((objective, grad, hess))
+    }
+
+    fn accumulate_rigid_sigma_pullback(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        primary_grad: &Array1<f64>,
+        primary_hessian: &Array2<f64>,
+        score: &mut Array1<f64>,
+        hessian: &mut BernoulliBlockHessianAccumulator,
+    ) -> Result<(), String> {
+        {
+            let mut marginal = score.slice_mut(s![slices.marginal.clone()]);
+            self.marginal_design
+                .axpy_row_into(row, primary_grad[0], &mut marginal)?;
+        }
+        {
+            let mut logslope = score.slice_mut(s![slices.logslope.clone()]);
+            self.logslope_design
+                .axpy_row_into(row, primary_grad[1], &mut logslope)?;
+        }
+        hessian.add_pullback(self, row, slices, &primary_slices(slices), primary_hessian);
+        Ok(())
+    }
+
     fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let _ = (block_states, specs);
-        if self.gaussian_frailty_sd.is_some() {
+        if self.effective_flex_active(block_states)? {
             return Err(
-                "bernoulli marginal-slope log-sigma hyperderivatives require an analytic implementation; production finite differences are disabled"
+                "bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
                     .to_string(),
             );
         }
-        Ok(None)
+        if self.gaussian_frailty_sd.is_none() {
+            return Ok(None);
+        }
+        let slices = block_slices(self);
+        let n = self.y.len();
+        let (objective_psi, score_psi, acc) = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(&slices),
+                    )
+                },
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let (obj, grad, hess) =
+                            self.row_sigma_primary_terms(row, block_states, false)?;
+                        acc.0 += obj;
+                        self.accumulate_rigid_sigma_pullback(
+                            row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                        )?;
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(&slices),
+                    )
+                },
+                |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2.add(&right.2);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(Arc::new(acc.into_operator(&slices))),
+        }))
+    }
+
+    fn sigma_exact_joint_psisecond_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if self.effective_flex_active(block_states)? {
+            return Err(
+                "bernoulli marginal-slope second log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
+                    .to_string(),
+            );
+        }
+        if self.gaussian_frailty_sd.is_none() {
+            return Ok(None);
+        }
+        let slices = block_slices(self);
+        let n = self.y.len();
+        let (objective_psi_psi, score_psi_psi, acc) = (0..((n + ROW_CHUNK_SIZE - 1)
+            / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(&slices),
+                    )
+                },
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let (obj, grad, hess) =
+                            self.row_sigma_primary_terms(row, block_states, true)?;
+                        acc.0 += obj;
+                        self.accumulate_rigid_sigma_pullback(
+                            row, &slices, &grad, &hess, &mut acc.1, &mut acc.2,
+                        )?;
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(&slices),
+                    )
+                },
+                |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2.add(&right.2);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(Box::new(acc.into_operator(&slices))),
+        }))
+    }
+
+    fn sigma_exact_joint_psihessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if self.effective_flex_active(block_states)? {
+            return Err(
+                "bernoulli marginal-slope log-sigma Hessian directional derivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
+                    .to_string(),
+            );
+        }
+        if self.gaussian_frailty_sd.is_none() {
+            return Ok(None);
+        }
+        let slices = block_slices(self);
+        if d_beta_flat.len() != slices.total {
+            return Err(format!(
+                "bernoulli marginal-slope d_beta length mismatch for sigma Hessian derivative: got {}, expected {}",
+                d_beta_flat.len(),
+                slices.total
+            ));
+        }
+        let n = self.y.len();
+        let primary = primary_slices(&slices);
+        let acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || BernoulliBlockHessianAccumulator::new(&slices),
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    for row in start..end {
+                        let row_dir =
+                            self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
+                        let zero = Array1::<f64>::zeros(primary.total);
+                        let mut grad = Array1::<f64>::zeros(primary.total);
+                        for a in 0..primary.total {
+                            let mut da = Array1::<f64>::zeros(primary.total);
+                            da[a] = 1.0;
+                            let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                            grad[a] = self.row_neglog_directional_with_scale_jet(
+                                row,
+                                block_states,
+                                &[zero.clone(), row_dir.clone(), da],
+                                &scale,
+                            )?;
+                        }
+                        let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
+                        for a in 0..primary.total {
+                            let mut da = Array1::<f64>::zeros(primary.total);
+                            da[a] = 1.0;
+                            for b in a..primary.total {
+                                let mut db = Array1::<f64>::zeros(primary.total);
+                                db[b] = 1.0;
+                                let scale = self.sigma_scale_jet(4, &[1], &[])?;
+                                let value = self.row_neglog_directional_with_scale_jet(
+                                    row,
+                                    block_states,
+                                    &[zero.clone(), row_dir.clone(), da.clone(), db],
+                                    &scale,
+                                )?;
+                                hess[[a, b]] = value;
+                                hess[[b, a]] = value;
+                            }
+                        }
+                        acc.add_pullback(self, row, &slices, &primary, &hess);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BernoulliBlockHessianAccumulator::new(&slices),
+                |mut left, right| -> Result<_, String> {
+                    left.add(&right);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(acc.into_operator(&slices).to_dense()))
     }
 
     #[inline]
@@ -7419,7 +7757,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if self.is_sigma_aux_index(derivative_blocks, psi_i)
             || self.is_sigma_aux_index(derivative_blocks, psi_j)
         {
-            return Ok(None);
+            if self.is_sigma_aux_index(derivative_blocks, psi_i)
+                && self.is_sigma_aux_index(derivative_blocks, psi_j)
+            {
+                return self.sigma_exact_joint_psisecond_order_terms(block_states);
+            }
+            return Err(
+                "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
+                    .to_string(),
+            );
         }
         let cache = self.build_exact_eval_cache(block_states)?;
         self.exact_newton_joint_psisecond_order_terms_from_cache(
@@ -7440,7 +7786,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return Ok(None);
+            return self
+                .sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat);
         }
         let cache = self.build_exact_eval_cache(block_states)?;
         self.exact_newton_joint_psihessian_directional_derivative_from_cache(
@@ -7679,7 +8026,21 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                 .family
                 .is_sigma_aux_index(&self.derivative_blocks, psi_j)
         {
-            return Ok(None);
+            if self
+                .family
+                .is_sigma_aux_index(&self.derivative_blocks, psi_i)
+                && self
+                    .family
+                    .is_sigma_aux_index(&self.derivative_blocks, psi_j)
+            {
+                return self
+                    .family
+                    .sigma_exact_joint_psisecond_order_terms(&self.block_states);
+            }
+            return Err(
+                "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
+                    .to_string(),
+            );
         }
         self.family
             .exact_newton_joint_psisecond_order_terms_from_cache(
@@ -7700,7 +8061,15 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             .family
             .is_sigma_aux_index(&self.derivative_blocks, psi_index)
         {
-            return Ok(None);
+            return self
+                .family
+                .sigma_exact_joint_psihessian_directional_derivative(
+                    &self.block_states,
+                    d_beta_flat,
+                )
+                .map(|result| {
+                    result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+                });
         }
         self.family
             .exact_newton_joint_psihessian_directional_derivative_operator_from_cache(
