@@ -5675,15 +5675,15 @@ fn compute_spatial_adaptiveweights_for_beta(
     //   u(t0) = eps / (2*sqrt(t0^2 + eps^2)).
     //
     // We apply this to:
-    //   t = f_k = |f(z_k)|            (magnitude),
-    //   t = g_k = ||nabla f(z_k)||_2  (gradient magnitude),
-    //   t = c_k = |Delta f(z_k)|      (laplacian magnitude),
+    //   t = f_k = |f(z_k)|             (magnitude),
+    //   t = g_k = ||nabla f(z_k)||_2   (gradient magnitude),
+    //   t = c_k = ||D²f(z_k)||_F       (full Hessian curvature),
     // both computed from beta^(t-1).
     //
     // These u values define the quadratic surrogate penalties:
     //   K0 = D0_con^T W_0 D0_con,  W_0 = diag(u_0)
     //   K1 = D1_con^T W_g D1_con,  W_g = diag(u_g) \otimes I_d  (k,axis order)
-    //   K2 = D2_con^T W_c D2_con,  W_c = diag(u_c).
+    //   K2 = D2_con^T W_c D2_con,  W_c = diag(u_c) \otimes I_(d*d).
     //
     // We clamp u directly, then derive inv_u=1/u for diagnostics and row scaling.
     caches
