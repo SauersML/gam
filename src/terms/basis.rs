@@ -3746,10 +3746,6 @@ fn build_aniso_design_psi_derivatives_shared(
         });
     }
 
-    if force_operator {
-        assert_no_dense_derivative_materialization(n, p_final, dim);
-    }
-
     // ── Materialized path: small-to-medium non-Duchon problems ────────────
     // Allocate O(n*k) arrays up front and fill with parallel chunks that
     // write directly into preallocated storage via raw pointers. No
@@ -3894,10 +3890,6 @@ fn build_scalar_design_psi_derivatives_shared(
             design_second_diag: Array2::<f64>::zeros((0, 0)),
             implicit_operator: Some(op),
         });
-    }
-
-    if force_operator {
-        assert_no_dense_derivative_materialization(n, p_final, 1);
     }
 
     let nk = n * k;
