@@ -5058,11 +5058,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
 
     if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        if parsed.linkspec.is_some() {
-            return Err(
-                "link(...) is not implemented for the survival marginal-slope family".to_string(),
-            );
-        }
+        let survival_marginal_slope_base_link = resolve_bernoulli_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+            "survival marginal-slope",
+        )?;
         let logslope_formula_raw = args.logslope_formula.as_deref().ok_or_else(|| {
             "--logslope-formula is required with --survival-likelihood marginal-slope".to_string()
         })?;
@@ -5154,6 +5153,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             event_target: event_target.mapv(f64::from),
             weights: weights.clone(),
             z: z.clone(),
+            base_link: survival_marginal_slope_base_link.clone(),
             marginalspec: termspec.clone(),
             marginal_offset: threshold_offset.clone(),
             frailty: frailty.clone(),
@@ -5183,6 +5183,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             logslope_offset: log_sigma_offset.clone(),
             score_warp: routed_score_warp.clone(),
             link_dev: routed_link_dev.clone(),
+            latent_z_policy: LatentZPolicy::default(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
             baseline_cfg = optimize_survival_baseline_config_with_gradient(

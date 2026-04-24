@@ -3918,8 +3918,8 @@ fn build_aniso_design_psi_derivatives_shared(
     // recomputes (q, t, s_a) on the fly during every matvec.
     if use_implicit {
         let op = ImplicitDesignPsiDerivative::new_streaming(
-            data.to_owned(),
-            centers.to_owned(),
+            Arc::new(data.to_owned()),
+            Arc::new(centers.to_owned()),
             eta.to_vec(),
             radial_kind,
             ident_transform,
@@ -4069,8 +4069,8 @@ fn build_scalar_design_psi_derivatives_shared(
             .map(|eta| eta.to_vec())
             .unwrap_or_else(|| vec![0.0; dim]);
         let op = ImplicitDesignPsiDerivative::new_streaming_scalar(
-            data.to_owned(),
-            centers.to_owned(),
+            Arc::new(data.to_owned()),
+            Arc::new(centers.to_owned()),
             metric_eta,
             radial_kind,
             ident_transform,
