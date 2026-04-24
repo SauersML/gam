@@ -102,7 +102,7 @@ impl<'a> RemlState<'a> {
 
     fn dense_penalty_logdet_derivs(
         &self,
-        _rho: &Array1<f64>,
+        rho: &Array1<f64>,
         e_for_logdet: &Array2<f64>,
         penalty_roots: &[Array2<f64>],
         ridge_passport: RidgePassport,
@@ -679,7 +679,6 @@ impl<'a> RemlState<'a> {
     fn apply_tk_to_result(
         &self,
         mut result: super::unified::RemlLamlResult,
-        rho: &Array1<f64>,
         tk_terms: TkCorrectionTerms,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         result.cost += tk_terms.value;
@@ -3134,7 +3133,7 @@ impl<'a> RemlState<'a> {
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
-        self.apply_tk_to_result(result, rho, tk_terms)
+        self.apply_tk_to_result(result, tk_terms)
     }
 
     /// Single assembly point for EFS: build `InnerSolution` from an assembly,
@@ -3172,7 +3171,7 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode)?;
-        let cost_result = self.apply_tk_to_result(cost_result, rho, tk_terms)?;
+        let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
 
         let efs_eval = if has_psi {
             let gradient = cost_result.gradient.as_ref().expect(
