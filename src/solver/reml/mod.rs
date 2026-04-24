@@ -1216,26 +1216,32 @@ mod tests {
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
 
-        let full = state
-            .evaluate_unified_with_psi_ext(
-                &rho,
-                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
-                &hyper_dirs,
-            )
-            .expect("full Firth psi gradient should be available");
-        let full_gradient = full.gradient.expect("full gradient");
-        let expected_psi = full_gradient[rho.len()];
-
-        let efs = state
-            .compute_efs_steps_with_psi_ext(&rho, &hyper_dirs)
-            .expect("hybrid EFS psi gradient should be available");
-        let psi_gradient = efs.psi_gradient.expect("hybrid EFS psi gradient");
-        assert_eq!(psi_gradient.len(), 1);
+        let full_err = match state.evaluate_unified_with_psi_ext(
+            &rho,
+            crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+            &hyper_dirs,
+        ) {
+            Ok(_) => panic!("full Firth psi gradient must reject incomplete TK psi calculus"),
+            Err(err) => err,
+        };
+        let full_msg = full_err.to_string();
         assert!(
-            (psi_gradient[0] - expected_psi).abs() <= 1e-10,
-            "hybrid EFS psi gradient mismatch: got={:.12e}, expected={:.12e}",
-            psi_gradient[0],
-            expected_psi
+            full_msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected full-gradient error: {full_msg}"
+        );
+
+        let efs_err = match state.compute_efs_steps_with_psi_ext(&rho, &hyper_dirs) {
+            Ok(_) => panic!("hybrid EFS must reject incomplete TK psi calculus"),
+            Err(err) => err,
+        };
+        let efs_msg = efs_err.to_string();
+        assert!(
+            efs_msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected EFS error: {efs_msg}"
         );
     }
 
