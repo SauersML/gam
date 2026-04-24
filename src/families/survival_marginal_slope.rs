@@ -84,7 +84,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
 pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
 const SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL: f64 = 1e-12;
 const SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL: f64 = 1e-8;
-const SURVIVAL_INTERCEPT_LOG_SURVIVAL_THRESHOLD: f64 = 1e-8;
+const SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD: f64 = 1e-8;
 
 #[inline]
 fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
@@ -2896,21 +2896,6 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    // `sigma_scale_factor`, `sigma_beta_linear_operator`, and `add_sigma_hessian_linear_terms`
-    // have been retired (mirror of the bernoulli_marginal_slope fix).
-    // Their construction —
-    //     direction[u] = (ṡ/s) · β[u]  for u ∈ {logslope, H, W}
-    //     mask[u]      = (ṡ/s)         on the same slices
-    // — encoded σ-perturbation as a β-rescaling by (1 + ε·ṡ/s), which is
-    // exact only on the rigid path (scalar-in-s·β affine likelihood).  In
-    // the flex path the per-row intercept a_r(β, σ) is implicit through
-    // the denested cell Φ-integrals and the dynamic-q time-wiggle
-    // composition, so the σ-derivative picks up an implicit-a term and
-    // cell-integral nonlinearities that a single β-direction cannot
-    // reproduce.  Production finite differences are intentionally not used for
-    // σ hyperderivatives; the σ auxiliary coordinate is unsupported until the
-    // full analytic cell-tensor path is implemented.
-
     fn is_sigma_aux_index(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -2933,19 +2918,427 @@ impl SurvivalMarginalSlopeFamily {
             && deriv.s_psi_psi.is_none()
     }
 
+    fn sigma_scale_jet(&self, n_dirs: usize, first_masks: &[usize], second_masks: &[usize]) -> Result<MultiDirJet, String> {
+        let sigma = self.gaussian_frailty_sd.ok_or_else(|| {
+            "survival marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
+                .to_string()
+        })?;
+        let jet = crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
+        let mut coeffs = Vec::with_capacity(1 + first_masks.len() + second_masks.len());
+        coeffs.push((0usize, jet.s));
+        coeffs.extend(first_masks.iter().copied().map(|mask| (mask, jet.ds)));
+        coeffs.extend(second_masks.iter().copied().map(|mask| (mask, jet.d2s)));
+        Ok(MultiDirJet::with_coeffs(n_dirs, &coeffs))
+    }
+
+    fn row_neglog_directional_with_scale_jet(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dirs: &[Array1<f64>],
+        scale_jet: &MultiDirJet,
+    ) -> Result<f64, String> {
+        let k = dirs.len();
+        if k > 4 {
+            return Err(format!(
+                "survival marginal-slope sigma row directional expects 0..=4 directions, got {k}"
+            ));
+        }
+        if scale_jet.coeffs.len() != (1usize << k) {
+            return Err(format!(
+                "survival marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
+                scale_jet.coeffs.len()
+            ));
+        }
+        let wi = self.weights[row];
+        let di = self.event[row];
+        let zi = self.z[row];
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+
+        let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
+        let q0_jet = MultiDirJet::linear(k, q_geom.q0, &first(0));
+        let q1_jet = MultiDirJet::linear(k, q_geom.q1, &first(1));
+        let qd1_jet = MultiDirJet::linear(k, q_geom.qd1, &first(2));
+        let g_jet = MultiDirJet::linear(k, block_states[2].eta[row], &first(3));
+
+        let observed_g_jet = g_jet.mul(scale_jet);
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
+        let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
+
+        let a0_jet = q0_jet.mul(&c_jet);
+        let a1_jet = q1_jet.mul(&c_jet);
+        let ad1_jet = qd1_jet.mul(&c_jet);
+        let z_jet = MultiDirJet::constant(k, zi);
+        let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
+        let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
+
+        let neg_eta0 = eta0_jet.scale(-1.0);
+        let entry_term = neg_eta0
+            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.coeff(0), wi))
+            .scale(-1.0);
+
+        let neg_eta1 = eta1_jet.scale(-1.0);
+        let exit_term = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
+            neg_eta1.coeff(0),
+            wi * (1.0 - di),
+        ));
+
+        let event_density_term = if di > 0.0 {
+            eta1_jet
+                .compose_unary(unary_derivatives_log_normal_pdf(eta1_jet.coeff(0)))
+                .scale(-wi * di)
+        } else {
+            MultiDirJet::zero(k)
+        };
+
+        let qd1_lower = self.time_derivative_lower_bound();
+        let qd1_val = qd1_jet.coeff(0);
+        let ad1_val = ad1_jet.coeff(0);
+        if survival_derivative_guard_violated(qd1_val, qd1_lower) {
+            return Err(format!(
+                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
+            ));
+        }
+        let time_deriv_term = if di > 0.0 {
+            ad1_jet
+                .compose_unary(unary_derivatives_log(ad1_val))
+                .scale(-wi * di)
+        } else {
+            MultiDirJet::zero(k)
+        };
+
+        Ok(exit_term
+            .add(&entry_term)
+            .add(&event_density_term)
+            .add(&time_deriv_term)
+            .coeff((1usize << k) - 1))
+    }
+
+    fn row_sigma_primary_terms(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        second_sigma: bool,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let primary_dim = N_PRIMARY;
+        let objective = if second_sigma {
+            let scale = self.sigma_scale_jet(2, &[1, 2], &[3])?;
+            self.row_neglog_directional_with_scale_jet(
+                row,
+                block_states,
+                &[Array1::zeros(primary_dim), Array1::zeros(primary_dim)],
+                &scale,
+            )?
+        } else {
+            let scale = self.sigma_scale_jet(1, &[1], &[])?;
+            self.row_neglog_directional_with_scale_jet(
+                row,
+                block_states,
+                &[Array1::zeros(primary_dim)],
+                &scale,
+            )?
+        };
+
+        let mut grad = Array1::<f64>::zeros(primary_dim);
+        for a in 0..primary_dim {
+            let da = unit_primary_direction(a);
+            let value = if second_sigma {
+                let scale = self.sigma_scale_jet(3, &[1, 2], &[3])?;
+                self.row_neglog_directional_with_scale_jet(
+                    row,
+                    block_states,
+                    &[Array1::zeros(primary_dim), Array1::zeros(primary_dim), da],
+                    &scale,
+                )?
+            } else {
+                let scale = self.sigma_scale_jet(2, &[1], &[])?;
+                self.row_neglog_directional_with_scale_jet(
+                    row,
+                    block_states,
+                    &[Array1::zeros(primary_dim), da],
+                    &scale,
+                )?
+            };
+            grad[a] = value;
+        }
+
+        let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
+        for a in 0..primary_dim {
+            let da = unit_primary_direction(a);
+            for b in a..primary_dim {
+                let db = unit_primary_direction(b);
+                let value = if second_sigma {
+                    let scale = self.sigma_scale_jet(4, &[1, 2], &[3])?;
+                    self.row_neglog_directional_with_scale_jet(
+                        row,
+                        block_states,
+                        &[
+                            Array1::zeros(primary_dim),
+                            Array1::zeros(primary_dim),
+                            da.clone(),
+                            db,
+                        ],
+                        &scale,
+                    )?
+                } else {
+                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                    self.row_neglog_directional_with_scale_jet(
+                        row,
+                        block_states,
+                        &[Array1::zeros(primary_dim), da.clone(), db],
+                        &scale,
+                    )?
+                };
+                hess[[a, b]] = value;
+                hess[[b, a]] = value;
+            }
+        }
+
+        Ok((objective, grad, hess))
+    }
+
     fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let _ = (block_states, specs);
-        if self.gaussian_frailty_sd.is_some() {
+        if self.flex_active() {
             return Err(
-                "survival marginal-slope log-sigma hyperderivatives require an analytic implementation; production finite differences are disabled"
+                "survival marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flex score/link/timewiggle kernels still require the analytic cell-tensor sigma path"
                     .to_string(),
             );
         }
-        Ok(None)
+        let slices = block_slices(self, block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |mut a, row| -> Result<_, String> {
+                    let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, false)?;
+                    a.0 += obj;
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    self.accumulate_score_with_q_geometry(
+                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess);
+                    Ok(a)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |mut a, b| {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4 += &b.4;
+                    a.5 += &b.5;
+                    a.6.add(&b.6);
+                    Ok(a)
+                },
+            )?;
+
+        let mut score_psi = Array1::zeros(slices.total);
+        score_psi.slice_mut(s![slices.time.clone()]).assign(&score_t);
+        score_psi
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&score_m);
+        score_psi
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&score_g);
+        if let Some(range) = slices.score_warp.as_ref() {
+            score_psi.slice_mut(s![range.clone()]).assign(&score_h);
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            score_psi.slice_mut(s![range.clone()]).assign(&score_w);
+        }
+
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(Arc::new(acc.into_operator(slices))),
+        }))
+    }
+
+    fn sigma_exact_joint_psisecond_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if self.flex_active() {
+            return Ok(None);
+        }
+        let slices = block_slices(self, block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let (objective_psi_psi, score_t, score_m, score_g, score_h, score_w, acc) = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |mut a, row| -> Result<_, String> {
+                    let (obj, grad, hess) = self.row_sigma_primary_terms(row, block_states, true)?;
+                    a.0 += obj;
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    self.accumulate_score_with_q_geometry(
+                        row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
+                    )?;
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess);
+                    Ok(a)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                },
+                |mut a, b| {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4 += &b.4;
+                    a.5 += &b.5;
+                    a.6.add(&b.6);
+                    Ok(a)
+                },
+            )?;
+
+        let mut score_psi_psi = Array1::zeros(slices.total);
+        score_psi_psi
+            .slice_mut(s![slices.time.clone()])
+            .assign(&score_t);
+        score_psi_psi
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&score_m);
+        score_psi_psi
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&score_g);
+        if let Some(range) = slices.score_warp.as_ref() {
+            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_h);
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_w);
+        }
+
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(Box::new(acc.into_operator(slices))),
+        }))
+    }
+
+    fn sigma_exact_joint_psihessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if self.flex_active() {
+            return Ok(None);
+        }
+        let slices = block_slices(self, block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let primary_dim = N_PRIMARY;
+        let acc = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut acc, row| -> Result<_, String> {
+                    let row_dir = self.row_primary_direction_from_flat_dynamic(
+                        row,
+                        block_states,
+                        &slices,
+                        d_beta_flat,
+                    )?;
+                    let mut grad = Array1::<f64>::zeros(primary_dim);
+                    for a in 0..primary_dim {
+                        let da = unit_primary_direction(a);
+                        let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                        grad[a] = self.row_neglog_directional_with_scale_jet(
+                            row,
+                            block_states,
+                            &[Array1::zeros(primary_dim), row_dir.clone(), da],
+                            &scale,
+                        )?;
+                    }
+                    let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
+                    for a in 0..primary_dim {
+                        let da = unit_primary_direction(a);
+                        for b in a..primary_dim {
+                            let db = unit_primary_direction(b);
+                            let scale = self.sigma_scale_jet(4, &[1], &[])?;
+                            let value = self.row_neglog_directional_with_scale_jet(
+                                row,
+                                block_states,
+                                &[Array1::zeros(primary_dim), row_dir.clone(), da.clone(), db],
+                                &scale,
+                            )?;
+                            hess[[a, b]] = value;
+                            hess[[b, a]] = value;
+                        }
+                    }
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess);
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                |mut a, b| {
+                    a.add(&b);
+                    Ok(a)
+                },
+            )?;
+        Ok(Some(acc.to_dense(&slices)))
     }
 
     fn flex_timewiggle_active(&self) -> bool {
@@ -3475,7 +3868,7 @@ impl SurvivalMarginalSlopeFamily {
         let probability_tol = SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL
             .max(SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL * tail_mass);
         let mut log_tail_residual = None;
-        let residual_ok = if tail_mass < SURVIVAL_INTERCEPT_LOG_SURVIVAL_THRESHOLD {
+        let residual_ok = if tail_mass < SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD {
             let (achieved_tail, target_log_tail) = if target_survival <= 0.5 {
                 let (target_log_survival, _) = signed_probit_logcdf_and_mills_ratio(-q);
                 (achieved_survival, target_log_survival)
@@ -9595,6 +9988,11 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 .family
                 .is_sigma_aux_index(&self.derivative_blocks, psi_j)
         {
+            if psi_i == psi_j {
+                return self
+                    .family
+                    .sigma_exact_joint_psisecond_order_terms(&self.block_states);
+            }
             return Ok(None);
         }
         self.family.psi_second_order_terms_inner(
@@ -9615,7 +10013,17 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             .family
             .is_sigma_aux_index(&self.derivative_blocks, psi_index)
         {
-            return Ok(None);
+            return self
+                .family
+                .sigma_exact_joint_psihessian_directional_derivative(
+                    &self.block_states,
+                    d_beta_flat,
+                )
+                .map(|result| {
+                    result.map(|matrix| {
+                        crate::solver::estimate::reml::unified::DriftDerivResult::Dense(matrix)
+                    })
+                });
         }
         self.family
             .psi_hessian_directional_derivative_operator(
@@ -12196,6 +12604,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         if self.is_sigma_aux_index(derivative_blocks, psi_i)
             || self.is_sigma_aux_index(derivative_blocks, psi_j)
         {
+            if psi_i == psi_j {
+                return self.sigma_exact_joint_psisecond_order_terms(block_states);
+            }
             return Ok(None);
         }
         self.psi_second_order_terms(block_states, derivative_blocks, psi_i, psi_j)
@@ -12210,7 +12621,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return Ok(None);
+            return self.sigma_exact_joint_psihessian_directional_derivative(
+                block_states,
+                d_beta_flat,
+            );
         }
         self.psi_hessian_directional_derivative(
             block_states,
@@ -12412,6 +12826,7 @@ fn joint_setup(
     logslopespec: &TermCollectionSpec,
     logslope_penalties: usize,
     extra_rho0: &[f64],
+    initial_sigma: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
@@ -12490,14 +12905,23 @@ fn joint_setup(
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-    ExactJointHyperSetup::new(
+    let setup = ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
         rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
-    )
+    );
+    if let Some(sigma) = initial_sigma.filter(|sigma| *sigma > 0.0) {
+        setup.with_auxiliary(
+            Array1::from_vec(vec![sigma.ln()]),
+            Array1::from_vec(vec![-12.0]),
+            Array1::from_vec(vec![6.0]),
+        )
+    } else {
+        setup
+    }
 }
 
 fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
@@ -12894,10 +13318,12 @@ pub fn fit_survival_marginal_slope_terms(
         &logslopespec_boot,
         logslope_design.penalties.len(),
         &extra_rho0,
+        initial_sigma,
         kappa_options,
     );
 
     let hints = RefCell::new(ThetaHints::default());
+    let sigma_hint = RefCell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
 
     let event = Arc::new(spec.event_target.clone());
@@ -13111,6 +13537,9 @@ pub fn fit_survival_marginal_slope_terms(
                 .zip(right.iter())
                 .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
     };
+    let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
+        initial_sigma.map(|_| theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
+    };
     let get_derivative_blocks = |theta: &Array1<f64>,
                                  specs: &[TermCollectionSpec],
                                  designs: &[TermCollectionDesign]|
@@ -13153,6 +13582,21 @@ pub fn fit_survival_marginal_slope_terms(
         if link_dev_runtime.is_some() {
             derivative_blocks.push(Vec::new());
         }
+        if initial_sigma.is_some_and(|sigma| sigma > 0.0) {
+            let sigma_aux = crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                Array2::zeros((0, 0)),
+                Array2::zeros((0, 0)),
+                None,
+                None,
+                None,
+                None,
+            );
+            derivative_blocks
+                .last_mut()
+                .ok_or_else(|| "survival marginal-slope missing derivative blocks".to_string())?
+                .push(sigma_aux);
+        }
         let derivative_blocks = Arc::new(derivative_blocks);
         derivative_block_cache.replace(Some((theta.clone(), Arc::clone(&derivative_blocks))));
         Ok(derivative_blocks)
@@ -13175,7 +13619,9 @@ pub fn fit_survival_marginal_slope_terms(
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], initial_sigma);
+            let sigma = sigma_from_theta(theta);
+            sigma_hint.replace(sigma);
+            let family = make_family(&designs[0], &designs[1], sigma);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.get(0) {
@@ -13203,7 +13649,7 @@ pub fn fit_survival_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], initial_sigma);
+            let family = make_family(&designs[0], &designs[1], sigma_from_theta(theta));
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
@@ -13231,7 +13677,7 @@ pub fn fit_survival_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], initial_sigma);
+            let family = make_family(&designs[0], &designs[1], sigma_from_theta(theta));
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
@@ -13247,7 +13693,7 @@ pub fn fit_survival_marginal_slope_terms(
     )?;
 
     let baseline_offset_residuals = {
-        let final_family = make_family(&solved.designs[0], &solved.designs[1], initial_sigma);
+        let final_family = make_family(&solved.designs[0], &solved.designs[1], *sigma_hint.borrow());
         final_family.offset_channel_residuals(&solved.fit.block_states)?
     };
     let mut resolved_specs = solved.resolved_specs;
@@ -13258,7 +13704,7 @@ pub fn fit_survival_marginal_slope_terms(
         logslopespec_resolved: resolved_specs.remove(0),
         marginal_design: designs[0].clone(),
         logslope_design: designs[1].clone(),
-        gaussian_frailty_sd: initial_sigma,
+        gaussian_frailty_sd: *sigma_hint.borrow(),
         baseline_slope,
         baseline_offset_residuals,
         z_normalization,
