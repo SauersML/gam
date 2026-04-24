@@ -200,50 +200,19 @@ pub(crate) fn bernoulli_marginal_slope_eta_from_probability(
     probability: f64,
     context: &str,
 ) -> Result<f64, String> {
+    require_probit_marginal_slope_link(base_link, context)?;
     let target = clamp_bernoulli_link_probability(probability);
-    match base_link {
-        InverseLink::Standard(LinkFunction::Probit) => standard_normal_quantile(target)
-            .map_err(|e| format!("{context} failed to invert probit probability {target}: {e}")),
-        InverseLink::Standard(LinkFunction::Logit) => Ok((target / (1.0 - target)).ln()),
-        InverseLink::Standard(LinkFunction::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
-        InverseLink::Standard(LinkFunction::Identity) => Ok(target),
-        InverseLink::Standard(LinkFunction::Log) => Ok(target.ln()),
-        _ => {
-            let initial = standard_normal_quantile(target).map_err(|e| {
-                format!(
-                    "{context} failed to initialize inverse-link solve at probability {target}: {e}"
-                )
-            })?;
-            let eval = |eta: f64| -> Result<(f64, f64, f64), String> {
-                let jet = inverse_link_jet_for_inverse_link(base_link, eta)
-                    .map_err(|e| format!("{context} inverse-link jet failed at eta={eta}: {e}"))?;
-                Ok((jet.mu - target, jet.d1, jet.d2))
-            };
-            let (eta, _, residual) =
-                super::monotone_root::solve_monotone_root(eval, initial, context, 1e-12, 64, 64)?;
-            let residual_tol = 1e-12_f64.max(1e-10 * target.min(1.0 - target));
-            if residual.abs() > residual_tol {
-                return Err(format!(
-                    "{context} inverse-link solve failed: residual={residual:.3e} \
-                     at eta={eta:.6}, target probability={target:.6}, tolerance={residual_tol:.3e}"
-                ));
-            }
-            Ok(eta)
-        }
-    }
+    standard_normal_quantile(target)
+        .map_err(|e| format!("{context} failed to invert probit probability {target}: {e}"))
 }
 
 pub(crate) fn bernoulli_marginal_link_map(
     base_link: &InverseLink,
     eta: f64,
 ) -> Result<BernoulliMarginalLinkMap, String> {
-    let jet = inverse_link_jet_for_inverse_link(base_link, eta).map_err(|e| {
-        format!("bernoulli marginal-slope inverse-link jet failed at eta={eta}: {e}")
-    })?;
-    let mu4 = inverse_link_pdfthird_derivative_for_inverse_link(base_link, eta).map_err(|e| {
-        format!("bernoulli marginal-slope inverse-link fourth derivative failed at eta={eta}: {e}")
-    })?;
-    let mu = clamp_bernoulli_link_probability(jet.mu);
+    require_probit_marginal_slope_link(base_link, "bernoulli marginal-slope")?;
+    let phi_eta = normal_pdf(eta);
+    let mu = clamp_bernoulli_link_probability(normal_cdf(eta));
     let q = standard_normal_quantile(mu).map_err(|e| {
         format!("bernoulli marginal-slope probit target inversion failed at mu={mu}: {e}")
     })?;
@@ -253,17 +222,23 @@ pub(crate) fn bernoulli_marginal_link_map(
             "bernoulli marginal-slope internal probit density must be positive, got phi(q)={phi_q} at eta={eta}, q={q}"
         ));
     }
-    let q1 = jet.d1 / phi_q;
-    let q2 = jet.d2 / phi_q + q * q1 * q1;
-    let q3 = jet.d3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1.powi(3);
-    let q4 =
-        mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1.powi(4) + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
-            - 6.0 * (q * q - 1.0) * q1 * q1 * q2;
+    let mu1 = phi_eta;
+    let mu2 = -eta * phi_eta;
+    let mu3 = (eta * eta - 1.0) * phi_eta;
+    let mu4 = -(eta.powi(3) - 3.0 * eta) * phi_eta;
+    let q1 = mu1 / phi_q;
+    let q2 = mu2 / phi_q + q * q1 * q1;
+    let q3 = mu3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1.powi(3);
+    let q4 = mu4 / phi_q
+        + (q.powi(3) - 3.0 * q) * q1.powi(4)
+        + 4.0 * q * q1 * q3
+        + 3.0 * q * q2 * q2
+        - 6.0 * (q * q - 1.0) * q1 * q1 * q2;
     Ok(BernoulliMarginalLinkMap {
         mu,
-        mu1: jet.d1,
-        mu2: jet.d2,
-        mu3: jet.d3,
+        mu1,
+        mu2,
+        mu3,
         mu4,
         q,
         q1,
@@ -271,6 +246,19 @@ pub(crate) fn bernoulli_marginal_link_map(
         q3,
         q4,
     })
+}
+
+fn require_probit_marginal_slope_link(
+    base_link: &InverseLink,
+    context: &str,
+) -> Result<(), String> {
+    if matches!(base_link, InverseLink::Standard(LinkFunction::Probit)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} requires link(type=probit); non-probit marginal-slope base links are not supported by the calibrated de-nested probit kernel"
+        ))
+    }
 }
 
 pub(crate) fn build_deviation_block_from_knots_design_seed_and_anchor_weights(

@@ -404,13 +404,11 @@ fn evaluate_marginal_slope_row(
     let surv = normal_cdf(-eta).clamp(1e-300, 1.0);
     let cum = -surv.ln();
     let phi_eta = (-0.5 * eta * eta).exp() / (2.0f64 * std::f64::consts::PI).sqrt();
-    let mut haz = phi_eta * eta_derivative.max(0.0);
-    if !(haz.is_finite() && haz > 0.0) {
-        // Floor to a tiny positive value rather than erroring; the
-        // survival/cumulative-hazard outputs remain exact and the hazard
-        // estimate is only a diagnostic derived from the time
-        // derivative of eta.
-        haz = 1e-12;
+    let haz = phi_eta * eta_derivative;
+    if !(eta_derivative.is_finite() && eta_derivative > 0.0 && haz.is_finite() && haz > 0.0) {
+        return Err(format!(
+            "saved survival marginal-slope prediction produced non-positive time derivative: eta_t={eta_derivative}, hazard={haz}"
+        ));
     }
     Ok((eta, cum, haz))
 }
