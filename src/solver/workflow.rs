@@ -948,6 +948,12 @@ pub struct FitConfig {
     // Fitting options
     pub scale_dimensions: bool,
     pub ridge_lambda: f64,
+
+    /// Route the fit through the transformation-normal family.  When set, the
+    /// formula terms are treated as the covariate side of the transformation
+    /// model and the response basis is built internally.  Incompatible with
+    /// `noise_formula` and with `Surv(...)` responses.
+    pub transformation_normal: bool,
 }
 
 impl Default for FitConfig {
@@ -980,6 +986,7 @@ impl Default for FitConfig {
             weight_column: None,
             scale_dimensions: false,
             ridge_lambda: 1e-6,
+            transformation_normal: false,
         }
     }
 }
@@ -1010,9 +1017,21 @@ pub fn materialize<'a>(
     let col_map = build_col_map(data);
 
     if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
+        if config.transformation_normal {
+            return Err(
+                "transformation_normal cannot be combined with a Surv(...) response".to_string(),
+            );
+        }
         materialize_survival(
             &parsed, data, &col_map, config, &entry_col, &exit_col, &event_col,
         )
+    } else if config.transformation_normal {
+        if config.noise_formula.is_some() {
+            return Err(
+                "transformation_normal cannot be combined with noise_formula".to_string(),
+            );
+        }
+        materialize_transformation_normal(&parsed, data, &col_map, config)
     } else if config.noise_formula.is_some() {
         materialize_location_scale(&parsed, data, &col_map, config)
     } else {
@@ -2040,6 +2059,63 @@ fn materialize_survival<'a>(
 
     Ok(MaterializedModel {
         request,
+        inference_notes,
+    })
+}
+
+fn materialize_transformation_normal<'a>(
+    parsed: &ParsedFormula,
+    data: &'a Dataset,
+    col_map: &HashMap<String, usize>,
+    config: &FitConfig,
+) -> Result<MaterializedModel<'a>, String> {
+    if parsed.linkspec.is_some() {
+        return Err(
+            "link(...) is not supported for the transformation-normal family".to_string(),
+        );
+    }
+    if parsed.linkwiggle.is_some() {
+        return Err(
+            "linkwiggle(...) is not supported for the transformation-normal family".to_string(),
+        );
+    }
+    if config.noise_offset_column.is_some() {
+        return Err(
+            "noise_offset_column is not supported for transformation-normal models".to_string(),
+        );
+    }
+    if config.frailty.is_some() {
+        return Err(
+            "frailty is not supported for transformation-normal models".to_string(),
+        );
+    }
+
+    let y_col = *col_map
+        .get(&parsed.response)
+        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y = data.values.column(y_col).to_owned();
+    let mut inference_notes = Vec::new();
+
+    let mut covariate_spec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
+    if config.scale_dimensions {
+        enable_scale_dimensions(&mut covariate_spec);
+    }
+
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
+
+    Ok(MaterializedModel {
+        request: FitRequest::TransformationNormal(TransformationNormalFitRequest {
+            data: data.values.view(),
+            response: y,
+            weights,
+            offset,
+            covariate_spec,
+            config: TransformationNormalConfig::default(),
+            options: BlockwiseFitOptions::default(),
+            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            warm_start: None,
+        }),
         inference_notes,
     })
 }
