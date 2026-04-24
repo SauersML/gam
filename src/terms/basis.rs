@@ -6486,6 +6486,16 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                     let s_a = s_vec[a];
                     let w_a = metric_weights[a];
 
+                    if r <= 1e-14 {
+                        // At a center collision all h_b and s_b are zero.
+                        // The D0/D1 anisotropy derivatives vanish directly.
+                        // The only surviving D2 terms come from differentiating
+                        // the metric trace in Δφ(0)=q(0)Σ_b w_b.
+                        d2_raw_eta[a][[k, col]] += 2.0 * q * w_a * z_jc;
+                        d2_raw_eta2[a][[k, col]] += 4.0 * q * w_a * z_jc;
+                        continue;
+                    }
+
                     // D₀ derivatives (unchanged — chain rule through r only).
                     d0_raw_eta[a][[k, col]] += q * s_a * z_jc;
                     d0_raw_eta2[a][[k, col]] += (t * s_a * s_a + 2.0 * q * s_a) * z_jc;
@@ -6516,14 +6526,10 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                         };
                         d1_raw_eta[a][[row, col]] += d1_first * z_jc;
 
-                        let d1_eta2_val = if r > 1e-14 {
-                            if a == b {
-                                w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
-                            } else {
-                                w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
-                            }
+                        let d1_eta2_val = if a == b {
+                            w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
                         } else {
-                            0.0
+                            w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
                         };
                         d1_raw_eta2[a][[row, col]] += d1_eta2_val * z_jc;
                     }
@@ -6537,14 +6543,10 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                     //     (∂(w_a·s_a)/∂ψ_a = 2·w_a·s_a + w_a·2·s_a = 4·w_a·s_a)
                     //   ∂q/∂ψ_a = t · s_a
                     //   ∂W₁/∂ψ_a = 2 · w_a
-                    let dlap_deta = if r > 1e-14 {
-                        dt_dr * s_a / r * sum_wb_sb
-                            + 4.0 * t * w_a * s_a
-                            + t * s_a * sum_metric_weights
-                            + 2.0 * q * w_a
-                    } else {
-                        2.0 * q * w_a
-                    };
+                    let dlap_deta = dt_dr * s_a / r * sum_wb_sb
+                        + 4.0 * t * w_a * s_a
+                        + t * s_a * sum_metric_weights
+                        + 2.0 * q * w_a;
                     d2_raw_eta[a][[k, col]] += dlap_deta * z_jc;
 
                     // D₂ second derivative (anisotropic Laplacian).
@@ -6555,35 +6557,31 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                     //   T2 = 4·t·w_a·s_a
                     //   T3 = t·s_a·W₁
                     //   T4 = 2·q·w_a
-                    let d2lap_deta2 = if r > 1e-14 {
-                        let s_a2 = s_a * s_a;
-                        let dt_sa_r = dt_dr * s_a / r;
+                    let s_a2 = s_a * s_a;
+                    let dt_sa_r = dt_dr * s_a / r;
 
-                        // ∂/∂ψ_a[dt_dr·s_a/r]:
-                        //   ∂t_r/∂ψ_a = d2t_dr2·s_a/r,  ∂(s_a/r)/∂ψ_a = s_a/r·(2 - s_a/r²)
-                        //   product rule => d2t_dr2·s_a²/r² + dt_dr·s_a/r·(2 - s_a/r²)
-                        let r2 = r * r;
-                        let d_dt_sa_r = d2t_dr2 * s_a2 / r2 + dt_dr * s_a / r * (2.0 - s_a / r2);
+                    // ∂/∂ψ_a[dt_dr·s_a/r]:
+                    //   ∂t_r/∂ψ_a = d2t_dr2·s_a/r,  ∂(s_a/r)/∂ψ_a = s_a/r·(2 - s_a/r²)
+                    //   product rule => d2t_dr2·s_a²/r² + dt_dr·s_a/r·(2 - s_a/r²)
+                    let r2 = r * r;
+                    let d_dt_sa_r = d2t_dr2 * s_a2 / r2 + dt_dr * s_a / r * (2.0 - s_a / r2);
 
-                        // ∂T1/∂ψ_a = d_dt_sa_r · W₂ + dt_sa_r · 4·w_a·s_a
-                        let dt1 = d_dt_sa_r * sum_wb_sb + dt_sa_r * 4.0 * w_a * s_a;
+                    // ∂T1/∂ψ_a = d_dt_sa_r · W₂ + dt_sa_r · 4·w_a·s_a
+                    let dt1 = d_dt_sa_r * sum_wb_sb + dt_sa_r * 4.0 * w_a * s_a;
 
-                        // ∂T2/∂ψ_a = 4·[(dt_dr·s_a/r)·w_a·s_a + t·(2w_a·s_a + w_a·2s_a)]
-                        //           = 4·w_a·s_a·(dt_sa_r + 4·t)
-                        let dt2 = 4.0 * w_a * s_a * (dt_sa_r + 4.0 * t);
+                    // ∂T2/∂ψ_a = 4·[(dt_dr·s_a/r)·w_a·s_a + t·(2w_a·s_a + w_a·2s_a)]
+                    //           = 4·w_a·s_a·(dt_sa_r + 4·t)
+                    let dt2 = 4.0 * w_a * s_a * (dt_sa_r + 4.0 * t);
 
-                        // ∂T3/∂ψ_a = (dt_dr·s_a/r)·s_a·W₁ + t·2·s_a·W₁ + t·s_a·2·w_a
-                        let dt3 = dt_sa_r * s_a * sum_metric_weights
-                            + 2.0 * t * s_a * sum_metric_weights
-                            + 2.0 * t * s_a * w_a;
+                    // ∂T3/∂ψ_a = (dt_dr·s_a/r)·s_a·W₁ + t·2·s_a·W₁ + t·s_a·2·w_a
+                    let dt3 = dt_sa_r * s_a * sum_metric_weights
+                        + 2.0 * t * s_a * sum_metric_weights
+                        + 2.0 * t * s_a * w_a;
 
-                        // ∂T4/∂ψ_a = 2·(t·s_a·w_a + q·2·w_a) = 2·w_a·(t·s_a + 2·q)
-                        let dt4 = 2.0 * w_a * (t * s_a + 2.0 * q);
+                    // ∂T4/∂ψ_a = 2·(t·s_a·w_a + q·2·w_a) = 2·w_a·(t·s_a + 2·q)
+                    let dt4 = 2.0 * w_a * (t * s_a + 2.0 * q);
 
-                        dt1 + dt2 + dt3 + dt4
-                    } else {
-                        4.0 * q * w_a
-                    };
+                    let d2lap_deta2 = dt1 + dt2 + dt3 + dt4;
                     d2_raw_eta2[a][[k, col]] += d2lap_deta2 * z_jc;
                 }
             }
