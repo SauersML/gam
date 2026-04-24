@@ -3853,6 +3853,62 @@ impl ImplicitDesignPsiDerivative {
         })
     }
 
+    /// Single-row specialization of `row_chunk_first(axis, row..row+1)` that
+    /// writes the length-`p_out` row directly into the caller-provided buffer.
+    ///
+    /// This is the row-local API used by `CustomFamilyPsiLinearMapRef::row_vector`
+    /// for survival rowwise exact-Hessian paths, which previously applied a
+    /// unit-vector `transpose_mul` trick (O(n·K) per row) to recover a single
+    /// row. Avoids allocating a temporary (1 × p_out) matrix per row call.
+    pub fn row_vector_first_into(
+        &self,
+        axis: usize,
+        row: usize,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), BasisError> {
+        assert!(row < self.n);
+        assert_eq!(out.len(), self.p_out());
+        let chunk = self.row_chunk_first(axis, row..row + 1)?;
+        out.assign(&chunk.row(0));
+        Ok(())
+    }
+
+    /// Apply the first derivative forward map to a row block: computes
+    /// `result[i - rows.start] = Σ_j (∂X/∂ψ_axis)[i, j] * u[j]` for each
+    /// `i ∈ rows`.
+    ///
+    /// The argument `u` is expressed in the final (`p_out`) basis. The returned
+    /// vector has length `rows.end - rows.start`.
+    pub fn forward_mul_rows(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+        u: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, BasisError> {
+        assert!(axis < self.n_axes());
+        assert_eq!(u.len(), self.p_out());
+        assert!(rows.end <= self.n);
+        let chunk = self.row_chunk_first(axis, rows)?;
+        Ok(chunk.dot(&u))
+    }
+
+    /// Apply the first derivative adjoint to a row block: computes
+    /// `result[j] = Σ_{i ∈ rows} (∂X/∂ψ_axis)[i, j] * v[i - rows.start]`
+    /// expressed in the final `p_out` basis (the `row_chunk_first` output is
+    /// already projected through the identifiability transforms).
+    pub fn transpose_mul_rows(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+        v: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, BasisError> {
+        assert!(axis < self.n_axes());
+        assert!(rows.end <= self.n);
+        assert_eq!(v.len(), rows.end - rows.start);
+        let chunk = self.row_chunk_first(axis, rows)?;
+        Ok(chunk.t().dot(&v))
+    }
+
     fn transformed_axis_combination(&self, axis: usize) -> &[(usize, f64)] {
         self.axis_combinations
             .as_ref()
@@ -9168,9 +9224,10 @@ fn insert_spatial_distance_cache_entry(
     key: SpatialDistanceCacheKey,
     entry: SpatialDistanceCacheEntry,
 ) {
-    cache.map.clear();
-    cache.order.clear();
-    cache.bytes = 0;
+    if let Some(old) = cache.map.remove(&key) {
+        cache.bytes = cache.bytes.saturating_sub(old.bytes);
+        cache.order.retain(|candidate| *candidate != key);
+    }
     cache.bytes = cache.bytes.saturating_add(entry.bytes);
     cache.map.insert(key, entry);
     cache.order.push(key);
@@ -9708,113 +9765,47 @@ pub fn build_matern_basiswithworkspace(
         let d = data.ncols();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
-        let kernel_fn = if let Some(eta) = aniso.as_ref() {
-            let eta = eta.clone();
-            let metric_weights = eta.mapv(|v| (2.0 * v).exp());
-            move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let mut q = 0.0;
-                for axis in 0..data_row.len() {
-                    let delta = data_row[axis] - center_row[axis];
-                    q += metric_weights[axis] * delta * delta;
-                }
-                let r = q.sqrt();
-                matern_kernel_from_distance(r, length_scale, nu)
-                    .expect("validated Matérn inputs should not fail")
-            }
-        } else {
-            move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
-                matern_kernel_from_distance(r, length_scale, nu)
-                    .expect("validated Matérn inputs should not fail")
-            }
-        };
-        let op = match aniso.as_ref() {
-            Some(_) => {
-                let eta = aniso.as_ref().expect("checked above").clone();
-                let metric_weights = eta.mapv(|v| (2.0 * v).exp());
-                let kernel_fn = move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let mut q = 0.0;
-                    for axis in 0..data_row.len() {
-                        let delta = data_row[axis] - center_row[axis];
-                        q += metric_weights[axis] * delta * delta;
-                    }
-                    let r = q.sqrt();
-                    matern_kernel_from_distance(r, length_scale, nu)
-                        .expect("validated Matérn inputs should not fail")
-                };
-                ChunkedKernelDesignOperator::new(
-                    shared_data,
-                    Arc::new(centers.clone()),
-                    kernel_fn,
-                    z_opt.as_ref().map(|z| Arc::new(z.clone())),
-                    poly_basis,
-                )
-            }
-            None => {
-                let kernel_fn = move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let r =
-                        stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
-                    matern_kernel_from_distance(r, length_scale, nu)
-                        .expect("validated Matérn inputs should not fail")
-                };
-                ChunkedKernelDesignOperator::new(
-                    shared_data,
-                    Arc::new(centers.clone()),
-                    kernel_fn,
-                    z_opt.as_ref().map(|z| Arc::new(z.clone())),
-                    poly_basis,
-                )
-            }
-        }
-        .map_err(BasisError::InvalidInput)?;
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)));
-        let candidates = if spec.double_penalty {
-            let penalty_kernel = build_matern_kernel_penalty(
-                centers.view(),
-                spec.length_scale,
-                spec.nu,
-                spec.include_intercept,
-                z_opt.as_ref(),
-            )?;
-            vec![PenaltyCandidate {
-                matrix: penalty_kernel,
-                nullspace_dim: 0,
-                source: PenaltySource::SpatialDoublePenalty,
-            }]
-        } else {
-            Vec::new()
-        };
-        (design, candidates)
-    } else {
-        let design = build_matern_design_matrix(data, centers.view(), spec)?;
-        let candidates = build_matern_penalties(centers.view(), spec)?;
-        (DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)), candidates)
-    };
-                let r = aniso_distance(data_row, center_row, &eta);
-                matern_kernel_from_distance(r, length_scale, nu)
-                    .expect("validated Matérn inputs should not fail")
-            })
-        } else {
-            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
-                matern_kernel_from_distance(r, length_scale, nu)
-                    .expect("validated Matérn inputs should not fail")
-            })
-        };
         let poly_basis = if spec.include_intercept {
             Some(Arc::new(Array2::<f64>::ones((data.nrows(), 1))))
         } else {
             None
         };
-        let op = ChunkedKernelDesignOperator::new(
-            shared_data,
-            Arc::new(centers.clone()),
-            kernel_fn,
-            z_opt.as_ref().map(|z| Arc::new(z.clone())),
-            poly_basis,
-        )
-        .map_err(BasisError::InvalidInput)?;
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)));
+        let design = if let Some(eta) = aniso.as_ref() {
+            let metric_weights = eta.mapv(|v| (2.0 * v).exp()).to_vec();
+            let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let mut q = 0.0;
+                for axis in 0..data_row.len() {
+                    let delta = data_row[axis] - center_row[axis];
+                    q += metric_weights[axis] * delta * delta;
+                }
+                matern_kernel_from_distance(q.sqrt(), length_scale, nu)
+                    .expect("validated Matérn inputs should not fail")
+            };
+            let op = ChunkedKernelDesignOperator::new(
+                shared_data.clone(),
+                Arc::new(centers.clone()),
+                kernel,
+                z_opt.as_ref().map(|z| Arc::new(z.clone())),
+                poly_basis.clone(),
+            )
+            .map_err(BasisError::InvalidInput)?;
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
+        } else {
+            let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
+                matern_kernel_from_distance(r, length_scale, nu)
+                    .expect("validated Matérn inputs should not fail")
+            };
+            let op = ChunkedKernelDesignOperator::new(
+                shared_data,
+                Arc::new(centers.clone()),
+                kernel,
+                z_opt.as_ref().map(|z| Arc::new(z.clone())),
+                poly_basis,
+            )
+            .map_err(BasisError::InvalidInput)?;
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
+        };
         let candidates = if spec.double_penalty {
             let penalty_kernel = build_matern_kernel_penalty(
                 centers.view(),
@@ -13038,13 +13029,17 @@ pub fn build_duchon_basiswithworkspace(
         } else {
             None
         };
-        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> = if let Some(eta) =
-            aniso.as_ref()
-        {
-            let eta = eta.clone();
+        let poly_block = polynomial_block_from_order(data, effective_nullspace_order);
+        let base_design = if let Some(eta) = aniso.as_ref() {
+            let metric_weights = eta.mapv(|v| (2.0 * v).exp()).to_vec();
             let coeffs = coeffs.clone();
-            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let r = aniso_distance(data_row, center_row, &eta);
+            let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let mut q = 0.0;
+                for axis in 0..data_row.len() {
+                    let delta = data_row[axis] - center_row[axis];
+                    q += metric_weights[axis] * delta * delta;
+                }
+                let r = q.sqrt();
                 if let Some(ppc) = pure_poly_coeff {
                     ppc.eval(r)
                 } else {
@@ -13058,10 +13053,19 @@ pub fn build_duchon_basiswithworkspace(
                     )
                     .expect("validated Duchon inputs should not fail")
                 }
-            })
+            };
+            let base_op = ChunkedKernelDesignOperator::new(
+                shared_data.clone(),
+                Arc::new(centers.clone()),
+                kernel,
+                Some(Arc::new(kernel_transform.clone())),
+                Some(Arc::new(poly_block.clone())),
+            )
+            .map_err(BasisError::InvalidInput)?;
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)))
         } else {
             let coeffs = coeffs.clone();
-            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+            let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
                 let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
                 if let Some(ppc) = pure_poly_coeff {
                     ppc.eval(r)
@@ -13076,19 +13080,17 @@ pub fn build_duchon_basiswithworkspace(
                     )
                     .expect("validated Duchon inputs should not fail")
                 }
-            })
+            };
+            let base_op = ChunkedKernelDesignOperator::new(
+                shared_data,
+                Arc::new(centers.clone()),
+                kernel,
+                Some(Arc::new(kernel_transform.clone())),
+                Some(Arc::new(poly_block)),
+            )
+            .map_err(BasisError::InvalidInput)?;
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)))
         };
-        let poly_block = polynomial_block_from_order(data, effective_nullspace_order);
-        let base_op = ChunkedKernelDesignOperator::new(
-            shared_data,
-            Arc::new(centers.clone()),
-            kernel_fn,
-            Some(Arc::new(kernel_transform.clone())),
-            Some(Arc::new(poly_block)),
-        )
-        .map_err(BasisError::InvalidInput)?;
-        let base_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)));
         let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
             data,
             &base_design,

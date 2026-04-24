@@ -24,7 +24,7 @@ use crate::solver::estimate::{
 };
 use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -1643,6 +1643,20 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
             .slice(ndarray::s![rows, ..])
             .to_owned())
     }
+    /// Single-row specialization of `row_chunk_first`. Default implementation
+    /// delegates to `row_chunk_first(axis, row..row+1)` and copies the
+    /// resulting row into the output buffer; implementations that can avoid
+    /// the temporary matrix allocation should override this method.
+    fn row_vector_first_into(
+        &self,
+        axis: usize,
+        row: usize,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), crate::terms::basis::BasisError> {
+        let chunk = self.row_chunk_first(axis, row..row + 1)?;
+        out.assign(&chunk.row(0));
+        Ok(())
+    }
     fn row_chunk_second_diag(
         &self,
         axis: usize,
@@ -1720,6 +1734,17 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         ) -> Result<Array2<f64>, crate::terms::basis::BasisError> =
             crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_first;
         f(self, axis, rows)
+    }
+
+    fn row_vector_first_into(
+        &self,
+        axis: usize,
+        row: usize,
+        out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), crate::terms::basis::BasisError> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::row_vector_first_into(
+            self, axis, row, out,
+        )
     }
 
     fn row_chunk_second_diag(
@@ -1944,6 +1969,17 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         let local = self.base.row_chunk_first(axis, rows)?;
         Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
+    }
+
+    fn row_vector_first_into(
+        &self,
+        axis: usize,
+        row: usize,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), crate::terms::basis::BasisError> {
+        out.fill(0.0);
+        let local_slice = out.slice_mut(ndarray::s![self.global_range.clone()]);
+        self.base.row_vector_first_into(axis, row, local_slice)
     }
 
     fn row_chunk_second_diag(
@@ -2244,6 +2280,32 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
         self.validate_axis(axis, "embedded dense psi row_chunk_first")?;
         let local = self.first_local.slice(ndarray::s![rows, ..]).to_owned();
         Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
+    }
+
+    fn row_vector_first_into(
+        &self,
+        axis: usize,
+        row: usize,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi row_vector_first_into")?;
+        if row >= self.first_local.nrows() {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "embedded dense psi row_vector_first_into row {row} out of bounds for {}",
+                self.first_local.nrows()
+            )));
+        }
+        if out.len() != self.total_p {
+            return Err(crate::terms::basis::BasisError::Other(format!(
+                "embedded dense psi row_vector_first_into expected length {}, got {}",
+                self.total_p,
+                out.len()
+            )));
+        }
+        out.fill(0.0);
+        out.slice_mut(ndarray::s![self.global_range.clone()])
+            .assign(&self.first_local.row(row));
+        Ok(())
     }
 
     fn row_chunk_second_diag(
@@ -2871,7 +2933,18 @@ impl CustomFamilyPsiDesignAction {
     }
 
     pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
-        self.row_chunk(row..row + 1).map(|m| m.row(0).to_owned())
+        if row >= self.nrows() {
+            return Err(format!(
+                "psi design row {row} exceeds available rows {}",
+                self.nrows()
+            ));
+        }
+        let absolute_row = self.row_range.start + row;
+        let mut out = Array1::<f64>::zeros(self.p);
+        self.operator
+            .row_vector_first_into(self.axis, absolute_row, out.view_mut())
+            .map_err(|e| e.to_string())?;
+        Ok(out)
     }
 }
 
@@ -3572,8 +3645,7 @@ pub(crate) fn resolve_custom_family_x_psi_map(
                     "{label}: dense x_psi fallback disabled by AnalyticOperatorRequired"
                 ));
             }
-            DerivativeStorageMode::MaterializeIfSmall
-            | DerivativeStorageMode::DiagnosticsOnly => {
+            DerivativeStorageMode::MaterializeIfSmall | DerivativeStorageMode::DiagnosticsOnly => {
                 let matrix = if row_range.start == 0 && row_range.end == n {
                     Arc::new(deriv.x_psi.clone())
                 } else {
@@ -3727,9 +3799,8 @@ pub(crate) fn resolve_custom_family_x_psi_psi(
     label: &str,
 ) -> Result<Array2<f64>, String> {
     let policy = crate::resource::ResourcePolicy::permissive_small_data();
-    let map = resolve_custom_family_x_psi_psi_map(
-        deriv_i, deriv_j, local_j, n, p, 0..n, label, &policy,
-    )?;
+    let map =
+        resolve_custom_family_x_psi_psi_map(deriv_i, deriv_j, local_j, n, p, 0..n, label, &policy)?;
     match map {
         PsiDesignMap::Zero { nrows, ncols } => Ok(Array2::<f64>::zeros((nrows, ncols))),
         PsiDesignMap::Dense { matrix } => Ok((*matrix).clone()),
