@@ -1852,8 +1852,12 @@ fn survival_cumulative_and_instant_hazard(
     match cfg.target {
         SurvivalBaselineTarget::Linear => Ok(None),
         SurvivalBaselineTarget::Weibull => {
-            let scale = cfg.scale.unwrap_or(1.0);
-            let shape = cfg.shape.unwrap_or(1.0);
+            let scale = cfg
+                .scale
+                .ok_or_else(|| "weibull missing scale".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "weibull missing shape".to_string())?;
             if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
                 return Err("weibull baseline requires finite positive scale and shape".to_string());
             }
@@ -1862,15 +1866,41 @@ fn survival_cumulative_and_instant_hazard(
             Ok(Some((cumulative_hazard, instant_hazard)))
         }
         SurvivalBaselineTarget::Gompertz => {
-            let rate = cfg.rate.unwrap_or(1.0);
-            let shape = cfg.shape.unwrap_or(0.0);
+            let rate = cfg
+                .rate
+                .ok_or_else(|| "gompertz missing rate".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "gompertz missing shape".to_string())?;
+            if !(rate.is_finite() && shape.is_finite() && rate > 0.0) {
+                return Err(
+                    "gompertz baseline requires finite positive rate and finite shape".to_string(),
+                );
+            }
             let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
             Ok(Some((cumulative_hazard, instant_hazard)))
         }
         SurvivalBaselineTarget::GompertzMakeham => {
-            let makeham = cfg.makeham.unwrap_or(0.0);
-            let rate = cfg.rate.unwrap_or(1.0);
-            let shape = cfg.shape.unwrap_or(0.0);
+            let makeham = cfg
+                .makeham
+                .ok_or_else(|| "gompertz-makeham missing makeham".to_string())?;
+            let rate = cfg
+                .rate
+                .ok_or_else(|| "gompertz-makeham missing rate".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "gompertz-makeham missing shape".to_string())?;
+            if !(rate.is_finite()
+                && shape.is_finite()
+                && makeham.is_finite()
+                && rate > 0.0
+                && makeham > 0.0)
+            {
+                return Err(
+                    "gompertz-makeham baseline requires finite positive rate, makeham, and finite shape"
+                        .to_string(),
+                );
+            }
             let (h_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
             Ok(Some((makeham * age + h_gompertz, makeham + inst_gompertz)))
         }
