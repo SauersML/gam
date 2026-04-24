@@ -147,7 +147,15 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "validate_formula",
         ],
     )?;
-    info.set_item("supported_model_classes", vec!["standard"])?;
+    info.set_item(
+        "supported_model_classes",
+        vec![
+            "standard",
+            "transformation-normal",
+            "bernoulli-marginal-slope",
+            "survival-marginal-slope",
+        ],
+    )?;
     Ok(info.unbind())
 }
 
@@ -249,40 +257,118 @@ fn fit_table_impl(
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
 
-    let family = match &request {
-        FitRequest::Standard(standard_request) => standard_request.family,
-        _ => {
+    let payload = match request {
+        FitRequest::Standard(standard_request) => {
+            let family = standard_request.family;
+            let fit_result = fit_model(FitRequest::Standard(standard_request))?;
+            let standard_result = match fit_result {
+                FitResult::Standard(standard_result) => standard_result,
+                _ => {
+                    return Err(
+                        "python binding expected the standard workflow to return a standard fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            let saved_fit = standard_result.fit.clone();
+            build_standard_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                family,
+                &saved_fit,
+                standard_result.resolvedspec,
+                standard_result.adaptive_diagnostics,
+                standard_result.wiggle_knots.map(|knots| knots.to_vec()),
+                standard_result.wiggle_degree,
+            )
+        }
+        FitRequest::TransformationNormal(tn_request) => {
+            let fit_result = fit_model(FitRequest::TransformationNormal(tn_request))?;
+            let tn_result = match fit_result {
+                FitResult::TransformationNormal(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the transformation-normal workflow to return a transformation-normal fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_transformation_normal_ffi_payload(formula, &dataset, &fit_config, tn_result)?
+        }
+        FitRequest::BernoulliMarginalSlope(ms_request) => {
+            let base_link = ms_request.spec.base_link.clone();
+            let frailty = ms_request.spec.frailty.clone();
+            let fit_result = fit_model(FitRequest::BernoulliMarginalSlope(ms_request))?;
+            let ms_result = match fit_result {
+                FitResult::BernoulliMarginalSlope(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the bernoulli marginal-slope workflow to return a marginal-slope fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_bernoulli_marginal_slope_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                base_link,
+                frailty,
+                ms_result,
+            )?
+        }
+        FitRequest::SurvivalMarginalSlope(ms_request) => {
+            let frailty = ms_request.spec.frailty.clone();
+            let fit_result = fit_model(FitRequest::SurvivalMarginalSlope(ms_request))?;
+            let ms_result = match fit_result {
+                FitResult::SurvivalMarginalSlope(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the survival marginal-slope workflow to return a survival marginal-slope fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_survival_marginal_slope_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                frailty,
+                ms_result,
+            )?
+        }
+        FitRequest::GaussianLocationScale(_) => {
             return Err(
-                "python binding currently supports standard models only; remove noise/survival/marginal-slope features from the formula"
+                "gaussian location-scale fitting is not yet plumbed through the Python FFI; remove the noise_formula or use the CLI"
+                    .to_string(),
+            );
+        }
+        FitRequest::BinomialLocationScale(_) => {
+            return Err(
+                "binomial location-scale fitting is not yet plumbed through the Python FFI; remove the noise_formula or use the CLI"
+                    .to_string(),
+            );
+        }
+        FitRequest::SurvivalLocationScale(_) => {
+            return Err(
+                "survival location-scale fitting is not yet plumbed through the Python FFI; use survival_likelihood='marginal-slope' or the CLI"
+                    .to_string(),
+            );
+        }
+        FitRequest::LatentSurvival(_) => {
+            return Err(
+                "latent survival fitting is not yet plumbed through the Python FFI; use the CLI"
+                    .to_string(),
+            );
+        }
+        FitRequest::LatentBinary(_) => {
+            return Err(
+                "latent binary fitting is not yet plumbed through the Python FFI; use the CLI"
                     .to_string(),
             );
         }
     };
-
-    let fit_result = fit_model(request)?;
-    let standard_result = match fit_result {
-        FitResult::Standard(standard_result) => standard_result,
-        _ => {
-            return Err(
-                "python binding expected the standard workflow to return a standard fit result"
-                    .to_string(),
-            );
-        }
-    };
-
-    let saved_fit = standard_result.fit.clone();
-
-    let payload = build_standard_payload(
-        formula,
-        &dataset,
-        &fit_config,
-        family,
-        &saved_fit,
-        standard_result.resolvedspec,
-        standard_result.adaptive_diagnostics,
-        standard_result.wiggle_knots.map(|knots| knots.to_vec()),
-        standard_result.wiggle_degree,
-    );
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec_pretty(&model).map_err(|err| format!("failed to serialize model: {err}"))
 }
@@ -327,13 +413,35 @@ fn predict_table_impl(
     options_json: Option<&str>,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
-    if model.predict_model_class() != PredictModelClass::Standard {
-        return Err(
-            "python binding currently supports prediction for standard models only".to_string(),
-        );
-    }
+    let model_class = model.predict_model_class();
     let dataset = dataset_with_model_schema(&model, headers, rows)?;
-    let predict_input = build_standard_predict_input(&model, &dataset)?;
+    let predict_input = match model_class {
+        PredictModelClass::Standard => build_standard_predict_input(&model, &dataset)?,
+        PredictModelClass::BernoulliMarginalSlope => {
+            build_bernoulli_marginal_slope_predict_input(&model, &dataset)?
+        }
+        PredictModelClass::TransformationNormal => {
+            build_transformation_normal_predict_input(&model, &dataset)?
+        }
+        PredictModelClass::Survival => {
+            return Err(
+                "survival prediction is not yet plumbed through the Python FFI; use the gam CLI predict command"
+                    .to_string(),
+            );
+        }
+        PredictModelClass::GaussianLocationScale => {
+            return Err(
+                "gaussian location-scale prediction is not yet plumbed through the Python FFI"
+                    .to_string(),
+            );
+        }
+        PredictModelClass::BinomialLocationScale => {
+            return Err(
+                "binomial location-scale prediction is not yet plumbed through the Python FFI"
+                    .to_string(),
+            );
+        }
+    };
     let predictor = model
         .predictor()
         .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
@@ -781,6 +889,261 @@ fn build_standard_payload(
     payload
 }
 
+fn build_transformation_normal_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    tn_result: TransformationNormalFitResult,
+) -> Result<FittedModelPayload, String> {
+    let frozen_covariate = freeze_term_collection_from_design(
+        &tn_result.covariate_spec_resolved,
+        &tn_result.covariate_design,
+    )
+    .map_err(|err| format!("failed to freeze transformation-normal covariate spec: {err}"))?;
+
+    let family = &tn_result.family;
+    let response_transform_rows: Vec<Vec<f64>> = family
+        .response_transform()
+        .rows()
+        .into_iter()
+        .map(|row| row.to_vec())
+        .collect();
+
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::TransformationNormal,
+        FittedFamily::TransformationNormal {
+            likelihood: LikelihoodFamily::GaussianIdentity,
+        },
+        "transformation-normal".to_string(),
+    );
+    payload.unified = Some(tn_result.fit.clone());
+    payload.fit_result = Some(tn_result.fit);
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.training_headers = Some(dataset.headers.clone());
+    payload.resolved_termspec = Some(frozen_covariate);
+    payload.transformation_response_knots = Some(family.response_knots().to_vec());
+    payload.transformation_response_transform = Some(response_transform_rows);
+    payload.transformation_response_degree = Some(family.response_degree());
+    payload.transformation_response_median = Some(family.response_median());
+    payload.offset_column = fit_config.offset_column.clone();
+    Ok(payload)
+}
+
+fn build_bernoulli_marginal_slope_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    base_link: InverseLink,
+    frailty: gam::families::lognormal_kernel::FrailtySpec,
+    ms_result: BernoulliMarginalSlopeFitResult,
+) -> Result<FittedModelPayload, String> {
+    let frozen_marginal = freeze_term_collection_from_design(
+        &ms_result.marginalspec_resolved,
+        &ms_result.marginal_design,
+    )
+    .map_err(|err| format!("failed to freeze marginal spec: {err}"))?;
+    let frozen_logslope = freeze_term_collection_from_design(
+        &ms_result.logslopespec_resolved,
+        &ms_result.logslope_design,
+    )
+    .map_err(|err| format!("failed to freeze logslope spec: {err}"))?;
+
+    let save_frailty = match (frailty, ms_result.gaussian_frailty_sd) {
+        (
+            gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
+            Some(learned),
+        ) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(learned),
+        },
+        (spec, _) => spec,
+    };
+
+    let logslope_formula = fit_config
+        .logslope_formula
+        .clone()
+        .ok_or_else(|| "bernoulli marginal-slope requires logslope_formula".to_string())?;
+    let z_column = fit_config
+        .z_column
+        .clone()
+        .ok_or_else(|| "bernoulli marginal-slope requires z_column".to_string())?;
+
+    let likelihood = inverse_link_to_binomial_family(&base_link);
+
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::MarginalSlope,
+        FittedFamily::MarginalSlope {
+            likelihood,
+            base_link: Some(base_link.clone()),
+            frailty: save_frailty,
+        },
+        "bernoulli-marginal-slope".to_string(),
+    );
+    payload.unified = Some(ms_result.fit.clone());
+    payload.fit_result = Some(ms_result.fit);
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.formula_logslope = Some(logslope_formula);
+    payload.z_column = Some(z_column);
+    payload.latent_z_normalization = Some(SavedLatentZNormalization {
+        mean: ms_result.z_normalization.mean,
+        sd: ms_result.z_normalization.sd,
+    });
+    payload.marginal_baseline = Some(ms_result.baseline_marginal);
+    payload.logslope_baseline = Some(ms_result.baseline_logslope);
+    payload.link = Some(inverse_link_to_saved_string(&base_link));
+    payload.training_headers = Some(dataset.headers.clone());
+    payload.resolved_termspec = Some(frozen_marginal);
+    payload.resolved_termspec_noise = Some(frozen_logslope);
+    payload.score_warp_runtime = ms_result
+        .score_warp_runtime
+        .as_ref()
+        .map(saved_anchored_deviation_runtime);
+    payload.link_deviation_runtime = ms_result
+        .link_dev_runtime
+        .as_ref()
+        .map(saved_anchored_deviation_runtime);
+    payload.offset_column = fit_config.offset_column.clone();
+    payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    Ok(payload)
+}
+
+fn build_survival_marginal_slope_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    frailty: gam::families::lognormal_kernel::FrailtySpec,
+    ms_result: SurvivalMarginalSlopeFitResult,
+) -> Result<FittedModelPayload, String> {
+    let frozen_marginal = freeze_term_collection_from_design(
+        &ms_result.marginalspec_resolved,
+        &ms_result.marginal_design,
+    )
+    .map_err(|err| format!("failed to freeze survival marginal spec: {err}"))?;
+    let frozen_logslope = freeze_term_collection_from_design(
+        &ms_result.logslopespec_resolved,
+        &ms_result.logslope_design,
+    )
+    .map_err(|err| format!("failed to freeze survival logslope spec: {err}"))?;
+
+    let save_frailty = match (frailty, ms_result.gaussian_frailty_sd) {
+        (
+            gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
+            Some(learned),
+        ) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(learned),
+        },
+        (spec, _) => spec,
+    };
+
+    let logslope_formula = fit_config.logslope_formula.clone();
+    let z_column = fit_config
+        .z_column
+        .clone()
+        .ok_or_else(|| "survival marginal-slope requires z_column".to_string())?;
+
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::Survival,
+        FittedFamily::Survival {
+            likelihood: LikelihoodFamily::RoystonParmar,
+            survival_likelihood: Some("marginal-slope".to_string()),
+            survival_distribution: Some("probit".to_string()),
+            frailty: save_frailty,
+        },
+        "royston-parmar".to_string(),
+    );
+    payload.unified = Some(ms_result.fit.clone());
+    payload.fit_result = Some(ms_result.fit);
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
+    payload.survival_likelihood = Some("marginal-slope".to_string());
+    payload.training_headers = Some(dataset.headers.clone());
+    payload.resolved_termspec = Some(frozen_marginal);
+    payload.resolved_termspec_noise = Some(frozen_logslope);
+    payload.formula_logslope = logslope_formula;
+    payload.z_column = Some(z_column);
+    payload.latent_z_normalization = Some(SavedLatentZNormalization {
+        mean: ms_result.z_normalization.mean,
+        sd: ms_result.z_normalization.sd,
+    });
+    payload.logslope_baseline = Some(ms_result.baseline_slope);
+    payload.score_warp_runtime = ms_result
+        .score_warp_runtime
+        .as_ref()
+        .map(saved_anchored_deviation_runtime);
+    payload.link_deviation_runtime = ms_result
+        .link_dev_runtime
+        .as_ref()
+        .map(saved_anchored_deviation_runtime);
+    payload.offset_column = fit_config.offset_column.clone();
+    payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    Ok(payload)
+}
+
+fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
+    SavedAnchoredDeviationRuntime {
+        kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+        breakpoints: runtime.breakpoints().to_vec(),
+        basis_dim: runtime.basis_dim(),
+        span_c0: runtime
+            .span_c0()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+        span_c1: runtime
+            .span_c1()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+        span_c2: runtime
+            .span_c2()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+        span_c3: runtime
+            .span_c3()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+    }
+}
+
+fn inverse_link_to_saved_string(link: &InverseLink) -> String {
+    match link {
+        InverseLink::Standard(link_fn) => link_name(*link_fn).to_string(),
+        InverseLink::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
+        InverseLink::Sas(_) => "sas".to_string(),
+        InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
+        InverseLink::Mixture(_) => "blended".to_string(),
+    }
+}
+
+fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
+    match link {
+        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
+        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+        InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+        InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+        InverseLink::Standard(LinkFunction::Sas) | InverseLink::Sas(_) => {
+            LikelihoodFamily::BinomialSas
+        }
+        InverseLink::Standard(LinkFunction::BetaLogistic) | InverseLink::BetaLogistic(_) => {
+            LikelihoodFamily::BinomialBetaLogistic
+        }
+        InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+        InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
+    }
+}
+
 fn saved_mixture_state_from_fit(fit: &gam::estimate::UnifiedFitResult) -> Option<MixtureLinkState> {
     match &fit.fitted_link {
         gam::estimate::FittedLinkState::Mixture { state, .. } => Some(state.clone()),
@@ -842,6 +1205,185 @@ fn build_standard_predict_input(
     Ok(PredictInput {
         design: design.design.clone(),
         offset,
+        design_noise: None,
+        offset_noise: None,
+        auxiliary_scalar: None,
+    })
+}
+
+fn build_bernoulli_marginal_slope_predict_input(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<PredictInput, String> {
+    let payload = model.payload();
+    let col_map = build_col_map(dataset);
+    let training_headers = payload.training_headers.as_ref();
+    let spec = resolve_termspec_for_prediction(
+        &payload.resolved_termspec,
+        training_headers,
+        &col_map,
+        "resolved_termspec",
+    )?;
+    let design = build_term_collection_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("failed to build marginal prediction design: {err}"))?;
+    let spec_logslope = resolve_termspec_for_prediction(
+        &payload.resolved_termspec_noise,
+        training_headers,
+        &col_map,
+        "resolved_termspec_noise",
+    )?;
+    let design_logslope = build_term_collection_design(dataset.values.view(), &spec_logslope)
+        .map_err(|err| format!("failed to build logslope prediction design: {err}"))?;
+
+    let z_name = payload
+        .z_column
+        .as_ref()
+        .ok_or_else(|| "marginal-slope model is missing z_column".to_string())?;
+    let &z_idx = col_map
+        .get(z_name)
+        .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
+    let z = dataset.values.column(z_idx).to_owned();
+
+    let offset = resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(dataset, &col_map, payload.noise_offset_column.as_deref())?;
+
+    Ok(PredictInput {
+        design: design.design.clone(),
+        offset,
+        design_noise: Some(design_logslope.design.clone()),
+        offset_noise: Some(offset_noise),
+        auxiliary_scalar: Some(z),
+    })
+}
+
+fn build_transformation_normal_predict_input(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<PredictInput, String> {
+    let payload = model.payload();
+    if payload.noise_offset_column.is_some() {
+        return Err(
+            "noise_offset_column is not supported for transformation-normal prediction"
+                .to_string(),
+        );
+    }
+    let col_map = build_col_map(dataset);
+    let training_headers = payload.training_headers.as_ref();
+    let spec = resolve_termspec_for_prediction(
+        &payload.resolved_termspec,
+        training_headers,
+        &col_map,
+        "resolved_termspec",
+    )?;
+    let covariate_design = build_term_collection_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("failed to build covariate prediction design: {err}"))?;
+    let offset = resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
+
+    let response_knots = payload
+        .transformation_response_knots
+        .as_ref()
+        .ok_or_else(|| {
+            "saved transformation-normal model is missing response_knots".to_string()
+        })?;
+    let response_transform_vecs = payload
+        .transformation_response_transform
+        .as_ref()
+        .ok_or_else(|| {
+            "saved transformation-normal model is missing response_transform".to_string()
+        })?;
+    let response_degree = payload.transformation_response_degree.ok_or_else(|| {
+        "saved transformation-normal model is missing response_degree".to_string()
+    })?;
+
+    let t_rows = response_transform_vecs.len();
+    let t_cols = response_transform_vecs.first().map(|row| row.len()).unwrap_or(0);
+    let mut resp_transform = ndarray::Array2::<f64>::zeros((t_rows, t_cols));
+    for (i, row) in response_transform_vecs.iter().enumerate() {
+        if row.len() != t_cols {
+            return Err(
+                "saved transformation-normal response_transform has inconsistent row widths"
+                    .to_string(),
+            );
+        }
+        for (j, &value) in row.iter().enumerate() {
+            resp_transform[[i, j]] = value;
+        }
+    }
+    let resp_knots = ndarray::Array1::from_vec(response_knots.clone());
+
+    let formula_text = &payload.formula;
+    let response_col_name = formula_text
+        .split('~')
+        .next()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "cannot parse response column from transformation-normal formula".to_string()
+        })?;
+    let &response_col_idx = col_map.get(response_col_name).ok_or_else(|| {
+        format!(
+            "response column '{}' not found in new data",
+            response_col_name
+        )
+    })?;
+    let response_new = dataset.values.column(response_col_idx).to_owned();
+    let n = dataset.values.nrows();
+
+    let (raw_val_basis, _) = gam::basis::create_basis::<gam::basis::Dense>(
+        response_new.view(),
+        gam::basis::KnotSource::Provided(resp_knots.view()),
+        response_degree,
+        gam::basis::BasisOptions::value(),
+    )
+    .map_err(|err| format!("failed to build response basis: {err}"))?;
+    let raw_val = raw_val_basis.as_ref().clone();
+    let dev_val = raw_val.dot(&resp_transform);
+    let dev_dim = resp_transform.ncols();
+    let p_resp = 2 + dev_dim;
+    let mut resp_val = ndarray::Array2::<f64>::zeros((n, p_resp));
+    resp_val.column_mut(0).fill(1.0);
+    resp_val.column_mut(1).assign(&response_new);
+    resp_val.slice_mut(ndarray::s![.., 2..]).assign(&dev_val);
+
+    let fit_saved = payload
+        .unified
+        .as_ref()
+        .ok_or_else(|| "saved transformation-normal model missing unified fit".to_string())?;
+    let beta = &fit_saved.blocks[0].beta;
+    let p_cov = covariate_design.design.ncols();
+    if beta.len() != p_resp * p_cov {
+        return Err(format!(
+            "beta length {} != p_resp({}) * p_cov({}) for transformation-normal prediction",
+            beta.len(),
+            p_resp,
+            p_cov
+        ));
+    }
+    let beta_mat = beta
+        .view()
+        .into_shape_with_order((p_resp, p_cov))
+        .map_err(|err| format!("beta reshape failed: {err}"))?;
+    let cov_mat = covariate_design.design.row_chunk(0..n);
+    let mut h = ndarray::Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let resp_row = resp_val.row(i);
+        let cov_row = cov_mat.row(i);
+        let mut val = 0.0;
+        for r in 0..p_resp {
+            if resp_row[r] == 0.0 {
+                continue;
+            }
+            for c in 0..p_cov {
+                val += resp_row[r] * cov_row[c] * beta_mat[[r, c]];
+            }
+        }
+        h[i] = val;
+    }
+
+    Ok(PredictInput {
+        design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
+        offset: h + offset,
         design_noise: None,
         offset_noise: None,
         auxiliary_scalar: None,
