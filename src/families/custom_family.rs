@@ -1632,6 +1632,37 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError>;
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(self
+            .materialize_first(axis)?
+            .slice(ndarray::s![rows, ..])
+            .to_owned())
+    }
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(self
+            .materialize_second_diag(axis)?
+            .slice(ndarray::s![rows, ..])
+            .to_owned())
+    }
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(self
+            .materialize_second_cross(axis_d, axis_e)?
+            .slice(ndarray::s![rows, ..])
+            .to_owned())
+    }
     fn materialize_first(
         &self,
         axis: usize,
@@ -1674,6 +1705,33 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         crate::terms::basis::ImplicitDesignPsiDerivative::forward_mul(self, axis, u)
+    }
+
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_first(self, axis, rows)
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_second_diag(self, axis, rows)
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_second_cross(
+            self, axis_d, axis_e, rows,
+        )
     }
 
     fn transpose_mul_second_diag(

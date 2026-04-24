@@ -5930,7 +5930,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let latent_cloglog_state = options.latent_cloglog;
     let shared_y = Arc::new(y.to_owned());
     let sharedweights = Arc::new(weights.to_owned());
-    let shared_design = baseline.design.design.to_dense_arc();
+    let shared_design = baseline
+        .design
+        .design
+        .try_to_dense_arc("spatial adaptive exact hyperfit design")
+        .map_err(EstimationError::InvalidInput)?;
     let shared_offset = Arc::new(offset.to_owned());
     let shared_runtime_caches = Arc::new(runtime_caches.to_vec());
     let shared_hyperspecs = Arc::new(hyperspecs.clone());

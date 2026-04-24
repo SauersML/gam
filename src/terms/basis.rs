@@ -2179,9 +2179,9 @@ enum StreamingAxisMode {
 #[derive(Debug, Clone)]
 struct StreamingRadialState {
     /// Data matrix, shape (n, d).
-    data: Array2<f64>,
+    data: Arc<Array2<f64>>,
     /// Center matrix, shape (k, d).
-    centers: Array2<f64>,
+    centers: Arc<Array2<f64>>,
     /// How per-pair axis components are exposed to the derivative operator.
     axis_mode: StreamingAxisMode,
     /// Which radial kernel family to use for recomputation.
@@ -2386,8 +2386,8 @@ impl ImplicitDesignPsiDerivative {
     /// from raw data/centers/eta during each matvec. No O(n*k) arrays are stored.
     /// This is the biobank-scale path.
     pub(crate) fn new_streaming(
-        data: Array2<f64>,
-        centers: Array2<f64>,
+        data: Arc<Array2<f64>>,
+        centers: Arc<Array2<f64>>,
         eta: Vec<f64>,
         radial_kind: RadialScalarKind,
         ident_transform: Option<Array2<f64>>,
@@ -2426,8 +2426,8 @@ impl ImplicitDesignPsiDerivative {
     /// exposes a single axis component equal to the full scaled squared
     /// distance r² under the fixed metric defined by `eta`.
     pub(crate) fn new_streaming_scalar(
-        data: Array2<f64>,
-        centers: Array2<f64>,
+        data: Arc<Array2<f64>>,
+        centers: Arc<Array2<f64>>,
         eta: Vec<f64>,
         radial_kind: RadialScalarKind,
         ident_transform: Option<Array2<f64>>,
@@ -3619,6 +3619,187 @@ impl ImplicitDesignPsiDerivative {
             Some(zf) => fast_ab(&padded, zf),
             None => padded,
         }
+    }
+
+    fn project_matrix_rows(&self, raw: Array2<f64>) -> Array2<f64> {
+        let nrows = raw.nrows();
+        let constrained = match &self.ident_transform {
+            Some(z) => fast_ab(&raw, z),
+            None => raw,
+        };
+        let padded = if self.n_poly > 0 {
+            let cols = constrained.ncols();
+            let mut out = Array2::<f64>::zeros((nrows, cols + self.n_poly));
+            out.slice_mut(s![.., ..cols]).assign(&constrained);
+            out
+        } else {
+            constrained
+        };
+        match &self.full_ident_transform {
+            Some(zf) => fast_ab(&padded, zf),
+            None => padded,
+        }
+    }
+
+    fn row_chunk_with_kernel<G>(
+        &self,
+        rows: std::ops::Range<usize>,
+        deriv_fn: G,
+    ) -> Result<Array2<f64>, BasisError>
+    where
+        G: Fn(f64, f64, f64, &[f64], usize) -> f64,
+    {
+        let mut raw = Array2::<f64>::zeros((rows.end - rows.start, self.n_knots));
+        if let Some(st) = self.streaming.as_ref() {
+            let mut sb = vec![0.0; self.n_axes];
+            for (local, i) in rows.enumerate() {
+                for j in 0..self.n_knots {
+                    let (phi, q, t) = st.compute_pair(i, j, &mut sb)?;
+                    raw[[local, j]] = deriv_fn(phi, q, t, &sb, i * self.n_knots + j);
+                }
+            }
+        } else {
+            for (local, i) in rows.enumerate() {
+                let base = i * self.n_knots;
+                for j in 0..self.n_knots {
+                    let idx = base + j;
+                    raw[[local, j]] = deriv_fn(
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        &[],
+                        idx,
+                    );
+                }
+            }
+        }
+        Ok(self.project_matrix_rows(raw))
+    }
+
+    pub fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, BasisError> {
+        assert!(axis < self.n_axes());
+        let c = self.psi_scale_share;
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            return self.row_chunk_with_kernel(rows, |phi, q, _, sb, idx| {
+                let s_combo = if sb.is_empty() {
+                    self.transformed_combo_axis_value_materialized(idx, combo)
+                } else {
+                    combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum()
+                };
+                Self::transformed_first_kernel_value(phi, q, s_combo, combo_sum, c)
+            });
+        }
+        self.row_chunk_with_kernel(rows, |phi, q, _, sb, idx| {
+            let s = if sb.is_empty() {
+                self.axis_components[[idx, axis]]
+            } else {
+                sb[axis]
+            };
+            q * s + c * phi
+        })
+    }
+
+    pub fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, BasisError> {
+        assert!(axis < self.n_axes());
+        let c = self.psi_scale_share;
+        if self.axis_combinations.is_some() {
+            let combo = self.transformed_axis_combination(axis);
+            let combo_sum = Self::transformed_combo_sum(combo);
+            return self.row_chunk_with_kernel(rows, |phi, q, t, sb, idx| {
+                let s_combo = if sb.is_empty() {
+                    self.transformed_combo_axis_value_materialized(idx, combo)
+                } else {
+                    combo
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum()
+                };
+                let overlap = if sb.is_empty() {
+                    self.transformed_combo_overlap_materialized(idx, combo, combo)
+                } else {
+                    Self::transformed_combo_overlap_streaming(combo, combo, sb)
+                };
+                Self::transformed_second_kernel_value(
+                    phi, q, t, s_combo, combo_sum, s_combo, combo_sum, overlap, c,
+                )
+            });
+        }
+        self.row_chunk_with_kernel(rows, |phi, q, t, sb, idx| {
+            let s = if sb.is_empty() {
+                self.axis_components[[idx, axis]]
+            } else {
+                sb[axis]
+            };
+            2.0 * q * s + t * s * s + 2.0 * c * q * s + c * c * phi
+        })
+    }
+
+    pub fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, BasisError> {
+        assert!(axis_d < self.n_axes());
+        assert!(axis_e < self.n_axes());
+        assert_ne!(axis_d, axis_e);
+        let c = self.psi_scale_share;
+        if self.axis_combinations.is_some() {
+            let combo_d = self.transformed_axis_combination(axis_d);
+            let combo_e = self.transformed_axis_combination(axis_e);
+            let sum_d = Self::transformed_combo_sum(combo_d);
+            let sum_e = Self::transformed_combo_sum(combo_e);
+            return self.row_chunk_with_kernel(rows, |phi, q, t, sb, idx| {
+                let s_d = if sb.is_empty() {
+                    self.transformed_combo_axis_value_materialized(idx, combo_d)
+                } else {
+                    combo_d
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum()
+                };
+                let s_e = if sb.is_empty() {
+                    self.transformed_combo_axis_value_materialized(idx, combo_e)
+                } else {
+                    combo_e
+                        .iter()
+                        .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
+                        .sum()
+                };
+                let overlap = if sb.is_empty() {
+                    self.transformed_combo_overlap_materialized(idx, combo_d, combo_e)
+                } else {
+                    Self::transformed_combo_overlap_streaming(combo_d, combo_e, sb)
+                };
+                Self::transformed_second_kernel_value(phi, q, t, s_d, sum_d, s_e, sum_e, overlap, c)
+            });
+        }
+        self.row_chunk_with_kernel(rows, |phi, q, t, sb, idx| {
+            let sd = if sb.is_empty() {
+                self.axis_components[[idx, axis_d]]
+            } else {
+                sb[axis_d]
+            };
+            let se = if sb.is_empty() {
+                self.axis_components[[idx, axis_e]]
+            } else {
+                sb[axis_e]
+            };
+            t * sd * se + c * q * (sd + se) + c * c * phi
+        })
     }
 
     fn transformed_axis_combination(&self, axis: usize) -> &[(usize, f64)] {
@@ -7248,7 +7429,7 @@ pub fn build_matern_collocation_operator_matrices(
     // Specialized Matérn operator assembly using explicit half-integer formulas:
     // - one exp(-a) and small polynomials per pair,
     // - NaN-safe phi'(r)/r without dividing by r for nu>=3/2,
-    // - exact Laplacian identity: Δphi = phi'' + (d-1) phi'/r.
+    // - exact Hessian rows for the stiffness operator, not just the Laplacian.
     let p = centers.nrows();
     let d = centers.ncols();
     let row_scales = if let Some(w) = collocationweights {
@@ -7273,18 +7454,20 @@ pub fn build_matern_collocation_operator_matrices(
     };
     let mut d0_raw = Array2::<f64>::zeros((p, p));
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
-    let mut d2_raw = Array2::<f64>::zeros((p, p));
+    let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
+    let metric_weights = aniso_log_scales.map(centered_aniso_metric_weights);
     const R_EPS: f64 = 1e-12;
     for k in 0..p {
         let scale_k = row_scales[k];
         for j in 0..p {
             // Distance: anisotropic r = |Ah| when eta present, isotropic |h| otherwise.
             let r = if let Some(eta) = aniso_log_scales {
-                aniso_distance(
+                aniso_distance_and_components(
                     centers.row(k).as_slice().unwrap(),
                     centers.row(j).as_slice().unwrap(),
                     eta,
                 )
+                .0
             } else {
                 stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
             };
@@ -7314,8 +7497,30 @@ pub fn build_matern_collocation_operator_matrices(
                     d1_raw[[k * d + c, j]] = 0.0;
                 }
             }
-            d2_raw[[k, j]] = scale_k * (phi_rr + ((d as f64 - 1.0) * phi_r_over_r));
-            if !d0_raw[[k, j]].is_finite() || !d2_raw[[k, j]].is_finite() {
+            let t = if r > R_EPS {
+                (phi_rr - phi_r_over_r) / (r * r)
+            } else {
+                0.0
+            };
+            for a in 0..d {
+                let h_a = centers[[k, a]] - centers[[j, a]];
+                let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
+                for b in 0..d {
+                    let h_b = centers[[k, b]] - centers[[j, b]];
+                    let w_b = metric_weights.as_ref().map(|w| w[b]).unwrap_or(1.0);
+                    let diagonal = if a == b { phi_r_over_r * w_a } else { 0.0 };
+                    let mixed = if r > R_EPS {
+                        t * w_a * h_a * w_b * h_b
+                    } else {
+                        0.0
+                    };
+                    let row = (k * d + a) * d + b;
+                    d2_raw[[row, j]] = scale_k * (diagonal + mixed);
+                }
+            }
+            if !d0_raw[[k, j]].is_finite()
+                || ((k * d * d)..((k + 1) * d * d)).any(|row| !d2_raw[[row, j]].is_finite())
+            {
                 return Err(BasisError::InvalidInput(format!(
                     "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
                 )));
@@ -7338,7 +7543,7 @@ pub fn build_matern_collocation_operator_matrices(
     let total_cols = kernel_cols + usize::from(include_intercept);
     let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
     let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
-    let mut d2 = Array2::<f64>::zeros((p_colloc, total_cols));
+    let mut d2 = Array2::<f64>::zeros((p_colloc * dim * dim, total_cols));
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
@@ -7404,10 +7609,6 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     let coeffs = length_scale
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(centered_aniso_metric_weights);
-    let sum_metric_weights = metric_weights
-        .as_ref()
-        .map(|w| w.iter().sum::<f64>())
-        .unwrap_or(dim as f64);
     let row_scales = if let Some(w) = collocationweights {
         if w.len() != p_colloc {
             return Err(BasisError::DimensionMismatch(format!(
@@ -7431,19 +7632,16 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let mut d0_raw = Array2::<f64>::zeros((p_colloc, p_colloc));
     let mut d1_raw = Array2::<f64>::zeros((p_colloc * dim, p_colloc));
-    let mut d2_raw = Array2::<f64>::zeros((p_colloc, p_colloc));
+    let mut d2_raw = Array2::<f64>::zeros((p_colloc * dim * dim, p_colloc));
     const R_EPS: f64 = 1e-10;
     for k in 0..p_colloc {
         let scale_k = row_scales[k];
         for j in k..p_colloc {
             let scale_j = row_scales[j];
-            let mut s_vec = Vec::new();
             let r = if let Some(eta) = aniso_log_scales {
                 let row_k: Vec<f64> = (0..dim).map(|a| centers[[k, a]]).collect();
                 let row_j: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-                let (r, components) = aniso_distance_and_components(&row_k, &row_j, eta);
-                s_vec = components;
-                r
+                aniso_distance(&row_k, &row_j, eta)
             } else {
                 stable_euclidean_norm((0..dim).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
             };
@@ -7462,20 +7660,37 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             }
             d0_raw[[k, j]] = scale_k * phi;
             d0_raw[[j, k]] = scale_j * phi;
-            let lap = if r > R_EPS {
+            let (q, t) = if r > R_EPS {
                 let q = phi_r / r;
-                if let Some(weights) = metric_weights.as_ref() {
-                    let t = (phi_rr - q) / (r * r);
-                    let sum_wb_sb: f64 = (0..dim).map(|axis| weights[axis] * s_vec[axis]).sum();
-                    q * sum_metric_weights + t * sum_wb_sb
-                } else {
-                    phi_rr + ((dim as f64 - 1.0) * q)
-                }
+                (q, (phi_rr - q) / (r * r))
             } else {
-                sum_metric_weights * phi_rr
+                (phi_rr, 0.0)
             };
-            d2_raw[[k, j]] = scale_k * lap;
-            d2_raw[[j, k]] = scale_j * lap;
+            for axis_a in 0..dim {
+                let h_a = centers[[k, axis_a]] - centers[[j, axis_a]];
+                let w_a = metric_weights
+                    .as_ref()
+                    .map(|weights| weights[axis_a])
+                    .unwrap_or(1.0);
+                for axis_b in 0..dim {
+                    let h_b = centers[[k, axis_b]] - centers[[j, axis_b]];
+                    let w_b = metric_weights
+                        .as_ref()
+                        .map(|weights| weights[axis_b])
+                        .unwrap_or(1.0);
+                    let diagonal = if axis_a == axis_b { q * w_a } else { 0.0 };
+                    let mixed = if r > R_EPS {
+                        t * w_a * h_a * w_b * h_b
+                    } else {
+                        0.0
+                    };
+                    let value = diagonal + mixed;
+                    let row_k = (k * dim + axis_a) * dim + axis_b;
+                    let row_j = (j * dim + axis_a) * dim + axis_b;
+                    d2_raw[[row_k, j]] = scale_k * value;
+                    d2_raw[[row_j, k]] = scale_j * value;
+                }
+            }
             if r > R_EPS {
                 let grad_scale = phi_r / r;
                 for axis in 0..dim {

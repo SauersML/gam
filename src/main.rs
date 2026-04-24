@@ -13,7 +13,7 @@ use gam::estimate::{
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
 };
 use gam::families::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime,
+    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::family_meta::{
@@ -76,8 +76,8 @@ use gam::survival_construction::{
     build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
-    evaluate_survival_baseline, evaluate_survival_time_basis_row,
-    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
+    evaluate_survival_time_basis_row, marginal_slope_baseline_chain_rule_gradient,
+    normalize_survival_time_pair,
     optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
     parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
     parse_survival_time_basis_config, require_structural_survival_time_basis,
@@ -586,11 +586,9 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    _: &FitArgs,
+    _args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
-    let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    options.use_outer_hessian = true;
-    options.compute_covariance = true;
+    let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
 
@@ -1439,6 +1437,7 @@ fn run_fit_bernoulli_marginal_slope(
                 frailty: frailty.clone(),
                 score_warp: routed_score_warp,
                 link_dev: routed_link_dev,
+                latent_z_policy: LatentZPolicy::default(),
             },
             options,
             kappa_options: kappa_options.clone(),
@@ -5148,10 +5147,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
             opts
         };
-        let options = gam::families::custom_family::BlockwiseFitOptions {
-            compute_covariance: true,
-            ..Default::default()
-        };
+        let options = gam::families::custom_family::BlockwiseFitOptions::default();
         let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -13168,7 +13164,7 @@ mod tests {
             "bernoulli marginal-slope",
         )
         .expect_err("log link should be rejected");
-        assert!(err.contains("does not support link(type=log)"));
+        assert!(err.contains("requires link(type=probit)"));
     }
 
     #[test]
