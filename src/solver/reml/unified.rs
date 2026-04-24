@@ -1229,6 +1229,11 @@ pub trait HyperOperator: Send + Sync {
         self.mul_vec(&v.to_owned())
     }
 
+    /// Compute B · v into caller-owned storage.
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        out.assign(&self.mul_vec_view(v));
+    }
+
     /// Compute v^T · B · u (bilinear form).
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let bv = self.mul_vec(v);
@@ -1280,6 +1285,10 @@ impl HyperOperator for DenseMatrixHyperOperator {
         self.matrix.dot(&v)
     }
 
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
+        dense_matvec_into(&self.matrix, v, out);
+    }
+
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         dense_bilinear(&self.matrix, v.view(), u.view())
     }
@@ -1325,6 +1334,20 @@ impl HyperOperator for CompositeHyperOperator {
             out += &op.mul_vec_view(v);
         }
         out
+    }
+
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        out.fill(0.0);
+        if let Some(dense) = self.dense.as_ref() {
+            dense_matvec_into(dense, v, out.view_mut());
+        }
+        if !self.operators.is_empty() {
+            let mut work = Array1::<f64>::zeros(out.len());
+            for op in &self.operators {
+                op.mul_vec_into(v, work.view_mut());
+                out += &work;
+            }
+        }
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
@@ -1406,6 +1429,13 @@ impl HyperOperator for BlockLocalDrift {
             out.slice_mut(ndarray::s![self.start..self.end]),
         );
         out
+    }
+
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        out.fill(0.0);
+        let v_block = v.slice(ndarray::s![self.start..self.end]);
+        let out_block = out.slice_mut(ndarray::s![self.start..self.end]);
+        dense_matvec_into(&self.local, v_block, out_block);
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
@@ -1639,6 +1669,16 @@ impl HyperOperator for ImplicitHyperOperator {
         dense_matvec_into(&self.s_psi, v, penalty.view_mut());
         out += &penalty;
         out
+    }
+
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
+        debug_assert_eq!(v.len(), self.p);
+        let n_obs = self.w_diag.len();
+        let mut x_v = Array1::<f64>::zeros(n_obs);
+        let mut n_work = Array1::<f64>::zeros(n_obs);
+        let mut p_work = Array1::<f64>::zeros(self.p);
+        design_matrix_apply_view_into(&self.x_design, v, x_v.view_mut());
+        self.matvec_with_shared_xz_into(&x_v, v, out, n_work.view_mut(), p_work.view_mut());
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
@@ -5007,6 +5047,20 @@ impl HyperOperator for WeightedHyperOperator {
         out
     }
 
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        out.fill(0.0);
+        if self.terms.is_empty() {
+            return;
+        }
+        let mut work = Array1::<f64>::zeros(out.len());
+        for (weight, op) in &self.terms {
+            if *weight != 0.0 {
+                op.mul_vec_into(v, work.view_mut());
+                out.scaled_add(*weight, &work);
+            }
+        }
+    }
+
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         self.terms
             .iter()
@@ -6847,9 +6901,9 @@ impl DenseSpectralOperator {
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
         let rank = factor.ncols();
         let mut op_factor = Array2::<f64>::zeros((self.n_dim, rank));
+        let mut bv = Array1::<f64>::zeros(self.n_dim);
         for col in 0..rank {
-            let bv = op.mul_vec_view(factor.column(col));
-            debug_assert_eq!(bv.len(), self.n_dim);
+            op.mul_vec_into(factor.column(col), bv.view_mut());
             op_factor.column_mut(col).assign(&bv);
         }
         factor.t().dot(&op_factor)
@@ -8117,8 +8171,9 @@ impl StochasticTraceEstimator {
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
         let check_interval = 4;
 
+        let mut z = Array1::<f64>::zeros(p);
         for m in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
             let w = hop.solve(&z);
             evaluate_probe(&z, &w, &mut probe_values);
 
@@ -8154,9 +8209,10 @@ impl StochasticTraceEstimator {
 
         match targets {
             StochasticTraceTargets::Dense(matrices) => {
+                let mut a_w = Array1::<f64>::zeros(hop.dim());
                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
                     for k in 0..matrices.len() {
-                        let a_w = matrices[k].dot(w);
+                        dense_matvec_into(matrices[k], w.view(), a_w.view_mut());
                         probe_values[k] = z.dot(&a_w);
                     }
                 })
@@ -8164,19 +8220,22 @@ impl StochasticTraceEstimator {
             StochasticTraceTargets::Mixed {
                 dense_matrices,
                 operators,
-            } => self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
-                for k in 0..dense_matrices.len() {
-                    let a_w = dense_matrices[k].dot(w);
-                    probe_values[k] = z.dot(&a_w);
-                }
+            } => {
+                let mut a_w = Array1::<f64>::zeros(hop.dim());
+                self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
+                    for k in 0..dense_matrices.len() {
+                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+                        probe_values[k] = z.dot(&a_w);
+                    }
 
-                let dense_count = dense_matrices.len();
-                for (oi, op) in operators.iter().enumerate() {
-                    let k = dense_count + oi;
-                    let a_w = op.mul_vec(w);
-                    probe_values[k] = z.dot(&a_w);
-                }
-            }),
+                    let dense_count = dense_matrices.len();
+                    for (oi, op) in operators.iter().enumerate() {
+                        let k = dense_count + oi;
+                        op.mul_vec_into(w.view(), a_w.view_mut());
+                        probe_values[k] = z.dot(&a_w);
+                    }
+                })
+            }
             StochasticTraceTargets::Structural {
                 dense_matrices,
                 implicit_ops,
@@ -8193,12 +8252,15 @@ impl StochasticTraceEstimator {
                 }
 
                 let x_design = implicit_ops[0].x_design.clone();
+                let mut x_vec = Array1::<f64>::zeros(x_design.nrows());
+                let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
+                let mut a_w = Array1::<f64>::zeros(hop.dim());
                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
-                    let x_vec = x_design.matrixvectormultiply(z);
-                    let y_vec = x_design.matrixvectormultiply(w);
+                    design_matrix_apply_view_into(x_design.as_ref(), z.view(), x_vec.view_mut());
+                    design_matrix_apply_view_into(x_design.as_ref(), w.view(), y_vec.view_mut());
 
                     for k in 0..dense_matrices.len() {
-                        let a_w = dense_matrices[k].dot(w);
+                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
                         probe_values[k] = z.dot(&a_w);
                     }
 
@@ -8561,8 +8623,7 @@ impl StochasticTraceEstimator {
             }
             for (oi, op) in operators.iter().enumerate() {
                 let e = n_dense + oi;
-                let q_e = op.mul_vec(&z);
-                q_columns.column_mut(e).assign(&q_e);
+                op.mul_vec_into(z.view(), q_columns.column_mut(e));
             }
 
             let r = hop.solve_multi(&q_columns);
@@ -8690,10 +8751,11 @@ impl StochasticTraceEstimator {
 
         let mut total = 0.0;
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let mut q = Array1::<f64>::zeros(p);
         for _ in 0..self.config.n_probes_max {
             let z = rademacher_probe(p, &mut rng_state);
             let u = hop.solve(&z);
-            let q = op.mul_vec(&z);
+            op.mul_vec_into(z.view(), q.view_mut());
             let r = hop.solve(&q);
             total += op.bilinear_view(r.view(), u.view());
         }
