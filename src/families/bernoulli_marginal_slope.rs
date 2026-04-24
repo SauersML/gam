@@ -19,9 +19,6 @@ use crate::families::row_kernel::{
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
-use crate::mixture_link::{
-    inverse_link_jet_for_inverse_link, inverse_link_pdfthird_derivative_for_inverse_link,
-};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
@@ -157,7 +154,7 @@ struct ThetaHints {
     link_dev_beta: Option<Array1<f64>>,
 }
 
-pub(crate) fn build_deviation_block_from_seed(
+pub(crate) fn build_score_warp_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
@@ -257,7 +254,7 @@ fn require_probit_marginal_slope_link(
     }
 }
 
-pub(crate) fn build_deviation_block_from_knots_design_seed_and_anchor_weights(
+pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     anchor_weights: &Array1<f64>,
@@ -7843,7 +7840,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| build_deviation_block_from_seed(&spec.z, cfg))
+        .map(|cfg| build_score_warp_deviation_block_from_seed(&spec.z, cfg))
         .transpose()?;
     // Build the link-deviation block if requested.  The seed only determines
     // knot placement for the deviation basis, so we use the closed-form
@@ -7887,7 +7884,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     q0_seed.clone()
                 }
             };
-            build_deviation_block_from_knots_design_seed_and_anchor_weights(
+            build_link_deviation_block_from_knots_design_seed_and_weights(
                 &link_dev_seed,
                 &q0_seed,
                 &spec.weights,
@@ -8306,7 +8303,7 @@ mod tests {
     #[test]
     fn score_warp_basis_is_orthogonal_to_standard_normal_location_and_scale() {
         let seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 5,
@@ -8348,7 +8345,7 @@ mod tests {
     fn link_deviation_basis_is_orthogonal_to_weighted_training_index_moments() {
         let q = array![-2.0, -0.8, -0.1, 0.4, 1.3, 2.1];
         let weights = array![0.2, 1.7, 0.5, 2.3, 0.8, 1.1];
-        let prepared = build_deviation_block_from_knots_design_seed_and_anchor_weights(
+        let prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
             &q,
             &q,
             &weights,
@@ -8485,7 +8482,7 @@ mod tests {
     #[test]
     fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8597,7 +8594,7 @@ mod tests {
     #[test]
     fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8605,7 +8602,7 @@ mod tests {
             },
         )
         .expect("build score-warp block");
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8664,7 +8661,7 @@ mod tests {
     #[test]
     fn score_warp_block_exposes_structural_derivative_lower_bounds() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8722,7 +8719,7 @@ mod tests {
     #[test]
     fn post_update_block_beta_projects_score_warp_to_feasible_step() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8768,7 +8765,7 @@ mod tests {
     #[test]
     fn structural_deviation_runtime_is_piecewise_cubic() {
         let seed = array![-1.0, 0.0, 1.0];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 ..DeviationBlockConfig::default()
@@ -8782,7 +8779,7 @@ mod tests {
     #[test]
     fn structural_deviation_runtime_is_c2_at_internal_breakpoints() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8823,7 +8820,7 @@ mod tests {
     #[test]
     fn structural_deviation_rejects_noncubic_degree() {
         let seed = array![-1.0, 0.0, 1.0];
-        let err = build_deviation_block_from_seed(
+        let err = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 degree: 4,
@@ -8837,7 +8834,7 @@ mod tests {
     #[test]
     fn deviation_runtime_replays_exact_training_design() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8861,7 +8858,7 @@ mod tests {
     #[test]
     fn structural_constraints_match_exact_monotonicity_guard() {
         let seed = array![-1.0, 0.0, 1.0, 2.0];
-        let prepared = build_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
+        let prepared = build_score_warp_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
             .expect("build deviation block");
         let constraints = prepared.runtime.structural_monotonicity_constraints();
         let dim = constraints.a.ncols();
@@ -8903,7 +8900,7 @@ mod tests {
     #[test]
     fn structural_constraints_are_quadratic_derivative_bernstein_controls() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8948,7 +8945,7 @@ mod tests {
     #[test]
     fn deviation_penalties_are_integrated_function_penalties() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9026,7 +9023,7 @@ mod tests {
         // For d0/d1/d2 the expected value matches the selected span at every
         // sample point.
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9109,7 +9106,7 @@ mod tests {
     #[test]
     fn basis_span_cubic_reconstructs_basis_column_exactly() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9159,7 +9156,7 @@ mod tests {
     #[test]
     fn deviation_runtime_saturates_outside_support() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9206,7 +9203,7 @@ mod tests {
     #[test]
     fn deviation_runtime_replays_the_exact_training_basis() {
         let seed = array![-2.0, -1.0, -0.25, 0.25, 1.0, 2.0];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9235,7 +9232,7 @@ mod tests {
     fn denested_microcells_follow_score_and_link_breaks() {
         let score_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
         let link_seed = array![-1.5, -0.5, 0.5, 1.5];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &score_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9243,7 +9240,7 @@ mod tests {
             },
         )
         .expect("build score warp block");
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9318,7 +9315,7 @@ mod tests {
     fn denested_microcell_eta_matches_direct_denested_formula() {
         let score_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
         let link_seed = array![-1.5, -0.5, 0.5, 1.5];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &score_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9326,7 +9323,7 @@ mod tests {
             },
         )
         .expect("build score warp block");
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9540,7 +9537,7 @@ mod tests {
     fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_link() {
         let z = array![-0.8, 0.2, 1.1];
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9708,7 +9705,7 @@ mod tests {
     #[test]
     fn flexible_family_exposes_exact_outer_derivative_path() {
         let seed = array![-1.0, 0.0, 1.0];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9887,7 +9884,7 @@ mod tests {
     #[test]
     fn w_only_gradient_hessian_finite_and_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9985,7 +9982,7 @@ mod tests {
     #[test]
     fn h_only_gradient_hessian_finite_and_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10077,7 +10074,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10210,7 +10207,7 @@ mod tests {
         // being supported solely on h.  This fix preserves that original
         // semantic and exercises the block→primary direction map end-to-end.
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10316,7 +10313,7 @@ mod tests {
     #[test]
     fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10440,7 +10437,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10566,7 +10563,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10575,7 +10572,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10713,7 +10710,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10722,7 +10719,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10809,7 +10806,7 @@ mod tests {
     #[test]
     fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10886,7 +10883,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10965,7 +10962,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10974,7 +10971,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11047,7 +11044,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11056,7 +11053,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11151,7 +11148,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11160,7 +11157,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11274,7 +11271,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11283,7 +11280,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11416,7 +11413,7 @@ mod tests {
     #[test]
     fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11513,7 +11510,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11610,7 +11607,7 @@ mod tests {
     #[test]
     fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11718,7 +11715,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11828,7 +11825,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11837,7 +11834,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11951,7 +11948,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11960,7 +11957,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12061,7 +12058,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12070,7 +12067,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12169,7 +12166,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12178,7 +12175,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12297,7 +12294,7 @@ mod tests {
     #[test]
     fn h_only_row_primary_third_direction_is_linear() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12403,7 +12400,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_third_direction_is_linear() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12511,7 +12508,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12520,7 +12517,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12627,7 +12624,7 @@ mod tests {
     #[test]
     fn h_only_exact_outer_third_direction_is_linear() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12707,7 +12704,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_third_direction_is_linear() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12787,7 +12784,7 @@ mod tests {
     #[test]
     fn h_only_exact_outer_direction_sign_rules_hold() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12872,7 +12869,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_direction_sign_rules_hold() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12957,7 +12954,7 @@ mod tests {
     #[test]
     fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13031,7 +13028,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13105,7 +13102,7 @@ mod tests {
     #[test]
     fn h_only_exact_outer_zero_direction_returns_zero() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13166,7 +13163,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_zero_direction_returns_zero() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_deviation_block_from_seed(
+        let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13230,7 +13227,7 @@ mod tests {
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13337,7 +13334,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13444,7 +13441,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13453,7 +13450,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13585,7 +13582,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13594,7 +13591,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13739,7 +13736,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13748,7 +13745,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13821,7 +13818,7 @@ mod tests {
         let z = array![-0.8, 0.2, 1.1];
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_deviation_block_from_seed(
+        let score_prepared = build_score_warp_deviation_block_from_seed(
             &z,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13830,7 +13827,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_deviation_block_from_seed(
+        let link_prepared = build_score_warp_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,

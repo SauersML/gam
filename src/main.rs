@@ -4151,11 +4151,36 @@ fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(
     Some((scale, shape))
 }
 
+fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&InverseLink>) -> bool {
+    matches!(
+        inverse_link,
+        Some(InverseLink::Standard(LinkFunction::Probit))
+    )
+}
+
+fn build_survival_time_offsets_for_likelihood(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    baseline_cfg: &SurvivalBaselineConfig,
+    likelihood_mode: SurvivalLikelihoodMode,
+    inverse_link: Option<&InverseLink>,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope
+        || (likelihood_mode == SurvivalLikelihoodMode::LocationScale
+            && location_scale_uses_probit_survival_baseline(inverse_link))
+    {
+        build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)
+    } else {
+        build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)
+    }
+}
+
 fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     baseline_cfg: &SurvivalBaselineConfig,
     likelihood_mode: SurvivalLikelihoodMode,
+    inverse_link: Option<&InverseLink>,
     time_anchor: f64,
     exact_derivative_guard: f64,
     time_build: &SurvivalTimeBuildOutput,
@@ -4182,11 +4207,13 @@ fn prepare_survival_time_stack(
         )
     } else {
         let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-            if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-                build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)?
-            } else {
-                build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)?
-            };
+            build_survival_time_offsets_for_likelihood(
+                age_entry,
+                age_exit,
+                baseline_cfg,
+                likelihood_mode,
+                inverse_link,
+            )?;
         let n = age_entry.len();
         (
             eta_offset_entry,
@@ -8277,109 +8304,16 @@ fn resolve_bernoulli_marginal_slope_base_link(
             "{context} requires link(type=probit); non-probit marginal-slope links are not supported by the calibrated de-nested probit kernel"
         ));
     }
-    if let Some(components) = choice.mixture_components.as_ref() {
-        if linkspec.sas_init.is_some() {
-            return Err("link(sas_init=...) requires link(type=sas)".to_string());
-        }
-        if linkspec.beta_logistic_init.is_some() {
-            return Err(
-                "link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string(),
-            );
-        }
-        let expected = components.len().saturating_sub(1);
-        let rho = if let Some(raw) = linkspec.mixture_rho.as_deref() {
-            let vals = parse_comma_f64(raw, "link(rho=...)")?;
-            if vals.len() != expected {
-                return Err(format!(
-                    "link(rho=...) length mismatch: expected {expected}, got {}",
-                    vals.len()
-                ));
-            }
-            Array1::from_vec(vals)
-        } else {
-            Array1::zeros(expected)
-        };
-        return state_fromspec(&MixtureLinkSpec {
-            components: components.clone(),
-            initial_rho: rho,
-        })
-        .map(InverseLink::Mixture)
-        .map_err(|e| format!("invalid blended link configuration: {e}"));
+    if linkspec.sas_init.is_some() {
+        return Err("link(sas_init=...) requires link(type=sas), which marginal-slope does not support".to_string());
+    }
+    if linkspec.beta_logistic_init.is_some() {
+        return Err("link(beta_logistic_init=...) requires link(type=beta-logistic), which marginal-slope does not support".to_string());
     }
     if linkspec.mixture_rho.is_some() {
-        return Err("link(rho=...) requires link(type=blended(...)/mixture(...))".to_string());
+        return Err("link(rho=...) requires link(type=blended(...)/mixture(...)), which marginal-slope does not support".to_string());
     }
-    match choice.link {
-        LinkFunction::Probit | LinkFunction::Logit | LinkFunction::CLogLog => {
-            if linkspec.sas_init.is_some() {
-                return Err("link(sas_init=...) requires link(type=sas)".to_string());
-            }
-            if linkspec.beta_logistic_init.is_some() {
-                return Err(
-                    "link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string(),
-                );
-            }
-            Ok(InverseLink::Standard(choice.link))
-        }
-        LinkFunction::Sas => {
-            if linkspec.beta_logistic_init.is_some() {
-                return Err(
-                    "link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string(),
-                );
-            }
-            let spec = if let Some(raw) = linkspec.sas_init.as_deref() {
-                let vals = parse_comma_f64(raw, "link(sas_init=...)")?;
-                if vals.len() != 2 {
-                    return Err(format!(
-                        "link(sas_init=...) expects two values: epsilon,log_delta (got {})",
-                        vals.len()
-                    ));
-                }
-                SasLinkSpec {
-                    initial_epsilon: vals[0],
-                    initial_log_delta: vals[1],
-                }
-            } else {
-                SasLinkSpec {
-                    initial_epsilon: 0.0,
-                    initial_log_delta: 0.0,
-                }
-            };
-            state_from_sasspec(spec)
-                .map(InverseLink::Sas)
-                .map_err(|e| format!("invalid SAS link configuration: {e}"))
-        }
-        LinkFunction::BetaLogistic => {
-            if linkspec.sas_init.is_some() {
-                return Err("link(sas_init=...) requires link(type=sas)".to_string());
-            }
-            let spec = if let Some(raw) = linkspec.beta_logistic_init.as_deref() {
-                let vals = parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
-                if vals.len() != 2 {
-                    return Err(format!(
-                        "link(beta_logistic_init=...) expects two values: epsilon,delta (got {})",
-                        vals.len()
-                    ));
-                }
-                SasLinkSpec {
-                    initial_epsilon: vals[0],
-                    initial_log_delta: vals[1],
-                }
-            } else {
-                SasLinkSpec {
-                    initial_epsilon: 0.0,
-                    initial_log_delta: 0.0,
-                }
-            };
-            state_from_beta_logisticspec(spec)
-                .map(InverseLink::BetaLogistic)
-                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))
-        }
-        LinkFunction::Identity | LinkFunction::Log => Err(format!(
-            "{context} does not support link(type={}); use probit|logit|cloglog|sas|beta-logistic|blended(...)/mixture(...)",
-            linkname(choice.link)
-        )),
-    }
+    Ok(InverseLink::Standard(LinkFunction::Probit))
 }
 
 fn build_transformation_normal_saved_model(
