@@ -3293,6 +3293,7 @@ pub(crate) fn weighted_crossprod_psi_maps(
     left: CustomFamilyPsiLinearMapRef<'_>,
     weights: ArrayView1<'_, f64>,
     right: CustomFamilyPsiLinearMapRef<'_>,
+    policy: &ResourcePolicy,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
         return Err(format!(
@@ -3319,7 +3320,7 @@ pub(crate) fn weighted_crossprod_psi_maps(
     // materialized at full n x p_right size. Chunk size is governed by the
     // resource policy's row_chunk_target_bytes.
     let rows_per_chunk = crate::resource::rows_for_target_bytes(
-        crate::resource::ResourcePolicy::default_library().row_chunk_target_bytes,
+        policy.row_chunk_target_bytes,
         p_left.saturating_add(p_right).max(1),
     );
 

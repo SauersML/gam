@@ -10,10 +10,10 @@ use crate::custom_family::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
     build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi, second_psi_linear_map,
-    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    resolve_custom_family_x_psi, resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi,
+    second_psi_linear_map, shared_dense_arc, slice_joint_into_block_working_sets,
+    weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -4846,7 +4846,6 @@ fn gaussian_joint_psihessian_fromweights(
     x_ls_psi: CustomFamilyPsiLinearMapRef<'_>,
     weights: &GaussianJointPsiFirstWeights,
 ) -> Result<Array2<f64>, String> {
-    // TODO(resource-policy-migration): thread real policy through caller
     let policy = crate::resource::ResourcePolicy::default_library();
     // For the symmetric blocks (hmumu, h_ls_ls), the pair
     //   X_psi^T D X  and  X^T D X_psi
@@ -4954,7 +4953,6 @@ fn gaussian_joint_psisecondhessian_fromweights(
     weights_j: &GaussianJointPsiFirstWeights,
     secondweights: &GaussianJointPsiSecondWeights,
 ) -> Result<Array2<f64>, String> {
-    // TODO(resource-policy-migration): thread real policy through caller
     let policy = crate::resource::ResourcePolicy::default_library();
     // Exploit transpose symmetry: X_a^T D X_b and X_b^T D X_a are transposes.
     // For each such pair in the symmetric blocks (hmumu, h_ls_ls), compute one
@@ -5065,7 +5063,6 @@ fn gaussian_joint_psi_mixedhessian_drift_fromweights(
     x_ls_psi: CustomFamilyPsiLinearMapRef<'_>,
     mixedweights: &GaussianJointPsiMixedDriftWeights,
 ) -> Result<Array2<f64>, String> {
-    // TODO(resource-policy-migration): thread real policy through caller
     let policy = crate::resource::ResourcePolicy::default_library();
     let a_mu = weighted_crossprod_psi_maps(
         xmu_psi,
@@ -7350,7 +7347,6 @@ impl GaussianLocationScaleWiggleFamily {
         let l = 2.0 * &rows.m;
         let l_a = 2.0 * &dm_a;
 
-        // TODO(resource-policy-migration): thread real policy through caller
         let policy = crate::resource::ResourcePolicy::default_library();
         let h_mm_a1 = weighted_crossprod_psi_maps(
             xmu_map,
@@ -7462,7 +7458,6 @@ impl GaussianLocationScaleWiggleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
-        // TODO(resource-policy-migration): thread real policy through caller
         let policy = crate::resource::ResourcePolicy::default_library();
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
@@ -7862,7 +7857,6 @@ impl GaussianLocationScaleWiggleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Array2<f64>, String> {
-        // TODO(resource-policy-migration): thread real policy through caller
         let policy = crate::resource::ResourcePolicy::default_library();
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
@@ -11183,7 +11177,6 @@ impl BinomialLocationScaleFamily {
         let hessian_psi = if hessian_psi_operator.is_some() {
             Array2::zeros((0, 0))
         } else {
-            // TODO(resource-policy-migration): thread real policy through caller
             let policy = crate::resource::ResourcePolicy::default_library();
             let h_tt_block = weighted_crossprod_psi_maps(
                 x_t_map,
@@ -11289,7 +11282,6 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
-        // TODO(resource-policy-migration): thread real policy through caller
         let policy = crate::resource::ResourcePolicy::default_library();
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
@@ -11722,6 +11714,7 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Array2<f64>, String> {
+        let policy = crate::resource::ResourcePolicy::default_library();
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -11853,28 +11846,34 @@ impl BinomialLocationScaleFamily {
             x_t_map,
             h_tt_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
+            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             h_tt_u.view(),
             x_t_map,
+            &policy,
         )? + &xt_diag_x_dense(x_t, &dh_tt_u)?;
         let tl_block = weighted_crossprod_psi_maps(
             x_t_map,
             h_tl_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             h_tl_u.view(),
             x_ls_map,
+            &policy,
         )? + &xt_diag_y_dense(x_t, &dh_tl_u, x_ls)?;
         let ll_block = weighted_crossprod_psi_maps(
             x_ls_map,
             h_ll_u.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             h_ll_u.view(),
             x_ls_map,
+            &policy,
         )? + &xt_diag_x_dense(x_ls, &dh_ll_u)?;
         let mut out = Array2::<f64>::zeros((total, total));
         out.slice_mut(s![0..pt, 0..pt]).assign(&tt_block);
@@ -12683,6 +12682,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        let policy = crate::resource::ResourcePolicy::default_library();
         if self
             .exact_newton_joint_psi_direction(
                 block_states,
@@ -13059,38 +13059,46 @@ impl BinomialLocationScaleWiggleFamily {
             x_t_map,
             coeff_tt_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
+            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             coeff_tt_w.view(),
             x_t_map,
+            &policy,
         )? + &xt_diag_x_dense(x_t, &coeff_tt_d)?;
         let h_tl_block = weighted_crossprod_psi_maps(
             x_t_map,
             coeff_tl_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             coeff_tl_w.view(),
             x_ls_map,
+            &policy,
         )? + &xt_diag_y_dense(x_t, &coeff_tl_d, x_ls)?;
         let h_ll_block = weighted_crossprod_psi_maps(
             x_ls_map,
             coeff_ll_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )? + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             coeff_ll_w.view(),
             x_ls_map,
+            &policy,
         )? + &xt_diag_x_dense(x_ls, &coeff_ll_d)?;
         let h_tw = weighted_crossprod_psi_maps(
             x_t_map,
             coeff_tw_b_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(&b0),
+            &policy,
         )? + &xt_diag_y_dense(x_t, &coeff_tw_b_d, &b0)?
             + &weighted_crossprod_psi_maps(
                 x_t_map,
                 coeff_tw_d1_w.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&d0),
+                &policy,
             )?
             + &xt_diag_y_dense(x_t, &coeff_tw_d1_d, &d0)?
             + &xt_diag_y_dense(x_t, &coeff_tw_d2_d, &dd0)?;
@@ -13098,11 +13106,13 @@ impl BinomialLocationScaleWiggleFamily {
             x_ls_map,
             coeff_lw_b_w.view(),
             CustomFamilyPsiLinearMapRef::Dense(&b0),
+            &policy,
         )? + &xt_diag_y_dense(x_ls, &coeff_lw_b_d, &b0)?
             + &weighted_crossprod_psi_maps(
                 x_ls_map,
                 coeff_lw_d1_w.view(),
                 CustomFamilyPsiLinearMapRef::Dense(&d0),
+                &policy,
             )?
             + &xt_diag_y_dense(x_ls, &coeff_lw_d1_d, &d0)?
             + &xt_diag_y_dense(x_ls, &coeff_lw_d2_d, &dd0)?;
