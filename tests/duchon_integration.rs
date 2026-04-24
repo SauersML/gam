@@ -46,15 +46,10 @@ fn simulate_duchon_regression(n: usize, d: usize) -> (Array2<f64>, Array1<f64>, 
     (x, y, y_true)
 }
 
-fn fit_duchon_simulated_10d(
-    power: usize,
-    nullspace_order: DuchonNullspaceOrder,
-    expected_lambda_count: usize,
-    max_mse_ratio: f64,
-) {
+fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: DuchonNullspaceOrder) {
     let n = 900usize;
     let d = 10usize;
-    let (x, y, y_true) = simulate_duchon_regression(n, d);
+    let (x, y, _) = simulate_duchon_regression(n, d);
 
     let spec = TermCollectionSpec {
         linear_terms: vec![],
@@ -79,7 +74,7 @@ fn fit_duchon_simulated_10d(
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let fitted = gam::smooth::fit_term_collection_forspec(
+    let err = match gam::smooth::fit_term_collection_forspec(
         x.view(),
         y.view(),
         weights.view(),
@@ -104,64 +99,32 @@ fn fit_duchon_simulated_10d(
             kronecker_penalty_system: None,
             kronecker_factored: None,
         },
-    )
-    .expect("Duchon term-collection fit should succeed");
-
-    // Double-penalty only adds an active shrinkage block when the primary Duchon
-    // penalty has a structural nullspace after construction/filtering.
-    // For `nullspace_order=Zero` (p=0) this can be full-rank => one active lambda.
-    // For `nullspace_order=Linear` (p=1) a nullspace block is present => two lambdas.
-    assert_eq!(fitted.fit.lambdas.len(), expected_lambda_count);
-    assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
-
-    let design = fitted.design.design.to_dense();
-    let pred = predict_gam(
-        design.view(),
-        fitted.fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("prediction on fitted Duchon design should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
-
-    let mse_model = (&pred.mean - &y_true)
-        .mapv(|v| v * v)
-        .mean()
-        .unwrap_or(f64::INFINITY);
-    let y_mean = y_true.mean().unwrap_or(0.0);
-    let mse_baseline = y_true
-        .iter()
-        .map(|&v| {
-            let d = v - y_mean;
-            d * d
-        })
-        .sum::<f64>()
-        / (n as f64);
-
+    ) {
+        Ok(_) => panic!("invalid pure 10D Duchon configuration should be rejected"),
+        Err(err) => err,
+    };
     assert!(
-        mse_model < max_mse_ratio * mse_baseline,
-        "Duchon integration fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}, ratio={:.6e}, allowed_ratio={max_mse_ratio:.6e}",
-        mse_model / mse_baseline.max(f64::MIN_POSITIVE),
+        err.to_string().contains("pointwise kernel values"),
+        "unexpected error: {err}"
     );
 }
 
 #[test]
-fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config() {
-    // Pure Duchon uses operator penalties directly. For p=0/s=1 this currently
-    // keeps two active operator blocks in the fitted design.
-    fit_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero, 2, 0.85);
+fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config_rejects_infinite_diagonal()
+{
+    assert_invalid_pure_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero);
 }
 
 #[test]
-fn duchon_fit_term_collection_gaussian_simulated_10d_p1_s0() {
-    fit_duchon_simulated_10d(0, DuchonNullspaceOrder::Linear, 2, 0.45);
+fn duchon_fit_term_collection_gaussian_simulated_10d_p1_s0_rejects_infinite_diagonal() {
+    assert_invalid_pure_duchon_simulated_10d(0, DuchonNullspaceOrder::Linear);
 }
 
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regularization() {
     let n = 96usize;
     let d = 10usize;
-    let (x, y, y_true) = simulate_duchon_regression(n, d);
+    let (x, y, _) = simulate_duchon_regression(n, d);
 
     let spec = TermCollectionSpec {
         linear_terms: vec![],
@@ -186,7 +149,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let fitted = gam::smooth::fit_term_collection_forspec(
+    let err = match gam::smooth::fit_term_collection_forspec(
         x.view(),
         y.view(),
         weights.view(),
@@ -220,47 +183,13 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
             kronecker_penalty_system: None,
             kronecker_factored: None,
         },
-    )
-    .expect("exact adaptive Duchon term-collection fit should succeed");
-
-    let diag = fitted
-        .adaptive_diagnostics
-        .as_ref()
-        .expect("adaptive diagnostics should be present");
-    assert_eq!(diag.mm_iterations, 0);
-    assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
-    assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
-    assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
-    assert_eq!(diag.maps.len(), 1);
-    assert!(fitted.fit.standard_deviation.is_finite() && fitted.fit.standard_deviation > 0.0);
-
-    let design = fitted.design.design.to_dense();
-    let pred = predict_gam(
-        design.view(),
-        fitted.fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("prediction on exact adaptive Duchon design should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
-
-    let mse_model = (&pred.mean - &y_true)
-        .mapv(|v| v * v)
-        .mean()
-        .unwrap_or(f64::INFINITY);
-    let y_mean = y_true.mean().unwrap_or(0.0);
-    let mse_baseline = y_true
-        .iter()
-        .map(|&v| {
-            let d = v - y_mean;
-            d * d
-        })
-        .sum::<f64>()
-        / (n as f64);
-
+    ) {
+        Ok(_) => panic!("invalid adaptive pure 10D Duchon configuration should be rejected"),
+        Err(err) => err,
+    };
     assert!(
-        mse_model < 0.95 * mse_baseline,
-        "exact adaptive Duchon integration fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
+        err.to_string().contains("pointwise kernel values"),
+        "unexpected error: {err}"
     );
 }
 
