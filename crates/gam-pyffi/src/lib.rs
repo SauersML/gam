@@ -1453,9 +1453,19 @@ fn predict_table_survival(
         gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent",
         gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
     };
+    let model_class_label = match result.likelihood_mode {
+        gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => {
+            "survival marginal-slope".to_string()
+        }
+        gam::survival_construction::SurvivalLikelihoodMode::LocationScale => {
+            "survival location-scale".to_string()
+        }
+        gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent survival".to_string(),
+        _ => predict_model_class_name(model.predict_model_class()).to_string(),
+    };
     let survival_payload = SurvivalPredictionPayload {
         class: "survival_prediction",
-        model_class: predict_model_class_name(model.predict_model_class()).to_string(),
+        model_class: model_class_label,
         likelihood_mode: likelihood_mode_str.to_string(),
         times: result.times.clone(),
         hazard: hazard_rows,
