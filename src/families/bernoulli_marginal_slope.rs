@@ -1,4 +1,3 @@
-use crate::basis::create_difference_penalty_matrix;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
@@ -14,8 +13,7 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed,
-    split_wiggle_penalty_orders,
+    ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed, split_wiggle_penalty_orders,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
@@ -43,7 +41,6 @@ use std::sync::Arc;
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
-use deviation_runtime::transform_deviation_penalty;
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -287,16 +284,19 @@ fn build_deviation_block_from_knots_and_design_seed_with_anchor(
     cfg: &DeviationBlockConfig,
     anchor: DeviationAnchorKind,
 ) -> Result<DeviationPrepared, String> {
+    if cfg.degree != 3 {
+        return Err(format!(
+            "structural deviation runtime is cubic; degree must be 3, got {}",
+            cfg.degree
+        ));
+    }
     let (primary_order, extra_orders) =
         split_wiggle_penalty_orders(cfg.penalty_order, &cfg.penalty_orders);
-    let effective_cfg = WiggleBlockConfig {
-        degree: cfg.degree,
-        num_internal_knots: cfg.num_internal_knots,
-        penalty_order: primary_order,
-        double_penalty: cfg.double_penalty,
-    };
-    let selected = select_wiggle_basis_from_seed(knot_seed.view(), &effective_cfg, &extra_orders)?;
-    let knots = selected.knots;
+    let knots = initialize_monotone_wiggle_knots_from_seed(
+        knot_seed.view(),
+        cfg.degree,
+        cfg.num_internal_knots,
+    )?;
     let runtime = match anchor {
         DeviationAnchorKind::StandardNormal => {
             DeviationRuntime::try_new_standard_normal_anchor(knots, cfg.monotonicity_eps)?
@@ -318,67 +318,26 @@ fn build_deviation_block_from_knots_and_design_seed_with_anchor(
         initial_log_lambdas: None,
         initial_beta: Some(Array1::zeros(p)),
     };
-    let raw_p = runtime.coefficient_transform().nrows();
-    if raw_p == 1 {
-        block
-            .penalties
-            .push(crate::solver::estimate::PenaltySpec::Dense(
-                Array2::<f64>::eye(1),
-            ));
-        block.nullspace_dims.push(0);
-    } else {
-        let effective_order = primary_order.max(1).min(raw_p - 1);
-        let diff_penalty = create_difference_penalty_matrix(raw_p, effective_order, None)
-            .map_err(|e| e.to_string())?;
-        block
-            .penalties
-            .push(crate::solver::estimate::PenaltySpec::Dense(
-                transform_deviation_penalty(&diff_penalty, runtime.coefficient_transform()),
-            ));
-        block
-            .nullspace_dims
-            .push(effective_order.saturating_sub(2).min(p));
-    }
+    append_deviation_function_penalty(&mut block, &runtime, primary_order)?;
     if cfg.double_penalty {
-        block
-            .penalties
-            .push(crate::solver::estimate::PenaltySpec::Dense(
-                Array2::<f64>::eye(p),
-            ));
-        block.nullspace_dims.push(0);
+        append_deviation_function_penalty(&mut block, &runtime, 0)?;
     }
-    append_transformed_deviation_penalty_orders(
-        &mut block,
-        runtime.coefficient_transform(),
-        raw_p,
-        &extra_orders,
-    )?;
+    for order in extra_orders {
+        append_deviation_function_penalty(&mut block, &runtime, order)?;
+    }
     Ok(DeviationPrepared { block, runtime })
 }
 
-fn append_transformed_deviation_penalty_orders(
+fn append_deviation_function_penalty(
     block: &mut ParameterBlockInput,
-    transform: &Array2<f64>,
-    raw_p: usize,
-    penalty_orders: &[usize],
+    runtime: &DeviationRuntime,
+    derivative_order: usize,
 ) -> Result<(), String> {
-    let p = block.design.ncols();
-    if p == 0 {
-        return Ok(());
-    }
-    for &order in penalty_orders {
-        if order == 0 || order >= raw_p {
-            continue;
-        }
-        let penalty =
-            create_difference_penalty_matrix(raw_p, order, None).map_err(|e| e.to_string())?;
-        block
-            .penalties
-            .push(crate::solver::estimate::PenaltySpec::Dense(
-                transform_deviation_penalty(&penalty, transform),
-            ));
-        block.nullspace_dims.push(order.saturating_sub(2).min(p));
-    }
+    let penalty = runtime.integrated_derivative_penalty(derivative_order)?;
+    block
+        .penalties
+        .push(crate::solver::estimate::PenaltySpec::Dense(penalty));
+    block.nullspace_dims.push(0);
     Ok(())
 }
 
@@ -2958,7 +2917,7 @@ impl BernoulliMarginalSlopeFamily {
             label,
         )
         .ok();
-        first_psi_linear_map(action.as_ref(), &deriv.x_psi, total_rows, p).row_vector(row)
+        first_psi_linear_map(action.as_ref(), Some(&deriv.x_psi), total_rows, p).row_vector(row)
     }
 
     fn psi_second_design_row_vector(
@@ -8645,13 +8604,26 @@ mod tests {
         let prepared = build_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
-                degree: 4,
                 ..DeviationBlockConfig::default()
             },
         )
         .expect("structural deviation basis");
         assert_eq!(prepared.runtime.degree(), 3);
         assert_eq!(prepared.runtime.value_span_degree(), 3);
+    }
+
+    #[test]
+    fn structural_deviation_rejects_noncubic_degree() {
+        let seed = array![-1.0, 0.0, 1.0];
+        let err = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                degree: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect_err("structural deviation block should reject non-cubic degree");
+        assert!(err.contains("degree must be 3"));
     }
 
     #[test]
@@ -8685,12 +8657,18 @@ mod tests {
             .expect("build deviation block");
         let constraints = prepared.runtime.structural_monotonicity_constraints();
         let dim = constraints.a.ncols();
-        let feasible = Array1::<f64>::from_elem(dim, prepared.runtime.monotonicity_eps() - 1.0);
+        assert_eq!(dim, prepared.runtime.basis_dim());
+        let feasible = Array1::<f64>::zeros(dim);
         prepared
             .runtime
             .monotonicity_feasible(&feasible, "feasible structural beta")
-            .expect("boundary point should be feasible");
-        let infeasible = &feasible - 1e-3;
+            .expect("zero deviation should be feasible");
+        let first_row = constraints.a.row(0).to_owned();
+        let row_norm_sq = first_row.dot(&first_row);
+        assert!(row_norm_sq > 0.0);
+        let scale = (constraints.b[0].abs() + 1.0) / row_norm_sq;
+        let infeasible = first_row.mapv(|value| -scale * value);
+        assert!(constraints.a.row(0).dot(&infeasible) < constraints.b[0]);
         assert!(
             prepared
                 .runtime

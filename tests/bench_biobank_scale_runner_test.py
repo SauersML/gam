@@ -39,7 +39,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertEqual(lane["family"], "binomial")
         self.assertEqual(lane["backend"], "rust_gam")
         self.assertEqual(lane["spatial_basis"], "duchon")
-        self.assertEqual(lane["centers"], 50)
+        self.assertEqual(lane["centers"], 24)
         self.assertTrue(lane["marginal_slope"])
         self.assertTrue(lane["scale_dimensions"])
         self.assertEqual(lane["z_column"], "pgs_std")
@@ -78,6 +78,51 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
         self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=10000), 22)
         self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=400000), 22)
+
+    def test_biobank_preflight_rejects_unsafe_dense_duchon_width_before_allocation(self) -> None:
+        report = _RUNNER.preflight_marginal_slope_biobank(
+            n_train=400000,
+            d_pc=16,
+            centers=1400,
+        )
+        self.assertEqual(report.status, "FAIL")
+        text = "\n".join(report.lines)
+        self.assertIn("anisotropic derivative dense estimate", text)
+        self.assertIn("status: FAIL", text)
+
+    def test_biobank_preflight_accepts_production_marginal_slope_width(self) -> None:
+        report = _RUNNER.preflight_marginal_slope_biobank(
+            n_train=400000,
+            d_pc=16,
+            centers=24,
+            linkwiggle_knots=8,
+            scorewarp_knots=8,
+        )
+        self.assertEqual(report.status, "PASS")
+        text = "\n".join(report.lines)
+        self.assertIn("Duchon smooth: lazy chunked", text)
+        self.assertIn("anisotropy derivatives: implicit streaming", text)
+
+    def test_ctn_preflight_uses_factored_kronecker_not_dense_rowwise_product(self) -> None:
+        report = _RUNNER.preflight_ctn_score_warp(
+            n_train=400000,
+            p_response=12,
+            p_cov=50,
+        )
+        self.assertEqual(report.status, "PASS")
+        text = "\n".join(report.lines)
+        self.assertIn("CTN Kronecker: factored", text)
+        self.assertIn("avoided dense rowwise Kronecker", text)
+        self.assertLess(report.largest_single_allocation_bytes, 400000 * 600 * 8)
+
+    def test_survival_prediction_preflight_chunks_large_horizon_grid(self) -> None:
+        report = _RUNNER.preflight_survival_prediction(
+            n_rows=400000,
+            grid_points=1000,
+        )
+        self.assertEqual(report.status, "PASS")
+        self.assertEqual(report.chunk_rows, _RUNNER.BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS)
+        self.assertLess(report.largest_single_allocation_bytes, 400000 * 1000 * 8)
 
     def test_build_method_specs_rejects_pc_count_above_generated_columns(self) -> None:
         cfg = {

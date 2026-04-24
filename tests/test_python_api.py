@@ -364,3 +364,29 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
     # Survival is non-increasing in time for every sample.
     deltas = np.diff(survival, axis=1)
     assert np.all(deltas <= 1e-9)
+
+
+def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path):
+    pred = gam.SurvivalPrediction(
+        model_class="survival marginal-slope",
+        parameters=np.zeros((1_001, 1), dtype=float),
+        parameter_names=("eta",),
+    )
+    grid = np.linspace(0.0, 1000.0, 1000, dtype=float)
+
+    with pytest.raises(ValueError, match="dense survival curves"):
+        pred.survival_at(grid)
+
+    chunks = list(pred.survival_at_chunks(grid, people_chunk=500, time_grid_chunk=128))
+    assert chunks[0][2].shape == (500, 128)
+    assert chunks[-1][2].shape == (1, 104)
+
+    out = pred.write_survival_at_csv(
+        tmp_path / "survival.csv",
+        np.array([1.0, 2.0], dtype=float),
+        people_chunk=500,
+        time_grid_chunk=1,
+    )
+    text = pathlib.Path(out).read_text(encoding="utf-8").splitlines()
+    assert text[0] == "row,time,survival"
+    assert len(text) == 1 + 1_001 * 2

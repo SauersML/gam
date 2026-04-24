@@ -18,6 +18,10 @@ from ._tables import (
     table_columns,
 )
 
+DEFAULT_SURVIVAL_PEOPLE_CHUNK = 50_000
+DEFAULT_SURVIVAL_TIME_GRID_CHUNK = 64
+MAX_DENSE_SURVIVAL_CURVE_CELLS = 1_000_000
+
 _SURVIVAL_MODEL_CLASSES = frozenset(
     {
         "survival marginal-slope",
@@ -68,14 +72,44 @@ class SurvivalPrediction:
     parameter_names: Sequence[str] = field(default_factory=tuple)
     baseline_times: Any | None = None
 
-    def hazard_at(self, times: Any) -> Any:
-        """Hazard rate ``h(t)`` evaluated at each time in ``times``.
-
-        Returns an ``(n_samples, len(times))`` numpy array.
-        """
+    def _coerce_times(self, times: Any) -> Any:
         import numpy as np
 
         times_arr = np.asarray(times, dtype=float).reshape(-1)
+        if times_arr.size == 0:
+            raise ValueError("survival prediction requires at least one time")
+        if not np.all(np.isfinite(times_arr)):
+            raise ValueError("survival prediction times must be finite")
+        return times_arr
+
+    def _parameters_array(self) -> Any:
+        import numpy as np
+
+        params = np.asarray(self.parameters, dtype=float)
+        if params.ndim == 1:
+            params = params.reshape(-1, 1)
+        return params
+
+    def _check_dense_size(self, n_rows: int, n_times: int) -> None:
+        cells = int(n_rows) * int(n_times)
+        if cells > MAX_DENSE_SURVIVAL_CURVE_CELLS:
+            raise ValueError(
+                "dense survival curves are limited to diagnostic subsets "
+                f"({MAX_DENSE_SURVIVAL_CURVE_CELLS} cells); requested "
+                f"{n_rows} rows x {n_times} times. Use survival_at_chunks(), "
+                "hazard_at_chunks(), or write_survival_at_csv()."
+            )
+
+    def hazard_at(self, times: Any) -> Any:
+        """Hazard rate ``h(t)`` evaluated at each time in ``times``.
+
+        Returns an ``(n_samples, len(times))`` numpy array for diagnostic-sized
+        requests. Large production grids must use ``hazard_at_chunks``.
+        """
+        import numpy as np
+
+        times_arr = self._coerce_times(times)
+        self._check_dense_size(self._parameters_array().shape[0], times_arr.size)
         cumulative = self.cumulative_hazard_at(times_arr)
         if times_arr.size <= 1:
             return cumulative
@@ -89,7 +123,7 @@ class SurvivalPrediction:
         return diffs / widths
 
     def cumulative_hazard_at(self, times: Any) -> Any:
-        """Cumulative hazard ``H(t) = -log S(t)`` at each requested time."""
+        """Cumulative hazard ``H(t) = -log S(t)`` for diagnostic-sized grids."""
         import numpy as np
 
         survival = self.survival_at(times)
@@ -103,14 +137,123 @@ class SurvivalPrediction:
         so this implements the plug-in identity ``S(t) = exp(-H(t))`` using a
         per-row piecewise-constant hazard whose coefficients are the returned
         ``parameters``. When the FFI exposes a richer contract this method
-        will be updated without breaking callers.
+        should be replaced with the richer evaluator.
+        Dense output is intentionally bounded. Use ``survival_at_chunks`` or
+        ``write_survival_at_csv`` for biobank-scale prediction.
         """
         import numpy as np
 
-        times_arr = np.asarray(times, dtype=float).reshape(-1)
-        params = np.asarray(self.parameters, dtype=float)
-        if params.ndim == 1:
-            params = params.reshape(-1, 1)
+        times_arr = self._coerce_times(times)
+        params = self._parameters_array()
+        self._check_dense_size(params.shape[0], times_arr.size)
+        return self._survival_block(params, times_arr)
+
+    def survival_at_chunks(
+        self,
+        times: Any,
+        *,
+        people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+        time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+    ) -> Any:
+        """Yield ``(row_slice, time_slice, survival_block)`` chunks."""
+        params = self._parameters_array()
+        times_arr = self._coerce_times(times)
+        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
+        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
+        for row_start in range(0, params.shape[0], people_chunk):
+            row_stop = min(row_start + people_chunk, params.shape[0])
+            row_params = params[row_start:row_stop, :]
+            for time_start in range(0, times_arr.size, time_grid_chunk):
+                time_stop = min(time_start + time_grid_chunk, times_arr.size)
+                yield (
+                    slice(row_start, row_stop),
+                    slice(time_start, time_stop),
+                    self._survival_block(row_params, times_arr[time_start:time_stop]),
+                )
+
+    def cumulative_hazard_at_chunks(
+        self,
+        times: Any,
+        *,
+        people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+        time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+    ) -> Any:
+        """Yield ``(row_slice, time_slice, cumulative_hazard_block)`` chunks."""
+        import numpy as np
+
+        for row_slice, time_slice, survival in self.survival_at_chunks(
+            times,
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+        ):
+            yield row_slice, time_slice, -np.log(np.clip(survival, 1e-12, 1.0))
+
+    def hazard_at_chunks(
+        self,
+        times: Any,
+        *,
+        people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+        time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+    ) -> Any:
+        """Yield ``(row_slice, time_slice, hazard_block)`` chunks."""
+        import numpy as np
+
+        times_arr = self._coerce_times(times)
+        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
+        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
+        params = self._parameters_array()
+        for row_start in range(0, params.shape[0], people_chunk):
+            row_stop = min(row_start + people_chunk, params.shape[0])
+            row_params = params[row_start:row_stop, :]
+            previous_cumulative = np.zeros((row_stop - row_start, 1), dtype=float)
+            previous_time = 0.0
+            for time_start in range(0, times_arr.size, time_grid_chunk):
+                time_stop = min(time_start + time_grid_chunk, times_arr.size)
+                time_block = times_arr[time_start:time_stop]
+                survival = self._survival_block(row_params, time_block)
+                cumulative = -np.log(np.clip(survival, 1e-12, 1.0))
+                cumulative_full = np.concatenate([previous_cumulative, cumulative], axis=1)
+                grid = np.concatenate([[previous_time], time_block])
+                widths = np.diff(grid)
+                widths = np.where(widths <= 0.0, 1.0, widths)
+                yield (
+                    slice(row_start, row_stop),
+                    slice(time_start, time_stop),
+                    np.diff(cumulative_full, axis=1) / widths.reshape(1, -1),
+                )
+                previous_cumulative = cumulative[:, -1:]
+                previous_time = float(time_block[-1])
+
+    def write_survival_at_csv(
+        self,
+        path: str | Path,
+        times: Any,
+        *,
+        people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+        time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+    ) -> str:
+        """Write chunked survival predictions as row,time,survival CSV."""
+        import csv
+
+        times_arr = self._coerce_times(times)
+        with Path(path).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["row", "time", "survival"])
+            for row_slice, time_slice, block in self.survival_at_chunks(
+                times_arr,
+                people_chunk=people_chunk,
+                time_grid_chunk=time_grid_chunk,
+            ):
+                time_block = times_arr[time_slice]
+                for local_row, values in enumerate(block):
+                    row_index = row_slice.start + local_row
+                    for time, survival in zip(time_block, values, strict=True):
+                        writer.writerow([row_index, float(time), float(survival)])
+        return str(path)
+
+    def _survival_block(self, params: Any, times_arr: Any) -> Any:
+        import numpy as np
+
         anchor_log_hazard = params[:, 0:1]
         hazard = np.exp(anchor_log_hazard)
         cumulative = hazard * times_arr.reshape(1, -1)
@@ -384,6 +527,13 @@ def _transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:
     raise KeyError(
         "transformation-normal prediction payload is missing a z-score column"
     )
+
+
+def _validate_survival_chunk_size(value: int, name: str) -> int:
+    chunk = int(value)
+    if chunk <= 0:
+        raise ValueError(f"{name} must be positive")
+    return chunk
 
 
 def _survival_prediction_from_columns(
