@@ -151,122 +151,6 @@ fn exact_design_row_chunks(n: usize, p: usize) -> impl Iterator<Item = std::ops:
         .map(move |start| start..(start + rows).min(n))
 }
 
-/// Operator-preserving view of a per-block GAMLSS design matrix.
-///
-/// `Dense` borrows already-materialized storage (zero-cost); `Operator`
-/// holds a borrow of the underlying `DesignMatrix` so chunked access stays
-/// lazy. Prefer this over `dense_block_designs_*` helpers, which return
-/// `Cow<'_, Array2<f64>>` and unconditionally densify lazy operators.
-pub(crate) enum BlockDesignView<'a> {
-    Dense(&'a Array2<f64>),
-    Operator(&'a DesignMatrix),
-}
-
-impl<'a> BlockDesignView<'a> {
-    pub(crate) fn from_design(design: &'a DesignMatrix) -> Self {
-        match design {
-            DesignMatrix::Dense(dm) => match dm.as_dense_ref() {
-                Some(arr) => Self::Dense(arr),
-                None => Self::Operator(design),
-            },
-            DesignMatrix::Sparse(_) => Self::Operator(design),
-        }
-    }
-
-    pub(crate) fn nrows(&self) -> usize {
-        match self {
-            Self::Dense(m) => m.nrows(),
-            Self::Operator(dm) => dm.nrows(),
-        }
-    }
-
-    pub(crate) fn ncols(&self) -> usize {
-        match self {
-            Self::Dense(m) => m.ncols(),
-            Self::Operator(dm) => dm.ncols(),
-        }
-    }
-
-    pub(crate) fn forward_mul(&self, beta: ArrayView1<'_, f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(m) => m.dot(&beta),
-            Self::Operator(dm) => {
-                use crate::matrix::LinearOperator;
-                LinearOperator::apply(*dm, &beta.to_owned())
-            }
-        }
-    }
-
-    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(m) => m.t().dot(&v),
-            Self::Operator(dm) => {
-                use crate::matrix::LinearOperator;
-                LinearOperator::apply_transpose(*dm, &v.to_owned())
-            }
-        }
-    }
-
-    pub(crate) fn row_chunk(&self, rows: std::ops::Range<usize>) -> Result<Array2<f64>, String> {
-        match self {
-            Self::Dense(m) => Ok(m.slice(s![rows, ..]).to_owned()),
-            Self::Operator(dm) => {
-                use crate::matrix::DenseDesignOperator;
-                DenseDesignOperator::try_row_chunk(*dm, rows).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    pub(crate) fn weighted_cross(
-        &self,
-        weights: ArrayView1<'_, f64>,
-        other: &BlockDesignView<'_>,
-        policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Array2<f64>, String> {
-        let n = weights.len();
-        if self.nrows() != n {
-            return Err(format!(
-                "BlockDesignView::weighted_cross: lhs nrows={} != weights len={}",
-                self.nrows(),
-                n
-            ));
-        }
-        if other.nrows() != n {
-            return Err(format!(
-                "BlockDesignView::weighted_cross: rhs nrows={} != weights len={}",
-                other.nrows(),
-                n
-            ));
-        }
-        let p_l = self.ncols();
-        let p_r = other.ncols();
-        let mut out = Array2::<f64>::zeros((p_l, p_r));
-        let rows_per_chunk = crate::resource::rows_for_target_bytes(
-            policy.row_chunk_target_bytes,
-            p_l + p_r,
-        )
-        .max(1);
-        let mut start = 0usize;
-        while start < n {
-            let end = (start + rows_per_chunk).min(n);
-            let rows = start..end;
-            let xl = self.row_chunk(rows.clone())?;
-            let mut xr = other.row_chunk(rows.clone())?;
-            for local in 0..xr.nrows() {
-                let w = weights[start + local];
-                if w != 1.0 {
-                    for j in 0..p_r {
-                        xr[[local, j]] *= w;
-                    }
-                }
-            }
-            out += &xl.t().dot(&xr);
-            start = end;
-        }
-        Ok(out)
-    }
-}
-
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
     if !rawweight.is_finite() || rawweight <= 0.0 {
@@ -295,9 +179,6 @@ fn gaussian_log_sigma_irlsinfo_directional_derivative(
         return 0.0;
     }
 
-    // The evaluated IRLS weight uses clamp(raw_g, -1, 1). On an active clamp
-    // branch the working weight is locally constant in eta_ls, so we return the
-    // derivative of that active piece, namely zero.
     if !(-1.0..=1.0).contains(&raw_g) || raw_g == -1.0 || raw_g == 1.0 {
         return 0.0;
     }
@@ -5307,26 +5188,6 @@ impl GaussianLocationScaleFamily {
         Ok(None)
     }
 
-    /// Operator-preserving view of the mu block design.
-    pub(crate) fn mu_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleFamily exact path is missing mu design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(mu_design))
-    }
-
-    /// Operator-preserving view of the log-sigma block design.
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(log_sigma_design))
-    }
-
-    // TODO(block-view-migration): prefer `mu_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
     fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
@@ -6856,26 +6717,6 @@ impl GaussianLocationScaleWiggleFamily {
         )?))
     }
 
-    /// Operator-preserving view of the mu block design.
-    pub(crate) fn mu_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(mu_design))
-    }
-
-    /// Operator-preserving view of the log-sigma block design.
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(log_sigma_design))
-    }
-
-    // TODO(block-view-migration): prefer `mu_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let mu_design = self.mu_design.as_ref().ok_or_else(|| {
             "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
@@ -10311,26 +10152,6 @@ impl BinomialLocationScaleFamily {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
 
-    /// Operator-preserving view of the threshold block design.
-    pub(crate) fn threshold_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(threshold_design))
-    }
-
-    /// Operator-preserving view of the log-sigma block design.
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(log_sigma_design))
-    }
-
-    // TODO(block-view-migration): prefer `threshold_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
@@ -12464,26 +12285,6 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(d4.dot(&beta_link_wiggle))
     }
 
-    /// Operator-preserving view of the threshold block design.
-    pub(crate) fn threshold_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let td = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleWiggleFamily exact path is missing threshold design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(td))
-    }
-
-    /// Operator-preserving view of the log-sigma block design.
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let lsd = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(lsd))
-    }
-
-    // TODO(block-view-migration): prefer `threshold_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let td = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleWiggleFamily exact path is missing threshold design".to_string()
