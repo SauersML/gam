@@ -7797,11 +7797,170 @@ impl SparseCholeskyOperator {
         Ok(solved)
     }
 
+    fn fill_scaled_block_columns(
+        block: &Array2<f64>,
+        scale: f64,
+        block_start: usize,
+        local_col_start: usize,
+        cols: usize,
+        mut rhs_block: ndarray::ArrayViewMut2<'_, f64>,
+    ) {
+        let block_end = block_start + block.nrows();
+        let source = block.slice(ndarray::s![.., local_col_start..local_col_start + cols]);
+        let target = rhs_block.slice_mut(ndarray::s![block_start..block_end, ..cols]);
+        Zip::from(target)
+            .and(source)
+            .for_each(|dst, &value| *dst = scale * value);
+    }
+
+    fn trace_hinv_block_local_exact(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        if scale == 0.0 {
+            return 0.0;
+        }
+        debug_assert_eq!(block.nrows(), end - start);
+        let block_size = end - start;
+        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
+        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut trace = 0.0;
+        let mut local_col_start = 0usize;
+
+        while local_col_start < block_size {
+            let cols = (block_size - local_col_start).min(chunk);
+            Self::fill_scaled_block_columns(
+                block,
+                scale,
+                start,
+                local_col_start,
+                cols,
+                rhs_block.view_mut(),
+            );
+            let diagonal_sum = if cols == chunk {
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
+                    &self.factor,
+                    &rhs_block,
+                    start + local_col_start,
+                )
+            } else {
+                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
+                    &self.factor,
+                    &rhs_view,
+                    start + local_col_start,
+                )
+            };
+            match diagonal_sum {
+                Ok(value) => trace += value,
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::trace_hinv_block_local_exact multi-solve failed: {e}"
+                    );
+                    return f64::NAN;
+                }
+            }
+            local_col_start += cols;
+        }
+
+        trace
+    }
+
+    fn solve_block_local_rows_exact(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> Result<Array2<f64>, String> {
+        debug_assert_eq!(block.nrows(), end - start);
+        let block_size = end - start;
+        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
+        let mut solved = Array2::<f64>::zeros((block_size, block_size));
+        if scale == 0.0 {
+            return Ok(solved);
+        }
+        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut local_col_start = 0usize;
+
+        while local_col_start < block_size {
+            let cols = (block_size - local_col_start).min(chunk);
+            Self::fill_scaled_block_columns(
+                block,
+                scale,
+                start,
+                local_col_start,
+                cols,
+                rhs_block.view_mut(),
+            );
+            let solved_block = if cols == chunk {
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_rows(
+                    &self.factor,
+                    &rhs_block,
+                    start,
+                    end,
+                )
+            } else {
+                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
+                crate::linalg::sparse_exact::solve_sparse_spdmulti_rows(
+                    &self.factor,
+                    &rhs_view,
+                    start,
+                    end,
+                )
+            }
+            .map_err(|e| {
+                format!(
+                    "SparseCholeskyOperator::solve_block_local_rows_exact multi-solve failed: {e}"
+                )
+            })?;
+            solved
+                .slice_mut(ndarray::s![.., local_col_start..local_col_start + cols])
+                .assign(&solved_block);
+            local_col_start += cols;
+        }
+
+        Ok(solved)
+    }
+
+    fn trace_hinv_block_local_cross_exact(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        let solved = match self.solve_block_local_rows_exact(block, scale, start, end) {
+            Ok(solved) => solved,
+            Err(e) => {
+                log::warn!(
+                    "SparseCholeskyOperator::trace_hinv_block_local_cross_exact failed: {e}"
+                );
+                return f64::NAN;
+            }
+        };
+        trace_matrix_product(&solved, &solved)
+    }
+
     fn trace_hinv_matrix_operator_cross_exact(
         &self,
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
+        if let Some((_, range_start, range_end)) = op.block_local_data()
+            && range_end - range_start < self.n_dim
+        {
+            return self.trace_hinv_matrix_block_operator_cross_exact(
+                matrix,
+                op,
+                range_start,
+                range_end,
+            );
+        }
+
         let solved_matrix = self.solve_multi(matrix);
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
@@ -7838,6 +7997,73 @@ impl SparseCholeskyOperator {
                 let matrix_row = start + local_col;
                 for row in 0..self.n_dim {
                     trace += solved_matrix[[matrix_row, row]] * solved_op[[row, local_col]];
+                }
+            }
+            start = end;
+        }
+
+        trace
+    }
+
+    fn trace_hinv_matrix_block_operator_cross_exact(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+        range_start: usize,
+        range_end: usize,
+    ) -> f64 {
+        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
+        let mut op_rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut eye_rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut trace = 0.0_f64;
+        let mut start = range_start;
+
+        while start < range_end {
+            let end = (start + chunk).min(range_end);
+            let cols = end - start;
+            op.mul_basis_columns_into(start, op_rhs_block.slice_mut(ndarray::s![.., ..cols]));
+
+            eye_rhs_block.fill(0.0);
+            for local_col in 0..cols {
+                eye_rhs_block[[start + local_col, local_col]] = 1.0;
+            }
+
+            let solved_op = if cols == chunk {
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &op_rhs_block)
+            } else {
+                let rhs_view = op_rhs_block.slice(ndarray::s![.., ..cols]);
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
+            };
+            let solved_op = match solved_op {
+                Ok(sol) => sol,
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::trace_hinv_matrix_block_operator_cross_exact failed on operator solve: {e}"
+                    );
+                    return f64::NAN;
+                }
+            };
+
+            let solved_eye = if cols == chunk {
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &eye_rhs_block)
+            } else {
+                let rhs_view = eye_rhs_block.slice(ndarray::s![.., ..cols]);
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
+            };
+            let solved_eye = match solved_eye {
+                Ok(sol) => sol,
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::trace_hinv_matrix_block_operator_cross_exact failed on identity solve: {e}"
+                    );
+                    return f64::NAN;
+                }
+            };
+
+            let selected_rows_t = matrix.t().dot(&solved_eye);
+            for local_col in 0..cols {
+                for row in 0..self.n_dim {
+                    trace += selected_rows_t[[row, local_col]] * solved_op[[row, local_col]];
                 }
             }
             start = end;
@@ -7975,12 +8201,7 @@ impl HessianOperator for SparseCholeskyOperator {
             debug_assert_eq!(block.nrows(), end - start);
             return scale * Self::takahashi_block_trace(taka, block, start);
         }
-        let op = BlockLocalDrift {
-            local: block.mapv(|value| scale * value),
-            start,
-            end,
-        };
-        self.trace_hinv_operator_exact(&op)
+        self.trace_hinv_block_local_exact(block, scale, start, end)
     }
 
     fn trace_hinv_block_local_cross(
@@ -7995,12 +8216,7 @@ impl HessianOperator for SparseCholeskyOperator {
             let za = Self::takahashi_left_multiply_block(taka, block, start);
             return scale * scale * trace_matrix_product(&za, &za);
         }
-        let op = BlockLocalDrift {
-            local: block.mapv(|value| scale * value),
-            start,
-            end,
-        };
-        self.trace_hinv_operator_cross_exact(&op, &op)
+        self.trace_hinv_block_local_cross_exact(block, scale, start, end)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
@@ -10482,6 +10698,48 @@ mod tests {
         assert_relative_eq!(
             sparse.trace_hinv_operator_cross(&op, &op),
             dense.trace_hinv_product_cross(&full, &full),
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+    }
+
+    #[test]
+    fn sparse_matrix_block_operator_cross_without_takahashi_matches_dense_reference() {
+        let h = array![
+            [5.0, 0.2, 0.0, 0.1],
+            [0.2, 4.0, 0.3, 0.0],
+            [0.0, 0.3, 3.0, 0.4],
+            [0.1, 0.0, 0.4, 2.5],
+        ];
+        let h_sparse =
+            crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
+        let factor = std::sync::Arc::new(
+            crate::linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
+        );
+        let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows());
+        let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let matrix = array![
+            [1.0, 0.2, -0.1, 0.3],
+            [0.2, 0.7, 0.4, -0.2],
+            [-0.1, 0.4, 1.2, 0.5],
+            [0.3, -0.2, 0.5, 0.9],
+        ];
+        let local = array![[0.8, 0.15], [0.15, 0.45]];
+        let start = 1;
+        let end = 3;
+        let op = BlockLocalDrift {
+            local: local.clone(),
+            start,
+            end,
+        };
+        let mut full = Array2::<f64>::zeros(h.raw_dim());
+        full.slice_mut(ndarray::s![start..end, start..end])
+            .assign(&local);
+
+        assert_relative_eq!(
+            sparse.trace_hinv_matrix_operator_cross(&matrix, &op),
+            dense.trace_hinv_product_cross(&matrix, &full),
             epsilon = 1e-10,
             max_relative = 1e-10
         );
