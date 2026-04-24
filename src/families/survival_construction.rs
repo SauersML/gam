@@ -2067,7 +2067,7 @@ pub fn build_survival_baseline_offsets(
     Ok((eta_entry, eta_exit, derivative_exit))
 }
 
-/// Compute marginal-slope probit baseline target offsets for all observations.
+/// Compute probit-survival baseline target offsets for all observations.
 /// Returns `(q_entry, q_exit, q_derivative_exit)` where `Phi(-q(t)) = exp(-H0(t))`.
 pub fn build_survival_marginal_slope_baseline_offsets(
     age_entry: &Array1<f64>,
@@ -2076,8 +2076,7 @@ pub fn build_survival_marginal_slope_baseline_offsets(
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
     if age_entry.len() != age_exit.len() {
         return Err(
-            "survival marginal-slope baseline offsets require matching entry/exit lengths"
-                .to_string(),
+            "survival probit baseline offsets require matching entry/exit lengths".to_string(),
         );
     }
     let n = age_entry.len();
@@ -2088,7 +2087,7 @@ pub fn build_survival_marginal_slope_baseline_offsets(
         let (e0, _) = evaluate_survival_marginal_slope_baseline(age_entry[i], cfg)?;
         let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
         if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
-            return Err("non-finite survival marginal-slope baseline offsets computed".to_string());
+            return Err("non-finite survival probit baseline offsets computed".to_string());
         }
         eta_entry[i] = e0;
         eta_exit[i] = e1;

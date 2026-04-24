@@ -10,7 +10,8 @@ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
 };
-use rayon::prelude::*;
+use rayon::iter::IndexedParallelIterator;
+use rayon::slice::ParallelSliceMut;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -537,12 +538,20 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     }
 
     /// Fill a dense row chunk without materializing the full matrix.
-    /// Required: every implementor must provide row-local access here.
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        out: ArrayViewMut2<'_, f64>,
-    ) -> Result<(), MatrixMaterializationError>;
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        let chunk = self.row_chunk(rows);
+        if out.raw_dim() != chunk.raw_dim() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "DenseDesignOperator::row_chunk_into shape mismatch",
+            });
+        }
+        out.assign(&chunk);
+        Ok(())
+    }
 
     /// Extract a dense row chunk without materializing the full matrix.
     /// Non-panicking owned-chunk API; preferred over the legacy `row_chunk`.
@@ -1254,15 +1263,23 @@ impl DenseDesignOperator for RandomEffectOperator {
         Ok(out)
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        let chunk_rows = rows.end - rows.start;
-        let mut out = Array2::<f64>::zeros((chunk_rows, self.num_groups));
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.num_groups {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "RandomEffectOperator::row_chunk_into shape mismatch",
+            });
+        }
+        out.fill(0.0);
         for (local, global) in rows.enumerate() {
             if let Some(g) = self.group_ids[global] {
                 out[[local, g]] = 1.0;
             }
         }
-        out
+        Ok(())
     }
 
     /// Materialize the full n × q one-hot matrix (fallback for diagnostics).
@@ -1832,16 +1849,23 @@ impl DenseDesignOperator for BlockDesignOperator {
         Ok(out)
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        let chunk_rows = rows.end - rows.start;
-        let mut out = Array2::<f64>::zeros((chunk_rows, self.total_cols));
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.total_cols {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "BlockDesignOperator::row_chunk_into shape mismatch",
+            });
+        }
         for (idx, block) in self.blocks.iter().enumerate() {
             let cs = self.col_offsets[idx];
             let ce = self.col_offsets[idx + 1];
             let block_chunk = block.row_chunk(rows.clone());
             out.slice_mut(s![.., cs..ce]).assign(&block_chunk);
         }
-        out
+        Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -1959,9 +1983,19 @@ unsafe impl Send for ReparamDesignOperator {}
 unsafe impl Sync for ReparamDesignOperator {}
 
 impl DenseDesignOperator for ReparamDesignOperator {
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        let inner_chunk = self.inner.row_chunk(rows);
-        fast_ab(&inner_chunk, &self.q)
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.p_new {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "ReparamDesignOperator::row_chunk_into shape mismatch",
+            });
+        }
+        let inner_chunk = self.inner.try_row_chunk(rows)?;
+        out.assign(&fast_ab(&inner_chunk, &self.q));
+        Ok(())
     }
 
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
@@ -2139,10 +2173,17 @@ impl DenseDesignOperator for MultiChannelOperator {
         out
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.p {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "MultiChannelOperator::row_chunk_into shape mismatch",
+            });
+        }
         let n = self.n_per_channel;
-        let chunk_rows = rows.end - rows.start;
-        let mut out = Array2::<f64>::zeros((chunk_rows, self.p));
         let mut local = 0usize;
         let mut global = rows.start;
         while global < rows.end {
@@ -2156,7 +2197,7 @@ impl DenseDesignOperator for MultiChannelOperator {
             local += segment_len;
             global += segment_len;
         }
-        out
+        Ok(())
     }
 }
 
@@ -2592,15 +2633,23 @@ impl DenseDesignOperator for TensorProductDesignOperator {
         Ok(out)
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((rows.end - rows.start, self.total_cols));
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.total_cols {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "TensorProductDesignOperator::row_chunk_into shape mismatch",
+            });
+        }
         for (local_row, global_row) in rows.enumerate() {
             let row_values = self.row_values(global_row);
             for (j, &value) in row_values.iter().enumerate() {
                 out[[local_row, j]] = value;
             }
         }
-        out
+        Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -2830,8 +2879,18 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
 }
 
 impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOperator<K> {
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        self.row_chunk_combined(rows)
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.total_cols {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "ChunkedKernelDesignOperator::row_chunk_into shape mismatch",
+            });
+        }
+        out.assign(&self.row_chunk_combined(rows));
+        Ok(())
     }
     fn to_dense(&self) -> Array2<f64> {
         self.row_chunk_combined(0..self.n)
@@ -2900,9 +2959,19 @@ impl DenseDesignOperator for CoefficientTransformOperator {
         let x = self.inner.to_dense();
         fast_ab(&x, &self.transform)
     }
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.p_out {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "CoefficientTransformOperator::row_chunk_into shape mismatch",
+            });
+        }
         let chunk = self.inner.row_chunk(rows);
-        fast_ab(&chunk, &self.transform)
+        out.assign(&fast_ab(&chunk, &self.transform));
+        Ok(())
     }
 }
 
@@ -3096,13 +3165,22 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
         Ok(out)
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
         let p_cov = self.p_cov;
         let p_time = self.p_time;
         let chunk_rows = rows.end - rows.start;
+        if out.nrows() != chunk_rows || out.ncols() != p_cov * p_time {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "RowwiseKroneckerOperator::row_chunk_into shape mismatch",
+            });
+        }
+        out.fill(0.0);
         let cov_chunk = self.cov.row_chunk(rows.clone());
         let time = self.time_basis.as_ref();
-        let mut out = Array2::<f64>::zeros((chunk_rows, p_cov * p_time));
         for local in 0..chunk_rows {
             let global = rows.start + local;
             for j in 0..p_cov {
@@ -3115,7 +3193,7 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
                 }
             }
         }
-        out
+        Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -3302,12 +3380,22 @@ impl DenseDesignOperator for ConditionedDesign {
         Ok(result)
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "ConditionedDesign::row_chunk_into shape mismatch",
+            });
+        }
         let mut chunk = self.inner.row_chunk(rows);
         for &(j, mean, scale) in &self.columns {
             chunk.column_mut(j).mapv_inplace(|v| (v - mean) / scale);
         }
-        chunk
+        out.assign(&chunk);
+        Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -4430,8 +4518,18 @@ impl DenseDesignOperator for DesignMatrix {
         }
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        DesignMatrix::row_chunk(self, rows)
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "DesignMatrix::row_chunk_into shape mismatch",
+            });
+        }
+        out.assign(&DesignMatrix::row_chunk(self, rows));
+        Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -6001,9 +6099,9 @@ mod tests {
     fn chunked_kernel_operator_uses_center_rows_for_column_count() {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
-        let kernel = Arc::new(|x: &[f64], c: &[f64]| {
+        let kernel = |x: &[f64], c: &[f64]| {
             x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>()
-        });
+        };
         let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
             .expect("chunked kernel operator");
 
@@ -6035,14 +6133,14 @@ mod tests {
     fn chunked_kernel_operator_rejects_incompatible_optional_shapes() {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
-        let kernel = Arc::new(|_: &[f64], _: &[f64]| 0.0);
+        let kernel = |_: &[f64], _: &[f64]| 0.0;
         let bad_constraint = Arc::new(Array2::<f64>::zeros((2, 1)));
         let bad_poly = Arc::new(Array2::<f64>::zeros((3, 1)));
 
         let constraint_err = match ChunkedKernelDesignOperator::new(
             data.clone(),
             centers.clone(),
-            kernel.clone(),
+            kernel,
             Some(bad_constraint),
             None,
         ) {
@@ -6066,9 +6164,9 @@ mod tests {
         assert!(!data.is_standard_layout());
         assert!(!centers.is_standard_layout());
 
-        let kernel = Arc::new(|x: &[f64], c: &[f64]| {
+        let kernel = |x: &[f64], c: &[f64]| {
             x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>()
-        });
+        };
         let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
             .expect("chunked kernel operator");
         let chunk = operator.row_chunk_combined(0..2);
