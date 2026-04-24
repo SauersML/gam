@@ -1595,6 +1595,86 @@ fn gompertz_shape_derivatives(age: f64, shape: f64) -> (f64, f64) {
     }
 }
 
+fn survival_hazard_theta_partials(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<Vec<(f64, f64)>>, String> {
+    if !age.is_finite() || age <= 0.0 {
+        return Err(
+            "survival ages must be finite and positive for baseline hazard partials".to_string(),
+        );
+    }
+
+    match cfg.target {
+        SurvivalBaselineTarget::Linear => Ok(None),
+        SurvivalBaselineTarget::Weibull => {
+            let scale = cfg
+                .scale
+                .ok_or_else(|| "weibull missing scale".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "weibull missing shape".to_string())?;
+            if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
+                return Err("weibull baseline requires finite positive scale and shape".to_string());
+            }
+            let log_time_ratio = age.ln() - scale.ln();
+            let cumulative_hazard = (age / scale).powf(shape);
+            let instant_hazard = shape * cumulative_hazard / age;
+            let eta = shape * log_time_ratio;
+            Ok(Some(vec![
+                (-shape * cumulative_hazard, -shape * instant_hazard),
+                (eta * cumulative_hazard, (1.0 + eta) * instant_hazard),
+            ]))
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            let rate = cfg
+                .rate
+                .ok_or_else(|| "gompertz missing rate".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "gompertz missing shape".to_string())?;
+            if !(rate.is_finite() && shape.is_finite() && rate > 0.0) {
+                return Err(
+                    "gompertz baseline requires finite positive rate and finite shape".to_string(),
+                );
+            }
+            let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
+            let (d_cum_dshape, d_inst_dshape) =
+                gompertz_cumulative_shape_derivative(age, rate, shape);
+            Ok(Some(vec![
+                (cumulative_hazard, instant_hazard),
+                (d_cum_dshape, d_inst_dshape),
+            ]))
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            let rate = cfg.rate.ok_or_else(|| "gm missing rate".to_string())?;
+            let shape = cfg.shape.ok_or_else(|| "gm missing shape".to_string())?;
+            let makeham = cfg
+                .makeham
+                .ok_or_else(|| "gm missing makeham".to_string())?;
+            if !(rate.is_finite()
+                && shape.is_finite()
+                && makeham.is_finite()
+                && rate > 0.0
+                && makeham > 0.0)
+            {
+                return Err(
+                    "gompertz-makeham baseline requires finite positive rate, makeham, and finite shape"
+                        .to_string(),
+                );
+            }
+            let (cum_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
+            let (d_cum_dshape, d_inst_dshape) =
+                gompertz_cumulative_shape_derivative(age, rate, shape);
+            Ok(Some(vec![
+                (cum_gompertz, inst_gompertz),
+                (d_cum_dshape, d_inst_dshape),
+                (makeham * age, makeham),
+            ]))
+        }
+    }
+}
+
 fn survival_cumulative_and_instant_hazard(
     age: f64,
     cfg: &SurvivalBaselineConfig,
@@ -1733,6 +1813,76 @@ pub fn evaluate_survival_marginal_slope_baseline(
         ));
     }
     Ok((q, instant_hazard * survival / phi_q))
+}
+
+/// Partial derivatives of the true survival marginal-slope probit offsets
+/// `(q(t), dq(t)/dt)` with respect to the baseline θ-parameters.
+///
+/// The returned channels match `survival_baseline_theta_from_config`.  For
+/// Gompertz-Makeham, θ is `(log_rate, shape, log_makeham)`.  If
+/// `S(t)=exp(-H(t))`, `q(t)=-Phi^-1(S(t))`, `A(t)=S(t)/phi(q(t))`, and
+/// `h(t)=dH/dt`, then
+///
+///   dq/dθ      = A * dH/dθ
+///   d(q')/dθ   = A * (dh/dθ + h * (q*A - 1) * dH/dθ)
+///
+/// which keeps the probit transform and the hazard baseline analytically tied.
+pub fn marginal_slope_baseline_offset_theta_partials(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<Vec<(f64, f64)>>, String> {
+    let Some((cumulative_hazard, instant_hazard)) =
+        survival_cumulative_and_instant_hazard(age, cfg)?
+    else {
+        return Ok(None);
+    };
+    if !(cumulative_hazard.is_finite() && cumulative_hazard > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive cumulative hazard",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    if !(instant_hazard.is_finite() && instant_hazard > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive instant hazard",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let survival = (-cumulative_hazard).exp();
+    if !(survival.is_finite() && survival > 0.0 && survival < 1.0) {
+        return Err(format!(
+            "{} marginal-slope baseline survival must be strictly inside (0,1), got {survival}",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let q = -standard_normal_quantile(survival).map_err(|e| {
+        format!(
+            "{} marginal-slope baseline failed to invert survival probability {survival}: {e}",
+            survival_baseline_targetname(cfg.target)
+        )
+    })?;
+    let phi_q = normal_pdf(q);
+    if !(phi_q.is_finite() && phi_q > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive probit density phi(q)={phi_q} at q={q}",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let hazard_partials = survival_hazard_theta_partials(age, cfg)?
+        .ok_or_else(|| "unexpected missing hazard partials for nonlinear baseline".to_string())?;
+    let a = survival / phi_q;
+    let a_log_derivative_factor = q * a - 1.0;
+    Ok(Some(
+        hazard_partials
+            .into_iter()
+            .map(|(d_h_cum, d_h_inst)| {
+                (
+                    a * d_h_cum,
+                    a * (d_h_inst + instant_hazard * a_log_derivative_factor * d_h_cum),
+                )
+            })
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
