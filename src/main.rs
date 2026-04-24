@@ -10620,6 +10620,7 @@ mod tests {
     };
     use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
     use gam::predict::PredictableModel;
+    use gam::resource::MatrixMaterializationError;
     use gam::probability::normal_cdf;
     use gam::smooth::{
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
@@ -10633,7 +10634,7 @@ mod tests {
         InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
         LogLikelihoodNormalization,
     };
-    use ndarray::{Array1, Array2, array, s};
+    use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand_distr::{Distribution, StandardNormal};
@@ -14242,8 +14243,13 @@ mod tests {
         }
 
         impl DenseDesignOperator for NoDensifyTestOperator {
-            fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-                self.dense.slice(s![rows, ..]).to_owned()
+            fn row_chunk_into(
+                &self,
+                rows: Range<usize>,
+                mut out: ArrayViewMut2<'_, f64>,
+            ) -> Result<(), MatrixMaterializationError> {
+                out.assign(&self.dense.slice(s![rows, ..]));
+                Ok(())
             }
 
             fn to_dense(&self) -> Array2<f64> {

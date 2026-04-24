@@ -15195,8 +15195,6 @@ mod tests {
 
     #[test]
     fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
-        let score_runtime = test_deviation_runtime();
-        let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
         let marginal_beta = array![0.35, -0.1];
         let logslope_beta = array![0.2];
@@ -15216,8 +15214,8 @@ mod tests {
             derivative_offset_exit: Arc::new(array![0.9]),
             marginal_design: DesignMatrix::from(marginal_design.clone()),
             logslope_design: DesignMatrix::from(array![[1.0]]),
-            score_warp: Some(score_runtime.clone()),
-            link_dev: Some(link_runtime.clone()),
+            score_warp: None,
+            link_dev: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
