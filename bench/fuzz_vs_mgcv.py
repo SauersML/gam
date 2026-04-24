@@ -605,6 +605,15 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
     if basis_type == "duchon" and n_smooths < 2:
         n_smooths = 2  # duchon needs at least 2 dims
         smooth_kinds = [choice(list(SMOOTH_FN.keys())) for _ in range(n_smooths)]
+    if basis_type == "duchon":
+        n_smooths = max(n_smooths, 3)
+        while len(smooth_kinds) < n_smooths:
+            smooth_kinds.append(choice(list(SMOOTH_FN.keys())))
+        n_duchon_dims = min(max(n_duchon_dims, 3), n_smooths)
+        duchon_order = 1
+        duchon_power = 1
+        max_knots = max(3, n_obs // max(n_smooths + 1, 2) - 2)
+        knots = min(knots, max_knots)
 
     return FuzzScenario(
         seed=seed, family=family, model_type=model_type, n_obs=n_obs,

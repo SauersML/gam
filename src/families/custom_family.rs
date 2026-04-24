@@ -3362,6 +3362,20 @@ pub struct ExactNewtonJointPsiTerms {
     pub hessian_psi_operator: Option<Arc<dyn HyperOperator>>,
 }
 
+impl std::fmt::Debug for ExactNewtonJointPsiTerms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExactNewtonJointPsiTerms")
+            .field("objective_psi", &self.objective_psi)
+            .field("score_psi", &self.score_psi)
+            .field("hessian_psi", &self.hessian_psi)
+            .field(
+                "hessian_psi_operator",
+                &self.hessian_psi_operator.as_ref().map(|_| "<operator>"),
+            )
+            .finish()
+    }
+}
+
 impl ExactNewtonJointPsiTerms {
     fn zeros(total: usize) -> Self {
         Self {
@@ -3371,85 +3385,6 @@ impl ExactNewtonJointPsiTerms {
             hessian_psi_operator: None,
         }
     }
-}
-
-const EXACT_JOINT_LOG_SIGMA_FD_STEP: f64 = 1e-6;
-
-pub(crate) fn exact_joint_psi_terms_from_log_sigma_fd<
-    F,
-    SetSigma,
-    ObjectiveEval,
-    GradientEval,
-    HessianEval,
->(
-    family: &F,
-    sigma: Option<f64>,
-    block_states: &[ParameterBlockState],
-    specs: &[ParameterBlockSpec],
-    family_label: &str,
-    mut set_sigma: SetSigma,
-    objective_eval: ObjectiveEval,
-    gradient_eval: GradientEval,
-    hessian_eval: HessianEval,
-) -> Result<Option<ExactNewtonJointPsiTerms>, String>
-where
-    F: Clone,
-    SetSigma: FnMut(&mut F, f64),
-    ObjectiveEval: Fn(&F, &[ParameterBlockState]) -> Result<f64, String>,
-    GradientEval: Fn(
-        &F,
-        &[ParameterBlockState],
-        &[ParameterBlockSpec],
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String>,
-    HessianEval: Fn(&F, &[ParameterBlockState]) -> Result<Option<Array2<f64>>, String>,
-{
-    let Some(sigma) = sigma else {
-        return Ok(None);
-    };
-    if !sigma.is_finite() || sigma <= 0.0 {
-        return Ok(None);
-    }
-
-    let log_sigma = sigma.ln();
-    let step = EXACT_JOINT_LOG_SIGMA_FD_STEP;
-    let scale = 1.0 / (2.0 * step);
-
-    let mut plus_family = family.clone();
-    set_sigma(&mut plus_family, (log_sigma + step).exp());
-
-    let mut minus_family = family.clone();
-    set_sigma(&mut minus_family, (log_sigma - step).exp());
-
-    let ll_plus = objective_eval(&plus_family, block_states)?;
-    let ll_minus = objective_eval(&minus_family, block_states)?;
-    let objective_psi = -(ll_plus - ll_minus) * scale;
-
-    let gradient_plus = gradient_eval(&plus_family, block_states, specs)?
-        .ok_or_else(|| {
-            format!("{family_label} sigma derivative requires exact joint gradient (plus step)")
-        })?
-        .gradient;
-    let gradient_minus = gradient_eval(&minus_family, block_states, specs)?
-        .ok_or_else(|| {
-            format!("{family_label} sigma derivative requires exact joint gradient (minus step)")
-        })?
-        .gradient;
-    let score_psi = -(&gradient_plus - &gradient_minus) * scale;
-
-    let hessian_plus = hessian_eval(&plus_family, block_states)?.ok_or_else(|| {
-        format!("{family_label} sigma derivative requires an exact joint Hessian (plus step)")
-    })?;
-    let hessian_minus = hessian_eval(&minus_family, block_states)?.ok_or_else(|| {
-        format!("{family_label} sigma derivative requires an exact joint Hessian (minus step)")
-    })?;
-    let hessian_psi = (&hessian_plus - &hessian_minus) * scale;
-
-    Ok(Some(ExactNewtonJointPsiTerms {
-        objective_psi,
-        score_psi,
-        hessian_psi,
-        hessian_psi_operator: None,
-    }))
 }
 
 pub struct ExactNewtonJointPsiSecondOrderTerms {
