@@ -1,5 +1,5 @@
-use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, rrqr_nullspace_basis};
 use crate::basis::create_ispline_derivative_dense;
+use crate::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, rrqr_nullspace_basis};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
 use crate::quadrature::compute_gauss_hermite_n;
@@ -195,8 +195,7 @@ fn build_quadratic_derivative_bernstein_constraints(
             let c3 = span_c3[[span_idx, basis_idx]];
             rows[[left_row, basis_idx]] = c1;
             rows[[mid_row, basis_idx]] = c1 + c2 * width;
-            rows[[right_row, basis_idx]] =
-                c1 + 2.0 * c2 * width + 3.0 * c3 * width * width;
+            rows[[right_row, basis_idx]] = c1 + 2.0 * c2 * width + 3.0 * c3 * width * width;
         }
     }
     Ok(rows)
@@ -272,18 +271,26 @@ impl DeviationRuntime {
                 .map_err(|e| format!("DeviationRuntime cubic I-spline values failed: {e}"))?;
         let raw_span_c1 =
             create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 1)
-                .map_err(|e| format!("DeviationRuntime cubic I-spline first derivatives failed: {e}"))?;
+                .map_err(|e| {
+                    format!("DeviationRuntime cubic I-spline first derivatives failed: {e}")
+                })?;
         let raw_span_c2 =
             create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 2)
-                .map_err(|e| format!("DeviationRuntime cubic I-spline second derivatives failed: {e}"))?
+                .map_err(|e| {
+                    format!("DeviationRuntime cubic I-spline second derivatives failed: {e}")
+                })?
                 .mapv(|value| 0.5 * value);
         let raw_span_c3 =
             create_ispline_derivative_dense(span_midpoints.view(), &knots, internal_degree, 3)
-                .map_err(|e| format!("DeviationRuntime cubic I-spline third derivatives failed: {e}"))?
+                .map_err(|e| {
+                    format!("DeviationRuntime cubic I-spline third derivatives failed: {e}")
+                })?
                 .mapv(|value| value / 6.0);
         let raw_right_boundary_values =
             create_ispline_derivative_dense(right_endpoint.view(), &knots, internal_degree, 0)
-                .map_err(|e| format!("DeviationRuntime cubic I-spline right boundary failed: {e}"))?;
+                .map_err(|e| {
+                    format!("DeviationRuntime cubic I-spline right boundary failed: {e}")
+                })?;
         let raw_right_boundary_value_row = raw_right_boundary_values.row(0).to_owned();
 
         let coefficient_transform = anchor_coefficient_nullspace(
@@ -457,6 +464,15 @@ impl DeviationRuntime {
         &self,
         derivative_order: usize,
     ) -> Result<Array2<f64>, String> {
+        Ok(self
+            .integrated_derivative_penalty_with_nullity(derivative_order)?
+            .0)
+    }
+
+    pub(crate) fn integrated_derivative_penalty_with_nullity(
+        &self,
+        derivative_order: usize,
+    ) -> Result<(Array2<f64>, usize), String> {
         if derivative_order > self.value_span_degree {
             return Err(format!(
                 "deviation penalty derivative order {derivative_order} exceeds value-basis degree {}",
@@ -489,7 +505,17 @@ impl DeviationRuntime {
                 }
             }
         }
-        Ok(penalty)
+        let (evals, _) = penalty
+            .eigh(faer::Side::Lower)
+            .map_err(|e| format!("deviation integrated penalty eigendecomposition failed: {e}"))?;
+        let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
+            evals
+                .as_slice()
+                .ok_or_else(|| "deviation penalty eigenvalues are not contiguous".to_string())?,
+        );
+        let rank = evals.iter().filter(|&&value| value > threshold).count();
+        let nullity = self.basis_dim.saturating_sub(rank);
+        Ok((penalty, nullity))
     }
 
     pub(crate) fn structural_monotonicity_constraints(&self) -> LinearInequalityConstraints {

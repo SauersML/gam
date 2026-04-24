@@ -13,7 +13,7 @@ overridden at construction time:
   centers, order ``1``, power ``1``.
 * Per-axis anisotropic scaling (``scale_dimensions="auto"``).
 * A transformation-normal likelihood so the fitted response is interpretable
-  as a standard normal z-score for each row.
+  as a conditional standard normal z-score for each row.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class PgsCalibration:
         to ``"auto"``.
     out_column:
         Name of the calibrated column appended by :meth:`transform`. Defaults
-        to ``"PGS_cal"``.
+        to ``"pgs_ctn_z"``.
     extra_fit_kwargs:
         Additional kwargs forwarded verbatim to :func:`gam.fit` (e.g.
         ``{"firth": True}``).
@@ -74,7 +74,7 @@ class PgsCalibration:
     duchon_order: int = 1
     duchon_power: int = 1
     scale_dimensions: str | None = "auto"
-    out_column: str = "PGS_cal"
+    out_column: str = "pgs_ctn_z"
     extra_fit_kwargs: dict[str, Any] = field(default_factory=dict)
 
     _model: Model | None = field(default=None, init=False, repr=False)
