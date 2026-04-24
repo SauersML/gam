@@ -2670,13 +2670,6 @@ pub(crate) fn wrap_spatial_implicit_psi_operator(
     )
 }
 
-const CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD: usize = 1_000_000_000; // 1 GB
-
-fn should_resolve_custom_family_psi_dense(total_rows: usize, p: usize) -> bool {
-    total_rows.saturating_mul(p).saturating_mul(8)
-        <= CUSTOM_FAMILY_PSI_DENSE_MATERIALIZATION_THRESHOLD
-}
-
 pub(crate) fn build_block_spatial_psi_derivatives(
     data: ndarray::ArrayView2<'_, f64>,
     resolvedspec: &TermCollectionSpec,
@@ -3192,6 +3185,7 @@ pub(crate) enum PsiDesignMap {
     },
 }
 
+#[allow(dead_code)]
 impl PsiDesignMap {
     pub(crate) fn nrows(&self) -> usize {
         match self {

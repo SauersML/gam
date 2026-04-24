@@ -106,26 +106,6 @@ pub struct TransformationWarmStart {
     pub scale: Array1<f64>,
 }
 
-/// Factored map placeholder for the second-derivative tensor psi materialization
-/// path. Stays zero/factored or dense-diagnostic only; real PsiDesignMap plumbing
-/// lands with the sibling agent's covariate-side refactor.
-// TODO(tensor-psi-map-migration): wire PsiDesignMap for covariate once sibling
-// agent lands; currently the covariate factor is held as an owned Array2 so
-// the type compiles standalone.
-pub(crate) enum TensorPsiKronMap {
-    Zero {
-        nrows: usize,
-        ncols: usize,
-    },
-    Factored {
-        response: Arc<Array2<f64>>,
-        covariate: Arc<Array2<f64>>,
-    },
-    DenseDiagnostic {
-        matrix: Arc<Array2<f64>>,
-    },
-}
-
 // ---------------------------------------------------------------------------
 // The family
 // ---------------------------------------------------------------------------
@@ -655,7 +635,11 @@ impl CustomFamily for TransformationNormalFamily {
         let (h, h_prime) = self.compute_h_and_h_prime(beta);
         let n = h.len();
 
-        // Check monotonicity (soft: warn but don't fail; constraints should enforce).
+        // Hard monotonicity gate: ℓ = -½h² + log h' is only defined for h' > 0,
+        // and the barrier line search in `log_likelihood_only` retreats via
+        // NEG_INFINITY before a step that would push any h' to zero. Reaching
+        // this branch in `evaluate` means the constraint solver handed us an
+        // invalid iterate, so fail loudly instead of silently producing NaNs.
         let min_h_prime = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
         if min_h_prime <= 0.0 {
             return Err(format!(
@@ -2542,26 +2526,6 @@ impl TensorKroneckerPsiOperator {
         self.lifted_transpose_second(&self.response_deriv_basis, axis_d, axis_e, v)
     }
 
-    fn materialize_first_deriv(
-        &self,
-        axis: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self.materialize_lifted(
-            &self.response_deriv_basis,
-            &self.materialize_cov_first(axis)?,
-        ))
-    }
-
-    fn materialize_second_deriv(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self.materialize_lifted(
-            &self.response_deriv_basis,
-            &self.materialize_cov_second(axis_d, axis_e)?,
-        ))
-    }
 }
 
 #[cfg(test)]
