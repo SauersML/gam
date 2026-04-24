@@ -194,15 +194,14 @@ impl<'a> RemlState<'a> {
         let t2_term = 0.125 * x_m.dot(y);
 
         let mut t1_sum = 0.0_f64;
+        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
         for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
             let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block = z.slice(s![.., j0..j1]);
             let c_j = c_array.slice(s![j0..j1]);
             for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                let x_block = x_dense.slice(s![i0..i1, ..]);
                 let c_i = c_array.slice(s![i0..i1]);
-                let gram = x_block.dot(&z_block);
+                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, &mut gram);
                 let mut block_sum = 0.0_f64;
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
@@ -229,6 +228,25 @@ impl<'a> RemlState<'a> {
             )));
         }
         Ok(value)
+    }
+
+    fn tk_fill_gram_block(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        i0: usize,
+        i1: usize,
+        j0: usize,
+        j1: usize,
+        gram: &mut Array2<f64>,
+    ) {
+        let rows = i1 - i0;
+        let cols = j1 - j0;
+        debug_assert!(rows <= gram.nrows());
+        debug_assert!(cols <= gram.ncols());
+        let x_block = x_dense.slice(s![i0..i1, ..]);
+        let z_block = z.slice(s![.., j0..j1]);
+        let mut target = gram.slice_mut(s![..rows, ..cols]);
+        ndarray::linalg::general_mat_mul(1.0, &x_block, &z_block, 0.0, &mut target);
     }
 
     fn tk_gradient_from_shared(
@@ -285,13 +303,14 @@ impl<'a> RemlState<'a> {
             }
         }
 
+        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
         for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
             let j1 = (j0 + TK_BLOCK_SIZE).min(n);
             let c_j = c_array.slice(s![j0..j1]);
             for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
                 let c_i = c_array.slice(s![i0..i1]);
-                let gram = Self::tk_gram_block(x_dense, z, i0, i1, j0, j1);
+                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, &mut gram);
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
                     if ci == 0.0 {
