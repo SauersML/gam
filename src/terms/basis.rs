@@ -9422,7 +9422,10 @@ fn build_matern_operator_penalty_candidates(
         aniso_log_scales,
     )?;
     Ok(operator_penalty_candidates_from_collocation(
-        &ops.d0, &ops.d1, &ops.d2,
+        &ops.d0,
+        &ops.d1,
+        &ops.d2,
+        &DuchonOperatorPenaltySpec::default(),
     ))
 }
 
