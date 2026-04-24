@@ -1607,7 +1607,7 @@ impl Default for MaternIdentifiability {
 /// Duchon null-space polynomial degree.
 /// `0` keeps the constant null space (`m=1`), `1` keeps
 /// `[1, x_1, ..., x_d]` (`m=2`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DuchonNullspaceOrder {
     Zero,
     Linear,
@@ -7507,13 +7507,26 @@ fn duchon_effective_nullspace_order(
     }
     let required = polynomial_block_from_order(centers, order).ncols();
     if centers.nrows() < required {
-        log::warn!(
-            "Duchon nullspace order={:?} needs >={} centers in dim={}; got {} — degrading to Zero",
-            order,
-            required,
-            centers.ncols(),
-            centers.nrows()
-        );
+        // Dedup: warn only once per (rows, cols, requested_order) per process.
+        // BFGS × P-IRLS × derivative callsites hit this path many times.
+        static SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(usize, usize, DuchonNullspaceOrder)>>,
+        > = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let key = (centers.nrows(), centers.ncols(), order);
+        let fresh = seen
+            .lock()
+            .map(|mut s| s.insert(key))
+            .unwrap_or(true);
+        if fresh {
+            log::warn!(
+                "Duchon nullspace order={:?} needs >={} centers in dim={}; got {} — degrading to Zero",
+                order,
+                required,
+                centers.ncols(),
+                centers.nrows()
+            );
+        }
         return DuchonNullspaceOrder::Zero;
     }
     order
@@ -8896,7 +8909,13 @@ fn matern_identifiability_transform(
             Ok(Some(kernel_constraint_nullspace_from_matrix(q.view())?))
         }
         MaternIdentifiability::CenterLinearOrthogonal => {
-            let q = polynomial_block_from_order(centers, DuchonNullspaceOrder::Linear);
+            // Mirror the Duchon path: auto-degrade to Zero (constant-only) when
+            // there aren't enough centers to affinely span [1, x_1, ..., x_d].
+            // kernel_constraint_nullspace_from_matrix would otherwise hard-error
+            // via rrqr_nullspace_basis when centers.nrows() < d + 1.
+            let effective_order =
+                duchon_effective_nullspace_order(centers, DuchonNullspaceOrder::Linear);
+            let q = polynomial_block_from_order(centers, effective_order);
             Ok(Some(kernel_constraint_nullspace_from_matrix(q.view())?))
         }
         MaternIdentifiability::FrozenTransform { transform } => {
