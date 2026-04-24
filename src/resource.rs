@@ -62,11 +62,11 @@ impl ResourcePolicy {
     /// Conservative default suitable for general-purpose use.
     pub fn default_library() -> Self {
         Self {
-            max_single_materialization_bytes: 256 * 1024 * 1024, // 256 MB
-            max_operator_cache_bytes: 1024 * 1024 * 1024,        // 1 GB
+            max_single_materialization_bytes: 256 * 1024 * 1024, // 256 MiB
+            max_operator_cache_bytes: 1024 * 1024 * 1024,        // 1 GiB
             max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
-            max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MB
-            row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MB per chunk
+            max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MiB
+            row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MiB per chunk
             derivative_storage_mode: DerivativeStorageMode::AnalyticOperatorRequired,
         }
     }
@@ -74,7 +74,7 @@ impl ResourcePolicy {
     /// Permissive mode for small-data usage and tests.
     pub fn permissive_small_data() -> Self {
         Self {
-            max_single_materialization_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
+            max_single_materialization_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
             max_operator_cache_bytes: 2 * 1024 * 1024 * 1024,
             max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
             max_owned_data_cache_bytes: 512 * 1024 * 1024,
