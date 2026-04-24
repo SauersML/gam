@@ -1301,6 +1301,9 @@ struct DuchonBasisDesign {
     num_kernel_basis: usize,
     num_polynomial_basis: usize,
     dimension: usize,
+    /// Effective null-space order actually used to build the basis. May
+    /// differ from the requested order when auto-degraded to `Zero` because
+    /// the center count could not span the requested polynomial block.
     nullspace_order: DuchonNullspaceOrder,
 }
 
@@ -7486,6 +7489,34 @@ fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
     }
 }
 
+/// Returns the effective Duchon null-space order, auto-degrading to `Zero`
+/// when the requested order cannot be spanned by the supplied centers.
+///
+/// When `order=Linear` and `centers.nrows() < d + 1`, the polynomial block
+/// `[1, x_1, ..., x_d]` cannot be affinely spanned; rather than hard-erroring
+/// the caller falls back to `order=Zero` (constant null space) and logs a
+/// single warning so the user sees the degradation.
+fn duchon_effective_nullspace_order(
+    centers: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> DuchonNullspaceOrder {
+    if order == DuchonNullspaceOrder::Zero {
+        return order;
+    }
+    let required = polynomial_block_from_order(centers, order).ncols();
+    if centers.nrows() < required {
+        log::warn!(
+            "Duchon nullspace order={:?} needs >={} centers in dim={}; got {} — degrading to Zero",
+            order,
+            required,
+            centers.ncols(),
+            centers.nrows()
+        );
+        return DuchonNullspaceOrder::Zero;
+    }
+    order
+}
+
 #[inline(always)]
 fn binomial_f64(n: usize, k: usize) -> f64 {
     if k > n {
@@ -8753,28 +8784,34 @@ fn kernel_constraint_nullspace(
     order: DuchonNullspaceOrder,
     cache: &mut BasisCacheContext,
 ) -> Result<Array2<f64>, BasisError> {
+    let effective_order = duchon_effective_nullspace_order(centers, order);
+    let degraded = effective_order != order;
     let key = ConstraintNullspaceCacheKey {
         centersrows: centers.nrows(),
         centers_cols: centers.ncols(),
         centers_hash: hash_arrayview2(centers),
-        order_code: constraint_nullspace_order_code(order),
+        order_code: constraint_nullspace_order_code(effective_order),
     };
 
     if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
         return Ok((**hit).clone());
     }
 
-    let p_k = polynomial_block_from_order(centers, order);
-    if centers.nrows() < p_k.ncols() {
-        return Err(BasisError::InvalidInput(format!(
-            "Duchon basis requires at least {} centers to span the order={:?} null space in dimension {}; got {}",
-            p_k.ncols(),
-            order,
-            centers.ncols(),
-            centers.nrows()
-        )));
-    }
-    let z = Arc::new(kernel_constraint_nullspace_from_matrix(p_k.view())?);
+    let p_k = polynomial_block_from_order(centers, effective_order);
+    let z = Arc::new(kernel_constraint_nullspace_from_matrix(p_k.view()).map_err(|err| {
+        if degraded {
+            BasisError::InvalidInput(format!(
+                "Duchon degraded from order={:?} to order={:?} due to insufficient centers ({} in dim={}); order={:?} construction then failed: {err}",
+                order,
+                effective_order,
+                centers.nrows(),
+                centers.ncols(),
+                effective_order,
+            ))
+        } else {
+            err
+        }
+    })?);
 
     if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
         return Ok((**hit).clone());
@@ -12083,6 +12120,10 @@ pub fn create_duchon_spline_basiswithworkspace(
         None, // create_duchon_spline_basis does not support anisotropy
         workspace,
     )?;
+    // Pick up the effective order from the design (which may have been
+    // auto-degraded to Zero when centers were insufficient) so the penalty
+    // Gram matrix is built with the same nullspace as the design.
+    let nullspace_order = design.nullspace_order;
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
     let d = centers.ncols();
@@ -12170,6 +12211,9 @@ fn build_duchon_basis_designwithworkspace(
             "Duchon basis requires finite data and center values".to_string(),
         ));
     }
+    // Auto-degrade the null-space order to Zero when centers are insufficient
+    // to span the requested polynomial block; emits a warning inside the helper.
+    let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
     validate_duchon_kernel_orders(length_scale, p_order, s_order, d)?;
@@ -12331,14 +12375,21 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    // Auto-degrade the requested null-space order to Zero when the selected
+    // centers cannot span the requested polynomial block. Every downstream
+    // consumer of `spec.nullspace_order` in this function MUST use the
+    // effective order, otherwise the penalty/nullspace is built with a
+    // different order than the basis.
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     validate_duchon_collocation_orders(spec.length_scale, p_order, spec.power, data.ncols())?;
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
     let kernel_transform =
-        kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
-    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+        kernel_constraint_nullspace(centers.view(), effective_nullspace_order, &mut workspace.cache)?;
+    let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let base_cols = kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
@@ -12352,7 +12403,7 @@ pub fn build_duchon_basiswithworkspace(
         );
         let d = data.ncols();
         let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
-        let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+        let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
         let s_order = spec.power;
         let length_scale = spec.length_scale;
         let coeffs = length_scale
@@ -12405,7 +12456,7 @@ pub fn build_duchon_basiswithworkspace(
                 }
             })
         };
-        let poly_block = polynomial_block_from_order(data, spec.nullspace_order);
+        let poly_block = polynomial_block_from_order(data, effective_nullspace_order);
         let base_op = ChunkedKernelDesignOperator::new(
             shared_data,
             Arc::new(centers.clone()),
@@ -12434,7 +12485,7 @@ pub fn build_duchon_basiswithworkspace(
             centers.view(),
             spec.length_scale,
             spec.power,
-            spec.nullspace_order,
+            effective_nullspace_order,
             aniso.as_deref(),
             workspace,
         )?;
@@ -12457,7 +12508,7 @@ pub fn build_duchon_basiswithworkspace(
         None,
         spec.length_scale,
         spec.power,
-        spec.nullspace_order,
+        effective_nullspace_order,
         aniso.as_deref(),
         identifiability_transform.as_ref().map(|z| z.view()),
         workspace,
@@ -12473,7 +12524,7 @@ pub fn build_duchon_basiswithworkspace(
             centers,
             length_scale: spec.length_scale,
             power: spec.power,
-            nullspace_order: spec.nullspace_order,
+            nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
