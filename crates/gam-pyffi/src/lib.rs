@@ -686,15 +686,15 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::BernoulliMarginalSlope(_) => (
             "Bernoulli marginal-slope",
             "bernoulli marginal-slope",
-            false,
+            true,
         ),
         FitRequest::SurvivalMarginalSlope(_) => {
-            ("Survival marginal-slope", "survival marginal-slope", false)
+            ("Survival marginal-slope", "survival marginal-slope", true)
         }
         FitRequest::LatentSurvival(_) => ("Latent survival", "latent survival", false),
         FitRequest::LatentBinary(_) => ("Latent binary", "latent binary", false),
         FitRequest::TransformationNormal(_) => {
-            ("Transformation-normal", "transformation-normal", false)
+            ("Transformation-normal", "transformation-normal", true)
         }
     }
 }
@@ -1038,7 +1038,12 @@ fn build_survival_marginal_slope_ffi_payload(
         (spec, _) => spec,
     };
 
-    let logslope_formula = fit_config.logslope_formula.clone();
+    let logslope_formula = fit_config
+        .logslope_formula
+        .clone()
+        .ok_or_else(|| {
+            "survival marginal-slope requires logslope_formula to persist a saved model".to_string()
+        })?;
     let z_column = fit_config
         .z_column
         .clone()
@@ -1064,7 +1069,7 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_noise = Some(frozen_logslope);
-    payload.formula_logslope = logslope_formula;
+    payload.formula_logslope = Some(logslope_formula);
     payload.z_column = Some(z_column);
     payload.latent_z_normalization = Some(SavedLatentZNormalization {
         mean: ms_result.z_normalization.mean,
