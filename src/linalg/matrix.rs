@@ -2594,9 +2594,17 @@ impl<F> SpatialKernelEvaluator for F
 where
     F: Fn(&[f64], &[f64]) -> f64 + Send + Sync + 'static,
 {
-    #[inline(always)]
     fn eval(&self, x: &[f64], c: &[f64]) -> f64 {
         self(x, c)
+    }
+}
+
+impl<F> SpatialKernelEvaluator for Arc<F>
+where
+    F: Fn(&[f64], &[f64]) -> f64 + Send + Sync + 'static + ?Sized,
+{
+    fn eval(&self, x: &[f64], c: &[f64]) -> f64 {
+        self.as_ref()(x, c)
     }
 }
 

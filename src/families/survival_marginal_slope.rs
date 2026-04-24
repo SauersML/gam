@@ -927,6 +927,16 @@ impl MultiDirJet {
         out
     }
 
+    fn with_coeffs(n_dirs: usize, coeffs: &[(usize, f64)]) -> Self {
+        let mut out = Self::zero(n_dirs);
+        for &(mask, value) in coeffs {
+            if mask < out.coeffs.len() {
+                out.coeffs[mask] = value;
+            }
+        }
+        out
+    }
+
     fn bilinear(base: f64, d1: f64, d2: f64, d12: f64) -> Self {
         Self {
             coeffs: vec![base, d1, d2, d12],
@@ -3460,30 +3470,39 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         let target_survival = crate::probability::normal_cdf(-q);
+        let achieved_survival = target_survival + residual;
         let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
         let probability_tol = SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL
             .max(SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL * tail_mass);
-        let mut residual_ok = residual.abs() <= probability_tol;
-
-        if target_survival < SURVIVAL_INTERCEPT_LOG_SURVIVAL_THRESHOLD {
-            let achieved_survival = target_survival + residual;
-            let (target_log_survival, _) = signed_probit_logcdf_and_mills_ratio(-q);
-            residual_ok = if target_log_survival.is_finite()
-                && achieved_survival.is_finite()
-                && achieved_survival > 0.0
-            {
-                (achieved_survival.ln() - target_log_survival).abs()
-                    <= SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL
+        let mut log_tail_residual = None;
+        let residual_ok = if tail_mass < SURVIVAL_INTERCEPT_LOG_SURVIVAL_THRESHOLD {
+            let (achieved_tail, target_log_tail) = if target_survival <= 0.5 {
+                let (target_log_survival, _) = signed_probit_logcdf_and_mills_ratio(-q);
+                (achieved_survival, target_log_survival)
             } else {
-                residual_ok
+                let (target_log_failure, _) = signed_probit_logcdf_and_mills_ratio(q);
+                (1.0 - achieved_survival, target_log_failure)
             };
-        }
+            if target_log_tail.is_finite() && achieved_tail.is_finite() && achieved_tail > 0.0 {
+                let log_residual = achieved_tail.ln() - target_log_tail;
+                log_tail_residual = Some(log_residual);
+                log_residual.abs() <= SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL
+            } else {
+                residual.abs() <= probability_tol
+            }
+        } else {
+            residual.abs() <= probability_tol
+        };
 
         if !residual_ok {
+            let log_tail_detail = log_tail_residual
+                .map(|value| format!(", log_tail_residual={value:.3e}"))
+                .unwrap_or_default();
             return Err(format!(
                 "survival marginal-slope intercept solve failed: \
                  residual={residual:.3e} at a={a:.6}, target survival={target_survival:.6e}, \
-                 probability_tol={probability_tol:.3e}"
+                 achieved survival={achieved_survival:.6e}, probability_tol={probability_tol:.3e}\
+                 {log_tail_detail}"
             ));
         }
 
