@@ -16499,12 +16499,12 @@ mod tests {
     #[test]
     fn pure_duchon_aniso_fit_optimizes_without_introducing_hybrid_scale() {
         let data = array![
-            [0.0, 0.1],
-            [0.2, 0.0],
-            [0.4, 0.3],
-            [0.6, 0.5],
-            [0.8, 0.7],
-            [1.0, 0.9],
+            [0.0, 0.1, 0.2],
+            [0.2, 0.0, 0.4],
+            [0.4, 0.3, 0.1],
+            [0.6, 0.5, 0.7],
+            [0.8, 0.7, 0.3],
+            [1.0, 0.9, 0.8],
         ];
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -17963,8 +17963,8 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 31 },
                         length_scale: None,
-                        power: 2,
-                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        power: 0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                     },
