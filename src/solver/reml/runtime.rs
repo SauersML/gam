@@ -1821,7 +1821,7 @@ impl<'a> RemlState<'a> {
                 let sfactor =
                     crate::linalg::sparse_exact::factorize_simplicial(&sparse_system.h_sparse)?;
                 let takahashi = Some(Arc::new(
-                    crate::linalg::sparse_exact::TakahashiInverse::compute(&sfactor),
+                    crate::linalg::sparse_exact::TakahashiInverse::compute(&sfactor)?,
                 ));
                 SparseExactEvalData {
                     factor,

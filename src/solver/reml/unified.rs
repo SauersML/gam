@@ -5289,6 +5289,7 @@ struct UnifiedOuterHessianOperator {
     incl_logdet_s: bool,
     kernel: OuterHessianDerivativeKernel,
     adjoint_z_c: Option<Array1<f64>>,
+    callback_second_modes: Option<Vec<Array1<f64>>>,
 }
 
 impl UnifiedOuterHessianOperator {
@@ -5601,15 +5602,14 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                             &correction_m_alpha,
                         )?,
                     OuterHessianDerivativeKernel::Callback { .. } => {
-                        let second_v = if coord.is_ext() {
-                            coord.v.clone()
-                        } else {
-                            -&coord.v
-                        };
+                        let second_v = &self
+                            .callback_second_modes
+                            .as_ref()
+                            .expect("callback second modes")[idx];
                         let rhs = self.pair_rhs_combo(idx, alpha);
                         self.callback_correction_trace(
                             &rhs,
-                            &second_v,
+                            second_v,
                             callback_neg_m_alpha
                                 .as_ref()
                                 .expect("callback negated mode"),
@@ -5876,6 +5876,20 @@ fn build_outer_hessian_operator(
         None
     };
 
+    let callback_second_modes = matches!(kernel, OuterHessianDerivativeKernel::Callback { .. })
+        .then(|| {
+            coords
+                .iter()
+                .map(|coord| {
+                    if coord.is_ext() {
+                        coord.v.clone()
+                    } else {
+                        -&coord.v
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
     Ok(UnifiedOuterHessianOperator {
         hop,
         coords,
@@ -5894,6 +5908,7 @@ fn build_outer_hessian_operator(
         incl_logdet_s,
         kernel,
         adjoint_z_c,
+        callback_second_modes,
     })
 }
 
