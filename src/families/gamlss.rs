@@ -256,11 +256,8 @@ impl<'a> BlockDesignView<'a> {
         let p_l = self.ncols();
         let p_r = other.ncols();
         let mut out = Array2::<f64>::zeros((p_l, p_r));
-        let rows_per_chunk = crate::resource::rows_for_target_bytes(
-            policy.row_chunk_target_bytes,
-            p_l + p_r,
-        )
-        .max(1);
+        let rows_per_chunk =
+            crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, p_l + p_r).max(1);
 
         let mut start = 0usize;
         while start < n {
@@ -5323,6 +5320,27 @@ impl GaussianLocationScaleFamily {
         Ok(None)
     }
 
+    /// Operator-preserving views of the mu / log-sigma block designs.
+    /// Prefer this over `exact_joint_dense_block_designs` for shape-only or
+    /// chunked work; only force a `Cow<Array2>` when a downstream API still
+    /// requires `&Array2<f64>`.
+    pub(crate) fn mu_design_view(&self) -> Result<BlockDesignView<'_>, String> {
+        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
+            "GaussianLocationScaleFamily exact path is missing mu design".to_string()
+        })?;
+        Ok(BlockDesignView::from_design(mu_design))
+    }
+
+    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
+        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
+            "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
+        })?;
+        Ok(BlockDesignView::from_design(log_sigma_design))
+    }
+
+    // TODO(block-view-migration): prefer `mu_design_view()` / `log_sigma_design_view()`
+    // returning `BlockDesignView<'_>`. This Cow-returning helper forces an n×p
+    // dense materialization on the operator branch.
     fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
@@ -6852,6 +6870,27 @@ impl GaussianLocationScaleWiggleFamily {
         )?))
     }
 
+    /// Operator-preserving views of the mu / log-sigma block designs.
+    /// Prefer this over `dense_block_designs` for shape-only or chunked work;
+    /// only force a `Cow<Array2>` when a downstream API still requires
+    /// `&Array2<f64>`.
+    pub(crate) fn mu_design_view(&self) -> Result<BlockDesignView<'_>, String> {
+        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
+            "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
+        })?;
+        Ok(BlockDesignView::from_design(mu_design))
+    }
+
+    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
+        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
+            "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
+        })?;
+        Ok(BlockDesignView::from_design(log_sigma_design))
+    }
+
+    // TODO(block-view-migration): prefer `mu_design_view()` / `log_sigma_design_view()`
+    // returning `BlockDesignView<'_>`. This Cow-returning helper forces an n×p
+    // dense materialization on the operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let mu_design = self.mu_design.as_ref().ok_or_else(|| {
             "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
@@ -6870,6 +6909,9 @@ impl GaussianLocationScaleWiggleFamily {
         Ok((xmu, x_ls))
     }
 
+    // TODO(block-view-migration): prefer `BlockDesignView::from_design(&specs[i].design)`
+    // for shape/chunked access; force the Cow only when handing off to
+    // `&Array2<f64>` consumers.
     fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
@@ -7704,6 +7746,7 @@ impl GaussianLocationScaleWiggleFamily {
         let l_b = 2.0 * &dm_b;
         let l_ab = 2.0 * &dm_ab;
 
+        let policy = crate::resource::ResourcePolicy::default_library();
         let hmm_ab = weighted_crossprod_psi_maps(
             xmu_ab_map,
             coeff_mm.view(),
@@ -11591,6 +11634,7 @@ impl BinomialLocationScaleFamily {
                 + x_ls.t().dot(&d2r_ls)),
         );
 
+        let policy = crate::resource::ResourcePolicy::default_library();
         let h_tt_block = weighted_crossprod_psi_maps(
             x_t_ab_map,
             h_tt.view(),
