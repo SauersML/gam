@@ -7835,6 +7835,7 @@ impl SparseCholeskyOperator {
             return 0.0;
         }
         debug_assert_eq!(block.nrows(), end - start);
+        let t_start = std::time::Instant::now();
         let block_size = end - start;
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
@@ -7877,6 +7878,15 @@ impl SparseCholeskyOperator {
             local_col_start += cols;
         }
 
+        let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        if elapsed_ms > 100.0 {
+            log::info!(
+                "[REML-trace] block_local_exact | n_dim={} | block={} | {:.1}ms",
+                self.n_dim,
+                block_size,
+                elapsed_ms
+            );
+        }
         trace
     }
 
@@ -7944,6 +7954,7 @@ impl SparseCholeskyOperator {
         start: usize,
         end: usize,
     ) -> f64 {
+        let t_start = std::time::Instant::now();
         let solved = match self.solve_block_local_rows_exact(block, scale, start, end) {
             Ok(solved) => solved,
             Err(e) => {
@@ -7953,7 +7964,17 @@ impl SparseCholeskyOperator {
                 return f64::NAN;
             }
         };
-        trace_matrix_product(&solved, &solved)
+        let result = trace_matrix_product(&solved, &solved);
+        let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        if elapsed_ms > 100.0 {
+            log::info!(
+                "[REML-trace] block_local_cross_exact | n_dim={} | block={} | {:.1}ms",
+                self.n_dim,
+                end - start,
+                elapsed_ms
+            );
+        }
+        result
     }
 
     fn trace_hinv_matrix_operator_cross_exact(
@@ -8023,6 +8044,7 @@ impl SparseCholeskyOperator {
         range_start: usize,
         range_end: usize,
     ) -> f64 {
+        let t_start = std::time::Instant::now();
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut op_rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
         let mut eye_rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
@@ -8080,6 +8102,15 @@ impl SparseCholeskyOperator {
             start = end;
         }
 
+        let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        if elapsed_ms > 100.0 {
+            log::info!(
+                "[REML-trace] matrix_block_op_cross_exact | n_dim={} | block={} | {:.1}ms",
+                self.n_dim,
+                range_end - range_start,
+                elapsed_ms
+            );
+        }
         trace
     }
 

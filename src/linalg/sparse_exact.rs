@@ -176,6 +176,8 @@ pub fn factorize_sparse_spd(
     //
     // This prevents off-diagonal double counting in paths that interpret input as
     // symmetric-upper and makes the sparse factor path robust to caller encoding.
+    let t_start = std::time::Instant::now();
+    let n_input = h.ncols();
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
     let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
@@ -190,6 +192,14 @@ pub fn factorize_sparse_spd(
                 min_eigenvalue: f64::NAN,
             })?;
     let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
+    let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+    if elapsed_ms > 100.0 {
+        log::info!(
+            "[sparse-chol] factorize_sparse_spd | n={} | {:.1}ms",
+            n_input,
+            elapsed_ms
+        );
+    }
     Ok(SparseExactFactor {
         factor,
         n: h_upper.ncols(),

@@ -2060,10 +2060,34 @@ impl<'a> RemlState<'a> {
             *calls += 1;
             *calls
         };
+        let reml_log_info = crate::solver::visualizer::reml_info_enabled();
+        let t_eval_start = std::time::Instant::now();
+        if reml_log_info {
+            let prefix: Vec<String> = p
+                .iter()
+                .take(4)
+                .map(|v| format!("{:.3}", v))
+                .collect();
+            log::info!(
+                "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
+                cost_call_idx,
+                prefix.join(","),
+                p.len()
+            );
+        }
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+            if reml_log_info {
+                log::info!(
+                    "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
+                    cost_call_idx,
+                    eval.cost,
+                    t_eval_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             return Ok(eval.cost);
         }
+        let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2104,9 +2128,28 @@ impl<'a> RemlState<'a> {
                 return Err(e);
             }
         };
+        let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
+        if reml_log_info {
+            log::info!(
+                "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?}",
+                cost_call_idx,
+                pirls_ms,
+                bundle.backend_kind()
+            );
+        }
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            let t_assemble = std::time::Instant::now();
             let result =
                 self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+            if reml_log_info {
+                log::info!(
+                    "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+                    cost_call_idx,
+                    result.cost,
+                    t_assemble.elapsed().as_secs_f64() * 1000.0,
+                    t_eval_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             return Ok(result.cost);
         }
         {
@@ -2167,7 +2210,17 @@ impl<'a> RemlState<'a> {
         }
         // Delegate to the unified evaluator for the actual formula computation.
         // This ensures cost and gradient share the exact same formula.
+        let t_assemble = std::time::Instant::now();
         let result = self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+        if reml_log_info {
+            log::info!(
+                "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+                cost_call_idx,
+                result.cost,
+                t_assemble.elapsed().as_secs_f64() * 1000.0,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(result.cost)
     }
 
@@ -3513,10 +3566,33 @@ impl<'a> RemlState<'a> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
+        let reml_log_info = crate::solver::visualizer::reml_info_enabled();
+        let t_eval_start = std::time::Instant::now();
+        if reml_log_info {
+            let prefix: Vec<String> = p
+                .iter()
+                .take(4)
+                .map(|v| format!("{:.3}", v))
+                .collect();
+            log::info!(
+                "[REML] grad-only begin | rho[..4]=[{}] | k={}",
+                prefix.join(","),
+                p.len()
+            );
+        }
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
+            if reml_log_info {
+                let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                log::info!(
+                    "[REML] grad-only cache hit | |g| {:.3e} | elapsed {:.1}ms",
+                    gnorm,
+                    t_eval_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             return Ok(eval.gradient);
         }
+        let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
@@ -3528,17 +3604,46 @@ impl<'a> RemlState<'a> {
                 return Err(e);
             }
         };
+        let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
+        if reml_log_info {
+            log::info!(
+                "[REML] grad-only pirls done | elapsed {:.1}ms | backend {:?}",
+                pirls_ms,
+                bundle.backend_kind()
+            );
+        }
+        let t_assemble = std::time::Instant::now();
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let result = self.evaluate_unified_sparse(
                 p,
                 &bundle,
                 super::unified::EvalMode::ValueAndGradient,
             )?;
-            return Ok(result.gradient.unwrap());
+            let grad = result.gradient.unwrap();
+            if reml_log_info {
+                let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+                log::info!(
+                    "[REML] grad-only sparse done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
+                    gnorm,
+                    t_assemble.elapsed().as_secs_f64() * 1000.0,
+                    t_eval_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(grad);
         }
         let result =
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
-        Ok(result.gradient.unwrap())
+        let grad = result.gradient.unwrap();
+        if reml_log_info {
+            let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+            log::info!(
+                "[REML] grad-only dense done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
+                gnorm,
+                t_assemble.elapsed().as_secs_f64() * 1000.0,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(grad)
     }
 
     pub fn compute_outer_eval_with_order(
@@ -3553,14 +3658,40 @@ impl<'a> RemlState<'a> {
             order,
             crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
         ) && self.analytic_outer_hessian_enabled();
+        let reml_log_info = crate::solver::visualizer::reml_info_enabled();
+        let t_eval_start = std::time::Instant::now();
+        if reml_log_info {
+            let prefix: Vec<String> = p
+                .iter()
+                .take(4)
+                .map(|v| format!("{:.3}", v))
+                .collect();
+            log::info!(
+                "[REML] outer-eval begin {:?} | rho[..4]=[{}] | k={} | 2nd-order={}",
+                order,
+                prefix.join(","),
+                p.len(),
+                allow_second_order
+            );
+        }
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {
+                if reml_log_info {
+                    let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                    log::info!(
+                        "[REML] outer-eval cache hit | cost {:.6e} | |g| {:.3e} | elapsed {:.1}ms",
+                        eval.cost,
+                        gnorm,
+                        t_eval_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 return Ok(eval);
             }
         }
 
+        let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -3601,11 +3732,23 @@ impl<'a> RemlState<'a> {
             _ => super::unified::EvalMode::ValueAndGradient,
         };
 
+        let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
+        if reml_log_info {
+            log::info!(
+                "[REML] outer-eval pirls done | elapsed {:.1}ms | backend {:?} | mode {:?}",
+                pirls_ms,
+                bundle.backend_kind(),
+                eval_mode
+            );
+        }
+
+        let t_assemble = std::time::Instant::now();
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.evaluate_unified_sparse(p, &bundle, eval_mode)?
         } else {
             self.evaluate_unified(p, &bundle, eval_mode)?
         };
+        let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
 
         let gradient = result.gradient.ok_or_else(|| {
             EstimationError::InvalidInput(format!(
@@ -3624,6 +3767,16 @@ impl<'a> RemlState<'a> {
             gradient,
             hessian,
         };
+        if reml_log_info {
+            let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+            log::info!(
+                "[REML] outer-eval done | cost {:.6e} | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
+                eval.cost,
+                gnorm,
+                assemble_ms,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         self.cache_manager.store_outer_eval(&rho_key, &eval);
         Ok(eval)
     }

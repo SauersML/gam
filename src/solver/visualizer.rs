@@ -95,6 +95,19 @@ pub fn pirls_iter_info_enabled() -> bool {
     })
 }
 
+/// Env-gated diagnostic: returns `true` when `GAM_LOG_REML_INFO` is set to any
+/// non-empty value. Promotes outer REML/LAML per-evaluation diagnostics from
+/// `debug` to `info` so CI stderr captures per-eval progress (rho, cost,
+/// |grad|, wallclock) during benchmark timeouts. Mirrors the PIRLS gate.
+pub fn reml_info_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("GAM_LOG_REML_INFO")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 fn install_multiprogress(mp: Option<MultiProgress>) {
     if let Ok(mut guard) = active_multiprogress().lock() {
         *guard = mp;

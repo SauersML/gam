@@ -26,6 +26,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   GAM_SKIP_LINT_CHECKS: "1"
+  # Enable per-iteration REML/PIRLS diagnostic logs so CI stderr shows
+  # where timeouts are spinning. Threshold-gated trace/factorize logs
+  # (>100ms) also emit without these vars, but the per-iter beacons need
+  # them. See solver/visualizer.rs::{pirls,reml}_info_enabled.
+  GAM_LOG_PIRLS_INFO: "1"
+  GAM_LOG_REML_INFO: "1"
+  RUST_LOG: "info"
 
 jobs:
   fuzz:

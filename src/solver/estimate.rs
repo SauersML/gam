@@ -1916,6 +1916,22 @@ where
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
 
+    let design_kind = match &x {
+        DesignMatrix::Dense(_) => "dense",
+        DesignMatrix::Sparse(_) => "sparse",
+    };
+    log::info!(
+        "[GAM fit] n={} p={} k={} fam={:?} link={:?} X={} reml_iter={} firth={}",
+        y.len(),
+        p,
+        k,
+        opts.family,
+        cfg.link_function(),
+        design_kind,
+        opts.max_iter,
+        cfg.firth_bias_reduction
+    );
+
     // Own the external arrays once; the conditioned design is shared through `reml_state`.
     let y_o = y.to_owned();
     let w_o = w.to_owned();
