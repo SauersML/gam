@@ -30,7 +30,13 @@ struct TkSharedIntermediates {
     h_diag: Array1<f64>,
     x_m: Array1<f64>,
     y: Array1<f64>,
-    active_blocks: Vec<(usize, usize)>,
+    active_blocks: Vec<TkActiveBlock>,
+}
+
+struct TkActiveBlock {
+    start: usize,
+    end: usize,
+    entries: Vec<(usize, f64)>,
 }
 
 /// Family-dependent derivative context shared by all assembly builders.
@@ -191,7 +197,6 @@ impl<'a> RemlState<'a> {
     fn tk_scalar_from_shared(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
-        c_array: &Array1<f64>,
         d_array: &Array1<f64>,
         shared: &TkSharedIntermediates,
         gram: &mut Array2<f64>,
@@ -205,22 +210,16 @@ impl<'a> RemlState<'a> {
         let t2_term = 0.125 * shared.x_m.dot(&shared.y);
 
         let mut t1_sum = 0.0_f64;
-        for (j_block_idx, &(j0, j1)) in shared.active_blocks.iter().enumerate() {
-            let c_j = c_array.slice(s![j0..j1]);
-            for &(i0, i1) in &shared.active_blocks[..=j_block_idx] {
-                let c_i = c_array.slice(s![i0..i1]);
+        for (j_block_idx, j_block) in shared.active_blocks.iter().enumerate() {
+            let j0 = j_block.start;
+            let j1 = j_block.end;
+            for i_block in &shared.active_blocks[..=j_block_idx] {
+                let i0 = i_block.start;
+                let i1 = i_block.end;
                 Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
                 let mut block_sum = 0.0_f64;
-                for bi in 0..(i1 - i0) {
-                    let ci = c_i[bi];
-                    if ci == 0.0 {
-                        continue;
-                    }
-                    for bj in 0..(j1 - j0) {
-                        let cj = c_j[bj];
-                        if cj == 0.0 {
-                            continue;
-                        }
+                for &(bi, ci) in &i_block.entries {
+                    for &(bj, cj) in &j_block.entries {
                         let kij = gram[[bi, bj]];
                         block_sum += ci * cj * kij * kij * kij;
                     }
@@ -238,20 +237,41 @@ impl<'a> RemlState<'a> {
         Ok(value)
     }
 
-    fn tk_active_blocks(c_array: &Array1<f64>) -> Vec<(usize, usize)> {
+    fn tk_active_blocks(c_array: &Array1<f64>) -> Vec<TkActiveBlock> {
         let n = c_array.len();
         let mut blocks = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
         for start in (0..n).step_by(TK_BLOCK_SIZE) {
             let end = (start + TK_BLOCK_SIZE).min(n);
-            if c_array
+            let entries = c_array
                 .slice(s![start..end])
                 .iter()
-                .any(|value| *value != 0.0)
-            {
-                blocks.push((start, end));
+                .enumerate()
+                .filter_map(|(offset, &value)| (value != 0.0).then_some((offset, value)))
+                .collect::<Vec<_>>();
+            if !entries.is_empty() {
+                blocks.push(TkActiveBlock {
+                    start,
+                    end,
+                    entries,
+                });
             }
         }
         blocks
+    }
+
+    fn tk_active_weighted_trace(
+        active_blocks: &[TkActiveBlock],
+        x_vk: &Array1<f64>,
+        lev_p: &Array1<f64>,
+    ) -> f64 {
+        let mut trace = 0.0;
+        for block in active_blocks {
+            for &(offset, c_i) in &block.entries {
+                let i = block.start + offset;
+                trace += c_i * x_vk[i] * lev_p[i];
+            }
+        }
+        trace
     }
 
     fn tk_fill_gram_block(
@@ -327,21 +347,15 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        for (j_block_idx, &(j0, j1)) in shared.active_blocks.iter().enumerate() {
-            let c_j = c_array.slice(s![j0..j1]);
-            for &(i0, i1) in &shared.active_blocks[..=j_block_idx] {
-                let c_i = c_array.slice(s![i0..i1]);
+        for (j_block_idx, j_block) in shared.active_blocks.iter().enumerate() {
+            let j0 = j_block.start;
+            let j1 = j_block.end;
+            for i_block in &shared.active_blocks[..=j_block_idx] {
+                let i0 = i_block.start;
+                let i1 = i_block.end;
                 Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
-                for bi in 0..(i1 - i0) {
-                    let ci = c_i[bi];
-                    if ci == 0.0 {
-                        continue;
-                    }
-                    for bj in 0..(j1 - j0) {
-                        let cj = c_j[bj];
-                        if cj == 0.0 {
-                            continue;
-                        }
+                for &(bi, ci) in &i_block.entries {
+                    for &(bj, cj) in &j_block.entries {
                         let gij = gram[[bi, bj]];
                         let weight = ci * cj * gij * gij;
                         let ii = i0 + bi;
@@ -391,7 +405,8 @@ impl<'a> RemlState<'a> {
                 * (0..cp.rank())
                     .map(|row| rk_p.row(row).dot(&cp.root.row(row)))
                     .sum::<f64>();
-            let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
+            let correction_trace =
+                Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
             gradient[idx] = trace_ak_p - correction_trace;
         }
         for (extra_idx, drift) in ext_drifts.iter().enumerate() {
@@ -411,9 +426,8 @@ impl<'a> RemlState<'a> {
                 }
             }
             let x_vk_idx = k + extra_idx;
-            let correction_trace: f64 = (0..n)
-                .map(|i| c_array[i] * x_vks[x_vk_idx][i] * lev_p[i])
-                .sum();
+            let correction_trace =
+                Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
             gradient[x_vk_idx] = trace_ak_p + correction_trace;
         }
 
@@ -451,7 +465,7 @@ impl<'a> RemlState<'a> {
             h_inv_solve,
         )?;
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        let value = Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &shared, &mut gram)?;
+        let value = Self::tk_scalar_from_shared(x_dense, z, d_array, &shared, &mut gram)?;
         if !compute_gradient {
             return Ok(TkCorrectionTerms {
                 value,
