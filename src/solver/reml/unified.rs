@@ -1307,12 +1307,7 @@ impl HyperOperator for DenseMatrixHyperOperator {
         dense_matvec_into(&self.matrix, v, out);
     }
 
-    fn scaled_add_mul_vec(
-        &self,
-        v: ArrayView1<'_, f64>,
-        scale: f64,
-        mut out: ArrayViewMut1<'_, f64>,
-    ) {
+    fn scaled_add_mul_vec(&self, v: ArrayView1<'_, f64>, scale: f64, out: ArrayViewMut1<'_, f64>) {
         dense_matvec_scaled_add_into(&self.matrix, v, scale, out);
     }
 
@@ -5172,6 +5167,18 @@ impl StoredFirstDrift {
         }
     }
 
+    fn apply_dot(&self, v: ArrayView1<'_, f64>, test: ArrayView1<'_, f64>) -> f64 {
+        debug_assert_eq!(v.len(), test.len());
+        let mut total = 0.0;
+        if let Some(matrix) = self.dense.as_ref() {
+            total += dense_bilinear(matrix, v, test);
+        }
+        for op in &self.operators {
+            total += op.bilinear_view(v, test);
+        }
+        total
+    }
+
     fn accumulate(
         &self,
         alpha: f64,
@@ -5371,6 +5378,53 @@ impl UnifiedOuterHessianOperator {
         out
     }
 
+    fn pair_rhs_dot(&self, row: usize, col: usize, test: ArrayView1<'_, f64>) -> f64 {
+        let row_coord = &self.coords[row];
+        let col_coord = &self.coords[col];
+        let pair_g_dot = self.pair_g[row][col]
+            .as_ref()
+            .map(|pair_g| pair_g.dot(&test))
+            .unwrap_or(0.0);
+
+        match (row_coord.is_ext(), col_coord.is_ext()) {
+            (false, false) => {
+                col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+                    + row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+                    - pair_g_dot
+            }
+            (false, true) => {
+                pair_g_dot
+                    - row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+                    - col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+            }
+            (true, false) => {
+                pair_g_dot
+                    - col_coord.base_drift.apply_dot(row_coord.v.view(), test)
+                    - row_coord.total_drift.apply_dot(col_coord.v.view(), test)
+            }
+            (true, true) => {
+                pair_g_dot
+                    - row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+                    - col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+            }
+        }
+    }
+
+    fn pair_rhs_combo_dot(
+        &self,
+        idx: usize,
+        alpha: &Array1<f64>,
+        test: ArrayView1<'_, f64>,
+    ) -> f64 {
+        let mut out = 0.0;
+        for j in 0..alpha.len() {
+            if alpha[j] != 0.0 {
+                out += alpha[j] * self.pair_rhs_dot(idx, j, test);
+            }
+        }
+        out
+    }
+
     fn scaled_add_pair_rhs(&self, row: usize, col: usize, scale: f64, out: &mut Array1<f64>) {
         if scale == 0.0 {
             return;
@@ -5435,6 +5489,36 @@ impl UnifiedOuterHessianOperator {
             }
         }
         out
+    }
+
+    fn scalar_correction_trace(
+        &self,
+        idx: usize,
+        alpha: &Array1<f64>,
+        v_i: &Array1<f64>,
+        m_alpha: &Array1<f64>,
+    ) -> Result<f64, String> {
+        let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
+            "missing adjoint trace cache for scalar outer Hessian operator".to_string()
+        })?;
+        let OuterHessianDerivativeKernel::ScalarGlm {
+            c_array,
+            d_array,
+            x,
+        } = &self.kernel
+        else {
+            return Err("scalar correction requested for non-scalar kernel".to_string());
+        };
+        let ingredients = ScalarGlmIngredients {
+            c_array,
+            d_array: d_array.as_ref(),
+            x,
+        };
+        let c_trace = self.pair_rhs_combo_dot(idx, alpha, z_c.view());
+        let d_trace =
+            compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())?
+                .unwrap_or(0.0);
+        Ok(c_trace + d_trace)
     }
 
     fn correction_trace(
@@ -5552,11 +5636,17 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                 value
             };
 
-            let rhs = self.pair_rhs_combo(idx, alpha);
             let correction_v = coord.correction_v();
 
             let correction = if self.incl_logdet_h {
-                self.correction_trace(&rhs, &correction_v, &correction_m_alpha)?
+                match &self.kernel {
+                    OuterHessianDerivativeKernel::ScalarGlm { .. } => self
+                        .scalar_correction_trace(idx, alpha, &correction_v, &correction_m_alpha)?,
+                    OuterHessianDerivativeKernel::Callback { .. } => {
+                        let rhs = self.pair_rhs_combo(idx, alpha);
+                        self.correction_trace(&rhs, &correction_v, &correction_m_alpha)?
+                    }
+                }
             } else {
                 0.0
             };
@@ -10136,6 +10226,54 @@ mod tests {
                 epsilon = 1e-12,
                 max_relative = 1e-12
             );
+        }
+    }
+
+    #[test]
+    fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
+        let dense = DenseMatrixHyperOperator {
+            matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
+        };
+        let block = BlockLocalDrift {
+            local: array![[1.2, 0.2], [0.2, 0.7]],
+            start: 1,
+            end: 3,
+        };
+        let composite = CompositeHyperOperator {
+            dense: Some(array![[0.4, 0.1, 0.0], [0.1, 0.8, -0.2], [0.0, -0.2, 0.6],]),
+            operators: vec![Arc::new(block.clone())],
+            dim_hint: 3,
+        };
+        let weighted = WeightedHyperOperator {
+            terms: vec![
+                (1.7, Arc::new(dense.clone()) as Arc<dyn HyperOperator>),
+                (-0.4, Arc::new(block.clone()) as Arc<dyn HyperOperator>),
+                (0.0, Arc::new(composite.clone()) as Arc<dyn HyperOperator>),
+            ],
+            dim_hint: 3,
+        };
+
+        let v_storage = array![9.0, 0.5, -1.2, 0.7, 8.0];
+        let v_view = v_storage.slice(ndarray::s![1..4]);
+        let v_owned = v_view.to_owned();
+        let base = array![0.25, -0.5, 1.5];
+        let scale = -1.3;
+
+        let operators: [&dyn HyperOperator; 4] = [&dense, &block, &composite, &weighted];
+        for op in operators {
+            let mut accumulated = base.clone();
+            op.scaled_add_mul_vec(v_view, scale, accumulated.view_mut());
+
+            let mut expected = base.clone();
+            expected.scaled_add(scale, &op.mul_vec(&v_owned));
+            for idx in 0..accumulated.len() {
+                assert_relative_eq!(
+                    accumulated[idx],
+                    expected[idx],
+                    epsilon = 1e-12,
+                    max_relative = 1e-12
+                );
+            }
         }
     }
 
