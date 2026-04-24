@@ -2587,7 +2587,6 @@ impl DenseDesignOperator for TensorProductDesignOperator {
 }
 
 pub trait SpatialKernelEvaluator: Send + Sync + 'static {
-    #[inline(always)]
     fn eval(&self, x: &[f64], c: &[f64]) -> f64;
 }
 
