@@ -4990,33 +4990,39 @@ fn gaussian_joint_psisecondhessian_fromweights(
         weights_i.hmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
         &policy,
-    )? + &weighted_crossprod_psi_maps(xmu_i, weights_i.hmu_ls.view(), x_ls_j, &policy)?
-        + &weighted_crossprod_psi_maps(xmu_j, weights_i.hmu_ls.view(), x_ls_i, &policy)?
-        + &weighted_crossprod_psi_maps(
-            xmu_i,
-            weights_j.dhmu_ls.view(),
-            CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
-        )?
-        + &weighted_crossprod_psi_maps(
-            xmu_j,
-            weights_i.dhmu_ls.view(),
-            CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
-        )?
-        + &weighted_crossprod_psi_maps(
-            CustomFamilyPsiLinearMapRef::Dense(xmu),
-            weights_i.dhmu_ls.view(),
-            x_ls_j,
-            &policy,
-        )?
-        + &weighted_crossprod_psi_maps(
-            CustomFamilyPsiLinearMapRef::Dense(xmu),
-            weights_j.dhmu_ls.view(),
-            x_ls_i,
-            &policy,
-        )?
-        + &xt_diag_y_dense(xmu, &secondweights.d2hmu_ls, x_ls)?
+    )? + &weighted_crossprod_psi_maps(
+        xmu_i,
+        weights_i.hmu_ls.view(),
+        x_ls_j,
+        &policy,
+        &policy,
+    )? + &weighted_crossprod_psi_maps(
+        xmu_j,
+        weights_i.hmu_ls.view(),
+        x_ls_i,
+        &policy,
+        &policy,
+    )? + &weighted_crossprod_psi_maps(
+        xmu_i,
+        weights_j.dhmu_ls.view(),
+        CustomFamilyPsiLinearMapRef::Dense(x_ls),
+        &policy,
+    )? + &weighted_crossprod_psi_maps(
+        xmu_j,
+        weights_i.dhmu_ls.view(),
+        CustomFamilyPsiLinearMapRef::Dense(x_ls),
+        &policy,
+    )? + &weighted_crossprod_psi_maps(
+        CustomFamilyPsiLinearMapRef::Dense(xmu),
+        weights_i.dhmu_ls.view(),
+        x_ls_j,
+        &policy,
+    )? + &weighted_crossprod_psi_maps(
+        CustomFamilyPsiLinearMapRef::Dense(xmu),
+        weights_j.dhmu_ls.view(),
+        x_ls_i,
+        &policy,
+    )? + &xt_diag_y_dense(xmu, &secondweights.d2hmu_ls, x_ls)?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_i.hmu_ls.view(),
@@ -7640,33 +7646,39 @@ impl GaussianLocationScaleWiggleFamily {
             coeff_ml.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             &policy,
-        )? + &weighted_crossprod_psi_maps(xmu_a_map, coeff_ml.view(), x_ls_b_map, &policy)?
-            + &weighted_crossprod_psi_maps(xmu_b_map, coeff_ml.view(), x_ls_a_map, &policy)?
-            + &weighted_crossprod_psi_maps(
-                xmu_a_map,
-                coeff_ml_b.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                xmu_b_map,
-                coeff_ml_a.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(xmu),
-                coeff_ml_a.view(),
-                x_ls_b_map,
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(xmu),
-                coeff_ml_b.view(),
-                x_ls_a_map,
-                &policy,
-            )?
-            + &xt_diag_y_dense(xmu, &coeff_ml_ab, x_ls)?
+        )? + &weighted_crossprod_psi_maps(
+            xmu_a_map,
+            coeff_ml.view(),
+            x_ls_b_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            xmu_b_map,
+            coeff_ml.view(),
+            x_ls_a_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            xmu_a_map,
+            coeff_ml_b.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            xmu_b_map,
+            coeff_ml_a.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(xmu),
+            coeff_ml_a.view(),
+            x_ls_b_map,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(xmu),
+            coeff_ml_b.view(),
+            x_ls_a_map,
+            &policy,
+        )? + &xt_diag_y_dense(xmu, &coeff_ml_ab, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml.view(),
@@ -11546,33 +11558,39 @@ impl BinomialLocationScaleFamily {
             h_tt.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_t),
             &policy,
-        )? + &weighted_crossprod_psi_maps(x_t_i_map, h_tt.view(), x_t_j_map, &policy)?
-            + &weighted_crossprod_psi_maps(x_t_j_map, h_tt.view(), x_t_i_map, &policy)?
-            + &weighted_crossprod_psi_maps(
-                x_t_i_map,
-                dh_tt_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_t),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_j_map,
-                dh_tt_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_t),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_t),
-                dh_tt_i.view(),
-                x_t_j_map,
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_t),
-                dh_tt_j.view(),
-                x_t_i_map,
-                &policy,
-            )?
-            + &xt_diag_x_dense(x_t, &d2h_tt)?
+        )? + &weighted_crossprod_psi_maps(
+            x_t_i_map,
+            h_tt.view(),
+            x_t_j_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_j_map,
+            h_tt.view(),
+            x_t_i_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_i_map,
+            dh_tt_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_t),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_j_map,
+            dh_tt_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_t),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_t),
+            dh_tt_i.view(),
+            x_t_j_map,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_t),
+            dh_tt_j.view(),
+            x_t_i_map,
+            &policy,
+        )? + &xt_diag_x_dense(x_t, &d2h_tt)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tt.view(),
@@ -11584,33 +11602,39 @@ impl BinomialLocationScaleFamily {
             h_tl.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             &policy,
-        )? + &weighted_crossprod_psi_maps(x_t_i_map, h_tl.view(), x_ls_j_map, &policy)?
-            + &weighted_crossprod_psi_maps(x_t_j_map, h_tl.view(), x_ls_i_map, &policy)?
-            + &weighted_crossprod_psi_maps(
-                x_t_i_map,
-                dh_tl_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_t_j_map,
-                dh_tl_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_t),
-                dh_tl_i.view(),
-                x_ls_j_map,
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_t),
-                dh_tl_j.view(),
-                x_ls_i_map,
-                &policy,
-            )?
-            + &xt_diag_y_dense(x_t, &d2h_tl, x_ls)?
+        )? + &weighted_crossprod_psi_maps(
+            x_t_i_map,
+            h_tl.view(),
+            x_ls_j_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_j_map,
+            h_tl.view(),
+            x_ls_i_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_i_map,
+            dh_tl_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_t_j_map,
+            dh_tl_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_t),
+            dh_tl_i.view(),
+            x_ls_j_map,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_t),
+            dh_tl_j.view(),
+            x_ls_i_map,
+            &policy,
+        )? + &xt_diag_y_dense(x_t, &d2h_tl, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_t),
                 h_tl.view(),
@@ -11622,33 +11646,39 @@ impl BinomialLocationScaleFamily {
             h_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
             &policy,
-        )? + &weighted_crossprod_psi_maps(x_ls_i_map, h_ll.view(), x_ls_j_map, &policy)?
-            + &weighted_crossprod_psi_maps(x_ls_j_map, h_ll.view(), x_ls_i_map, &policy)?
-            + &weighted_crossprod_psi_maps(
-                x_ls_i_map,
-                dh_ll_j.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                x_ls_j_map,
-                dh_ll_i.view(),
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                dh_ll_i.view(),
-                x_ls_j_map,
-                &policy,
-            )?
-            + &weighted_crossprod_psi_maps(
-                CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                dh_ll_j.view(),
-                x_ls_i_map,
-                &policy,
-            )?
-            + &xt_diag_x_dense(x_ls, &d2h_ll)?
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_i_map,
+            h_ll.view(),
+            x_ls_j_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_j_map,
+            h_ll.view(),
+            x_ls_i_map,
+            &policy,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_i_map,
+            dh_ll_j.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            x_ls_j_map,
+            dh_ll_i.view(),
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            dh_ll_i.view(),
+            x_ls_j_map,
+            &policy,
+        )? + &weighted_crossprod_psi_maps(
+            CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            dh_ll_j.view(),
+            x_ls_i_map,
+            &policy,
+        )? + &xt_diag_x_dense(x_ls, &d2h_ll)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
                 h_ll.view(),
