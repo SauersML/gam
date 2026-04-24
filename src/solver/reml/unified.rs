@@ -8476,6 +8476,9 @@ impl StochasticTraceEstimator {
         let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
         let mut implicit_dx_u: Vec<Array1<f64>> =
             (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+        let mut implicit_w_dx_u: Vec<Array1<f64>> =
+            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+        let mut implicit_w_y: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
         let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
             .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
             .collect();
@@ -8546,6 +8549,11 @@ impl StochasticTraceEstimator {
                         "radial scalar evaluation failed during implicit derivative forward_mul",
                     ),
                 );
+                let w = &*op.w_diag;
+                for i in 0..w.len() {
+                    implicit_w_dx_u[idx][i] = w[i] * implicit_dx_u[idx][i];
+                    implicit_w_y[idx][i] = w[i] * y_vec[i];
+                }
                 for e in 0..total {
                     implicit_dx_r[idx][e].assign(
                         &op.implicit_deriv.forward_mul(op.axis, &r.column(e)).expect(
@@ -8572,18 +8580,16 @@ impl StochasticTraceEstimator {
                         // u^T A_d r_e = ((∂X/∂ψ_d)u)^T (W X r_e) + (Xu)^T (W (∂X/∂ψ_d) r_e)
                         //             + u^T S_psi r_e
                         let oi = d - n_dense;
-                        let op = &implicit_ops[oi];
                         let x_re = &x_r[e];
 
-                        let dx_u = &implicit_dx_u[oi];
+                        let w_dx_u = &implicit_w_dx_u[oi];
+                        let w_y = &implicit_w_y[oi];
                         let dx_re = &implicit_dx_r[oi][e];
 
-                        let w = &*op.w_diag;
                         let mut design_val = 0.0f64;
-                        for i in 0..w.len() {
-                            let wi = w[i];
-                            design_val += dx_u[i] * wi * x_re[i];
-                            design_val += y_vec[i] * wi * dx_re[i];
+                        for i in 0..w_dx_u.len() {
+                            design_val += w_dx_u[i] * x_re[i];
+                            design_val += w_y[i] * dx_re[i];
                         }
 
                         // Penalty: u^T S_psi r_e = (S_psi^T u)^T r_e
@@ -8601,18 +8607,16 @@ impl StochasticTraceEstimator {
                             dense_a_u[e].dot(&r_d)
                         } else {
                             let oi = e - n_dense;
-                            let op = &implicit_ops[oi];
                             let x_rd = &x_r[d];
 
-                            let dx_u = &implicit_dx_u[oi];
+                            let w_dx_u = &implicit_w_dx_u[oi];
+                            let w_y = &implicit_w_y[oi];
                             let dx_rd = &implicit_dx_r[oi][d];
 
-                            let w = &*op.w_diag;
                             let mut design_val = 0.0f64;
-                            for i in 0..w.len() {
-                                let wi = w[i];
-                                design_val += dx_u[i] * wi * x_rd[i];
-                                design_val += y_vec[i] * wi * dx_rd[i];
+                            for i in 0..w_dx_u.len() {
+                                design_val += w_dx_u[i] * x_rd[i];
+                                design_val += w_y[i] * dx_rd[i];
                             }
 
                             let penalty_val = implicit_u_s[oi].dot(&r_d);
@@ -8629,9 +8633,14 @@ impl StochasticTraceEstimator {
         let n_probes = self.config.n_probes_max as f64;
         t_sum /= n_probes;
 
-        // Symmetrize: T = (T + T^T) / 2
-        let t_sym = (&t_sum + &t_sum.t()) / 2.0;
-        t_sym
+        for d in 0..total {
+            for e in (d + 1)..total {
+                let avg = 0.5 * (t_sum[[d, e]] + t_sum[[e, d]]);
+                t_sum[[d, e]] = avg;
+                t_sum[[e, d]] = avg;
+            }
+        }
+        t_sum
     }
 
     /// Estimate the full D×D matrix of second-order traces `tr(H⁻¹ A_d H⁻¹ A_e)`
@@ -8712,7 +8721,14 @@ impl StochasticTraceEstimator {
 
         let n_probes = self.config.n_probes_max as f64;
         t_sum /= n_probes;
-        (&t_sum + &t_sum.t()) / 2.0
+        for d in 0..total {
+            for e in (d + 1)..total {
+                let avg = 0.5 * (t_sum[[d, e]] + t_sum[[e, d]]);
+                t_sum[[d, e]] = avg;
+                t_sum[[e, d]] = avg;
+            }
+        }
+        t_sum
     }
 
     fn estimate_second_order_single_dense(
