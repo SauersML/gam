@@ -1637,12 +1637,7 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
         &self,
         axis: usize,
         rows: Range<usize>,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self
-            .materialize_first(axis)?
-            .slice(ndarray::s![rows, ..])
-            .to_owned())
-    }
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
     /// Single-row specialization of `row_chunk_first`. Default implementation
     /// delegates to `row_chunk_first(axis, row..row+1)` and copies the
     /// resulting row into the output buffer; implementations that can avoid
@@ -1661,23 +1656,32 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
         &self,
         axis: usize,
         rows: Range<usize>,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self
-            .materialize_second_diag(axis)?
-            .slice(ndarray::s![rows, ..])
-            .to_owned())
-    }
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
     fn row_chunk_second_cross(
         &self,
         axis_d: usize,
         axis_e: usize,
         rows: Range<usize>,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        Ok(self
-            .materialize_second_cross(axis_d, axis_e)?
-            .slice(ndarray::s![rows, ..])
-            .to_owned())
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+
+    /// Optional upcast to the dense materialization surface. Production exact
+    /// paths should prefer the analytic matvec / row-chunk methods above and
+    /// avoid forming the full derivative matrix; implementations that *do*
+    /// support dense materialization (used by diagnostics, tests, and
+    /// small-data fallbacks) should override this to return `Some(self)`.
+    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
+        None
     }
+}
+
+/// Diagnostic / small-data extension that exposes dense materialization of
+/// `\partial X / \partial \psi`, `\partial^2 X / \partial \psi_d^2`, and
+/// `\partial^2 X / \partial \psi_d \partial \psi_e`. Production exact-Hessian
+/// code MUST NOT depend on this trait — it is reserved for diagnostics, tests,
+/// and small-data fallbacks where materialization is actually safe.
+pub(crate) trait MaterializablePsiDerivativeOperator:
+    CustomFamilyPsiDerivativeOperator
+{
     fn materialize_first(
         &self,
         axis: usize,
@@ -1691,6 +1695,91 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
+
+    fn materialize_first_with_policy(
+        &self,
+        axis: usize,
+        policy: &crate::resource::ResourcePolicy,
+        context: &'static str,
+    ) -> Result<Array2<f64>, crate::resource::MatrixMaterializationError> {
+        let nrows = self.n_data();
+        let ncols = self.p_out();
+        let estimated = nrows
+            .saturating_mul(ncols)
+            .saturating_mul(std::mem::size_of::<f64>());
+        if estimated > policy.max_single_materialization_bytes {
+            return Err(crate::resource::MatrixMaterializationError::TooLarge {
+                context,
+                nrows,
+                ncols,
+                bytes: estimated,
+                limit_bytes: policy.max_single_materialization_bytes,
+            });
+        }
+        self.materialize_first(axis).map_err(|_| {
+            crate::resource::MatrixMaterializationError::Forbidden {
+                context,
+                mode: policy.derivative_storage_mode,
+            }
+        })
+    }
+
+    fn materialize_second_diag_with_policy(
+        &self,
+        axis: usize,
+        policy: &crate::resource::ResourcePolicy,
+        context: &'static str,
+    ) -> Result<Array2<f64>, crate::resource::MatrixMaterializationError> {
+        let nrows = self.n_data();
+        let ncols = self.p_out();
+        let estimated = nrows
+            .saturating_mul(ncols)
+            .saturating_mul(std::mem::size_of::<f64>());
+        if estimated > policy.max_single_materialization_bytes {
+            return Err(crate::resource::MatrixMaterializationError::TooLarge {
+                context,
+                nrows,
+                ncols,
+                bytes: estimated,
+                limit_bytes: policy.max_single_materialization_bytes,
+            });
+        }
+        self.materialize_second_diag(axis).map_err(|_| {
+            crate::resource::MatrixMaterializationError::Forbidden {
+                context,
+                mode: policy.derivative_storage_mode,
+            }
+        })
+    }
+
+    fn materialize_second_cross_with_policy(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        policy: &crate::resource::ResourcePolicy,
+        context: &'static str,
+    ) -> Result<Array2<f64>, crate::resource::MatrixMaterializationError> {
+        let nrows = self.n_data();
+        let ncols = self.p_out();
+        let estimated = nrows
+            .saturating_mul(ncols)
+            .saturating_mul(std::mem::size_of::<f64>());
+        if estimated > policy.max_single_materialization_bytes {
+            return Err(crate::resource::MatrixMaterializationError::TooLarge {
+                context,
+                nrows,
+                ncols,
+                bytes: estimated,
+                limit_bytes: policy.max_single_materialization_bytes,
+            });
+        }
+        self.materialize_second_cross(axis_d, axis_e).map_err(|_| {
+            crate::resource::MatrixMaterializationError::Forbidden {
+                context,
+                mode: policy.derivative_storage_mode,
+            }
+        })
+    }
 }
 
 impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
@@ -1815,6 +1904,12 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         )
     }
 
+    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
+        Some(self)
+    }
+}
+
+impl MaterializablePsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
     fn materialize_first(
         &self,
         axis: usize,
@@ -2001,6 +2096,12 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator
         Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
     }
 
+    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
+        Some(self)
+    }
+}
+
+impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator {
     fn materialize_first(
         &self,
         axis: usize,
@@ -2335,6 +2436,12 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
         Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
     }
 
+    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
+        Some(self)
+    }
+}
+
+impl MaterializablePsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
     fn materialize_first(
         &self,
         axis: usize,
@@ -2609,11 +2716,53 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         Ok(out)
     }
 
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mat = MaterializablePsiDerivativeOperator::materialize_first(self, axis)?;
+        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mat = MaterializablePsiDerivativeOperator::materialize_second_diag(self, axis)?;
+        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mat = MaterializablePsiDerivativeOperator::materialize_second_cross(
+            self, axis_d, axis_e,
+        )?;
+        Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
+    }
+
+    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
+        Some(self)
+    }
+}
+
+impl MaterializablePsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
     fn materialize_first(
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let base = self.base.materialize_first(axis)?;
+        let base_mat = self.base.as_materializable().ok_or_else(|| {
+            crate::terms::basis::BasisError::Other(
+                "rowwise kronecker psi operator: base operator does not support materialization"
+                    .to_string(),
+            )
+        })?;
+        let base = base_mat.materialize_first(axis)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
@@ -2626,7 +2775,13 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let base = self.base.materialize_second_diag(axis)?;
+        let base_mat = self.base.as_materializable().ok_or_else(|| {
+            crate::terms::basis::BasisError::Other(
+                "rowwise kronecker psi operator: base operator does not support materialization"
+                    .to_string(),
+            )
+        })?;
+        let base = base_mat.materialize_second_diag(axis)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
@@ -2640,7 +2795,13 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let base = self.base.materialize_second_cross(axis_d, axis_e)?;
+        let base_mat = self.base.as_materializable().ok_or_else(|| {
+            crate::terms::basis::BasisError::Other(
+                "rowwise kronecker psi operator: base operator does not support materialization"
+                    .to_string(),
+            )
+        })?;
+        let base = base_mat.materialize_second_cross(axis_d, axis_e)?;
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
@@ -3293,7 +3454,6 @@ pub(crate) fn weighted_crossprod_psi_maps(
     left: CustomFamilyPsiLinearMapRef<'_>,
     weights: ArrayView1<'_, f64>,
     right: CustomFamilyPsiLinearMapRef<'_>,
-    policy: &ResourcePolicy,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
         return Err(format!(
@@ -3319,6 +3479,7 @@ pub(crate) fn weighted_crossprod_psi_maps(
     // Stream row chunks of both operands so the weighted intermediate is never
     // materialized at full n x p_right size. Chunk size is governed by the
     // resource policy's row_chunk_target_bytes.
+    let policy = ResourcePolicy::default_library();
     let rows_per_chunk = crate::resource::rows_for_target_bytes(
         policy.row_chunk_target_bytes,
         p_left.saturating_add(p_right).max(1),
