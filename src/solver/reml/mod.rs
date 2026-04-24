@@ -1145,8 +1145,9 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let err = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect_err("Firth penalty-only directional gradient should require analytic TK psi derivatives");
+        let err = single_directional_tau_gradient(&state, &rho, hyper).expect_err(
+            "Firth penalty-only directional gradient should require analytic TK psi derivatives",
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("Tierney-Kadane psi gradients require analytic derivatives"),
@@ -1182,8 +1183,9 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let err = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect_err("Firth design-moving directional gradient should require analytic TK psi derivatives");
+        let err = single_directional_tau_gradient(&state, &rho, hyper).expect_err(
+            "Firth design-moving directional gradient should require analytic TK psi derivatives",
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("Tierney-Kadane psi gradients require analytic derivatives"),
