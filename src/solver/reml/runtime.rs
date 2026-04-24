@@ -26,12 +26,6 @@ struct TkCorrectionTerms {
     gradient: Option<Array1<f64>>,
 }
 
-struct TkPsiDirection {
-    h_dot: Array2<f64>,
-    x_tau: Array2<f64>,
-    eta_dot: Array1<f64>,
-}
-
 /// Family-dependent derivative context shared by all assembly builders.
 ///
 /// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
@@ -108,7 +102,7 @@ impl<'a> RemlState<'a> {
 
     fn dense_penalty_logdet_derivs(
         &self,
-        rho: &Array1<f64>,
+        _rho: &Array1<f64>,
         e_for_logdet: &Array2<f64>,
         penalty_roots: &[Array2<f64>],
         ridge_passport: RidgePassport,
@@ -691,10 +685,7 @@ impl<'a> RemlState<'a> {
         result.cost += tk_terms.value;
         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
             if tk_grad.len() == grad.len() {
-                *grad += &tk_grad;
-            } else if tk_grad.len() == rho.len() && grad.len() >= rho.len() {
-                let mut sl = grad.slice_mut(s![..rho.len()]);
-                sl += &tk_grad;
+                **grad += &tk_grad;
             } else {
                 return Err(EstimationError::InvalidInput(format!(
                     "Tierney-Kadane gradient length mismatch: evaluator returned {}, correction returned {}",
@@ -3161,6 +3152,11 @@ impl<'a> RemlState<'a> {
         let inner_solution = assembly.build();
 
         let has_psi = inner_solution.ext_coords.iter().any(|c| !c.is_penalty_like);
+        if has_psi && self.config.link_function() != LinkFunction::Identity {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate EFS psi gradients".to_string(),
+            ));
+        }
         let eval_mode = if has_psi {
             super::unified::EvalMode::ValueAndGradient
         } else {
@@ -3326,29 +3322,23 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
-        let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        let tk_psi_dirs = if self.config.link_function() != LinkFunction::Identity
-            && compute_gradient_for_tk(mode)
-            && !ext_coords.is_empty()
+        let has_psi = ext_coords.iter().any(|c| !c.is_penalty_like);
+        if compute_gradient_for_tk(mode)
+            && has_psi
+            && self.config.link_function() != LinkFunction::Identity
         {
-            Some(self.build_tk_psi_directions(&bundle, &ext_coords, hyper_dirs)?)
-        } else {
-            None
-        };
-
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
+            ));
+        }
+        let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
         assembly.fixed_drift_deriv = fixed_drift_deriv;
-        let result = self.assemble_and_evaluate_with_tk_psi_dirs(
-            rho,
-            &bundle,
-            mode,
-            assembly,
-            tk_psi_dirs.as_deref(),
-        );
+        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         log::info!(
@@ -3430,12 +3420,7 @@ impl<'a> RemlState<'a> {
             return self.compute_efs_steps(rho);
         }
 
-        let tk_psi_dirs = if self.config.link_function() != LinkFunction::Identity {
-            Some(self.build_tk_psi_directions(&bundle, &ext_coords, hyper_dirs)?)
-        } else {
-            None
-        };
-        self.evaluate_efs(rho, &bundle, ext_coords, tk_psi_dirs.as_deref())
+        self.evaluate_efs(rho, &bundle, ext_coords)
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
