@@ -1867,6 +1867,9 @@ fn spatial_term_min_center_count(term: &SmoothTermSpec) -> usize {
         } => match spec.nullspace_order {
             crate::basis::DuchonNullspaceOrder::Zero => 1,
             crate::basis::DuchonNullspaceOrder::Linear => feature_cols.len() + 1,
+            crate::basis::DuchonNullspaceOrder::Degree(degree) => {
+                crate::basis::duchon_nullspace_dimension(feature_cols.len(), degree)
+            }
         },
         SmoothBasisSpec::Matern { .. } => 1,
         _ => 1,
