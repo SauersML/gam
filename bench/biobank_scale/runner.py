@@ -61,7 +61,7 @@ PGS_CTN_DIAGNOSTIC_MIN_N = 40
 PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN = 0.30
 PGS_CTN_DIAGNOSTIC_MIN_VAR = 0.50
 PGS_CTN_DIAGNOSTIC_MAX_VAR = 1.75
-SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale"}
+SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale", "marginal-slope"}
 SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS = {
     "gaussian",
     "probit",
@@ -283,11 +283,23 @@ def validate_method_spec(spec: MethodSpec) -> None:
             raise RuntimeError(
                 f"survival method '{spec.name}' requires survival_likelihood in {supported}"
             )
-        if spec.survival_distribution not in SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS:
+        if (
+            spec.survival_likelihood != "marginal-slope"
+            and spec.survival_distribution not in SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS
+        ):
             supported = "|".join(sorted(SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS))
             raise RuntimeError(
                 f"survival method '{spec.name}' requires survival_distribution in {supported}"
             )
+        if spec.survival_likelihood == "marginal-slope":
+            if not spec.marginal_slope:
+                raise RuntimeError(
+                    f"survival method '{spec.name}' must set marginal_slope=true for survival_likelihood=marginal-slope"
+                )
+            if spec.survival_distribution is not None:
+                raise RuntimeError(
+                    f"survival marginal-slope method '{spec.name}' must not set survival_distribution"
+                )
         if spec.include_sigma:
             raise RuntimeError(
                 f"survival method '{spec.name}' cannot use include_sigma; choose survival_likelihood explicitly"
@@ -861,6 +873,100 @@ def survival_metrics(
         "horizon_brier": compute_brier(y_horizon, 1.0 - horizon_surv),
         "event_rate": float(np.mean(test_events)),
     }
+
+
+def survival_metrics_from_native_probabilities(
+    train_rows: list[dict[str, Any]],
+    test_rows: list[dict[str, Any]],
+    grid: np.ndarray,
+    survival_matrix: np.ndarray,
+) -> dict[str, float | None]:
+    train_times = np.array([float(r["time"]) for r in train_rows], dtype=float)
+    train_events = np.array([float(r["event"]) for r in train_rows], dtype=float)
+    test_times = np.array([float(r["time"]) for r in test_rows], dtype=float)
+    test_events = np.array([float(r["event"]) for r in test_rows], dtype=float)
+    if survival_matrix.shape != (len(test_rows), grid.shape[0]):
+        raise RuntimeError(
+            "native survival probability matrix shape mismatch: "
+            f"got {survival_matrix.shape}, expected {(len(test_rows), grid.shape[0])}"
+        )
+    surv = np.clip(np.asarray(survival_matrix, dtype=float), 1e-12, 1.0)
+    null_curve = _survival_null_curve(train_times, train_events, grid)
+    proper = survival_lifted_metrics(
+        test_times,
+        test_events,
+        grid,
+        surv,
+        _repeat_survival_curve(null_curve, len(test_rows)),
+    )
+    horizon = float(np.median(train_times))
+    horizon_idx = min(int(np.searchsorted(grid, horizon, side="left")), grid.shape[0] - 1)
+    horizon_surv = surv[:, horizon_idx]
+    native_failure = 1.0 - horizon_surv
+    y_horizon = ((test_events > 0.5) & (test_times <= horizon)).astype(float)
+    return {
+        "c_index": _lifelines_concordance(test_times, native_failure, test_events),
+        "auc": _lifelines_concordance(test_times, native_failure, test_events),
+        "brier": proper["brier"],
+        "logloss": proper["logloss"],
+        "lifted_brier": proper["lifted_brier"],
+        "lifted_logloss": proper["lifted_logloss"],
+        "nagelkerke_r2": proper["nagelkerke_r2"],
+        "horizon_years": horizon,
+        "horizon_auc": compute_auc(y_horizon, native_failure),
+        "horizon_brier": compute_brier(y_horizon, native_failure),
+        "event_rate": float(np.mean(test_events)),
+    }
+
+
+def _survival_probability_column(rows: list[dict[str, str]], *, method_name: str) -> np.ndarray:
+    if not rows:
+        raise RuntimeError(f"{method_name} survival prediction output is empty")
+    key = "survival_prob" if "survival_prob" in rows[0] else "mean"
+    values = np.array([float(r[key]) for r in rows], dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError(f"{method_name} survival prediction column '{key}' contains non-finite values")
+    if np.any(values < -1e-9) or np.any(values > 1.0 + 1e-9):
+        raise RuntimeError(f"{method_name} survival prediction column '{key}' is outside [0,1]")
+    return np.clip(values, 0.0, 1.0)
+
+
+def predict_native_survival_matrix(
+    *,
+    rust_bin: Path,
+    spec: MethodSpec,
+    model_path: Path,
+    base_rows: list[dict[str, Any]],
+    grid: np.ndarray,
+    out_dir: Path,
+) -> tuple[np.ndarray, Path]:
+    matrix = np.empty((len(base_rows), grid.shape[0]), dtype=float)
+    last_pred_path = out_dir / f"{spec.name}.native_survival_grid_last.pred.csv"
+    for j, horizon in enumerate(grid):
+        input_path = out_dir / f"{spec.name}.native_survival_grid_{j:03d}.csv"
+        pred_path = out_dir / f"{spec.name}.native_survival_grid_{j:03d}.pred.csv"
+        write_survival_benchmark_csv(input_path, base_rows, prediction_horizon=float(horizon))
+        pred_cmd = [
+            str(rust_bin),
+            "predict",
+            str(model_path),
+            str(input_path),
+            "--out",
+            str(pred_path),
+        ]
+        rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
+        if rc != 0:
+            raise RuntimeError(
+                err.strip()
+                or out.strip()
+                or f"{spec.name} native survival-grid prediction failed at t={horizon:.6g}"
+            )
+        matrix[:, j] = _survival_probability_column(
+            read_csv_rows(pred_path),
+            method_name=spec.name,
+        )
+        last_pred_path = pred_path
+    return matrix, last_pred_path
 
 
 def ps_snapshot(pid: int) -> dict[str, Any]:
@@ -1522,6 +1628,23 @@ def run_rust_marginal_slope_classification(
 
 
 def rust_survival_formula_rhs(spec: MethodSpec) -> str:
+    if spec.survival_likelihood == "marginal-slope":
+        centers = int(spec.centers or 24)
+        if spec.spatial_basis != "duchon":
+            raise RuntimeError(
+                f"survival marginal-slope method '{spec.name}' requires spatial_basis='duchon'"
+            )
+        terms = [
+            "sex",
+            "smooth(age_entry_std)",
+            _biobank_duchon_pc_term(int(spec.pc_count), centers),
+        ]
+        if spec.timewiggle_knots is not None:
+            terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
+        if spec.mean_linkwiggle_knots is not None:
+            terms.append(f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})")
+        return " + ".join(terms)
+
     distribution = spec.survival_distribution
     if distribution is None:
         raise RuntimeError(
@@ -1552,6 +1675,20 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
 
 def rust_survival_formula(spec: MethodSpec) -> str:
     return f"Surv({SURVIVAL_ENTRY_COLUMN}, time, event) ~ {rust_survival_formula_rhs(spec)}"
+
+
+def rust_survival_marginal_slope_logslope_formula(spec: MethodSpec, centers: int) -> str:
+    if spec.spatial_basis != "duchon":
+        raise RuntimeError(
+            f"survival marginal-slope method '{spec.name}' requires spatial_basis='duchon'"
+        )
+    terms = [
+        "smooth(age_entry_std)",
+        _biobank_duchon_pc_term(int(spec.pc_count), centers),
+    ]
+    if spec.logslope_linkwiggle_knots is not None:
+        terms.append(f"linkwiggle(internal_knots={int(spec.logslope_linkwiggle_knots)})")
+    return " + ".join(terms)
 
 
 def survival_eval_horizon_from_rows(rows: list[dict[str, Any]]) -> float:
