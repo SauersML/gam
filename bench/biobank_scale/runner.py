@@ -43,8 +43,15 @@ def _env_int_optional(name: str) -> int | None:
 
 
 _CMD_TIMEOUT_SEC = _env_int_optional("BENCH_CMD_TIMEOUT_SEC")
-MAX_SURVIVAL_GRID_POINTS = 256
+ROUTINE_SURVIVAL_HORIZONS = (1.0, 2.0, 5.0, 10.0)
 SURVIVAL_ENTRY_COLUMN = "__entry"
+F64_BYTES = 8
+F32_BYTES = 4
+DEFAULT_BIOBANK_RAM_BUDGET_BYTES = 64 * 1024**3
+BIOBANK_PREFLIGHT_DEFAULT_MAX_PEAK_BYTES = int(0.80 * DEFAULT_BIOBANK_RAM_BUDGET_BYTES)
+BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
+BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
+BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
 SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale"}
 SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS = {
     "gaussian",
@@ -76,6 +83,146 @@ class MethodSpec:
     logslope_linkwiggle_knots: int | None = None
     timewiggle_knots: int | None = None
     max_centers: int | None = None
+
+
+@dataclass(frozen=True)
+class BiobankPreflightReport:
+    status: str
+    lines: list[str]
+    estimated_peak_bytes: int
+    largest_single_allocation_bytes: int
+    chunk_rows: int | None = None
+
+    def require_pass(self) -> None:
+        if self.status != "PASS":
+            raise RuntimeError("\n".join(self.lines))
+
+
+def gibibytes(nbytes: int) -> float:
+    return float(nbytes) / float(1024**3)
+
+
+def _preflight_status_line(status: str) -> str:
+    return f"status: {status}"
+
+
+def preflight_marginal_slope_biobank(
+    *,
+    n_train: int,
+    d_pc: int,
+    centers: int,
+    linkwiggle_knots: int | None = None,
+    scorewarp_knots: int | None = None,
+    ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
+) -> BiobankPreflightReport:
+    if n_train <= 0 or d_pc <= 0 or centers <= 0:
+        raise RuntimeError("biobank preflight dimensions must be positive")
+    p_pc = centers + 1
+    dense_block_bytes = n_train * p_pc * F64_BYTES
+    derivative_dense_bytes = d_pc * dense_block_bytes
+    linkwiggle = int(linkwiggle_knots or 0)
+    scorewarp = int(scorewarp_knots or 0)
+    working_bytes = n_train * (8 + d_pc + linkwiggle + scorewarp) * F64_BYTES
+    estimated_peak = dense_block_bytes + working_bytes + 384 * 1024**2
+    largest = max(dense_block_bytes, derivative_dense_bytes, working_bytes)
+    failures: list[str] = []
+    if dense_block_bytes > BIOBANK_MAX_DENSE_BLOCK_BYTES:
+        failures.append(
+            f"estimated dense block: {gibibytes(dense_block_bytes):.1f} GiB exceeds {gibibytes(BIOBANK_MAX_DENSE_BLOCK_BYTES):.1f} GiB"
+        )
+    if derivative_dense_bytes > BIOBANK_MAX_DERIVATIVE_DENSE_BYTES:
+        failures.append(
+            f"anisotropic derivative dense estimate: {gibibytes(derivative_dense_bytes):.1f} GiB exceeds {gibibytes(BIOBANK_MAX_DERIVATIVE_DENSE_BYTES):.1f} GiB"
+        )
+    if estimated_peak > int(0.80 * ram_budget_bytes):
+        failures.append(
+            f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB exceeds 80% RAM budget {gibibytes(ram_budget_bytes):.1f} GiB"
+        )
+    status = "FAIL" if failures else "PASS"
+    lines = [
+        "BIOBANK PREFLIGHT",
+        f"n_train: {n_train:,}",
+        f"d_pc: {d_pc}",
+        f"K_pc: {centers}",
+        "Duchon smooth: lazy chunked",
+        "anisotropy derivatives: implicit streaming",
+        "CTN Kronecker: n/a",
+        "survival time tensor: n/a",
+        f"linkwiggle knots: {linkwiggle}",
+        f"scorewarp knots: {scorewarp}",
+        f"estimated dense block: {gibibytes(dense_block_bytes):.1f} GiB",
+        f"anisotropic derivative dense estimate: {gibibytes(derivative_dense_bytes):.1f} GiB",
+        f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB",
+        f"RAM budget: {gibibytes(ram_budget_bytes):.0f} GiB",
+        f"largest single allocation planned: {gibibytes(largest):.1f} GiB",
+        _preflight_status_line(status),
+    ]
+    lines.extend(f"reason: {failure}" for failure in failures)
+    return BiobankPreflightReport(status, lines, estimated_peak, largest)
+
+
+def preflight_ctn_score_warp(
+    *,
+    n_train: int,
+    p_response: int,
+    p_cov: int,
+    ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
+) -> BiobankPreflightReport:
+    if n_train <= 0 or p_response <= 0 or p_cov <= 0:
+        raise RuntimeError("CTN preflight dimensions must be positive")
+    dense_kron_bytes = n_train * p_response * p_cov * F64_BYTES
+    factored_bytes = n_train * (p_response + p_cov) * F64_BYTES
+    estimated_peak = factored_bytes + 512 * 1024**2
+    status = "PASS"
+    failures: list[str] = []
+    if estimated_peak > int(0.80 * ram_budget_bytes):
+        status = "FAIL"
+        failures.append("factored CTN design exceeds RAM budget")
+    lines = [
+        "BIOBANK PREFLIGHT",
+        f"n_train: {n_train:,}",
+        f"CTN Kronecker: factored",
+        f"p_response: {p_response}",
+        f"p_cov: {p_cov}",
+        f"avoided dense rowwise Kronecker: {gibibytes(dense_kron_bytes):.1f} GiB",
+        f"estimated factored bytes: {gibibytes(factored_bytes):.1f} GiB",
+        f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB",
+        _preflight_status_line(status),
+    ]
+    lines.extend(f"reason: {failure}" for failure in failures)
+    return BiobankPreflightReport(status, lines, estimated_peak, max(factored_bytes, p_response * p_cov * F64_BYTES))
+
+
+def preflight_survival_prediction(
+    *,
+    n_rows: int,
+    grid_points: int,
+    chunk_rows: int = BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS,
+    ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
+) -> BiobankPreflightReport:
+    if n_rows <= 0 or grid_points <= 0 or chunk_rows <= 0:
+        raise RuntimeError("survival prediction preflight dimensions must be positive")
+    dense_time_tensor_bytes = n_rows * grid_points * F64_BYTES
+    chunked_bytes = min(n_rows, chunk_rows) * grid_points * F64_BYTES
+    estimated_peak = chunked_bytes + 256 * 1024**2
+    failures: list[str] = []
+    if chunked_bytes > BIOBANK_MAX_DENSE_BLOCK_BYTES:
+        failures.append("survival prediction chunk is too large")
+    if estimated_peak > int(0.80 * ram_budget_bytes):
+        failures.append("chunked survival prediction exceeds RAM budget")
+    status = "FAIL" if failures else "PASS"
+    lines = [
+        "BIOBANK PREFLIGHT",
+        f"n_predict: {n_rows:,}",
+        f"survival grid: {grid_points}",
+        f"survival time tensor: chunked rows={chunk_rows}",
+        f"avoided dense n x grid tensor: {gibibytes(dense_time_tensor_bytes):.1f} GiB",
+        f"largest single allocation planned: {gibibytes(chunked_bytes):.1f} GiB",
+        f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB",
+        _preflight_status_line(status),
+    ]
+    lines.extend(f"reason: {failure}" for failure in failures)
+    return BiobankPreflightReport(status, lines, estimated_peak, chunked_bytes, chunk_rows=chunk_rows)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -299,14 +446,12 @@ def _survival_score_grid(train_times: np.ndarray) -> np.ndarray:
     vals = vals[np.isfinite(vals) & (vals > 0.0)]
     if vals.size == 0:
         return np.array([0.0, 1.0], dtype=float)
-    grid = np.unique(vals)
-    if grid.size > MAX_SURVIVAL_GRID_POINTS - 1:
-        probs = np.linspace(0.0, 1.0, MAX_SURVIVAL_GRID_POINTS - 1, dtype=float)
-        grid = np.unique(np.quantile(grid, probs, method="linear"))
-    if grid[0] > 0.0:
-        grid = np.concatenate([[0.0], grid])
-    else:
-        grid[0] = 0.0
+    median_followup = float(np.median(vals))
+    grid = np.unique(
+        np.asarray([0.0, *ROUTINE_SURVIVAL_HORIZONS, median_followup], dtype=float)
+    )
+    grid = grid[np.isfinite(grid) & (grid >= 0.0)]
+    grid[0] = 0.0
     if grid.size == 1:
         grid = np.array([0.0, max(float(grid[0]), 1.0)], dtype=float)
     return grid
@@ -1003,7 +1148,7 @@ def count_csv_rows(path: Path) -> int:
 
 
 def effective_marginal_slope_centers(spec: MethodSpec, train_rows: int) -> int:
-    centers = int(spec.centers or 50)
+    centers = int(spec.centers or 24)
     if spec.max_centers is not None:
         centers = min(centers, int(spec.max_centers))
     if train_rows >= 250000:
@@ -1097,6 +1242,15 @@ def run_rust_marginal_slope_classification(
     rust_bin = load_or_build_rust_binary()
     train_rows = count_csv_rows(train_csv)
     centers = effective_marginal_slope_centers(spec, train_rows)
+    preflight = preflight_marginal_slope_biobank(
+        n_train=train_rows,
+        d_pc=int(spec.pc_count),
+        centers=centers,
+        linkwiggle_knots=spec.mean_linkwiggle_knots,
+        scorewarp_knots=spec.logslope_linkwiggle_knots,
+    )
+    print("\n".join(preflight.lines), file=sys.stderr, flush=True)
+    preflight.require_pass()
     mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec, centers)
     z_column = spec.z_column or "pgs_std"
     model_path = out_dir / f"{spec.name}.model.json"
@@ -1296,6 +1450,16 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         )
     train_rows_raw = read_csv_rows(train_csv)
     test_rows_raw = read_csv_rows(test_csv)
+    prediction_preflight = preflight_survival_prediction(
+        n_rows=max(len(train_rows_raw), len(test_rows_raw)),
+        grid_points=len(
+            _survival_score_grid(
+                np.array([float(r["time"]) for r in train_rows_raw], dtype=float)
+            )
+        ),
+    )
+    print("\n".join(prediction_preflight.lines), file=sys.stderr, flush=True)
+    prediction_preflight.require_pass()
     horizon = survival_eval_horizon_from_rows(train_rows_raw)
     with tempfile.TemporaryDirectory(prefix="gam_biobank_survival_", dir=out_dir) as td:
         td_path = Path(td)

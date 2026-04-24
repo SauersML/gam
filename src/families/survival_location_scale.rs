@@ -2876,28 +2876,25 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
 
 /// Build row-wise Kronecker product: each row of the result is
 /// kron(cov_row[i,:], time_row[i,:]).
-/// Threshold (bytes) below which materializing the full rowwise-Kronecker design
-/// is cheaper than the implicit operator (avoids per-column dispatch overhead
-/// and enables BLAS-accelerated dense X'WX).
-const ROWWISE_KRONECKER_MATERIALIZE_THRESHOLD: usize = 64 * 1024 * 1024; // 64 MB
+fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) {
+    let bytes = n
+        .saturating_mul(p_resp)
+        .saturating_mul(p_cov)
+        .saturating_mul(std::mem::size_of::<f64>());
+    assert!(
+        bytes > 0,
+        "rowwise Kronecker design dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
+    );
+}
 
 fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> DesignMatrix {
     let n = cov_design.nrows();
     let p_cov = cov_design.ncols();
     let p_time = time_basis.ncols();
-    let bytes = n * p_cov * p_time * 8;
-    if bytes <= ROWWISE_KRONECKER_MATERIALIZE_THRESHOLD {
-        // Small enough to materialize: better cache locality + BLAS X'WX.
-        let op = RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
-            .expect("rowwise kronecker design should have matched row counts");
-        DesignMatrix::Dense(DenseDesignMatrix::from(op.to_dense()))
-    } else {
-        // Biobank scale: keep implicit.
-        DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
-            RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
-                .expect("rowwise kronecker design should have matched row counts"),
-        )))
-    }
+    assert_no_rowwise_kronecker_materialization(n, p_time, p_cov);
+    let op = RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
+        .expect("rowwise kronecker design should have matched row counts");
+    DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op)))
 }
 
 fn design_block_from_matrix(design: DesignMatrix) -> DesignBlock {
@@ -6546,49 +6543,49 @@ impl SurvivalLocationScaleFamily {
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_i_map = first_psi_linear_map(
             dir_i.x_t_exit_action.as_ref(),
-            &dir_i.x_t_exit_psi,
+            Some(&dir_i.x_t_exit_psi),
             self.n,
             x_threshold_exit.ncols(),
         );
         let x_t_entry_i_map = first_psi_linear_map(
             dir_i.x_t_entry_action.as_ref(),
-            &dir_i.x_t_entry_psi,
+            Some(&dir_i.x_t_entry_psi),
             self.n,
             x_threshold_entry.ncols(),
         );
         let x_ls_exit_i_map = first_psi_linear_map(
             dir_i.x_ls_exit_action.as_ref(),
-            &dir_i.x_ls_exit_psi,
+            Some(&dir_i.x_ls_exit_psi),
             self.n,
             x_log_sigma_exit.ncols(),
         );
         let x_ls_entry_i_map = first_psi_linear_map(
             dir_i.x_ls_entry_action.as_ref(),
-            &dir_i.x_ls_entry_psi,
+            Some(&dir_i.x_ls_entry_psi),
             self.n,
             x_log_sigma_entry.ncols(),
         );
         let x_t_exit_j_map = first_psi_linear_map(
             dir_j.x_t_exit_action.as_ref(),
-            &dir_j.x_t_exit_psi,
+            Some(&dir_j.x_t_exit_psi),
             self.n,
             x_threshold_exit.ncols(),
         );
         let x_t_entry_j_map = first_psi_linear_map(
             dir_j.x_t_entry_action.as_ref(),
-            &dir_j.x_t_entry_psi,
+            Some(&dir_j.x_t_entry_psi),
             self.n,
             x_threshold_entry.ncols(),
         );
         let x_ls_exit_j_map = first_psi_linear_map(
             dir_j.x_ls_exit_action.as_ref(),
-            &dir_j.x_ls_exit_psi,
+            Some(&dir_j.x_ls_exit_psi),
             self.n,
             x_log_sigma_exit.ncols(),
         );
         let x_ls_entry_j_map = first_psi_linear_map(
             dir_j.x_ls_entry_action.as_ref(),
-            &dir_j.x_ls_entry_psi,
+            Some(&dir_j.x_ls_entry_psi),
             self.n,
             x_log_sigma_entry.ncols(),
         );
@@ -7329,25 +7326,25 @@ impl SurvivalLocationScaleFamily {
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_map = first_psi_linear_map(
             dir.x_t_exit_action.as_ref(),
-            &dir.x_t_exit_psi,
+            Some(&dir.x_t_exit_psi),
             self.n,
             x_threshold_exit.ncols(),
         );
         let x_t_entry_map = first_psi_linear_map(
             dir.x_t_entry_action.as_ref(),
-            &dir.x_t_entry_psi,
+            Some(&dir.x_t_entry_psi),
             self.n,
             x_threshold_entry.ncols(),
         );
         let x_ls_exit_map = first_psi_linear_map(
             dir.x_ls_exit_action.as_ref(),
-            &dir.x_ls_exit_psi,
+            Some(&dir.x_ls_exit_psi),
             self.n,
             x_log_sigma_exit.ncols(),
         );
         let x_ls_entry_map = first_psi_linear_map(
             dir.x_ls_entry_action.as_ref(),
-            &dir.x_ls_entry_psi,
+            Some(&dir.x_ls_entry_psi),
             self.n,
             x_log_sigma_entry.ncols(),
         );

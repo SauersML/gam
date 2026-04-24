@@ -35,6 +35,53 @@ fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usi
         .ok_or_else(|| format!("{context}: dense size overflow for {nrows}x{ncols}"))
 }
 
+pub fn panic_or_error_if_biobank_mode_and_to_dense_called(
+    context: &str,
+    n: usize,
+    p: usize,
+) -> Result<(), String> {
+    let dense_bytes = checked_dense_nbytes(n, p, context)?;
+    if dense_bytes > MAX_DENSE_OPERATOR_TO_DENSE_BYTES {
+        let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        return Err(format!(
+            "{context}: refusing to densify operator-backed design {n}x{p} (~{gib:.2} GiB); use matrix-free or chunked code"
+        ));
+    }
+    Ok(())
+}
+
+pub fn panic_or_error_if_rowwise_kronecker_to_dense_called(
+    context: &str,
+    n: usize,
+    pa: usize,
+    pb: usize,
+) -> Result<(), String> {
+    let p = pa.checked_mul(pb).ok_or_else(|| {
+        format!("{context}: rowwise Kronecker column count overflow: {pa} x {pb}")
+    })?;
+    panic_or_error_if_biobank_mode_and_to_dense_called(context, n, p)
+}
+
+pub fn panic_or_error_if_derivative_dense_alloc_called(
+    context: &str,
+    n: usize,
+    p: usize,
+    d: usize,
+) -> Result<(), String> {
+    let dense_bytes = n
+        .checked_mul(p)
+        .and_then(|cells| cells.checked_mul(d))
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| format!("{context}: derivative dense size overflow for {d} x {n}x{p}"))?;
+    if dense_bytes > MAX_DENSE_OPERATOR_TO_DENSE_BYTES {
+        let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        return Err(format!(
+            "{context}: refusing to allocate {d} dense derivative matrices {n}x{p} (~{gib:.2} GiB); use implicit streaming derivatives"
+        ));
+    }
+    Ok(())
+}
+
 pub struct DenseRightProductView<'a> {
     base: &'a Array2<f64>,
     first: Option<&'a Array2<f64>>,
@@ -587,15 +634,11 @@ impl DenseDesignMatrix {
         match self {
             Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
             Self::Lazy(op) => {
-                let dense_bytes = checked_dense_nbytes(op.nrows(), op.ncols(), context)?;
-                if dense_bytes > MAX_DENSE_OPERATOR_TO_DENSE_BYTES {
-                    let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    return Err(format!(
-                        "{context}: refusing to densify operator-backed design {}x{} (~{gib:.2} GiB); use matrix-free or chunked code",
-                        op.nrows(),
-                        op.ncols()
-                    ));
-                }
+                panic_or_error_if_biobank_mode_and_to_dense_called(
+                    context,
+                    op.nrows(),
+                    op.ncols(),
+                )?;
                 Ok(op.to_dense_arc())
             }
         }
