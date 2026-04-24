@@ -7626,7 +7626,7 @@ impl PolyharmonicBlockCoeff {
     #[inline(always)]
     fn eval(&self, r: f64) -> f64 {
         if r <= 0.0 {
-            return polyharmonic_origin_value(self.c, self.power, self.is_log_case);
+            return self.origin_limit();
         }
         if self.is_log_case {
             self.c * r.powf(self.power) * r.max(1e-300).ln()
@@ -7634,30 +7634,19 @@ impl PolyharmonicBlockCoeff {
             self.c * r.powf(self.power)
         }
     }
+
+    #[inline(always)]
+    fn origin_limit(&self) -> f64 {
+        if self.is_log_case {
+            log_power_origin_limit(self.c, self.power, 1.0, 0.0)
+        } else {
+            log_power_origin_limit(self.c, self.power, 0.0, 1.0)
+        }
+    }
 }
 
 fn polyharmonic_kernel(r: f64, m: usize, k_dim: usize) -> f64 {
-    let k_half = 0.5 * k_dim as f64;
-    let power_i = 2_i64 * (m as i64) - (k_dim as i64);
-    let power_f = power_i as f64;
-    // Log case: k even and m >= k/2 (gamma pole in generic power form).
-    if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = polyharmonic_log_sign(m, k_dim)
-            / (2.0_f64.powi((2 * m - 1) as i32)
-                * std::f64::consts::PI.powf(k_half)
-                * gamma_lanczos(m as f64)
-                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
-        if r <= 0.0 {
-            return polyharmonic_origin_value(c, power_f, true);
-        }
-        return c * r.powf(power_f) * r.max(1e-300).ln();
-    }
-    let c = gamma_lanczos(k_half - m as f64)
-        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
-    if r <= 0.0 {
-        return polyharmonic_origin_value(c, power_f, false);
-    }
-    c * r.powf(power_f)
+    PolyharmonicBlockCoeff::new(m, k_dim).eval(r)
 }
 
 #[inline(always)]
@@ -7670,22 +7659,23 @@ fn signed_infinity(sign: f64) -> f64 {
 }
 
 #[inline(always)]
-fn polyharmonic_origin_value(c: f64, power: f64, is_log_case: bool) -> f64 {
-    if is_log_case {
-        if power > 0.0 {
-            0.0
+fn log_power_origin_limit(coeff: f64, exponent: f64, log_coeff: f64, pure_coeff: f64) -> f64 {
+    if log_coeff == 0.0 && pure_coeff == 0.0 {
+        return 0.0;
+    }
+    if exponent > 0.0 {
+        return 0.0;
+    }
+    if exponent == 0.0 {
+        if log_coeff != 0.0 {
+            signed_infinity(-coeff * log_coeff)
         } else {
-            // r^0 log(r) -> -inf; for negative powers the logarithm has the
-            // same sign-dominant divergence. Even-dimensional log cases have
-            // power >= 0, but keep the branch explicit for robustness.
-            signed_infinity(-c)
+            coeff * pure_coeff
         }
-    } else if power < 0.0 {
-        signed_infinity(c)
-    } else if power == 0.0 {
-        c
+    } else if log_coeff != 0.0 {
+        signed_infinity(-coeff * log_coeff)
     } else {
-        0.0
+        signed_infinity(coeff * pure_coeff)
     }
 }
 
@@ -7758,14 +7748,9 @@ fn polyharmonic_block_jet4(
             "polyharmonic distance must be finite and non-negative".to_string(),
         ));
     }
-    if r <= 0.0 {
-        return Ok((0.0, 0.0, 0.0, 0.0, 0.0));
-    }
 
     let k_half = 0.5 * k_dim as f64;
     let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
-    let r_safe = r.max(1e-300);
-    let log_r = r_safe.ln();
 
     if k_dim % 2 == 0 && m >= (k_dim / 2) {
         let c = polyharmonic_log_sign(m, k_dim)
@@ -7778,7 +7763,11 @@ fn polyharmonic_block_jet4(
             let e = alpha - d as f64;
             let ff = falling_factorial(alpha, d);
             let ff_d = falling_factorial_derivative(alpha, d);
-            out[d] = c * r_safe.powf(e) * (ff * log_r + ff_d);
+            out[d] = if r <= 0.0 {
+                log_power_origin_limit(c, e, ff, ff_d)
+            } else {
+                c * r.powf(e) * (ff * r.ln() + ff_d)
+            };
         }
         return Ok((out[0], out[1], out[2], out[3], out[4]));
     }
@@ -7788,7 +7777,12 @@ fn polyharmonic_block_jet4(
     let mut out = [0.0; 5];
     for d in 0..5 {
         let e = alpha - d as f64;
-        out[d] = c * falling_factorial(alpha, d) * r_safe.powf(e);
+        let ff = falling_factorial(alpha, d);
+        out[d] = if r <= 0.0 {
+            log_power_origin_limit(c, e, 0.0, ff)
+        } else {
+            c * ff * r.powf(e)
+        };
     }
     Ok((out[0], out[1], out[2], out[3], out[4]))
 }
@@ -7810,7 +7804,11 @@ fn log_power_family_value(
     log_coeff: f64,
     pure_coeff: f64,
 ) -> f64 {
-    coeff * r.powf(exponent) * (log_coeff * r.ln() + pure_coeff)
+    if r <= 0.0 {
+        log_power_origin_limit(coeff, exponent, log_coeff, pure_coeff)
+    } else {
+        coeff * r.powf(exponent) * (log_coeff * r.ln() + pure_coeff)
+    }
 }
 
 #[inline(always)]
@@ -7823,9 +7821,6 @@ fn duchon_polyharmonic_operator_block_jets(
         return Err(BasisError::InvalidInput(
             "polyharmonic distance must be finite and non-negative".to_string(),
         ));
-    }
-    if r <= 0.0 {
-        return Ok((0.0, 0.0, 0.0, 0.0));
     }
 
     let k_half = 0.5 * k_dim as f64;
@@ -17906,6 +17901,51 @@ mod tests {
             err.to_string().contains("D1 collocation"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_pure_duchon_rejects_divergent_laplacian_collocation() {
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let err = match build_duchon_collocation_operator_matrices(
+            centers.view(),
+            None,
+            None,
+            0,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("2D thin-plate Duchon collocation has no finite collision Laplacian"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("D2 collocation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pure_polyharmonic_origin_jets_preserve_derivative_singularities() {
+        let (_, _, tps_phi_rr) = polyharmonic_kernel_triplet(0.0, 2, 2).expect("thin-plate jet");
+        assert!(
+            tps_phi_rr.is_infinite() && tps_phi_rr.is_sign_negative(),
+            "2D thin-plate phi_rr(0) should diverge to -inf, got {tps_phi_rr}"
+        );
+        let (q, _, _, _) =
+            duchon_polyharmonic_operator_block_jets(0.0, 2, 2).expect("thin-plate operator jet");
+        assert!(
+            q.is_infinite() && q.is_sign_negative(),
+            "2D thin-plate phi_r/r at collision should diverge to -inf, got {q}"
+        );
+
+        let (_, gradient_first, gradient_second) =
+            polyharmonic_kernel_triplet(0.0, 2, 3).expect("3D first-derivative jet");
+        assert_abs_diff_eq!(
+            gradient_first,
+            -1.0 / (8.0 * std::f64::consts::PI),
+            epsilon = 1e-14
+        );
+        assert_abs_diff_eq!(gradient_second, 0.0, epsilon = 1e-14);
     }
 
     #[test]

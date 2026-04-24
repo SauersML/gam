@@ -5341,6 +5341,165 @@ impl DesignMatrix {
         }
     }
 
+    fn apply_transpose_view(&self, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                dense_transpose_matvec_view(matrix, vector)
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.apply_transpose(&vector.to_owned()),
+            Self::Sparse(matrix) => {
+                let mut output = Array1::<f64>::zeros(matrix.ncols());
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let mut acc = 0.0;
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        acc += values[idx] * vector[row_idx[idx]];
+                    }
+                    output[col] = acc;
+                }
+                output
+            }
+        }
+    }
+
+    fn compute_xtwx_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                Ok(dense_xtwx_view(matrix, weights))
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
+            Self::Sparse(xs) => {
+                let p = xs.ncols();
+                let mut xtwx = Array2::<f64>::zeros((p, p));
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..xs.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    let start = row_ptr[i];
+                    let end = row_ptr[i + 1];
+                    for a_ptr in start..end {
+                        let a = col_idx[a_ptr];
+                        let xa = vals[a_ptr];
+                        for b_ptr in a_ptr..end {
+                            let b = col_idx[b_ptr];
+                            let xb = vals[b_ptr];
+                            let v = wi * xa * xb;
+                            xtwx[[a, b]] += v;
+                            if a != b {
+                                xtwx[[b, a]] += v;
+                            }
+                        }
+                    }
+                }
+                Ok(xtwx)
+            }
+        }
+    }
+
+    fn diag_gram_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "diag_gram dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                Ok(dense_diag_gram_view(matrix, weights))
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_gram(&weights.to_owned()),
+            Self::Sparse(xs) => {
+                let p = xs.ncols();
+                let mut diag = Array1::<f64>::zeros(p);
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in diag_gram".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..xs.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for idx in row_ptr[i]..row_ptr[i + 1] {
+                        let j = col_idx[idx];
+                        let xij = vals[idx];
+                        diag[j] += wi * xij * xij;
+                    }
+                }
+                Ok(diag)
+            }
+        }
+    }
+
+    fn compute_xtwy_view(
+        &self,
+        weights: ArrayView1<'_, f64>,
+        y: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() || y.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.nrows()
+            ));
+        }
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                Ok(dense_transpose_weighted_response_view(matrix, weights, y))
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(op)) => {
+                op.compute_xtwy(&weights.to_owned(), &y.to_owned())
+            }
+            Self::Sparse(xs) => {
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in compute_xtwy".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                let mut out = Array1::<f64>::zeros(xs.ncols());
+                for i in 0..xs.nrows() {
+                    let scaled = weights[i].max(0.0) * y[i];
+                    if scaled == 0.0 {
+                        continue;
+                    }
+                    for idx in row_ptr[i]..row_ptr[i + 1] {
+                        out[col_idx[idx]] += vals[idx] * scaled;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     pub fn dot(&self, vector: &Array1<f64>) -> Array1<f64> {
         <Self as LinearOperator>::apply(self, vector)
     }
@@ -5526,8 +5685,9 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock, ReparamOperator, SparseDesignMatrix, SparseHessianAccumulator,
-        dense_matvec, dense_transpose_matvec, dense_transpose_weighted_response,
+        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, SparseDesignMatrix,
+        SparseHessianAccumulator, dense_matvec, dense_transpose_matvec,
+        dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -5636,6 +5796,69 @@ mod tests {
 
         let borrowed = op.as_dense_ref().expect("cached dense materialization");
         assert_eq!(borrowed, first.as_ref());
+    }
+
+    #[test]
+    fn multi_channel_operator_view_paths_match_stacked_dense_reference() {
+        let dense_channel = array![[1.0, 2.0], [0.5, -1.0], [3.0, 0.25]];
+        let sparse_dense = array![[0.0, 1.5], [2.0, 0.0], [-1.0, 0.75]];
+        let sparse = SparseColMat::try_new_from_triplets(
+            3,
+            2,
+            &[
+                Triplet::new(1, 0, 2.0),
+                Triplet::new(2, 0, -1.0),
+                Triplet::new(0, 1, 1.5),
+                Triplet::new(2, 1, 0.75),
+            ],
+        )
+        .expect("sparse channel");
+        let op = MultiChannelOperator::new(vec![
+            DesignMatrix::Dense(DenseDesignMatrix::from(dense_channel.clone())),
+            DesignMatrix::from(sparse),
+        ])
+        .expect("multi-channel operator");
+        let mut stacked = Array2::<f64>::zeros((6, 2));
+        stacked.slice_mut(s![0..3, ..]).assign(&dense_channel);
+        stacked.slice_mut(s![3..6, ..]).assign(&sparse_dense);
+
+        let beta = array![0.25, -0.4];
+        let expected_apply = stacked.dot(&beta);
+        let got_apply = op.apply(&beta);
+        for i in 0..expected_apply.len() {
+            assert!((expected_apply[i] - got_apply[i]).abs() < 1e-12);
+        }
+
+        let probe = array![0.5, -1.0, 0.25, 1.5, -0.75, 0.2];
+        let expected_transpose = stacked.t().dot(&probe);
+        let got_transpose = op.apply_transpose(&probe);
+        for i in 0..expected_transpose.len() {
+            assert!((expected_transpose[i] - got_transpose[i]).abs() < 1e-12);
+        }
+
+        let weights = array![1.0, -0.5, 0.75, 2.0, 0.25, 1.5];
+        let w_pos = weights.mapv(|w: f64| w.max(0.0));
+        let weighted = stacked.clone() * &w_pos.view().insert_axis(Axis(1));
+        let expected_xtwx = stacked.t().dot(&weighted);
+        let got_xtwx = op.diag_xtw_x(&weights).expect("multi-channel xtwx");
+        for i in 0..expected_xtwx.nrows() {
+            for j in 0..expected_xtwx.ncols() {
+                assert!((expected_xtwx[[i, j]] - got_xtwx[[i, j]]).abs() < 1e-12);
+            }
+        }
+
+        let expected_diag = Array1::from_iter((0..2).map(|j| expected_xtwx[[j, j]]));
+        let got_diag = op.diag_gram(&weights).expect("multi-channel diag gram");
+        for i in 0..expected_diag.len() {
+            assert!((expected_diag[i] - got_diag[i]).abs() < 1e-12);
+        }
+
+        let y = array![1.0, 0.5, -0.25, 2.0, -1.0, 0.75];
+        let expected_xtwy = stacked.t().dot(&(w_pos * &y));
+        let got_xtwy = op.compute_xtwy(&weights, &y).expect("multi-channel xtwy");
+        for i in 0..expected_xtwy.len() {
+            assert!((expected_xtwy[i] - got_xtwy[i]).abs() < 1e-12);
+        }
     }
 
     #[test]
