@@ -42,7 +42,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertEqual(lane["centers"], 24)
         self.assertTrue(lane["marginal_slope"])
         self.assertTrue(lane["scale_dimensions"])
-        self.assertEqual(lane["z_column"], "pgs_std")
+        self.assertEqual(lane["z_column"], "pgs_ctn_z")
 
     def test_marginal_slope_formula_supports_linkwiggle_and_scorewarp(self) -> None:
         spec = _RUNNER.MethodSpec(
@@ -53,14 +53,14 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             spatial_basis="duchon",
             marginal_slope=True,
             scale_dimensions=True,
-            z_column="pgs_std",
+            z_column="pgs_ctn_z",
             mean_linkwiggle_knots=8,
             logslope_linkwiggle_knots=7,
         )
         mean_formula, logslope_formula = _RUNNER.rust_marginal_slope_formula_classification(spec, centers=20)
         self.assertIn("duchon(pc1_std, pc2_std", mean_formula)
         self.assertIn("centers=20", mean_formula)
-        self.assertNotIn("pgs_std", mean_formula)
+        self.assertNotIn("pgs_ctn_z", mean_formula)
         self.assertIn("linkwiggle(internal_knots=8)", mean_formula)
         self.assertIn("linkwiggle(internal_knots=7)", logslope_formula)
 

@@ -1440,8 +1440,21 @@ def run_rust_marginal_slope_classification(
     )
     print("\n".join(preflight.lines), file=sys.stderr, flush=True)
     preflight.require_pass()
+    ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
+        rust_bin=rust_bin,
+        spec=spec,
+        train_csv=train_csv,
+        test_csv=test_csv,
+        out_dir=out_dir,
+        centers=centers,
+    )
+    print("\n".join(ctn_diagnostics), file=sys.stderr, flush=True)
     mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec, centers)
-    z_column = spec.z_column or "pgs_std"
+    z_column = spec.z_column or PGS_CTN_Z_COLUMN
+    if z_column != PGS_CTN_Z_COLUMN:
+        raise RuntimeError(
+            f"{spec.name} marginal-slope requires {PGS_CTN_Z_COLUMN}; got {z_column}"
+        )
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
     fit_cmd = [
@@ -1452,13 +1465,13 @@ def run_rust_marginal_slope_classification(
     ]
     if spec.scale_dimensions:
         fit_cmd.append("--scale-dimensions")
-    fit_cmd.extend([str(train_csv), mean_formula])
+    fit_cmd.extend([str(ctn_train_csv), mean_formula])
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     fit_sec = time.perf_counter() - t0
     if rc != 0:
         raise RuntimeError(err.strip() or out.strip() or f"{spec.name} marginal-slope fit failed")
-    pred_cmd = [str(rust_bin), "predict", str(model_path), str(test_csv), "--out", str(pred_path)]
+    pred_cmd = [str(rust_bin), "predict", str(model_path), str(ctn_test_csv), "--out", str(pred_path)]
     t1 = time.perf_counter()
     rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
     predict_sec = time.perf_counter() - t1
@@ -1466,8 +1479,8 @@ def run_rust_marginal_slope_classification(
         raise RuntimeError(err.strip() or out.strip() or f"{spec.name} marginal-slope predict failed")
     pred_rows = read_csv_rows(pred_path)
     pred = np.array([float(r["mean"]) for r in pred_rows], dtype=float)
-    y_train = csv_numeric_column(train_csv, "phenotype")
-    y_test = csv_numeric_column(test_csv, "phenotype")
+    y_train = csv_numeric_column(ctn_train_csv, "phenotype")
+    y_test = csv_numeric_column(ctn_test_csv, "phenotype")
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
     return {
         "fit_sec": fit_sec,
@@ -1477,7 +1490,7 @@ def run_rust_marginal_slope_classification(
         "model_spec": (
             f"Rust 16D {spec.spatial_basis} marginal-slope"
             f"{' aniso' if spec.scale_dimensions else ''}"
-            f" (z={z_column}, centers={centers}) holdout"
+            f" (z={z_column}, CTN=train-only transformation-normal, centers={centers}) holdout"
         ),
     }
 
