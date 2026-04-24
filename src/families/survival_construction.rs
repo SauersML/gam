@@ -1789,6 +1789,61 @@ fn survival_cumulative_and_instant_hazard(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MarginalSlopeBaselinePoint {
+    instant_hazard: f64,
+    q: f64,
+    q_t: f64,
+}
+
+fn evaluate_marginal_slope_baseline_point(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<MarginalSlopeBaselinePoint>, String> {
+    let Some((cumulative_hazard, instant_hazard)) =
+        survival_cumulative_and_instant_hazard(age, cfg)?
+    else {
+        return Ok(None);
+    };
+    if !(cumulative_hazard.is_finite() && cumulative_hazard > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive cumulative hazard",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    if !(instant_hazard.is_finite() && instant_hazard > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive instant hazard",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let survival = (-cumulative_hazard).exp();
+    if !(survival.is_finite() && survival > 0.0 && survival < 1.0) {
+        return Err(format!(
+            "{} marginal-slope baseline survival must be strictly inside (0,1), got {survival}",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let q = -standard_normal_quantile(survival).map_err(|e| {
+        format!(
+            "{} marginal-slope baseline failed to invert survival probability {survival}: {e}",
+            survival_baseline_targetname(cfg.target)
+        )
+    })?;
+    let phi_q = normal_pdf(q);
+    if !(phi_q.is_finite() && phi_q > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive probit density phi(q)={phi_q} at q={q}",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    Ok(Some(MarginalSlopeBaselinePoint {
+        instant_hazard,
+        q,
+        q_t: instant_hazard * survival / phi_q,
+    }))
+}
+
 /// Evaluate the parametric baseline target at a given age.
 /// Returns `(eta_target(age), d eta_target / d age)` on the log-cumulative-hazard scale.
 pub fn evaluate_survival_baseline(
@@ -1851,44 +1906,11 @@ pub fn evaluate_survival_marginal_slope_baseline(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<(f64, f64), String> {
-    let Some((cumulative_hazard, instant_hazard)) =
-        survival_cumulative_and_instant_hazard(age, cfg)?
+    let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)?
     else {
         return Ok((0.0, 0.0));
     };
-    if !(cumulative_hazard.is_finite() && cumulative_hazard > 0.0) {
-        return Err(format!(
-            "{} marginal-slope baseline produced non-positive cumulative hazard",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    if !(instant_hazard.is_finite() && instant_hazard > 0.0) {
-        return Err(format!(
-            "{} marginal-slope baseline produced non-positive instant hazard",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    let survival = (-cumulative_hazard).exp();
-    if !(survival.is_finite() && survival > 0.0 && survival < 1.0) {
-        return Err(format!(
-            "{} marginal-slope baseline survival must be strictly inside (0,1), got {survival}",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    let q = -standard_normal_quantile(survival).map_err(|e| {
-        format!(
-            "{} marginal-slope baseline failed to invert survival probability {survival}: {e}",
-            survival_baseline_targetname(cfg.target)
-        )
-    })?;
-    let phi_q = normal_pdf(q);
-    if !(phi_q.is_finite() && phi_q > 0.0) {
-        return Err(format!(
-            "{} marginal-slope baseline produced non-positive probit density phi(q)={phi_q} at q={q}",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    Ok((q, instant_hazard * survival / phi_q))
+    Ok((point.q, point.q_t))
 }
 
 /// Partial derivatives of the true survival marginal-slope probit offsets
@@ -1907,54 +1929,21 @@ pub fn marginal_slope_baseline_offset_theta_partials(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<Option<Vec<(f64, f64)>>, String> {
-    let Some((cumulative_hazard, instant_hazard)) =
-        survival_cumulative_and_instant_hazard(age, cfg)?
-    else {
+    let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)? else {
         return Ok(None);
     };
-    if !(cumulative_hazard.is_finite() && cumulative_hazard > 0.0) {
-        return Err(format!(
-            "{} marginal-slope baseline produced non-positive cumulative hazard",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    if !(instant_hazard.is_finite() && instant_hazard > 0.0) {
-        return Err(format!(
-            "{} marginal-slope baseline produced non-positive instant hazard",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    let survival = (-cumulative_hazard).exp();
-    if !(survival.is_finite() && survival > 0.0 && survival < 1.0) {
-        return Err(format!(
-            "{} marginal-slope baseline survival must be strictly inside (0,1), got {survival}",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
-    let q = -standard_normal_quantile(survival).map_err(|e| {
-        format!(
-            "{} marginal-slope baseline failed to invert survival probability {survival}: {e}",
-            survival_baseline_targetname(cfg.target)
-        )
-    })?;
-    let phi_q = normal_pdf(q);
-    if !(phi_q.is_finite() && phi_q > 0.0) {
-        return Err(format!(
-            "{} marginal-slope baseline produced non-positive probit density phi(q)={phi_q} at q={q}",
-            survival_baseline_targetname(cfg.target)
-        ));
-    }
     let hazard_partials = survival_hazard_theta_partials(age, cfg)?
         .ok_or_else(|| "unexpected missing hazard partials for nonlinear baseline".to_string())?;
-    let a = survival / phi_q;
-    let a_log_derivative_factor = q * a - 1.0;
+    let a = point.q_t / point.instant_hazard;
+    let a_log_derivative_factor = point.q * a - 1.0;
     Ok(Some(
         hazard_partials
             .into_iter()
             .map(|(d_h_cum, d_h_inst)| {
                 (
                     a * d_h_cum,
-                    a * (d_h_inst + instant_hazard * a_log_derivative_factor * d_h_cum),
+                    a * (d_h_inst
+                        + point.instant_hazard * a_log_derivative_factor * d_h_cum),
                 )
             })
             .collect(),

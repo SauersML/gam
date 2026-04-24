@@ -2193,10 +2193,11 @@ impl StreamingRadialState {
             StreamingAxisMode::PerAxis { eta } => {
                 let dim = eta.len();
                 debug_assert_eq!(s_buf.len(), dim);
+                let eta_mean = centered_aniso_log_scale_mean(eta);
                 let mut r2 = 0.0;
                 for a in 0..dim {
                     let h = self.data[[i, a]] - self.centers[[j, a]];
-                    let w = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
+                    let w = aniso_metric_weight(eta[a], eta_mean);
                     let s_a = w * h * h;
                     s_buf[a] = s_a;
                     r2 += s_a;
@@ -2205,10 +2206,11 @@ impl StreamingRadialState {
             }
             StreamingAxisMode::ScalarTotal { eta } => {
                 debug_assert_eq!(s_buf.len(), 1);
+                let eta_mean = centered_aniso_log_scale_mean(eta);
                 let mut r2 = 0.0;
                 for a in 0..eta.len() {
                     let h = self.data[[i, a]] - self.centers[[j, a]];
-                    let w = (2.0 * eta[a].clamp(-50.0, 50.0)).exp();
+                    let w = aniso_metric_weight(eta[a], eta_mean);
                     r2 += w * h * h;
                 }
                 s_buf[0] = r2;
