@@ -16022,7 +16022,7 @@ mod tests {
             let x1 = (i as f64 * 0.19).cos();
             data[[i, 0]] = x0;
             data[[i, 1]] = x1;
-            let eta = -0.35 + 0.9 * x0 - 0.55 * x1 + 0.25 * (6.0 * x0).sin();
+            let eta = -0.15 + 0.45 * x0 - 0.25 * x1 + 0.10 * (6.0 * x0).sin();
             let mu = 1.0 / (1.0 + (-eta).exp());
             let u = (((i * 37 + 17) % 101) as f64 + 0.5) / 101.0;
             y[i] = if u < mu { 1.0 } else { 0.0 };
