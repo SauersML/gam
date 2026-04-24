@@ -10,9 +10,9 @@ use ndarray::ArrayView1;
 
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
-    default_num_centers, default_spatial_center_strategy,
+    DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
+    default_spatial_center_strategy,
     minimum_duchon_power_for_operator_penalties,
 };
 use crate::inference::data::EncodedDataset as Dataset;
