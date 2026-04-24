@@ -1865,6 +1865,8 @@ const IMPLICIT_OPERATOR_MEMORY_THRESHOLD: usize = 1_000_000_000; // 1 GB
 /// Memory threshold (in bytes) above which spatial kernel designs switch to a
 /// lazy chunked operator instead of dense n×p materialization.
 const SPATIAL_LAZY_DESIGN_MEMORY_THRESHOLD: usize = 256 * 1024 * 1024; // 256 MiB
+const SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
 
 /// Determine whether implicit operators should be used based on problem size.
@@ -1877,6 +1879,46 @@ pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
     // the cross-t matrix and s_components. Conservative estimate: 3*D matrices.
     let dense_bytes = 3 * n * p * d * 8;
     dense_bytes > IMPLICIT_OPERATOR_MEMORY_THRESHOLD
+}
+
+pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
+    let first = dense_design_bytes(n, p).saturating_mul(d_pc);
+    let second = dense_design_bytes(n, p).saturating_mul(d_pc.saturating_mul(d_pc));
+    panic!(
+        "spatial PC Duchon derivative designs must remain operator-backed; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB)",
+        first as f64 / (1024.0 * 1024.0),
+        second as f64 / (1024.0 * 1024.0),
+    );
+}
+
+pub fn assert_spatial_centers_below_biobank_cap(
+    n: usize,
+    d_pc: usize,
+    centers: ArrayView2<'_, f64>,
+) {
+    assert_eq!(
+        centers.ncols(),
+        d_pc,
+        "spatial PC center dimension mismatch: centers have {} columns, expected {d_pc}",
+        centers.ncols()
+    );
+    let k = centers.nrows();
+    let centers_bytes = dense_design_bytes(k, d_pc);
+    let center_center_bytes = dense_design_bytes(k, k);
+    let data_center_bytes = dense_design_bytes(n, k);
+    assert!(
+        center_center_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
+        "spatial PC centers exceed center-center biobank cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
+        center_center_bytes as f64 / (1024.0 * 1024.0),
+        SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
+    );
+    assert!(
+        data_center_bytes <= SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES
+            || centers_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
+        "spatial PC centers exceed persistent-object cap: n={n}, K={k}, d_pc={d_pc}, centers={:.1} MiB, optional n*K cache={:.1} MiB",
+        centers_bytes as f64 / (1024.0 * 1024.0),
+        data_center_bytes as f64 / (1024.0 * 1024.0),
+    );
 }
 
 fn dense_design_bytes(n: usize, p: usize) -> usize {
@@ -2101,6 +2143,14 @@ impl RadialScalarKind {
                 ..
             } => duchon_scaling_exponent(*p_order, *s_order, *dim) / *dim as f64,
         }
+    }
+
+    #[inline]
+    fn is_duchon_family(&self) -> bool {
+        matches!(
+            self,
+            RadialScalarKind::Duchon { .. } | RadialScalarKind::PureDuchon { .. }
+        )
     }
 }
 
@@ -3657,7 +3707,8 @@ fn build_aniso_design_psi_derivatives_shared(
         )));
     }
 
-    let use_implicit = should_use_implicit_operators(n, p_final, dim);
+    let force_operator = radial_kind.is_duchon_family();
+    let use_implicit = force_operator || should_use_implicit_operators(n, p_final, dim);
 
     // ── Streaming path: biobank scale ─────────────────────────────────────
     // When dense materialization would exceed the memory threshold, build a
@@ -3686,7 +3737,11 @@ fn build_aniso_design_psi_derivatives_shared(
         });
     }
 
-    // ── Materialized path: small-to-medium problems ───────────────────────
+    if force_operator {
+        assert_no_dense_derivative_materialization(n, p_final, dim);
+    }
+
+    // ── Materialized path: small-to-medium non-Duchon problems ────────────
     // Allocate O(n*k) arrays up front and fill with parallel chunks that
     // write directly into preallocated storage via raw pointers. No
     // intermediate Vec<(i, q_row, t_row, s_row)> collection.
@@ -3810,7 +3865,8 @@ fn build_scalar_design_psi_derivatives_shared(
         )));
     }
 
-    if should_use_implicit_operators(n, p_final, 1) {
+    let force_operator = radial_kind.is_duchon_family();
+    if force_operator || should_use_implicit_operators(n, p_final, 1) {
         let metric_eta = fixed_eta
             .map(|eta| eta.to_vec())
             .unwrap_or_else(|| vec![0.0; dim]);
@@ -3829,6 +3885,10 @@ fn build_scalar_design_psi_derivatives_shared(
             design_second_diag: Array2::<f64>::zeros((0, 0)),
             implicit_operator: Some(op),
         });
+    }
+
+    if force_operator {
+        assert_no_dense_derivative_materialization(n, p_final, 1);
     }
 
     let nk = n * k;
@@ -8646,15 +8706,18 @@ struct SpatialDistanceCacheKey {
 struct SpatialDistanceCacheEntry {
     data_center_r: Arc<Array2<f64>>,
     center_center_r: Arc<Array2<f64>>,
+    bytes: usize,
 }
 
 #[derive(Default, Clone, Debug)]
 struct SpatialDistanceCache {
     map: HashMap<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
     order: Vec<SpatialDistanceCacheKey>,
+    bytes: usize,
 }
 
-const SPATIAL_DISTANCE_CACHE_MAX_ENTRIES: usize = 12;
+const SPATIAL_DISTANCE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -8688,7 +8751,7 @@ struct OwnedDataCache {
     order: Vec<OwnedDataCacheKey>,
 }
 
-const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 8;
+const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
 
 #[derive(Default, Clone, Debug)]
 struct BasisCacheContext {
@@ -8758,6 +8821,45 @@ fn compute_center_center_distances(centers: ArrayView2<'_, f64>) -> Array2<f64> 
     distances
 }
 
+#[inline(always)]
+fn spatial_distance_data_center_bytes(n: usize, k: usize) -> usize {
+    n.saturating_mul(k)
+        .saturating_mul(std::mem::size_of::<f64>())
+}
+
+#[inline(always)]
+fn spatial_distance_cache_entry_bytes(n: usize, k: usize) -> usize {
+    spatial_distance_data_center_bytes(n, k).saturating_add(
+        k.saturating_mul(k)
+            .saturating_mul(std::mem::size_of::<f64>()),
+    )
+}
+
+#[inline(always)]
+fn spatial_distance_cacheable_entry(n: usize, k: usize) -> bool {
+    spatial_distance_data_center_bytes(n, k) <= SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
+}
+
+fn insert_spatial_distance_cache_entry(
+    cache: &mut SpatialDistanceCache,
+    key: SpatialDistanceCacheKey,
+    entry: SpatialDistanceCacheEntry,
+) {
+    cache.bytes = cache.bytes.saturating_add(entry.bytes);
+    cache.map.insert(key, entry);
+    cache.order.push(key);
+
+    while cache.bytes > SPATIAL_DISTANCE_CACHE_MAX_BYTES {
+        if cache.order.is_empty() {
+            break;
+        }
+        let oldkey = cache.order.remove(0);
+        if let Some(removed) = cache.map.remove(&oldkey) {
+            cache.bytes = cache.bytes.saturating_sub(removed.bytes);
+        }
+    }
+}
+
 fn spatial_distance_matrices(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -8765,7 +8867,9 @@ fn spatial_distance_matrices(
 ) -> Result<(Arc<Array2<f64>>, Arc<Array2<f64>>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
-    if n.saturating_mul(k) < SPATIAL_DISTANCE_CACHE_MIN_PAIRS {
+    if n.saturating_mul(k) < SPATIAL_DISTANCE_CACHE_MIN_PAIRS
+        || !spatial_distance_cacheable_entry(n, k)
+    {
         let dc = Arc::new(compute_data_center_distances(data, centers)?);
         let cc = Arc::new(compute_center_center_distances(centers));
         return Ok((dc, cc));
@@ -8792,21 +8896,15 @@ fn spatial_distance_matrices(
     if let Some(hit) = cache.spatial_distance.map.get(&key) {
         return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
     }
-    cache.spatial_distance.map.insert(
+    insert_spatial_distance_cache_entry(
+        &mut cache.spatial_distance,
         key,
         SpatialDistanceCacheEntry {
             data_center_r: computed_dc.clone(),
             center_center_r: computed_cc.clone(),
+            bytes: spatial_distance_cache_entry_bytes(n, k),
         },
     );
-    cache.spatial_distance.order.push(key);
-    while cache.spatial_distance.map.len() > SPATIAL_DISTANCE_CACHE_MAX_ENTRIES {
-        if cache.spatial_distance.order.is_empty() {
-            break;
-        }
-        let oldkey = cache.spatial_distance.order.remove(0);
-        cache.spatial_distance.map.remove(&oldkey);
-    }
     Ok((computed_dc, computed_cc))
 }
 
@@ -15275,6 +15373,75 @@ mod tests {
     }
 
     #[test]
+    fn owned_data_cache_keeps_two_entries() {
+        let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).expect("first data");
+        let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).expect("second data");
+        let third =
+            Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
+        let mut cache = BasisCacheContext::default();
+
+        let _ = shared_owned_data_matrix(first.view(), &mut cache);
+        let _ = shared_owned_data_matrix(second.view(), &mut cache);
+        let _ = shared_owned_data_matrix(third.view(), &mut cache);
+
+        assert_eq!(cache.owned_data.map.len(), 2);
+    }
+
+    #[test]
+    fn spatial_distance_cacheability_is_byte_capped() {
+        let n = 400_000;
+
+        assert_eq!(spatial_distance_data_center_bytes(n, 24), 76_800_000);
+        assert_eq!(spatial_distance_data_center_bytes(n, 32), 102_400_000);
+        assert_eq!(spatial_distance_data_center_bytes(n, 64), 204_800_000);
+        assert_eq!(spatial_distance_data_center_bytes(n, 128), 409_600_000);
+        assert_eq!(spatial_distance_data_center_bytes(n, 1400), 4_480_000_000);
+
+        assert!(spatial_distance_cacheable_entry(n, 24));
+        assert!(spatial_distance_cacheable_entry(n, 32));
+        assert!(spatial_distance_cacheable_entry(n, 64));
+        assert!(!spatial_distance_cacheable_entry(n, 128));
+        assert!(!spatial_distance_cacheable_entry(n, 1400));
+    }
+
+    #[test]
+    fn spatial_distance_cache_evicts_by_total_bytes() {
+        fn key(id: usize) -> SpatialDistanceCacheKey {
+            SpatialDistanceCacheKey {
+                datarows: id,
+                data_cols: 1,
+                data_ptr: id,
+                data_stride0: 1,
+                data_stride1: 1,
+                centersrows: 1,
+                centers_cols: 1,
+                centers_hash: id as u64,
+            }
+        }
+
+        fn entry(bytes: usize) -> SpatialDistanceCacheEntry {
+            SpatialDistanceCacheEntry {
+                data_center_r: Arc::new(Array2::zeros((1, 1))),
+                center_center_r: Arc::new(Array2::zeros((1, 1))),
+                bytes,
+            }
+        }
+
+        let mut cache = SpatialDistanceCache::default();
+        let entry_bytes = 200 * 1024 * 1024;
+
+        insert_spatial_distance_cache_entry(&mut cache, key(1), entry(entry_bytes));
+        insert_spatial_distance_cache_entry(&mut cache, key(2), entry(entry_bytes));
+        insert_spatial_distance_cache_entry(&mut cache, key(3), entry(entry_bytes));
+
+        assert_eq!(cache.bytes, 2 * entry_bytes);
+        assert_eq!(cache.map.len(), 2);
+        assert!(!cache.map.contains_key(&key(1)));
+        assert!(cache.map.contains_key(&key(2)));
+        assert!(cache.map.contains_key(&key(3)));
+    }
+
+    #[test]
     fn test_knot_generation_uniform() {
         let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
         // 3 internal + 2 * (2+1) boundary = 9 knots
@@ -19560,6 +19727,7 @@ mod tests {
         build_duchon_basis(data.view(), &spec)
             .expect("pure Duchon basis")
             .design
+            .to_dense()
     }
 
     fn perturb_contrast_eta(base_eta: &[f64], perturbations: &[(usize, f64)]) -> Vec<f64> {

@@ -5,19 +5,30 @@ use crate::quadrature::compute_gauss_hermite_n;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2};
 
+fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 {
+    let mut total = 0.0;
+    for (left_power, &left_coeff) in left.iter().enumerate() {
+        for (right_power, &right_coeff) in right.iter().enumerate() {
+            let power = left_power + right_power + 1;
+            total += left_coeff * right_coeff * width.powi(power as i32) / power as f64;
+        }
+    }
+    total
+}
+
 /// Precomputed per-span polynomial coefficient matrices for a structurally
 /// monotone anchored deviation basis.
 ///
-/// Free coefficients are quadratic Bernstein control values for the deviation
+/// Raw coefficients are quadratic Bernstein control values for the deviation
 /// derivative `w'(x)`: interior endpoint controls shared across adjacent spans,
-/// plus one midpoint control per span.  The left and right endpoint controls
+/// plus one midpoint control per span. The left and right endpoint controls
 /// are fixed at `0`, so `w(x)` has constant tails and zero still means the
-/// identity map.
+/// identity map. The fitted coefficients live in the configured moment-anchor
+/// nullspace and are mapped back to these raw controls for monotonicity.
 ///
 /// On each knot span `w'(x)` is a quadratic Bernstein polynomial, so `w(x)` is
 /// truly piecewise cubic.  Exact monotonicity of the full transform `x + w(x)`
-/// is guaranteed by lower bounds on every derivative control value:
-/// `beta_j >= monotonicity_eps - 1`.
+/// is guaranteed by lower bounds on every raw derivative control value.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
     degree: usize,
@@ -35,6 +46,135 @@ pub struct DeviationRuntime {
     /// Used for constant-tail continuation outside support: the deviation
     /// saturates at this value for all z > right endpoint.
     right_boundary_value_row: Array1<f64>,
+}
+
+enum DeviationMomentAnchor<'a> {
+    StandardNormal,
+    Empirical(&'a Array1<f64>),
+}
+
+fn anchor_coefficient_nullspace(
+    endpoint_points: &Array1<f64>,
+    raw_span_c0: &Array2<f64>,
+    raw_span_c1: &Array2<f64>,
+    raw_span_c2: &Array2<f64>,
+    raw_span_c3: &Array2<f64>,
+    raw_right_boundary_value_row: &Array1<f64>,
+    anchor: DeviationMomentAnchor<'_>,
+) -> Result<Array2<f64>, String> {
+    let raw_dim = raw_span_c0.ncols();
+    let mut c = Array2::<f64>::zeros((2, raw_dim));
+    match anchor {
+        DeviationMomentAnchor::StandardNormal => {
+            let rule = compute_gauss_hermite_n(51);
+            let inv_sqrt_pi = std::f64::consts::PI.sqrt().recip();
+            for (&node, &weight) in rule.nodes.iter().zip(rule.weights.iter()) {
+                let z = std::f64::consts::SQRT_2 * node;
+                let row = raw_design_row(
+                    z,
+                    endpoint_points,
+                    raw_span_c0,
+                    raw_span_c1,
+                    raw_span_c2,
+                    raw_span_c3,
+                    raw_right_boundary_value_row,
+                )?;
+                let w = weight * inv_sqrt_pi;
+                for j in 0..raw_dim {
+                    c[[0, j]] += w * row[j];
+                    c[[1, j]] += w * z * row[j];
+                }
+            }
+        }
+        DeviationMomentAnchor::Empirical(values) => {
+            if values.is_empty() {
+                return Err(
+                    "deviation empirical moment anchor requires at least one value".to_string(),
+                );
+            }
+            let inv_n = 1.0 / values.len() as f64;
+            for (idx, &q) in values.iter().enumerate() {
+                if !q.is_finite() {
+                    return Err(format!(
+                        "deviation empirical moment anchor value at row {idx} is non-finite ({q})"
+                    ));
+                }
+                let row = raw_design_row(
+                    q,
+                    endpoint_points,
+                    raw_span_c0,
+                    raw_span_c1,
+                    raw_span_c2,
+                    raw_span_c3,
+                    raw_right_boundary_value_row,
+                )?;
+                for j in 0..raw_dim {
+                    c[[0, j]] += inv_n * row[j];
+                    c[[1, j]] += inv_n * q * row[j];
+                }
+            }
+        }
+    }
+    let (z, rank) = rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha())
+        .map_err(|e| format!("deviation moment anchor RRQR failed: {e}"))?;
+    if rank >= raw_dim || z.ncols() == 0 {
+        return Err(
+            "deviation moment anchor constraints removed all columns; increase basis richness"
+                .to_string(),
+        );
+    }
+    Ok(z)
+}
+
+fn raw_design_row(
+    value: f64,
+    endpoint_points: &Array1<f64>,
+    raw_span_c0: &Array2<f64>,
+    raw_span_c1: &Array2<f64>,
+    raw_span_c2: &Array2<f64>,
+    raw_span_c3: &Array2<f64>,
+    raw_right_boundary_value_row: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    if !value.is_finite() {
+        return Err(format!(
+            "deviation moment anchor design value is non-finite ({value})"
+        ));
+    }
+    let raw_dim = raw_span_c0.ncols();
+    let left_ep = endpoint_points[0];
+    let right_ep = endpoint_points[endpoint_points.len() - 1];
+    if value < left_ep {
+        return Ok(raw_span_c0.row(0).to_owned());
+    }
+    if value > right_ep {
+        return Ok(raw_right_boundary_value_row.to_owned());
+    }
+    let mut span_idx = span_index_for_breakpoints(
+        endpoint_points
+            .as_slice()
+            .ok_or_else(|| "deviation moment anchor breakpoints are not contiguous".to_string())?,
+        value,
+        "deviation moment anchor span lookup",
+    )?;
+    if span_idx > 0 && value == endpoint_points[span_idx] {
+        span_idx -= 1;
+    }
+    let t = value - endpoint_points[span_idx];
+    let mut out = Array1::<f64>::zeros(raw_dim);
+    for j in 0..raw_dim {
+        out[j] = raw_span_c0[[span_idx, j]]
+            + raw_span_c1[[span_idx, j]] * t
+            + raw_span_c2[[span_idx, j]] * t * t
+            + raw_span_c3[[span_idx, j]] * t * t * t;
+    }
+    Ok(out)
+}
+
+pub(crate) fn transform_deviation_penalty(
+    penalty: &Array2<f64>,
+    transform: &Array2<f64>,
+) -> Array2<f64> {
+    fast_ab(&fast_atb(transform, penalty), transform)
 }
 
 impl DeviationRuntime {
@@ -88,12 +228,12 @@ impl DeviationRuntime {
         let n_spans = endpoint_points.len() - 1;
         let interior_endpoint_controls = endpoint_points.len() - 2;
         let midpoint_control_offset = interior_endpoint_controls;
-        let basis_dim = interior_endpoint_controls + n_spans;
-        let mut span_c0 = Array2::<f64>::zeros((n_spans, basis_dim));
-        let mut span_c1 = Array2::<f64>::zeros((n_spans, basis_dim));
-        let mut span_c2 = Array2::<f64>::zeros((n_spans, basis_dim));
-        let mut span_c3 = Array2::<f64>::zeros((n_spans, basis_dim));
-        let mut right_boundary_value_row = Array1::<f64>::zeros(basis_dim);
+        let raw_basis_dim = interior_endpoint_controls + n_spans;
+        let mut raw_span_c0 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
+        let mut raw_span_c1 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
+        let mut raw_span_c2 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
+        let mut raw_span_c3 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
+        let mut raw_right_boundary_value_row = Array1::<f64>::zeros(raw_basis_dim);
 
         for span_idx in 0..n_spans {
             let left = endpoint_points[span_idx];
@@ -121,23 +261,40 @@ impl DeviationRuntime {
             }
 
             for &(basis_idx, c1, c2, c3) in &active_controls {
-                span_c1[[span_idx, basis_idx]] = c1;
-                span_c2[[span_idx, basis_idx]] = c2;
-                span_c3[[span_idx, basis_idx]] = c3;
+                raw_span_c1[[span_idx, basis_idx]] = c1;
+                raw_span_c2[[span_idx, basis_idx]] = c2;
+                raw_span_c3[[span_idx, basis_idx]] = c3;
             }
 
-            for basis_idx in 0..basis_dim {
-                let full_span_integral = (span_c1[[span_idx, basis_idx]] * width
-                    + span_c2[[span_idx, basis_idx]] * width * width
-                    + span_c3[[span_idx, basis_idx]] * width * width * width)
+            for basis_idx in 0..raw_basis_dim {
+                let full_span_integral = (raw_span_c1[[span_idx, basis_idx]] * width
+                    + raw_span_c2[[span_idx, basis_idx]] * width * width
+                    + raw_span_c3[[span_idx, basis_idx]] * width * width * width)
                     / 1.0;
-                let next_value = right_boundary_value_row[basis_idx] + full_span_integral;
+                let next_value = raw_right_boundary_value_row[basis_idx] + full_span_integral;
                 if span_idx + 1 < n_spans {
-                    span_c0[[span_idx + 1, basis_idx]] = next_value;
+                    raw_span_c0[[span_idx + 1, basis_idx]] = next_value;
                 }
-                right_boundary_value_row[basis_idx] = next_value;
+                raw_right_boundary_value_row[basis_idx] = next_value;
             }
         }
+
+        let coefficient_transform = anchor_coefficient_nullspace(
+            &endpoint_points,
+            &raw_span_c0,
+            &raw_span_c1,
+            &raw_span_c2,
+            &raw_span_c3,
+            &raw_right_boundary_value_row,
+            anchor,
+        )?;
+        let basis_dim = coefficient_transform.ncols();
+        let span_c0 = fast_ab(&raw_span_c0, &coefficient_transform);
+        let span_c1 = fast_ab(&raw_span_c1, &coefficient_transform);
+        let span_c2 = fast_ab(&raw_span_c2, &coefficient_transform);
+        let span_c3 = fast_ab(&raw_span_c3, &coefficient_transform);
+        let right_boundary_value_row = raw_right_boundary_value_row.dot(&coefficient_transform);
+        let monotonicity_constraint_rows = coefficient_transform.clone();
 
         Ok(Self {
             degree: 3,
@@ -149,6 +306,8 @@ impl DeviationRuntime {
             span_c1,
             span_c2,
             span_c3,
+            coefficient_transform,
+            monotonicity_constraint_rows,
             right_boundary_value_row,
         })
     }
@@ -185,6 +344,10 @@ impl DeviationRuntime {
 
     pub fn span_c3(&self) -> &Array2<f64> {
         &self.span_c3
+    }
+
+    pub(crate) fn coefficient_transform(&self) -> &Array2<f64> {
+        &self.coefficient_transform
     }
 
     // ── design evaluation ──
@@ -278,14 +441,52 @@ impl DeviationRuntime {
         self.evaluate_span_polynomial_design(values, 4)
     }
 
-    pub(crate) fn structural_monotonicity_constraints(&self) -> LinearInequalityConstraints {
-        let mut a = Array2::<f64>::zeros((self.basis_dim, self.basis_dim));
-        for idx in 0..self.basis_dim {
-            a[[idx, idx]] = 1.0;
+    pub(crate) fn integrated_derivative_penalty(
+        &self,
+        derivative_order: usize,
+    ) -> Result<Array2<f64>, String> {
+        if derivative_order > self.value_span_degree {
+            return Err(format!(
+                "deviation penalty derivative order {derivative_order} exceeds value-basis degree {}",
+                self.value_span_degree
+            ));
         }
+        let mut penalty = Array2::<f64>::zeros((self.basis_dim, self.basis_dim));
+        for span_idx in 0..self.span_count() {
+            let (left, right) = self.span_interval(span_idx)?;
+            let width = right - left;
+            if !width.is_finite() || width <= 0.0 {
+                return Err(format!(
+                    "deviation penalty span {span_idx} has invalid width {width}"
+                ));
+            }
+            for i in 0..self.basis_dim {
+                let ci =
+                    self.span_derivative_polynomial_coefficients(span_idx, i, derivative_order)?;
+                for j in i..self.basis_dim {
+                    let cj = self.span_derivative_polynomial_coefficients(
+                        span_idx,
+                        j,
+                        derivative_order,
+                    )?;
+                    let contribution = integrate_polynomial_product(&ci, &cj, width);
+                    penalty[[i, j]] += contribution;
+                    if i != j {
+                        penalty[[j, i]] += contribution;
+                    }
+                }
+            }
+        }
+        Ok(penalty)
+    }
+
+    pub(crate) fn structural_monotonicity_constraints(&self) -> LinearInequalityConstraints {
         LinearInequalityConstraints {
-            a,
-            b: Array1::from_elem(self.basis_dim, self.monotonicity_eps - 1.0),
+            a: self.monotonicity_constraint_rows.clone(),
+            b: Array1::from_elem(
+                self.monotonicity_constraint_rows.nrows(),
+                self.monotonicity_eps - 1.0,
+            ),
         }
     }
 
@@ -321,6 +522,40 @@ impl DeviationRuntime {
             value,
             "deviation span lookup",
         )
+    }
+
+    fn span_derivative_polynomial_coefficients(
+        &self,
+        span_idx: usize,
+        basis_idx: usize,
+        derivative_order: usize,
+    ) -> Result<Vec<f64>, String> {
+        if span_idx >= self.span_count() {
+            return Err(format!(
+                "deviation span index {} out of range for {} spans",
+                span_idx,
+                self.span_count()
+            ));
+        }
+        if basis_idx >= self.basis_dim {
+            return Err(format!(
+                "deviation basis index {} out of range for {} coefficients",
+                basis_idx, self.basis_dim
+            ));
+        }
+        let c0 = self.span_c0[[span_idx, basis_idx]];
+        let c1 = self.span_c1[[span_idx, basis_idx]];
+        let c2 = self.span_c2[[span_idx, basis_idx]];
+        let c3 = self.span_c3[[span_idx, basis_idx]];
+        match derivative_order {
+            0 => Ok(vec![c0, c1, c2, c3]),
+            1 => Ok(vec![c1, 2.0 * c2, 3.0 * c3]),
+            2 => Ok(vec![2.0 * c2, 6.0 * c3]),
+            3 => Ok(vec![6.0 * c3]),
+            other => Err(format!(
+                "deviation polynomial coefficients only support derivative orders up to 3, got {other}"
+            )),
+        }
     }
 
     // ── cubic Taylor extraction ──

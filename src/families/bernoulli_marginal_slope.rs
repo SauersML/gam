@@ -14,8 +14,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{
-    ParameterBlockInput, WiggleBlockConfig, append_selected_wiggle_penalty_orders,
-    select_wiggle_basis_from_seed, split_wiggle_penalty_orders,
+    ParameterBlockInput, WiggleBlockConfig, select_wiggle_basis_from_seed,
+    split_wiggle_penalty_orders,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
@@ -43,6 +43,7 @@ use std::sync::Arc;
 mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
+use deviation_runtime::transform_deviation_penalty;
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -159,7 +160,12 @@ pub(crate) fn build_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
+    build_deviation_block_from_knots_and_design_seed_with_anchor(
+        seed,
+        seed,
+        cfg,
+        DeviationAnchorKind::StandardNormal,
+    )
 }
 
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
@@ -262,6 +268,25 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
+    build_deviation_block_from_knots_and_design_seed_with_anchor(
+        knot_seed,
+        design_seed,
+        cfg,
+        DeviationAnchorKind::EmpiricalDesign,
+    )
+}
+
+enum DeviationAnchorKind {
+    StandardNormal,
+    EmpiricalDesign,
+}
+
+fn build_deviation_block_from_knots_and_design_seed_with_anchor(
+    knot_seed: &Array1<f64>,
+    design_seed: &Array1<f64>,
+    cfg: &DeviationBlockConfig,
+    anchor: DeviationAnchorKind,
+) -> Result<DeviationPrepared, String> {
     let (primary_order, extra_orders) =
         split_wiggle_penalty_orders(cfg.penalty_order, &cfg.penalty_orders);
     let effective_cfg = WiggleBlockConfig {
@@ -272,7 +297,14 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
     };
     let selected = select_wiggle_basis_from_seed(knot_seed.view(), &effective_cfg, &extra_orders)?;
     let knots = selected.knots;
-    let runtime = DeviationRuntime::try_new(knots, cfg.monotonicity_eps)?;
+    let runtime = match anchor {
+        DeviationAnchorKind::StandardNormal => {
+            DeviationRuntime::try_new_standard_normal_anchor(knots, cfg.monotonicity_eps)?
+        }
+        DeviationAnchorKind::EmpiricalDesign => {
+            DeviationRuntime::try_new_empirical_anchor(knots, cfg.monotonicity_eps, design_seed)?
+        }
+    };
     let design = runtime.design(design_seed)?;
     let p = design.ncols();
     if p == 0 {
@@ -286,7 +318,8 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
         initial_log_lambdas: None,
         initial_beta: Some(Array1::zeros(p)),
     };
-    if p == 1 {
+    let raw_p = runtime.coefficient_transform().nrows();
+    if raw_p == 1 {
         block
             .penalties
             .push(crate::solver::estimate::PenaltySpec::Dense(
@@ -294,13 +327,17 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
             ));
         block.nullspace_dims.push(0);
     } else {
-        let effective_order = primary_order.max(1).min(p - 1);
-        let diff_penalty = create_difference_penalty_matrix(p, effective_order, None)
+        let effective_order = primary_order.max(1).min(raw_p - 1);
+        let diff_penalty = create_difference_penalty_matrix(raw_p, effective_order, None)
             .map_err(|e| e.to_string())?;
         block
             .penalties
-            .push(crate::solver::estimate::PenaltySpec::Dense(diff_penalty));
-        block.nullspace_dims.push(effective_order);
+            .push(crate::solver::estimate::PenaltySpec::Dense(
+                transform_deviation_penalty(&diff_penalty, runtime.coefficient_transform()),
+            ));
+        block
+            .nullspace_dims
+            .push(effective_order.saturating_sub(2).min(p));
     }
     if cfg.double_penalty {
         block
@@ -310,8 +347,39 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
             ));
         block.nullspace_dims.push(0);
     }
-    append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
+    append_transformed_deviation_penalty_orders(
+        &mut block,
+        runtime.coefficient_transform(),
+        raw_p,
+        &extra_orders,
+    )?;
     Ok(DeviationPrepared { block, runtime })
+}
+
+fn append_transformed_deviation_penalty_orders(
+    block: &mut ParameterBlockInput,
+    transform: &Array2<f64>,
+    raw_p: usize,
+    penalty_orders: &[usize],
+) -> Result<(), String> {
+    let p = block.design.ncols();
+    if p == 0 {
+        return Ok(());
+    }
+    for &order in penalty_orders {
+        if order == 0 || order >= raw_p {
+            continue;
+        }
+        let penalty =
+            create_difference_penalty_matrix(raw_p, order, None).map_err(|e| e.to_string())?;
+        block
+            .penalties
+            .push(crate::solver::estimate::PenaltySpec::Dense(
+                transform_deviation_penalty(&penalty, transform),
+            ));
+        block.nullspace_dims.push(order.saturating_sub(2).min(p));
+    }
+    Ok(())
 }
 
 pub(crate) fn project_monotone_feasible_beta(
@@ -339,17 +407,35 @@ pub(crate) fn project_monotone_feasible_beta(
             return Err(format!("{label} current coefficient {idx} is non-finite"));
         }
     }
-    let lower_bound = runtime.monotonicity_eps() - 1.0;
-    let mut projected = proposed.clone();
-    for (idx, value) in projected.iter_mut().enumerate() {
+    for (idx, value) in proposed.iter().enumerate() {
         if !value.is_finite() {
             return Err(format!("{label} coefficient {idx} is non-finite"));
         }
-        if *value < lower_bound {
-            *value = lower_bound;
+    }
+    runtime.monotonicity_feasible(current, &format!("{label} current beta"))?;
+    if runtime
+        .monotonicity_feasible(proposed, &format!("{label} proposed beta"))
+        .is_ok()
+    {
+        return Ok(proposed.clone());
+    }
+
+    let direction = proposed - current;
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        let candidate = current + &direction.mapv(|value| value * mid);
+        if runtime
+            .monotonicity_feasible(&candidate, &format!("{label} projected beta"))
+            .is_ok()
+        {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
-    Ok(projected)
+    Ok(current + &direction.mapv(|value| value * lo))
 }
 
 fn validate_spec(
@@ -9184,7 +9270,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_denested_partials_zero_third_a_derivative_for_piecewise_quadratic_link() {
+    fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_link() {
         let z = array![-0.8, 0.2, 1.1];
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
         let link_prepared = build_deviation_block_from_seed(
@@ -9230,8 +9316,8 @@ mod tests {
 
         assert_eq!(obs.dc_daaa, expected_daaa);
         assert!(
-            eval_coeff4_at(&obs.dc_daaa, z[row]).abs() < 1e-12,
-            "piecewise-quadratic link spans should not contribute a third a-derivative"
+            eval_coeff4_at(&obs.dc_daaa, z[row]).abs() > 1e-12,
+            "piecewise-cubic link spans should contribute a third a-derivative"
         );
     }
 
@@ -9289,6 +9375,21 @@ mod tests {
         )
         .expect_err("non-finite z should be rejected");
         assert!(err.contains("finite z values"));
+    }
+
+    #[test]
+    fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
+        let data = Array2::<f64>::zeros((3, 0));
+        let mut spec = base_spec(
+            array![0.0, 1.0, 0.0],
+            array![1.0, 1.0, 1.0],
+            array![-1.0, 0.0, 1.0],
+        );
+        spec.frailty = FrailtySpec::GaussianShift { sigma_fixed: None };
+
+        let err = validate_spec(data.view(), &spec)
+            .expect_err("learnable GaussianShift sigma should be rejected");
+        assert!(err.contains("learnable GaussianShift sigma is not implemented"));
     }
 
     #[test]

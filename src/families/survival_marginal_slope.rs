@@ -12,7 +12,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization,
-    build_deviation_block_from_seed, project_monotone_feasible_beta,
+    build_deviation_block_from_knots_and_design_seed, build_deviation_block_from_seed,
+    project_monotone_feasible_beta,
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
     standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
@@ -12774,7 +12775,7 @@ pub fn fit_survival_marginal_slope_terms(
                 let slope = baseline_slope + spec.logslope_offset[row];
                 rigid_observed_eta(q_exit, slope, spec.z[row], probit_scale)
             }));
-            build_deviation_block_from_seed(&q0_seed, cfg)
+            build_deviation_block_from_knots_and_design_seed(&q0_seed, &q0_seed, cfg)
         })
         .transpose()?;
     let extra_rho0 = {
@@ -13379,6 +13380,31 @@ mod tests {
             err.contains("requires structural time monotonicity"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
+        let spec = SurvivalMarginalSlopeTermSpec {
+            age_entry: array![0.0, 0.0],
+            age_exit: array![1.0, 1.0],
+            event_target: array![0.0, 1.0],
+            weights: array![1.0, 1.0],
+            z: array![-1.0, 1.0],
+            marginalspec: empty_termspec(),
+            marginal_offset: Array1::zeros(2),
+            frailty: FrailtySpec::GaussianShift { sigma_fixed: None },
+            derivative_guard: 1e-4,
+            time_block: base_time_block(),
+            timewiggle_block: None,
+            logslopespec: empty_termspec(),
+            logslope_offset: Array1::zeros(2),
+            score_warp: None,
+            link_dev: None,
+        };
+
+        let err =
+            validate_spec(&spec).expect_err("learnable GaussianShift sigma should be rejected");
+        assert!(err.contains("learnable GaussianShift sigma is not implemented"));
     }
 
     #[test]

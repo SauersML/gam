@@ -11875,18 +11875,6 @@ impl ExactJointHyperSetup {
         }
     }
 
-    pub(crate) fn with_auxiliary(
-        mut self,
-        auxiliary0: Array1<f64>,
-        auxiliary_lower: Array1<f64>,
-        auxiliary_upper: Array1<f64>,
-    ) -> Self {
-        self.auxiliary0 = auxiliary0;
-        self.auxiliary_lower = auxiliary_lower;
-        self.auxiliary_upper = auxiliary_upper;
-        self
-    }
-
     pub(crate) fn rho_dim(&self) -> usize {
         self.rho0.len()
     }

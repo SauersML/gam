@@ -945,16 +945,6 @@ fn build_bernoulli_marginal_slope_ffi_payload(
     )
     .map_err(|err| format!("failed to freeze logslope spec: {err}"))?;
 
-    let save_frailty = match (frailty, ms_result.gaussian_frailty_sd) {
-        (
-            gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
-            Some(learned),
-        ) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: Some(learned),
-        },
-        (spec, _) => spec,
-    };
-
     let logslope_formula = fit_config
         .logslope_formula
         .clone()
@@ -973,7 +963,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
         FittedFamily::MarginalSlope {
             likelihood,
             base_link: Some(base_link.clone()),
-            frailty: save_frailty,
+            frailty,
         },
         "bernoulli-marginal-slope".to_string(),
     );
@@ -1023,16 +1013,6 @@ fn build_survival_marginal_slope_ffi_payload(
     )
     .map_err(|err| format!("failed to freeze survival logslope spec: {err}"))?;
 
-    let save_frailty = match (frailty, ms_result.gaussian_frailty_sd) {
-        (
-            gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
-            Some(learned),
-        ) => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: Some(learned),
-        },
-        (spec, _) => spec,
-    };
-
     let logslope_formula = fit_config.logslope_formula.clone().ok_or_else(|| {
         "survival marginal-slope requires logslope_formula to persist a saved model".to_string()
     })?;
@@ -1049,7 +1029,7 @@ fn build_survival_marginal_slope_ffi_payload(
             likelihood: LikelihoodFamily::RoystonParmar,
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some("probit".to_string()),
-            frailty: save_frailty,
+            frailty,
         },
         "royston-parmar".to_string(),
     );
