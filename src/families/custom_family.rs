@@ -1695,7 +1695,6 @@ pub(crate) trait MaterializablePsiDerivativeOperator:
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
-
 }
 
 impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
@@ -2656,9 +2655,8 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat = MaterializablePsiDerivativeOperator::materialize_second_cross(
-            self, axis_d, axis_e,
-        )?;
+        let mat =
+            MaterializablePsiDerivativeOperator::materialize_second_cross(self, axis_d, axis_e)?;
         Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
     }
 

@@ -1538,9 +1538,7 @@ pub fn plan_spatial_basis(
     // 3. Dense byte estimates.
     let derivative_axes = if scale_dims { d } else { 0 };
     let bytes_per_f64 = std::mem::size_of::<f64>();
-    let dense_design_bytes = bytes_per_f64
-        .saturating_mul(n)
-        .saturating_mul(p);
+    let dense_design_bytes = bytes_per_f64.saturating_mul(n).saturating_mul(p);
     let first_derivative_dense_bytes = dense_design_bytes.saturating_mul(derivative_axes);
     // Diagonal second derivatives are also (D × n × p); off-diagonal cross terms
     // would scale as D^2 but the planner reports the diagonal tier here.
@@ -2148,7 +2146,11 @@ fn dense_design_bytes(n: usize, p: usize) -> usize {
         .saturating_mul(std::mem::size_of::<f64>())
 }
 
-fn should_use_lazy_spatial_design(n: usize, p: usize, policy: &crate::resource::ResourcePolicy) -> bool {
+fn should_use_lazy_spatial_design(
+    n: usize,
+    p: usize,
+    policy: &crate::resource::ResourcePolicy,
+) -> bool {
     dense_design_bytes(n, p) > policy.max_single_materialization_bytes
 }
 
@@ -20326,6 +20328,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: Some(vec![0.0, 0.0]),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
 
         let basis = build_duchon_basis(data.view(), &spec).expect("aniso Duchon basis");
@@ -20385,6 +20388,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.1, -0.1]),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
 
         let basis = build_duchon_basis(data.view(), &spec).expect("pure Duchon basis");
@@ -20582,6 +20586,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.05, -0.15]),
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
             .expect("pure Duchon anisotropic derivatives");

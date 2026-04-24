@@ -2548,7 +2548,6 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         self.lifted_transpose_second(&self.response_deriv_basis, axis_d, axis_e, v)
     }
-
 }
 
 #[cfg(test)]
@@ -2989,9 +2988,8 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis_e: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let mat = MaterializablePsiDerivativeOperator::materialize_second_cross(
-            self, axis_d, axis_e,
-        )?;
+        let mat =
+            MaterializablePsiDerivativeOperator::materialize_second_cross(self, axis_d, axis_e)?;
         Ok(mat.slice(ndarray::s![rows, ..]).to_owned())
     }
 
