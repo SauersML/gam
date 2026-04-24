@@ -276,7 +276,7 @@ pub(crate) fn build_deviation_block_from_knots_and_design_seed(
     let design = runtime.design(design_seed)?;
     let p = design.ncols();
     if p == 0 {
-        return Err("structural deviation basis has no free interior derivative nodes".to_string());
+        return Err("structural deviation basis has no free derivative controls".to_string());
     }
     let mut block = ParameterBlockInput {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
@@ -396,12 +396,16 @@ fn validate_spec(
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
-            if let Some(sigma) = sigma_fixed {
-                if !sigma.is_finite() || *sigma < 0.0 {
-                    return Err(format!(
-                        "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                    ));
-                }
+            let Some(sigma) = sigma_fixed else {
+                return Err(
+                    "bernoulli-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
+                        .to_string(),
+                );
+            };
+            if !sigma.is_finite() || *sigma < 0.0 {
+                return Err(format!(
+                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                ));
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
@@ -2264,21 +2268,16 @@ impl BernoulliMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    // `sigma_beta_linear_operator` and `add_sigma_hessian_linear_terms`
-    // have been retired.  Their construction —
-    //     direction[u] = (ṡ/s) · β[u] for u ∈ {logslope, H, W}
-    //     mask[u]      = (ṡ/s)        on the same slices
-    // — encoded σ-perturbation as a β-rescaling by (1 + ε·ṡ/s), which is
-    // exact only on the rigid-probit path (where the likelihood is a
-    // scalar-in-s·β affine form).  In the flex path the per-row intercept
-    // a_r(β, σ) satisfies f_r = s·F_r(a, β) − μ_r = 0 and the denested
-    // cell polynomial ĉ(a, β) is nonlinear in (β_H, β_W), so the σ
-    // derivative picks up an implicit-a term that a single β-direction
-    // cannot reproduce.  The replacement `sigma_exact_joint_psi_terms`
-    // computes the σ-derivative directly via the implicit function
-    // theorem on the intercept equation (objective, score) and via a
-    // tight central difference of the analytic `exact_newton_joint_hessian`
-    // (hessian).  See the derivation comment on `sigma_exact_joint_psi_terms`.
+    // Learnable GaussianShift sigma is intentionally not an outer coordinate
+    // for this family yet. The cell coefficients scale by
+    // s(log sigma) = 1 / sqrt(1 + sigma^2), but the probit cell integral is
+    // not linear in s. The analytic implementation must differentiate exact
+    // cell moments by coefficient direction:
+    //     F_tau = integral phi(c(z)) c_tau(z) phi(z) dz,
+    //     c_tau(z) = d(log s)/d tau * c(z),
+    // with row intercept derivatives supplied by F(a, beta, tau) - mu = 0.
+    // Until that tensor path exists, public validation accepts only fixed
+    // GaussianShift sigma or no frailty, and this branch remains defensive.
 
     fn is_sigma_aux_index(
         &self,
@@ -2302,85 +2301,6 @@ impl BernoulliMarginalSlopeFamily {
             && deriv.s_psi_psi.is_none()
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Sigma (frailty log-sd) ψ-derivatives — analytic via implicit function
-    // theorem on the per-row intercept equation, plus direct σ-scaling of
-    // denested cell coefficients.
-    //
-    // GEOMETRY.  Let t = log σ and s(t) = 1/√(1+e^(2t)).  The probit frailty
-    // scale s(t) enters the per-row model through `scale_coeff4`, which
-    // multiplies every denested cell coefficient `ĉ(a, β)` by s: the
-    // observed "scaled" cell coefficient is `c = s·ĉ`.  Consequently s acts
-    // as a pure scalar prefactor on every per-row cell polynomial.  The
-    // row-level marginal moment `μ_r` depends only on the marginal-block
-    // η_r = q_r (i.e. on β_q alone), NOT on σ nor on (β_b, β_H, β_W).
-    //
-    // INTERCEPT EQUATION.  For each row r, the intercept a_r is defined
-    // implicitly by
-    //     f_r(a, β, σ)  ≡  Σ_cells value_cell(a, β; σ) − μ_r(β_q)  =  0.
-    // Since cell values scale linearly in s,
-    //     f_r(a, β, σ)  =  s(t)·F_r(a, β) − μ_r(β_q)
-    // where F_r(a, β) is the σ-independent "unscaled" partition sum.
-    //
-    // IMPLICIT DERIVATIVES.
-    //   (a)  ∂f_r/∂t       =  s'(t)·F_r(a,β)
-    //                      =  (ṡ/s)·s·F_r
-    //                      =  (ṡ/s)·(f_r + μ_r)
-    //                      |_{f_r=0}  =  (ṡ/s)·μ_r
-    //   (b)  ∂f_r/∂a       =  s·∂F_r/∂a  =  f_a_r   (already stored as row_ctx.m_a)
-    //   (c)  ∂a_r/∂t|_β    =  −(∂f_r/∂t)/(∂f_r/∂a)
-    //                      =  −(ṡ/s)·μ_r / f_a_r.
-    //
-    // Similarly, for the σ-derivative of f_u (the per-primary-axis first
-    // partial of f) and f_a themselves:
-    //   ∂f_a/∂t|_{a,β}     =  (ṡ/s)·f_a
-    //   ∂f_u/∂t|_{a,β}     =  (ṡ/s)·[f_u + μ_{r,u}]   where
-    //                        μ_{r,u} = ∂μ_r/∂β_u is nonzero only for u = q
-    //                        (marginal block) and equals marginal.mu1 there.
-    //   That is, only the cell contribution to f_u scales with s; the μ_r
-    //   piece is σ-independent.  We use f_u_cell ≡ f_u + mu1·δ_{u,q}.
-    //
-    //   Consequently the full implicit-a cross partial is
-    //     ∂a_u/∂t|_β  =  −[∂f_u/∂t + f_au·a_σ + ∂f_a/∂t·a_u + f_aa·a_u·a_σ] / f_a
-    //                 =  −[(ṡ/s)·f_u_cell + f_au·a_σ + (ṡ/s)·f_a·a_u
-    //                      + f_aa·a_u·a_σ] / f_a,
-    //   where a_σ = ∂a/∂t|_β.
-    //
-    // OBSERVED η DERIVATIVES THROUGH a.  Let the observed row quantity be
-    //     η_r(a, β, σ) = eval_coeff4_at(scale_coeff4(ĉ_obs(a,β), s), z_r)
-    //                  = s·η̂_obs(a, β).
-    // So ∂η_r/∂a|_{β,σ} = χ_obs = s·∂η̂_obs/∂a, already stored per-row.
-    // At fixed (a, β) we have ∂η_r/∂t = (ṡ/s)·η_r.  Combining with the
-    // implicit a-shift:
-    //     η_t := ∂η_r/∂t|_β  =  (ṡ/s)·η_r  +  χ_obs·a_σ
-    //                         =  (ṡ/s)·(η_r − χ_obs·μ_r/f_a_r)
-    //
-    // OBJECTIVE.  The row NLL contribution is G_r(η_r) = −w_r·log Φ(s_y·η_r).
-    // Its total σ-derivative (through the implicit a and direct scaling) is
-    //     ∂G_r/∂t  =  G_r'(η_r)·∂η_r/∂t  =  d1_m·s_y·η_t
-    // where d1_m = −w_r·λ_r and λ_r is the Mills ratio at s_y·η_r.
-    // Summing over rows gives `objective_psi = −∂L/∂t = Σ_r d1_m·s_y·η_t`.
-    //
-    // SCORE.  The β-gradient of the NLL is (−∇_β L)_u = d1_m·s_y·η_u per row
-    // summed (with η_u the per-primary total derivative through implicit a),
-    // then projected through the block design matrices.  Its σ-derivative is
-    //     ∂(d1_m·s_y·η_u)/∂t  =  d2_m·s_y·η_t·s_y·η_u  +  d1_m·s_y·η_{u,t}
-    //                          =  d2_m·η_t·η_u + d1_m·s_y·η_{u,t},
-    // with d2_m = w_r·λ·(m+λ).  The primary-space σ-cross partial is
-    //     η_{u,t} = eta_aa_obs·a_u·a_σ + (ṡ/s)·χ_obs·a_u
-    //              + χ_obs·a_{u,σ} + τ_u·a_σ + (ṡ/s)·ρ_u,
-    // obtained by differentiating η_u = χ_obs·a_u + ρ_u w.r.t. t through
-    //    — the implicit a dependence of χ_obs (via eta_aa_obs·a_σ),
-    //    — the direct σ-scaling of χ_obs (= (ṡ/s)·χ_obs),
-    //    — the implicit a dependence of a_u (via a_{u,σ}),
-    //    — the implicit a dependence of ρ_u (via τ_u·a_σ),
-    //    — the direct σ-scaling of ρ_u (= (ṡ/s)·ρ_u).
-    //
-    // HESSIAN.  The log-σ Hessian derivative requires the closed-form
-    // third-order denested cell tensors.  Production finite differences are
-    // intentionally not used here; callers must supply an analytic
-    // implementation before optimizing σ as a hypercoordinate.
-    // ─────────────────────────────────────────────────────────────────────
     fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
@@ -7813,17 +7733,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
         standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
     spec.z = z_standardized;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
-    let sigma_learnable = matches!(
-        &spec.frailty,
-        FrailtySpec::GaussianShift { sigma_fixed: None }
-    );
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
             sigma_fixed: Some(s),
         } => Some(*s),
-        FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
         FrailtySpec::None => None,
-        _ => None,
+        FrailtySpec::GaussianShift { sigma_fixed: None } | FrailtySpec::HazardMultiplier { .. } => {
+            unreachable!("validate_spec rejects unsupported marginal-slope frailty")
+        }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
     let baseline = (
@@ -7917,20 +7834,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &extra_rho0,
         kappa_options,
     );
-    let setup = if sigma_learnable {
-        setup.with_auxiliary(
-            Array1::from_vec(vec![initial_sigma.unwrap_or(0.5).ln()]),
-            Array1::from_vec(vec![0.01_f64.ln()]),
-            Array1::from_vec(vec![5.0_f64.ln()]),
-        )
-    } else {
-        setup
-    };
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
     let hints = RefCell::new(ThetaHints::default());
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
-    let final_sigma_cell = std::cell::Cell::new(initial_sigma);
 
     let build_blocks = |rho: &Array1<f64>,
                         marginal_design: &TermCollectionDesign,
@@ -8029,20 +7936,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
             joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    let analytic_joint_hessian_available = !sigma_learnable
-        && analytic_joint_derivatives_available
+    let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && matches!(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-
-    let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
-        if sigma_learnable {
-            Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
-        } else {
-            initial_sigma
-        }
-    };
     let derivative_block_cache = RefCell::new(
         None::<(
             Array1<f64>,
@@ -8104,20 +8002,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             if link_dev_runtime.is_some() {
                 derivative_blocks.push(Vec::new());
             }
-            if sigma_learnable {
-                derivative_blocks
-                    .last_mut()
-                    .expect("bernoulli marginal-slope derivative blocks")
-                    .push(crate::custom_family::CustomFamilyBlockPsiDerivative::new(
-                        None,
-                        Array2::zeros((0, 0)),
-                        Array2::zeros((0, 0)),
-                        None,
-                        None,
-                        None,
-                        None,
-                    ));
-            }
             Ok(derivative_blocks)
         }(specs, designs)?;
         let built = Arc::new(built);
@@ -8141,10 +8025,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let sigma = sigma_from_theta(theta);
-            final_sigma_cell.set(sigma);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], initial_sigma);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             let mut bidx = 0usize;
@@ -8171,9 +8053,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], initial_sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
@@ -8200,9 +8081,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let sigma = sigma_from_theta(theta);
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], initial_sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
@@ -8216,7 +8096,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             Ok(eval.efs_eval)
         },
     )?;
-    let final_sigma = final_sigma_cell.get();
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
@@ -8231,7 +8110,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         z_normalization,
         score_warp_runtime,
         link_dev_runtime,
-        gaussian_frailty_sd: final_sigma,
+        gaussian_frailty_sd: initial_sigma,
     })
 }
 
@@ -8675,7 +8554,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_deviation_runtime_is_piecewise_quadratic() {
+    fn structural_deviation_runtime_is_piecewise_cubic() {
         let seed = array![-1.0, 0.0, 1.0];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -8685,8 +8564,8 @@ mod tests {
             },
         )
         .expect("structural deviation basis");
-        assert_eq!(prepared.runtime.degree(), 2);
-        assert_eq!(prepared.runtime.value_span_degree(), 2);
+        assert_eq!(prepared.runtime.degree(), 3);
+        assert_eq!(prepared.runtime.value_span_degree(), 3);
     }
 
     #[test]

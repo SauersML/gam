@@ -23,6 +23,7 @@ use crate::families::survival_location_scale::{
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
+use crate::probability::{normal_pdf, standard_normal_quantile};
 use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
@@ -1594,6 +1595,44 @@ fn gompertz_shape_derivatives(age: f64, shape: f64) -> (f64, f64) {
     }
 }
 
+fn survival_cumulative_and_instant_hazard(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<(f64, f64)>, String> {
+    if !age.is_finite() || age <= 0.0 {
+        return Err(
+            "survival ages must be finite and positive for baseline hazard evaluation".to_string(),
+        );
+    }
+
+    match cfg.target {
+        SurvivalBaselineTarget::Linear => Ok(None),
+        SurvivalBaselineTarget::Weibull => {
+            let scale = cfg.scale.unwrap_or(1.0);
+            let shape = cfg.shape.unwrap_or(1.0);
+            if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
+                return Err("weibull baseline requires finite positive scale and shape".to_string());
+            }
+            let cumulative_hazard = (age / scale).powf(shape);
+            let instant_hazard = shape * cumulative_hazard / age;
+            Ok(Some((cumulative_hazard, instant_hazard)))
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            let rate = cfg.rate.unwrap_or(1.0);
+            let shape = cfg.shape.unwrap_or(0.0);
+            let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
+            Ok(Some((cumulative_hazard, instant_hazard)))
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            let makeham = cfg.makeham.unwrap_or(0.0);
+            let rate = cfg.rate.unwrap_or(1.0);
+            let shape = cfg.shape.unwrap_or(0.0);
+            let (h_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
+            Ok(Some((makeham * age + h_gompertz, makeham + inst_gompertz)))
+        }
+    }
+}
+
 /// Evaluate the parametric baseline target at a given age.
 /// Returns `(eta_target(age), d eta_target / d age)` on the log-cumulative-hazard scale.
 pub fn evaluate_survival_baseline(
@@ -1647,6 +1686,55 @@ pub fn evaluate_survival_baseline(
     }
 }
 
+/// Evaluate the parametric baseline as the probit index whose marginal
+/// survival is the true hazard survival `exp(-H0(t))`.
+///
+/// Returns `(q(age), dq / d age)` such that `Phi(-q(age)) = exp(-H0(age))`.
+/// The derivative is `h0(t) * exp(-H0(t)) / phi(q(t))`.
+pub fn evaluate_survival_marginal_slope_baseline(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<(f64, f64), String> {
+    let Some((cumulative_hazard, instant_hazard)) =
+        survival_cumulative_and_instant_hazard(age, cfg)?
+    else {
+        return Ok((0.0, 0.0));
+    };
+    if !(cumulative_hazard.is_finite() && cumulative_hazard > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive cumulative hazard",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    if !(instant_hazard.is_finite() && instant_hazard > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive instant hazard",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let survival = (-cumulative_hazard).exp();
+    if !(survival.is_finite() && survival > 0.0 && survival < 1.0) {
+        return Err(format!(
+            "{} marginal-slope baseline survival must be strictly inside (0,1), got {survival}",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    let q = -standard_normal_quantile(survival).map_err(|e| {
+        format!(
+            "{} marginal-slope baseline failed to invert survival probability {survival}: {e}",
+            survival_baseline_targetname(cfg.target)
+        )
+    })?;
+    let phi_q = normal_pdf(q);
+    if !(phi_q.is_finite() && phi_q > 0.0) {
+        return Err(format!(
+            "{} marginal-slope baseline produced non-positive probit density phi(q)={phi_q} at q={q}",
+            survival_baseline_targetname(cfg.target)
+        ));
+    }
+    Ok((q, instant_hazard * survival / phi_q))
+}
+
 // ---------------------------------------------------------------------------
 // Baseline offsets
 // ---------------------------------------------------------------------------
@@ -1670,6 +1758,36 @@ pub fn build_survival_baseline_offsets(
         let (e1, d1) = evaluate_survival_baseline(age_exit[i], cfg)?;
         if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
             return Err("non-finite survival baseline offsets computed".to_string());
+        }
+        eta_entry[i] = e0;
+        eta_exit[i] = e1;
+        derivative_exit[i] = d1;
+    }
+    Ok((eta_entry, eta_exit, derivative_exit))
+}
+
+/// Compute marginal-slope probit baseline target offsets for all observations.
+/// Returns `(q_entry, q_exit, q_derivative_exit)` where `Phi(-q(t)) = exp(-H0(t))`.
+pub fn build_survival_marginal_slope_baseline_offsets(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    if age_entry.len() != age_exit.len() {
+        return Err(
+            "survival marginal-slope baseline offsets require matching entry/exit lengths"
+                .to_string(),
+        );
+    }
+    let n = age_entry.len();
+    let mut eta_entry = Array1::<f64>::zeros(n);
+    let mut eta_exit = Array1::<f64>::zeros(n);
+    let mut derivative_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let (e0, _) = evaluate_survival_marginal_slope_baseline(age_entry[i], cfg)?;
+        let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
+        if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
+            return Err("non-finite survival marginal-slope baseline offsets computed".to_string());
         }
         eta_entry[i] = e0;
         eta_exit[i] = e1;
@@ -1987,12 +2105,14 @@ pub fn build_time_varying_survival_covariate_template(
 mod tests {
     use super::{
         SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_chain_rule_gradient,
-        baseline_offset_theta_partials, build_survival_timewiggle_from_baseline,
-        evaluate_survival_baseline, survival_baseline_config_from_theta,
+        baseline_offset_theta_partials, build_survival_marginal_slope_baseline_offsets,
+        build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
+        evaluate_survival_marginal_slope_baseline, survival_baseline_config_from_theta,
         survival_baseline_theta_from_config,
     };
     use crate::families::survival::OffsetChannelResiduals;
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
+    use crate::probability::normal_cdf;
     use ndarray::{Array1, array};
 
     #[test]
@@ -2014,6 +2134,66 @@ mod tests {
         assert_eq!(build.penalties.len(), 3);
         assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
         assert!(build.ncols > 0);
+    }
+
+    #[test]
+    fn marginal_slope_baseline_maps_gompertz_makeham_survival_to_probit_index() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.07),
+            rate: Some(0.012),
+            makeham: Some(0.003),
+        };
+        let age = 11.5;
+        let (q, q_derivative) = evaluate_survival_marginal_slope_baseline(age, &cfg)
+            .expect("evaluate marginal-slope gompertz-makeham baseline");
+        let shape = cfg.shape.expect("shape");
+        let rate = cfg.rate.expect("rate");
+        let makeham = cfg.makeham.expect("makeham");
+        let cumulative_hazard = makeham * age + (rate / shape) * ((shape * age).exp() - 1.0);
+        let instant_hazard = makeham + rate * (shape * age).exp();
+        let expected_survival = (-cumulative_hazard).exp();
+        let actual_survival = normal_cdf(-q);
+        assert!((actual_survival - expected_survival).abs() <= 1e-12);
+
+        let h = 1e-5;
+        let q_plus = evaluate_survival_marginal_slope_baseline(age + h, &cfg)
+            .expect("q plus")
+            .0;
+        let q_minus = evaluate_survival_marginal_slope_baseline(age - h, &cfg)
+            .expect("q minus")
+            .0;
+        let fd = (q_plus - q_minus) / (2.0 * h);
+        assert!((q_derivative - fd).abs() <= 1e-7);
+        assert!(instant_hazard > 0.0);
+    }
+
+    #[test]
+    fn marginal_slope_baseline_offsets_use_true_gompertz_makeham_survival() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.03),
+            rate: Some(0.01),
+            makeham: Some(0.002),
+        };
+        let age_entry = array![2.0, 4.0];
+        let age_exit = array![5.0, 9.0];
+        let (entry, exit, derivative) =
+            build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &cfg)
+                .expect("marginal-slope baseline offsets");
+        for i in 0..age_entry.len() {
+            let entry_h = cfg.makeham.expect("makeham") * age_entry[i]
+                + (cfg.rate.expect("rate") / cfg.shape.expect("shape"))
+                    * ((cfg.shape.expect("shape") * age_entry[i]).exp() - 1.0);
+            let exit_h = cfg.makeham.expect("makeham") * age_exit[i]
+                + (cfg.rate.expect("rate") / cfg.shape.expect("shape"))
+                    * ((cfg.shape.expect("shape") * age_exit[i]).exp() - 1.0);
+            assert!((normal_cdf(-entry[i]) - (-entry_h).exp()).abs() <= 1e-12);
+            assert!((normal_cdf(-exit[i]) - (-exit_h).exp()).abs() <= 1e-12);
+            assert!(derivative[i].is_finite() && derivative[i] > 0.0);
+        }
     }
 
     // ─── baseline_offset_theta_partials — analytic vs central-difference ─
