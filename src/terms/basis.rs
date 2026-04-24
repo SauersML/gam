@@ -9268,6 +9268,27 @@ fn shared_owned_data_matrix(
     owned
 }
 
+/// Minimal cache-less intern: wraps an `ArrayView2` into an `Arc<Array2<f64>>`.
+///
+/// Used by derivative-operator builders that don't have a `BasisCacheContext`
+/// in scope (e.g. `build_aniso_design_psi_derivatives_shared`). The goal is the
+/// same as `shared_owned_data_matrix`: move the owned payload into an `Arc`
+/// once so that downstream `StreamingRadialState` copies share it via
+/// `Arc::clone` instead of materializing a fresh n×d `Array2<f64>` per axis.
+#[inline]
+fn shared_owned_data_matrix_from_view(data: ArrayView2<'_, f64>) -> Arc<Array2<f64>> {
+    Arc::new(data.to_owned())
+}
+
+/// Minimal cache-less intern for knot centers; mirrors
+/// `shared_owned_data_matrix_from_view`. Centers are typically k×d with k
+/// much smaller than n, but the `Arc::clone` pattern still avoids a k×d
+/// copy per axis when the same operator feeds multiple derivative paths.
+#[inline]
+fn shared_owned_centers_matrix_from_view(centers: ArrayView2<'_, f64>) -> Arc<Array2<f64>> {
+    Arc::new(centers.to_owned())
+}
+
 fn kernel_constraint_nullspace(
     centers: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
@@ -13202,6 +13223,64 @@ fn monomial_basis_block(points: ArrayView2<'_, f64>, max_total_degree: usize) ->
         }
     }
     block
+}
+
+fn monomial_hessian_operator_block(
+    points: ArrayView2<'_, f64>,
+    max_total_degree: usize,
+) -> Array2<f64> {
+    let n = points.nrows();
+    let d = points.ncols();
+    let exponents = monomial_exponents(d, max_total_degree);
+    let mut block = Array2::<f64>::zeros((n * d * d, exponents.len()));
+    for (col, exponents) in exponents.iter().enumerate() {
+        for row in 0..n {
+            for axis_a in 0..d {
+                for axis_b in 0..d {
+                    let ea = exponents[axis_a];
+                    let eb = exponents[axis_b];
+                    let coeff = if axis_a == axis_b {
+                        if ea < 2 {
+                            continue;
+                        }
+                        (ea * (ea - 1)) as f64
+                    } else {
+                        if ea == 0 || eb == 0 {
+                            continue;
+                        }
+                        (ea * eb) as f64
+                    };
+                    let mut value = coeff;
+                    for axis in 0..d {
+                        let mut exponent = exponents[axis];
+                        if axis == axis_a {
+                            exponent -= 1;
+                        }
+                        if axis == axis_b {
+                            exponent -= 1;
+                        }
+                        if exponent != 0 {
+                            value *= points[[row, axis]].powi(exponent as i32);
+                        }
+                    }
+                    block[[(row * d + axis_a) * d + axis_b, col]] = value;
+                }
+            }
+        }
+    }
+    block
+}
+
+fn polynomial_hessian_operator_block(
+    points: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Array2<f64> {
+    match order {
+        DuchonNullspaceOrder::Zero | DuchonNullspaceOrder::Linear => {
+            Array2::<f64>::zeros((points.nrows() * points.ncols() * points.ncols(), polynomial_block_from_order(points, order).ncols()))
+        }
+        DuchonNullspaceOrder::Degree(degree) => monomial_hessian_operator_block(points, degree),
+    }
 }
 
 #[inline(always)]
