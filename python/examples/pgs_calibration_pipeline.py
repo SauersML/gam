@@ -88,7 +88,10 @@ def load_biobank_sample(n: int = 2000, seed: int = 0) -> pd.DataFrame:
 
 def _pc_duchon(centers: int) -> str:
     args = ", ".join(PC_COLUMNS)
-    return f"duchon({args}, centers={centers}, order=1, power=1, double_penalty=true)"
+    return (
+        f"duchon({args}, centers={centers}, order=1, power=1, "
+        "length_scale=1, double_penalty=true)"
+    )
 
 
 def stage1_calibrate(df: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
@@ -112,6 +115,7 @@ def stage2_binary(df: pd.DataFrame) -> Any:
         main_formula,
         family="bernoulli-marginal-slope",
         link="probit",
+        scale_dimensions="auto",
         z_column="pgs_ctn_z",
         logslope_formula=logslope_formula,
     )
@@ -132,6 +136,7 @@ def stage2_survival(df: pd.DataFrame) -> Any:
         family="survival",
         survival_likelihood="marginal-slope",
         baseline_target="gompertz-makeham",
+        scale_dimensions="auto",
         z_column="pgs_ctn_z",
         logslope_formula=logslope_formula,
     )

@@ -4082,7 +4082,7 @@ mod tests {
     #[test]
     fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
         let seed = array![-1.5, -0.2, 0.6, 1.4];
-        let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+        let prepared = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
             &seed,
             &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
                 degree: 3,
@@ -4118,7 +4118,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("DenestedCubicTransport"));
 
-        let err = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+        let err = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
             &seed,
             &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
                 degree: 2,
@@ -4141,7 +4141,7 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+        let prepared = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
             &seed,
             &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -4326,7 +4326,7 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+        let prepared = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
             &seed,
             &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
                 num_internal_knots: 4,

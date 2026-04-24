@@ -3018,21 +3018,14 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
         let n = self.n;
         let p_cov = self.p_cov;
         let p_time = self.p_time;
-        let cov_dense = self.cov.as_dense_cow();
-        let time = self.time_basis.as_ref();
-        let mut out = Array2::<f64>::zeros((n, p_cov * p_time));
-        for i in 0..n {
-            for j in 0..p_cov {
-                let cij = cov_dense[[i, j]];
-                if cij == 0.0 {
-                    continue;
-                }
-                for t in 0..p_time {
-                    out[[i, j * p_time + t]] = cij * time[[i, t]];
-                }
-            }
-        }
-        out
+        let bytes = n
+            .saturating_mul(p_cov)
+            .saturating_mul(p_time)
+            .saturating_mul(std::mem::size_of::<f64>());
+        panic!(
+            "RowwiseKroneckerOperator must remain operator-backed; refused persistent n x p_covariate x p_time materialization (n={n}, p_covariate={p_cov}, p_time={p_time}, dense={:.1} MiB)",
+            bytes as f64 / (1024.0 * 1024.0),
+        );
     }
 }
 
