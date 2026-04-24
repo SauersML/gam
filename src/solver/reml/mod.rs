@@ -271,8 +271,8 @@ mod tests {
     #[test]
     fn tau_tau_hessian_policy_prefers_gradient_only_for_implicit_multidim_duchon() {
         let operator = ImplicitDesignPsiDerivative::new_streaming(
-            array![[0.0, 0.0], [1.0, 0.2]],
-            array![[0.0, 0.0], [1.0, 1.0]],
+            Arc::new(array![[0.0, 0.0], [1.0, 0.2]]),
+            Arc::new(array![[0.0, 0.0], [1.0, 1.0]]),
             vec![0.0, 0.0],
             RadialScalarKind::PureDuchon {
                 block_order: 1,

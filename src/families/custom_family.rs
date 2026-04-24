@@ -3293,6 +3293,7 @@ pub(crate) fn weighted_crossprod_psi_maps(
     left: CustomFamilyPsiLinearMapRef<'_>,
     weights: ArrayView1<'_, f64>,
     right: CustomFamilyPsiLinearMapRef<'_>,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
         return Err(format!(
@@ -3302,26 +3303,39 @@ pub(crate) fn weighted_crossprod_psi_maps(
             right.nrows()
         ));
     }
-    if left.ncols() == 0 || right.ncols() == 0 {
-        return Ok(Array2::<f64>::zeros((left.ncols(), right.ncols())));
+    let p_left = left.ncols();
+    let p_right = right.ncols();
+    if p_left == 0 || p_right == 0 {
+        return Ok(Array2::<f64>::zeros((p_left, p_right)));
     }
+    // Zero fast path: either operand being the Zero variant makes the full product zero.
     if matches!(left, CustomFamilyPsiLinearMapRef::Zero { .. })
         || matches!(right, CustomFamilyPsiLinearMapRef::Zero { .. })
     {
-        return Ok(Array2::<f64>::zeros((left.ncols(), right.ncols())));
+        return Ok(Array2::<f64>::zeros((p_left, p_right)));
     }
-    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
-    let row_width = left.ncols().saturating_add(right.ncols()).max(1);
-    let rows_per_chunk = crate::resource::rows_for_target_bytes(8 * 1024 * 1024, row_width);
-    for start in (0..weights.len()).step_by(rows_per_chunk) {
-        let end = (start + rows_per_chunk).min(weights.len());
+
+    let mut out = Array2::<f64>::zeros((p_left, p_right));
+    // Stream row chunks of both operands so the weighted intermediate is never
+    // materialized at full n x p_right size. Chunk size is governed by the
+    // resource policy's row_chunk_target_bytes.
+    let rows_per_chunk = crate::resource::rows_for_target_bytes(
+        policy.row_chunk_target_bytes,
+        p_left.saturating_add(p_right).max(1),
+    );
+
+    let n = weights.len();
+    for start in (0..n).step_by(rows_per_chunk) {
+        let end = (start + rows_per_chunk).min(n);
         let rows = start..end;
         let xl = left.row_chunk(rows.clone())?;
         let mut xr = right.row_chunk(rows.clone())?;
         for local in 0..xr.nrows() {
             let w = weights[start + local];
-            for j in 0..xr.ncols() {
-                xr[[local, j]] *= w;
+            if w != 1.0 {
+                for j in 0..p_right {
+                    xr[[local, j]] *= w;
+                }
             }
         }
         out += &fast_atb(&xl, &xr);

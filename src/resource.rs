@@ -102,3 +102,121 @@ pub fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
     let bytes_per_row = cols.saturating_mul(std::mem::size_of::<f64>()).max(1);
     (target_bytes / bytes_per_row).max(1)
 }
+
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
+use std::sync::{Arc, Mutex};
+
+/// Byte-limited LRU cache.
+///
+/// Unlike an entry-count-limited LRU, this cache tracks the resident byte cost
+/// of each value (via [`ResidentBytes`]) and evicts the least-recently-used
+/// entries until the total resident bytes fit under `max_bytes`. This is the
+/// correct policy for biobank-scale payloads where a single cache entry (e.g.
+/// an n*K distance matrix) can itself be multiple gigabytes and an entry-count
+/// cap would silently blow the memory budget.
+pub struct ByteLruCache<K: Eq + Hash + Clone, V> {
+    inner: Mutex<ByteLruInner<K, V>>,
+    max_bytes: usize,
+}
+
+struct ByteLruInner<K, V> {
+    map: HashMap<K, (V, usize)>, // (value, byte_charge)
+    order: VecDeque<K>,
+    resident_bytes: usize,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(ByteLruInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                resident_bytes: 0,
+            }),
+            max_bytes,
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
+        let mut g = self.inner.lock().unwrap();
+        let v = g.map.get(key)?.0.clone();
+        // move to back (most-recently-used)
+        if let Some(pos) = g.order.iter().position(|k| k == key) {
+            let k = g.order.remove(pos).unwrap();
+            g.order.push_back(k);
+        }
+        Some(v)
+    }
+
+    pub fn insert(&self, key: K, value: V) {
+        let charge = value.resident_bytes();
+        let mut g = self.inner.lock().unwrap();
+
+        // If already present, remove the old entry first so resident bytes stay
+        // accurate and the LRU ordering reflects this insertion.
+        if let Some((_old, old_charge)) = g.map.remove(&key) {
+            g.resident_bytes = g.resident_bytes.saturating_sub(old_charge);
+            if let Some(pos) = g.order.iter().position(|k| k == &key) {
+                g.order.remove(pos);
+            }
+        }
+
+        if charge > self.max_bytes {
+            // Too large to cache; skip insertion.
+            return;
+        }
+
+        while g.resident_bytes + charge > self.max_bytes {
+            if let Some(evict_key) = g.order.pop_front() {
+                if let Some((_v, c)) = g.map.remove(&evict_key) {
+                    g.resident_bytes = g.resident_bytes.saturating_sub(c);
+                }
+            } else {
+                break;
+            }
+        }
+
+        g.map.insert(key.clone(), (value, charge));
+        g.order.push_back(key);
+        g.resident_bytes = g.resident_bytes.saturating_add(charge);
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.inner.lock().unwrap().resident_bytes
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    pub fn clear(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.map.clear();
+        g.order.clear();
+        g.resident_bytes = 0;
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> std::fmt::Debug for ByteLruCache<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteLruCache")
+            .field("resident_bytes", &self.resident_bytes())
+            .field("max_bytes", &self.max_bytes)
+            .finish()
+    }
+}
+
+/// Byte-accounting for `Arc<Array2<f64>>`.
+///
+/// Reports the full dense footprint of the owned array. Multiple `Arc`s
+/// pointing to the same allocation will each report the full size; this is
+/// the conservative accounting the caches want because a single residency in
+/// the cache is what we are budgeting for.
+impl ResidentBytes for Arc<ndarray::Array2<f64>> {
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<f64>()
+            .saturating_mul(self.nrows())
+            .saturating_mul(self.ncols())
+    }
+}

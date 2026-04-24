@@ -5917,7 +5917,8 @@ mod tests {
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use ndarray::{Array1, Array2, Axis, array, s};
+    use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
+    use crate::resource::MatrixMaterializationError;
     use std::ops::Range;
     use std::sync::Arc;
 
@@ -6213,8 +6214,8 @@ mod tests {
             fn row_chunk_into(
                 &self,
                 rows: Range<usize>,
-                mut out: ArrayViewMut2<'_, f64>,
-            ) -> Result<(), MatrixMaterializationError> {
+                mut out: ndarray::ArrayViewMut2<'_, f64>,
+            ) -> Result<(), crate::resource::MatrixMaterializationError> {
                 out.assign(&self.dense.slice(s![rows, ..]));
                 Ok(())
             }

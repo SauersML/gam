@@ -8,10 +8,11 @@ use crate::custom_family::{
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
-    first_psi_linear_map, fit_custom_family, fit_custom_family_fixed_log_lambdas,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
+    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi,
+    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi, second_psi_linear_map,
     shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
@@ -4322,10 +4323,8 @@ impl Clone for GaussianLocationScaleFamily {
 struct GaussianLocationScaleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
-    xmu_action: Option<CustomFamilyPsiDesignAction>,
-    x_ls_action: Option<CustomFamilyPsiDesignAction>,
-    xmu_psi: Option<Array2<f64>>,
-    x_ls_psi: Option<Array2<f64>>,
+    xmu_psi: PsiDesignMap,
+    x_ls_psi: PsiDesignMap,
     zmu_psi: Array1<f64>,
     z_ls_psi: Array1<f64>,
 }
@@ -5467,67 +5466,56 @@ impl GaussianLocationScaleFamily {
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
 
         let mut global = 0usize;
+        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
-                    let mut xmu_psi = None;
-                    let mut x_ls_psi = None;
-                    let mut xmu_action = None;
-                    let mut x_ls_action = None;
-                    let mut zmu_psi = Array1::<f64>::zeros(n);
-                    let mut z_ls_psi = Array1::<f64>::zeros(n);
+                    let xmu_psi;
+                    let x_ls_psi;
+                    let zmu_psi;
+                    let z_ls_psi;
                     match block_idx {
                         Self::BLOCK_MU => {
-                            xmu_action = CustomFamilyPsiDesignAction::from_first_derivative(
+                            xmu_psi = resolve_custom_family_x_psi_map(
                                 deriv,
                                 n,
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleFamily mu",
-                            )
-                            .ok();
-                            if let Some(action) = xmu_action.as_ref() {
-                                zmu_psi = action.forward_mul(betamu.view());
-                            } else {
-                                let dense = resolve_custom_family_x_psi(
-                                    deriv,
-                                    n,
-                                    pmu,
-                                    "GaussianLocationScaleFamily mu",
-                                )?;
-                                zmu_psi = dense.dot(betamu);
-                                xmu_psi = Some(dense);
-                            }
+                                &policy,
+                            )?;
+                            zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
+                                format!("GaussianLocationScaleFamily mu forward_mul: {e}")
+                            })?;
+                            x_ls_psi = PsiDesignMap::Zero {
+                                nrows: n,
+                                ncols: p_ls,
+                            };
+                            z_ls_psi = Array1::<f64>::zeros(n);
                         }
                         Self::BLOCK_LOG_SIGMA => {
-                            x_ls_action = CustomFamilyPsiDesignAction::from_first_derivative(
+                            x_ls_psi = resolve_custom_family_x_psi_map(
                                 deriv,
                                 n,
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleFamily log-sigma",
-                            )
-                            .ok();
-                            if let Some(action) = x_ls_action.as_ref() {
-                                z_ls_psi = action.forward_mul(beta_ls.view());
-                            } else {
-                                let dense = resolve_custom_family_x_psi(
-                                    deriv,
-                                    n,
-                                    p_ls,
-                                    "GaussianLocationScaleFamily log-sigma",
-                                )?;
-                                z_ls_psi = dense.dot(beta_ls);
-                                x_ls_psi = Some(dense);
-                            }
+                                &policy,
+                            )?;
+                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
+                                format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
+                            })?;
+                            xmu_psi = PsiDesignMap::Zero {
+                                nrows: n,
+                                ncols: pmu,
+                            };
+                            zmu_psi = Array1::<f64>::zeros(n);
                         }
                         _ => return Ok(None),
                     }
                     return Ok(Some(GaussianLocationScaleJointPsiDirection {
                         block_idx,
                         local_idx,
-                        xmu_action,
-                        x_ls_action,
                         zmu_psi,
                         z_ls_psi,
                         xmu_psi,
@@ -5687,26 +5675,16 @@ impl GaussianLocationScaleFamily {
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
         let weights_a = gaussian_joint_psi_firstweights(&rows, &dir_a.zmu_psi, &dir_a.z_ls_psi);
         let objective_psi = weights_a.objective_psirow.sum();
-        let xmu_map = first_psi_linear_map(
-            dir_a.xmu_action.as_ref(),
-            dir_a.xmu_psi.as_ref(),
-            xmu.nrows(),
-            xmu.ncols(),
-        );
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            dir_a.x_ls_psi.as_ref(),
-            x_ls.nrows(),
-            x_ls.ncols(),
-        );
+        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_mu =
             xmu_map.transpose_mul(weights_a.scoremu.view()) + xmu.t().dot(&weights_a.dscoremu);
         let score_ls =
             x_ls_map.transpose_mul(weights_a.score_ls.view()) + x_ls.t().dot(&weights_a.dscore_ls);
         let score_psi = gaussian_pack_joint_score(&score_mu, &score_ls);
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
-            dir_a.xmu_action.clone(),
-            dir_a.x_ls_action.clone(),
+            dir_a.xmu_psi.cloned_first_action(),
+            dir_a.x_ls_psi.cloned_first_action(),
             0..xmu.ncols(),
             xmu.ncols()..xmu.ncols() + x_ls.ncols(),
             xmu,
@@ -5791,30 +5769,10 @@ impl GaussianLocationScaleFamily {
             x_ls,
         )?;
         let n = self.y.len();
-        let xmu_i_map = first_psi_linear_map(
-            dir_i.xmu_action.as_ref(),
-            dir_i.xmu_psi.as_ref(),
-            n,
-            xmu.ncols(),
-        );
-        let x_ls_i_map = first_psi_linear_map(
-            dir_i.x_ls_action.as_ref(),
-            dir_i.x_ls_psi.as_ref(),
-            n,
-            x_ls.ncols(),
-        );
-        let xmu_j_map = first_psi_linear_map(
-            dir_j.xmu_action.as_ref(),
-            dir_j.xmu_psi.as_ref(),
-            n,
-            xmu.ncols(),
-        );
-        let x_ls_j_map = first_psi_linear_map(
-            dir_j.x_ls_action.as_ref(),
-            dir_j.x_ls_psi.as_ref(),
-            n,
-            x_ls.ncols(),
-        );
+        let xmu_i_map = dir_i.xmu_psi.as_linear_map_ref();
+        let x_ls_i_map = dir_i.x_ls_psi.as_linear_map_ref();
+        let xmu_j_map = dir_j.xmu_psi.as_linear_map_ref();
+        let x_ls_j_map = dir_j.x_ls_psi.as_linear_map_ref();
         let xmu_ab_map = second_psi_linear_map(
             second_drifts.xmu_ab_action.as_ref(),
             second_drifts.xmu_ab.as_ref(),
@@ -5940,18 +5898,8 @@ impl GaussianLocationScaleFamily {
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
-        let xmu_map = first_psi_linear_map(
-            dir_a.xmu_action.as_ref(),
-            dir_a.xmu_psi.as_ref(),
-            xmu.nrows(),
-            pmu,
-        );
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            dir_a.x_ls_psi.as_ref(),
-            x_ls.nrows(),
-            p_ls,
-        );
+        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let total = pmu + p_ls;
         if d_beta_flat.len() != total {
             return Err(format!(
@@ -6415,10 +6363,8 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
 struct GaussianLocationScaleWiggleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
-    xmu_action: Option<CustomFamilyPsiDesignAction>,
-    x_ls_action: Option<CustomFamilyPsiDesignAction>,
-    xmu_psi: Option<Array2<f64>>,
-    x_ls_psi: Option<Array2<f64>>,
+    xmu_psi: PsiDesignMap,
+    x_ls_psi: PsiDesignMap,
     zmu_psi: Array1<f64>,
     z_ls_psi: Array1<f64>,
 }
@@ -6898,59 +6844,52 @@ impl GaussianLocationScaleWiggleFamily {
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
 
         let mut global = 0usize;
+        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
-                    let mut xmu_psi = None;
-                    let mut x_ls_psi = None;
-                    let mut xmu_action = None;
-                    let mut x_ls_action = None;
-                    let mut zmu_psi = Array1::<f64>::zeros(n);
-                    let mut z_ls_psi = Array1::<f64>::zeros(n);
+                    let xmu_psi;
+                    let x_ls_psi;
+                    let zmu_psi;
+                    let z_ls_psi;
                     match block_idx {
                         Self::BLOCK_MU => {
-                            xmu_action = CustomFamilyPsiDesignAction::from_first_derivative(
+                            xmu_psi = resolve_custom_family_x_psi_map(
                                 deriv,
                                 n,
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily mu",
-                            )
-                            .ok();
-                            if let Some(action) = xmu_action.as_ref() {
-                                zmu_psi = action.forward_mul(betamu.view());
-                            } else {
-                                let dense = resolve_custom_family_x_psi(
-                                    deriv,
-                                    n,
-                                    pmu,
-                                    "GaussianLocationScaleWiggleFamily mu",
-                                )?;
-                                zmu_psi = dense.dot(betamu);
-                                xmu_psi = Some(dense);
-                            }
+                                &policy,
+                            )?;
+                            zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
+                                format!("GaussianLocationScaleWiggleFamily mu forward_mul: {e}")
+                            })?;
+                            x_ls_psi = PsiDesignMap::Zero {
+                                nrows: n,
+                                ncols: p_ls,
+                            };
+                            z_ls_psi = Array1::<f64>::zeros(n);
                         }
                         Self::BLOCK_LOG_SIGMA => {
-                            x_ls_action = CustomFamilyPsiDesignAction::from_first_derivative(
+                            x_ls_psi = resolve_custom_family_x_psi_map(
                                 deriv,
                                 n,
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily log-sigma",
-                            )
-                            .ok();
-                            if let Some(action) = x_ls_action.as_ref() {
-                                z_ls_psi = action.forward_mul(beta_ls.view());
-                            } else {
-                                let dense = resolve_custom_family_x_psi(
-                                    deriv,
-                                    n,
-                                    p_ls,
-                                    "GaussianLocationScaleWiggleFamily log-sigma",
-                                )?;
-                                z_ls_psi = dense.dot(beta_ls);
-                                x_ls_psi = Some(dense);
-                            }
+                                &policy,
+                            )?;
+                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
+                                format!(
+                                    "GaussianLocationScaleWiggleFamily log-sigma forward_mul: {e}"
+                                )
+                            })?;
+                            xmu_psi = PsiDesignMap::Zero {
+                                nrows: n,
+                                ncols: pmu,
+                            };
+                            zmu_psi = Array1::<f64>::zeros(n);
                         }
                         Self::BLOCK_WIGGLE => return Ok(None),
                         _ => return Ok(None),
@@ -6958,8 +6897,6 @@ impl GaussianLocationScaleWiggleFamily {
                     return Ok(Some(GaussianLocationScaleWiggleJointPsiDirection {
                         block_idx,
                         local_idx,
-                        xmu_action,
-                        x_ls_action,
                         zmu_psi,
                         z_ls_psi,
                         xmu_psi,
@@ -7346,18 +7283,8 @@ impl GaussianLocationScaleWiggleFamily {
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
-        let xmu_map = first_psi_linear_map(
-            dir_a.xmu_action.as_ref(),
-            dir_a.xmu_psi.as_ref(),
-            xmu.nrows(),
-            xmu.ncols(),
-        );
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            dir_a.x_ls_psi.as_ref(),
-            x_ls.nrows(),
-            x_ls.ncols(),
-        );
+        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
 
         let q_a = &geom.dq_dq0 * &dir_a.zmu_psi;
         let s1_a = &geom.d2q_dq02 * &dir_a.zmu_psi;
@@ -7509,30 +7436,10 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls,
         )?;
         let n = self.y.len();
-        let xmu_a_map = first_psi_linear_map(
-            dir_a.xmu_action.as_ref(),
-            dir_a.xmu_psi.as_ref(),
-            n,
-            xmu.ncols(),
-        );
-        let x_ls_a_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            dir_a.x_ls_psi.as_ref(),
-            x_ls.nrows(),
-            x_ls.ncols(),
-        );
-        let xmu_b_map = first_psi_linear_map(
-            dir_b.xmu_action.as_ref(),
-            dir_b.xmu_psi.as_ref(),
-            n,
-            xmu.ncols(),
-        );
-        let x_ls_b_map = first_psi_linear_map(
-            dir_b.x_ls_action.as_ref(),
-            dir_b.x_ls_psi.as_ref(),
-            n,
-            x_ls.ncols(),
-        );
+        let xmu_a_map = dir_a.xmu_psi.as_linear_map_ref();
+        let x_ls_a_map = dir_a.x_ls_psi.as_linear_map_ref();
+        let xmu_b_map = dir_b.xmu_psi.as_linear_map_ref();
+        let x_ls_b_map = dir_b.x_ls_psi.as_linear_map_ref();
         let xmu_ab_map = second_psi_linear_map(
             second_drifts.xmu_ab_action.as_ref(),
             second_drifts.xmu_ab.as_ref(),
@@ -7893,18 +7800,8 @@ impl GaussianLocationScaleWiggleFamily {
     ) -> Result<Array2<f64>, String> {
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
-        let xmu_map = first_psi_linear_map(
-            dir_a.xmu_action.as_ref(),
-            dir_a.xmu_psi.as_ref(),
-            xmu.nrows(),
-            pmu,
-        );
-        let x_ls_map = first_psi_linear_map(
-            dir_a.x_ls_action.as_ref(),
-            dir_a.x_ls_psi.as_ref(),
-            x_ls.nrows(),
-            p_ls,
-        );
+        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let q0 = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -9994,10 +9891,8 @@ pub struct BinomialLocationScaleFamily {
 struct BinomialLocationScaleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
-    x_t_action: Option<CustomFamilyPsiDesignAction>,
-    x_ls_action: Option<CustomFamilyPsiDesignAction>,
-    x_t_psi: Option<Array2<f64>>,
-    x_ls_psi: Option<Array2<f64>>,
+    x_t_psi: PsiDesignMap,
+    x_ls_psi: PsiDesignMap,
     z_t_psi: Array1<f64>,
     z_ls_psi: Array1<f64>,
 }

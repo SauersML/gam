@@ -1580,6 +1580,7 @@ pub struct MaternBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -1644,6 +1645,7 @@ pub struct DuchonBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     #[serde(default)]
     pub operator_penalties: DuchonOperatorPenaltySpec,
 }
@@ -1721,6 +1723,7 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     },
     Duchon {
         centers: Array2<f64>,
@@ -1732,6 +1735,7 @@ pub enum BasisMetadata {
         input_scales: Option<Vec<f64>>,
         /// Per-axis anisotropy log-scales η_a, stored for prediction.
         aniso_log_scales: Option<Vec<f64>>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     },
     TensorBSpline {
         feature_cols: Vec<usize>,
@@ -6098,6 +6102,7 @@ fn matern_aniso_extended_radial_scalars(
 struct MaternCrossPenaltyContext {
     centers: Array2<f64>,
     aniso_log_scales: Vec<f64>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     length_scale: f64,
     nu: MaternNu,
     z_transform: Option<Array2<f64>>,
@@ -6518,6 +6523,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
     let cross_ctx = std::sync::Arc::new(MaternCrossPenaltyContext {
         centers: centers.to_owned(),
         aniso_log_scales: eta.to_vec(),
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         length_scale,
         nu,
         z_transform: z_opt.cloned(),
@@ -6569,6 +6575,7 @@ struct DuchonCrossPenaltyContext {
     pure_block_order: usize,
     coeffs: Option<DuchonPartialFractionCoeffs>,
     aniso_log_scales: Vec<f64>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     z_kernel: Array2<f64>,
     poly_cols: usize,
     identifiability_transform: Option<Array2<f64>>,
@@ -6771,6 +6778,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<
@@ -7178,6 +7186,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         pure_block_order,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         z_kernel,
         poly_cols,
         identifiability_transform: identifiability_transform.cloned(),
@@ -7424,6 +7433,7 @@ fn build_matern_kernel_penalty(
     nu: MaternNu,
     include_intercept: bool,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<Array2<f64>, BasisError> {
     let k = centers.nrows();
     let total_cols = k + usize::from(include_intercept);
@@ -7539,6 +7549,7 @@ pub fn build_matern_collocation_operator_matrices(
     include_intercept: bool,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     // Specialized Matérn operator assembly using explicit half-integer formulas:
     // - one exp(-a) and small polynomials per pair,
@@ -7681,6 +7692,7 @@ pub fn build_duchon_collocation_operator_matrices(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let mut workspace = BasisWorkspace::default();
@@ -7703,6 +7715,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
@@ -9085,17 +9098,21 @@ struct SpatialDistanceCacheKey {
 struct SpatialDistanceCacheEntry {
     data_center_r: Arc<Array2<f64>>,
     center_center_r: Arc<Array2<f64>>,
-    bytes: usize,
 }
 
-#[derive(Default, Clone, Debug)]
-struct SpatialDistanceCache {
-    map: HashMap<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
-    order: Vec<SpatialDistanceCacheKey>,
-    bytes: usize,
+impl crate::resource::ResidentBytes for SpatialDistanceCacheEntry {
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<f64>()
+            .saturating_mul(self.data_center_r.nrows())
+            .saturating_mul(self.data_center_r.ncols())
+            .saturating_add(
+                std::mem::size_of::<f64>()
+                    .saturating_mul(self.center_center_r.nrows())
+                    .saturating_mul(self.center_center_r.ncols()),
+            )
+    }
 }
 
-const SPATIAL_DISTANCE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
 
@@ -9124,33 +9141,71 @@ struct OwnedDataCacheKey {
     stride1: isize,
 }
 
-#[derive(Default, Clone, Debug)]
-struct OwnedDataCache {
-    map: HashMap<OwnedDataCacheKey, Arc<Array2<f64>>>,
-    order: Vec<OwnedDataCacheKey>,
+#[derive(Debug)]
+struct BasisCacheContext {
+    spatial_distance: crate::resource::ByteLruCache<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
+    constraint_nullspace: ConstraintNullspaceCache,
+    owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
 
-const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
+impl BasisCacheContext {
+    fn with_policy(policy: &crate::resource::ResourcePolicy) -> Self {
+        Self {
+            spatial_distance: crate::resource::ByteLruCache::new(
+                policy.max_spatial_distance_cache_bytes,
+            ),
+            constraint_nullspace: ConstraintNullspaceCache::default(),
+            owned_data: crate::resource::ByteLruCache::new(policy.max_owned_data_cache_bytes),
+        }
+    }
+}
 
-#[derive(Default, Clone, Debug)]
-struct BasisCacheContext {
-    spatial_distance: SpatialDistanceCache,
-    constraint_nullspace: ConstraintNullspaceCache,
-    owned_data: OwnedDataCache,
+impl Default for BasisCacheContext {
+    fn default() -> Self {
+        Self::with_policy(&crate::resource::ResourcePolicy::default_library())
+    }
 }
 
 /// Explicit per-run workspace for basis/spatial cache reuse.
 ///
 /// Pass one workspace through repeated basis builds to avoid global mutable state
 /// and to keep caching scoped to a caller-controlled lifecycle.
-#[derive(Default, Clone, Debug)]
+///
+/// The spatial-distance and owned-data caches are byte-limited via the
+/// [`crate::resource::ResourcePolicy`] provided at construction; use
+/// [`BasisWorkspace::with_policy`] for biobank-scale workloads where a single
+/// entry can be multiple gigabytes.
+#[derive(Debug)]
 pub struct BasisWorkspace {
     cache: BasisCacheContext,
+    policy: crate::resource::ResourcePolicy,
 }
 
 impl BasisWorkspace {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_policy(policy: crate::resource::ResourcePolicy) -> Self {
+        Self {
+            cache: BasisCacheContext::with_policy(&policy),
+            policy,
+        }
+    }
+
+    pub fn default_library() -> Self {
+        Self::with_policy(crate::resource::ResourcePolicy::default_library())
+    }
+
+    /// Returns the resource policy this workspace was configured with.
+    pub fn policy(&self) -> &crate::resource::ResourcePolicy {
+        &self.policy
+    }
+}
+
+impl Default for BasisWorkspace {
+    fn default() -> Self {
+        Self::default_library()
     }
 }
 
@@ -9207,46 +9262,14 @@ fn spatial_distance_data_center_bytes(n: usize, k: usize) -> usize {
 }
 
 #[inline(always)]
-fn spatial_distance_cache_entry_bytes(n: usize, k: usize) -> usize {
-    spatial_distance_data_center_bytes(n, k).saturating_add(
-        k.saturating_mul(k)
-            .saturating_mul(std::mem::size_of::<f64>()),
-    )
-}
-
-#[inline(always)]
 fn spatial_distance_cacheable_entry(n: usize, k: usize) -> bool {
     spatial_distance_data_center_bytes(n, k) <= SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES
-}
-
-fn insert_spatial_distance_cache_entry(
-    cache: &mut SpatialDistanceCache,
-    key: SpatialDistanceCacheKey,
-    entry: SpatialDistanceCacheEntry,
-) {
-    if let Some(old) = cache.map.remove(&key) {
-        cache.bytes = cache.bytes.saturating_sub(old.bytes);
-        cache.order.retain(|candidate| *candidate != key);
-    }
-    cache.bytes = cache.bytes.saturating_add(entry.bytes);
-    cache.map.insert(key, entry);
-    cache.order.push(key);
-
-    while cache.bytes > SPATIAL_DISTANCE_CACHE_MAX_BYTES {
-        if cache.order.is_empty() {
-            break;
-        }
-        let oldkey = cache.order.remove(0);
-        if let Some(removed) = cache.map.remove(&oldkey) {
-            cache.bytes = cache.bytes.saturating_sub(removed.bytes);
-        }
-    }
 }
 
 fn spatial_distance_matrices(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
-    cache: &mut BasisCacheContext,
+    cache: &BasisCacheContext,
 ) -> Result<(Arc<Array2<f64>>, Arc<Array2<f64>>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
@@ -9269,23 +9292,21 @@ fn spatial_distance_matrices(
         centers_hash: hash_arrayview2(centers),
     };
 
-    if let Some(hit) = cache.spatial_distance.map.get(&key) {
+    if let Some(hit) = cache.spatial_distance.get(&key) {
         return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
     }
 
     let computed_dc = Arc::new(compute_data_center_distances(data, centers)?);
     let computed_cc = Arc::new(compute_center_center_distances(centers));
 
-    if let Some(hit) = cache.spatial_distance.map.get(&key) {
+    if let Some(hit) = cache.spatial_distance.get(&key) {
         return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
     }
-    insert_spatial_distance_cache_entry(
-        &mut cache.spatial_distance,
+    cache.spatial_distance.insert(
         key,
         SpatialDistanceCacheEntry {
             data_center_r: computed_dc.clone(),
             center_center_r: computed_cc.clone(),
-            bytes: spatial_distance_cache_entry_bytes(n, k),
         },
     );
     Ok((computed_dc, computed_cc))
@@ -9306,7 +9327,7 @@ fn thin_plate_constraint_nullspace_order_code() -> u8 {
 
 fn shared_owned_data_matrix(
     data: ArrayView2<'_, f64>,
-    cache: &mut BasisCacheContext,
+    cache: &BasisCacheContext,
 ) -> Arc<Array2<f64>> {
     let key = OwnedDataCacheKey {
         rows: data.nrows(),
@@ -9315,24 +9336,16 @@ fn shared_owned_data_matrix(
         stride0: data.strides()[0],
         stride1: data.strides()[1],
     };
-    if let Some(hit) = cache.owned_data.map.get(&key) {
-        return hit.clone();
+    if let Some(hit) = cache.owned_data.get(&key) {
+        return hit;
     }
 
     let owned = Arc::new(data.to_owned());
-    if let Some(hit) = cache.owned_data.map.get(&key) {
-        return hit.clone();
+    if let Some(hit) = cache.owned_data.get(&key) {
+        return hit;
     }
 
-    cache.owned_data.map.insert(key, owned.clone());
-    cache.owned_data.order.push(key);
-    while cache.owned_data.map.len() > OWNED_DATA_CACHE_MAX_ENTRIES {
-        if cache.owned_data.order.is_empty() {
-            break;
-        }
-        let oldkey = cache.owned_data.order.remove(0);
-        cache.owned_data.map.remove(&oldkey);
-    }
+    cache.owned_data.insert(key, owned.clone());
     owned
 }
 
@@ -9500,6 +9513,7 @@ fn build_matern_operator_penalty_candidates(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let ops = build_matern_collocation_operator_matrices(
         centers,
@@ -9557,6 +9571,7 @@ pub fn create_matern_spline_basiswithworkspace(
     nu: MaternNu,
     include_intercept: bool,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
     let n = data.nrows();
@@ -9884,6 +9899,7 @@ pub fn build_matern_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         },
         kronecker_factored: None,
     })
@@ -10240,6 +10256,7 @@ fn build_matern_operator_penalty_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
     // Full operator-to-penalty derivative pipeline in constrained coordinates:
     //
@@ -10714,6 +10731,7 @@ fn build_matern_design_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
@@ -10738,6 +10756,7 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, f64), BasisError> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
@@ -12793,6 +12812,7 @@ fn build_duchon_basis_designwithworkspace(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonBasisDesign, BasisError> {
     let n = data.nrows();
@@ -13160,6 +13180,7 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         },
         kronecker_factored: None,
     })
@@ -15881,28 +15902,35 @@ mod tests {
     fn shared_owned_data_matrix_reuses_cached_arc_for_same_view() {
         let data =
             Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("data");
-        let mut cache = BasisCacheContext::default();
+        let cache = BasisCacheContext::default();
 
-        let first = shared_owned_data_matrix(data.view(), &mut cache);
-        let second = shared_owned_data_matrix(data.view(), &mut cache);
+        let first = shared_owned_data_matrix(data.view(), &cache);
+        let second = shared_owned_data_matrix(data.view(), &cache);
 
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.owned_data.map.len(), 1);
+        assert!(cache.owned_data.resident_bytes() > 0);
     }
 
     #[test]
-    fn owned_data_cache_keeps_two_entries() {
+    fn owned_data_cache_respects_byte_budget() {
+        // Tiny budget: only one 2x2 matrix fits.
+        let policy = crate::resource::ResourcePolicy {
+            max_owned_data_cache_bytes: 8 * 2 * 2,
+            ..crate::resource::ResourcePolicy::default_library()
+        };
+        let cache = BasisCacheContext::with_policy(&policy);
+
         let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).expect("first data");
         let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).expect("second data");
         let third =
             Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
-        let mut cache = BasisCacheContext::default();
 
-        let _ = shared_owned_data_matrix(first.view(), &mut cache);
-        let _ = shared_owned_data_matrix(second.view(), &mut cache);
-        let _ = shared_owned_data_matrix(third.view(), &mut cache);
+        let _ = shared_owned_data_matrix(first.view(), &cache);
+        let _ = shared_owned_data_matrix(second.view(), &cache);
+        let _ = shared_owned_data_matrix(third.view(), &cache);
 
-        assert_eq!(cache.owned_data.map.len(), 2);
+        // At most one 2x2 f64 matrix (32 bytes) resident.
+        assert!(cache.owned_data.resident_bytes() <= 8 * 2 * 2);
     }
 
     #[test]
@@ -15937,26 +15965,32 @@ mod tests {
             }
         }
 
-        fn entry(bytes: usize) -> SpatialDistanceCacheEntry {
+        // Each entry reports 200 MiB via its dense arrays.
+        fn entry() -> SpatialDistanceCacheEntry {
+            // 25 * 1024 * 1024 f64 = 200 MiB per field; we only need one field
+            // to hit the target, but keep both populated to match production.
+            let pair_bytes: usize = 200 * 1024 * 1024 / std::mem::size_of::<f64>();
             SpatialDistanceCacheEntry {
-                data_center_r: Arc::new(Array2::zeros((1, 1))),
+                data_center_r: Arc::new(Array2::zeros((pair_bytes, 1))),
                 center_center_r: Arc::new(Array2::zeros((1, 1))),
-                bytes,
             }
         }
 
-        let mut cache = SpatialDistanceCache::default();
-        let entry_bytes = 200 * 1024 * 1024;
+        let cache: crate::resource::ByteLruCache<
+            SpatialDistanceCacheKey,
+            SpatialDistanceCacheEntry,
+        > = crate::resource::ByteLruCache::new(512 * 1024 * 1024);
 
-        insert_spatial_distance_cache_entry(&mut cache, key(1), entry(entry_bytes));
-        insert_spatial_distance_cache_entry(&mut cache, key(2), entry(entry_bytes));
-        insert_spatial_distance_cache_entry(&mut cache, key(3), entry(entry_bytes));
+        cache.insert(key(1), entry());
+        cache.insert(key(2), entry());
+        cache.insert(key(3), entry());
 
-        assert_eq!(cache.bytes, 2 * entry_bytes);
-        assert_eq!(cache.map.len(), 2);
-        assert!(!cache.map.contains_key(&key(1)));
-        assert!(cache.map.contains_key(&key(2)));
-        assert!(cache.map.contains_key(&key(3)));
+        // Total resident bytes must stay at or below the 512 MiB cap, and the
+        // oldest entry must have been evicted.
+        assert!(cache.resident_bytes() <= 512 * 1024 * 1024);
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(2)).is_some());
+        assert!(cache.get(&key(3)).is_some());
     }
 
     #[test]
@@ -18390,6 +18424,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         match &out.metadata {
@@ -18418,6 +18453,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         let out_design = out.design.to_dense();
@@ -18460,6 +18496,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 3);
@@ -18489,6 +18526,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penaltyinfo.len(), 3);
@@ -18913,6 +18951,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -18946,6 +18985,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -18966,6 +19006,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -18987,6 +19028,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -19012,6 +19054,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -19081,6 +19124,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -19243,6 +19287,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let mut workspace = BasisWorkspace::default();
         let derivative = build_duchon_basis_log_kappa_derivativewithworkspace(
@@ -19313,6 +19358,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let mut workspace = BasisWorkspace::default();
         let second_derivative = build_duchon_basis_log_kappasecond_derivativewithworkspace(
@@ -19993,6 +20039,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -20085,6 +20132,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let analytic = build_duchon_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Duchon second derivative should build");
@@ -20241,6 +20289,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta),
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         build_duchon_basis(data.view(), &spec)
             .expect("pure Duchon basis")
@@ -20283,6 +20332,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta.clone()),
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
             .expect("pure Duchon anisotropic derivatives");
@@ -20528,6 +20578,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let err = match build_duchon_basis(data.view(), &spec) {
             Ok(_) => panic!("pure Duchon default tuple violates the nullspace-order condition"),
@@ -20559,6 +20610,7 @@ mod tests {
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let err = match build_duchon_basis(centers.view(), &spec) {
             Ok(_) => panic!("indefinite pure Duchon counterexample should be rejected"),

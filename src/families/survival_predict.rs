@@ -17,21 +17,24 @@ use crate::families::survival_construction::{
     build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
     build_survival_time_basis, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_likelihood_mode,
-    require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
-    survival_likelihood_modename,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
+    parse_survival_likelihood_mode, require_structural_survival_time_basis,
+    resolved_survival_time_basis_config_from_build, survival_likelihood_modename,
 };
+use crate::families::survival_location_scale::residual_distribution_inverse_link;
 use crate::gamlss::buildwiggle_block_input_from_knots;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, load_survival_time_basis_config_from_model,
     survival_baseline_config_from_model,
 };
+use crate::inference::formula_dsl::parse_link_choice;
 use crate::inference::predict::predict_gam;
 use crate::linalg::matrix::DesignMatrix;
+use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::probability::normal_cdf;
-use crate::solver::estimate::UnifiedFitResult;
+use crate::solver::estimate::{FittedLinkState, UnifiedFitResult};
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use crate::types::{InverseLink, LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
@@ -612,26 +615,129 @@ pub fn saved_survival_location_scale_fit_result(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, String> {
     model.saved_prediction_runtime()?;
-    model.fit_result.clone().ok_or_else(|| {
+    let mut fit = model.fit_result.clone().ok_or_else(|| {
         "saved location-scale survival model missing canonical fit_result; refit with current CLI"
             .to_string()
-    })
+    })?;
+    let inverse_link = resolve_survival_inverse_link_from_saved(model)?;
+    apply_inverse_link_state_to_fit_result(&mut fit, &inverse_link);
+    Ok(fit)
 }
 
-/// Resolve the saved survival inverse-link, with a probit fallback for
-/// payloads that stored an identity link by mistake.
+fn apply_inverse_link_state_to_fit_result(
+    fit_result: &mut UnifiedFitResult,
+    inverse_link: &InverseLink,
+) {
+    fit_result.fitted_link = match inverse_link {
+        InverseLink::LatentCLogLog(state) => FittedLinkState::LatentCLogLog { state: *state },
+        InverseLink::Sas(state) => FittedLinkState::Sas {
+            state: *state,
+            covariance: None,
+        },
+        InverseLink::BetaLogistic(state) => FittedLinkState::BetaLogistic {
+            state: *state,
+            covariance: None,
+        },
+        InverseLink::Mixture(state) => FittedLinkState::Mixture {
+            state: state.clone(),
+            covariance: None,
+        },
+        InverseLink::Standard(_) => FittedLinkState::Standard(None),
+    };
+}
+
+/// Resolve the saved survival inverse-link from saved link metadata and fitted
+/// state.
 pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, String> {
-    model
-        .resolved_inverse_link()?
-        .ok_or_else(|| {
-            "saved survival model missing resolved inverse-link; refit with current CLI".to_string()
+    let raw = model
+        .link
+        .as_deref()
+        .or(model.survival_distribution.as_deref())
+        .ok_or_else(|| "saved survival model is missing link/distribution metadata".to_string())?;
+    let name = raw.trim().to_ascii_lowercase();
+    if name == "loglog" || name == "cauchit" {
+        let component = if name == "loglog" {
+            LinkComponent::LogLog
+        } else {
+            LinkComponent::Cauchit
+        };
+        return state_fromspec(&MixtureLinkSpec {
+            components: vec![component],
+            initial_rho: Array1::zeros(0),
         })
-        .map(|link| match link {
-            InverseLink::Standard(LinkFunction::Identity) => {
-                InverseLink::Standard(LinkFunction::Probit)
+        .map(InverseLink::Mixture)
+        .map_err(|e| format!("invalid saved survival {name} link state: {e}"));
+    }
+    let choice = match parse_link_choice(Some(raw), false) {
+        Ok(v) => v,
+        Err(_) => {
+            let dist = parse_survival_distribution(raw)?;
+            return Ok(residual_distribution_inverse_link(dist));
+        }
+    };
+    let fit = model
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "saved survival model is missing fit_result".to_string())?;
+    let Some(choice) = choice else {
+        let dist = parse_survival_distribution(raw)?;
+        return Ok(residual_distribution_inverse_link(dist));
+    };
+    if let Some(components) = choice.mixture_components {
+        let rho = match &fit.fitted_link {
+            FittedLinkState::Mixture { state, .. } => state.rho.clone(),
+            _ => {
+                return Err(
+                    "saved survival blended-link model missing fitted mixture link parameters"
+                        .to_string(),
+                );
             }
-            other => other,
+        };
+        return state_fromspec(&MixtureLinkSpec {
+            components,
+            initial_rho: rho,
         })
+        .map(InverseLink::Mixture)
+        .map_err(|e| format!("invalid saved survival blended link state: {e}"));
+    }
+    match choice.link {
+        crate::types::LinkFunction::Sas => {
+            let (epsilon, log_delta) = match &fit.fitted_link {
+                FittedLinkState::Sas { state, .. } => (state.epsilon, state.log_delta),
+                _ => {
+                    return Err(
+                        "saved survival SAS model missing fitted SAS link parameters".to_string(),
+                    );
+                }
+            };
+            state_from_sasspec(SasLinkSpec {
+                initial_epsilon: epsilon,
+                initial_log_delta: log_delta,
+            })
+            .map(InverseLink::Sas)
+            .map_err(|e| format!("invalid saved survival SAS state: {e}"))
+        }
+        crate::types::LinkFunction::BetaLogistic => {
+            let (epsilon, delta) = match &fit.fitted_link {
+                FittedLinkState::BetaLogistic { state, .. } => {
+                    (state.epsilon, state.log_delta)
+                }
+                _ => {
+                    return Err(
+                        "saved survival beta-logistic model missing fitted beta-logistic link parameters"
+                            .to_string(),
+                    )
+                }
+            };
+            state_from_beta_logisticspec(SasLinkSpec {
+                initial_epsilon: epsilon,
+                initial_log_delta: delta,
+            })
+            .map(InverseLink::BetaLogistic)
+            .map_err(|e| format!("invalid saved survival beta-logistic state: {e}"))
+        }
+        other => Ok(InverseLink::Standard(other)),
+    }
 }
 
 /// Build a [`ScaleDeviationTransform`] from saved projection metadata
