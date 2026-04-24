@@ -7774,19 +7774,6 @@ impl SparseCholeskyOperator {
         Ok(solved)
     }
 
-    fn solve_operator_columns_exact(&self, op: &dyn HyperOperator) -> Result<Array2<f64>, String> {
-        let mut solved_all = Array2::<f64>::zeros((self.n_dim, self.n_dim));
-        let (range_start, range_end) = op
-            .block_local_data()
-            .map(|(_, start, end)| (start, end))
-            .unwrap_or((0, self.n_dim));
-        let solved = self.solve_operator_column_range_exact(op, range_start, range_end)?;
-        solved_all
-            .slice_mut(ndarray::s![.., range_start..range_end])
-            .assign(&solved);
-        Ok(solved_all)
-    }
-
     fn trace_hinv_matrix_operator_cross_exact(
         &self,
         matrix: &Array2<f64>,
@@ -7841,7 +7828,16 @@ impl SparseCholeskyOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        let solved_left = match self.solve_operator_columns_exact(left) {
+        let (left_start, left_end) = left
+            .block_local_data()
+            .map(|(_, start, end)| (start, end))
+            .unwrap_or((0, self.n_dim));
+        let (right_start, right_end) = right
+            .block_local_data()
+            .map(|(_, start, end)| (start, end))
+            .unwrap_or((0, self.n_dim));
+
+        let solved_left = match self.solve_operator_column_range_exact(left, left_start, left_end) {
             Ok(sol) => sol,
             Err(e) => {
                 log::warn!(
@@ -7850,19 +7846,36 @@ impl SparseCholeskyOperator {
                 return f64::NAN;
             }
         };
-        if std::ptr::addr_eq(left, right) {
-            return trace_matrix_product(&solved_left, &solved_left);
-        }
-        let solved_right = match self.solve_operator_columns_exact(right) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!(
-                    "SparseCholeskyOperator::trace_hinv_operator_cross_exact failed on right operator: {e}"
-                );
-                return f64::NAN;
+        let same_operator =
+            std::ptr::addr_eq(left, right) && left_start == right_start && left_end == right_end;
+        let solved_right = if same_operator {
+            None
+        } else {
+            match self.solve_operator_column_range_exact(right, right_start, right_end) {
+                Ok(sol) => Some(sol),
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::trace_hinv_operator_cross_exact failed on right operator: {e}"
+                    );
+                    return f64::NAN;
+                }
             }
         };
-        trace_matrix_product(&solved_left, &solved_right)
+
+        let right_cols = right_end - right_start;
+        let mut trace = 0.0;
+        for left_col in 0..(left_end - left_start) {
+            let global_left_col = left_start + left_col;
+            for right_col in 0..right_cols {
+                let global_right_col = right_start + right_col;
+                let right_value = match solved_right.as_ref() {
+                    Some(solved) => solved[[global_left_col, right_col]],
+                    None => solved_left[[global_left_col, right_col]],
+                };
+                trace += solved_left[[global_right_col, left_col]] * right_value;
+            }
+        }
+        trace
     }
 }
 
