@@ -202,7 +202,6 @@ where
 
 trait FdGradientState<E> {
     fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, E>;
-    fn compute_gradient(&self, rho: &Array1<f64>) -> Result<Array1<f64>, E>;
     fn last_ridge_used(&self) -> Option<f64>;
 }
 
@@ -307,7 +306,7 @@ fn select_fd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
         }
         (true, false) => d_small,
         (false, true) => d_big,
-        (false, false) => 0.0,
+        (false, false) => f64::NAN,
     }
 }
 
@@ -315,13 +314,12 @@ fn compute_fd_gradient<S, E>(
     reml_state: &S,
     rho: &Array1<f64>,
     emit_logs: bool,
-    allow_analytic_fallback: bool,
+    _allow_analytic_fallback: bool,
 ) -> Result<Array1<f64>, E>
 where
     S: FdGradientState<E>,
 {
     let mut fd_grad = Array1::zeros(rho.len());
-    let mut analytic_fallback: Option<Array1<f64>> = None;
 
     let mut log_lines: Vec<String> = Vec::new();
     let (rho_min, rho_max) = rho
@@ -451,17 +449,6 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             }
         }
 
-        if derivative.is_none() && allow_analytic_fallback {
-            if analytic_fallback.is_none() {
-                analytic_fallback = Some(reml_state.compute_gradient(rho)?);
-            }
-            derivative = analytic_fallback.as_ref().map(|g| g[i]);
-            log_lines.push(format!(
-                "[FD RIDGE]   coord {} fallback to analytic gradient due to ridge jitter (max rel span {:.3e})",
-                i, ridge_rel_span_max
-            ));
-        }
-
         fd_grad[i] = derivative.unwrap_or(f64::NAN);
         let rel_gap_first = rel_gap_first.unwrap_or(f64::NAN);
         log_lines.push(format!(
@@ -490,10 +477,6 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
 impl FdGradientState<EstimationError> for RemlState<'_> {
     fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         RemlState::compute_cost(self, rho)
-    }
-
-    fn compute_gradient(&self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        RemlState::compute_gradient(self, rho)
     }
 
     fn last_ridge_used(&self) -> Option<f64> {
@@ -834,8 +817,9 @@ const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
 
 /// Smooth approximation of `max(dp, DP_FLOOR)` that is differentiable.
 ///
-/// Returns the smoothed value and its derivative with respect to `dp`.
-pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64) {
+/// Returns the smoothed value, first derivative, and second derivative with
+/// respect to `dp`.
+pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64, f64) {
     let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
     let scaled = (dp - DP_FLOOR) / tau;
 
@@ -856,7 +840,8 @@ pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     };
 
     let dp_c = DP_FLOOR + tau * softplus;
-    (dp_c, sigma)
+    let dp_cgrad2 = sigma * (1.0 - sigma) / tau;
+    (dp_c, sigma, dp_cgrad2)
 }
 
 /// Compute the smoothing parameter uncertainty correction matrix `V_corr = J * V_rho * J^T`.
@@ -2793,6 +2778,12 @@ pub struct FitOptions {
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
     pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    /// Use Jeffreys/Firth bias reduction for supported likelihoods.
+    ///
+    /// Model-fitting paths must pass this explicitly through every objective
+    /// evaluator so baseline fits, spatial hyperparameter evaluations, outer
+    /// line searches, final refits, and inference all optimize the same target.
+    pub firth_bias_reduction: bool,
     pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
     /// Relative shrinkage floor for penalized block eigenvalues.
     ///
@@ -3282,6 +3273,20 @@ fn array2_values_equal(lhs: &Array2<f64>, rhs: &Array2<f64>) -> bool {
     lhs.dim() == rhs.dim() && lhs.iter().zip(rhs.iter()).all(|(a, b)| a == b)
 }
 
+fn log_lambdas_match_lambdas(log_lambdas: &Array1<f64>, lambdas: &Array1<f64>) -> bool {
+    if log_lambdas.len() != lambdas.len() {
+        return false;
+    }
+    log_lambdas
+        .iter()
+        .zip(lambdas.iter())
+        .all(|(&log_lam, &lam)| {
+            let canonical = lam.max(1e-300).ln();
+            let tol = 1e-12 * (1.0 + canonical.abs());
+            (log_lam - canonical).abs() <= tol
+        })
+}
+
 fn flatten_block_betas(blocks: &[FittedBlock]) -> Array1<f64> {
     let total: usize = blocks.iter().map(|b| b.beta.len()).sum();
     let mut flat = Array1::zeros(total);
@@ -3372,8 +3377,7 @@ impl UnifiedFitResult {
         }
         validate_all_finite_estimation("fit_result.log_lambdas", log_lambdas.iter().copied())?;
         validate_all_finite_estimation("fit_result.lambdas", lambdas.iter().copied())?;
-        let canonical_log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
-        if !array1_values_equal(&canonical_log_lambdas, &log_lambdas) {
+        if !log_lambdas_match_lambdas(&log_lambdas, &lambdas) {
             return Err(EstimationError::InvalidInput(
                 "UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise".to_string(),
             ));
@@ -4528,7 +4532,7 @@ where
         tol: opts.tol,
         nullspace_dims: opts.nullspace_dims.clone(),
         linear_constraints: opts.linear_constraints.clone(),
-        firth_bias_reduction: Some(false),
+        firth_bias_reduction: Some(opts.firth_bias_reduction),
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
         rho_prior: Default::default(),
         kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
@@ -4564,8 +4568,7 @@ where
         .inference
         .as_ref()
         .and_then(|inf| inf.beta_covariance_corrected.clone());
-    let penalized_objective =
-        -result.log_likelihood + result.stable_penalty_term + result.reml_score;
+    let penalized_objective = result.reml_score;
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: result.beta.clone(),
@@ -4923,6 +4926,27 @@ mod fd_policy_tests {
         assert!(
             err.to_string()
                 .contains("EDF smoothing-parameter count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unified_fit_validation_accepts_persisted_log_lambda_roundoff() {
+        let mut fit = decode_invariant_test_fit();
+        fit.log_lambdas[0] += 5e-14;
+        fit.validate_numeric_finiteness()
+            .expect("sub-ulp persisted log-lambda roundoff should remain valid");
+    }
+
+    #[test]
+    fn unified_fit_validation_rejects_material_log_lambda_drift() {
+        let mut fit = decode_invariant_test_fit();
+        fit.log_lambdas[0] += 1e-4;
+        let err = fit
+            .validate_numeric_finiteness()
+            .expect_err("material log-lambda drift should fail validation");
+        assert!(
+            err.to_string().contains("log_lambdas must equal"),
             "unexpected error: {err}"
         );
     }

@@ -6615,6 +6615,7 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         tol: options.tol,
         nullspace_dims: design.nullspace_dims.clone(),
         linear_constraints: design.linear_constraints.clone(),
+        firth_bias_reduction: options.firth_bias_reduction,
         adaptive_regularization: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         rho_prior: Default::default(),
@@ -9114,7 +9115,7 @@ fn external_opts_for_design(
         tol: options.tol,
         nullspace_dims: design.nullspace_dims.clone(),
         linear_constraints: design.linear_constraints.clone(),
-        firth_bias_reduction: None,
+        firth_bias_reduction: Some(options.firth_bias_reduction),
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         rho_prior: options.rho_prior.clone(),
         kronecker_penalty_system: None,
@@ -14575,6 +14576,7 @@ mod tests {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -15453,6 +15455,7 @@ mod tests {
             tol: 1e-7,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -15943,6 +15946,7 @@ mod tests {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -16018,9 +16022,9 @@ mod tests {
             let x1 = (i as f64 * 0.19).cos();
             data[[i, 0]] = x0;
             data[[i, 1]] = x1;
-            let eta = -0.8 + 2.0 * x0 - 1.1 * x1;
+            let eta = -0.35 + 0.9 * x0 - 0.55 * x1 + 0.25 * (6.0 * x0).sin();
             let mu = 1.0 / (1.0 + (-eta).exp());
-            y[i] = if mu > 0.5 { 1.0 } else { 0.0 };
+            y[i] = 0.05 + 0.90 * mu;
         }
 
         let spec = TermCollectionSpec {
@@ -16055,6 +16059,7 @@ mod tests {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -16172,6 +16177,7 @@ mod tests {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -16532,6 +16538,7 @@ mod tests {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -16729,6 +16736,7 @@ mod tests {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -17095,6 +17103,7 @@ mod tests {
                 tol: 1e-6,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
                 rho_prior: Default::default(),
@@ -17597,6 +17606,7 @@ mod tests {
                 tol: 1e-5,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 4,
@@ -17686,6 +17696,7 @@ mod tests {
                 tol: 1e-5,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 4,
@@ -17767,6 +17778,7 @@ mod tests {
                 tol: 1e-6,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
                 rho_prior: Default::default(),
@@ -17978,6 +17990,7 @@ mod tests {
                 tol: 1e-6,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
                 rho_prior: Default::default(),
@@ -18149,6 +18162,7 @@ mod tests {
                 tol: 1e-6,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 10,

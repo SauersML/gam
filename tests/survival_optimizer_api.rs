@@ -20,6 +20,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
         tol: 1e-6,
         nullspace_dims: Vec::new(),
         linear_constraints: None,
+        firth_bias_reduction: false,
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
