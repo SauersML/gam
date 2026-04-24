@@ -8694,14 +8694,12 @@ mod tests {
 
         let expected_orders = [1, 0, 2, 3];
         assert_eq!(prepared.block.penalties.len(), expected_orders.len());
-        assert_eq!(prepared.block.nullspace_dims, vec![0; expected_orders.len()]);
+        assert_eq!(
+            prepared.block.nullspace_dims,
+            vec![0; expected_orders.len()]
+        );
 
-        for (penalty, &order) in prepared
-            .block
-            .penalties
-            .iter()
-            .zip(expected_orders.iter())
-        {
+        for (penalty, &order) in prepared.block.penalties.iter().zip(expected_orders.iter()) {
             let crate::solver::estimate::PenaltySpec::Dense(actual) = penalty else {
                 panic!("deviation penalties should be dense local Gram matrices");
             };
@@ -8722,8 +8720,7 @@ mod tests {
             }
         }
 
-        let crate::solver::estimate::PenaltySpec::Dense(l2_penalty) =
-            &prepared.block.penalties[1]
+        let crate::solver::estimate::PenaltySpec::Dense(l2_penalty) = &prepared.block.penalties[1]
         else {
             panic!("deviation double penalty should be dense");
         };
