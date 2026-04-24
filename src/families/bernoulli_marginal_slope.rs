@@ -8678,6 +8678,69 @@ mod tests {
     }
 
     #[test]
+    fn deviation_penalties_are_integrated_function_penalties() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                penalty_order: 2,
+                penalty_orders: vec![1, 2, 3],
+                double_penalty: true,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+
+        let expected_orders = [1, 0, 2, 3];
+        assert_eq!(prepared.block.penalties.len(), expected_orders.len());
+        assert_eq!(prepared.block.nullspace_dims, vec![0; expected_orders.len()]);
+
+        for (penalty, &order) in prepared
+            .block
+            .penalties
+            .iter()
+            .zip(expected_orders.iter())
+        {
+            let crate::solver::estimate::PenaltySpec::Dense(actual) = penalty else {
+                panic!("deviation penalties should be dense local Gram matrices");
+            };
+            let expected = prepared
+                .runtime
+                .integrated_derivative_penalty(order)
+                .expect("integrated function penalty");
+            assert_eq!(actual.dim(), expected.dim());
+            for i in 0..actual.nrows() {
+                for j in 0..actual.ncols() {
+                    assert!(
+                        (actual[[i, j]] - expected[[i, j]]).abs() <= 1e-10,
+                        "penalty order {order} mismatch at ({i},{j}): got {}, expected {}",
+                        actual[[i, j]],
+                        expected[[i, j]]
+                    );
+                }
+            }
+        }
+
+        let crate::solver::estimate::PenaltySpec::Dense(l2_penalty) =
+            &prepared.block.penalties[1]
+        else {
+            panic!("deviation double penalty should be dense");
+        };
+        let mut max_identity_diff = 0.0_f64;
+        for i in 0..l2_penalty.nrows() {
+            for j in 0..l2_penalty.ncols() {
+                let identity = if i == j { 1.0 } else { 0.0 };
+                max_identity_diff = max_identity_diff.max((l2_penalty[[i, j]] - identity).abs());
+            }
+        }
+        assert!(
+            max_identity_diff > 1e-6,
+            "deviation double penalty must be integrated L2, not coefficient identity"
+        );
+    }
+
+    #[test]
     fn local_cubic_span_reconstructs_deviation_exactly() {
         // Score-warp deviation runtime: C¹ piecewise-cubic basis.
         //
