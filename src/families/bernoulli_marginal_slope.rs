@@ -1709,7 +1709,7 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
 }
 
 #[inline]
-fn cell_coeff4(cell: exact_kernel::DenestedCubicCell) -> [f64; 4] {
+fn cell_coeff4(cell: crate::families::cubic_cell_kernel::DenestedCubicCell) -> [f64; 4] {
     [cell.c0, cell.c1, cell.c2, cell.c3]
 }
 
@@ -2378,14 +2378,81 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let _ = (block_states, specs);
-        if self.gaussian_frailty_sd.is_some() {
-            return Err(
-                "bernoulli marginal-slope log-sigma hyperderivatives require an analytic implementation; production finite differences are disabled"
-                    .to_string(),
-            );
+        let _ = specs;
+        let Some(sigma) = self.gaussian_frailty_sd else {
+            return Ok(None);
+        };
+        let cache = self.build_exact_eval_cache(block_states)?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        if sigma <= 0.0 {
+            return Ok(Some(ExactNewtonJointPsiTerms {
+                objective_psi: 0.0,
+                score_psi: Array1::zeros(slices.total),
+                hessian_psi: Array2::zeros((slices.total, slices.total)),
+                hessian_psi_operator: None,
+            }));
         }
-        Ok(None)
+        let log_scale_slope =
+            -crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln())
+                .alpha;
+        let (objective_psi, score_psi, block_acc) = (0..self.y.len())
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0f64,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(slices),
+                    )
+                },
+                |mut acc, row| -> Result<_, String> {
+                    let (row_obj, row_score_primary, row_hessian_primary) = self
+                        .compute_row_sigma_primary_terms(
+                            row,
+                            block_states,
+                            primary,
+                            Self::row_ctx(&cache, row),
+                            log_scale_slope,
+                        )?;
+                    acc.0 += row_obj;
+                    acc.1 += &self.pullback_primary_vector(
+                        row,
+                        slices,
+                        primary,
+                        &row_score_primary,
+                    )?;
+                    acc.2.add_pullback(
+                        self,
+                        row,
+                        slices,
+                        primary,
+                        &row_hessian_primary,
+                    );
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0f64,
+                        Array1::<f64>::zeros(slices.total),
+                        BernoulliBlockHessianAccumulator::new(slices),
+                    )
+                },
+                |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2.add(&right.2);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(std::sync::Arc::new(block_acc.into_operator(slices))),
+        }))
     }
 
     #[inline]
@@ -3613,406 +3680,6 @@ impl BernoulliMarginalSlopeFamily {
 
         eta_u.mapv_inplace(|eu| d1_m * s_y * eu);
         Ok(neglog_val)
-    }
-
-    fn compute_row_sigma_primary_terms(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        primary: &PrimarySlices,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        log_scale_slope: f64,
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
-
-        let r = primary.total;
-        let point = self.primary_point_from_block_states(row, block_states, primary)?;
-        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
-        let beta_h = beta_h_owned.as_ref();
-        let beta_w = beta_w_owned.as_ref();
-        let a = row_ctx.intercept;
-        let f_a = row_ctx.m_a;
-        let inv_f_a = 1.0 / f_a;
-        let marginal = self.marginal_link_map(q)?;
-        let h_range = primary.h.as_ref();
-        let w_range = primary.w.as_ref();
-        let score_runtime = self.score_warp.as_ref();
-        let link_runtime = self.link_dev.as_ref();
-        let scale = self.probit_frailty_scale();
-        let zero_family = vec![[0.0; 4]; r];
-
-        let mut f_tau = 0.0;
-        let mut f_a_tau = 0.0;
-        let mut f_aa = 0.0;
-        let mut f_aa_tau = 0.0;
-        let mut f_u = Array1::<f64>::zeros(r);
-        let mut f_u_tau = Array1::<f64>::zeros(r);
-        let mut f_au = Array1::<f64>::zeros(r);
-        let mut f_au_tau = Array1::<f64>::zeros(r);
-        let mut f_uv = Array2::<f64>::zeros((r, r));
-        let mut f_uv_tau = Array2::<f64>::zeros((r, r));
-
-        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-        for partition_cell in cells {
-            let cell = partition_cell.cell;
-            let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
-            let u_mid = a + b * z_mid;
-            let state = exact::evaluate_cell_moments(cell, 15)?;
-
-            let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                b,
-            );
-            let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                b,
-            );
-            let dc_da = scale_coeff4(dc_da_raw, scale);
-            let dc_db = scale_coeff4(dc_db_raw, scale);
-            let dc_daa = scale_coeff4(dc_daa_raw, scale);
-            let dc_dab = scale_coeff4(dc_dab_raw, scale);
-            let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
-
-            let c_tau = scale_coeff4(cell_coeff4(cell), log_scale_slope);
-            let c_a_tau = scale_coeff4(dc_da, log_scale_slope);
-            let c_aa_tau = scale_coeff4(dc_daa, log_scale_slope);
-
-            let mut coeff_u = vec![[0.0; 4]; r];
-            let mut coeff_au = vec![[0.0; 4]; r];
-            let mut coeff_bu = vec![[0.0; 4]; r];
-
-            coeff_u[primary.logslope] = dc_db;
-            coeff_au[primary.logslope] = dc_dab;
-            coeff_bu[primary.logslope] = dc_dbb;
-
-            if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
-                for local_idx in 0..h_range.len() {
-                    let basis_span = runtime.basis_cubic_at(local_idx, z_mid)?;
-                    let idx = h_range.start + local_idx;
-                    coeff_u[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    coeff_bu[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
-                }
-            }
-            if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
-                for local_idx in 0..w_range.len() {
-                    let basis_span = runtime.basis_cubic_at(local_idx, u_mid)?;
-                    let idx = w_range.start + local_idx;
-                    coeff_u[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                    coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                }
-            }
-
-            let coeff_jet = SparsePrimaryCoeffJetView::new(
-                h_range,
-                w_range,
-                &coeff_u,
-                &coeff_au,
-                &coeff_bu,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-            );
-
-            f_tau += exact::cell_first_derivative_from_moments(&c_tau, &state.moments)?;
-            f_a_tau += exact::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &c_tau,
-                &c_a_tau,
-                &state.moments,
-            )?;
-            f_aa += exact::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &dc_daa,
-                &state.moments,
-            )?;
-            f_aa_tau += exact::cell_third_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &c_tau,
-                &dc_daa,
-                &c_a_tau,
-                &c_a_tau,
-                &c_aa_tau,
-                &state.moments,
-            )?;
-
-            for u in 1..r {
-                let c_u_tau = scale_coeff4(coeff_jet.first[u], log_scale_slope);
-                let c_au_tau = scale_coeff4(coeff_jet.a_first[u], log_scale_slope);
-                f_u[u] +=
-                    exact::cell_first_derivative_from_moments(&coeff_jet.first[u], &state.moments)?;
-                f_u_tau[u] += exact::cell_second_derivative_from_moments(
-                    cell,
-                    &coeff_jet.first[u],
-                    &c_tau,
-                    &c_u_tau,
-                    &state.moments,
-                )?;
-                f_au[u] += exact::cell_second_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_jet.first[u],
-                    &coeff_jet.a_first[u],
-                    &state.moments,
-                )?;
-                f_au_tau[u] += exact::cell_third_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_jet.first[u],
-                    &c_tau,
-                    &coeff_jet.a_first[u],
-                    &c_a_tau,
-                    &c_u_tau,
-                    &c_au_tau,
-                    &state.moments,
-                )?;
-            }
-
-            for u in 1..r {
-                for v in u..r {
-                    let c_uv =
-                        coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                    let c_u_tau = scale_coeff4(coeff_jet.first[u], log_scale_slope);
-                    let c_v_tau = scale_coeff4(coeff_jet.first[v], log_scale_slope);
-                    let c_uv_tau = scale_coeff4(c_uv, log_scale_slope);
-                    let val = exact::cell_second_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &c_uv,
-                        &state.moments,
-                    )?;
-                    f_uv[[u, v]] += val;
-                    if u != v {
-                        f_uv[[v, u]] += val;
-                    }
-                    let val_tau = exact::cell_third_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &c_tau,
-                        &c_uv,
-                        &c_u_tau,
-                        &c_v_tau,
-                        &c_uv_tau,
-                        &state.moments,
-                    )?;
-                    f_uv_tau[[u, v]] += val_tau;
-                    if u != v {
-                        f_uv_tau[[v, u]] += val_tau;
-                    }
-                }
-            }
-        }
-
-        f_u[primary.q] = -marginal.mu1;
-        f_uv[[primary.q, primary.q]] = -marginal.mu2;
-
-        let a_tau = -f_tau * inv_f_a;
-        let mut a_u = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            a_u[u] = -f_u[u] * inv_f_a;
-        }
-        let mut a_u_tau = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            a_u_tau[u] = -(f_u_tau[u] + f_au[u] * a_tau + f_a_tau * a_u[u] + f_aa * a_u[u] * a_tau)
-                * inv_f_a;
-        }
-
-        let mut a_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val =
-                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
-                        * inv_f_a;
-                a_uv[[u, v]] = val;
-                a_uv[[v, u]] = val;
-            }
-        }
-        let mut a_uv_tau = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let n_tau = f_uv_tau[[u, v]]
-                    + f_au_tau[u] * a_u[v]
-                    + f_au[u] * a_u_tau[v]
-                    + f_au_tau[v] * a_u[u]
-                    + f_au[v] * a_u_tau[u]
-                    + f_aa_tau * a_u[u] * a_u[v]
-                    + f_aa * (a_u_tau[u] * a_u[v] + a_u[u] * a_u_tau[v]);
-                let val = -(n_tau + f_a_tau * a_uv[[u, v]]) * inv_f_a;
-                a_uv_tau[[u, v]] = val;
-                a_uv_tau[[v, u]] = val;
-            }
-        }
-
-        let z_obs = self.z[row];
-        let u_obs = a + b * z_obs;
-        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
-        let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
-        let g_a = eval_coeff4_at(&obs.dc_da, z_obs);
-        let g_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
-        let g_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
-        let g_tau = log_scale_slope * eta_val;
-        let g_a_tau = log_scale_slope * g_a;
-        let g_aa_tau = log_scale_slope * g_aa;
-
-        let mut g_u_fixed = vec![[0.0; 4]; r];
-        let mut g_au_fixed = vec![[0.0; 4]; r];
-        let mut g_bu_fixed = vec![[0.0; 4]; r];
-        let mut g_aau_fixed = vec![[0.0; 4]; r];
-
-        g_u_fixed[primary.logslope] = obs.dc_db;
-        g_au_fixed[primary.logslope] = obs.dc_dab;
-        g_bu_fixed[primary.logslope] = obs.dc_dbb;
-        g_aau_fixed[primary.logslope] = obs.dc_daab;
-        if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
-            for local_idx in 0..h_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
-                let idx = h_range.start + local_idx;
-                g_u_fixed[idx] =
-                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                g_bu_fixed[idx] =
-                    scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
-            }
-        }
-        if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
-            for local_idx in 0..w_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                let idx = w_range.start + local_idx;
-                g_u_fixed[idx] =
-                    scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                let (dc_aw_raw, dc_bw_raw) =
-                    exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                let (dc_aaw_raw, _, _) = exact::link_basis_cell_second_partials(basis_span, a, b);
-                g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
-                g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
-            }
-        }
-        let g_jet = SparsePrimaryCoeffJetView::new(
-            h_range,
-            w_range,
-            &g_u_fixed,
-            &g_au_fixed,
-            &g_bu_fixed,
-            &g_aau_fixed,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-        );
-
-        let mut g_u = Array1::<f64>::zeros(r);
-        let mut g_au = Array1::<f64>::zeros(r);
-        let mut g_aau = Array1::<f64>::zeros(r);
-        let mut g_uv = Array2::<f64>::zeros((r, r));
-        let mut g_auv = Array2::<f64>::zeros((r, r));
-        for u in 1..r {
-            g_u[u] = eval_coeff4_at(&g_jet.first[u], z_obs);
-            g_au[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
-            g_aau[u] = eval_coeff4_at(&g_jet.aa_first[u], z_obs);
-        }
-        for u in 1..r {
-            for v in u..r {
-                let uv = g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                let auv = g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
-                let val = eval_coeff4_at(&uv, z_obs);
-                let aval = eval_coeff4_at(&auv, z_obs);
-                g_uv[[u, v]] = val;
-                g_uv[[v, u]] = val;
-                g_auv[[u, v]] = aval;
-                g_auv[[v, u]] = aval;
-            }
-        }
-        let eta_u = g_a * &a_u + &g_u;
-        let mut eta_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val = g_a * a_uv[[u, v]]
-                    + g_aa * a_u[u] * a_u[v]
-                    + g_au[u] * a_u[v]
-                    + g_au[v] * a_u[u]
-                    + g_uv[[u, v]];
-                eta_uv[[u, v]] = val;
-                eta_uv[[v, u]] = val;
-            }
-        }
-
-        let eta_tau = g_a * a_tau + g_tau;
-        let mut eta_u_tau = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            let dg_a_tau = g_aa * a_tau + g_a_tau;
-            let dg_u_tau = g_au[u] * a_tau + log_scale_slope * g_u[u];
-            eta_u_tau[u] = dg_a_tau * a_u[u] + g_a * a_u_tau[u] + dg_u_tau;
-        }
-        let mut eta_uv_tau = Array2::<f64>::zeros((r, r));
-        let dg_a_tau = g_aa * a_tau + g_a_tau;
-        let dg_aa_tau = g_aaa * a_tau + g_aa_tau;
-        for u in 0..r {
-            for v in u..r {
-                let dg_au_tau_u = g_aau[u] * a_tau + log_scale_slope * g_au[u];
-                let dg_au_tau_v = g_aau[v] * a_tau + log_scale_slope * g_au[v];
-                let dg_uv_tau = g_auv[[u, v]] * a_tau + log_scale_slope * g_uv[[u, v]];
-                let val = dg_a_tau * a_uv[[u, v]]
-                    + g_a * a_uv_tau[[u, v]]
-                    + dg_aa_tau * a_u[u] * a_u[v]
-                    + g_aa * (a_u_tau[u] * a_u[v] + a_u[u] * a_u_tau[v])
-                    + dg_au_tau_u * a_u[v]
-                    + g_au[u] * a_u_tau[v]
-                    + dg_au_tau_v * a_u[u]
-                    + g_au[v] * a_u_tau[u]
-                    + dg_uv_tau;
-                eta_uv_tau[[u, v]] = val;
-                eta_uv_tau[[v, u]] = val;
-            }
-        }
-
-        let y_i = self.y[row];
-        let w_i = self.weights[row];
-        let s_y = 2.0 * y_i - 1.0;
-        let margin = s_y * eta_val;
-        let (k1, k2, k3, _) = signed_probit_neglog_derivatives_up_to_fourth(margin, w_i)?;
-        let u1 = s_y * k1;
-        let u3 = s_y * k3;
-        let objective_tau = u1 * eta_tau;
-        let mut score_tau = Array1::<f64>::zeros(r);
-        let mut hessian_tau = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            score_tau[u] = k2 * eta_u[u] * eta_tau + u1 * eta_u_tau[u];
-        }
-        for u in 0..r {
-            for v in u..r {
-                let val = u3 * eta_u[u] * eta_u[v] * eta_tau
-                    + k2 * (eta_uv[[u, v]] * eta_tau
-                        + eta_u[u] * eta_u_tau[v]
-                        + eta_u[v] * eta_u_tau[u])
-                    + u1 * eta_uv_tau[[u, v]];
-                hessian_tau[[u, v]] = val;
-                hessian_tau[[v, u]] = val;
-            }
-        }
-
-        Ok((objective_tau, score_tau, hessian_tau))
     }
 
     fn primary_point_from_block_states(
@@ -9226,20 +8893,29 @@ mod tests {
         let constraints = prepared.runtime.structural_monotonicity_constraints();
         let dim = constraints.a.ncols();
         assert_eq!(dim, prepared.runtime.basis_dim());
+        assert_eq!(constraints.a, prepared.runtime.coefficient_transform().clone());
+        assert_eq!(
+            constraints.b,
+            Array1::<f64>::from_elem(
+                prepared.runtime.coefficient_transform().nrows(),
+                prepared.runtime.monotonicity_eps() - 1.0
+            )
+        );
         let feasible = Array1::<f64>::zeros(dim);
         prepared
             .runtime
             .monotonicity_feasible(&feasible, "feasible structural beta")
             .expect("zero deviation should be feasible");
-        let row_idx = (0..constraints.a.nrows())
-            .find(|&idx| constraints.a.row(idx).dot(&constraints.a.row(idx)) > 0.0)
-            .expect("monotonicity constraints should include a nonzero derivative row");
-        let first_row = constraints.a.row(row_idx).to_owned();
-        let row_norm_sq = first_row.dot(&first_row);
-        assert!(row_norm_sq > 0.0);
-        let scale = (constraints.b[row_idx].abs() + 1.0) / row_norm_sq;
-        let infeasible = first_row.mapv(|value| -scale * value);
-        assert!(constraints.a.row(row_idx).dot(&infeasible) < constraints.b[row_idx]);
+        let d1_design = prepared
+            .runtime
+            .first_derivative_design(&seed)
+            .expect("derivative design");
+        let row_idx = (0..d1_design.nrows())
+            .find(|&idx| d1_design.row(idx).dot(&d1_design.row(idx)) > 0.0)
+            .expect("derivative design should include a nonzero row");
+        let derivative_row = d1_design.row(row_idx).to_owned();
+        let row_norm_sq = derivative_row.dot(&derivative_row);
+        let infeasible = derivative_row.mapv(|value| -2.0 * value / row_norm_sq);
         assert!(
             prepared
                 .runtime

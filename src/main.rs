@@ -2267,9 +2267,17 @@ fn build_predict_input_for_model(
                 .copied()
                 .filter(|value| value.is_finite())
                 .collect::<Vec<_>>();
+            for value in response_new.iter().copied() {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "transformation-normal response value in prediction data is not finite: {value}"
+                    ));
+                }
+                derivative_grid.push(value);
+            }
             if derivative_grid.is_empty() {
                 return Err(
-                    "saved transformation-normal model has no finite response knots".to_string(),
+                    "saved transformation-normal model has no finite response knots and prediction data has no finite response values".to_string(),
                 );
             }
             derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

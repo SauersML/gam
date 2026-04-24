@@ -124,7 +124,8 @@ pub struct TransformationNormalFamily {
     /// Derivative design operator: keeps the tensor factors separate.
     x_deriv_kron: KroneckerDesign,
     /// Derivative design operator evaluated on the monotonicity grid formed by
-    /// all training covariate rows crossed with response knots and tail guards.
+    /// all training covariate rows crossed with a bounded response grid covering
+    /// knots, support quantiles, interval guard points, and tail guards.
     x_deriv_grid_kron: KroneckerDesign,
 
     // --- Response-direction basis (fixed, does not depend on κ) ---

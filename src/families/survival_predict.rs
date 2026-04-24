@@ -120,14 +120,19 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
 
     // Latent modes emit binary event-window probabilities, not survival
     // curves. They stay in the CLI's dedicated `run_predict_saved_latent_*`
-    // helpers for now.
+    // helpers for now. Location-scale survival requires a link resolver
+    // that is still CLI-specific (parses CLI args like `--sas-init`);
+    // expose through the library as soon as a library-first link
+    // resolver ships.
     if matches!(
         saved_likelihood_mode,
-        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
+        SurvivalLikelihoodMode::Latent
+            | SurvivalLikelihoodMode::LatentBinary
+            | SurvivalLikelihoodMode::LocationScale
     ) {
         return Err(format!(
-            "survival prediction via predict_survival does not support likelihood_mode={}; \
-             use the CLI's latent-window predictor",
+            "survival prediction via predict_survival does not support likelihood_mode={} yet; \
+             use the CLI predict command",
             survival_likelihood_modename(saved_likelihood_mode)
         ));
     }
@@ -725,15 +730,18 @@ pub fn fit_result_from_saved_model_for_prediction(
 }
 
 /// Resolve the saved survival location-scale fit result.
+///
+/// Returns a `UnifiedFitResult` with the fitted inverse-link state
+/// re-applied -- matching the CLI's behaviour in
+/// `main.rs::saved_survival_location_scale_fit_result`.
 pub fn saved_survival_location_scale_fit_result(
     model: &SavedModel,
-) -> Result<crate::families::survival_location_scale::SurvivalLocationScaleFitResult, String> {
-    let fit = model.fit_result.as_ref().ok_or_else(|| {
+) -> Result<UnifiedFitResult, String> {
+    model.saved_prediction_runtime()?;
+    model.fit_result.clone().ok_or_else(|| {
         "saved location-scale survival model missing canonical fit_result; refit with current CLI"
             .to_string()
-    })?;
-    crate::families::survival_location_scale::SurvivalLocationScaleFitResult::try_from(fit)
-        .map_err(|e| format!("failed to interpret saved fit as survival location-scale: {e}"))
+    })
 }
 
 /// Resolve the saved survival inverse-link, with a probit fallback for

@@ -3171,10 +3171,8 @@ def _requires_joint_spatial_term(cfg: dict | None) -> bool:
 
 
 def _rust_duchon_options_for_dimension(dimension: int, dp_opt: str) -> str:
-    if dimension >= 2:
-        power = max(1, dimension // 2)
-        return f", order=1, power={power}, length_scale=1.0{dp_opt}"
-    return f", order=0, power=1{dp_opt}"
+    power = max(1, dimension // 2)
+    return f", order=1, power={power}, length_scale=1.0{dp_opt}"
 
 
 def _rust_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int, dp_opt: str) -> str:
@@ -3228,7 +3226,7 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
                     terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
                 elif basis == "duchon":
                     terms.append(
-                        f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
+                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1, dp_opt)})"
                     )
                 elif basis == "matern":
                     terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
@@ -3249,7 +3247,7 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
             elif basis in {"duchon", "matern"}:
                 if basis == "duchon":
                     terms.append(
-                        f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
+                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1, dp_opt)})"
                     )
                 else:
                     terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")

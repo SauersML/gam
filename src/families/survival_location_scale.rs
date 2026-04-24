@@ -25,8 +25,8 @@ use crate::families::scale_design::{
     infer_non_intercept_start_design,
 };
 use crate::matrix::{
-    BlockDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix,
-    EmbeddedColumnBlock, EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator,
+    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+    EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator,
 };
 use crate::mixture_link::{
     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
