@@ -77,12 +77,12 @@ use gam::survival_construction::{
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, marginal_slope_baseline_chain_rule_gradient,
-    normalize_survival_time_pair,
-    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
-    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
-    parse_survival_time_basis_config, require_structural_survival_time_basis,
-    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
-    survival_baseline_targetname, survival_likelihood_modename,
+    normalize_survival_time_pair, optimize_survival_baseline_config,
+    optimize_survival_baseline_config_with_gradient, parse_survival_baseline_config,
+    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
+    survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -2150,10 +2150,14 @@ fn build_predict_input_for_model(
                 .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
             let z = data.column(z_col).to_owned();
             let spec_logslope = resolve_termspec_for_prediction(
-                &model.resolved_termspec_noise,
+                &model
+                    .resolved_termspec_logslope
+                    .as_ref()
+                    .or(model.resolved_termspec_noise.as_ref())
+                    .cloned(),
                 training_headers,
                 col_map,
-                "resolved_termspec_noise",
+                "resolved_termspec_logslope",
             )?;
             let design_logslope = build_term_collection_design(data, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
@@ -3563,10 +3567,14 @@ fn run_predict_survival(
             .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
         let z = data.column(z_col).to_owned();
         let logslopespec = resolve_termspec_for_prediction(
-            &model.resolved_termspec_noise,
+            &model
+                .resolved_termspec_logslope
+                .as_ref()
+                .or(model.resolved_termspec_noise.as_ref())
+                .cloned(),
             training_headers,
             col_map,
-            "resolved_termspec_noise",
+            "resolved_termspec_logslope",
         )?;
         let logslope_design = build_term_collection_design(data, &logslopespec)
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
@@ -5343,7 +5351,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?,
             );
-            payload.resolved_termspec_noise = Some(
+            payload.resolved_termspec_logslope = Some(
                 freeze_term_collection_from_design(
                     &fit.logslopespec_resolved,
                     &fit.logslope_design,
@@ -8280,7 +8288,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.link = Some(inverse_link_to_saved_string(&base_link));
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_marginalspec);
-    payload.resolved_termspec_noise = Some(resolved_logslopespec);
+    payload.resolved_termspec_logslope = Some(resolved_logslopespec);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
     payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
     SavedModel::from_payload(payload)

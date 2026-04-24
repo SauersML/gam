@@ -1,6 +1,6 @@
-use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::FaerSvd;
+use crate::faer_ndarray::{FaerCholesky, fast_atb};
 use crate::linalg::utils::{StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd};
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
@@ -1712,7 +1712,13 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_first(self, axis, rows)
+        let f: fn(
+            &crate::terms::basis::ImplicitDesignPsiDerivative,
+            usize,
+            Range<usize>,
+        ) -> Result<Array2<f64>, crate::terms::basis::BasisError> =
+            crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_first;
+        f(self, axis, rows)
     }
 
     fn row_chunk_second_diag(
@@ -1720,7 +1726,13 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_second_diag(self, axis, rows)
+        let f: fn(
+            &crate::terms::basis::ImplicitDesignPsiDerivative,
+            usize,
+            Range<usize>,
+        ) -> Result<Array2<f64>, crate::terms::basis::BasisError> =
+            crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_second_diag;
+        f(self, axis, rows)
     }
 
     fn row_chunk_second_cross(
@@ -1729,9 +1741,14 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
         axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_second_cross(
-            self, axis_d, axis_e, rows,
-        )
+        let f: fn(
+            &crate::terms::basis::ImplicitDesignPsiDerivative,
+            usize,
+            usize,
+            Range<usize>,
+        ) -> Result<Array2<f64>, crate::terms::basis::BasisError> =
+            crate::terms::basis::ImplicitDesignPsiDerivative::row_chunk_second_cross;
+        f(self, axis_d, axis_e, rows)
     }
 
     fn transpose_mul_second_diag(
@@ -1917,6 +1934,34 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator
         let local = self.local_coeffs(u, "embedded implicit psi forward_mul_second_cross")?;
         self.base
             .forward_mul_second_cross(axis_d, axis_e, &local.view())
+    }
+
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let local = self.base.row_chunk_first(axis, rows)?;
+        Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let local = self.base.row_chunk_second_diag(axis, rows)?;
+        Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let local = self.base.row_chunk_second_cross(axis_d, axis_e, rows)?;
+        Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
     }
 
     fn materialize_first(
@@ -2188,6 +2233,43 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
         Ok(self
             .cross_local(axis_e, "embedded dense psi forward_mul_second_cross")?
             .dot(&self.local_coeffs(u, "embedded dense psi forward_mul_second_cross")?))
+    }
+
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi row_chunk_first")?;
+        let local = self.first_local.slice(ndarray::s![rows, ..]).to_owned();
+        Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis, "embedded dense psi row_chunk_second_diag")?;
+        let local = self
+            .second_diag_local
+            .slice(ndarray::s![rows, ..])
+            .to_owned();
+        Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        self.validate_axis(axis_d, "embedded dense psi row_chunk_second_cross")?;
+        let local = self
+            .cross_local(axis_e, "embedded dense psi row_chunk_second_cross")?
+            .slice(ndarray::s![rows, ..])
+            .to_owned();
+        Ok(EmbeddedColumnBlock::new(&local, self.global_range.clone(), self.total_p).materialize())
     }
 
     fn materialize_first(
@@ -3016,6 +3098,97 @@ impl CustomFamilyPsiLinearMapRef<'_> {
             Self::Zero { ncols, .. } => Array2::<f64>::zeros((rows.end - rows.start, *ncols)),
         })
     }
+}
+
+// TODO(row-local-api-dep): depends on impl-row-local agent adding row_chunk/row_vector to actions
+#[derive(Clone)]
+pub(crate) enum PsiDesignMap {
+    Zero {
+        nrows: usize,
+        ncols: usize,
+    },
+    Dense {
+        matrix: Arc<Array2<f64>>,
+    },
+    First {
+        action: CustomFamilyPsiDesignAction,
+    },
+    Second {
+        action: CustomFamilyPsiSecondDesignAction,
+    },
+}
+
+impl PsiDesignMap {
+    pub(crate) fn nrows(&self) -> usize {
+        match self {
+            Self::Zero { nrows, .. } => *nrows,
+            Self::Dense { matrix } => matrix.nrows(),
+            Self::First { action } => action.nrows(),
+            Self::Second { action } => action.nrows(),
+        }
+    }
+
+    pub(crate) fn ncols(&self) -> usize {
+        match self {
+            Self::Zero { ncols, .. } => *ncols,
+            Self::Dense { matrix } => matrix.ncols(),
+            Self::First { action } => action.p,
+            Self::Second { action } => action.p,
+        }
+    }
+
+    pub(crate) fn forward_mul(&self, u: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+        match self {
+            Self::Zero { nrows, .. } => Ok(Array1::<f64>::zeros(*nrows)),
+            Self::Dense { matrix } => Ok(matrix.dot(&u)),
+            Self::First { action } => Ok(action.forward_mul(u)),
+            Self::Second { action } => Ok(action.forward_mul(u)),
+        }
+    }
+
+    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+        match self {
+            Self::Zero { ncols, .. } => Ok(Array1::<f64>::zeros(*ncols)),
+            Self::Dense { matrix } => Ok(matrix.t().dot(&v)),
+            Self::First { action } => Ok(action.transpose_mul(v)),
+            Self::Second { action } => Ok(action.transpose_mul(v)),
+        }
+    }
+
+    pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
+        let ncols = self.ncols();
+        match self {
+            Self::Zero { .. } => Ok(Array2::<f64>::zeros((rows.end - rows.start, ncols))),
+            Self::Dense { matrix } => Ok(matrix.slice(ndarray::s![rows, ..]).to_owned()),
+            Self::First { action } => action.row_chunk(rows),
+            Self::Second { action } => action.row_chunk(rows),
+        }
+    }
+
+    pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
+        match self {
+            Self::Zero { ncols, .. } => Ok(Array1::<f64>::zeros(*ncols)),
+            Self::Dense { matrix } => Ok(matrix.row(row).to_owned()),
+            Self::First { action } => action.row_vector(row),
+            Self::Second { action } => action.row_vector(row),
+        }
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Zero { .. } => 0,
+            Self::Dense { matrix } => 8 * matrix.nrows() * matrix.ncols(),
+            Self::First { .. } | Self::Second { .. } => 0,
+        }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        matches!(self, Self::Zero { .. })
+    }
+}
+
+fn is_zero_array(a: &Array2<f64>) -> bool {
+    a.iter().all(|x| *x == 0.0)
 }
 
 pub(crate) fn weighted_crossprod_psi_maps(

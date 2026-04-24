@@ -7731,28 +7731,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 let b0 = baseline.1 + spec.logslope_offset[row];
                 rigid_observed_eta(a0, b0, spec.z[row], probit_scale)
             }));
-            // Pad with a conservative envelope so the basis support covers
-            // the domain reached during flexible joint optimization, not just
-            // the baseline range.  Padding is 50 % of the IQR on each side.
-            let link_dev_seed = {
-                let mut sorted = q0_seed.to_vec();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let n_s = sorted.len();
-                if n_s >= 4 {
-                    let q1 = sorted[n_s / 4];
-                    let q3 = sorted[3 * n_s / 4];
-                    let iqr = (q3 - q1).max(1.0);
-                    let pad = 0.5 * iqr;
-                    let lo = sorted[0] - pad;
-                    let hi = sorted[n_s - 1] + pad;
-                    let mut padded = q0_seed.to_vec();
-                    padded.push(lo);
-                    padded.push(hi);
-                    Array1::from_vec(padded)
-                } else {
-                    q0_seed.clone()
-                }
-            };
+            let link_dev_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
             build_link_deviation_block_from_knots_design_seed_and_weights(
                 &link_dev_seed,
                 &q0_seed,

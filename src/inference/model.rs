@@ -155,6 +155,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub latent_z_normalization: Option<SavedLatentZNormalization>,
     #[serde(default)]
+    pub latent_score_contract: Option<SavedLatentScoreContract>,
+    #[serde(default)]
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
     pub logslope_baseline: Option<f64>,
@@ -231,7 +233,19 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub resolved_termspec_noise: Option<TermCollectionSpec>,
     #[serde(default)]
+    pub resolved_termspec_logslope: Option<TermCollectionSpec>,
+    #[serde(default)]
     pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedLatentScoreContract {
+    pub semantics: String,
+    pub source_transform_id: Option<String>,
+    pub normalization_mean: f64,
+    pub normalization_sd: f64,
+    pub clip_eps: Option<f64>,
+    pub conditioning_columns: Vec<String>,
 }
 
 impl FittedModelPayload {
@@ -274,6 +288,7 @@ impl FittedModelPayload {
             beta_baseline_timewiggle: None,
             z_column: None,
             latent_z_normalization: None,
+            latent_score_contract: None,
             marginal_baseline: None,
             logslope_baseline: None,
             score_warp_runtime: None,
@@ -310,6 +325,7 @@ impl FittedModelPayload {
             transformation_response_median: None,
             resolved_termspec: None,
             resolved_termspec_noise: None,
+            resolved_termspec_logslope: None,
             adaptive_regularization_diagnostics: None,
         }
     }
@@ -1929,9 +1945,14 @@ impl FittedModel {
                         .to_string(),
                 );
             }
-            if self.resolved_termspec_noise.is_none() {
+            if self
+                .resolved_termspec_logslope
+                .as_ref()
+                .or(self.resolved_termspec_noise.as_ref())
+                .is_none()
+            {
                 return Err(
-                    "marginal-slope model is missing resolved_termspec_noise for the logslope surface"
+                    "marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
                         .to_string(),
                 );
             }
@@ -2000,9 +2021,14 @@ impl FittedModel {
                             .to_string(),
                     );
                 }
-                if self.resolved_termspec_noise.is_none() {
+                if self
+                    .resolved_termspec_logslope
+                    .as_ref()
+                    .or(self.resolved_termspec_noise.as_ref())
+                    .is_none()
+                {
                     return Err(
-                        "survival marginal-slope model is missing resolved_termspec_noise for the logslope surface"
+                        "survival marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
                             .to_string(),
                     );
                 }

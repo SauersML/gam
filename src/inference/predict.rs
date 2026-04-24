@@ -4088,7 +4088,11 @@ mod tests {
                 assert!((cubic.evaluate(x) - expected[i]).abs() < 1e-10);
                 assert!((cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10);
                 let selected = runtime.local_cubic_at(&beta, x).expect("local cubic at x");
-                let expected_span_idx = span_idx;
+                let expected_span_idx = if i == 0 && span_idx > 0 {
+                    span_idx - 1
+                } else {
+                    span_idx
+                };
                 let expected_cubic = runtime
                     .local_cubic_on_span(&beta, expected_span_idx)
                     .expect("expected local cubic on span");

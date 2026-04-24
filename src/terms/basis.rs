@@ -5234,7 +5234,7 @@ pub fn build_thin_plate_basiswithworkspace(
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
         let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
-        let kernel_fn = Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+        let kernel_fn = move |data_row: &[f64], center_row: &[f64]| -> f64 {
             let mut dist2 = 0.0;
             for axis in 0..d {
                 let delta = data_row[axis] - center_row[axis];
@@ -5242,7 +5242,7 @@ pub fn build_thin_plate_basiswithworkspace(
             }
             thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
                 .expect("validated thin-plate inputs should not fail")
-        });
+        };
         let base_op = ChunkedKernelDesignOperator::new(
             shared_data,
             Arc::new(centers.clone()),
@@ -9676,11 +9676,88 @@ pub fn build_matern_basiswithworkspace(
         let d = data.ncols();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
-        let kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync> = if let Some(eta) =
-            aniso.as_ref()
-        {
+        let kernel_fn = if let Some(eta) = aniso.as_ref() {
             let eta = eta.clone();
-            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+            let metric_weights = eta.mapv(|v| (2.0 * v).exp());
+            move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let mut q = 0.0;
+                for axis in 0..data_row.len() {
+                    let delta = data_row[axis] - center_row[axis];
+                    q += metric_weights[axis] * delta * delta;
+                }
+                let r = q.sqrt();
+                matern_kernel_from_distance(r, length_scale, nu)
+                    .expect("validated Matérn inputs should not fail")
+            }
+        } else {
+            move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
+                matern_kernel_from_distance(r, length_scale, nu)
+                    .expect("validated Matérn inputs should not fail")
+            }
+        };
+        let op = match aniso.as_ref() {
+            Some(_) => {
+                let eta = aniso.as_ref().expect("checked above").clone();
+                let metric_weights = eta.mapv(|v| (2.0 * v).exp());
+                let kernel_fn = move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let mut q = 0.0;
+                    for axis in 0..data_row.len() {
+                        let delta = data_row[axis] - center_row[axis];
+                        q += metric_weights[axis] * delta * delta;
+                    }
+                    let r = q.sqrt();
+                    matern_kernel_from_distance(r, length_scale, nu)
+                        .expect("validated Matérn inputs should not fail")
+                };
+                ChunkedKernelDesignOperator::new(
+                    shared_data,
+                    Arc::new(centers.clone()),
+                    kernel_fn,
+                    z_opt.as_ref().map(|z| Arc::new(z.clone())),
+                    poly_basis,
+                )
+            }
+            None => {
+                let kernel_fn = move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let r =
+                        stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
+                    matern_kernel_from_distance(r, length_scale, nu)
+                        .expect("validated Matérn inputs should not fail")
+                };
+                ChunkedKernelDesignOperator::new(
+                    shared_data,
+                    Arc::new(centers.clone()),
+                    kernel_fn,
+                    z_opt.as_ref().map(|z| Arc::new(z.clone())),
+                    poly_basis,
+                )
+            }
+        }
+        .map_err(BasisError::InvalidInput)?;
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)));
+        let candidates = if spec.double_penalty {
+            let penalty_kernel = build_matern_kernel_penalty(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+            )?;
+            vec![PenaltyCandidate {
+                matrix: penalty_kernel,
+                nullspace_dim: 0,
+                source: PenaltySource::SpatialDoublePenalty,
+            }]
+        } else {
+            Vec::new()
+        };
+        (design, candidates)
+    } else {
+        let design = build_matern_design_matrix(data, centers.view(), spec)?;
+        let candidates = build_matern_penalties(centers.view(), spec)?;
+        (DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)), candidates)
+    };
                 let r = aniso_distance(data_row, center_row, &eta);
                 matern_kernel_from_distance(r, length_scale, nu)
                     .expect("validated Matérn inputs should not fail")
@@ -12575,7 +12652,7 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
     })
 }
 
-/// Creates a Duchon-like basis with spectral penalty
+/// Creates a Duchon radial basis whose kernel is derived from
 ///   P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
 /// using:
 /// - integer-parameter partial-fraction decomposition in spectral space,
@@ -12583,6 +12660,10 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
 /// - explicit polynomial null-space block determined by `nullspace_order`,
 /// - side-constraint projection `P(centers)^T alpha = 0` for the selected
 ///   null-space degree.
+///
+/// The returned penalties are the canonical triple operator regularization
+/// matrices built from collocation images of the final function, not the
+/// native Fourier-space Duchon seminorm.
 ///
 /// API mapping:
 /// - `p` is the Duchon smoothness order `m`, determined by `nullspace_order`:
