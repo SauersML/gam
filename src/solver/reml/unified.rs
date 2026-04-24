@@ -7688,13 +7688,20 @@ impl SparseCholeskyOperator {
         let dim = block.nrows();
         let mut out = Array2::<f64>::zeros((dim, dim));
         for i in 0..dim {
-            for j in 0..dim {
+            let z_diag = taka.get(start + i, start + i);
+            if z_diag.abs() > 1e-30 {
+                for k in 0..dim {
+                    out[[i, k]] += z_diag * block[[i, k]];
+                }
+            }
+            for j in (i + 1)..dim {
                 let z = taka.get(start + i, start + j);
                 if z.abs() <= 1e-30 {
                     continue;
                 }
                 for k in 0..dim {
                     out[[i, k]] += z * block[[j, k]];
+                    out[[j, k]] += z * block[[i, k]];
                 }
             }
         }
@@ -7807,10 +7814,14 @@ impl SparseCholeskyOperator {
     ) {
         let block_end = block_start + block.nrows();
         let source = block.slice(ndarray::s![.., local_col_start..local_col_start + cols]);
-        let target = rhs_block.slice_mut(ndarray::s![block_start..block_end, ..cols]);
-        Zip::from(target)
-            .and(source)
-            .for_each(|dst, &value| *dst = scale * value);
+        let mut target = rhs_block.slice_mut(ndarray::s![block_start..block_end, ..cols]);
+        if scale == 1.0 {
+            target.assign(&source);
+        } else {
+            Zip::from(target)
+                .and(source)
+                .for_each(|dst, &value| *dst = scale * value);
+        }
     }
 
     fn trace_hinv_block_local_exact(
