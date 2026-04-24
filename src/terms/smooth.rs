@@ -13222,7 +13222,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(0.9),
-                    power: 3,
+                    power: 5,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     aniso_log_scales: None,
@@ -13690,7 +13690,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     length_scale: Some(1.0),
-                    power: 1,
+                    power: 5,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -14095,7 +14095,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(0.9),
-                    power: 3,
+                    power: 5,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -14130,7 +14130,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(1.0),
-                    power: 1,
+                    power: 3,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -14177,7 +14177,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 3,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -14228,7 +14228,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 3,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -14271,7 +14271,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 3,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -16136,12 +16136,12 @@ mod tests {
     #[test]
     fn duchon_terms_participate_in_kappa_optimization() {
         let data = array![
-            [0.0, 0.1],
-            [0.2, 0.0],
-            [0.4, 0.3],
-            [0.6, 0.5],
-            [0.8, 0.7],
-            [1.0, 0.9],
+            [0.0, 0.1, 0.2],
+            [0.2, 0.0, 0.4],
+            [0.4, 0.3, 0.1],
+            [0.6, 0.5, 0.7],
+            [0.8, 0.7, 0.3],
+            [1.0, 0.9, 0.8],
         ];
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -16512,14 +16512,14 @@ mod tests {
             smooth_terms: vec![SmoothTermSpec {
                 name: "pure_duchon".to_string(),
                 basis: SmoothBasisSpec::Duchon {
-                    feature_cols: vec![0, 1],
+                    feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: None,
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                        aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
                     },
                     input_scales: None,
                 },
@@ -16629,12 +16629,12 @@ mod tests {
         }
 
         let data = array![
-            [0.0, 0.1],
-            [0.2, 0.0],
-            [0.4, 0.3],
-            [0.6, 0.5],
-            [0.8, 0.7],
-            [1.0, 0.9],
+            [0.0, 0.1, 0.2],
+            [0.2, 0.0, 0.4],
+            [0.4, 0.3, 0.1],
+            [0.6, 0.5, 0.7],
+            [0.8, 0.7, 0.3],
+            [1.0, 0.9, 0.8],
         ];
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -16642,14 +16642,14 @@ mod tests {
             smooth_terms: vec![SmoothTermSpec {
                 name: "pure_duchon".to_string(),
                 basis: SmoothBasisSpec::Duchon {
-                    feature_cols: vec![0, 1],
+                    feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: None,
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                        aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
                     },
                     input_scales: None,
                 },
@@ -16669,9 +16669,10 @@ mod tests {
 
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
         let rho_dim = frozen_design.penalties.len();
-        let dims_per_term = vec![1];
-        let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+        let dims_per_term = vec![2];
+        let mut theta = Array1::<f64>::zeros(rho_dim + 2);
         theta[rho_dim] = 0.2;
+        theta[rho_dim + 1] = -0.2;
 
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
@@ -16914,8 +16915,8 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                     length_scale: None,
-                    power: 1,
-                    nullspace_order: DuchonNullspaceOrder::Zero,
+                    power: 2,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: Some(vec![0.0; d]),
                 },
@@ -18133,8 +18134,8 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 120 },
                         length_scale: None,
-                        power: 2,
-                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        power: 0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                     },
