@@ -1474,7 +1474,6 @@ fn run_fit_bernoulli_marginal_slope(
 
     if let Some(out) = args.out.as_ref() {
         progress.set_stage("fit", "writing bernoulli marginal-slope model");
-        // Bake learned sigma into the frailty spec for the saved model.
         let save_frailty = match (&frailty, solved.gaussian_frailty_sd) {
             (
                 gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
@@ -5118,7 +5117,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival marginal-slope model");
-            // Bake learned sigma into the frailty spec for the saved model.
             let save_frailty = match (&frailty, fit.gaussian_frailty_sd) {
                 (
                     gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
