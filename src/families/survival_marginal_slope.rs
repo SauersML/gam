@@ -15246,7 +15246,10 @@ mod tests {
             .expect("sigma psi terms should evaluate analytically")
             .expect("sigma psi terms should be present");
         assert!(terms.objective_psi.is_finite());
-        assert_eq!(terms.score_psi.len(), block_slices(&family, &block_states).total);
+        assert_eq!(
+            terms.score_psi.len(),
+            block_slices(&family, &block_states).total
+        );
         assert!(terms.score_psi.iter().all(|value| value.is_finite()));
         assert!(terms.hessian_psi_operator.is_some());
     }

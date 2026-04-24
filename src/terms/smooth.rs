@@ -17532,7 +17532,16 @@ mod tests {
             [0.0, 1.0, 1.0],
             [1.5, 0.0, 0.5],
         ];
-        let d2 = array![[1.0, 0.0, 1.0], [0.0, 1.0, 2.0]];
+        let d2 = array![
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 2.0],
+            [2.0, 0.0, 0.5],
+            [0.0, 0.5, 1.0],
+            [0.5, 0.0, 1.5],
+            [1.0, 1.0, 0.0],
+            [0.0, 2.0, 1.0],
+            [1.5, 0.0, 0.0],
+        ];
         let weight = array![2.0, 3.0];
         let s1 = weighted_operator_gram_from_d1(&d1, &weight, 2);
         let s2 = weighted_operator_gram_from_d2(&d2, &weight);
