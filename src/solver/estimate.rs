@@ -314,7 +314,6 @@ fn compute_fd_gradient<S, E>(
     reml_state: &S,
     rho: &Array1<f64>,
     emit_logs: bool,
-    _allow_analytic_fallback: bool,
 ) -> Result<Array1<f64>, E>
 where
     S: FdGradientState<E>,
@@ -4676,7 +4675,7 @@ fn computefdgradient(
     reml_state: &RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    compute_fd_gradient(reml_state, rho, true, true)
+    compute_fd_gradient(reml_state, rho, true)
 }
 
 /// Evaluate both analytic and finite-difference gradients for the external REML objective.

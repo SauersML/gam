@@ -16024,7 +16024,8 @@ mod tests {
             data[[i, 1]] = x1;
             let eta = -0.35 + 0.9 * x0 - 0.55 * x1 + 0.25 * (6.0 * x0).sin();
             let mu = 1.0 / (1.0 + (-eta).exp());
-            y[i] = 0.05 + 0.90 * mu;
+            let u = (((i * 37 + 17) % 101) as f64 + 0.5) / 101.0;
+            y[i] = if u < mu { 1.0 } else { 0.0 };
         }
 
         let spec = TermCollectionSpec {
