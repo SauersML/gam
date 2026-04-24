@@ -139,14 +139,14 @@
       "survival_distribution": "gaussian"
     },
     {
-      "name": "rust_survival_transform_ps_link_timewiggle_fast",
+      "name": "rust_survival_locscale_ps_link_timewiggle_fast",
       "dataset": "survival",
       "backend": "rust_survival",
       "family": "survival",
       "spatial_basis": "ps",
       "smooth_kind": "separate",
       "include_sigma": false,
-      "survival_likelihood": "transformation",
+      "survival_likelihood": "location-scale",
       "survival_distribution": "gaussian",
       "mean_linkwiggle_knots": 8,
       "timewiggle_knots": 8
