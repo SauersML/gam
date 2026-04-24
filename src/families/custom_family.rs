@@ -1314,6 +1314,7 @@ pub struct BlockwiseFitResultParts {
     pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
     pub covariance_conditional: Option<Array2<f64>>,
+    pub stable_penalty_term: f64,
     pub penalized_objective: f64,
     pub outer_iterations: usize,
     pub outer_gradient_norm: f64,
@@ -1368,6 +1369,7 @@ pub fn blockwise_fit_from_parts(
         log_lambdas,
         lambdas,
         covariance_conditional,
+        stable_penalty_term,
         penalized_objective,
         outer_iterations,
         outer_gradient_norm,
@@ -1387,6 +1389,8 @@ pub fn blockwise_fit_from_parts(
         .map_err(|e| e.to_string())?;
     validate_lambda_pair_consistency(&log_lambdas, &lambdas, "blockwise_fit.lambdas")?;
     ensure_finite_scalar_estimation("blockwise_fit.penalized_objective", penalized_objective)
+        .map_err(|e| e.to_string())?;
+    ensure_finite_scalar_estimation("blockwise_fit.stable_penalty_term", stable_penalty_term)
         .map_err(|e| e.to_string())?;
     ensure_finite_scalar_estimation("blockwise_fit.outer_gradient_norm", outer_gradient_norm)
         .map_err(|e| e.to_string())?;
@@ -1503,7 +1507,7 @@ pub fn blockwise_fit_from_parts(
         log_likelihood,
         deviance,
         reml_score: penalized_objective,
-        stable_penalty_term: 2.0 * penalized_objective - deviance,
+        stable_penalty_term,
         penalized_objective,
         outer_iterations,
         outer_converged,
@@ -10672,6 +10676,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 log_lambdas: Array1::zeros(0),
                 lambdas: Array1::zeros(0),
                 covariance_conditional,
+                stable_penalty_term: 2.0 * inner.penalty_value,
                 penalized_objective,
                 outer_iterations: 0,
                 outer_gradient_norm: 0.0,
@@ -10939,6 +10944,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             log_lambdas: log_lambdas_final,
             lambdas: lambdas_final,
             covariance_conditional,
+            stable_penalty_term: 2.0 * inner.penalty_value,
             penalized_objective,
             outer_iterations: outer_iters,
             outer_gradient_norm: outer_grad_norm,
@@ -11000,6 +11006,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
             log_lambdas,
             lambdas,
             covariance_conditional,
+            stable_penalty_term: 2.0 * inner.penalty_value,
             penalized_objective,
             outer_iterations,
             outer_gradient_norm,

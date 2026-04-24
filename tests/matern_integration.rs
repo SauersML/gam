@@ -93,6 +93,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -186,6 +187,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
             tol: 1e-4,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: Some(AdaptiveRegularizationOptions {
                 enabled: true,
                 max_mm_iter: 4,
@@ -337,6 +339,7 @@ fn matern_3d_aniso_fits_successfully() {
                 tol: 1e-6,
                 nullspace_dims: vec![],
                 linear_constraints: None,
+                firth_bias_reduction: false,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
                 rho_prior: Default::default(),

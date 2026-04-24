@@ -2476,7 +2476,7 @@ mod tests {
             };
             let penalty_term = if profiled_gaussian {
                 let dp_raw = pr.deviance + pr.stable_penalty_term;
-                let (dp_c, dp_cgrad) = crate::solver::estimate::smooth_floor_dp(dp_raw);
+                let (dp_c, dp_cgrad, _) = crate::solver::estimate::smooth_floor_dp(dp_raw);
                 let denom = (pr.finalmu.len() as f64 - 1.0).max(1e-8);
                 let phi = dp_c / denom;
                 dp_cgrad * coord.a / phi

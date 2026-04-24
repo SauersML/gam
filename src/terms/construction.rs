@@ -1094,7 +1094,7 @@ pub fn canonicalize_penalty_specs(
     let mut active_nullspace = Vec::with_capacity(specs.len());
     for (idx, spec) in specs.iter().enumerate() {
         if let Some(canonical) = canonicalize_penalty_spec(spec, p, idx, context)? {
-            active_nullspace.push(canonical.nullity);
+            active_nullspace.push(nullspace_dims[idx]);
             active.push(canonical);
         }
     }
@@ -1827,12 +1827,7 @@ pub fn stable_reparameterizationwith_invariant(
         }
     }
 
-    let max_eig = range_eigs_sorted
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let eigenvalue_floor = max_eig * 1e-12;
+    let eigenvalue_floor = invariant.max_balanced_eigenvalue.max(1.0) * 1e-12;
     let qs = compose_qs_from_split(&q_pen, &q_null, p);
 
     // Guard against any accidental penalized/null mixing. The transformed penalty
@@ -1880,33 +1875,19 @@ pub fn stable_reparameterizationwith_invariant(
         }
     }
 
-    // Smooth δ-regularized pseudo-logdet: L_δ(S) = log det(S + δI) − m₀ log δ.
-    //
-    // This replaces the hard ε-threshold truncation of null eigenvalues,
-    // making the objective C∞ in outer parameters θ and eliminating
-    // artificial kinks when eigenvalues cross the threshold.
-    //
-    // m₀ is the nullity: p_dim − structural_rank (number of null eigenvalues).
-    // δ is chosen proportional to machine epsilon × spectral scale.
-    //
-    // Reference: response.md Section 7.
-    let nullity = penalized_rank.saturating_sub(structural_rank);
-    let delta = {
-        let max_ev = range_eigs_sorted
-            .iter()
-            .copied()
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        1e-10 * max_ev
-    };
-    let log_det: f64 = {
-        let log_det_reg: f64 = range_eigs_sorted
-            .iter()
-            .take(penalized_rank)
-            .map(|&ev| (ev + delta).ln())
-            .sum();
-        log_det_reg - (nullity as f64) * delta.ln()
-    };
+    // Exact pseudo-logdet on the structural penalized block.  The null block is
+    // split out above, so there is no δ-dependent nullspace normalization here.
+    let delta = 0.0;
+    let mut log_det_sum = KahanSum::default();
+    for (idx, &ev) in range_eigs_sorted.iter().take(penalized_rank).enumerate() {
+        if !ev.is_finite() || ev <= 0.0 {
+            return Err(EstimationError::LayoutError(format!(
+                "Penalty pseudo-logdet has a non-positive structural eigenvalue at index {idx}: {ev:.3e}"
+            )));
+        }
+        log_det_sum.add(ev.ln());
+    }
+    let log_det = log_det_sum.sum();
 
     let mut det1vec = vec![0.0; lambdas.len()];
 

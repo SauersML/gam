@@ -445,6 +445,14 @@ fn require_moments_degree(
     Ok(())
 }
 
+#[inline]
+fn first_coefficients_degree(label: &str, coefficients: &[f64]) -> Result<usize, String> {
+    coefficients
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| format!("{label} first-derivative coefficients must be non-empty"))
+}
+
 pub fn cell_third_derivative_from_moments(
     cell: DenestedCubicCell,
     first_coefficients_r: &[f64],
@@ -457,6 +465,9 @@ pub fn cell_third_derivative_from_moments(
     moments: &[f64],
 ) -> Result<f64, String> {
     let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
+    let r_degree = first_coefficients_degree("r", first_coefficients_r)?;
+    let s_degree = first_coefficients_degree("s", first_coefficients_s)?;
+    let t_degree = first_coefficients_degree("t", first_coefficients_t)?;
     let second_sum_degree = [
         second_coefficients_rs.len() + first_coefficients_t.len(),
         second_coefficients_rt.len() + first_coefficients_s.len(),
@@ -466,8 +477,7 @@ pub fn cell_third_derivative_from_moments(
     .max()
     .unwrap_or(0)
     .saturating_sub(1);
-    let triple_product_degree =
-        first_coefficients_r.len() + first_coefficients_s.len() + first_coefficients_t.len() - 3;
+    let triple_product_degree = r_degree + s_degree + t_degree;
     let needed = (third_coefficients_rst.len().saturating_sub(1))
         .max(3 + second_sum_degree)
         .max(6 + triple_product_degree);
@@ -534,6 +544,10 @@ pub fn cell_fourth_derivative_from_moments(
     moments: &[f64],
 ) -> Result<f64, String> {
     let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
+    let r_degree = first_coefficients_degree("r", first_coefficients_r)?;
+    let s_degree = first_coefficients_degree("s", first_coefficients_s)?;
+    let t_degree = first_coefficients_degree("t", first_coefficients_t)?;
+    let u_degree = first_coefficients_degree("u", first_coefficients_u)?;
     let linear_sum_degree = [
         third_coefficients_rst.len() + first_coefficients_u.len(),
         third_coefficients_rsu.len() + first_coefficients_t.len(),
@@ -559,11 +573,7 @@ pub fn cell_fourth_derivative_from_moments(
     .max()
     .unwrap_or(0)
     .saturating_sub(2);
-    let quartic_product_degree = first_coefficients_r.len()
-        + first_coefficients_s.len()
-        + first_coefficients_t.len()
-        + first_coefficients_u.len()
-        - 4;
+    let quartic_product_degree = r_degree + s_degree + t_degree + u_degree;
     let needed = (fourth_coefficients_rstu.len().saturating_sub(1))
         .max(3 + linear_sum_degree)
         .max(6 + quad_sum_degree)

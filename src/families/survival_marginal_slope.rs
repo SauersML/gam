@@ -11390,7 +11390,10 @@ impl SurvivalMarginalSlopeFamily {
                                         let ca = cia[pi];
                                         let xia = va[pi] * alpha;
                                         for pj in rb.clone() {
-                                            hess_time.add_upper(ca, cib[pj], xia * vb[pj]);
+                                            let cb = cib[pj];
+                                            if ca <= cb {
+                                                hess_time.add_upper(ca, cb, xia * vb[pj]);
+                                            }
                                         }
                                     }
                                 }
@@ -11415,7 +11418,7 @@ impl SurvivalMarginalSlopeFamily {
                                 for pi in m_rp[row]..m_rp[row + 1] {
                                     let ca = m_ci[pi];
                                     let xia = m_v[pi] * alpha_m;
-                                    for pj in m_rp[row]..m_rp[row + 1] {
+                                    for pj in pi..m_rp[row + 1] {
                                         hess_marginal.add_upper(ca, m_ci[pj], xia * m_v[pj]);
                                     }
                                 }
@@ -11440,7 +11443,7 @@ impl SurvivalMarginalSlopeFamily {
                                 for pi in g_rp[row]..g_rp[row + 1] {
                                     let ca = g_ci[pi];
                                     let xia = g_v[pi] * alpha_g;
-                                    for pj in g_rp[row]..g_rp[row + 1] {
+                                    for pj in pi..g_rp[row + 1] {
                                         hess_logslope.add_upper(ca, g_ci[pj], xia * g_v[pj]);
                                     }
                                 }

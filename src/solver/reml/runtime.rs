@@ -203,10 +203,6 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    fn tk_sanitized_array(values: &Array1<f64>) -> Array1<f64> {
-        values.mapv(|v| if v.is_finite() { v } else { 0.0 })
-    }
-
     /// Compute the Tierney-Kadane scalar value from pre-built intermediates.
     ///
     /// `TK = Q + T1/12 + T2` where
@@ -281,7 +277,8 @@ impl<'a> RemlState<'a> {
 
     /// Analytic TK value + gradient given Z = H⁻¹ X^T.
     ///
-    /// Gradient formula (holding c, d fixed, differentiating through Σ = H⁻¹):
+    /// Gradient formula for the frozen-derivative TK surrogate (holding c, d
+    /// fixed and differentiating through Σ = H⁻¹):
     ///
     ///   ∂TK/∂ρ_k = tr(Ḣ_k · P_total)
     ///
@@ -293,7 +290,8 @@ impl<'a> RemlState<'a> {
     ///   P_{T2a} = Z diag(c⊙(Xy)) Z^T
     ///   P_{T2b} = y y^T
     ///
-    /// and Ḣ_k = A_k + X^T diag(c⊙Xv_k) X is the total Hessian drift.
+    /// and Ḣ_k = A_k − X^T diag(c⊙Xv_k) X is the total Hessian drift under
+    /// the same response-mode convention as `SinglePredictorGlmDerivatives`.
     /// Analytic TK value + gradient given Z = H⁻¹ X^T.
     ///
     /// This is the shared core for both dense and sparse paths.
@@ -730,8 +728,18 @@ impl<'a> RemlState<'a> {
 
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
-        let c_array = Self::tk_sanitized_array(&c_array);
-        let d_array = Self::tk_sanitized_array(&d_array);
+        if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane correction received non-finite c derivative at row {idx}: {}",
+                c_array[idx]
+            )));
+        }
+        if let Some(idx) = d_array.iter().position(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane correction received non-finite d derivative at row {idx}: {}",
+                d_array[idx]
+            )));
+        }
         if c_array.is_empty() || d_array.is_empty() {
             let ext_dim = psi_dirs.map_or(0, |d| d.len());
             return Ok(TkCorrectionTerms {
