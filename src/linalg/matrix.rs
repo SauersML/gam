@@ -5915,10 +5915,10 @@ mod tests {
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
+    use crate::resource::MatrixMaterializationError;
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
-    use crate::resource::MatrixMaterializationError;
     use std::ops::Range;
     use std::sync::Arc;
 

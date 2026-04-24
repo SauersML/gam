@@ -10601,8 +10601,8 @@ mod tests {
     use csv::StringRecord;
     use gam::basis::{
         BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,
-        Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec, MaternNu,
-        SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
+        Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
+        MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
     use gam::estimate::{
         FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResultParts,
@@ -12626,6 +12626,7 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
+                            operator_penalties: DuchonOperatorPenaltySpec::default(),
                         },
                         input_scales: None,
                     },
@@ -12642,6 +12643,7 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
+                            operator_penalties: DuchonOperatorPenaltySpec::default(),
                         },
                         input_scales: None,
                     },
@@ -12658,6 +12660,7 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
+                            operator_penalties: DuchonOperatorPenaltySpec::default(),
                         },
                         input_scales: None,
                     },
@@ -12778,6 +12781,7 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
                     },
                     input_scales: None,
                 },
@@ -12813,6 +12817,7 @@ mod tests {
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
+                            operator_penalties: DuchonOperatorPenaltySpec::default(),
                         },
                         input_scales: None,
                     },
