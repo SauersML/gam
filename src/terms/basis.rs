@@ -4,6 +4,7 @@ use crate::faer_ndarray::{
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix};
+use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -1643,6 +1644,56 @@ pub struct DuchonBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
+    #[serde(default)]
+    pub operator_penalties: DuchonOperatorPenaltySpec,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DuchonOperatorPenaltySpec {
+    pub mass: OperatorPenaltySpec,
+    pub tension: OperatorPenaltySpec,
+    pub stiffness: OperatorPenaltySpec,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum OperatorPenaltySpec {
+    Active {
+        initial_log_lambda: f64,
+        prior: Option<RhoPrior>,
+    },
+    Disabled,
+}
+
+impl Default for DuchonOperatorPenaltySpec {
+    fn default() -> Self {
+        Self {
+            mass: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+            tension: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+            stiffness: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+        }
+    }
+}
+
+pub fn minimum_duchon_power_for_operator_penalties(
+    dim: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    max_operator_derivative_order: usize,
+) -> usize {
+    let p = duchon_p_from_nullspace_order(nullspace_order);
+    let mut s = 0usize;
+    while 2 * (p + s) <= dim + max_operator_derivative_order {
+        s += 1;
+    }
+    s
 }
 
 /// Metadata returned by generic basis builders.
@@ -7176,33 +7227,40 @@ fn operator_penalty_candidates_from_collocation(
     d0: &Array2<f64>,
     d1: &Array2<f64>,
     d2: &Array2<f64>,
+    spec: &DuchonOperatorPenaltySpec,
 ) -> Vec<PenaltyCandidate> {
     let (s0, c0) = normalize_penalty(&symmetrize(&fast_ata(d0)));
     let (s1, c1) = normalize_penalty(&symmetrize(&fast_ata(d1)));
     let (s2, c2) = normalize_penalty(&symmetrize(&fast_ata(d2)));
-    vec![
-        PenaltyCandidate {
+    let mut out = Vec::new();
+    if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
             matrix: s0,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
-        },
-        PenaltyCandidate {
+        });
+    }
+    if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
             matrix: s1,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
-        },
-        PenaltyCandidate {
+        });
+    }
+    if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
             matrix: s2,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
-        },
-    ]
+        });
+    }
+    out
 }
 
 fn active_operator_penalty_derivatives(
@@ -12964,7 +13022,12 @@ pub fn build_duchon_basiswithworkspace(
     // Duchon radial basis with triple operator regularization. These are
     // collocation operator penalties on the fitted function, not the native
     // Fourier-space Duchon seminorm.
-    let candidates = operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2);
+    let candidates = operator_penalty_candidates_from_collocation(
+        &ops.d0,
+        &ops.d1,
+        &ops.d2,
+        &spec.operator_penalties,
+    );
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
