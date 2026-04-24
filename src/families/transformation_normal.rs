@@ -1456,7 +1456,7 @@ fn assert_rowwise_kronecker_dimensions(n: usize, p_resp: usize, p_cov: usize, co
     );
 }
 
-fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) {
+fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) -> ! {
     let bytes = n
         .saturating_mul(p_resp)
         .saturating_mul(p_cov)
@@ -1499,12 +1499,7 @@ impl KroneckerDesign {
                 right.nrows()
             ));
         }
-        assert_rowwise_kronecker_dimensions(
-            left.nrows(),
-            left.ncols(),
-            right.ncols(),
-            "CTN",
-        );
+        assert_rowwise_kronecker_dimensions(left.nrows(), left.ncols(), right.ncols(), "CTN");
         Ok(KroneckerDesign::Factored {
             left: left.clone(),
             right,

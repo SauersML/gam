@@ -8,6 +8,7 @@ pub mod families;
 pub mod inference;
 pub mod linalg;
 pub mod report;
+pub mod resource;
 pub mod solver;
 mod span;
 pub mod terms;
@@ -20,6 +21,10 @@ pub use data::{
 };
 pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
+pub use resource::{
+    DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError, ResidentBytes,
+    ResourcePolicy,
+};
 pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
 

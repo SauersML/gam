@@ -924,12 +924,7 @@ impl SavedAnchoredDeviationRuntime {
                 }
                 continue;
             }
-            let mut span_idx = self.span_index_for(value)?;
-            // LEFT-bias at interior breakpoints mirrors DeviationRuntime. The
-            // saved cubic basis is C2, but d3 remains span-local.
-            if span_idx > 0 && value == self.breakpoints[span_idx] {
-                span_idx -= 1;
-            }
+            let span_idx = self.left_biased_span_index_for(value)?;
             let t = value - self.breakpoints[span_idx];
             for basis_idx in 0..self.basis_dim {
                 let c0 = self.span_c0[span_idx][basis_idx];
@@ -965,6 +960,18 @@ impl SavedAnchoredDeviationRuntime {
     pub fn span_index_for(&self, value: f64) -> Result<usize, String> {
         let points = self.breakpoints()?;
         span_index_for_breakpoints(&points, value, "saved anchored deviation span lookup")
+    }
+
+    fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
+        let points = self.breakpoints()?;
+        let mut span_idx =
+            span_index_for_breakpoints(&points, value, "saved anchored deviation span lookup")?;
+        // LEFT-bias at interior breakpoints mirrors DeviationRuntime. The
+        // saved cubic basis is C2, but d3 remains span-local.
+        if span_idx > 0 && value == points[span_idx] {
+            span_idx -= 1;
+        }
+        Ok(span_idx)
     }
 
     pub fn local_cubic_on_span(
@@ -1090,7 +1097,7 @@ impl SavedAnchoredDeviationRuntime {
                 },
             );
         }
-        let span_idx = self.span_index_for(value)?;
+        let span_idx = self.left_biased_span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
     }
 
@@ -1141,7 +1148,7 @@ impl SavedAnchoredDeviationRuntime {
                 },
             );
         }
-        let span_idx = self.span_index_for(value)?;
+        let span_idx = self.left_biased_span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
     }
 

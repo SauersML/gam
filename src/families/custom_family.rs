@@ -5576,7 +5576,7 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     let gradient = if order.has_gradient() {
         Derivative::Analytic
     } else {
-        Derivative::FiniteDifference
+        Derivative::Unavailable
     };
     // The analytic outer Hessian is routed to ARC (adaptive cubic
     // regularization), which handles indefinite Hessians natively via

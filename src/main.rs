@@ -364,13 +364,6 @@ struct FitArgs {
     /// full dataset re-optimizes κ/anisotropy jointly. Set to 0 to disable.
     #[arg(long, value_name = "N", default_value_t = 10_000)]
     pilot_subsample_threshold: usize,
-    /// Use exact outer Hessians in blockwise/flexible family optimizers.
-    #[arg(long = "outer-hessian", default_value_t = false)]
-    outer_hessian: bool,
-    /// Fit-time covariance materialization. `full` computes dense covariance
-    /// and is not appropriate for UKB-scale batch fits.
-    #[arg(long = "covariance-mode", value_enum, default_value_t = BlockwiseCovarianceModeArg::None)]
-    covariance_mode: BlockwiseCovarianceModeArg,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -509,14 +502,6 @@ enum CovarianceModeArg {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
-enum BlockwiseCovarianceModeArg {
-    None,
-    Diagonal,
-    Block,
-    Full,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 enum PredictModeArg {
     PosteriorMean,
     Map,
@@ -601,11 +586,11 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    args: &FitArgs,
+    _: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    options.use_outer_hessian = args.outer_hessian;
-    options.compute_covariance = matches!(args.covariance_mode, BlockwiseCovarianceModeArg::Full);
+    options.use_outer_hessian = true;
+    options.compute_covariance = true;
     Ok(options)
 }
 
