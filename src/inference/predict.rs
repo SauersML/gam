@@ -1551,12 +1551,13 @@ impl BernoulliMarginalSlopePredictor {
                                 cell, 9,
                             )
                             .map_err(EstimationError::InvalidInput)?;
-                        let (_, dc_db) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
+                        let (_, dc_db_raw) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
                             partition_cell.score_span,
                             partition_cell.link_span,
                             intercept,
                             slope,
                         );
+                        let dc_db = Self::scale_coeff4(dc_db_raw, scale);
                         f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                             &dc_db,
                             &state.moments,
@@ -1574,6 +1575,7 @@ impl BernoulliMarginalSlopePredictor {
                                 let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
                                     basis_span, slope,
                                 );
+                                let coeffs = Self::scale_coeff4(coeffs, scale);
                                 f_h_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                                     &coeffs,
                                     &state.moments,
@@ -1598,6 +1600,7 @@ impl BernoulliMarginalSlopePredictor {
                                     intercept,
                                     slope,
                                 );
+                                let coeffs = Self::scale_coeff4(coeffs, scale);
                                 f_w_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                                     &coeffs,
                                     &state.moments,
