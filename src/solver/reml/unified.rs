@@ -32,7 +32,7 @@
 //! Cholesky-based logdet while gradient uses eigendecomposition-based traces
 //! with a different numerical threshold.
 
-use ndarray::{Array1, Array2, Zip};
+use ndarray::{Array1, Array2, ArrayView1, Zip};
 use std::sync::{Arc, OnceLock};
 
 use crate::faer_ndarray::FaerEigh;
@@ -109,8 +109,11 @@ pub trait HessianOperator: Send + Sync {
     /// `tr((H⁻¹A)(H⁻¹B))`.
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let solved_a = self.solve_multi(a);
+        if std::ptr::eq(a, b) {
+            return trace_matrix_product(&solved_a, &solved_a);
+        }
         let solved_b = self.solve_multi(b);
-        (&solved_a.t() * &solved_b).sum()
+        trace_matrix_product(&solved_a, &solved_b)
     }
 
     /// tr(H⁻¹ A H⁻¹ B) for a dense drift `A` and an operator-backed drift `B`.
@@ -286,8 +289,11 @@ pub trait HessianOperator: Send + Sync {
         // Default: standard formula -tr(H⁻¹ Ḣ_j H⁻¹ Ḣ_i) = -⟨Y_j^T, Y_i⟩_F
         // where Y_i = H⁻¹ Ḣ_i.
         let y_i = self.solve_multi(h_i);
+        if std::ptr::eq(h_i, h_j) {
+            return -trace_matrix_product(&y_i, &y_i);
+        }
         let y_j = self.solve_multi(h_j);
-        -(&y_j.t() * &y_i).sum()
+        -trace_matrix_product(&y_j, &y_i)
     }
 
     /// Batched cross traces for the logdet Hessian:
@@ -1224,6 +1230,11 @@ pub trait HyperOperator: Send + Sync {
         u.dot(&bv)
     }
 
+    /// Compute v^T · B · u without requiring owned vector inputs.
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        self.bilinear(&v.to_owned(), &u.to_owned())
+    }
+
     /// Full dense materialization (fallback for exact trace computation).
     ///
     /// Panics or returns a zero matrix if the operator was designed to avoid
@@ -1264,6 +1275,10 @@ impl HyperOperator for DenseMatrixHyperOperator {
         u.dot(&self.matrix.dot(v))
     }
 
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        u.dot(&self.matrix.dot(&v))
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         self.matrix.clone()
     }
@@ -1299,6 +1314,17 @@ impl HyperOperator for CompositeHyperOperator {
         }
         for op in &self.operators {
             total += op.bilinear(v, u);
+        }
+        total
+    }
+
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        let mut total = 0.0;
+        if let Some(dense) = self.dense.as_ref() {
+            total += u.dot(&dense.dot(&v));
+        }
+        for op in &self.operators {
+            total += op.bilinear_view(v, u);
         }
         total
     }
@@ -1352,6 +1378,12 @@ impl HyperOperator for BlockLocalDrift {
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        let v_block = v.slice(ndarray::s![self.start..self.end]);
+        let u_block = u.slice(ndarray::s![self.start..self.end]);
+        u_block.dot(&self.local.dot(&v_block))
+    }
+
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
         let v_block = v.slice(ndarray::s![self.start..self.end]);
         let u_block = u.slice(ndarray::s![self.start..self.end]);
         u_block.dot(&self.local.dot(&v_block))
@@ -2817,24 +2849,32 @@ fn trace_hinv_penalty_self_terms(
     coord: &PenaltyCoordinate,
     lambda: f64,
 ) -> (f64, f64) {
-    if coord.uses_operator_fast_path() {
-        let op = coord.scaled_operator(lambda, None);
-        (
-            hop.trace_hinv_operator(&op),
-            hop.trace_hinv_operator_cross(&op, &op),
-        )
-    } else if coord.is_block_local() {
+    if matches!(coord, PenaltyCoordinate::BlockRoot { .. }) {
         let (block, start, end) = coord.scaled_block_local(1.0);
         (
             hop.trace_hinv_block_local(&block, lambda, start, end),
             hop.trace_hinv_block_local_cross(&block, lambda, start, end),
         )
+    } else if coord.uses_operator_fast_path() {
+        let op = coord.scaled_operator(lambda, None);
+        if let Some(dense_hop) = hop.as_dense_spectral() {
+            dense_hop.trace_hinv_self_terms_operator(&op)
+        } else {
+            (
+                hop.trace_hinv_operator(&op),
+                hop.trace_hinv_operator_cross(&op, &op),
+            )
+        }
     } else {
         let matrix = coord.scaled_dense_matrix(lambda);
-        (
-            hop.trace_hinv_h_k(&matrix, None),
-            hop.trace_hinv_product_cross(&matrix, &matrix),
-        )
+        if let Some(dense_hop) = hop.as_dense_spectral() {
+            dense_hop.trace_hinv_self_terms_dense(&matrix)
+        } else {
+            (
+                hop.trace_hinv_h_k(&matrix, None),
+                hop.trace_hinv_product_cross(&matrix, &matrix),
+            )
+        }
     }
 }
 
@@ -2922,6 +2962,26 @@ fn hyper_coord_drift_operators(drift: &HyperCoordDrift) -> Vec<Arc<dyn HyperOper
     operators
 }
 
+fn hyper_coord_drift_operator_arc(
+    drift: &HyperCoordDrift,
+    dim_hint: usize,
+) -> Option<Arc<dyn HyperOperator>> {
+    if drift.dense.is_some() {
+        return None;
+    }
+
+    let mut operators = hyper_coord_drift_operators(drift);
+    match operators.len() {
+        0 => None,
+        1 => Some(operators.pop().expect("single operator drift")),
+        _ => Some(Arc::new(CompositeHyperOperator {
+            dense: None,
+            operators,
+            dim_hint,
+        })),
+    }
+}
+
 fn drift_parts_into_result(
     dense: Option<Array2<f64>>,
     mut operators: Vec<Arc<dyn HyperOperator>>,
@@ -2971,20 +3031,44 @@ fn hyper_coord_total_drift_result(
 }
 
 fn efs_trace_and_denominator(hop: &dyn HessianOperator, drift: &HyperCoordDrift) -> (f64, f64) {
-    if let Some(op) = drift
-        .operator_ref()
-        .filter(|_| drift.uses_operator_fast_path())
-    {
-        (
-            hop.trace_hinv_operator(op),
-            hop.trace_hinv_operator_cross(op, op),
-        )
+    if drift.dense.is_none() && drift.operator.is_none() {
+        if let Some(block_local) = drift.block_local.as_ref() {
+            return (
+                hop.trace_hinv_block_local(
+                    &block_local.local,
+                    1.0,
+                    block_local.start,
+                    block_local.end,
+                ),
+                hop.trace_hinv_block_local_cross(
+                    &block_local.local,
+                    1.0,
+                    block_local.start,
+                    block_local.end,
+                ),
+            );
+        }
+    }
+
+    if let Some(op) = hyper_coord_drift_operator_arc(drift, hop.dim()) {
+        if let Some(dense_hop) = hop.as_dense_spectral() {
+            dense_hop.trace_hinv_self_terms_operator(op.as_ref())
+        } else {
+            (
+                hop.trace_hinv_operator(op.as_ref()),
+                hop.trace_hinv_operator_cross(op.as_ref(), op.as_ref()),
+            )
+        }
     } else {
         let matrix = drift.materialize();
-        (
-            hop.trace_hinv_h_k(&matrix, None),
-            hop.trace_hinv_product_cross(&matrix, &matrix),
-        )
+        if let Some(dense_hop) = hop.as_dense_spectral() {
+            dense_hop.trace_hinv_self_terms_dense(&matrix)
+        } else {
+            (
+                hop.trace_hinv_h_k(&matrix, None),
+                hop.trace_hinv_product_cross(&matrix, &matrix),
+            )
+        }
     }
 }
 
@@ -3010,6 +3094,20 @@ fn trace_hinv_cached_drift_cross(
             right_dense.expect("right dense drift should be cached"),
         ),
     }
+}
+
+#[inline]
+fn trace_matrix_product(left: &Array2<f64>, right: &Array2<f64>) -> f64 {
+    debug_assert_eq!(left.nrows(), left.ncols());
+    debug_assert_eq!(left.raw_dim(), right.raw_dim());
+    let n = left.nrows();
+    let mut trace = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            trace += left[[i, j]] * right[[j, i]];
+        }
+    }
+    trace
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4152,14 +4250,10 @@ fn compute_outer_hessian(
         let v_i = hop.solve(&coord.g);
 
         if use_stochastic_cross_traces {
-            if let Some(op) = coord
-                .drift
-                .operator_ref()
-                .filter(|_| coord.drift.uses_operator_fast_path())
-            {
+            if let Some(op) = hyper_coord_drift_operator_arc(&coord.drift, hop.dim()) {
                 if op.is_implicit() {
                     // Skip dense materialization: stochastic cross-traces
-                    // will use the implicit operator directly.
+                    // will use the full operator-backed drift directly.
                     ext_v.push(v_i);
                     ext_h_matrices.push(None);
                     continue;
@@ -4204,8 +4298,7 @@ fn compute_outer_hessian(
         let total_coords = k + ext_dim;
         let mut dense_mats: Vec<Array2<f64>> = Vec::new();
         let mut coord_has_operator: Vec<bool> = Vec::with_capacity(total_coords);
-        let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
-        let mut impl_ops: Vec<&ImplicitHyperOperator> = Vec::new();
+        let mut operator_arcs: Vec<Arc<dyn HyperOperator>> = Vec::new();
 
         // rho coordinates: always dense.
         for idx in 0..k {
@@ -4215,16 +4308,9 @@ fn compute_outer_hessian(
 
         // ext coordinates: dense or operator-backed.
         for (ei, coord) in solution.ext_coords.iter().enumerate() {
-            if let Some(op) = coord
-                .drift
-                .operator_ref()
-                .filter(|_| coord.drift.uses_operator_fast_path())
-            {
+            if let Some(op) = hyper_coord_drift_operator_arc(&coord.drift, hop.dim()) {
                 coord_has_operator.push(true);
-                if let Some(imp) = op.as_implicit() {
-                    impl_ops.push(imp);
-                }
-                generic_ops.push(op);
+                operator_arcs.push(op);
                 continue;
             }
             dense_mats.push(
@@ -4235,6 +4321,13 @@ fn compute_outer_hessian(
             );
             coord_has_operator.push(false);
         }
+
+        let generic_ops: Vec<&dyn HyperOperator> =
+            operator_arcs.iter().map(|op| op.as_ref()).collect();
+        let impl_ops: Vec<&ImplicitHyperOperator> = generic_ops
+            .iter()
+            .filter_map(|op| op.as_implicit())
+            .collect();
 
         Some(stochastic_trace_hinv_crosses(
             hop,
@@ -4660,6 +4753,14 @@ impl HyperOperator for WeightedHyperOperator {
             .iter()
             .filter(|(weight, _)| *weight != 0.0)
             .map(|(weight, op)| weight * op.bilinear(v, u))
+            .sum()
+    }
+
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        self.terms
+            .iter()
+            .filter(|(weight, _)| *weight != 0.0)
+            .map(|(weight, op)| weight * op.bilinear_view(v, u))
             .sum()
     }
 
@@ -5555,20 +5656,24 @@ pub fn compute_hybrid_efs_update(
         if n_psi == 1 {
             let li = psi_local_indices[0];
             let drift = &solution.ext_coords[li].drift;
-            let op = drift
-                .operator_ref()
-                .filter(|_| drift.uses_operator_fast_path());
+            let op = hyper_coord_drift_operator_arc(drift, hop.dim());
             let dense = op.is_none().then(|| drift.materialize());
             let gram = if let Some(dense_hop) = hop.as_dense_spectral() {
-                let projected = if let Some(op) = op {
-                    dense_hop.projected_operator(&dense_hop.w_factor, op)
+                let projected = if let Some(op) = op.as_ref() {
+                    dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
                 } else {
                     dense_hop
                         .projected_matrix(dense.as_ref().expect("dense drift should be cached"))
                 };
                 dense_hop.trace_projected_cross(&projected, &projected)
             } else {
-                trace_hinv_cached_drift_cross(hop, dense.as_ref(), op, dense.as_ref(), op)
+                trace_hinv_cached_drift_cross(
+                    hop,
+                    dense.as_ref(),
+                    op.as_deref(),
+                    dense.as_ref(),
+                    op.as_deref(),
+                )
             };
             if gram.abs() >= PSI_GRAM_PINV_TOL.max(1e-30) {
                 let global_idx = psi_global_indices[0];
@@ -5585,9 +5690,7 @@ pub fn compute_hybrid_efs_update(
         let total_p = hop.dim();
         let any_psi_operator = psi_local_indices.iter().any(|&li| {
             let drift = &solution.ext_coords[li].drift;
-            drift
-                .operator_ref()
-                .is_some_and(|_| drift.uses_operator_fast_path())
+            drift.uses_operator_fast_path()
         });
         let use_stochastic_psi_gram =
             any_psi_operator && total_p > 500 && hop.prefers_stochastic_trace_estimation();
@@ -5601,26 +5704,25 @@ pub fn compute_hybrid_efs_update(
         let gram = if use_stochastic_psi_gram {
             let mut dense_mats = Vec::new();
             let mut coord_has_operator = Vec::with_capacity(n_psi);
-            let mut generic_ops: Vec<&dyn HyperOperator> = Vec::new();
-            let mut impl_ops: Vec<&ImplicitHyperOperator> = Vec::new();
+            let mut operator_arcs: Vec<Arc<dyn HyperOperator>> = Vec::new();
 
             for &li in &psi_local_indices {
                 let coord = &solution.ext_coords[li];
-                if let Some(op) = coord
-                    .drift
-                    .operator_ref()
-                    .filter(|_| coord.drift.uses_operator_fast_path())
-                {
+                if let Some(op) = hyper_coord_drift_operator_arc(&coord.drift, hop.dim()) {
                     coord_has_operator.push(true);
-                    if let Some(imp) = op.as_implicit() {
-                        impl_ops.push(imp);
-                    }
-                    generic_ops.push(op);
+                    operator_arcs.push(op);
                 } else {
                     coord_has_operator.push(false);
                     dense_mats.push(coord.drift.materialize());
                 }
             }
+
+            let generic_ops: Vec<&dyn HyperOperator> =
+                operator_arcs.iter().map(|op| op.as_ref()).collect();
+            let impl_ops: Vec<&ImplicitHyperOperator> = generic_ops
+                .iter()
+                .filter_map(|op| op.as_implicit())
+                .collect();
 
             stochastic_trace_hinv_crosses(
                 hop,
@@ -5631,34 +5733,26 @@ pub fn compute_hybrid_efs_update(
             )
         } else {
             let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
-            let dense_drifts: Vec<Option<Array2<f64>>> = psi_local_indices
+            let drift_ops: Vec<Option<Arc<dyn HyperOperator>>> = psi_local_indices
                 .iter()
                 .map(|&li| {
                     let drift = &solution.ext_coords[li].drift;
-                    if drift
-                        .operator_ref()
-                        .is_some_and(|_| drift.uses_operator_fast_path())
-                    {
-                        None
-                    } else {
-                        Some(drift.materialize())
-                    }
+                    hyper_coord_drift_operator_arc(drift, hop.dim())
                 })
                 .collect();
-            let drift_ops: Vec<Option<&dyn HyperOperator>> = psi_local_indices
+            let dense_drifts: Vec<Option<Array2<f64>>> = psi_local_indices
                 .iter()
-                .map(|&li| {
+                .enumerate()
+                .map(|(idx, &li)| {
                     let drift = &solution.ext_coords[li].drift;
-                    drift
-                        .operator_ref()
-                        .filter(|_| drift.uses_operator_fast_path())
+                    drift_ops[idx].is_none().then(|| drift.materialize())
                 })
                 .collect();
             if let Some(dense_hop) = hop.as_dense_spectral() {
                 let projected_drifts: Vec<Array2<f64>> = (0..n_psi)
                     .map(|idx| {
-                        if let Some(op) = drift_ops[idx] {
-                            dense_hop.projected_operator(&dense_hop.w_factor, op)
+                        if let Some(op) = drift_ops[idx].as_ref() {
+                            dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
                         } else {
                             dense_hop.projected_matrix(
                                 dense_drifts[idx]
@@ -5682,9 +5776,9 @@ pub fn compute_hybrid_efs_update(
                         let val = trace_hinv_cached_drift_cross(
                             hop,
                             dense_drifts[d].as_ref(),
-                            drift_ops[d],
+                            drift_ops[d].as_deref(),
                             dense_drifts[e].as_ref(),
-                            drift_ops[e],
+                            drift_ops[e].as_deref(),
                         );
                         gram[[d, e]] = val;
                         gram[[e, d]] = val;
@@ -5701,8 +5795,7 @@ pub fn compute_hybrid_efs_update(
         // the pseudoinverse, avoiding noise amplification in near-singular
         // directions. This is the standard approach for constrained
         // optimization on submanifolds (see response.md Section 4).
-        let g_psi = ndarray::Array1::from_vec(psi_gradient.clone());
-        let delta_psi = pseudoinverse_times_vec(&gram, &g_psi, PSI_GRAM_PINV_TOL);
+        let delta_psi = pseudoinverse_times_vec(&gram, &psi_gradient, PSI_GRAM_PINV_TOL);
 
         // Step 3: Apply damping and capping.
         //
@@ -5729,10 +5822,11 @@ pub fn compute_hybrid_efs_update(
 /// (typical n_psi = 2-10), the O(n³) cost is negligible.
 fn pseudoinverse_times_vec(
     gram: &ndarray::Array2<f64>,
-    v: &ndarray::Array1<f64>,
+    v: &[f64],
     tol: f64,
 ) -> ndarray::Array1<f64> {
     let n = gram.nrows();
+    assert_eq!(n, v.len(), "pseudoinverse_times_vec dimension mismatch");
     if n == 0 {
         return ndarray::Array1::zeros(0);
     }
@@ -5766,18 +5860,16 @@ fn pseudoinverse_times_vec(
 
     // G⁺ v = Q diag(1/λ_i for λ_i > cutoff, else 0) Q^T v
     let qt_v: Vec<f64> = (0..n)
-        .map(|i| {
-            let col = eigenvectors.column(i);
-            col.dot(v)
-        })
+        .map(|i| (0..n).map(|row| eigenvectors[[row, i]] * v[row]).sum())
         .collect();
 
     let mut result = ndarray::Array1::zeros(n);
     for i in 0..n {
         if eigenvalues[i] > cutoff {
             let scale = qt_v[i] / eigenvalues[i];
-            let col = eigenvectors.column(i);
-            result.scaled_add(scale, &col.to_owned());
+            for row in 0..n {
+                result[row] += scale * eigenvectors[[row, i]];
+            }
         }
     }
     result
@@ -6484,6 +6576,15 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
+    fn trace_hinv_self_terms_dense(&self, matrix: &Array2<f64>) -> (f64, f64) {
+        let projected = self.projected_matrix(matrix);
+        (
+            projected.diag().sum(),
+            self.trace_projected_cross(&projected, &projected),
+        )
+    }
+
+    #[inline]
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
         let rank = factor.ncols();
         let mut op_factor = Array2::<f64>::zeros((self.n_dim, rank));
@@ -6494,6 +6595,15 @@ impl DenseSpectralOperator {
             op_factor.column_mut(col).assign(&bv);
         }
         factor.t().dot(&op_factor)
+    }
+
+    #[inline]
+    fn trace_hinv_self_terms_operator(&self, op: &dyn HyperOperator) -> (f64, f64) {
+        let projected = self.projected_operator(&self.w_factor, op);
+        (
+            projected.diag().sum(),
+            self.trace_projected_cross(&projected, &projected),
+        )
     }
 
     #[inline]
@@ -6599,6 +6709,9 @@ impl HessianOperator for DenseSpectralOperator {
         right: &dyn HyperOperator,
     ) -> f64 {
         let left_proj = self.projected_operator(&self.w_factor, left);
+        if std::ptr::addr_eq(left, right) {
+            return self.trace_projected_cross(&left_proj, &left_proj);
+        }
         let right_proj = self.projected_operator(&self.w_factor, right);
         self.trace_projected_cross(&left_proj, &right_proj)
     }
@@ -6685,6 +6798,9 @@ impl HessianOperator for DenseSpectralOperator {
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         let hp_i = self.rotate_to_eigenbasis(h_i);
+        if std::ptr::eq(h_i, h_j) {
+            return self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_i);
+        }
         let hp_j = self.rotate_to_eigenbasis(h_j);
         self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
     }
@@ -6870,7 +6986,7 @@ impl SparseCholeskyOperator {
                 return f64::NAN;
             }
         };
-        (&solved_matrix.t() * &solved_op).sum()
+        trace_matrix_product(&solved_matrix, &solved_op)
     }
 
     fn trace_hinv_operator_cross_exact(
@@ -6887,6 +7003,9 @@ impl SparseCholeskyOperator {
                 return f64::NAN;
             }
         };
+        if std::ptr::addr_eq(left, right) {
+            return trace_matrix_product(&solved_left, &solved_left);
+        }
         let solved_right = match self.solve_operator_columns_exact(right) {
             Ok(sol) => sol,
             Err(e) => {
@@ -6896,7 +7015,7 @@ impl SparseCholeskyOperator {
                 return f64::NAN;
             }
         };
-        (&solved_left.t() * &solved_right).sum()
+        trace_matrix_product(&solved_left, &solved_right)
     }
 }
 
@@ -6920,19 +7039,13 @@ impl HessianOperator for SparseCholeskyOperator {
             }
             return trace;
         }
-        // Fallback: column-by-column solve
-        let mut trace = 0.0;
-        for j in 0..a.ncols() {
-            let col = a.column(j).to_owned();
-            match crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, &col) {
-                Ok(sol) => trace += sol[j],
-                Err(e) => {
-                    log::warn!("SparseCholeskyOperator::trace_hinv_product solve failed: {e}");
-                    return f64::NAN;
-                }
+        match crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, a) {
+            Ok(solved) => solved.diag().sum(),
+            Err(e) => {
+                log::warn!("SparseCholeskyOperator::trace_hinv_product multi-solve failed: {e}");
+                f64::NAN
             }
         }
-        trace
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
@@ -6958,7 +7071,42 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        self.trace_hinv_operator_exact(op)
+        self.trace_hinv_operator(op)
+    }
+
+    fn trace_hinv_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        if let Some(ref taka) = self.takahashi {
+            let z_block = taka.block(start, end);
+            let mut trace = 0.0;
+            for i in 0..z_block.nrows() {
+                for j in 0..z_block.ncols() {
+                    trace += z_block[[i, j]] * block[[i, j]];
+                }
+            }
+            return scale * trace;
+        }
+        HessianOperator::trace_hinv_block_local(self, block, scale, start, end)
+    }
+
+    fn trace_hinv_block_local_cross(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        if let Some(ref taka) = self.takahashi {
+            let z = taka.block(start, end);
+            let za = z.dot(block);
+            return scale * scale * trace_matrix_product(&za, &za);
+        }
+        HessianOperator::trace_hinv_block_local_cross(self, block, scale, start, end)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
@@ -6986,8 +7134,11 @@ impl HessianOperator for SparseCholeskyOperator {
         // full Z from Takahashi (O(p * nnz) vs O(p³)). Takahashi cross-traces
         // are only used for block-local operators via trace_hinv_operator_cross.
         let solved_a = self.solve_multi(a);
+        if std::ptr::eq(a, b) {
+            return trace_matrix_product(&solved_a, &solved_a);
+        }
         let solved_b = self.solve_multi(b);
-        (&solved_a.t() * &solved_b).sum()
+        trace_matrix_product(&solved_a, &solved_b)
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -7323,6 +7474,12 @@ impl HessianOperator for MatrixFreeSpdOperator {
 
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let estimator = StochasticTraceEstimator::with_defaults();
+        if std::ptr::eq(a, b) {
+            let no_ops: [&dyn HyperOperator; 0] = [];
+            let mats = [a];
+            return estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops)
+                [[0, 0]];
+        }
         let no_ops: [&dyn HyperOperator; 0] = [];
         let mats = [a, b];
         let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
@@ -7347,6 +7504,11 @@ impl HessianOperator for MatrixFreeSpdOperator {
     ) -> f64 {
         let estimator = StochasticTraceEstimator::with_defaults();
         let no_dense: [&Array2<f64>; 0] = [];
+        if std::ptr::addr_eq(left, right) {
+            let cross =
+                estimator.estimate_second_order_traces_with_operators(self, &no_dense, &[left]);
+            return cross[[0, 0]];
+        }
         let cross =
             estimator.estimate_second_order_traces_with_operators(self, &no_dense, &[left, right]);
         cross[[0, 1]]
@@ -7379,6 +7541,11 @@ impl HessianOperator for MatrixFreeSpdOperator {
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         let estimator = StochasticTraceEstimator::with_defaults();
         let no_ops: [&dyn HyperOperator; 0] = [];
+        if std::ptr::eq(h_i, h_j) {
+            let mats = [h_i];
+            let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
+            return -cross[[0, 0]];
+        }
         let mats = [h_i, h_j];
         let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
         -cross[[0, 1]]
@@ -8113,7 +8280,7 @@ impl StochasticTraceEstimator {
                     let val = if d < n_dense {
                         dense_a_u[d].dot(&r_e)
                     } else {
-                        operators[d - n_dense].bilinear(&r_e.to_owned(), &u)
+                        operators[d - n_dense].bilinear_view(r_e, u.view())
                     };
                     t_sum[[d, e]] += val;
                     if d != e {
@@ -8121,7 +8288,7 @@ impl StochasticTraceEstimator {
                         let val_sym = if e < n_dense {
                             dense_a_u[e].dot(&r_d)
                         } else {
-                            operators[e - n_dense].bilinear(&r_d.to_owned(), &u)
+                            operators[e - n_dense].bilinear_view(r_d, u.view())
                         };
                         t_sum[[e, d]] += val_sym;
                     }
@@ -9603,7 +9770,8 @@ mod tests {
     fn test_pseudoinverse_times_vec_identity() {
         let eye = Array2::<f64>::eye(3);
         let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
-        let result = pseudoinverse_times_vec(&eye, &v, 1e-8);
+        let result =
+            pseudoinverse_times_vec(&eye, v.as_slice().expect("contiguous test vector"), 1e-8);
         for i in 0..3 {
             assert!((result[i] - v[i]).abs() < 1e-12, "G=I: G⁺v should equal v");
         }
@@ -9618,7 +9786,8 @@ mod tests {
         g[[1, 0]] = 1.0;
         g[[1, 1]] = 1.0;
         let v = Array1::from_vec(vec![2.0, 0.0]);
-        let result = pseudoinverse_times_vec(&g, &v, 1e-8);
+        let result =
+            pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8);
         // G⁺ v = [0.25*2 + 0.25*0; 0.25*2 + 0.25*0] = [0.5; 0.5]
         assert!((result[0] - 0.5).abs() < 1e-10);
         assert!((result[1] - 0.5).abs() < 1e-10);
@@ -9629,7 +9798,8 @@ mod tests {
         let mut g = Array2::<f64>::zeros((1, 1));
         g[[0, 0]] = 4.0;
         let v = Array1::from_vec(vec![8.0]);
-        let result = pseudoinverse_times_vec(&g, &v, 1e-8);
+        let result =
+            pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8);
         assert!((result[0] - 2.0).abs() < 1e-12);
     }
 }
