@@ -1,13 +1,11 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyPsiDesignAction,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    cost_gated_outer_order, custom_family_outer_derivatives,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
-    slice_joint_into_block_working_sets,
+    fit_custom_family, slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
@@ -6150,15 +6148,66 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_i, _)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
+        let Some((block_i, local_i)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
             return Ok(None);
         };
-        let Some((block_j, _)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
+        let Some((block_j, local_j)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
             return Ok(None);
         };
         let idx_i = if block_i == 0 { 0 } else { 1 };
         let idx_j = if block_j == 0 { 0 } else { 1 };
         let n = self.y.len();
+        let deriv_i = &derivative_blocks[block_i][local_i];
+        let deriv_j = &derivative_blocks[block_j][local_j];
+        let (p_psi_i, label_i) = match block_i {
+            0 => (
+                self.marginal_design.ncols(),
+                "BernoulliMarginalSlopeFamily marginal",
+            ),
+            1 => (
+                self.logslope_design.ncols(),
+                "BernoulliMarginalSlopeFamily log-slope",
+            ),
+            _ => {
+                return Err(format!(
+                    "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_i}"
+                ));
+            }
+        };
+        let (p_psi_j, label_j) = match block_j {
+            0 => (
+                self.marginal_design.ncols(),
+                "BernoulliMarginalSlopeFamily marginal",
+            ),
+            1 => (
+                self.logslope_design.ncols(),
+                "BernoulliMarginalSlopeFamily log-slope",
+            ),
+            _ => {
+                return Err(format!(
+                    "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_j}"
+                ));
+            }
+        };
+
+        // Build psi design maps once outside the row loop.
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map_i = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv_i, n, p_psi_i, 0..n, label_i, &policy,
+        )?;
+        let psi_map_j = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv_j, n, p_psi_j, 0..n, label_j, &policy,
+        )?;
+        let psi_map_ij = if block_i == block_j {
+            Some(
+                crate::families::custom_family::resolve_custom_family_x_psi_psi_map(
+                    deriv_i, deriv_j, local_j, n, p_psi_i, 0..n, label_i, &policy,
+                )?,
+            )
+        } else {
+            None
+        };
+
         // Block-local accumulator path for second-order psi terms
         let (objective_psi_psi, score_psi_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
             / ROW_CHUNK_SIZE))
@@ -6175,36 +6224,28 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
-                        let Some(dir_i) = self.row_primary_psi_direction(
+                        let dir_i = self.row_primary_psi_direction_from_map(
                             row,
+                            block_i,
+                            &psi_map_i,
                             block_states,
-                            derivative_blocks,
-                            psi_i,
                             primary,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let Some(dir_j) = self.row_primary_psi_direction(
+                        )?;
+                        let dir_j = self.row_primary_psi_direction_from_map(
                             row,
+                            block_j,
+                            &psi_map_j,
                             block_states,
-                            derivative_blocks,
-                            psi_j,
                             primary,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let dir_ij = self
-                            .row_primary_psi_second_direction(
-                                row,
-                                block_states,
-                                derivative_blocks,
-                                psi_i,
-                                psi_j,
-                                primary,
-                            )?
-                            .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+                        )?;
+                        let dir_ij = self.row_primary_psi_second_direction_from_map(
+                            row,
+                            block_i,
+                            block_j,
+                            psi_map_ij.as_ref(),
+                            block_states,
+                            primary,
+                        )?;
                         let row_ctx = Self::row_ctx(cache, row);
                         let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
                             row,
@@ -6234,22 +6275,18 @@ impl BernoulliMarginalSlopeFamily {
                             &dir_i,
                             &dir_j,
                         )?;
-                        let br_i = self
-                            .block_psi_row(row, slices, derivative_blocks, psi_i)?
-                            .ok_or_else(|| {
-                                "missing bernoulli marginal-slope psi_i vector".to_string()
-                            })?;
-                        let br_j = self
-                            .block_psi_row(row, slices, derivative_blocks, psi_j)?
-                            .ok_or_else(|| {
-                                "missing bernoulli marginal-slope psi_j vector".to_string()
-                            })?;
-                        let br_ij = self.block_psi_second_row(
+                        let br_i = self.block_psi_row_from_map(
+                            row, block_i, &psi_map_i, slices,
+                        )?;
+                        let br_j = self.block_psi_row_from_map(
+                            row, block_j, &psi_map_j, slices,
+                        )?;
+                        let br_ij = self.block_psi_second_row_from_map(
                             row,
+                            block_i,
+                            block_j,
+                            psi_map_ij.as_ref(),
                             slices,
-                            derivative_blocks,
-                            psi_i,
-                            psi_j,
                         )?;
 
                         // --- scalar and score accumulation (unchanged) ---
@@ -6377,11 +6414,35 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, _)) = self.resolve_psi_location(derivative_blocks, psi_index) else {
+        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        else {
             return Ok(None);
         };
         let idx_primary = if block_idx == 0 { 0 } else { 1 };
         let n = self.y.len();
+        let deriv = &derivative_blocks[block_idx][local_idx];
+        let (p_psi, psi_label) = match block_idx {
+            0 => (
+                self.marginal_design.ncols(),
+                "BernoulliMarginalSlopeFamily marginal",
+            ),
+            1 => (
+                self.logslope_design.ncols(),
+                "BernoulliMarginalSlopeFamily log-slope",
+            ),
+            _ => {
+                return Err(format!(
+                    "bernoulli marginal-slope psi hessian only supports marginal/logslope blocks, got block {block_idx}"
+                ));
+            }
+        };
+
+        // Build the psi design map once; rowwise calls use direct row_vector(row).
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv, n, p_psi, 0..n, psi_label, &policy,
+        )?;
+
         let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
@@ -6396,26 +6457,21 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             d_beta_flat,
                         )?;
-                        let Some(psi_dir) = self.row_primary_psi_direction(
+                        let psi_dir = self.row_primary_psi_direction_from_map(
                             row,
+                            block_idx,
+                            &psi_map,
                             block_states,
-                            derivative_blocks,
-                            psi_index,
                             primary,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let psi_action = self
-                            .row_primary_psi_action_on_direction(
-                                row,
-                                slices,
-                                derivative_blocks,
-                                psi_index,
-                                d_beta_flat,
-                                primary,
-                            )?
-                            .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+                        )?;
+                        let psi_action = self.row_primary_psi_action_on_direction_from_map(
+                            row,
+                            block_idx,
+                            &psi_map,
+                            slices,
+                            d_beta_flat,
+                            primary,
+                        )?;
                         let row_ctx = Self::row_ctx(cache, row);
                         let third_beta = self.row_primary_third_contracted_recompute(
                             row,
@@ -6432,11 +6488,9 @@ impl BernoulliMarginalSlopeFamily {
                             &row_dir,
                             &psi_dir,
                         )?;
-                        let psi_row = self
-                            .block_psi_row(row, slices, derivative_blocks, psi_index)?
-                            .ok_or_else(|| {
-                                "missing bernoulli marginal-slope psi vector".to_string()
-                            })?;
+                        let psi_row = self.block_psi_row_from_map(
+                            row, block_idx, &psi_map, slices,
+                        )?;
                         let right_primary = third_beta.row(idx_primary).to_owned();
                         acc.add_rank1_psi_cross(
                             self,
@@ -6480,11 +6534,35 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, _)) = self.resolve_psi_location(derivative_blocks, psi_index) else {
+        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        else {
             return Ok(None);
         };
         let idx_primary = if block_idx == 0 { 0 } else { 1 };
         let n = self.y.len();
+        let deriv = &derivative_blocks[block_idx][local_idx];
+        let (p_psi, psi_label) = match block_idx {
+            0 => (
+                self.marginal_design.ncols(),
+                "BernoulliMarginalSlopeFamily marginal",
+            ),
+            1 => (
+                self.logslope_design.ncols(),
+                "BernoulliMarginalSlopeFamily log-slope",
+            ),
+            _ => {
+                return Err(format!(
+                    "bernoulli marginal-slope psi hessian operator only supports marginal/logslope blocks, got block {block_idx}"
+                ));
+            }
+        };
+
+        // Build the psi design map once; rowwise calls use direct row_vector(row).
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            deriv, n, p_psi, 0..n, psi_label, &policy,
+        )?;
+
         let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
@@ -6499,26 +6577,21 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             d_beta_flat,
                         )?;
-                        let Some(psi_dir) = self.row_primary_psi_direction(
+                        let psi_dir = self.row_primary_psi_direction_from_map(
                             row,
+                            block_idx,
+                            &psi_map,
                             block_states,
-                            derivative_blocks,
-                            psi_index,
                             primary,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let psi_action = self
-                            .row_primary_psi_action_on_direction(
-                                row,
-                                slices,
-                                derivative_blocks,
-                                psi_index,
-                                d_beta_flat,
-                                primary,
-                            )?
-                            .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
+                        )?;
+                        let psi_action = self.row_primary_psi_action_on_direction_from_map(
+                            row,
+                            block_idx,
+                            &psi_map,
+                            slices,
+                            d_beta_flat,
+                            primary,
+                        )?;
                         let row_ctx = Self::row_ctx(cache, row);
                         let third_beta = self.row_primary_third_contracted_recompute(
                             row,
@@ -6535,11 +6608,9 @@ impl BernoulliMarginalSlopeFamily {
                             &row_dir,
                             &psi_dir,
                         )?;
-                        let psi_row = self
-                            .block_psi_row(row, slices, derivative_blocks, psi_index)?
-                            .ok_or_else(|| {
-                                "missing bernoulli marginal-slope psi vector".to_string()
-                            })?;
+                        let psi_row = self.block_psi_row_from_map(
+                            row, block_idx, &psi_map, slices,
+                        )?;
                         let right_primary = third_beta.row(idx_primary).to_owned();
                         acc.add_rank1_psi_cross(
                             self,
