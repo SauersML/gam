@@ -203,6 +203,7 @@ where
 trait FdGradientState<E> {
     fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, E>;
     fn last_ridge_used(&self) -> Option<f64>;
+    fn fd_gradient_error(message: String) -> E;
 }
 
 struct FdEval {
@@ -438,6 +439,12 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             break;
         }
 
+        if ridge_jitter_seen {
+            return Err(S::fd_gradient_error(format!(
+                "finite-difference gradient failed at coordinate {i}: solver ridge jitter was observed during the stencil (max relative ridge span {ridge_rel_span_max:.3e})"
+            )));
+        }
+
         if derivative.is_none() {
             let same_sign = fd_same_sign(d_small, d_big);
             if same_sign && !ridge_jitter_seen {
@@ -448,7 +455,17 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             }
         }
 
-        fd_grad[i] = derivative.unwrap_or(f64::NAN);
+        let derivative = derivative.ok_or_else(|| {
+            S::fd_gradient_error(format!(
+                "finite-difference gradient failed at coordinate {i}: no valid stencil derivative was available (d_small={d_small:+.9e}, d_big={d_big:+.9e})"
+            ))
+        })?;
+        if !derivative.is_finite() {
+            return Err(S::fd_gradient_error(format!(
+                "finite-difference gradient failed at coordinate {i}: non-finite stencil derivative (d_small={d_small:+.9e}, d_big={d_big:+.9e})"
+            )));
+        }
+        fd_grad[i] = derivative;
         let rel_gap_first = rel_gap_first.unwrap_or(f64::NAN);
         log_lines.push(format!(
             "[FD RIDGE]   refine steps={} h_start={:.3e} h_final={:.3e} rel_gap_first={:.3e} rel_gap_max={:.3e} ridge_jitter_seen={} ridge_rel_span_max={:.3e}",
@@ -480,6 +497,10 @@ impl FdGradientState<EstimationError> for RemlState<'_> {
 
     fn last_ridge_used(&self) -> Option<f64> {
         RemlState::last_ridge_used(self)
+    }
+
+    fn fd_gradient_error(message: String) -> EstimationError {
+        EstimationError::InvalidInput(message)
     }
 }
 
@@ -1241,11 +1262,13 @@ pub struct ExternalOptimResult {
     pub finalgrad_norm: f64,
     pub pirls_status: crate::pirls::PirlsStatus,
     pub deviance: f64,
+    /// Stable quadratic penalty term βᵀSβ, including any solver ridge quadratic.
     pub stable_penalty_term: f64,
     pub max_abs_eta: f64,
     pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
     pub artifacts: FitArtifacts,
     pub inference: Option<FitInference>,
+    /// Complete REML/LAML objective value used for smoothing selection.
     pub reml_score: f64,
     pub fitted_link: FittedLinkState,
 }
@@ -3063,11 +3086,12 @@ pub struct UnifiedFitResult {
     pub log_likelihood: f64,
     /// Explicit deviance reported by the fitting path.
     pub deviance: f64,
-    /// REML/LAML score (penalized objective used for smoothing selection).
+    /// Complete REML/LAML objective value used for smoothing selection.
     pub reml_score: f64,
-    /// Stable penalty term (sum of lambda * beta' S beta terms).
+    /// Stable quadratic penalty term βᵀSβ, including any solver ridge quadratic.
     pub stable_penalty_term: f64,
-    /// Penalized objective value (−ℓ + penalty + REML terms).
+    /// Public objective value reported for the fit. For REML/LAML fits this is
+    /// the same complete objective as `reml_score`, not `-ℓ + penalty + reml_score`.
     pub penalized_objective: f64,
     /// Number of outer (smoothing parameter) iterations.
     pub outer_iterations: usize,
@@ -4826,6 +4850,63 @@ mod fd_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
+    use std::cell::Cell;
+
+    struct NonFiniteFdState;
+
+    impl FdGradientState<String> for NonFiniteFdState {
+        fn compute_cost(&self, _rho: &Array1<f64>) -> Result<f64, String> {
+            Ok(f64::NAN)
+        }
+
+        fn last_ridge_used(&self) -> Option<f64> {
+            Some(0.0)
+        }
+
+        fn fd_gradient_error(message: String) -> String {
+            message
+        }
+    }
+
+    struct JitterFdState {
+        calls: Cell<usize>,
+    }
+
+    impl FdGradientState<String> for JitterFdState {
+        fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, String> {
+            let next = self.calls.get() + 1;
+            self.calls.set(next);
+            Ok(rho[0] * rho[0])
+        }
+
+        fn last_ridge_used(&self) -> Option<f64> {
+            Some(if self.calls.get() % 2 == 0 { 1e-6 } else { 0.0 })
+        }
+
+        fn fd_gradient_error(message: String) -> String {
+            message
+        }
+    }
+
+    #[test]
+    fn fd_gradient_rejects_non_finite_stencil() {
+        let err = compute_fd_gradient(&NonFiniteFdState, &array![0.0], false)
+            .expect_err("non-finite FD stencil should fail");
+        assert!(err.contains("non-finite stencil derivative"), "err={err}");
+    }
+
+    #[test]
+    fn fd_gradient_rejects_solver_ridge_jitter() {
+        let err = compute_fd_gradient(
+            &JitterFdState {
+                calls: Cell::new(0),
+            },
+            &array![1.0],
+            false,
+        )
+        .expect_err("ridge jitter should fail FD diagnostics");
+        assert!(err.contains("solver ridge jitter"), "err={err}");
+    }
 
     fn decode_invariant_test_fit() -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {

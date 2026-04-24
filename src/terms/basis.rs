@@ -7898,6 +7898,9 @@ fn duchon_matern_family_radial_derivative(
             "Duchon Matérn-family kappa must be finite and positive".to_string(),
         ));
     }
+    if r <= 0.0 && derivative_order == 0 && mu > 0.0 {
+        return Ok(coeff * 2.0_f64.powf(mu - 1.0) * gamma_lanczos(mu) * kappa.powf(-mu));
+    }
     if r <= 0.0 {
         return Ok(0.0);
     }
@@ -10850,6 +10853,9 @@ fn duchon_matern_block_radial_derivative(
             "Duchon Matérn-block kappa must be finite and positive".to_string(),
         ));
     }
+    if r <= 0.0 && derivative_order == 0 {
+        return duchon_matern_block(0.0, kappa, n_order, k_dim);
+    }
     if r <= 0.0 {
         return Ok(0.0);
     }
@@ -12265,11 +12271,7 @@ fn build_duchon_basis_designwithworkspace(
                     };
                     kernel_row[j] = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
-                        if r == 0.0 && p_order > 0 {
-                            0.0
-                        } else {
-                            ppc.eval(r)
-                        }
+                        ppc.eval(r)
                     } else {
                         duchon_matern_kernel_general_from_distance(
                             r,
@@ -12371,11 +12373,7 @@ pub fn build_duchon_basiswithworkspace(
             Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
                 let r = aniso_distance(data_row, center_row, &eta);
                 if let Some(ppc) = pure_poly_coeff {
-                    if r == 0.0 && p_order > 0 {
-                        0.0
-                    } else {
-                        ppc.eval(r)
-                    }
+                    ppc.eval(r)
                 } else {
                     duchon_matern_kernel_general_from_distance(
                         r,
@@ -12393,11 +12391,7 @@ pub fn build_duchon_basiswithworkspace(
             Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
                 let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
                 if let Some(ppc) = pure_poly_coeff {
-                    if r == 0.0 && p_order > 0 {
-                        0.0
-                    } else {
-                        ppc.eval(r)
-                    }
+                    ppc.eval(r)
                 } else {
                     duchon_matern_kernel_general_from_distance(
                         r,
@@ -17967,13 +17961,39 @@ mod tests {
     }
 
     #[test]
+    fn test_duchon_hybrid_public_basis_uses_nonzero_collision_diagonal() {
+        let centers = array![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let out = create_duchon_spline_basis(
+            centers.view(),
+            centers.view(),
+            Some(1.0),
+            1,
+            DuchonNullspaceOrder::Zero,
+        )
+        .expect("hybrid Duchon basis");
+
+        assert_eq!(out.num_kernel_basis, 1);
+        let expected_collision = 1.0 / (4.0 * std::f64::consts::PI);
+        let expected_offdiag = (1.0 - (-1.0_f64).exp()) / (4.0 * std::f64::consts::PI);
+        let expected_projected = expected_collision - expected_offdiag;
+        assert_abs_diff_eq!(
+            out.penalty_kernel[[0, 0]],
+            expected_projected,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
     fn test_duchon_matern_block_origin_includes_kappa_power() {
         let kappa = 4.0;
         let value = duchon_matern_block(0.0, kappa, 1, 1).expect("block value");
         let (jet_value, _, _, _, _) =
             duchon_matern_block_jet4(0.0, kappa, 1, 1).expect("block jet");
+        let radial_value =
+            duchon_matern_block_radial_derivative(0.0, kappa, 1, 1, 0).expect("radial value");
         assert_abs_diff_eq!(value, 1.0 / 8.0, epsilon = 1e-14);
         assert_abs_diff_eq!(jet_value, value, epsilon = 1e-14);
+        assert_abs_diff_eq!(radial_value, value, epsilon = 1e-14);
     }
 
     #[test]
