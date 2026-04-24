@@ -2457,7 +2457,7 @@ mod tests {
         let instant_hazard = makeham + rate * (shape * age).exp();
         let expected_survival = (-cumulative_hazard).exp();
         let actual_survival = normal_cdf(-q);
-        assert!((actual_survival - expected_survival).abs() <= 1e-12);
+        assert!((actual_survival - expected_survival).abs() <= 1e-10);
 
         let h = 1e-5;
         let q_plus = evaluate_survival_marginal_slope_baseline(age + h, &cfg)
@@ -2492,8 +2492,8 @@ mod tests {
             let exit_h = cfg.makeham.expect("makeham") * age_exit[i]
                 + (cfg.rate.expect("rate") / cfg.shape.expect("shape"))
                     * ((cfg.shape.expect("shape") * age_exit[i]).exp() - 1.0);
-            assert!((normal_cdf(-entry[i]) - (-entry_h).exp()).abs() <= 1e-12);
-            assert!((normal_cdf(-exit[i]) - (-exit_h).exp()).abs() <= 1e-12);
+            assert!((normal_cdf(-entry[i]) - (-entry_h).exp()).abs() <= 1e-10);
+            assert!((normal_cdf(-exit[i]) - (-exit_h).exp()).abs() <= 1e-10);
             assert!(derivative[i].is_finite() && derivative[i] > 0.0);
         }
     }

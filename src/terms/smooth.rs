@@ -12353,7 +12353,7 @@ where
         if analytic_joint_gradient_available {
             Derivative::Analytic
         } else {
-            Derivative::FiniteDifference
+            Derivative::Unavailable
         },
         if analytic_outer_hessian_available {
             Derivative::Analytic

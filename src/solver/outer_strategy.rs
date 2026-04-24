@@ -114,12 +114,6 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 pub enum Derivative {
     /// Exact analytic derivative implemented and available.
     Analytic,
-    /// Derivative is available only via finite differences computed inside
-    /// `opt` from a lower-order objective interface. This is a real capability
-    /// for gradients; Hessians are normalized to `Unavailable` at planning time
-    /// because finite-differenced Hessians are a last resort and should not be
-    /// selected ahead of a gradient-only solver.
-    FiniteDifference,
     /// No analytic derivative; must be approximated or skipped.
     Unavailable,
 }
@@ -348,7 +342,7 @@ impl OuterCapability {
     fn declared_hessian_for_planning(&self) -> Derivative {
         match self.hessian {
             Derivative::Analytic => Derivative::Analytic,
-            Derivative::FiniteDifference | Derivative::Unavailable => Derivative::Unavailable,
+            Derivative::Unavailable => Derivative::Unavailable,
         }
     }
 }
@@ -671,18 +665,14 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         },
 
         // Gradient-only problems should use a gradient-only optimizer.
-        // Finite-differencing a Hessian multiplies objective cost by ~2p per
-        // outer step and is a bad default for expensive likelihoods.
         (Analytic, Unavailable) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
-        // FD-gradient planning is a production footgun: the runner now rejects
-        // non-analytic gradients in `Solver::Bfgs`, but we still emit a plan
-        // here so the error surfaces with context rather than as a panic on an
-        // unmatched arm. The caller must supply an analytic gradient or use an
-        // EFS-eligible capability.
-        (Analytic, FiniteDifference) | (FiniteDifference, _) | (Unavailable, _) => OuterPlan {
+        // No analytic gradient: emit a BFGS plan so the error surfaces with
+        // context rather than as a panic on an unmatched arm. The runner will
+        // reject this path because it requires an analytic gradient.
+        (Unavailable, _) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
@@ -729,10 +719,6 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         }
         _ => String::new(),
     };
-    let grad_warning = match cap.gradient {
-        Derivative::FiniteDifference => " [FD gradient from cost-only objective]",
-        _ => "",
-    };
     let barrier_note = if cap.barrier_config.is_some() && cap.efs_plan_eligible() {
         " [EFS with runtime barrier-curvature guard]"
     } else {
@@ -744,7 +730,7 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
         ""
     };
     log::info!(
-        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{grad_warning}{hess_warning}{barrier_note}{hybrid_note}",
+        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}{barrier_note}{hybrid_note}",
         cap.n_params,
         cap.gradient,
         cap.hessian,
@@ -3063,23 +3049,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_fd_hessian_capability_is_treated_as_gradient_only() {
-        let cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::FiniteDifference,
-            n_params: 3,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        let p = plan(&cap);
-        assert_eq!(p.solver, Solver::Bfgs);
-        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
-    }
-
-    #[test]
     fn plan_no_hessian_many_params_selects_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
@@ -3094,46 +3063,6 @@ mod tests {
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
-    }
-
-    #[test]
-    fn plan_fd_gradient_still_maps_to_bfgs_for_error_context() {
-        // FD-gradient capabilities must not be declared by production callers;
-        // the runner now errors out on the Bfgs path. The planner still
-        // produces a `Solver::Bfgs` plan so the eventual error can format a
-        // meaningful "plan={plan}" context string instead of panicking on an
-        // unmatched match arm.
-        for n in [1, 5, 20] {
-            let cap = OuterCapability {
-                gradient: Derivative::FiniteDifference,
-                hessian: Derivative::Unavailable,
-                n_params: n,
-                psi_dim: 0,
-                fixed_point_available: false,
-                barrier_config: None,
-                prefer_gradient_only: false,
-                disable_fixed_point: false,
-            };
-            let p = plan(&cap);
-            assert_eq!(p.solver, Solver::Bfgs);
-            assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
-        }
-    }
-
-    #[test]
-    fn plan_fd_gradient_with_hessian_still_bfgs_for_error_context() {
-        let cap = OuterCapability {
-            gradient: Derivative::FiniteDifference,
-            hessian: Derivative::Analytic,
-            n_params: 3,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        let p = plan(&cap);
-        assert_eq!(p.solver, Solver::Bfgs);
     }
 
     #[test]
