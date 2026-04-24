@@ -6,6 +6,7 @@ use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::{LinearInequalityConstraints, solve_newton_directionwith_lower_bounds};
+use crate::resource::{DerivativeStorageMode, ResourcePolicy};
 use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
     try_build_spatial_log_kappa_derivativeinfo_list,
@@ -3531,45 +3532,192 @@ pub(crate) fn shared_dense_arc(x: &Array2<f64>) -> Arc<Array2<f64>> {
     }
 }
 
+pub(crate) fn resolve_custom_family_x_psi_map(
+    deriv: &CustomFamilyBlockPsiDerivative,
+    n: usize,
+    p: usize,
+    row_range: Range<usize>,
+    label: &str,
+    policy: &ResourcePolicy,
+) -> Result<PsiDesignMap, String> {
+    if row_range.end > n {
+        return Err(format!(
+            "{label}: row range {}..{} exceeds total rows {n}",
+            row_range.start, row_range.end
+        ));
+    }
+
+    // Prefer operator action when dimensions match.
+    if let Some(op) = deriv.implicit_operator.as_ref() {
+        if op.n_data() == n && op.p_out() == p {
+            return Ok(PsiDesignMap::First {
+                action: CustomFamilyPsiDesignAction::from_first_derivative(
+                    deriv, n, p, row_range, label,
+                )?,
+            });
+        }
+    }
+
+    // Dense fallback guarded by policy.
+    if deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p {
+        match policy.derivative_storage_mode {
+            DerivativeStorageMode::AnalyticOperatorRequired => {
+                if is_zero_array(&deriv.x_psi) {
+                    return Ok(PsiDesignMap::Zero {
+                        nrows: row_range.end - row_range.start,
+                        ncols: p,
+                    });
+                }
+                return Err(format!(
+                    "{label}: dense x_psi fallback disabled by AnalyticOperatorRequired"
+                ));
+            }
+            DerivativeStorageMode::MaterializeIfSmall
+            | DerivativeStorageMode::DiagnosticsOnly => {
+                let matrix = if row_range.start == 0 && row_range.end == n {
+                    Arc::new(deriv.x_psi.clone())
+                } else {
+                    Arc::new(
+                        deriv
+                            .x_psi
+                            .slice(ndarray::s![row_range.clone(), ..])
+                            .to_owned(),
+                    )
+                };
+                return Ok(PsiDesignMap::Dense { matrix });
+            }
+        }
+    }
+
+    // Empty / zero sentinel.
+    if deriv.x_psi.nrows() == 0 || deriv.x_psi.ncols() == 0 {
+        return Ok(PsiDesignMap::Zero {
+            nrows: row_range.end - row_range.start,
+            ncols: p,
+        });
+    }
+
+    Err(format!(
+        "{label}: x_psi shape {:?} does not match ({n}, {p})",
+        deriv.x_psi.dim()
+    ))
+}
+
+pub(crate) fn resolve_custom_family_x_psi_psi_map(
+    deriv_i: &CustomFamilyBlockPsiDerivative,
+    deriv_j: &CustomFamilyBlockPsiDerivative,
+    local_j: usize,
+    n: usize,
+    p: usize,
+    row_range: Range<usize>,
+    label: &str,
+    policy: &ResourcePolicy,
+) -> Result<PsiDesignMap, String> {
+    if row_range.end > n {
+        return Err(format!(
+            "{label}: row range {}..{} exceeds total rows {n}",
+            row_range.start, row_range.end
+        ));
+    }
+
+    // Prefer operator action when dimensions match.
+    if let Some(op) = deriv_i.implicit_operator.as_ref() {
+        if op.n_data() == n && op.p_out() == p {
+            let same_group = deriv_i.implicit_group_id.is_some()
+                && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
+            if !same_group {
+                return Ok(PsiDesignMap::Zero {
+                    nrows: row_range.end - row_range.start,
+                    ncols: p,
+                });
+            }
+            match CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                deriv_i,
+                deriv_j,
+                n,
+                p,
+                row_range.clone(),
+                label,
+            )? {
+                Some(action) => {
+                    return Ok(PsiDesignMap::Second { action });
+                }
+                None => {
+                    return Ok(PsiDesignMap::Zero {
+                        nrows: row_range.end - row_range.start,
+                        ncols: p,
+                    });
+                }
+            }
+        }
+    }
+
+    // Dense fallback guarded by policy, reading from the per-second-derivative
+    // slot `x_psi_psi[local_j]` if provided.
+    if let Some(x_psi_psi) = deriv_i.x_psi_psi.as_ref()
+        && let Some(x_ab) = x_psi_psi.get(local_j)
+    {
+        if x_ab.nrows() == n && x_ab.ncols() == p {
+            match policy.derivative_storage_mode {
+                DerivativeStorageMode::AnalyticOperatorRequired => {
+                    if is_zero_array(x_ab) {
+                        return Ok(PsiDesignMap::Zero {
+                            nrows: row_range.end - row_range.start,
+                            ncols: p,
+                        });
+                    }
+                    return Err(format!(
+                        "{label}: dense x_psi_psi fallback disabled by AnalyticOperatorRequired"
+                    ));
+                }
+                DerivativeStorageMode::MaterializeIfSmall
+                | DerivativeStorageMode::DiagnosticsOnly => {
+                    let matrix = if row_range.start == 0 && row_range.end == n {
+                        Arc::new(x_ab.clone())
+                    } else {
+                        Arc::new(x_ab.slice(ndarray::s![row_range.clone(), ..]).to_owned())
+                    };
+                    return Ok(PsiDesignMap::Dense { matrix });
+                }
+            }
+        }
+        if x_ab.is_empty() {
+            return Ok(PsiDesignMap::Zero {
+                nrows: row_range.end - row_range.start,
+                ncols: p,
+            });
+        }
+        return Err(format!(
+            "{label}: x_psi_psi shape {:?} does not match ({n}, {p})",
+            x_ab.dim()
+        ));
+    }
+
+    // No operator, no dense slot: treat as zero.
+    Ok(PsiDesignMap::Zero {
+        nrows: row_range.end - row_range.start,
+        ncols: p,
+    })
+}
+
+// TODO(psi-design-map-migration): callers should switch to resolve_custom_family_x_psi_map
 pub(crate) fn resolve_custom_family_x_psi(
     deriv: &CustomFamilyBlockPsiDerivative,
     n: usize,
     p: usize,
     label: &str,
 ) -> Result<Array2<f64>, String> {
-    if deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p {
-        return Ok(deriv.x_psi.clone());
+    let policy = crate::resource::ResourcePolicy::permissive_small_data();
+    let map = resolve_custom_family_x_psi_map(deriv, n, p, 0..n, label, &policy)?;
+    match map {
+        PsiDesignMap::Zero { nrows, ncols } => Ok(Array2::<f64>::zeros((nrows, ncols))),
+        PsiDesignMap::Dense { matrix } => Ok((*matrix).clone()),
+        PsiDesignMap::First { action } => action.row_chunk(0..n),
+        PsiDesignMap::Second { action } => action.row_chunk(0..n),
     }
-    if let Some(op) = deriv.implicit_operator.as_ref() {
-        if !should_resolve_custom_family_psi_dense(n, p) {
-            return Err(format!(
-                "{label} would materialize implicit x_psi densely at {}x{}; use the operator-aware exact-joint path instead",
-                n, p
-            ));
-        }
-        let x = op
-            .materialize_first(deriv.implicit_axis)
-            .map_err(|e| format!("{label} implicit materialize_first failed: {e}"))?;
-        if x.nrows() != n || x.ncols() != p {
-            return Err(format!(
-                "{label} implicit x_psi shape mismatch: got {}x{}, expected {}x{}",
-                x.nrows(),
-                x.ncols(),
-                n,
-                p
-            ));
-        }
-        return Ok(x);
-    }
-    Err(format!(
-        "{label} x_psi shape mismatch: got {}x{}, expected {}x{}",
-        deriv.x_psi.nrows(),
-        deriv.x_psi.ncols(),
-        n,
-        p
-    ))
 }
 
+// TODO(psi-design-map-migration): callers should switch to resolve_custom_family_x_psi_psi_map
 pub(crate) fn resolve_custom_family_x_psi_psi(
     deriv_i: &CustomFamilyBlockPsiDerivative,
     deriv_j: &CustomFamilyBlockPsiDerivative,
@@ -3578,57 +3726,16 @@ pub(crate) fn resolve_custom_family_x_psi_psi(
     p: usize,
     label: &str,
 ) -> Result<Array2<f64>, String> {
-    if let Some(op) = deriv_i.implicit_operator.as_ref() {
-        if !should_resolve_custom_family_psi_dense(n, p) {
-            return Err(format!(
-                "{label} would materialize implicit x_psi_psi densely at {}x{}; use the operator-aware exact-joint path instead",
-                n, p
-            ));
-        }
-        let same_group = deriv_i.implicit_group_id.is_some()
-            && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
-        let x = if same_group {
-            if deriv_i.implicit_axis == deriv_j.implicit_axis {
-                op.materialize_second_diag(deriv_i.implicit_axis)
-                    .map_err(|e| format!("{label} implicit materialize_second_diag failed: {e}"))?
-            } else {
-                op.materialize_second_cross(deriv_i.implicit_axis, deriv_j.implicit_axis)
-                    .map_err(|e| format!("{label} implicit materialize_second_cross failed: {e}"))?
-            }
-        } else {
-            Array2::<f64>::zeros((n, p))
-        };
-        if x.nrows() != n || x.ncols() != p {
-            return Err(format!(
-                "{label} implicit x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-                x.nrows(),
-                x.ncols(),
-                n,
-                p
-            ));
-        }
-        return Ok(x);
+    let policy = crate::resource::ResourcePolicy::permissive_small_data();
+    let map = resolve_custom_family_x_psi_psi_map(
+        deriv_i, deriv_j, local_j, n, p, 0..n, label, &policy,
+    )?;
+    match map {
+        PsiDesignMap::Zero { nrows, ncols } => Ok(Array2::<f64>::zeros((nrows, ncols))),
+        PsiDesignMap::Dense { matrix } => Ok((*matrix).clone()),
+        PsiDesignMap::First { action } => action.row_chunk(0..n),
+        PsiDesignMap::Second { action } => action.row_chunk(0..n),
     }
-
-    if let Some(x_psi_psi) = deriv_i.x_psi_psi.as_ref()
-        && let Some(x_ab) = x_psi_psi.get(local_j)
-    {
-        if x_ab.nrows() == n && x_ab.ncols() == p {
-            return Ok(x_ab.clone());
-        }
-        if x_ab.is_empty() {
-            return Ok(Array2::<f64>::zeros((n, p)));
-        }
-        return Err(format!(
-            "{label} x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
-            x_ab.nrows(),
-            x_ab.ncols(),
-            n,
-            p
-        ));
-    }
-
-    Ok(Array2::<f64>::zeros((n, p)))
 }
 
 pub struct ExactNewtonJointPsiTerms {
