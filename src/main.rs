@@ -76,12 +76,13 @@ use gam::survival_construction::{
     build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
-    evaluate_survival_baseline, evaluate_survival_time_basis_row, normalize_survival_time_pair,
-    optimize_survival_baseline_config, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
-    survival_likelihood_modename,
+    evaluate_survival_baseline, evaluate_survival_time_basis_row,
+    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
+    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
+    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config, require_structural_survival_time_basis,
+    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
+    survival_baseline_targetname, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -91,6 +92,7 @@ use gam::survival_location_scale::{
 use gam::survival_marginal_slope::{
     DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
 };
+use gam::survival_predict::{SurvivalPredictRequest, SurvivalPredictResult, predict_survival};
 use gam::term_builder::{build_termspec, enable_scale_dimensions};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
@@ -5105,7 +5107,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             link_dev: routed_link_dev.clone(),
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-            baseline_cfg = optimize_survival_baseline_config(
+            baseline_cfg = optimize_survival_baseline_config_with_gradient(
                 &baseline_cfg,
                 "survival marginal-slope baseline",
                 |candidate| {
@@ -5144,7 +5146,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             return Err(format!("survival marginal-slope fit failed: {e}"));
                         }
                     };
-                    Ok(fit.fit.reml_score)
+                    let gradient = marginal_slope_baseline_chain_rule_gradient(
+                        age_entry.view(),
+                        age_exit.view(),
+                        candidate,
+                        &fit.baseline_offset_residuals,
+                    )?
+                    .ok_or_else(|| {
+                        "survival marginal-slope baseline unexpectedly has no theta gradient"
+                            .to_string()
+                    })?;
+                    Ok((fit.fit.reml_score, gradient))
                 },
             )?;
         }
@@ -6261,7 +6273,11 @@ fn run_sample_survival(
     }
     let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
     let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
-        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+        if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+            build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
+        } else {
+            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
+        };
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
         let time_anchor = model
             .survival_time_anchor

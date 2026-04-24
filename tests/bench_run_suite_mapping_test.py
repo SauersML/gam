@@ -236,6 +236,15 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertEqual(cfg["smooth_cols"], [f"pc{i}" for i in range(1, 17)])
         self.assertEqual(cfg["knots"], 50)
         self.assertTrue(cfg.get("scale_dimensions"))
+        term = _RUN_SUITE._rust_joint_spatial_term(
+            cfg["smooth_basis"],
+            cfg["smooth_cols"],
+            cfg["knots"],
+            ", double_penalty=true",
+        )
+        self.assertIn("order=1", term)
+        self.assertIn("power=8", term)
+        self.assertIn("length_scale=1.0", term)
 
     def test_geo_subpop16_marginal_slope_aniso_lane_is_present_and_enabled(self) -> None:
         scenarios = json.loads((_REPO_ROOT / "bench" / "scenarios.json").read_text())["scenarios"]

@@ -12,19 +12,20 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization,
-    build_deviation_block_from_knots_and_design_seed, build_deviation_block_from_seed,
-    project_monotone_feasible_beta, signed_probit_logcdf_and_mills_ratio,
-    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z, unary_derivatives_log,
-    unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    build_deviation_block_from_knots_design_seed_and_anchor_weights,
+    build_deviation_block_from_seed, project_monotone_feasible_beta,
+    signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
+    standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
-use crate::families::survival::OffsetChannelResiduals;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
+use crate::families::survival::OffsetChannelResiduals;
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
     structural_time_coefficient_constraints,
@@ -4570,7 +4571,8 @@ impl SurvivalMarginalSlopeFamily {
                     )?
                     .1
                 } else {
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?.1
+                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                        .1
                 };
                 Ok((row, gradient[1], gradient[0], gradient[2]))
             })
@@ -12818,7 +12820,12 @@ pub fn fit_survival_marginal_slope_terms(
                 let slope = baseline_slope + spec.logslope_offset[row];
                 rigid_observed_eta(q_exit, slope, spec.z[row], probit_scale)
             }));
-            build_deviation_block_from_knots_and_design_seed(&q0_seed, &q0_seed, cfg)
+            build_deviation_block_from_knots_design_seed_and_anchor_weights(
+                &q0_seed,
+                &q0_seed,
+                Some(&spec.weights),
+                cfg,
+            )
         })
         .transpose()?;
     let extra_rho0 = {

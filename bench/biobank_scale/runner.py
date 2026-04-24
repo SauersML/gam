@@ -354,12 +354,17 @@ def _pc_std_columns(pc_count: int) -> list[str]:
     return [f"pc{i}_std" for i in range(1, int(pc_count) + 1)]
 
 
-def _ctn_formula(pc_count: int, centers: int) -> str:
+def _biobank_duchon_pc_term(pc_count: int, centers: int) -> str:
     pc_cols = ", ".join(_pc_std_columns(pc_count))
     return (
-        f"{PGS_RAW_COLUMN} ~ "
-        f"duchon({pc_cols}, centers={centers}, order=0, power=1)"
+        f"duchon({pc_cols}, centers={centers}, "
+        f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
+        f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
     )
+
+
+def _ctn_formula(pc_count: int, centers: int) -> str:
+    return f"{PGS_RAW_COLUMN} ~ {_biobank_duchon_pc_term(pc_count, centers)}"
 
 
 def _attach_column(rows: list[dict[str, str]], column: str, values: list[float]) -> list[dict[str, Any]]:
@@ -394,7 +399,14 @@ def _z_moment_report(
             return
         mean = float(np.mean(values))
         var = float(np.var(values))
-        reports.append(f"{split_label}: {label} n={values.size:,} mean={mean:+.4f} var={var:.4f}")
+        centered = values - mean
+        sd = math.sqrt(var) if var > 0.0 else 0.0
+        skew = float(np.mean((centered / sd) ** 3)) if sd > 0.0 else float("nan")
+        excess_kurt = float(np.mean((centered / sd) ** 4) - 3.0) if sd > 0.0 else float("nan")
+        reports.append(
+            f"{split_label}: {label} n={values.size:,} mean={mean:+.4f} "
+            f"var={var:.4f} skew={skew:+.4f} excess_kurt={excess_kurt:+.4f}"
+        )
         if abs(mean) > PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN:
             raise RuntimeError(
                 f"{split_label}: {label} has E[{z_column}|A] too far from 0: {mean:+.4f}"
@@ -452,9 +464,22 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         )
 
     ctn_model_path = out_dir / f"{spec.name}.pgs_ctn.model.json"
+    ctn_train_input_path = out_dir / f"{spec.name}.pgs_ctn.train_input.csv"
+    ctn_test_input_path = out_dir / f"{spec.name}.pgs_ctn.test_input.csv"
     ctn_train_pred_path = out_dir / f"{spec.name}.pgs_ctn.train_pred.csv"
     ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
     formula = _ctn_formula(spec.pc_count, centers)
+    ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
+    write_csv_rows(
+        ctn_train_input_path,
+        [{key: row[key] for key in ctn_columns} for row in train_rows],
+        ctn_columns,
+    )
+    write_csv_rows(
+        ctn_test_input_path,
+        [{key: row[key] for key in ctn_columns} for row in test_rows],
+        ctn_columns,
+    )
     fit_cmd = [
         str(rust_bin),
         "fit",
@@ -462,7 +487,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         "--scale-dimensions",
         "--out",
         str(ctn_model_path),
-        str(train_csv),
+        str(ctn_train_input_path),
         formula,
     ]
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
@@ -471,8 +496,8 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
             err.strip() or out.strip() or f"{spec.name} conditional PGS CTN fit failed"
         )
     for input_path, output_path in (
-        (train_csv, ctn_train_pred_path),
-        (test_csv, ctn_test_pred_path),
+        (ctn_train_input_path, ctn_train_pred_path),
+        (ctn_test_input_path, ctn_test_pred_path),
     ):
         pred_cmd = [str(rust_bin), "predict", str(ctn_model_path), str(input_path), "--out", str(output_path)]
         rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
@@ -1386,14 +1411,10 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
 
 def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -> tuple[str, str]:
     """Build mean and logslope formulas for biobank marginal-slope classification."""
-    pc_cols = ", ".join(f"pc{i}_std" for i in range(1, int(spec.pc_count) + 1))
     if spec.spatial_basis == "duchon":
-        spatial = (
-            f"duchon({pc_cols}, centers={centers}, "
-            f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
-            f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
-        )
+        spatial = _biobank_duchon_pc_term(int(spec.pc_count), centers)
     elif spec.spatial_basis == "matern":
+        pc_cols = ", ".join(f"pc{i}_std" for i in range(1, int(spec.pc_count) + 1))
         spatial = f"matern({pc_cols}, centers={centers})"
     else:
         raise RuntimeError(

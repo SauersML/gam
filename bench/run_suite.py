@@ -3171,8 +3171,9 @@ def _requires_joint_spatial_term(cfg: dict | None) -> bool:
 
 
 def _rust_duchon_options_for_dimension(dimension: int, dp_opt: str) -> str:
-    if dimension >= 6:
-        return f", order=1, power=8, length_scale=1.0{dp_opt}"
+    if dimension >= 2:
+        power = max(1, dimension // 2)
+        return f", order=1, power={power}, length_scale=1.0{dp_opt}"
     return f", order=0, power=1{dp_opt}"
 
 
