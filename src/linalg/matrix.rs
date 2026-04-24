@@ -24,6 +24,7 @@ const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
+// TODO(material-policy-migration): replace with ResourcePolicy.max_single_materialization_bytes
 const MAX_DENSE_OPERATOR_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
@@ -538,20 +539,12 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     }
 
     /// Fill a dense row chunk without materializing the full matrix.
+    /// Required: every implementor must provide row-local access here.
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        mut out: ArrayViewMut2<'_, f64>,
-    ) -> Result<(), MatrixMaterializationError> {
-        let chunk = self.row_chunk(rows);
-        if out.raw_dim() != chunk.raw_dim() {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "DenseDesignOperator::row_chunk_into shape mismatch",
-            });
-        }
-        out.assign(&chunk);
-        Ok(())
-    }
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError>;
 
     /// Extract a dense row chunk without materializing the full matrix.
     /// Non-panicking owned-chunk API; preferred over the legacy `row_chunk`.
@@ -561,10 +554,12 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         Ok(out)
     }
 
-    /// Extract a dense row chunk.
+    /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
+    /// `try_row_chunk(...)?` to propagate materialization errors.
+    // TODO(material-policy-migration): replace call sites with try_row_chunk
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         self.try_row_chunk(rows)
-            .expect("DenseDesignOperator::row_chunk failed")
+            .expect("DenseDesignOperator::row_chunk (legacy; migrate to try_row_chunk)")
     }
 
     /// Borrow dense storage when this operator already owns it.
@@ -5347,13 +5342,17 @@ impl DesignMatrix {
                 let x = if let Some(lhs_dense) = lhs.as_dense_ref() {
                     lhs_dense.row(row)
                 } else {
-                    lhs_chunk = lhs.row_chunk(row..row + 1);
+                    lhs_chunk = lhs
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("row_outer_into_view lhs: {e}"))?;
                     lhs_chunk.row(0)
                 };
                 let y = if let Some(rhs_dense) = rhs.as_dense_ref() {
                     rhs_dense.row(row)
                 } else {
-                    rhs_chunk = rhs.row_chunk(row..row + 1);
+                    rhs_chunk = rhs
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("row_outer_into_view rhs: {e}"))?;
                     rhs_chunk.row(0)
                 };
                 for i in 0..x.len() {

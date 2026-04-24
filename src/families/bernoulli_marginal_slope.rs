@@ -580,17 +580,6 @@ fn validate_spec(
     Ok(())
 }
 
-/// Recenter/rescale latent z for finite-sample identification while still
-/// rejecting obviously non-Gaussian inputs. Both marginal-slope families use
-/// the same latent-score convention, so survival reuses this helper too.
-pub(crate) fn standardize_latent_z(
-    z: &Array1<f64>,
-    weights: &Array1<f64>,
-    context: &str,
-) -> Result<(Array1<f64>, LatentZNormalization), String> {
-    standardize_latent_z_with_policy(z, weights, context, &LatentZPolicy::default())
-}
-
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,
     weights: &Array1<f64>,
@@ -13534,8 +13523,13 @@ mod tests {
             -0.85, -0.12, 0.31, 1.04, -1.21, 0.56, 0.77, -0.44, 1.33, -0.09, 0.28, -0.67
         ];
         let weights = Array1::from_elem(12, 1.0);
-        let (standardized, normalization) =
-            standardize_latent_z(&z, &weights, "bernoulli-marginal-slope").expect("normalize z");
+        let (standardized, normalization) = standardize_latent_z_with_policy(
+            &z,
+            &weights,
+            "bernoulli-marginal-slope",
+            &LatentZPolicy::default(),
+        )
+        .expect("normalize z");
         let replayed = normalization
             .apply(&z, "bernoulli-marginal-slope replay")
             .expect("replay normalized z");
@@ -13550,7 +13544,12 @@ mod tests {
     fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
         let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
         let weights = Array1::from_elem(6, 1.0);
-        let err = standardize_latent_z(&z, &weights, "bernoulli-marginal-slope")
+        let err = standardize_latent_z_with_policy(
+            &z,
+            &weights,
+            "bernoulli-marginal-slope",
+            &LatentZPolicy::default(),
+        )
             .expect_err("expected non-gaussian rejection");
         assert!(err.contains("approximately latent N(0,1)"));
     }
