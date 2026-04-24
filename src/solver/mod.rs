@@ -3,6 +3,7 @@ pub mod estimate;
 pub mod mixture_link;
 pub mod outer_strategy;
 pub mod pirls;
+pub mod protocol;
 pub mod seeding;
 pub mod visualizer;
 pub(crate) mod workflow;

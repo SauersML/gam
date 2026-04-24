@@ -586,16 +586,11 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    _args: &FitArgs,
+    _: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    Ok(options)
-}
-
-fn blockwise_options_from_survival_args(
-    _args: &SurvivalArgs,
-) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
-    let options = gam::families::custom_family::BlockwiseFitOptions::default();
+    options.use_outer_hessian = true;
+    options.compute_covariance = true;
     Ok(options)
 }
 
@@ -3332,6 +3327,7 @@ fn run_predict_survival(
             &age_exit,
             &baseline_cfg,
             saved_likelihood_mode,
+            None,
             time_anchor,
             DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             &time_build,
@@ -3358,12 +3354,20 @@ fn run_predict_survival(
             _ => unreachable!(),
         };
     }
-    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
-        if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-            build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
+    let saved_location_scale_inverse_link =
+        if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
+            Some(resolve_survival_inverse_link_from_saved(model)?)
         } else {
-            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
+            None
         };
+    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
+        build_survival_time_offsets_for_likelihood(
+            &age_entry,
+            &age_exit,
+            &baseline_cfg,
+            saved_likelihood_mode,
+            saved_location_scale_inverse_link.as_ref(),
+        )?;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
@@ -3389,7 +3393,9 @@ fn run_predict_survival(
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let saved_fit = saved_survival_location_scale_fit_result(model)?;
-        let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
+        let survival_inverse_link = saved_location_scale_inverse_link
+            .clone()
+            .ok_or_else(|| "saved location-scale model missing inverse link".to_string())?;
         let thresholdspec = resolve_termspec_for_prediction(
             &model.resolved_termspec,
             training_headers,
@@ -5657,6 +5663,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_exit,
             candidate,
             likelihood_mode,
+            None,
             time_anchor,
             exact_derivative_guard,
             &time_build,
@@ -13117,7 +13124,7 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_accepts_standard_and_stateful_base_links() {
+    fn bernoulli_marginal_slope_accepts_only_probit_base_link() {
         let parsed = parse_formula("y ~ x + link(type=probit)").expect("main formula");
         let resolved = super::resolve_bernoulli_marginal_slope_base_link(
             parsed.linkspec.as_ref(),
@@ -13126,47 +13133,22 @@ mod tests {
         .expect("explicit probit base link");
         assert_eq!(resolved, InverseLink::Standard(LinkFunction::Probit));
 
-        let parsed = parse_formula("y ~ x + link(type=logit)").expect("main formula");
-        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
-            parsed.linkspec.as_ref(),
-            "bernoulli marginal-slope",
-        )
-        .expect("explicit logit base link");
-        assert_eq!(resolved, InverseLink::Standard(LinkFunction::Logit));
-
-        let parsed =
-            parse_formula("y ~ x + link(type=sas, sas_init=\"0.1,-0.2\")").expect("sas formula");
-        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
-            parsed.linkspec.as_ref(),
-            "bernoulli marginal-slope",
-        )
-        .expect("SAS base link");
-        assert!(matches!(resolved, InverseLink::Sas(_)));
-
-        let parsed =
-            parse_formula("y ~ x + link(type=beta-logistic, beta_logistic_init=\"0.3,0.7\")")
-                .expect("beta-logistic formula");
-        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
-            parsed.linkspec.as_ref(),
-            "bernoulli marginal-slope",
-        )
-        .expect("beta-logistic base link");
-        assert!(matches!(resolved, InverseLink::BetaLogistic(_)));
-
-        let parsed =
-            parse_formula("y ~ x + link(type=blended(logit,probit,cloglog), rho=\"0.4,-0.1\")")
-                .expect("mixture formula");
-        let resolved = super::resolve_bernoulli_marginal_slope_base_link(
-            parsed.linkspec.as_ref(),
-            "bernoulli marginal-slope",
-        )
-        .expect("mixture base link");
-        match resolved {
-            InverseLink::Mixture(state) => {
-                assert_eq!(state.components.len(), 3);
-                assert_eq!(state.rho.len(), 2);
-            }
-            other => panic!("expected mixture link, got {other:?}"),
+        for formula in [
+            "y ~ x + link(type=logit)",
+            "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\")",
+            "y ~ x + link(type=beta-logistic, beta_logistic_init=\"0.3,0.7\")",
+            "y ~ x + link(type=blended(logit,probit,cloglog), rho=\"0.4,-0.1\")",
+        ] {
+            let parsed = parse_formula(formula).expect("main formula");
+            let err = super::resolve_bernoulli_marginal_slope_base_link(
+                parsed.linkspec.as_ref(),
+                "bernoulli marginal-slope",
+            )
+            .expect_err("non-probit marginal-slope link should be rejected");
+            assert!(
+                err.contains("requires link(type=probit)"),
+                "unexpected error for {formula}: {err}"
+            );
         }
     }
 

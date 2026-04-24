@@ -4,6 +4,30 @@ use std::ops::{Deref, DerefMut};
 
 pub use crate::hull::PeeledHull;
 
+/// Shared default for monotone wiggle/deviation blocks. Formula DSL defaults,
+/// workflow configs, and runtime deviation blocks should all derive from this
+/// type so reproducible presets do not drift across layers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WigglePenaltyConfig {
+    pub degree: usize,
+    pub num_internal_knots: usize,
+    pub penalty_orders: Vec<usize>,
+    pub double_penalty: bool,
+    pub monotonicity_eps: f64,
+}
+
+impl WigglePenaltyConfig {
+    pub fn cubic_triple_operator_default() -> Self {
+        Self {
+            degree: 3,
+            num_internal_knots: 8,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: true,
+            monotonicity_eps: 1e-4,
+        }
+    }
+}
+
 /// Shared engine-level link selector for generalized models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkFunction {

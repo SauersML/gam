@@ -1,5 +1,5 @@
 use gam::estimate::{
-    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
     optimize_external_design,
 };
 use gam::smooth::BlockwisePenalty;
@@ -68,7 +68,7 @@ fn analytic_gradient_sign_matches_localcost_trend() {
     let offset = Array1::<f64>::zeros(y.len());
     let opts = default_logit_opts();
 
-    let (analytic, _) = evaluate_externalgradients(
+    let analytic = evaluate_externalgradient(
         y.view(),
         w.view(),
         x.view(),
@@ -173,7 +173,7 @@ fn gradient_components_remain_finite_across_rho_sweep() {
     let offset = Array1::<f64>::zeros(y.len());
     let opts = default_logit_opts();
     for rho in [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
-        let (analytic, fd) = evaluate_externalgradients(
+        let analytic = evaluate_externalgradient(
             y.view(),
             w.view(),
             x.view(),
@@ -187,7 +187,6 @@ fn gradient_components_remain_finite_across_rho_sweep() {
             analytic[0].is_finite(),
             "analytic gradient non-finite at rho={rho}"
         );
-        assert!(fd[0].is_finite(), "fd gradient non-finite at rho={rho}");
     }
 }
 

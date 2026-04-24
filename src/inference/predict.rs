@@ -1336,30 +1336,14 @@ impl BernoulliMarginalSlopePredictor {
         // through unwarped and the observed probit index has the closed form
         //   η_obs = q·√(1 + (s b)²) + s b·z,  s = 1/√(1+σ²).
         //
-        // For the Probit base link the marginal-slope map is the identity on
-        // η_marg (i.e. q ≡ η_marg and q1 ≡ 1 analytically), but the numerical
-        // round-trip through Φ→clamp→Φ⁻¹ inside `bernoulli_marginal_link_map`
-        // drops accuracy to ~1e-9 because statrs' normal quantile is a rational
-        // approximation.  For non-probit links q really differs from η_marg
-        // and the round-trip is the only way to evaluate it.  The special-case
-        // below preserves bit-exact closed-form behavior for probit while the
-        // general formula still carries the non-trivial q/q1 factors for the
-        // other base links.
+        // The marginal-slope policy is probit-only, so q is exactly η_marg
+        // on the rigid path. Avoiding the Φ→clamp→Φ⁻¹ round trip preserves
+        // bit-exact closed-form behavior.
         if !flex_active {
-            let probit_base_link = matches!(
-                self.base_link,
-                InverseLink::Standard(crate::types::LinkFunction::Probit)
-            );
             let sb_vec = logslope_eta.mapv(|b| scale * b);
             let c_vec = sb_vec.mapv(|sb| (1.0 + sb * sb).sqrt());
-            let final_eta_internal = Array1::from_iter((0..n).map(|i| {
-                let q_value = if probit_base_link {
-                    marginal_eta[i]
-                } else {
-                    marginal_map[i].q
-                };
-                c_vec[i] * q_value + sb_vec[i] * z[i]
-            }));
+            let final_eta_internal =
+                Array1::from_iter((0..n).map(|i| c_vec[i] * marginal_eta[i] + sb_vec[i] * z[i]));
 
             if !need_gradient {
                 return self.transform_internal_eta_to_base_scale(final_eta_internal, None);
@@ -1377,20 +1361,10 @@ impl BernoulliMarginalSlopePredictor {
                     let i = start + li;
                     let c = c_vec[i];
                     let b = logslope_eta[i];
-                    let q_value = if probit_base_link {
-                        marginal_eta[i]
-                    } else {
-                        marginal_map[i].q
-                    };
-                    let g_scale = q_value * (scale * scale) * b / c + scale * z[i];
-                    let q_factor = if probit_base_link {
-                        c
-                    } else {
-                        c * marginal_map[i].q1
-                    };
+                    let g_scale = marginal_eta[i] * (scale * scale) * b / c + scale * z[i];
                     let mut row = grad_internal.row_mut(i);
                     for j in 0..marginal_dim {
-                        row[j] = q_factor * mc[[li, j]];
+                        row[j] = c * mc[[li, j]];
                     }
                     for j in 0..logslope_dim {
                         row[logslope_offset + j] = g_scale * lc[[li, j]];
