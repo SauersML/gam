@@ -10,7 +10,7 @@ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
 };
-use rayon::iter::IndexedParallelIterator;
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -561,12 +561,10 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         Ok(out)
     }
 
-    /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
-    /// `try_row_chunk(...)?` to propagate materialization errors.
-    // TODO(material-policy-migration): replace call sites with try_row_chunk
+    /// Extract a dense row chunk.
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         self.try_row_chunk(rows)
-            .expect("DenseDesignOperator::row_chunk (legacy; migrate to try_row_chunk)")
+            .expect("DenseDesignOperator::row_chunk failed")
     }
 
     /// Borrow dense storage when this operator already owns it.
@@ -2672,10 +2670,10 @@ where
 
 impl<F> SpatialKernelEvaluator for Arc<F>
 where
-    F: SpatialKernelEvaluator + ?Sized,
+    F: Fn(&[f64], &[f64]) -> f64 + Send + Sync + 'static + ?Sized,
 {
     fn eval(&self, x: &[f64], c: &[f64]) -> f64 {
-        self.as_ref().eval(x, c)
+        self.as_ref()(x, c)
     }
 }
 
@@ -2892,6 +2890,11 @@ impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOpera
         out.assign(&self.row_chunk_combined(rows));
         Ok(())
     }
+
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.row_chunk_combined(rows)
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         self.row_chunk_combined(0..self.n)
     }
@@ -6099,9 +6102,8 @@ mod tests {
     fn chunked_kernel_operator_uses_center_rows_for_column_count() {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
-        let kernel = |x: &[f64], c: &[f64]| {
-            x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>()
-        };
+        let kernel =
+            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
         let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
             .expect("chunked kernel operator");
 
@@ -6164,9 +6166,8 @@ mod tests {
         assert!(!data.is_standard_layout());
         assert!(!centers.is_standard_layout());
 
-        let kernel = |x: &[f64], c: &[f64]| {
-            x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>()
-        };
+        let kernel =
+            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
         let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
             .expect("chunked kernel operator");
         let chunk = operator.row_chunk_combined(0..2);
@@ -6214,8 +6215,13 @@ mod tests {
         }
 
         impl DenseDesignOperator for NoDensifyOperator {
-            fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-                self.dense.slice(s![rows, ..]).to_owned()
+            fn row_chunk_into(
+                &self,
+                rows: Range<usize>,
+                mut out: ArrayViewMut2<'_, f64>,
+            ) -> Result<(), MatrixMaterializationError> {
+                out.assign(&self.dense.slice(s![rows, ..]));
+                Ok(())
             }
 
             fn to_dense(&self) -> Array2<f64> {
