@@ -1,4 +1,5 @@
 use csv::StringRecord;
+use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, DeviationRuntime};
 use gam::estimate::{BlockRole, PredictInput};
 use gam::families::family_meta::{family_to_link, pretty_familyname};
 use gam::inference::data::{
@@ -7,11 +8,20 @@ use gam::inference::data::{
 };
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    PredictModelClass,
+    PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
 };
+use gam::matrix::DesignMatrix;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
-use gam::smooth::{SmoothBasisSpec, TermCollectionSpec, build_term_collection_design};
-use gam::types::{LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState};
+use gam::smooth::{
+    SmoothBasisSpec, TermCollectionSpec, build_term_collection_design,
+    freeze_term_collection_from_design,
+};
+use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
+use gam::transformation_normal::TransformationNormalFitResult;
+use gam::types::{
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState,
+    SasLinkState,
+};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -28,6 +38,37 @@ struct PyFitConfig {
     offset: Option<String>,
     weights: Option<String>,
     ridge_lambda: Option<f64>,
+
+    // Transformation-normal routing.
+    transformation_normal: Option<bool>,
+
+    // Survival-specific.
+    survival_likelihood: Option<String>,
+    baseline_target: Option<String>,
+    baseline_scale: Option<f64>,
+    baseline_shape: Option<f64>,
+    baseline_rate: Option<f64>,
+    baseline_makeham: Option<f64>,
+
+    // Marginal-slope.
+    z_column: Option<String>,
+    logslope_formula: Option<String>,
+
+    // Link / flexibility.
+    link: Option<String>,
+    flexible_link: Option<bool>,
+    scale_dimensions: Option<bool>,
+
+    // Location-scale (GAMLSS).
+    noise_formula: Option<String>,
+    noise_offset: Option<String>,
+
+    // CLI-only flags retained for future plumbing. The underlying workflow
+    // does not currently honour these, but accepting them (and returning a
+    // clear error when set) keeps the surface explicit.
+    disable_link_dev: Option<bool>,
+    disable_score_warp: Option<bool>,
+    firth: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -437,6 +478,85 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     fit_config.weight_column = py_config.weights;
     if let Some(ridge_lambda) = py_config.ridge_lambda {
         fit_config.ridge_lambda = ridge_lambda;
+    }
+    if let Some(flag) = py_config.transformation_normal {
+        fit_config.transformation_normal = flag;
+    }
+    if let Some(mode) = py_config.survival_likelihood {
+        let trimmed = mode.trim();
+        if trimmed.is_empty() {
+            return Err("survival_likelihood must be a non-empty string".to_string());
+        }
+        fit_config.survival_likelihood = trimmed.to_string();
+    }
+    if let Some(target) = py_config.baseline_target {
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            return Err("baseline_target must be a non-empty string".to_string());
+        }
+        fit_config.baseline_target = trimmed.to_string();
+    }
+    if let Some(value) = py_config.baseline_scale {
+        fit_config.baseline_scale = Some(value);
+    }
+    if let Some(value) = py_config.baseline_shape {
+        fit_config.baseline_shape = Some(value);
+    }
+    if let Some(value) = py_config.baseline_rate {
+        fit_config.baseline_rate = Some(value);
+    }
+    if let Some(value) = py_config.baseline_makeham {
+        fit_config.baseline_makeham = Some(value);
+    }
+    if let Some(z) = py_config.z_column {
+        let trimmed = z.trim();
+        if trimmed.is_empty() {
+            return Err("z_column must be a non-empty string".to_string());
+        }
+        fit_config.z_column = Some(trimmed.to_string());
+    }
+    if let Some(formula) = py_config.logslope_formula {
+        fit_config.logslope_formula = Some(formula);
+    }
+    if let Some(link) = py_config.link {
+        let trimmed = link.trim();
+        fit_config.link = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(flag) = py_config.flexible_link {
+        fit_config.flexible_link = flag;
+    }
+    if let Some(flag) = py_config.scale_dimensions {
+        fit_config.scale_dimensions = flag;
+    }
+    if let Some(formula) = py_config.noise_formula {
+        fit_config.noise_formula = Some(formula);
+    }
+    if let Some(column) = py_config.noise_offset {
+        fit_config.noise_offset_column = Some(column);
+    }
+    // CLI-only flags: workflow does not honour these in its current form;
+    // return a clear error if the caller tries to set them so we never
+    // silently drop meaningful configuration.
+    if py_config.disable_link_dev.unwrap_or(false) {
+        return Err(
+            "disable_link_dev is not yet plumbed through the Python FFI; drop the linkwiggle(...) term from the main formula instead"
+                .to_string(),
+        );
+    }
+    if py_config.disable_score_warp.unwrap_or(false) {
+        return Err(
+            "disable_score_warp is not yet plumbed through the Python FFI; drop the linkwiggle(...) term from the logslope formula instead"
+                .to_string(),
+        );
+    }
+    if py_config.firth.unwrap_or(false) {
+        return Err(
+            "firth bias reduction is not yet plumbed through the Python FFI".to_string(),
+        );
     }
     Ok(fit_config)
 }
