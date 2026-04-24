@@ -16,11 +16,6 @@ const TK_MAX_OBSERVATIONS: usize = 20_000;
 const TK_MAX_COEFFICIENTS: usize = 2_000;
 const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
-#[inline]
-fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
-    !matches!(mode, super::unified::EvalMode::ValueOnly)
-}
-
 struct TkCorrectionTerms {
     value: f64,
     gradient: Option<Array1<f64>>,
@@ -272,12 +267,10 @@ impl<'a> RemlState<'a> {
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
         penalty_coords: Option<&[&super::unified::PenaltyCoordinate]>,
-        psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
-        let ext_dim = psi_dirs.map_or(0, <[TkPsiDirection]>::len);
         let xt = x_dense.t();
 
         // Hat leverages
@@ -388,7 +381,7 @@ impl<'a> RemlState<'a> {
             lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
         }
 
-        let mut gradient = Array1::<f64>::zeros(k + ext_dim);
+        let mut gradient = Array1::<f64>::zeros(k);
         for idx in 0..k {
             let trace_ak_p = if let Some(coords) = penalty_coords {
                 coords[idx].trace_with_dense(&p_total, lambdas[idx])
@@ -405,66 +398,6 @@ impl<'a> RemlState<'a> {
             };
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p + correction_trace;
-        }
-
-        if let Some(psi_dirs) = psi_dirs {
-            let mut b_z_t = Array2::<f64>::zeros((n, p));
-            for i in 0..n {
-                let diag_coeff = -0.25 * d_array[i] * h_diag[i] + 0.25 * c_array[i] * x_y[i];
-                let t2_coeff = 0.125 * m_vec[i];
-                for a in 0..p {
-                    b_z_t[[i, a]] += diag_coeff * z[[a, i]] + t2_coeff * y[a];
-                }
-            }
-            for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-                let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-                let z_block_j = z.slice(s![.., j0..j1]);
-                let c_j = c_array.slice(s![j0..j1]);
-                for i0 in (0..n).step_by(TK_BLOCK_SIZE) {
-                    let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                    let x_block_i = x_dense.slice(s![i0..i1, ..]);
-                    let c_i = c_array.slice(s![i0..i1]);
-                    let gram = x_block_i.dot(&z_block_j.to_owned());
-                    for bi in 0..(i1 - i0) {
-                        let ci = c_i[bi];
-                        if ci == 0.0 {
-                            continue;
-                        }
-                        let row = i0 + bi;
-                        for bj in 0..(j1 - j0) {
-                            let cj = c_j[bj];
-                            if cj == 0.0 {
-                                continue;
-                            }
-                            let gij = gram[[bi, bj]];
-                            let coeff = 0.25 * ci * cj * gij * gij;
-                            if coeff == 0.0 {
-                                continue;
-                            }
-                            let col = j0 + bj;
-                            for a in 0..p {
-                                b_z_t[[row, a]] += coeff * z[[a, col]];
-                            }
-                        }
-                    }
-                }
-            }
-            for (j, dir) in psi_dirs.iter().enumerate() {
-                if dir.h_dot.nrows() != p
-                    || dir.h_dot.ncols() != p
-                    || dir.x_tau.nrows() != n
-                    || dir.x_tau.ncols() != p
-                {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "Tierney-Kadane psi direction {j} shape mismatch: Hdot={}x{}, Xtau={}x{}, expected Hdot={p}x{p}, Xtau={n}x{p}",
-                        dir.h_dot.nrows(),
-                        dir.h_dot.ncols(),
-                        dir.x_tau.nrows(),
-                        dir.x_tau.ncols()
-                    )));
-                }
-                gradient[k + j] = (&dir.h_dot * &p_total).sum() + 2.0 * (&dir.x_tau * &b_z_t).sum();
-            }
         }
 
         for g in gradient.iter_mut() {
@@ -488,7 +421,6 @@ impl<'a> RemlState<'a> {
         beta: &Array1<f64>,
         compute_gradient: bool,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-        psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         let p = x_dense.ncols();
         let k = tk_penalties.len();
@@ -537,7 +469,6 @@ impl<'a> RemlState<'a> {
             &x_vks,
             h_inv_solve,
             None,
-            psi_dirs,
         )?;
 
         Ok(TkCorrectionTerms {
@@ -574,7 +505,7 @@ impl<'a> RemlState<'a> {
                 d_array[idx]
             )));
         }
-        let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
+        let compute_gradient = !matches!(mode, super::unified::EvalMode::ValueOnly);
         let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
         if compute_hessian {
             return Err(EstimationError::InvalidInput(
@@ -586,10 +517,11 @@ impl<'a> RemlState<'a> {
                 "Tierney-Kadane psi gradients require analytic derivatives; production finite-difference stencils are disabled".to_string(),
             ));
         }
+
         if c_array.is_empty() || d_array.is_empty() {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
-                gradient: if mode != super::unified::EvalMode::ValueOnly {
+                gradient: if compute_gradient {
                     Some(Array1::zeros(rho.len()))
                 } else {
                     None
@@ -3217,22 +3149,22 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.assemble_and_evaluate_with_psi_coords(rho, bundle, mode, assembly, 0)
+        self.assemble_and_evaluate_with_tk_psi_dirs(rho, bundle, mode, assembly, None)
     }
 
-    fn assemble_and_evaluate_with_psi_coords(
+    fn assemble_and_evaluate_with_tk_psi_dirs(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
-        psi_coord_count: usize,
+        tk_psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, psi_coord_count)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, tk_psi_dirs)?;
         Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
@@ -3304,7 +3236,7 @@ impl<'a> RemlState<'a> {
         };
 
         let tk_terms =
-            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly, 0)?;
+            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly, None)?;
         Ok(self.apply_tk_cost_to_efs(efs_eval, tk_terms.value))
     }
 
@@ -3350,6 +3282,105 @@ impl<'a> RemlState<'a> {
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
+    }
+
+    fn build_tk_psi_directions(
+        &self,
+        bundle: &EvalShared,
+        ext_coords: &[super::unified::HyperCoord],
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<Vec<TkPsiDirection>, EstimationError> {
+        if ext_coords.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ext_coords.len() != hyper_dirs.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "TK psi direction count mismatch: ext_coords={}, hyper_dirs={}",
+                ext_coords.len(),
+                hyper_dirs.len()
+            )));
+        }
+        let pirls_result = bundle.pirls_result.as_ref();
+        let free_basis = self.active_constraint_free_basis(pirls_result);
+        let h_eff = if let Some(z) = free_basis.as_ref() {
+            Self::projectwith_basis(bundle.h_eff.as_ref(), z)
+        } else {
+            bundle.h_eff.as_ref().clone()
+        };
+        let chol = h_eff.cholesky(Side::Lower).map_err(|_| {
+            EstimationError::InvalidInput(
+                "Tierney-Kadane psi gradients require a positive definite effective Hessian"
+                    .to_string(),
+            )
+        })?;
+        let x_base = pirls_result.x_transformed.to_dense();
+        let x_eff = if let Some(z) = free_basis.as_ref() {
+            x_base.dot(z)
+        } else {
+            x_base
+        };
+        let n = x_eff.nrows();
+        let p = x_eff.ncols();
+        let c_array = &pirls_result.solve_c_array;
+        let rotate_original_to_transformed =
+            matches!(
+                pirls_result.coordinate_frame,
+                pirls::PirlsCoordinateFrame::TransformedQs
+            ) && self.active_constraint_free_basis(pirls_result).is_none();
+        let qs = &pirls_result.reparam_result.qs;
+        let mut out = Vec::with_capacity(ext_coords.len());
+        for (coord_idx, coord) in ext_coords.iter().enumerate() {
+            let mut g = coord.g.clone();
+            let mut b = coord.drift.materialize();
+            let base_cols = if rotate_original_to_transformed {
+                qs.nrows()
+            } else if let Some(z) = free_basis.as_ref() {
+                z.nrows()
+            } else {
+                p
+            };
+            let mut x_tau = if hyper_dirs[coord_idx].x_tau_original.any_nonzero() {
+                hyper_dirs[coord_idx].x_tau_original.materialize()
+            } else {
+                Array2::<f64>::zeros((n, base_cols))
+            };
+            if rotate_original_to_transformed {
+                g = qs.t().dot(&g);
+                b = qs.t().dot(&b).dot(qs);
+                x_tau = x_tau.dot(qs);
+            }
+            if let Some(z) = free_basis.as_ref() {
+                g = z.t().dot(&g);
+                b = z.t().dot(&b).dot(z);
+                x_tau = x_tau.dot(z);
+            }
+            if g.len() != p
+                || b.nrows() != p
+                || b.ncols() != p
+                || x_tau.nrows() != n
+                || x_tau.ncols() != p
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "TK psi direction {coord_idx} shape mismatch after basis alignment: g={}, B={}x{}, X_tau={}x{}, expected p={p}, n={n}",
+                    g.len(),
+                    b.nrows(),
+                    b.ncols(),
+                    x_tau.nrows(),
+                    x_tau.ncols()
+                )));
+            }
+            let v_psi = chol.solvevec(&g);
+            let x_v = x_eff.dot(&v_psi);
+            let mut weights = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                weights[i] = c_array[i] * x_v[i];
+            }
+            let weighted_x = x_eff.clone() * &weights.view().insert_axis(Axis(1));
+            let mut h_dot = b;
+            h_dot += &x_eff.t().dot(&weighted_x);
+            out.push(TkPsiDirection { h_dot, x_tau });
+        }
+        Ok(out)
     }
 
     /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
@@ -3419,10 +3450,10 @@ impl<'a> RemlState<'a> {
             };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-        let psi_coord_count = if !matches!(mode, super::unified::EvalMode::ValueOnly) {
-            ext_coords.len()
+        let tk_psi_dirs = if compute_gradient_for_tk(mode) && !ext_coords.is_empty() {
+            Some(self.build_tk_psi_directions(&bundle, &ext_coords, hyper_dirs)?)
         } else {
-            0
+            None
         };
 
         let t2 = std::time::Instant::now();
@@ -3431,12 +3462,12 @@ impl<'a> RemlState<'a> {
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
         assembly.fixed_drift_deriv = fixed_drift_deriv;
-        let result = self.assemble_and_evaluate_with_psi_coords(
+        let result = self.assemble_and_evaluate_with_tk_psi_dirs(
             rho,
             &bundle,
             mode,
             assembly,
-            psi_coord_count,
+            tk_psi_dirs.as_deref(),
         );
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
