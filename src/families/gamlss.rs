@@ -4948,7 +4948,6 @@ fn gaussian_joint_psisecondhessian_fromweights(
     weights_j: &GaussianJointPsiFirstWeights,
     secondweights: &GaussianJointPsiSecondWeights,
 ) -> Result<Array2<f64>, String> {
-    let policy = crate::resource::ResourcePolicy::default_library();
     // Exploit transpose symmetry: X_a^T D X_b and X_b^T D X_a are transposes.
     // For each such pair in the symmetric blocks (hmumu, h_ls_ls), compute one
     // and add its transpose, halving the number of O(np²) products.
@@ -4956,20 +4955,17 @@ fn gaussian_joint_psisecondhessian_fromweights(
         xmu_ab,
         weights_i.hmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let a_ij_mu = weighted_crossprod_psi_maps(xmu_i, weights_i.hmumu.view(), xmu_j)?;
     let a_iwj_mu = weighted_crossprod_psi_maps(
         xmu_i,
         weights_j.dhmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let a_jwi_mu = weighted_crossprod_psi_maps(
         xmu_j,
         weights_i.dhmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
-        &policy,
     )?;
     let hmumu = &a_ab_mu
         + &a_ab_mu.t()
@@ -4984,52 +4980,44 @@ fn gaussian_joint_psisecondhessian_fromweights(
         xmu_ab,
         weights_i.hmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )? + &weighted_crossprod_psi_maps(xmu_i, weights_i.hmu_ls.view(), x_ls_j)?
         + &weighted_crossprod_psi_maps(xmu_j, weights_i.hmu_ls.view(), x_ls_i)?
         + &weighted_crossprod_psi_maps(
             xmu_i,
             weights_j.dhmu_ls.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?
         + &weighted_crossprod_psi_maps(
             xmu_j,
             weights_i.dhmu_ls.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_i.dhmu_ls.view(),
             x_ls_j,
-            &policy,
         )?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_j.dhmu_ls.view(),
             x_ls_i,
-            &policy,
         )?
         + &xt_diag_y_dense(xmu, &secondweights.d2hmu_ls, x_ls)?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_i.hmu_ls.view(),
             x_ls_ab,
-            &policy,
         )?;
     let a_ab_ls = weighted_crossprod_psi_maps(
         x_ls_ab,
         weights_i.h_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
     let a_ij_ls = weighted_crossprod_psi_maps(x_ls_i, weights_i.h_ls_ls.view(), x_ls_j)?;
     let a_iwj_ls = weighted_crossprod_psi_maps(
         x_ls_i,
         weights_j.dh_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        &policy,
     )?;
     let a_jwi_ls = weighted_crossprod_psi_maps(
         x_ls_j,
@@ -5202,28 +5190,6 @@ impl GaussianLocationScaleFamily {
         }
         Ok(None)
     }
-
-    /// Operator-preserving views of the mu / log-sigma block designs.
-    /// Prefer this over `exact_joint_dense_block_designs` for shape-only or
-    /// chunked work; only force a `Cow<Array2>` when a downstream API still
-    /// requires `&Array2<f64>`.
-    pub(crate) fn mu_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleFamily exact path is missing mu design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(mu_design))
-    }
-
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(log_sigma_design))
-    }
-
-    // TODO(block-view-migration): prefer `mu_design_view()` / `log_sigma_design_view()`
-    // returning `BlockDesignView<'_>`. This Cow-returning helper forces an n×p
-    // dense materialization on the operator branch.
     fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
@@ -6752,28 +6718,6 @@ impl GaussianLocationScaleWiggleFamily {
             &self.weights,
         )?))
     }
-
-    /// Operator-preserving views of the mu / log-sigma block designs.
-    /// Prefer this over `dense_block_designs` for shape-only or chunked work;
-    /// only force a `Cow<Array2>` when a downstream API still requires
-    /// `&Array2<f64>`.
-    pub(crate) fn mu_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(mu_design))
-    }
-
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(log_sigma_design))
-    }
-
-    // TODO(block-view-migration): prefer `mu_design_view()` / `log_sigma_design_view()`
-    // returning `BlockDesignView<'_>`. This Cow-returning helper forces an n×p
-    // dense materialization on the operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let mu_design = self.mu_design.as_ref().ok_or_else(|| {
             "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
@@ -6791,10 +6735,6 @@ impl GaussianLocationScaleWiggleFamily {
         };
         Ok((xmu, x_ls))
     }
-
-    // TODO(block-view-migration): prefer `BlockDesignView::from_design(&specs[i].design)`
-    // for shape/chunked access; force the Cow only when handing off to
-    // `&Array2<f64>` consumers.
     fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
@@ -7629,25 +7569,21 @@ impl GaussianLocationScaleWiggleFamily {
         let l_b = 2.0 * &dm_b;
         let l_ab = 2.0 * &dm_ab;
 
-        let policy = crate::resource::ResourcePolicy::default_library();
         let hmm_ab = weighted_crossprod_psi_maps(
             xmu_ab_map,
             coeff_mm.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
-        let hmm_ij = weighted_crossprod_psi_maps(xmu_a_map, coeff_mm.view(), xmu_b_map )?;
+        let hmm_ij = weighted_crossprod_psi_maps(xmu_a_map, coeff_mm.view(), xmu_b_map)?;
         let hmm_iwj = weighted_crossprod_psi_maps(
             xmu_a_map,
             coeff_mm_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
         let hmm_jwi = weighted_crossprod_psi_maps(
             xmu_b_map,
             coeff_mm_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
-            &policy,
         )?;
         let h_mm = &hmm_ab
             + &hmm_ab.t()
@@ -7662,52 +7598,44 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_ab_map,
             coeff_ml.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
-        )? + &weighted_crossprod_psi_maps(xmu_a_map, coeff_ml.view(), x_ls_b_map )?
-            + &weighted_crossprod_psi_maps(xmu_b_map, coeff_ml.view(), x_ls_a_map )?
+        )? + &weighted_crossprod_psi_maps(xmu_a_map, coeff_ml.view(), x_ls_b_map)?
+            + &weighted_crossprod_psi_maps(xmu_b_map, coeff_ml.view(), x_ls_a_map)?
             + &weighted_crossprod_psi_maps(
                 xmu_a_map,
                 coeff_ml_b.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 xmu_b_map,
                 coeff_ml_a.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml_a.view(),
                 x_ls_b_map,
-                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml_b.view(),
                 x_ls_a_map,
-                &policy,
             )?
             + &xt_diag_y_dense(xmu, &coeff_ml_ab, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml.view(),
                 x_ls_ab_map,
-                &policy,
             )?;
         let hll_ab = weighted_crossprod_psi_maps(
             x_ls_ab_map,
             coeff_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
-        let hll_ij = weighted_crossprod_psi_maps(x_ls_a_map, coeff_ll.view(), x_ls_b_map )?;
+        let hll_ij = weighted_crossprod_psi_maps(x_ls_a_map, coeff_ll.view(), x_ls_b_map)?;
         let hll_iwj = weighted_crossprod_psi_maps(
             x_ls_a_map,
             coeff_ll_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-            &policy,
         )?;
         let hll_jwi = weighted_crossprod_psi_maps(
             x_ls_b_map,
@@ -10211,27 +10139,6 @@ impl BinomialLocationScaleFamily {
     fn exact_joint_supported(&self) -> bool {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
-
-    /// Operator-preserving views of the threshold / log-sigma block designs.
-    /// Prefer this over `dense_block_designs` for shape-only or chunked work;
-    /// only force a `Cow<Array2>` when a downstream API still requires
-    /// `&Array2<f64>`.
-    pub(crate) fn threshold_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(threshold_design))
-    }
-
-    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        Ok(BlockDesignView::from_design(log_sigma_design))
-    }
-
-    // TODO(block-view-migration): prefer `threshold_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
     // Cow-returning helper forces an n×p dense materialization on the
     // operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
@@ -10251,10 +10158,6 @@ impl BinomialLocationScaleFamily {
         };
         Ok((xt, x_ls))
     }
-
-    // TODO(block-view-migration): prefer `BlockDesignView::from_design(&specs[i].design)`
-    // for shape/chunked access; force the Cow only when handing off to
-    // `&Array2<f64>` consumers.
     fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
@@ -11553,7 +11456,6 @@ impl BinomialLocationScaleFamily {
                 + x_ls.t().dot(&d2r_ls)),
         );
 
-        let policy = crate::resource::ResourcePolicy::default_library();
         let h_tt_block = weighted_crossprod_psi_maps(
             x_t_ab_map,
             h_tt.view(),
