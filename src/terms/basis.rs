@@ -9771,9 +9771,9 @@ pub fn build_matern_basiswithworkspace(
             None
         };
         let design = if let Some(eta) = aniso.as_ref() {
-            let metric_weights = eta.mapv(|v| (2.0 * v).exp()).to_vec();
+            let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let mut q = 0.0;
+                let mut q = 0.0f64;
                 for axis in 0..data_row.len() {
                     let delta = data_row[axis] - center_row[axis];
                     q += metric_weights[axis] * delta * delta;
@@ -13031,10 +13031,10 @@ pub fn build_duchon_basiswithworkspace(
         };
         let poly_block = polynomial_block_from_order(data, effective_nullspace_order);
         let base_design = if let Some(eta) = aniso.as_ref() {
-            let metric_weights = eta.mapv(|v| (2.0 * v).exp()).to_vec();
+            let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let coeffs = coeffs.clone();
             let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let mut q = 0.0;
+                let mut q = 0.0f64;
                 for axis in 0..data_row.len() {
                     let delta = data_row[axis] - center_row[axis];
                     q += metric_weights[axis] * delta * delta;
@@ -13289,9 +13289,10 @@ fn polynomial_hessian_operator_block(
     order: DuchonNullspaceOrder,
 ) -> Array2<f64> {
     match order {
-        DuchonNullspaceOrder::Zero | DuchonNullspaceOrder::Linear => {
-            Array2::<f64>::zeros((points.nrows() * points.ncols() * points.ncols(), polynomial_block_from_order(points, order).ncols()))
-        }
+        DuchonNullspaceOrder::Zero | DuchonNullspaceOrder::Linear => Array2::<f64>::zeros((
+            points.nrows() * points.ncols() * points.ncols(),
+            polynomial_block_from_order(points, order).ncols(),
+        )),
         DuchonNullspaceOrder::Degree(degree) => monomial_hessian_operator_block(points, degree),
     }
 }
@@ -15819,6 +15820,20 @@ mod tests {
         let kappa = psi.exp();
         let t = kappa * D::from(r);
         (psi * D::from(eta + 2.0)).exp() * (D::from(2.0 * d) + D::from(4.0 * d + 8.0) * t * t)
+    }
+
+    #[test]
+    fn polynomial_hessian_operator_penalizes_trace_free_curvature() {
+        let points = array![[0.0, 0.0]];
+        let hessian = monomial_hessian_operator_block(points.view(), 2);
+        let beta = array![0.0, 0.0, 0.0, 1.0, 0.0, -1.0];
+        let signal = hessian.dot(&beta);
+        let frobenius_sq = signal.iter().map(|value| value * value).sum::<f64>();
+        let laplacian = signal[0] + signal[3];
+
+        assert_eq!(signal.to_vec(), vec![2.0, 0.0, 0.0, -2.0]);
+        assert_eq!(laplacian, 0.0);
+        assert_eq!(frobenius_sq, 8.0);
     }
 
     /// Independent recursive implementation of B-spline basis function evaluation.
