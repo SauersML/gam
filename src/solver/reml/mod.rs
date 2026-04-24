@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_computes_penalty_only_tk_psi_gradient() {
+    fn firth_logit_directional_hypergradient_rejects_penalty_only_without_full_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1145,13 +1145,20 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect("Firth penalty-only directional gradient should be available");
-        assert!(gradient.is_finite());
+        let err = single_directional_tau_gradient(&state, &rho, hyper).expect_err(
+            "Firth penalty-only directional gradient must reject incomplete TK psi calculus",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected penalty-only directional-gradient error: {msg}"
+        );
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_computes_design_moving_tk_psi_gradient() {
+    fn firth_logit_directional_hypergradient_rejects_design_moving_without_full_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1178,13 +1185,20 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect("Firth design-moving directional gradient should be available");
-        assert!(gradient.is_finite());
+        let err = single_directional_tau_gradient(&state, &rho, hyper).expect_err(
+            "Firth design-moving directional gradient must reject incomplete TK psi calculus",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected design-moving directional-gradient error: {msg}"
+        );
     }
 
     #[test]
-    fn firth_logit_hybrid_efs_uses_unified_tk_psi_gradient() {
+    fn firth_logit_hybrid_efs_rejects_incomplete_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![

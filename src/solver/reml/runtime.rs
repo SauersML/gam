@@ -462,7 +462,6 @@ impl<'a> RemlState<'a> {
             h_inv_solve,
             None,
         )?;
-        let gradient = rho_gradient;
         Ok(TkCorrectionTerms {
             value,
             gradient: Some(gradient),
@@ -3127,23 +3126,11 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.assemble_and_evaluate_with_tk_hyper_dirs(rho, bundle, mode, assembly, None)
-    }
-
-    fn assemble_and_evaluate_with_tk_hyper_dirs(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        assembly: super::assembly::InnerAssembly<'static>,
-        tk_hyper_dirs: Option<&[crate::estimate::reml::DirectionalHyperParam]>,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
-        let tk_sources = tk_hyper_dirs.map(|dirs| (assembly.ext_coords.as_slice(), dirs));
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, tk_sources)?;
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
         self.apply_tk_to_result(result, tk_terms)
     }
 
@@ -3155,19 +3142,14 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         assembly: super::assembly::InnerAssembly<'static>,
-        tk_hyper_dirs: Option<&[crate::estimate::reml::DirectionalHyperParam]>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         use super::unified::{compute_efs_update, compute_hybrid_efs_update};
 
         let beta_for_barrier = assembly.beta.clone();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
-        if has_psi
-            && self.config.link_function() != LinkFunction::Identity
-            && tk_hyper_dirs.is_none()
-        {
+        if has_psi && self.config.link_function() != LinkFunction::Identity {
             return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane psi gradients require directional hyperparameter sources"
-                    .to_string(),
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate EFS psi gradients".to_string(),
             ));
         }
         let eval_mode = if has_psi {
@@ -3175,8 +3157,7 @@ impl<'a> RemlState<'a> {
         } else {
             super::unified::EvalMode::ValueOnly
         };
-        let tk_sources = tk_hyper_dirs.map(|dirs| (assembly.ext_coords.as_slice(), dirs));
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, tk_sources)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode)?;
         let inner_solution = assembly.build();
 
         let prior = self.build_prior(rho, eval_mode);
@@ -3353,13 +3334,7 @@ impl<'a> RemlState<'a> {
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
         assembly.fixed_drift_deriv = fixed_drift_deriv;
-        let result = self.assemble_and_evaluate_with_tk_hyper_dirs(
-            rho,
-            &bundle,
-            mode,
-            assembly,
-            (!hyper_dirs.is_empty() && compute_gradient_for_tk(mode)).then_some(hyper_dirs),
-        );
+        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         log::info!(
@@ -3441,7 +3416,7 @@ impl<'a> RemlState<'a> {
             return self.compute_efs_steps(rho);
         }
 
-        self.evaluate_efs(rho, &bundle, ext_coords, Some(hyper_dirs))
+        self.evaluate_efs(rho, &bundle, ext_coords)
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -3770,7 +3745,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         ext_coords: Vec<super::unified::HyperCoord>,
-        tk_hyper_dirs: Option<&[crate::estimate::reml::DirectionalHyperParam]>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         let mut assembly = self.build_auto_assembly(
             rho,
@@ -3780,6 +3754,6 @@ impl<'a> RemlState<'a> {
         )?;
         assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
-        self.assemble_and_evaluate_efs(rho, bundle, assembly, tk_hyper_dirs)
+        self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 }
