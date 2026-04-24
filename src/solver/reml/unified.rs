@@ -2156,13 +2156,32 @@ impl PenaltyCoordinate {
     ) {
         debug_assert_eq!(beta.len(), self.dim());
         debug_assert_eq!(out.len(), self.dim());
+        out.fill(0.0);
+        self.scaled_add_penalty_view(beta, scale, out);
+    }
+
+    pub fn scaled_add_penalty_view(
+        &self,
+        beta: ArrayView1<'_, f64>,
+        scale: f64,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) {
+        debug_assert_eq!(beta.len(), self.dim());
+        debug_assert_eq!(out.len(), self.dim());
+        if scale == 0.0 {
+            return;
+        }
         match self {
             Self::DenseRoot(_) | Self::BlockRoot { .. } => match self {
                 Self::DenseRoot(root) => {
                     let mut root_beta = Array1::<f64>::zeros(root.nrows());
                     dense_matvec_into(root, beta, root_beta.view_mut());
-                    dense_transpose_matvec_into(root, root_beta.view(), out.view_mut());
-                    out.mapv_inplace(|value| scale * value);
+                    dense_transpose_matvec_scaled_add_into(
+                        root,
+                        root_beta.view(),
+                        scale,
+                        out.view_mut(),
+                    );
                 }
                 Self::BlockRoot {
                     root,
@@ -2170,13 +2189,16 @@ impl PenaltyCoordinate {
                     end,
                     total_dim: _,
                 } => {
-                    out.fill(0.0);
                     let beta_block = beta.slice(ndarray::s![*start..*end]);
                     let mut root_beta = Array1::<f64>::zeros(root.nrows());
                     dense_matvec_into(root, beta_block, root_beta.view_mut());
-                    let mut out_block = out.slice_mut(ndarray::s![*start..*end]);
-                    dense_transpose_matvec_into(root, root_beta.view(), out_block.view_mut());
-                    out_block.mapv_inplace(|value| scale * value);
+                    let out_block = out.slice_mut(ndarray::s![*start..*end]);
+                    dense_transpose_matvec_scaled_add_into(
+                        root,
+                        root_beta.view(),
+                        scale,
+                        out_block,
+                    );
                 }
                 _ => unreachable!(),
             },
@@ -2205,7 +2227,6 @@ impl PenaltyCoordinate {
                     "KroneckerMarginal dimension mismatch in apply"
                 );
 
-                out.fill(0.0);
                 for outer in 0..outer_size {
                     for j in 0..q_k {
                         let mu = eigs[j] * scale;
@@ -2215,7 +2236,7 @@ impl PenaltyCoordinate {
                         let base = outer * q_k * stride_k + j * stride_k;
                         for inner in 0..inner_size {
                             let idx = base + inner;
-                            out[idx] = mu * beta[idx];
+                            out[idx] += mu * beta[idx];
                         }
                     }
                 }
@@ -3431,6 +3452,27 @@ fn dense_transpose_matvec_into(
             value += matrix[[row, col]] * x[row];
         }
         out[col] = value;
+    }
+}
+
+#[inline]
+fn dense_transpose_matvec_scaled_add_into(
+    matrix: &Array2<f64>,
+    x: ArrayView1<'_, f64>,
+    scale: f64,
+    mut out: ArrayViewMut1<'_, f64>,
+) {
+    debug_assert_eq!(matrix.nrows(), x.len());
+    debug_assert_eq!(matrix.ncols(), out.len());
+    if scale == 0.0 {
+        return;
+    }
+    for col in 0..matrix.ncols() {
+        let mut value = 0.0;
+        for row in 0..matrix.nrows() {
+            value += matrix[[row, col]] * x[row];
+        }
+        out[col] += scale * value;
     }
 }
 
@@ -5129,15 +5171,8 @@ impl StoredFirstDrift {
         }
     }
 
-    fn scaled_add_apply_with_work(
-        &self,
-        v: ArrayView1<'_, f64>,
-        scale: f64,
-        out: &mut Array1<f64>,
-        work: &mut Array1<f64>,
-    ) {
+    fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
         debug_assert_eq!(v.len(), out.len());
-        debug_assert_eq!(work.len(), out.len());
         if scale == 0.0 {
             return;
         }
@@ -5335,14 +5370,7 @@ impl UnifiedOuterHessianOperator {
         out
     }
 
-    fn scaled_add_pair_rhs(
-        &self,
-        row: usize,
-        col: usize,
-        scale: f64,
-        out: &mut Array1<f64>,
-        work: &mut Array1<f64>,
-    ) {
+    fn scaled_add_pair_rhs(&self, row: usize, col: usize, scale: f64, out: &mut Array1<f64>) {
         if scale == 0.0 {
             return;
         }
@@ -5352,18 +5380,12 @@ impl UnifiedOuterHessianOperator {
 
         match (row_coord.is_ext(), col_coord.is_ext()) {
             (false, false) => {
-                col_coord.total_drift.scaled_add_apply_with_work(
-                    row_coord.v.view(),
-                    scale,
-                    out,
-                    work,
-                );
-                row_coord.base_drift.scaled_add_apply_with_work(
-                    col_coord.v.view(),
-                    scale,
-                    out,
-                    work,
-                );
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), scale, out);
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), scale, out);
                 if let Some(pair_g) = pair_g {
                     out.scaled_add(-scale, pair_g);
                 }
@@ -5372,62 +5394,43 @@ impl UnifiedOuterHessianOperator {
                 if let Some(pair_g) = pair_g {
                     out.scaled_add(scale, pair_g);
                 }
-                row_coord.base_drift.scaled_add_apply_with_work(
-                    col_coord.v.view(),
-                    -scale,
-                    out,
-                    work,
-                );
-                col_coord.total_drift.scaled_add_apply_with_work(
-                    row_coord.v.view(),
-                    -scale,
-                    out,
-                    work,
-                );
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), -scale, out);
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), -scale, out);
             }
             (true, false) => {
                 if let Some(pair_g) = pair_g {
                     out.scaled_add(scale, pair_g);
                 }
-                col_coord.base_drift.scaled_add_apply_with_work(
-                    row_coord.v.view(),
-                    -scale,
-                    out,
-                    work,
-                );
-                row_coord.total_drift.scaled_add_apply_with_work(
-                    col_coord.v.view(),
-                    -scale,
-                    out,
-                    work,
-                );
+                col_coord
+                    .base_drift
+                    .scaled_add_apply(row_coord.v.view(), -scale, out);
+                row_coord
+                    .total_drift
+                    .scaled_add_apply(col_coord.v.view(), -scale, out);
             }
             (true, true) => {
                 if let Some(pair_g) = pair_g {
                     out.scaled_add(scale, pair_g);
                 }
-                row_coord.base_drift.scaled_add_apply_with_work(
-                    col_coord.v.view(),
-                    -scale,
-                    out,
-                    work,
-                );
-                col_coord.total_drift.scaled_add_apply_with_work(
-                    row_coord.v.view(),
-                    -scale,
-                    out,
-                    work,
-                );
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), -scale, out);
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), -scale, out);
             }
         }
     }
 
     fn pair_rhs_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.hop.dim());
-        let mut work = Array1::<f64>::zeros(self.hop.dim());
         for j in 0..alpha.len() {
             if alpha[j] != 0.0 {
-                self.scaled_add_pair_rhs(idx, j, alpha[j], &mut out, &mut work);
+                self.scaled_add_pair_rhs(idx, j, alpha[j], &mut out);
             }
         }
         out
