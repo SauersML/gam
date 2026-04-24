@@ -27,8 +27,8 @@ fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 
 /// coefficients live in the configured moment-anchor nullspace and are mapped
 /// back to these raw coefficients for monotonicity.
 ///
-/// Exact monotonicity of the full transform `x + w(x)` is guaranteed by lower
-/// bounds on every raw I-spline coefficient.
+/// Monotonicity of the full transform `x + w(x)` is enforced by lower bounds
+/// on each span's quadratic Bernstein controls for `w'(x)`.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
     degree: usize,
@@ -170,6 +170,38 @@ fn raw_design_row(
     Ok(out)
 }
 
+fn build_quadratic_derivative_bernstein_constraints(
+    endpoint_points: &Array1<f64>,
+    span_c1: &Array2<f64>,
+    span_c2: &Array2<f64>,
+    span_c3: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let n_spans = endpoint_points.len().saturating_sub(1);
+    let basis_dim = span_c1.ncols();
+    let mut rows = Array2::<f64>::zeros((3 * n_spans, basis_dim));
+    for span_idx in 0..n_spans {
+        let width = endpoint_points[span_idx + 1] - endpoint_points[span_idx];
+        if !width.is_finite() || width <= 0.0 {
+            return Err(format!(
+                "DeviationRuntime monotonicity span {span_idx} has invalid width {width}"
+            ));
+        }
+        let left_row = 3 * span_idx;
+        let mid_row = left_row + 1;
+        let right_row = left_row + 2;
+        for basis_idx in 0..basis_dim {
+            let c1 = span_c1[[span_idx, basis_idx]];
+            let c2 = span_c2[[span_idx, basis_idx]];
+            let c3 = span_c3[[span_idx, basis_idx]];
+            rows[[left_row, basis_idx]] = c1;
+            rows[[mid_row, basis_idx]] = c1 + c2 * width;
+            rows[[right_row, basis_idx]] =
+                c1 + 2.0 * c2 * width + 3.0 * c3 * width * width;
+        }
+    }
+    Ok(rows)
+}
+
 impl DeviationRuntime {
     pub(crate) fn try_new_standard_normal_anchor(
         knots: Array1<f64>,
@@ -269,7 +301,12 @@ impl DeviationRuntime {
         let span_c2 = fast_ab(&raw_span_c2, &coefficient_transform);
         let span_c3 = fast_ab(&raw_span_c3, &coefficient_transform);
         let right_boundary_value_row = raw_right_boundary_value_row.dot(&coefficient_transform);
-        let monotonicity_constraint_rows = coefficient_transform.clone();
+        let monotonicity_constraint_rows = build_quadratic_derivative_bernstein_constraints(
+            &endpoint_points,
+            &span_c1,
+            &span_c2,
+            &span_c3,
+        )?;
 
         Ok(Self {
             degree: 3,
@@ -366,9 +403,9 @@ impl DeviationRuntime {
             }
             let mut span_idx = self.span_index_for(value)?;
             // Bias to the LEFT-hand span at internal breakpoints so the
-            // design / first / second-derivative outputs match
-            // local_cubic_on_span(k) evaluated at its right endpoint; the
-            // piecewise basis is C¹ but not C² across interior breaks.
+            // design / derivative outputs match local_cubic_on_span(k)
+            // evaluated at its right endpoint. The cubic basis is C², but the
+            // third derivative is span-local.
             if span_idx > 0 && value == self.endpoint_points[span_idx] {
                 span_idx -= 1;
             }

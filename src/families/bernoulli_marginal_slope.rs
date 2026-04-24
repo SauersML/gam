@@ -8428,10 +8428,18 @@ mod tests {
             .block_linear_constraints(&block_states, 2, &dummy_spec)
             .expect("link constraint lookup")
             .expect("link constraints");
-        assert_eq!(constraints.a, Array2::<f64>::eye(link_dim));
+        assert_eq!(constraints.a.ncols(), link_dim);
+        assert_eq!(constraints.b.len(), constraints.a.nrows());
+        assert!(
+            constraints.a.nrows() >= link_dim,
+            "anchored link constraints should be expressed in raw derivative-control rows"
+        );
         assert_eq!(
             constraints.b,
-            Array1::<f64>::from_elem(link_dim, prepared.runtime.monotonicity_eps() - 1.0)
+            Array1::<f64>::from_elem(
+                constraints.a.nrows(),
+                prepared.runtime.monotonicity_eps() - 1.0
+            )
         );
     }
 
@@ -8545,10 +8553,18 @@ mod tests {
             .block_linear_constraints(&block_states, 2, &dummy_spec)
             .expect("constraint lookup")
             .expect("score-warp constraints");
-        assert_eq!(constraints.a, Array2::<f64>::eye(score_dim));
+        assert_eq!(constraints.a.ncols(), score_dim);
+        assert_eq!(constraints.b.len(), constraints.a.nrows());
+        assert!(
+            constraints.a.nrows() >= score_dim,
+            "anchored score-warp constraints should be expressed in raw derivative-control rows"
+        );
         assert_eq!(
             constraints.b,
-            Array1::<f64>::from_elem(score_dim, prepared.runtime.monotonicity_eps() - 1.0)
+            Array1::<f64>::from_elem(
+                constraints.a.nrows(),
+                prepared.runtime.monotonicity_eps() - 1.0
+            )
         );
     }
 
@@ -8663,12 +8679,15 @@ mod tests {
             .runtime
             .monotonicity_feasible(&feasible, "feasible structural beta")
             .expect("zero deviation should be feasible");
-        let first_row = constraints.a.row(0).to_owned();
+        let row_idx = (0..constraints.a.nrows())
+            .find(|&idx| constraints.a.row(idx).dot(&constraints.a.row(idx)) > 0.0)
+            .expect("monotonicity constraints should include a nonzero derivative row");
+        let first_row = constraints.a.row(row_idx).to_owned();
         let row_norm_sq = first_row.dot(&first_row);
         assert!(row_norm_sq > 0.0);
-        let scale = (constraints.b[0].abs() + 1.0) / row_norm_sq;
+        let scale = (constraints.b[row_idx].abs() + 1.0) / row_norm_sq;
         let infeasible = first_row.mapv(|value| -scale * value);
-        assert!(constraints.a.row(0).dot(&infeasible) < constraints.b[0]);
+        assert!(constraints.a.row(row_idx).dot(&infeasible) < constraints.b[row_idx]);
         assert!(
             prepared
                 .runtime
@@ -8739,30 +8758,21 @@ mod tests {
 
     #[test]
     fn local_cubic_span_reconstructs_deviation_exactly() {
-        // Score-warp deviation runtime: C¹ piecewise-cubic basis.
+        // Score-warp deviation runtime: C² piecewise-cubic basis.
         //
         // Continuity across interior breakpoints:
         //   value  (d0) — C⁰ continuous (matches on both sides)
         //   slope  (d1) — C¹ continuous (matches on both sides)
-        //   curvature (d2) — NOT continuous in general (basis is only C¹)
+        //   curvature (d2) — C² continuous (matches on both sides)
         //
         // `evaluate_span_polynomial_design` resolves the two-sided ambiguity at
         // an interior breakpoint x == endpoint_points[k] (0 < k < last) by
-        // biasing to the LEFT span (span_idx = k − 1) — see the LEFT-bias
-        // comment at deviation_runtime.rs:186-192.  Therefore the d2 design
-        // row at such a breakpoint reconstructs the polynomial of span k−1
-        // evaluated at its RIGHT endpoint, NOT the polynomial of span k
-        // evaluated at its LEFT endpoint.  At support boundaries (k = 0,
-        // k = last) the one-sided limit is unique.
+        // biasing to the LEFT span (span_idx = k - 1). For a C² cubic this is
+        // numerically the same value through d2; only d3 is span-local.
         //
         // This test reconstructs each span's polynomial from design rows.
-        // For d0/d1 the expected value matches `cubic.evaluate` /
-        // `cubic.first_derivative` on the test span at every sample point
-        // (C¹ continuity).  For d2 the mid-span and boundary-endpoint
-        // expectations also match on-span, but the INTERIOR-LEFT endpoint
-        // (i = 0, span_idx > 0) follows the LEFT-bias convention: the
-        // expected d2 there is the PREVIOUS span's polynomial evaluated at
-        // its right endpoint.
+        // For d0/d1/d2 the expected value matches the selected span at every
+        // sample point.
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_deviation_block_from_seed(
             &seed,
@@ -8799,19 +8809,6 @@ mod tests {
             let expected = value_design.dot(&beta);
             let expected_d1 = d1_design.dot(&beta);
             let expected_d2 = d2_design.dot(&beta);
-            // For d2 only, replace the interior-left expectation with the
-            // LEFT-biased one-sided limit (previous span's d2 at its right
-            // endpoint).  Boundary-left (span_idx == 0) is the unique
-            // support-left one-sided limit and is already consistent with
-            // the test cubic.
-            let mut expected_d2_onesided = expected_d2.clone();
-            if span_idx > 0 {
-                let prev_cubic = prepared
-                    .runtime
-                    .local_cubic_on_span(&beta, span_idx - 1)
-                    .expect("previous span cubic");
-                expected_d2_onesided[0] = prev_cubic.second_derivative(prev_cubic.right);
-            }
             for i in 0..x_eval.len() {
                 let x = x_eval[i];
                 assert!(
@@ -8822,29 +8819,9 @@ mod tests {
                     (cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10,
                     "span {span_idx}, x={x:.6}: cubic first-derivative mismatch"
                 );
-                // At an interior-left breakpoint the design biases LEFT, so
-                // `cubic.second_derivative(left)` (this span's right-sided
-                // limit) is compared against `expected_d2_onesided[0]`
-                // (previous span's left-sided limit, via the design).  For
-                // smooth deviations these agree within a small tolerance;
-                // they are only exactly equal in the degenerate case of a
-                // linear deviation (d2 ≡ 0).  We therefore compare the
-                // design-reconstructed value against the LEFT-biased target,
-                // which equals `prev_cubic.second_derivative(prev.right)` at
-                // the interior-left sample and `cubic.second_derivative(x)`
-                // elsewhere.
-                let cubic_d2_expected = if i == 0 && span_idx > 0 {
-                    let prev_cubic = prepared
-                        .runtime
-                        .local_cubic_on_span(&beta, span_idx - 1)
-                        .expect("previous span cubic for d2 comparison");
-                    prev_cubic.second_derivative(prev_cubic.right)
-                } else {
-                    cubic.second_derivative(x)
-                };
                 assert!(
-                    (cubic_d2_expected - expected_d2_onesided[i]).abs() < 1e-10,
-                    "span {span_idx}, x={x:.6}: cubic second-derivative mismatch (LEFT-biased one-sided d2)"
+                    (cubic.second_derivative(x) - expected_d2[i]).abs() < 1e-10,
+                    "span {span_idx}, x={x:.6}: cubic second-derivative mismatch"
                 );
                 let selected = prepared
                     .runtime
