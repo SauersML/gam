@@ -11878,6 +11878,28 @@ impl ExactJointHyperSetup {
         }
     }
 
+    pub(crate) fn with_auxiliary(
+        mut self,
+        auxiliary0: Array1<f64>,
+        auxiliary_lower: Array1<f64>,
+        auxiliary_upper: Array1<f64>,
+    ) -> Self {
+        assert_eq!(
+            auxiliary0.len(),
+            auxiliary_lower.len(),
+            "auxiliary lower bound length mismatch"
+        );
+        assert_eq!(
+            auxiliary0.len(),
+            auxiliary_upper.len(),
+            "auxiliary upper bound length mismatch"
+        );
+        self.auxiliary0 = Self::sanitize_rho_seed(auxiliary0, &auxiliary_lower, &auxiliary_upper);
+        self.auxiliary_lower = auxiliary_lower;
+        self.auxiliary_upper = auxiliary_upper;
+        self
+    }
+
     pub(crate) fn rho_dim(&self) -> usize {
         self.rho0.len()
     }
