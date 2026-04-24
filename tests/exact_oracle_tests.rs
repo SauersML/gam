@@ -328,4 +328,3 @@ fn test_lamlgradient_firth_exact_formula_ground_truth() {
         "firth-path ground-truth mismatch at rho={rho:.3}: g_laml={g_laml:.6e}, g_exact={g_exact:.6e}, rel={rel_err:.3e}",
     );
 }
-

@@ -10,6 +10,7 @@ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
 };
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -24,6 +25,7 @@ const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const MAX_DENSE_OPERATOR_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
+const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
 /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
 const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
@@ -919,7 +921,6 @@ impl ReparamOperator {
     pub fn qs(&self) -> &Array2<f64> {
         &self.qs
     }
-
 }
 
 impl LinearOperator for ReparamOperator {
@@ -2585,6 +2586,21 @@ impl DenseDesignOperator for TensorProductDesignOperator {
     }
 }
 
+pub trait SpatialKernelEvaluator: Send + Sync + 'static {
+    #[inline(always)]
+    fn eval(&self, x: &[f64], c: &[f64]) -> f64;
+}
+
+impl<F> SpatialKernelEvaluator for F
+where
+    F: Fn(&[f64], &[f64]) -> f64 + Send + Sync + 'static,
+{
+    #[inline(always)]
+    fn eval(&self, x: &[f64], c: &[f64]) -> f64 {
+        self(x, c)
+    }
+}
+
 /// Chunked kernel design operator for spatial smooths (TPS, Matérn, Duchon).
 ///
 /// Instead of storing a dense n × k matrix, evaluates K(data[i], center[j])
@@ -2595,13 +2611,13 @@ impl DenseDesignOperator for TensorProductDesignOperator {
 ///
 /// The optional `constraint_transform` applies a column-space projection Z
 /// such that the effective design is [K * Z | poly] instead of [K | poly].
-pub struct ChunkedKernelDesignOperator {
+pub struct ChunkedKernelDesignOperator<K: SpatialKernelEvaluator> {
     /// Observation data points (n × d).
     data: Arc<Array2<f64>>,
     /// Radial basis centers (k × d).
     centers: Arc<Array2<f64>>,
-    /// Kernel evaluator: (data_row, center_row) → f64
-    kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync>,
+    /// Kernel evaluator: (data_row, center_row) -> f64.
+    kernel: K,
     /// Optional constraint projection (k × k_eff) applied to kernel columns.
     constraint_transform: Option<Arc<Array2<f64>>>,
     /// Optional polynomial basis columns (n × m) appended after kernel columns.
@@ -2610,11 +2626,11 @@ pub struct ChunkedKernelDesignOperator {
     total_cols: usize,
 }
 
-impl ChunkedKernelDesignOperator {
+impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     pub fn new(
         data: Arc<Array2<f64>>,
         centers: Arc<Array2<f64>>,
-        kernel_fn: Arc<dyn Fn(&[f64], &[f64]) -> f64 + Send + Sync>,
+        kernel: K,
         constraint_transform: Option<Arc<Array2<f64>>>,
         poly_basis: Option<Arc<Array2<f64>>>,
     ) -> Result<Self, String> {
@@ -2650,7 +2666,7 @@ impl ChunkedKernelDesignOperator {
         Ok(Self {
             data: Arc::new(data.as_standard_layout().to_owned()),
             centers: Arc::new(centers.as_standard_layout().to_owned()),
-            kernel_fn,
+            kernel,
             constraint_transform,
             poly_basis,
             n,
@@ -2662,22 +2678,31 @@ impl ChunkedKernelDesignOperator {
     fn kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_raw = self.centers.nrows();
-        let mut kernel_block = Array2::<f64>::zeros((chunk_n, k_raw));
-        for (local, global) in rows.clone().enumerate() {
-            let data_row = self.data.row(global);
-            let data_row = data_row
-                .as_slice()
-                .map(Cow::Borrowed)
-                .unwrap_or_else(|| Cow::Owned(data_row.to_vec()));
-            for j in 0..k_raw {
-                let center_row = self.centers.row(j);
-                let center_row = center_row
-                    .as_slice()
-                    .map(Cow::Borrowed)
-                    .unwrap_or_else(|| Cow::Owned(center_row.to_vec()));
-                kernel_block[[local, j]] = (self.kernel_fn)(data_row.as_ref(), center_row.as_ref());
-            }
-        }
+        let dim = self.data.ncols();
+        let data = self
+            .data
+            .as_slice()
+            .expect("ChunkedKernelDesignOperator stores standard-layout data");
+        let centers = self
+            .centers
+            .as_slice()
+            .expect("ChunkedKernelDesignOperator stores standard-layout centers");
+        let kernel = &self.kernel;
+        let mut values = vec![0.0_f64; chunk_n * k_raw];
+        values
+            .par_chunks_mut(k_raw)
+            .enumerate()
+            .for_each(|(local, out_row)| {
+                let global = rows.start + local;
+                let x_start = global * dim;
+                let x = &data[x_start..x_start + dim];
+                for j in 0..k_raw {
+                    let c_start = j * dim;
+                    out_row[j] = kernel.eval(x, &centers[c_start..c_start + dim]);
+                }
+            });
+        let kernel_block = Array2::from_shape_vec((chunk_n, k_raw), values)
+            .expect("kernel chunk shape should match generated values");
         if let Some(z) = self.constraint_transform.as_ref() {
             fast_ab(&kernel_block, z)
         } else {
@@ -2686,7 +2711,7 @@ impl ChunkedKernelDesignOperator {
     }
 }
 
-impl LinearOperator for ChunkedKernelDesignOperator {
+impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K> {
     fn nrows(&self) -> usize {
         self.n
     }
@@ -2701,8 +2726,8 @@ impl LinearOperator for ChunkedKernelDesignOperator {
         let v_kernel = vector.slice(s![..k_eff]);
         let mut result = Array1::<f64>::zeros(self.n);
         // Process in chunks to limit memory.
-        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
-            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+        for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
             let chunk = self.kernel_chunk(start..end);
             let partial = chunk.dot(&v_kernel);
             result.slice_mut(s![start..end]).assign(&partial);
@@ -2721,8 +2746,8 @@ impl LinearOperator for ChunkedKernelDesignOperator {
             .map_or(self.centers.nrows(), |z| z.ncols());
         let mut result = Array1::<f64>::zeros(self.total_cols);
         // Kernel part: chunked accumulation of K^T v.
-        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
-            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+        for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
             let chunk = self.kernel_chunk(start..end);
             let v_slice = vector.slice(s![start..end]);
             let partial = chunk.t().dot(&v_slice);
@@ -2738,8 +2763,8 @@ impl LinearOperator for ChunkedKernelDesignOperator {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         let p = self.total_cols;
         let mut xtwx = Array2::<f64>::zeros((p, p));
-        for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
-            let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
+        for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
+            let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
             let mut chunk = self.row_chunk_combined(start..end);
             // Apply sqrt(w) to each row.
             for local in 0..(end - start) {
@@ -2754,7 +2779,7 @@ impl LinearOperator for ChunkedKernelDesignOperator {
     }
 }
 
-impl ChunkedKernelDesignOperator {
+impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     /// Combined row chunk: [kernel_chunk | poly_chunk].
     fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
@@ -2775,7 +2800,7 @@ impl ChunkedKernelDesignOperator {
     }
 }
 
-impl DenseDesignOperator for ChunkedKernelDesignOperator {
+impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOperator<K> {
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         self.row_chunk_combined(rows)
     }

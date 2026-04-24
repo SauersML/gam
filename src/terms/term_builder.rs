@@ -10,9 +10,10 @@ use ndarray::ArrayView1;
 
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability,
-    ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
-    default_spatial_center_strategy,
+    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
+    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
+    default_num_centers, default_spatial_center_strategy,
+    minimum_duchon_power_for_operator_penalties,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -345,8 +346,13 @@ pub fn build_smooth_basis(
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
-            let power = parse_duchon_power(options)?;
             let nullspace_order = parse_duchon_order(options)?;
+            let power = match parse_duchon_power_policy(options)? {
+                DuchonPowerPolicy::Explicit(power) => power,
+                DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
+                    minimum_duchon_power_for_operator_penalties(cols.len(), nullspace_order, 2)
+                }
+            };
             let length_scale = option_f64(options, "length_scale");
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
@@ -362,6 +368,7 @@ pub fn build_smooth_basis(
                     nullspace_order,
                     identifiability: parse_spatial_identifiability(options)?,
                     aniso_log_scales,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
                 },
                 input_scales: None,
             })
@@ -514,7 +521,15 @@ pub fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
     }
 }
 
-pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, String> {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum DuchonPowerPolicy {
+    Explicit(usize),
+    MinimumAdmissibleForTripleOperator,
+}
+
+pub fn parse_duchon_power_policy(
+    options: &BTreeMap<String, String>,
+) -> Result<DuchonPowerPolicy, String> {
     if let Some(raw_nu) = options.get("nu") {
         return Err(format!(
             "Duchon smooths use power=<integer>, not nu='{}'. Use power=0, power=1, etc.",
@@ -522,13 +537,20 @@ pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, S
         ));
     }
     match options.get("power") {
-        Some(raw) => raw.parse::<usize>().map_err(|_| {
+        Some(raw) => raw.parse::<usize>().map(DuchonPowerPolicy::Explicit).map_err(|_| {
             format!(
                 "invalid Duchon power '{}'; expected a non-negative integer such as power=0 or power=1",
                 raw
             )
         }),
-        None => Ok(2),
+        None => Ok(DuchonPowerPolicy::MinimumAdmissibleForTripleOperator),
+    }
+}
+
+pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, String> {
+    match parse_duchon_power_policy(options)? {
+        DuchonPowerPolicy::Explicit(power) => Ok(power),
+        DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => Ok(2),
     }
 }
 
