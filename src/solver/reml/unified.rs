@@ -5178,27 +5178,6 @@ impl StoredFirstDrift {
         }
         total
     }
-
-    fn accumulate(
-        &self,
-        alpha: f64,
-        dense: &mut Array2<f64>,
-        dense_rotated: Option<&mut Array2<f64>>,
-        ops: &mut Vec<(f64, Arc<dyn HyperOperator>)>,
-    ) {
-        if alpha == 0.0 {
-            return;
-        }
-        if let Some(matrix) = self.dense.as_ref() {
-            dense.scaled_add(alpha, matrix);
-        }
-        if let (Some(target), Some(matrix)) = (dense_rotated, self.dense_rotated.as_ref()) {
-            target.scaled_add(alpha, matrix);
-        }
-        for op in &self.operators {
-            ops.push((alpha, Arc::clone(op)));
-        }
-    }
 }
 
 struct WeightedHyperOperator {
@@ -5302,12 +5281,8 @@ impl OuterHessianCoord {
         self.ext_index.is_some()
     }
 
-    fn correction_v(&self) -> Array1<f64> {
-        if self.is_ext() {
-            -&self.v
-        } else {
-            self.v.clone()
-        }
+    fn correction_sign(&self) -> f64 {
+        if self.is_ext() { -1.0 } else { 1.0 }
     }
 }
 
@@ -5336,25 +5311,38 @@ impl UnifiedOuterHessianOperator {
         &self,
         alpha: &Array1<f64>,
     ) -> (
-        Array2<f64>,
+        Option<Array2<f64>>,
         Option<Array2<f64>>,
         Option<WeightedHyperOperator>,
     ) {
         let p = self.hop.dim();
-        let mut dense = Array2::<f64>::zeros((p, p));
-        let mut dense_rotated = self
-            .hop
-            .as_dense_spectral()
-            .map(|_| Array2::<f64>::zeros((p, p)));
+        let has_dense = self
+            .coords
+            .iter()
+            .enumerate()
+            .any(|(idx, coord)| alpha[idx] != 0.0 && coord.total_drift.dense.is_some());
+        let mut dense = has_dense.then(|| Array2::<f64>::zeros((p, p)));
+        let mut dense_rotated = (has_dense && self.hop.as_dense_spectral().is_some())
+            .then(|| Array2::<f64>::zeros((p, p)));
         let mut ops = Vec::new();
         for (idx, coord) in self.coords.iter().enumerate() {
             let weight = alpha[idx];
             if weight == 0.0 {
                 continue;
             }
-            coord
-                .total_drift
-                .accumulate(weight, &mut dense, dense_rotated.as_mut(), &mut ops);
+            if let (Some(target), Some(matrix)) = (dense.as_mut(), coord.total_drift.dense.as_ref())
+            {
+                target.scaled_add(weight, matrix);
+            }
+            if let (Some(target), Some(matrix)) = (
+                dense_rotated.as_mut(),
+                coord.total_drift.dense_rotated.as_ref(),
+            ) {
+                target.scaled_add(weight, matrix);
+            }
+            for op in &coord.total_drift.operators {
+                ops.push((weight, Arc::clone(op)));
+            }
         }
         let operator = (!ops.is_empty()).then_some(WeightedHyperOperator {
             terms: ops,
@@ -5496,6 +5484,7 @@ impl UnifiedOuterHessianOperator {
         idx: usize,
         alpha: &Array1<f64>,
         v_i: &Array1<f64>,
+        v_i_sign: f64,
         m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
         let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
@@ -5518,7 +5507,7 @@ impl UnifiedOuterHessianOperator {
         let d_trace =
             compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())?
                 .unwrap_or(0.0);
-        Ok(c_trace + d_trace)
+        Ok(c_trace + v_i_sign * d_trace)
     }
 
     fn correction_trace(
@@ -5602,18 +5591,17 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             let cross_trace = if !self.incl_logdet_h {
                 0.0
             } else {
-                let mut value = if let Some(left_dense) = coord.total_drift.dense.as_ref() {
-                    if alpha_dense.is_empty() {
-                        0.0
-                    } else if let (Some(dense_hop), Some(left_rot), Some(alpha_rot)) = (
+                let mut value = if let (Some(left_dense), Some(alpha_dense)) =
+                    (coord.total_drift.dense.as_ref(), alpha_dense.as_ref())
+                {
+                    if let (Some(dense_hop), Some(left_rot), Some(alpha_rot)) = (
                         self.hop.as_dense_spectral(),
                         coord.total_drift.dense_rotated.as_ref(),
                         alpha_dense_rotated.as_ref(),
                     ) {
                         dense_hop.trace_logdet_hessian_cross_rotated(left_rot, alpha_rot)
                     } else {
-                        self.hop
-                            .trace_logdet_hessian_cross(left_dense, &alpha_dense)
+                        self.hop.trace_logdet_hessian_cross(left_dense, alpha_dense)
                     }
                 } else {
                     0.0
@@ -5626,23 +5614,32 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                         value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
                     }
                 }
-                if !alpha_dense.is_empty() {
+                if let Some(alpha_dense) = alpha_dense.as_ref() {
                     for left in &coord.total_drift.operators {
                         value -= self
                             .hop
-                            .trace_hinv_matrix_operator_cross(&alpha_dense, left.as_ref());
+                            .trace_hinv_matrix_operator_cross(alpha_dense, left.as_ref());
                     }
                 }
                 value
             };
 
-            let correction_v = coord.correction_v();
-
             let correction = if self.incl_logdet_h {
                 match &self.kernel {
                     OuterHessianDerivativeKernel::ScalarGlm { .. } => self
-                        .scalar_correction_trace(idx, alpha, &correction_v, &correction_m_alpha)?,
+                        .scalar_correction_trace(
+                            idx,
+                            alpha,
+                            &coord.v,
+                            coord.correction_sign(),
+                            &correction_m_alpha,
+                        )?,
                     OuterHessianDerivativeKernel::Callback { .. } => {
+                        let correction_v = if coord.is_ext() {
+                            -&coord.v
+                        } else {
+                            coord.v.clone()
+                        };
                         let rhs = self.pair_rhs_combo(idx, alpha);
                         self.correction_trace(&rhs, &correction_v, &correction_m_alpha)?
                     }
@@ -7526,7 +7523,7 @@ impl SparseCholeskyOperator {
             let solved = if cols == chunk {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)
             } else {
-                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
+                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             };
             let solved = match solved {
@@ -7571,7 +7568,7 @@ impl SparseCholeskyOperator {
             let solved = if cols == chunk {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)
             } else {
-                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]).to_owned();
+                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             }
             .map_err(|e| {
