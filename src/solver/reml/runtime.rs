@@ -29,6 +29,7 @@ struct TkCorrectionTerms {
 struct TkPsiDirection {
     h_dot: Array2<f64>,
     x_tau: Array2<f64>,
+    eta_dot: Array1<f64>,
 }
 
 /// Family-dependent derivative context shared by all assembly builders.
@@ -468,7 +469,6 @@ impl<'a> RemlState<'a> {
             h_inv_solve,
             None,
         )?;
-
         Ok(TkCorrectionTerms {
             value,
             gradient: Some(gradient),
@@ -558,12 +558,24 @@ impl<'a> RemlState<'a> {
         }
 
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-        let h_eff_eval = if let Some(z) = free_basis_opt.as_ref() {
+        let use_original_basis = matches!(
+            pirls_result.coordinate_frame,
+            pirls::PirlsCoordinateFrame::TransformedQs
+        ) && free_basis_opt.is_none();
+        let h_eff_eval = if use_original_basis {
+            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_eff.as_ref())
+        } else if let Some(z) = free_basis_opt.as_ref() {
             Self::projectwith_basis(bundle.h_eff.as_ref(), z)
         } else {
             bundle.h_eff.as_ref().clone()
         };
-        let x_eff_dense = if let Some(z) = free_basis_opt.as_ref() {
+        let x_eff_dense = if use_original_basis {
+            self.x()
+                .try_to_dense_arc("Tierney-Kadane correction requires dense original design access")
+                .map_err(EstimationError::InvalidInput)?
+                .as_ref()
+                .clone()
+        } else if let Some(z) = free_basis_opt.as_ref() {
             pirls_result.x_transformed.to_dense().dot(z)
         } else {
             pirls_result.x_transformed.to_dense()
@@ -633,9 +645,9 @@ impl<'a> RemlState<'a> {
         };
 
         let p_eff = x_eff_dense.ncols();
-        let tk_penalties: Vec<crate::construction::CanonicalPenalty> = if let Some(z) =
-            free_basis_opt.as_ref()
-        {
+        let tk_penalties: Vec<crate::construction::CanonicalPenalty> = if use_original_basis {
+            self.canonical_penalties.as_ref().clone()
+        } else if let Some(z) = free_basis_opt.as_ref() {
             pirls_result
                 .reparam_result
                 .canonical_transformed
@@ -648,7 +660,9 @@ impl<'a> RemlState<'a> {
             pirls_result.reparam_result.canonical_transformed.clone()
         };
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
-        let beta = if let Some(z) = free_basis_opt.as_ref() {
+        let beta = if use_original_basis {
+            self.sparse_exact_beta_original(pirls_result)
+        } else if let Some(z) = free_basis_opt.as_ref() {
             z.t()
                 .dot(&pirls_result.beta_transformed.as_ref().to_owned())
         } else {
@@ -673,17 +687,23 @@ impl<'a> RemlState<'a> {
         mut result: super::unified::RemlLamlResult,
         rho: &Array1<f64>,
         tk_terms: TkCorrectionTerms,
-    ) -> super::unified::RemlLamlResult {
-        let _ = rho; // kept for API compatibility; lengths come from tk_grad now.
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         result.cost += tk_terms.value;
         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
-            let len = grad.len().min(tk_grad.len());
-            {
-                let mut sl = grad.slice_mut(s![..len]);
-                sl += &tk_grad.slice(s![..len]);
+            if tk_grad.len() == grad.len() {
+                *grad += &tk_grad;
+            } else if tk_grad.len() == rho.len() && grad.len() >= rho.len() {
+                let mut sl = grad.slice_mut(s![..rho.len()]);
+                sl += &tk_grad;
+            } else {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane gradient length mismatch: evaluator returned {}, correction returned {}",
+                    grad.len(),
+                    tk_grad.len()
+                )));
             }
         }
-        result
+        Ok(result)
     }
 
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -3118,23 +3138,12 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.assemble_and_evaluate_with_tk_psi_dirs(rho, bundle, mode, assembly, None)
-    }
-
-    fn assemble_and_evaluate_with_tk_psi_dirs(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        assembly: super::assembly::InnerAssembly<'static>,
-        tk_psi_dirs: Option<&[TkPsiDirection]>,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, tk_psi_dirs)?;
-        Ok(self.apply_tk_to_result(result, rho, tk_terms))
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        self.apply_tk_to_result(result, rho, tk_terms)
     }
 
     /// Single assembly point for EFS: build `InnerSolution` from an assembly,
@@ -3145,7 +3154,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         assembly: super::assembly::InnerAssembly<'static>,
-        tk_psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         use super::unified::{compute_efs_update, compute_hybrid_efs_update};
 
@@ -3167,8 +3175,8 @@ impl<'a> RemlState<'a> {
             prior,
         )
         .map_err(EstimationError::InvalidInput)?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, tk_psi_dirs)?;
-        let cost_result = self.apply_tk_to_result(cost_result, rho, tk_terms);
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode)?;
+        let cost_result = self.apply_tk_to_result(cost_result, rho, tk_terms)?;
 
         let efs_eval = if has_psi {
             let gradient = cost_result.gradient.as_ref().expect(
@@ -3319,7 +3327,10 @@ impl<'a> RemlState<'a> {
                 (Vec::new(), None, None, None)
             };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        let tk_psi_dirs = if compute_gradient_for_tk(mode) && !ext_coords.is_empty() {
+        let tk_psi_dirs = if self.config.link_function() != LinkFunction::Identity
+            && compute_gradient_for_tk(mode)
+            && !ext_coords.is_empty()
+        {
             Some(self.build_tk_psi_directions(&bundle, &ext_coords, hyper_dirs)?)
         } else {
             None
@@ -3374,7 +3385,7 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        self.evaluate_efs(p, &bundle, Vec::new(), None)
+        self.evaluate_efs(p, &bundle, Vec::new())
     }
 
     /// EFS evaluation with anisotropic or isotropic ψ ext_coords injected.
@@ -3419,8 +3430,12 @@ impl<'a> RemlState<'a> {
             return self.compute_efs_steps(rho);
         }
 
-        let tk_psi_dirs = self.build_tk_psi_directions(&bundle, &ext_coords, hyper_dirs)?;
-        self.evaluate_efs(rho, &bundle, ext_coords, Some(&tk_psi_dirs))
+        let tk_psi_dirs = if self.config.link_function() != LinkFunction::Identity {
+            Some(self.build_tk_psi_directions(&bundle, &ext_coords, hyper_dirs)?)
+        } else {
+            None
+        };
+        self.evaluate_efs(rho, &bundle, ext_coords, tk_psi_dirs.as_deref())
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -3758,6 +3773,6 @@ impl<'a> RemlState<'a> {
         )?;
         assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
-        self.assemble_and_evaluate_efs(rho, bundle, assembly, None)
+        self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 }
