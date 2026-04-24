@@ -1,11 +1,11 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
+use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerColView, FaerEigh};
 use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use ndarray::{Array1, Array2, ArrayBase, Data, Ix1};
+use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -433,13 +433,14 @@ fn canonicalize_sparse_symmetric_upper(
     })
 }
 
-pub fn solve_sparse_spd(
+pub fn solve_sparse_spd<S>(
     factor: &SparseExactFactor,
-    rhs: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    let rhs_arr =
-        Array2::from_shape_vec((rhs.len(), 1), rhs.to_vec()).expect("rhs vector should reshape");
-    let rhsview = FaerArrayView::new(&rhs_arr);
+    rhs: &ArrayBase<S, Ix1>,
+) -> Result<Array1<f64>, EstimationError>
+where
+    S: Data<Elem = f64>,
+{
+    let rhsview = FaerColView::new(rhs);
     let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array1::<f64>::zeros(rhs.len());
     for i in 0..rhs.len() {
@@ -453,10 +454,13 @@ pub fn solve_sparse_spd(
     Ok(result)
 }
 
-pub fn solve_sparse_spdmulti(
+pub fn solve_sparse_spdmulti<S>(
     factor: &SparseExactFactor,
-    rhs: &Array2<f64>,
-) -> Result<Array2<f64>, EstimationError> {
+    rhs: &ArrayBase<S, Ix2>,
+) -> Result<Array2<f64>, EstimationError>
+where
+    S: Data<Elem = f64>,
+{
     let rhsview = FaerArrayView::new(rhs);
     let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array2::<f64>::zeros(rhs.raw_dim());

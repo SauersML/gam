@@ -198,7 +198,7 @@ impl<'a> RemlState<'a> {
         let mut t1_sum = 0.0_f64;
         for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
             let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-            let z_block = z.slice(s![.., j0..j1]).to_owned();
+            let z_block = z.slice(s![.., j0..j1]);
             let c_j = c_array.slice(s![j0..j1]);
             for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
@@ -342,7 +342,7 @@ impl<'a> RemlState<'a> {
                 let i1 = (i0 + TK_BLOCK_SIZE).min(n);
                 let x_block_i = x_dense.slice(s![i0..i1, ..]);
                 let c_i = c_array.slice(s![i0..i1]);
-                let gram = x_block_i.dot(&z_block_j.to_owned());
+                let gram = x_block_i.dot(&z_block_j);
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
                     if ci == 0.0 {
@@ -389,7 +389,7 @@ impl<'a> RemlState<'a> {
         let xp = x_dense.dot(&p_total);
         let mut lev_p = Array1::<f64>::zeros(n);
         for i in 0..n {
-            lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
+            lev_p[i] = xp.row(i).dot(&x_dense.row(i));
         }
 
         let mut gradient = Array1::<f64>::zeros(total_k);
@@ -400,7 +400,7 @@ impl<'a> RemlState<'a> {
             let rk_p = cp.root.dot(&p_block);
             let trace_ak_p = lambdas[idx]
                 * (0..cp.rank())
-                    .map(|row| rk_p.row(row).dot(&cp.root.row(row).to_owned()))
+                    .map(|row| rk_p.row(row).dot(&cp.root.row(row)))
                     .sum::<f64>();
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p - correction_trace;
@@ -667,7 +667,7 @@ impl<'a> RemlState<'a> {
                 let mut solved = Array2::<f64>::zeros((p, n));
                 for m in 0..evals.len() {
                     let ev = evals[m];
-                    let u = evecs.column(m).to_owned();
+                    let u = evecs.column(m);
                     let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
                     for row in 0..p {
                         let u_row = u[row];
@@ -688,7 +688,9 @@ impl<'a> RemlState<'a> {
                     for m in 0..evals.len() {
                         let u = evecs.column(m);
                         let coeff = u.dot(rhs) / evals[m];
-                        sol.scaled_add(coeff, &u.to_owned());
+                        for row in 0..sol.len() {
+                            sol[row] += coeff * u[row];
+                        }
                     }
                     Ok(sol)
                 }
