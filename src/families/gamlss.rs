@@ -151,6 +151,7 @@ fn exact_design_row_chunks(n: usize, p: usize) -> impl Iterator<Item = std::ops:
         .map(move |start| start..(start + rows).min(n))
 }
 
+
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
     if !rawweight.is_finite() || rawweight <= 0.0 {
@@ -5190,6 +5191,7 @@ impl GaussianLocationScaleFamily {
         }
         Ok(None)
     }
+
     fn exact_joint_dense_block_designs<'a>(
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
