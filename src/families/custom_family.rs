@@ -5941,30 +5941,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         family.exact_newton_joint_hessian(&states)?.is_some()
     };
     let use_joint_newton = has_joint_exacthessian && specs.len() >= 2;
-    // Families that opt into `HardPseudo` are structurally rank-deficient in
-    // the likelihood curvature (they have a numerical null-space direction
-    // in H by design, e.g. the threshold / wiggle-intercept direction in the
-    // 3-block GAMLSS wiggle family).  For those families, the outer REML
-    // gradient `0.5 λ_k (H⁺[k,k] − S⁺[k,k])` is a DIFFERENCE of two O(1)
-    // quantities that are very close to each other at converged β̂, so any
-    // β̂-solver residual of magnitude η turns into an O(η) bias in FD
-    // measurements of the gradient — small in absolute terms but large
-    // relative to the analytic answer (~1e-7).  Tightening `inner_tol` far
-    // below its default 1e-6 is essential for these families so FD closes
-    // against the analytic IFT gradient rather than measuring solver drift.
-    // For full-rank families the default 1e-6 already converges β̂ to f64
-    // precision, so this tightening has no effect.
-    let hardpseudo_family = family.pseudo_logdet_mode() == PseudoLogdetMode::HardPseudo;
-    let inner_tol = if hardpseudo_family {
-        options.inner_tol.min(1e-12)
-    } else {
-        options.inner_tol
-    };
-    let inner_max_cycles = if hardpseudo_family {
-        options.inner_max_cycles.max(200)
-    } else {
-        options.inner_max_cycles
-    };
+    let inner_tol = options.inner_tol;
+    let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
     let mut s_lambdas = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
