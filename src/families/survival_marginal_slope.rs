@@ -13,10 +13,9 @@ use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization,
     build_deviation_block_from_knots_and_design_seed, build_deviation_block_from_seed,
-    project_monotone_feasible_beta,
-    signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
-    standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
-    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    project_monotone_feasible_beta, signed_probit_logcdf_and_mills_ratio,
+    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z, unary_derivatives_log,
+    unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
@@ -7988,7 +7987,7 @@ impl SurvivalMarginalSlopeFamily {
             label,
         )
         .ok();
-        first_psi_linear_map(action.as_ref(), &deriv.x_psi, total_rows, p).row_vector(row)
+        first_psi_linear_map(action.as_ref(), Some(&deriv.x_psi), total_rows, p).row_vector(row)
     }
 
     fn psi_second_design_row_vector(

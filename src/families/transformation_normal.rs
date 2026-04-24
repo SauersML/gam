@@ -1414,6 +1414,13 @@ fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     out
 }
 
+fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) {
+    assert!(
+        n > 0 && p_resp > 0 && p_cov > 0,
+        "CTN rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Kronecker-aware operator for biobank-scale tensor products
 // ---------------------------------------------------------------------------
@@ -1446,6 +1453,7 @@ impl KroneckerDesign {
                 right.nrows()
             ));
         }
+        assert_no_rowwise_kronecker_materialization(left.nrows(), left.ncols(), right.ncols());
         Ok(KroneckerDesign::Factored {
             left: left.clone(),
             right,

@@ -3370,6 +3370,9 @@ impl ImplicitDesignPsiDerivative {
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(axis < self.n_axes());
+        if self.is_duchon_family() {
+            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+        }
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
             let combo_sum = Self::transformed_combo_sum(combo);
@@ -3424,6 +3427,9 @@ impl ImplicitDesignPsiDerivative {
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(axis < self.n_axes());
+        if self.is_duchon_family() {
+            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+        }
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
             let combo_sum = Self::transformed_combo_sum(combo);
@@ -3500,6 +3506,9 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_d < self.n_axes());
         assert!(axis_e < self.n_axes());
         assert_ne!(axis_d, axis_e);
+        if self.is_duchon_family() {
+            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+        }
         if self.axis_combinations.is_some() {
             let combo_d = self.transformed_axis_combination(axis_d);
             let combo_e = self.transformed_axis_combination(axis_e);
@@ -10272,6 +10281,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
     let raw_design = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
@@ -12564,6 +12574,7 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
     // Auto-degrade the requested null-space order to Zero when the selected
     // centers cannot span the requested polynomial block. Every downstream
     // consumer of `spec.nullspace_order` in this function MUST use the

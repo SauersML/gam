@@ -681,16 +681,23 @@ def nagelkerke_r2_score(
 
 
 def _survival_score_grid(train_df: pd.DataFrame, time_col: str) -> np.ndarray:
+    """Routine survival calibration horizons in the data's time unit.
+
+    Biobank-scale runs must not allocate all-observed-time survival matrices.
+    Dense curves over every event time are reserved for explicit diagnostics;
+    routine scoring uses 1y, 2y, 5y, 10y, and median follow-up.
+    """
     train_times = train_df[time_col].to_numpy(dtype=float)
     times = train_times
     times = times[np.isfinite(times) & (times > 0.0)]
     if times.size == 0:
         return np.array([0.0, 1.0], dtype=float)
-    grid = np.unique(times)
-    if grid[0] > 0.0:
-        grid = np.concatenate([[0.0], grid])
-    else:
-        grid[0] = 0.0
+    median_followup = float(np.median(times))
+    grid = np.unique(
+        np.asarray([0.0, 1.0, 2.0, 5.0, 10.0, median_followup], dtype=float)
+    )
+    grid = grid[np.isfinite(grid) & (grid >= 0.0)]
+    grid[0] = 0.0
     if grid.size == 1:
         grid = np.array([0.0, max(float(grid[0]), 1.0)], dtype=float)
     return grid.astype(float, copy=False)

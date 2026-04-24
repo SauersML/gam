@@ -3518,9 +3518,10 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
                 .lock()
                 .map_err(|_| "joint psi direct cache poisoned".to_string())?;
             if let Some(cached) = guard.as_ref() {
+                let cached = cached.clone();
                 drop(guard);
                 self.touch_lru(index)?;
-                return Ok(cached.clone());
+                return Ok(cached);
             }
         }
 

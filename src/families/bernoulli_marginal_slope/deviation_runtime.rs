@@ -1,4 +1,4 @@
-use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
+use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, rrqr_nullspace_basis};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
 use crate::quadrature::compute_gauss_hermite_n;
@@ -168,13 +168,6 @@ fn raw_design_row(
             + raw_span_c3[[span_idx, j]] * t * t * t;
     }
     Ok(out)
-}
-
-pub(crate) fn transform_deviation_penalty(
-    penalty: &Array2<f64>,
-    transform: &Array2<f64>,
-) -> Array2<f64> {
-    fast_ab(&fast_atb(transform, penalty), transform)
 }
 
 impl DeviationRuntime {
