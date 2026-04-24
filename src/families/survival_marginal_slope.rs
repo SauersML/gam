@@ -6,8 +6,8 @@ use crate::custom_family::{
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    exact_joint_psi_terms_from_log_sigma_fd, first_psi_linear_map, fit_custom_family,
-    second_psi_linear_map, slice_joint_into_block_working_sets,
+    first_psi_linear_map, fit_custom_family, second_psi_linear_map,
+    slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
@@ -2884,10 +2884,9 @@ impl SurvivalMarginalSlopeFamily {
     // the denested cell Φ-integrals and the dynamic-q time-wiggle
     // composition, so the σ-derivative picks up an implicit-a term and
     // cell-integral nonlinearities that a single β-direction cannot
-    // reproduce.  The replacement `sigma_exact_joint_psi_terms` computes
-    // ψ-terms by tight central difference of the fully-analytic objective
-    // / gradient / Hessian evaluators at eps = 5e-4 — matching how the
-    // bernoulli mirror lands to 5e-4 / 2e-3 / 8e-3 tolerances.
+    // reproduce.  Production finite differences are intentionally not used for
+    // σ hyperderivatives; the σ auxiliary coordinate is unsupported until the
+    // full analytic cell-tensor path is implemented.
 
     fn is_sigma_aux_index(
         &self,
@@ -2916,19 +2915,14 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        exact_joint_psi_terms_from_log_sigma_fd(
-            self,
-            self.gaussian_frailty_sd,
-            block_states,
-            specs,
-            "survival marginal-slope",
-            |family, sigma| family.gaussian_frailty_sd = Some(sigma),
-            |family, states| family.log_likelihood_only(states),
-            |family, states, gradient_specs| {
-                family.exact_newton_joint_gradient_evaluation(states, gradient_specs)
-            },
-            |family, states| family.exact_newton_joint_hessian(states),
-        )
+        let _ = (block_states, specs);
+        if self.gaussian_frailty_sd.is_some() {
+            return Err(
+                "survival marginal-slope log-sigma hyperderivatives require an analytic implementation; production finite differences are disabled"
+                    .to_string(),
+            );
+        }
+        Ok(None)
     }
 
     fn flex_timewiggle_active(&self) -> bool {
@@ -14595,7 +14589,7 @@ mod tests {
     }
 
     #[test]
-    fn sigma_exact_joint_psi_terms_match_finite_differences_for_flexible_family() {
+    fn sigma_exact_joint_psi_terms_rejects_production_finite_differences() {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2]];
@@ -14658,74 +14652,13 @@ mod tests {
             dummy_blockspec(link_runtime.basis_dim()),
         ];
 
-        let terms = family
+        let error = family
             .sigma_exact_joint_psi_terms(&block_states, &specs)
-            .expect("sigma psi terms")
-            .expect("sigma psi terms present");
-
-        let log_sigma = sigma.ln();
-        let eps = 1e-6;
-        let mut family_plus = family.clone();
-        family_plus.gaussian_frailty_sd = Some((log_sigma + eps).exp());
-        let mut family_minus = family.clone();
-        family_minus.gaussian_frailty_sd = Some((log_sigma - eps).exp());
-
-        let ll_plus = family_plus
-            .log_likelihood_only(&block_states)
-            .expect("plus log likelihood");
-        let ll_minus = family_minus
-            .log_likelihood_only(&block_states)
-            .expect("minus log likelihood");
-        let objective_fd = -(ll_plus - ll_minus) / (2.0 * eps);
-
-        let grad_plus = family_plus
-            .exact_newton_joint_gradient_evaluation(&block_states, &specs)
-            .expect("plus joint gradient")
-            .expect("plus exact joint gradient")
-            .gradient;
-        let grad_minus = family_minus
-            .exact_newton_joint_gradient_evaluation(&block_states, &specs)
-            .expect("minus joint gradient")
-            .expect("minus exact joint gradient")
-            .gradient;
-        let score_fd = -(&grad_plus - &grad_minus) / (2.0 * eps);
-
-        let hess_plus = family_plus
-            .exact_newton_joint_hessian(&block_states)
-            .expect("plus joint hessian")
-            .expect("plus exact joint hessian");
-        let hess_minus = family_minus
-            .exact_newton_joint_hessian(&block_states)
-            .expect("minus joint hessian")
-            .expect("minus exact joint hessian");
-        let hessian_fd = (&hess_plus - &hess_minus) / (2.0 * eps);
-
+            .expect_err("sigma psi terms should require analytic derivatives");
         assert!(
-            (terms.objective_psi - objective_fd).abs() < 5e-4,
-            "objective sigma derivative mismatch: analytic={} fd={}",
-            terms.objective_psi,
-            objective_fd
+            error.contains("production finite differences are disabled"),
+            "{error}"
         );
-        assert_eq!(terms.score_psi.len(), score_fd.len());
-        for idx in 0..score_fd.len() {
-            assert!(
-                (terms.score_psi[idx] - score_fd[idx]).abs() < 2e-3,
-                "score sigma derivative mismatch at {idx}: analytic={} fd={}",
-                terms.score_psi[idx],
-                score_fd[idx]
-            );
-        }
-        assert_eq!(terms.hessian_psi.dim(), hessian_fd.dim());
-        for i in 0..hessian_fd.nrows() {
-            for j in 0..hessian_fd.ncols() {
-                assert!(
-                    (terms.hessian_psi[[i, j]] - hessian_fd[[i, j]]).abs() < 8e-3,
-                    "hessian sigma derivative mismatch at ({i},{j}): analytic={} fd={}",
-                    terms.hessian_psi[[i, j]],
-                    hessian_fd[[i, j]]
-                );
-            }
-        }
     }
 
     #[test]

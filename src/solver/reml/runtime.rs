@@ -96,26 +96,6 @@ impl<'a> RemlState<'a> {
         enabled
     }
 
-    fn tk_disabled_terms(
-        rho: &Array1<f64>,
-        ext_dim: usize,
-        mode: super::unified::EvalMode,
-    ) -> TkCorrectionTerms {
-        TkCorrectionTerms {
-            value: 0.0,
-            gradient: if mode != super::unified::EvalMode::ValueOnly {
-                Some(Array1::zeros(rho.len() + ext_dim))
-            } else {
-                None
-            },
-            hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
-                Some(Array2::zeros((rho.len(), rho.len())))
-            } else {
-                None
-            },
-        }
-    }
-
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
         match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
@@ -760,17 +740,9 @@ impl<'a> RemlState<'a> {
         let dense_work = n_x.saturating_mul(p_x);
         if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
         {
-            log::warn!(
-                "disabling exact Tierney-Kadane correction for large model (n={}, p={}, n*p={}): exact TK is small-model-only",
-                n_x,
-                p_x,
-                dense_work
-            );
-            return Ok(Self::tk_disabled_terms(
-                rho,
-                psi_dirs.map_or(0, |d| d.len()),
-                mode,
-            ));
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane correction requires dense small-model calculus; refusing to silently disable it for n={n_x}, p={p_x}, n*p={dense_work}"
+            )));
         }
 
         // Build Z = H⁻¹ X^T and solve closure, then call shared analytic core.
