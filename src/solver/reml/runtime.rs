@@ -274,7 +274,6 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-        penalty_coords: Option<&[&super::unified::PenaltyCoordinate]>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
@@ -386,18 +385,14 @@ impl<'a> RemlState<'a> {
 
         let mut gradient = Array1::<f64>::zeros(k);
         for idx in 0..k {
-            let trace_ak_p = if let Some(coords) = penalty_coords {
-                coords[idx].trace_with_dense(&p_total, lambdas[idx])
-            } else {
-                let cp = &tk_penalties[idx];
-                let r = &cp.col_range;
-                let p_block = p_total.slice(s![r.start..r.end, r.start..r.end]);
-                let rk_p = cp.root.dot(&p_block);
-                lambdas[idx]
-                    * (0..cp.rank())
-                        .map(|row| rk_p.row(row).dot(&cp.root.row(row).to_owned()))
-                        .sum::<f64>()
-            };
+            let cp = &tk_penalties[idx];
+            let r = &cp.col_range;
+            let p_block = p_total.slice(s![r.start..r.end, r.start..r.end]);
+            let rk_p = cp.root.dot(&p_block);
+            let trace_ak_p = lambdas[idx]
+                * (0..cp.rank())
+                    .map(|row| rk_p.row(row).dot(&cp.root.row(row).to_owned()))
+                    .sum::<f64>();
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p + correction_trace;
         }
@@ -461,7 +456,6 @@ impl<'a> RemlState<'a> {
             lambdas,
             &x_vks,
             h_inv_solve,
-            None,
         )?;
         Ok(TkCorrectionTerms {
             value,
@@ -497,8 +491,7 @@ impl<'a> RemlState<'a> {
             )));
         }
         let compute_gradient = compute_gradient_for_tk(mode);
-        let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
-        if compute_hessian {
+        if mode == super::unified::EvalMode::ValueGradientHessian {
             return Err(EstimationError::InvalidInput(
                 "Tierney-Kadane outer Hessian requires analytic second derivatives; production finite-difference stencils are disabled".to_string(),
             ));
@@ -513,6 +506,7 @@ impl<'a> RemlState<'a> {
                 },
             });
         }
+
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
         let dense_work = n_x.saturating_mul(p_x);
@@ -661,6 +655,7 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
+
         self.tierney_kadane_analytic_core(
             &x_eff_dense,
             &z_mat,
@@ -3127,16 +3122,13 @@ impl<'a> RemlState<'a> {
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
         self.apply_tk_to_result(result, tk_terms)
     }
 
-    /// Single assembly point for EFS: build `InnerSolution` from an assembly,
-    /// compute cost (and gradient when ψ coords are present), return EFS step
-    /// vector with TK cost correction applied.
     fn assemble_and_evaluate_efs(
         &self,
         rho: &Array1<f64>,
@@ -3147,6 +3139,11 @@ impl<'a> RemlState<'a> {
 
         let beta_for_barrier = assembly.beta.clone();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
+        if has_psi && self.config.link_function() != LinkFunction::Identity {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate EFS psi gradients".to_string(),
+            ));
+        }
         let eval_mode = if has_psi {
             super::unified::EvalMode::ValueAndGradient
         } else {
@@ -3320,7 +3317,13 @@ impl<'a> RemlState<'a> {
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
         assembly.fixed_drift_deriv = fixed_drift_deriv;
-        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
+        let result = self.assemble_and_evaluate_with_tk_hyper_dirs(
+            rho,
+            &bundle,
+            mode,
+            assembly,
+            (!hyper_dirs.is_empty()).then_some(hyper_dirs),
+        );
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         log::info!(
@@ -3357,7 +3360,7 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        self.evaluate_efs(p, &bundle, Vec::new())
+        self.evaluate_efs(p, &bundle, Vec::new(), None)
     }
 
     /// EFS evaluation with anisotropic or isotropic ψ ext_coords injected.
@@ -3402,7 +3405,7 @@ impl<'a> RemlState<'a> {
             return self.compute_efs_steps(rho);
         }
 
-        self.evaluate_efs(rho, &bundle, ext_coords)
+        self.evaluate_efs(rho, &bundle, ext_coords, Some(hyper_dirs))
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -3721,7 +3724,7 @@ impl<'a> RemlState<'a> {
         // predicate.
         self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
-        self.evaluate_efs(rho, &bundle, ext_coords)
+        self.evaluate_efs(rho, &bundle, ext_coords, None)
     }
 
     /// Unified EFS bridge: auto-dispatches backend, injects ext_coords,
