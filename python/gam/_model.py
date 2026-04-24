@@ -341,7 +341,14 @@ class Model:
           grid.
         """
         headers, rows, table_kind = normalize_table(data)
-        payload = {"interval": interval}
+        payload: dict[str, Any] = {"interval": interval}
+        # For survival models we auto-supply a default time grid built
+        # from the exit/entry columns in the prediction frame so that
+        # ``hazard_at`` / ``survival_at`` can interpolate at arbitrary
+        # caller times.
+        default_survival_grid = self._default_survival_time_grid(headers, rows)
+        if default_survival_grid is not None:
+            payload["time_grid"] = [float(t) for t in default_survival_grid]
         try:
             raw = rust_module().predict_table(
                 self._model_bytes,
@@ -352,6 +359,11 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         parsed = json.loads(raw)
+
+        # Structured survival payload: dense hazard/survival grid.
+        if parsed.get("class") == "survival_prediction":
+            return _survival_prediction_from_ffi_payload(parsed)
+
         columns = _ordered_prediction_columns(parsed["columns"])
         model_class = str(parsed.get("model_class") or self._model_class_from_summary())
 
@@ -611,6 +623,86 @@ def _survival_prediction_from_columns(
         parameter_names=tuple(parameter_names),
         baseline_times=baseline_arr,
     )
+
+
+def _survival_prediction_from_ffi_payload(
+    parsed: dict[str, Any],
+) -> SurvivalPrediction:
+    """Build a :class:`SurvivalPrediction` from the FFI's dense payload."""
+    import numpy as np
+
+    model_class = str(parsed.get("model_class") or "survival marginal-slope")
+    times = np.asarray(parsed.get("times") or [], dtype=float).reshape(-1)
+    hazard = _coerce_matrix(parsed.get("hazard"))
+    survival = _coerce_matrix(parsed.get("survival"))
+    cumulative = _coerce_matrix(parsed.get("cumulative_hazard"))
+    linear_predictor = np.asarray(
+        parsed.get("linear_predictor") or [], dtype=float
+    ).reshape(-1)
+    columns = parsed.get("columns") or {}
+    parameter_names = tuple(columns.keys())
+    if parameter_names:
+        stacked = np.column_stack(
+            [np.asarray(columns[name], dtype=float) for name in parameter_names]
+        )
+    else:
+        stacked = linear_predictor.reshape(-1, 1) if linear_predictor.size else np.zeros((0, 0))
+    baseline = columns.get("baseline_times")
+    baseline_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
+    return SurvivalPrediction(
+        model_class=model_class,
+        parameters=stacked,
+        parameter_names=parameter_names,
+        baseline_times=baseline_arr,
+        times=times if times.size else None,
+        hazard=hazard,
+        survival=survival,
+        cumulative_hazard=cumulative,
+        linear_predictor=linear_predictor if linear_predictor.size else None,
+    )
+
+
+def _coerce_matrix(value: Any) -> Any:
+    import numpy as np
+
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    return arr
+
+
+def _interpolate_rows(grid: Any, surface: Any, query: Any, *, clip: tuple) -> Any:
+    """Linear interpolation of each row of ``surface`` against ``grid``.
+
+    ``grid`` — 1-D time grid (must be sorted for ``numpy.interp``; we
+    sort a copy if the FFI returned an unsorted grid, e.g. per-row
+    exit times on a shuffled dataset).
+    ``surface`` — ``(n_rows, len(grid))`` dense surface.
+    ``query`` — 1-D query times.
+    ``clip`` — ``(lo, hi)`` bounds applied to every output cell (either
+    bound may be ``None`` for no clipping on that side).
+    """
+    import numpy as np
+
+    grid = np.asarray(grid, dtype=float).reshape(-1)
+    query = np.asarray(query, dtype=float).reshape(-1)
+    surface = np.asarray(surface, dtype=float)
+    if grid.size == 0 or surface.shape[1] != grid.size:
+        raise ValueError("survival interpolation requires a non-empty grid")
+
+    order = np.argsort(grid, kind="stable")
+    sorted_grid = grid[order]
+    sorted_surface = surface[:, order]
+
+    out = np.empty((sorted_surface.shape[0], query.size), dtype=float)
+    for row_idx in range(sorted_surface.shape[0]):
+        out[row_idx, :] = np.interp(query, sorted_grid, sorted_surface[row_idx, :])
+    lo, hi = clip
+    if lo is not None or hi is not None:
+        out = np.clip(out, lo if lo is not None else -np.inf, hi if hi is not None else np.inf)
+    return out
 
 
 __all__ = ["Model", "SurvivalPrediction"]
