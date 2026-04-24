@@ -4120,8 +4120,8 @@ fn build_scalar_design_psi_derivatives_shared(
             .map(|eta| eta.to_vec())
             .unwrap_or_else(|| vec![0.0; dim]);
         let op = ImplicitDesignPsiDerivative::new_streaming_scalar(
-            Arc::new(data.to_owned()),
-            Arc::new(centers.to_owned()),
+            shared_owned_data_matrix_from_view(data),
+            shared_owned_centers_matrix_from_view(centers),
             metric_eta,
             radial_kind,
             ident_transform,
