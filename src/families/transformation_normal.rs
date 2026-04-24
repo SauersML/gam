@@ -8,8 +8,9 @@
 //! with an arbitrary covariate design operator. The deviations are B-splines with
 //! value and first derivative projected to zero at the response median, so setting
 //! deviation coefficients to zero recovers an affine (location-scale) transformation
-//! exactly. Monotonicity is enforced by the natural `log(h')` barrier in the
-//! likelihood combined with a fraction-to-boundary line search.
+//! exactly. Monotonicity is enforced by explicit derivative lower-bound
+//! constraints on a response grid, plus the natural `log(h')` barrier in the
+//! likelihood and a fraction-to-boundary line search.
 //!
 //! The log-likelihood per observation is the change-of-variables density for a
 //! standard normal target:
@@ -89,6 +90,8 @@ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
 /// tensor width bounded even when the covariate side is narrow.
 const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
+const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
+const TRANSFORMATION_TAIL_GUARD_FRACTION: f64 = 0.25;
 
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
@@ -118,6 +121,9 @@ pub struct TransformationNormalFamily {
     x_val_kron: KroneckerDesign,
     /// Derivative design operator: keeps the tensor factors separate.
     x_deriv_kron: KroneckerDesign,
+    /// Derivative design operator evaluated on the monotonicity grid formed by
+    /// all training covariate rows crossed with response knots and tail guards.
+    x_deriv_grid_kron: KroneckerDesign,
 
     // --- Response-direction basis (fixed, does not depend on κ) ---
     /// Response value basis: n × p_resp. Columns: [1, y, dev_1(y), ..., dev_k(y)].
@@ -232,9 +238,17 @@ impl TransformationNormalFamily {
         // ----- 2. Row-wise Kronecker product (operator form) -----
         let x_val_kron = KroneckerDesign::new(&resp_val, covariate_design.clone())?;
         let x_deriv_kron = KroneckerDesign::new(&resp_deriv, covariate_design.clone())?;
+        let x_deriv_grid_kron = build_monotonicity_derivative_grid_kron(
+            response,
+            &resp_knots,
+            config.response_degree,
+            &resp_transform,
+            &covariate_design,
+        )?;
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
+        debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
 
         // ----- 3. Warm start -----
         let initial_beta = compute_warm_start(
@@ -273,6 +287,7 @@ impl TransformationNormalFamily {
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
+            x_deriv_grid_kron,
             response_val_basis: resp_val,
             response_deriv_basis: resp_deriv,
             covariate_design,
@@ -369,6 +384,14 @@ impl TransformationNormalFamily {
         // Warm start: need response values for location-scale init.
         // Extract response from column 1 of response_val_basis (which stores y).
         let response_approx = response_val_basis.column(1).to_owned();
+        let x_deriv_grid_kron = build_monotonicity_derivative_grid_kron(
+            &response_approx,
+            &response_knots,
+            response_degree,
+            &response_transform,
+            &covariate_design,
+        )?;
+        debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
         let initial_beta = compute_warm_start(
             &response_approx,
             weights,
@@ -404,6 +427,7 @@ impl TransformationNormalFamily {
         Ok(Self {
             x_val_kron,
             x_deriv_kron,
+            x_deriv_grid_kron,
             response_val_basis,
             response_deriv_basis,
             covariate_design,
@@ -602,9 +626,12 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let h_prime = self.x_deriv_kron.forward_mul(beta);
         let d_h_prime = self.x_deriv_kron.forward_mul(delta);
+        let h_prime_grid = self.x_deriv_grid_kron.forward_mul(beta);
+        let d_h_prime_grid = self.x_deriv_grid_kron.forward_mul(delta);
 
         // Fraction-to-boundary rule: find the largest alpha in (0, 1] such that
-        // h'(beta + alpha * delta) > 0 at every observation.
+        // h'(beta + alpha * delta) > 0 at every observed row and monotonicity
+        // grid row.
         //
         // For each i where d_h'[i] < 0, the step that drives h'[i] to zero is
         // alpha_i = h'[i] / (-d_h'[i]).  We take the minimum and apply a 0.995
@@ -614,6 +641,15 @@ impl CustomFamily for TransformationNormalFamily {
             let dh = d_h_prime[i];
             if dh < -1e-14 {
                 let hit = h_prime[i] / (-dh);
+                if hit < alpha_max {
+                    alpha_max = hit;
+                }
+            }
+        }
+        for i in 0..h_prime_grid.len() {
+            let dh = d_h_prime_grid[i];
+            if dh < -1e-14 {
+                let hit = (h_prime_grid[i] - TRANSFORMATION_MONOTONICITY_EPS) / (-dh);
                 if hit < alpha_max {
                     alpha_max = hit;
                 }
@@ -631,13 +667,19 @@ impl CustomFamily for TransformationNormalFamily {
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
-        _: usize,
+        block_index: usize,
         _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        // Monotonicity is enforced by the natural log(h') barrier in the
-        // likelihood combined with the fraction-to-boundary line search
-        // (max_feasible_step_size).  No explicit constraints needed.
-        Ok(None)
+        if block_index != 0 {
+            return Ok(None);
+        }
+        Ok(Some(LinearInequalityConstraints {
+            a: self.x_deriv_grid_kron.to_dense(),
+            b: Array1::from_elem(
+                self.x_deriv_grid_kron.nrows(),
+                TRANSFORMATION_MONOTONICITY_EPS,
+            ),
+        }))
     }
 
     fn exact_newton_hessian_directional_derivative(
@@ -1140,6 +1182,137 @@ fn build_response_basis(
     }
 
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
+}
+
+fn evaluate_response_derivative_basis(
+    values: &Array1<f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    transform: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    for (i, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "response monotonicity grid value {i} is not finite: {value}"
+            ));
+        }
+    }
+
+    let dev_dim = transform.ncols();
+    let p_resp = 2 + dev_dim;
+    let mut resp_deriv = Array2::<f64>::zeros((values.len(), p_resp));
+    resp_deriv.column_mut(1).fill(1.0);
+
+    if dev_dim == 0 {
+        return Ok(resp_deriv);
+    }
+    if knots.is_empty() {
+        return Err(
+            "response derivative grid needs knots when deviation columns are present".to_string(),
+        );
+    }
+    let (raw_deriv_basis, _) = create_basis::<Dense>(
+        values.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .map_err(|e| e.to_string())?;
+    let raw_deriv = raw_deriv_basis.as_ref().clone();
+    if raw_deriv.ncols() != transform.nrows() {
+        return Err(format!(
+            "response derivative transform shape mismatch: raw cols={} transform rows={}",
+            raw_deriv.ncols(),
+            transform.nrows()
+        ));
+    }
+    let dev_deriv = raw_deriv.dot(transform);
+    resp_deriv.slice_mut(s![.., 2..]).assign(&dev_deriv);
+    Ok(resp_deriv)
+}
+
+fn transformation_monotonicity_response_grid(
+    response: &Array1<f64>,
+    knots: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    if response.is_empty() {
+        return Err(
+            "cannot build transformation monotonicity grid with no response values".to_string(),
+        );
+    }
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut values = Vec::with_capacity(response.len() + knots.len() + 4);
+    for (i, &value) in response.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("response[{i}] is not finite: {value}"));
+        }
+        min_y = min_y.min(value);
+        max_y = max_y.max(value);
+        values.push(value);
+    }
+    for &knot in knots.iter() {
+        if knot.is_finite() {
+            values.push(knot);
+            min_y = min_y.min(knot);
+            max_y = max_y.max(knot);
+        }
+    }
+    let span = (max_y - min_y).abs().max(1.0);
+    let guard = TRANSFORMATION_TAIL_GUARD_FRACTION * span;
+    values.push(min_y - guard);
+    values.push(max_y + guard);
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12 * span);
+    Ok(Array1::from_vec(values))
+}
+
+fn expand_response_derivative_grid(
+    response_deriv_grid: &Array2<f64>,
+    n_covariate_rows: usize,
+) -> Array2<f64> {
+    let n_grid = response_deriv_grid.nrows();
+    let p_resp = response_deriv_grid.ncols();
+    let mut out = Array2::<f64>::zeros((n_covariate_rows * n_grid, p_resp));
+    for i in 0..n_covariate_rows {
+        let start = i * n_grid;
+        out.slice_mut(s![start..(start + n_grid), ..])
+            .assign(response_deriv_grid);
+    }
+    out
+}
+
+fn expand_covariate_rows_for_response_grid(
+    covariate_rows: &Array2<f64>,
+    n_grid: usize,
+) -> Array2<f64> {
+    let n = covariate_rows.nrows();
+    let p = covariate_rows.ncols();
+    let mut out = Array2::<f64>::zeros((n * n_grid, p));
+    for i in 0..n {
+        for g in 0..n_grid {
+            out.row_mut(i * n_grid + g).assign(&covariate_rows.row(i));
+        }
+    }
+    out
+}
+
+fn build_monotonicity_derivative_grid_kron(
+    response: &Array1<f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    transform: &Array2<f64>,
+    covariate_design: &DesignMatrix,
+) -> Result<KroneckerDesign, String> {
+    let response_grid = transformation_monotonicity_response_grid(response, knots)?;
+    let response_deriv_grid =
+        evaluate_response_derivative_basis(&response_grid, knots, degree, transform)?;
+    let n_covariate_rows = covariate_design.nrows();
+    let left = expand_response_derivative_grid(&response_deriv_grid, n_covariate_rows);
+    let covariate_rows = covariate_design.row_chunk(0..n_covariate_rows);
+    let right = expand_covariate_rows_for_response_grid(&covariate_rows, response_grid.len());
+    KroneckerDesign::new(&left, DesignMatrix::Dense(DenseDesignMatrix::from(right)))
 }
 
 fn effective_response_num_internal_knots(

@@ -73,10 +73,10 @@ use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, append_zero_tail_columns,
     build_latent_survival_baseline_offsets, build_survival_baseline_offsets,
-    build_survival_time_basis, build_survival_timewiggle_derivative_design,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
-    center_survival_time_designs_at_anchor, evaluate_survival_baseline,
-    evaluate_survival_time_basis_row, normalize_survival_time_pair,
+    build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
+    build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
+    build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
+    evaluate_survival_baseline, evaluate_survival_time_basis_row, normalize_survival_time_pair,
     optimize_survival_baseline_config, parse_survival_baseline_config, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
@@ -3210,6 +3210,7 @@ fn run_predict_survival(
             &age_entry,
             &age_exit,
             &baseline_cfg,
+            saved_likelihood_mode,
             time_anchor,
             DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             &time_build,
@@ -3236,16 +3237,12 @@ fn run_predict_survival(
             _ => unreachable!(),
         };
     }
-    let mut eta_offset_entry = Array1::<f64>::zeros(n);
-    let mut eta_offset_exit = Array1::<f64>::zeros(n);
-    let mut derivative_offset_exit = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (eta_entry, _) = evaluate_survival_baseline(age_entry[i], &baseline_cfg)?;
-        let (eta_exit_i, deriv_exit_i) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
-        eta_offset_entry[i] = eta_entry;
-        eta_offset_exit[i] = eta_exit_i;
-        derivative_offset_exit[i] = deriv_exit_i;
-    }
+    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
+        if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+            build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
+        } else {
+            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
+        };
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
@@ -4027,6 +4024,7 @@ fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     baseline_cfg: &SurvivalBaselineConfig,
+    likelihood_mode: SurvivalLikelihoodMode,
     time_anchor: f64,
     exact_derivative_guard: f64,
     time_build: &SurvivalTimeBuildOutput,
@@ -4053,7 +4051,11 @@ fn prepare_survival_time_stack(
         )
     } else {
         let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-            build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)?;
+            if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+                build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)?
+            } else {
+                build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)?
+            };
         let n = age_entry.len();
         (
             eta_offset_entry,
@@ -4669,6 +4671,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         &age_entry,
                         &age_exit,
                         candidate,
+                        SurvivalLikelihoodMode::LocationScale,
                         time_anchor,
                         exact_derivative_guard,
                         &time_build,
@@ -4708,6 +4711,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_entry,
             &age_exit,
             &baseline_cfg,
+            SurvivalLikelihoodMode::LocationScale,
             time_anchor,
             exact_derivative_guard,
             &time_build,
@@ -5037,6 +5041,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         &age_entry,
                         &age_exit,
                         candidate,
+                        SurvivalLikelihoodMode::MarginalSlope,
                         time_anchor,
                         exact_derivative_guard,
                         &time_build,
@@ -5075,6 +5080,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_entry,
             &age_exit,
             &baseline_cfg,
+            SurvivalLikelihoodMode::MarginalSlope,
             time_anchor,
             exact_derivative_guard,
             &time_build,
@@ -5290,6 +5296,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         &age_entry,
                         &age_exit,
                         candidate,
+                        likelihood_mode,
                         time_anchor,
                         latent_derivative_guard,
                         &time_build,
@@ -5331,6 +5338,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_entry,
             &age_exit,
             &baseline_cfg,
+            likelihood_mode,
             time_anchor,
             latent_derivative_guard,
             &time_build,
@@ -5485,6 +5493,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_entry,
             &age_exit,
             candidate,
+            likelihood_mode,
             time_anchor,
             exact_derivative_guard,
             &time_build,
@@ -7805,7 +7814,9 @@ fn fixed_gaussian_shift_frailty_from_spec(
             },
         ),
         gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => {
-            Ok(gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None })
+            Err(format!(
+                "{context} currently requires a fixed GaussianShift sigma; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
+            ))
         }
         gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(format!(
             "{context} requires --frailty-kind gaussian-shift or no frailty"

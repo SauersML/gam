@@ -1,19 +1,23 @@
+use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
+use crate::quadrature::compute_gauss_hermite_n;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2};
 
 /// Precomputed per-span polynomial coefficient matrices for a structurally
 /// monotone anchored deviation basis.
 ///
-/// Free coefficients are the interior nodal values of the deviation derivative
-/// `w'(x)`; the left and right endpoint node values are fixed at `0`, so
-/// `w(x)` has constant tails and zero still means the identity map.
+/// Free coefficients are quadratic Bernstein control values for the deviation
+/// derivative `w'(x)`: interior endpoint controls shared across adjacent spans,
+/// plus one midpoint control per span.  The left and right endpoint controls
+/// are fixed at `0`, so `w(x)` has constant tails and zero still means the
+/// identity map.
 ///
-/// On each knot span `w'(x)` is linearly interpolated between adjacent node
-/// values, so `w(x)` is piecewise quadratic. Exact monotonicity of the full
-/// transform `x + w(x)` is therefore equivalent to simple lower bounds on the
-/// interior nodal coefficients: `beta_j >= monotonicity_eps - 1`.
+/// On each knot span `w'(x)` is a quadratic Bernstein polynomial, so `w(x)` is
+/// truly piecewise cubic.  Exact monotonicity of the full transform `x + w(x)`
+/// is guaranteed by lower bounds on every derivative control value:
+/// `beta_j >= monotonicity_eps - 1`.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
     degree: usize,
@@ -25,6 +29,8 @@ pub struct DeviationRuntime {
     span_c1: Array2<f64>,
     span_c2: Array2<f64>,
     span_c3: Array2<f64>,
+    coefficient_transform: Array2<f64>,
+    monotonicity_constraint_rows: Array2<f64>,
     /// Deviation basis values at the rightmost breakpoint (1 × basis_dim).
     /// Used for constant-tail continuation outside support: the deviation
     /// saturates at this value for all z > right endpoint.
@@ -32,7 +38,34 @@ pub struct DeviationRuntime {
 }
 
 impl DeviationRuntime {
-    pub(crate) fn try_new(knots: Array1<f64>, monotonicity_eps: f64) -> Result<Self, String> {
+    pub(crate) fn try_new_standard_normal_anchor(
+        knots: Array1<f64>,
+        monotonicity_eps: f64,
+    ) -> Result<Self, String> {
+        Self::try_new_with_anchor(
+            knots,
+            monotonicity_eps,
+            DeviationMomentAnchor::StandardNormal,
+        )
+    }
+
+    pub(crate) fn try_new_empirical_anchor(
+        knots: Array1<f64>,
+        monotonicity_eps: f64,
+        reference: &Array1<f64>,
+    ) -> Result<Self, String> {
+        Self::try_new_with_anchor(
+            knots,
+            monotonicity_eps,
+            DeviationMomentAnchor::Empirical(reference),
+        )
+    }
+
+    fn try_new_with_anchor(
+        knots: Array1<f64>,
+        monotonicity_eps: f64,
+        anchor: DeviationMomentAnchor<'_>,
+    ) -> Result<Self, String> {
         if !monotonicity_eps.is_finite() || monotonicity_eps < 0.0 {
             return Err(format!(
                 "DeviationRuntime monotonicity_eps must be finite and non-negative, got {monotonicity_eps}"
@@ -53,51 +86,62 @@ impl DeviationRuntime {
             );
         }
         let n_spans = endpoint_points.len() - 1;
-        let basis_dim = endpoint_points.len() - 2;
+        let interior_endpoint_controls = endpoint_points.len() - 2;
+        let midpoint_control_offset = interior_endpoint_controls;
+        let basis_dim = interior_endpoint_controls + n_spans;
         let mut span_c0 = Array2::<f64>::zeros((n_spans, basis_dim));
         let mut span_c1 = Array2::<f64>::zeros((n_spans, basis_dim));
         let mut span_c2 = Array2::<f64>::zeros((n_spans, basis_dim));
-        let span_c3 = Array2::<f64>::zeros((n_spans, basis_dim));
+        let mut span_c3 = Array2::<f64>::zeros((n_spans, basis_dim));
         let mut right_boundary_value_row = Array1::<f64>::zeros(basis_dim);
-        for basis_idx in 0..basis_dim {
-            let node_idx = basis_idx + 1;
-            let left = endpoint_points[node_idx - 1];
-            let center = endpoint_points[node_idx];
-            let right = endpoint_points[node_idx + 1];
-            let left_width = center - left;
-            let right_width = right - center;
-            if !left_width.is_finite()
-                || !right_width.is_finite()
-                || left_width <= 0.0
-                || right_width <= 0.0
-            {
+
+        for span_idx in 0..n_spans {
+            let left = endpoint_points[span_idx];
+            let right = endpoint_points[span_idx + 1];
+            let width = right - left;
+            if !width.is_finite() || width <= 0.0 {
                 return Err(format!(
-                    "DeviationRuntime requires strictly increasing interior support around node {node_idx}: left_width={left_width}, right_width={right_width}"
+                    "DeviationRuntime requires strictly increasing span endpoints at span {span_idx}: left={left}, right={right}"
                 ));
             }
-            let right_tail_value = 0.5 * (left_width + right_width);
-            right_boundary_value_row[basis_idx] = right_tail_value;
-            for span_idx in 0..n_spans {
-                if span_idx + 1 < node_idx {
-                    continue;
+            let inv_width = 1.0 / width;
+            let inv_width_sq = inv_width * inv_width;
+            let mut active_controls = Vec::with_capacity(3);
+            if span_idx > 0 {
+                active_controls.push((span_idx - 1, 1.0, -inv_width, inv_width_sq / 3.0));
+            }
+            active_controls.push((
+                midpoint_control_offset + span_idx,
+                0.0,
+                inv_width,
+                -2.0 * inv_width_sq / 3.0,
+            ));
+            if span_idx + 1 < n_spans {
+                active_controls.push((span_idx, 0.0, 0.0, inv_width_sq / 3.0));
+            }
+
+            for &(basis_idx, c1, c2, c3) in &active_controls {
+                span_c1[[span_idx, basis_idx]] = c1;
+                span_c2[[span_idx, basis_idx]] = c2;
+                span_c3[[span_idx, basis_idx]] = c3;
+            }
+
+            for basis_idx in 0..basis_dim {
+                let full_span_integral = (span_c1[[span_idx, basis_idx]] * width
+                    + span_c2[[span_idx, basis_idx]] * width * width
+                    + span_c3[[span_idx, basis_idx]] * width * width * width)
+                    / 1.0;
+                let next_value = right_boundary_value_row[basis_idx] + full_span_integral;
+                if span_idx + 1 < n_spans {
+                    span_c0[[span_idx + 1, basis_idx]] = next_value;
                 }
-                if span_idx == node_idx - 1 {
-                    span_c2[[span_idx, basis_idx]] = 0.5 / left_width;
-                    continue;
-                }
-                if span_idx == node_idx {
-                    span_c0[[span_idx, basis_idx]] = 0.5 * left_width;
-                    span_c1[[span_idx, basis_idx]] = 1.0;
-                    span_c2[[span_idx, basis_idx]] = -0.5 / right_width;
-                    continue;
-                }
-                span_c0[[span_idx, basis_idx]] = right_tail_value;
+                right_boundary_value_row[basis_idx] = next_value;
             }
         }
 
         Ok(Self {
-            degree: 2,
-            value_span_degree: 2,
+            degree: 3,
+            value_span_degree: 3,
             basis_dim,
             monotonicity_eps,
             endpoint_points,
