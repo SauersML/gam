@@ -1622,7 +1622,14 @@ impl DenseDesignOperator for KroneckerDesign {
     fn to_dense(&self) -> Array2<f64> {
         match self {
             KroneckerDesign::Factored { left, right } => {
-                rowwise_kronecker(left, right.as_dense_cow().as_ref())
+                assert_no_rowwise_kronecker_materialization(
+                    left.nrows(),
+                    left.ncols(),
+                    right.ncols(),
+                );
+                panic!(
+                    "CTN KroneckerDesign must remain factored; refused persistent n x p_response x p_covariate materialization"
+                )
             }
         }
     }

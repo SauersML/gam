@@ -5282,6 +5282,36 @@ impl GaussianLocationScaleFamily {
         Ok(None)
     }
 
+    fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_block_designs(specs)? else {
+            return Ok(None);
+        };
+        let xmu = match xmu {
+            DenseOrOperator::Borrowed(dense) => Cow::Borrowed(dense),
+            DenseOrOperator::Owned(dense) => Cow::Owned(dense),
+            DenseOrOperator::Operator(_) => {
+                return Err(
+                    "GaussianLocationScaleFamily exact psi path requires chunked operator support for oversized designs"
+                        .to_string(),
+                );
+            }
+        };
+        let x_ls = match x_ls {
+            DenseOrOperator::Borrowed(dense) => Cow::Borrowed(dense),
+            DenseOrOperator::Owned(dense) => Cow::Owned(dense),
+            DenseOrOperator::Operator(_) => {
+                return Err(
+                    "GaussianLocationScaleFamily exact psi path requires chunked operator support for oversized designs"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(Some((xmu, x_ls)))
+    }
+
     fn exact_newton_joint_hessian_for_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -5336,7 +5366,7 @@ impl GaussianLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_block_designs(Some(specs))? else {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
         self.exact_newton_joint_psi_terms_from_designs(
@@ -5357,7 +5387,7 @@ impl GaussianLocationScaleFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_block_designs(Some(specs))? else {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
         self.exact_newton_joint_psisecond_order_terms_from_designs(
@@ -5378,7 +5408,7 @@ impl GaussianLocationScaleFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some((xmu, x_ls)) = self.exact_joint_block_designs(Some(specs))? else {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
         self.exact_newton_joint_psihessian_directional_derivative_from_designs(
