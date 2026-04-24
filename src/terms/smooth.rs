@@ -3296,9 +3296,10 @@ pub fn build_smooth_design_withworkspace(
             // structure of the inner design.
             let inner_dense = match design_t {
                 DesignMatrix::Dense(d) => d,
-                DesignMatrix::Sparse(sp) => {
-                    crate::matrix::DenseDesignMatrix::from(sp.to_dense_arc())
-                }
+                DesignMatrix::Sparse(sp) => crate::matrix::DenseDesignMatrix::from(
+                    sp.try_to_dense_arc("shape-constrained coefficient transform")
+                        .map_err(BasisError::InvalidInput)?,
+                ),
             };
             let coeff_op = crate::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
                 .map_err(|e| {
@@ -4385,7 +4386,11 @@ fn apply_smooth_transform_to_design(
             )))
         }
         DesignMatrix::Sparse(inner) => {
-            let dense = inner.to_dense_arc().as_ref().dot(transform);
+            let dense = inner
+                .try_to_dense_arc("smooth identifiability sparse transform")
+                .map_err(BasisError::InvalidInput)?
+                .as_ref()
+                .dot(transform);
             Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 dense,
             )))
@@ -5279,7 +5284,7 @@ fn grouped_operatorhessian(
 struct SpatialPenaltyExactState {
     magnitude: CharbonnierScalarBlockState,
     gradient: CharbonnierGroupedBlockState,
-    curvature: CharbonnierScalarBlockState,
+    curvature: CharbonnierGroupedBlockState,
 }
 
 fn collocationgradient_blocks(
@@ -5302,6 +5307,29 @@ fn collocationgradient_blocks(
     Ok(out)
 }
 
+fn collocationhessian_blocks(
+    hessianrows: &Array1<f64>,
+    dimension: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    let block_dim = dimension.checked_mul(dimension).ok_or_else(|| {
+        EstimationError::InvalidInput("invalid collocation Hessian dimension overflow".to_string())
+    })?;
+    if block_dim == 0 || hessianrows.len() % block_dim != 0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "invalid collocation Hessian layout: rows={}, dimension={dimension}",
+            hessianrows.len()
+        )));
+    }
+    let p = hessianrows.len() / block_dim;
+    let mut out = Array2::<f64>::zeros((p, block_dim));
+    for k in 0..p {
+        for idx in 0..block_dim {
+            out[[k, idx]] = hessianrows[k * block_dim + idx];
+        }
+    }
+    Ok(out)
+}
+
 impl SpatialPenaltyExactState {
     fn from_beta_local(
         beta_local: ArrayView1<'_, f64>,
@@ -5315,12 +5343,14 @@ impl SpatialPenaltyExactState {
         //
         //   magnitude:  f = D0 beta_local
         //   slope:      v_k = G_k beta_local
-        //   curvature:  c = D2 beta_local
+        //   curvature:  H_k = D2_k beta_local
         //
         // where the gradient operator is stored in row-stacked form:
         //
         //   D1 beta_local in R^(P * d),
         //   row layout = (point 0, axis 0..d-1), (point 1, axis 0..d-1), ...
+        //   D2 beta_local in R^(P * d * d),
+        //   row layout = (point, Hessian axis_a, Hessian axis_b).
         //
         // so we first reshape that stacked vector into the grouped block array
         //
@@ -5336,6 +5366,7 @@ impl SpatialPenaltyExactState {
         // This is the canonical translation from coefficient-space beta to the
         // penalty-side mathematical objects used throughout the implementation.
         let gradientrows = cache.d1.dot(&beta_local);
+        let hessianrows = cache.d2.dot(&beta_local);
         Ok(Self {
             magnitude: CharbonnierScalarBlockState::from_signal(
                 cache.d0.dot(&beta_local),
@@ -5345,8 +5376,8 @@ impl SpatialPenaltyExactState {
                 collocationgradient_blocks(&gradientrows, cache.dimension)?,
                 epsilons[1],
             ),
-            curvature: CharbonnierScalarBlockState::from_signal(
-                cache.d2.dot(&beta_local),
+            curvature: CharbonnierGroupedBlockState::from_signal_blocks(
+                collocationhessian_blocks(&hessianrows, cache.dimension)?,
                 epsilons[2],
             ),
         })
@@ -5356,7 +5387,7 @@ impl SpatialPenaltyExactState {
         (
             self.magnitude.absolute_signal(),
             self.gradient.norm_signal(),
-            self.curvature.absolute_signal(),
+            self.curvature.norm_signal(),
         )
     }
 }
