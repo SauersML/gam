@@ -32,13 +32,6 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct SparseTraceWorkspace {
-    bound_factor_addr: Option<usize>,
-    selected_block_inv_cache: BTreeMap<(usize, usize), Array2<f64>>,
-    selected_support_inv_cache: BTreeMap<Vec<usize>, Array2<f64>>,
-}
-
 #[derive(Clone)]
 pub struct SparsePenaltyBlock {
     pub term_index: usize,
@@ -58,84 +51,6 @@ pub struct SparsePenalizedSystem {
     pub h_sparse: SparseColMat<usize, f64>,
     pub factor: SparseExactFactor,
     pub logdet_h: f64,
-}
-
-impl SparseTraceWorkspace {
-    fn bind_factor(&mut self, factor: &SparseExactFactor) {
-        let factor_addr = factor as *const SparseExactFactor as usize;
-        if self.bound_factor_addr != Some(factor_addr) {
-            self.bound_factor_addr = Some(factor_addr);
-            self.selected_block_inv_cache.clear();
-            self.selected_support_inv_cache.clear();
-        }
-    }
-
-    pub(crate) fn selected_block_inverse(
-        &mut self,
-        factor: &SparseExactFactor,
-        p_start: usize,
-        p_end: usize,
-    ) -> Result<&Array2<f64>, EstimationError> {
-        self.bind_factor(factor);
-        if p_end <= p_start || p_end > factor.n {
-            return Err(EstimationError::InvalidInput(format!(
-                "invalid selected-inverse block [{p_start},{p_end}) for dimension {}",
-                factor.n
-            )));
-        }
-        let key = (p_start, p_end);
-        if !self.selected_block_inv_cache.contains_key(&key) {
-            let block_dim = p_end - p_start;
-            let mut rhs = Array2::<f64>::zeros((factor.n, block_dim));
-            for j in 0..block_dim {
-                rhs[[p_start + j, j]] = 1.0;
-            }
-            let block = solve_sparse_spdmulti_row_range(factor, &rhs, p_start, p_end)?;
-            self.selected_block_inv_cache.insert(key, block);
-        }
-        self.selected_block_inv_cache.get(&key).ok_or_else(|| {
-            EstimationError::InvalidInput("selected inverse block cache lookup failed".to_string())
-        })
-    }
-
-    fn canonical_support(support: &[usize], n: usize) -> Result<Vec<usize>, EstimationError> {
-        let mut key = support.to_vec();
-        key.sort_unstable();
-        key.dedup();
-        if let Some(&bad) = key.iter().find(|&&idx| idx >= n) {
-            return Err(EstimationError::InvalidInput(format!(
-                "selected-inverse support index {bad} out of bounds for dimension {n}"
-            )));
-        }
-        Ok(key)
-    }
-
-    pub(crate) fn selected_support_inverse(
-        &mut self,
-        factor: &SparseExactFactor,
-        support: &[usize],
-    ) -> Result<&Array2<f64>, EstimationError> {
-        self.bind_factor(factor);
-        let key = Self::canonical_support(support, factor.n)?;
-        if key.is_empty() {
-            self.selected_support_inv_cache
-                .entry(key.clone())
-                .or_insert_with(|| Array2::<f64>::zeros((0, 0)));
-        } else if !self.selected_support_inv_cache.contains_key(&key) {
-            let m = key.len();
-            let mut rhs = Array2::<f64>::zeros((factor.n, m));
-            for (j, &idx) in key.iter().enumerate() {
-                rhs[[idx, j]] = 1.0;
-            }
-            let sub = solve_sparse_spdmulti_selected_rows(factor, &rhs, &key)?;
-            self.selected_support_inv_cache.insert(key.clone(), sub);
-        }
-        self.selected_support_inv_cache.get(&key).ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "selected inverse support cache lookup failed".to_string(),
-            )
-        })
-    }
 }
 
 pub fn dense_to_sparse(
@@ -271,41 +186,6 @@ pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     out
 }
 
-fn sparserow_quadratic_form_from_selected_inverse(
-    row_idx: &[usize],
-    rowval: &[f64],
-    support_pos: &BTreeMap<usize, usize>,
-    h_support: &Array2<f64>,
-) -> Result<f64, EstimationError> {
-    if row_idx.len() != rowval.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "row quadratic form support/value length mismatch: idx={}, val={}",
-            row_idx.len(),
-            rowval.len()
-        )));
-    }
-    let mut quad = 0.0_f64;
-    for (a, &ia) in row_idx.iter().enumerate() {
-        let pa = support_pos.get(&ia).ok_or_else(|| {
-            EstimationError::InvalidInput(format!(
-                "row support index {} missing from selected-inverse support map",
-                ia
-            ))
-        })?;
-        let va = rowval[a];
-        for (b, &ib) in row_idx.iter().enumerate() {
-            let pb = support_pos.get(&ib).ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
-                    "row support index {} missing from selected-inverse support map",
-                    ib
-                ))
-            })?;
-            quad += va * h_support[[*pa, *pb]] * rowval[b];
-        }
-    }
-    Ok(quad)
-}
-
 pub fn factorize_sparse_spd(
     h: &SparseColMat<usize, f64>,
 ) -> Result<SparseExactFactor, EstimationError> {
@@ -433,6 +313,13 @@ pub fn solve_sparse_spd<S>(
 where
     S: Data<Elem = f64>,
 {
+    if rhs.len() != factor.n {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD solve dimension mismatch: rhs has {}, factor has {}",
+            rhs.len(),
+            factor.n
+        )));
+    }
     let rhsview = FaerColView::new(rhs);
     let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array1::<f64>::zeros(rhs.len());
@@ -455,6 +342,13 @@ pub fn solve_sparse_spdmulti<S>(
 where
     S: Data<Elem = f64>,
 {
+    if rhs.nrows() != factor.n {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD multi-solve row mismatch: rhs has {}, factor has {}",
+            rhs.nrows(),
+            factor.n
+        )));
+    }
     let rhsview = FaerArrayView::new(rhs);
     let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array2::<f64>::zeros(rhs.raw_dim());
@@ -501,136 +395,6 @@ where
         sum += value;
     }
     Ok(sum)
-}
-
-pub fn solve_sparse_spdmulti_row_range<S>(
-    factor: &SparseExactFactor,
-    rhs: &ArrayBase<S, Ix2>,
-    row_start: usize,
-    row_end: usize,
-) -> Result<Array2<f64>, EstimationError>
-where
-    S: Data<Elem = f64>,
-{
-    if row_end < row_start || row_end > rhs.nrows() {
-        return Err(EstimationError::InvalidInput(format!(
-            "sparse SPD selected row range out of bounds: [{row_start},{row_end}) for {} rows",
-            rhs.nrows()
-        )));
-    }
-    let rhsview = FaerArrayView::new(rhs);
-    let out = factor.factor.solve(rhsview.as_ref());
-    let mut selected = Array2::<f64>::zeros((row_end - row_start, rhs.ncols()));
-    for row in row_start..row_end {
-        for col in 0..rhs.ncols() {
-            let value = out[(row, col)];
-            if !value.is_finite() {
-                return Err(EstimationError::InvalidInput(
-                    "sparse SPD selected row solve produced non-finite values".to_string(),
-                ));
-            }
-            selected[[row - row_start, col]] = value;
-        }
-    }
-    Ok(selected)
-}
-
-pub fn solve_sparse_spdmulti_selected_rows<S>(
-    factor: &SparseExactFactor,
-    rhs: &ArrayBase<S, Ix2>,
-    rows: &[usize],
-) -> Result<Array2<f64>, EstimationError>
-where
-    S: Data<Elem = f64>,
-{
-    if let Some(&bad) = rows.iter().find(|&&row| row >= rhs.nrows()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "sparse SPD selected row out of bounds: row={bad}, rows={}",
-            rhs.nrows()
-        )));
-    }
-    let rhsview = FaerArrayView::new(rhs);
-    let out = factor.factor.solve(rhsview.as_ref());
-    let mut selected = Array2::<f64>::zeros((rows.len(), rhs.ncols()));
-    for (local_row, &row) in rows.iter().enumerate() {
-        for col in 0..rhs.ncols() {
-            let value = out[(row, col)];
-            if !value.is_finite() {
-                return Err(EstimationError::InvalidInput(
-                    "sparse SPD selected row solve produced non-finite values".to_string(),
-                ));
-            }
-            selected[[local_row, col]] = value;
-        }
-    }
-    Ok(selected)
-}
-
-pub fn trace_hinv_sk(
-    factor: &SparseExactFactor,
-    workspace: &mut SparseTraceWorkspace,
-    penalty: &SparsePenaltyBlock,
-) -> Result<f64, EstimationError> {
-    // Selected-inversion style path:
-    // For block-local spline penalties S_k (and their roots R_k), we only need
-    // H^{-1} entries on that block support. We compute and cache
-    // H^{-1}[p_start:p_end, p_start:p_end] exactly by solving for identity columns
-    // in that block once, then reuse across all row quadratics in tr(R_k H^{-1} R_k^T).
-    if penalty.block_support_strict && penalty.p_end > penalty.p_start {
-        let p_start = penalty.p_start;
-        let p_end = penalty.p_end;
-        let h_block = workspace.selected_block_inverse(factor, p_start, p_end)?;
-        let s_block = penalty.s_k_block_dense.as_ref();
-        if h_block.raw_dim() != s_block.raw_dim() {
-            return Err(EstimationError::InvalidInput(format!(
-                "selected block inverse and penalty block dimension mismatch: H={}x{}, S={}x{}",
-                h_block.nrows(),
-                h_block.ncols(),
-                s_block.nrows(),
-                s_block.ncols()
-            )));
-        }
-        let mut total = 0.0_f64;
-        for &(i, j, value) in penalty.s_k_block_upper_entries.iter() {
-            if i == j {
-                total += h_block[[i, j]] * value;
-            } else {
-                // H^{-1} and S are symmetric on this SPD branch.
-                total += 2.0 * h_block[[i, j]] * value;
-            }
-        }
-        return Ok(total);
-    }
-
-    let symbolic = penalty.r_krows.symbolic();
-    let row_ptr = symbolic.row_ptr();
-    let col_idx = symbolic.col_idx();
-    let values = penalty.r_krows.val();
-
-    // Takahashi-style selected support route (exact): build H^{-1}_{J,J} once
-    // for J = union(support(R_k)), then evaluate all row quadratics using only
-    // selected inverse entries.
-    let mut support = col_idx.to_vec();
-    support.sort_unstable();
-    support.dedup();
-    let h_support = workspace.selected_support_inverse(factor, &support)?;
-    let mut support_pos = BTreeMap::<usize, usize>::new();
-    for (pos, &idx) in support.iter().enumerate() {
-        support_pos.insert(idx, pos);
-    }
-
-    let mut total = 0.0_f64;
-    for row in 0..penalty.r_krows.nrows() {
-        let start = row_ptr[row];
-        let end = row_ptr[row + 1];
-        total += sparserow_quadratic_form_from_selected_inverse(
-            &col_idx[start..end],
-            &values[start..end],
-            &support_pos,
-            h_support,
-        )?;
-    }
-    Ok(total)
 }
 
 pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, EstimationError> {
