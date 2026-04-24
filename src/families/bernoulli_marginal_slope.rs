@@ -70,6 +70,12 @@ pub(crate) struct DeviationPrepared {
     pub(crate) runtime: DeviationRuntime,
 }
 
+impl std::fmt::Debug for DeviationPrepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviationPrepared").finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct BernoulliMarginalSlopeTermSpec {
     pub y: Array1<f64>,
@@ -213,8 +219,15 @@ pub(crate) fn bernoulli_marginal_slope_eta_from_probability(
                     .map_err(|e| format!("{context} inverse-link jet failed at eta={eta}: {e}"))?;
                 Ok((jet.mu - target, jet.d1, jet.d2))
             };
-            let (eta, _, _) =
+            let (eta, _, residual) =
                 super::monotone_root::solve_monotone_root(eval, initial, context, 1e-12, 64, 64)?;
+            let residual_tol = 1e-12_f64.max(1e-10 * target.min(1.0 - target));
+            if residual.abs() > residual_tol {
+                return Err(format!(
+                    "{context} inverse-link solve failed: residual={residual:.3e} \
+                     at eta={eta:.6}, target probability={target:.6}, tolerance={residual_tol:.3e}"
+                ));
+            }
             Ok(eta)
         }
     }
@@ -448,13 +461,9 @@ fn validate_spec(
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
-            let Some(sigma) = sigma_fixed else {
-                return Err(
-                    "bernoulli-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
-                        .to_string(),
-                );
-            };
-            if !sigma.is_finite() || *sigma < 0.0 {
+            if let Some(sigma) = sigma_fixed
+                && (!sigma.is_finite() || *sigma < 0.0)
+            {
                 return Err(format!(
                     "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
                 ));
@@ -7784,12 +7793,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
         standardize_latent_z(&spec.z, &spec.weights, "bernoulli-marginal-slope")?;
     spec.z = z_standardized;
     let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
+    let sigma_learnable = matches!(
+        &spec.frailty,
+        FrailtySpec::GaussianShift { sigma_fixed: None }
+    );
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
             sigma_fixed: Some(s),
         } => Some(*s),
+        FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
         FrailtySpec::None => None,
-        FrailtySpec::GaussianShift { sigma_fixed: None } | FrailtySpec::HazardMultiplier { .. } => {
+        FrailtySpec::HazardMultiplier { .. } => {
             unreachable!("validate_spec rejects unsupported marginal-slope frailty")
         }
     };
@@ -7890,6 +7904,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &extra_rho0,
         kappa_options,
     );
+    let setup = if sigma_learnable {
+        setup.with_auxiliary(
+            Array1::from_vec(vec![initial_sigma.expect("learnable sigma seed").ln()]),
+            Array1::from_vec(vec![0.01_f64.ln()]),
+            Array1::from_vec(vec![5.0_f64.ln()]),
+        )
+    } else {
+        setup
+    };
+    let final_sigma_cell = std::cell::Cell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
     let hints = RefCell::new(ThetaHints::default());
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
@@ -7997,6 +8021,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
             joint_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
         );
+    let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
+        if sigma_learnable {
+            Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
+        } else {
+            initial_sigma
+        }
+    };
     let derivative_block_cache = RefCell::new(
         None::<(
             Array1<f64>,
@@ -8058,6 +8089,20 @@ pub fn fit_bernoulli_marginal_slope_terms(
             if link_dev_runtime.is_some() {
                 derivative_blocks.push(Vec::new());
             }
+            if sigma_learnable {
+                derivative_blocks
+                    .last_mut()
+                    .expect("bernoulli derivative block list is non-empty")
+                    .push(crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                        None,
+                        Array2::zeros((0, 0)),
+                        Array2::zeros((0, 0)),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ));
+            }
             Ok(derivative_blocks)
         }(specs, designs)?;
         let built = Arc::new(built);
@@ -8082,7 +8127,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], initial_sigma);
+            let sigma = sigma_from_theta(theta);
+            final_sigma_cell.set(sigma);
+            let family = make_family(&designs[0], &designs[1], sigma);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             let mut bidx = 0usize;
@@ -8110,7 +8157,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], initial_sigma);
+            let sigma = sigma_from_theta(theta);
+            final_sigma_cell.set(sigma);
+            let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
@@ -8138,7 +8187,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
-            let family = make_family(&designs[0], &designs[1], initial_sigma);
+            let sigma = sigma_from_theta(theta);
+            final_sigma_cell.set(sigma);
+            let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
@@ -8166,7 +8217,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         z_normalization,
         score_warp_runtime,
         link_dev_runtime,
-        gaussian_frailty_sd: initial_sigma,
+        gaussian_frailty_sd: final_sigma_cell.get(),
     })
 }
 

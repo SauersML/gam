@@ -213,7 +213,7 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     anchor_row,
                 )?;
             }
-            let (r_eta_entry, r_eta_exit, r_deriv_exit) = build_baseline_offsets_by_mode(
+            let (_r_eta_entry, r_eta_exit, r_deriv_exit) = build_baseline_offsets_by_mode(
                 &single_entry,
                 &single_exit,
                 &baseline_cfg,
@@ -242,7 +242,9 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 SurvivalLikelihoodMode::Latent
                 | SurvivalLikelihoodMode::LatentBinary
                 | SurvivalLikelihoodMode::LocationScale => {
-                    return Err("unreachable: unsupported likelihood_mode filtered earlier".to_string());
+                    return Err(
+                        "unreachable: unsupported likelihood_mode filtered earlier".to_string()
+                    );
                 }
             };
             if per_row_eval {
@@ -255,8 +257,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 cumulative_hazard[[i, j]] = cum_t;
                 survival[[i, j]] = (-cum_t).exp().clamp(0.0, 1.0);
             }
-            // Unused-binding parity (matches ambient construction path).
-            let _ = &r_eta_entry;
         }
         if !per_row_eval {
             // Track the linear predictor at each row's own exit time.
@@ -300,7 +300,9 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 SurvivalLikelihoodMode::Latent
                 | SurvivalLikelihoodMode::LatentBinary
                 | SurvivalLikelihoodMode::LocationScale => {
-                    return Err("unreachable: unsupported likelihood_mode filtered earlier".to_string());
+                    return Err(
+                        "unreachable: unsupported likelihood_mode filtered earlier".to_string()
+                    );
                 }
             };
             linear_predictor[i] = eta_t;
@@ -366,7 +368,7 @@ fn evaluate_marginal_slope_row(
         + primary_offset_row;
     let qd_exit_base = row_time.x_derivative_time.dot(&beta_time_base)[0] + r_deriv_exit[0];
 
-    let eta = if let Some(runtime) = saved_timewiggle.as_ref() {
+    let (eta, eta_derivative) = if let Some(runtime) = saved_timewiggle.as_ref() {
         let knots = Array1::from_vec(runtime.knots.clone());
         let beta_w = beta_time.slice(s![p_time_base..]).to_owned();
         let eta_exit_row = Array1::from_elem(1, q_exit_base);
@@ -385,22 +387,29 @@ fn evaluate_marginal_slope_row(
                 return Err("saved baseline-timewiggle exit design must be dense".to_string());
             }
         };
-        let _ = build_survival_timewiggle_derivative_design(
+        let derivative_design = build_survival_timewiggle_derivative_design(
             &eta_exit_row,
             &deriv_row,
             &knots,
             runtime.degree,
         )?;
-        q_exit_base + exit_design.dot(&beta_w)[0]
+        (
+            q_exit_base + exit_design.dot(&beta_w)[0],
+            qd_exit_base + derivative_design.dot(&beta_w)[0],
+        )
     } else {
-        q_exit_base
+        (q_exit_base, qd_exit_base)
     };
 
     let surv = normal_cdf(-eta).clamp(1e-300, 1.0);
     let cum = -surv.ln();
     let phi_eta = (-0.5 * eta * eta).exp() / (2.0f64 * std::f64::consts::PI).sqrt();
-    let mut haz = phi_eta * qd_exit_base.abs();
+    let mut haz = phi_eta * eta_derivative.max(0.0);
     if !(haz.is_finite() && haz > 0.0) {
+        // Floor to a tiny positive value rather than erroring; the
+        // survival/cumulative-hazard outputs remain exact and the hazard
+        // estimate is only a diagnostic derived from the time
+        // derivative of eta.
         haz = 1e-12;
     }
     Ok((eta, cum, haz))
