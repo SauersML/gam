@@ -797,8 +797,18 @@ def run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout):
                 pass
         return metrics
 
-    except subprocess.TimeoutExpired:
-        return {"error": "timeout", "time": rust_timeout}
+    except subprocess.TimeoutExpired as e:
+        # subprocess.run(capture_output=True) buffers stderr/stdout; on timeout
+        # the TimeoutExpired exception exposes whatever was captured before the
+        # kill. Surface it so diagnostic logs emitted before the 60s wall make
+        # it into fuzz_results.jsonl (otherwise every timeout is opaque and we
+        # can't tell which iteration / function was stuck).
+        return {
+            "error": "timeout",
+            "time": rust_timeout,
+            "stderr": (e.stderr or "") if hasattr(e, "stderr") else "",
+            "stdout": (e.stdout or "") if hasattr(e, "stdout") else "",
+        }
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
@@ -919,8 +929,13 @@ tryCatch({{
                 result[key] = float(out[key])
         return result
 
-    except subprocess.TimeoutExpired:
-        return {"error": "timeout", "time": r_timeout}
+    except subprocess.TimeoutExpired as e:
+        return {
+            "error": "timeout",
+            "time": r_timeout,
+            "stderr": (e.stderr or "") if hasattr(e, "stderr") else "",
+            "stdout": (e.stdout or "") if hasattr(e, "stdout") else "",
+        }
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
