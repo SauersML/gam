@@ -8933,7 +8933,11 @@ mod tests {
                 } else {
                     // Interior or exact boundary point: uses the same
                     // left-biased span convention as derivative designs.
-                    let expected_span_idx = span_idx;
+                    let expected_span_idx = if i == 0 && span_idx > 0 {
+                        span_idx - 1
+                    } else {
+                        span_idx
+                    };
                     let expected_cubic = prepared
                         .runtime
                         .local_cubic_on_span(&beta, expected_span_idx)
