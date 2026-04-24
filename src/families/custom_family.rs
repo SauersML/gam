@@ -2946,13 +2946,16 @@ pub(crate) fn weighted_crossprod_psi_maps(
 
 pub(crate) fn first_psi_linear_map<'a>(
     action: Option<&'a CustomFamilyPsiDesignAction>,
-    dense: &'a Array2<f64>,
+    dense: Option<&'a Array2<f64>>,
     nrows: usize,
     ncols: usize,
 ) -> CustomFamilyPsiLinearMapRef<'a> {
     if let Some(action) = action {
         CustomFamilyPsiLinearMapRef::First(action)
-    } else if dense.nrows() == nrows && dense.ncols() == ncols {
+    } else if let Some(dense) = dense
+        && dense.nrows() == nrows
+        && dense.ncols() == ncols
+    {
         CustomFamilyPsiLinearMapRef::Dense(dense)
     } else {
         CustomFamilyPsiLinearMapRef::Zero { nrows, ncols }
@@ -3461,13 +3464,43 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
 
 pub(crate) struct ExactNewtonJointPsiDirectCache<T> {
     entries: Vec<Mutex<Option<Option<Arc<T>>>>>,
+    lru: Mutex<std::collections::VecDeque<usize>>,
+    limit: usize,
 }
 
 impl<T> ExactNewtonJointPsiDirectCache<T> {
+    const DEFAULT_LIMIT: usize = 4;
+
     pub(crate) fn new(len: usize) -> Self {
         Self {
             entries: (0..len).map(|_| Mutex::new(None)).collect(),
+            lru: Mutex::new(std::collections::VecDeque::new()),
+            limit: Self::DEFAULT_LIMIT.min(len),
         }
+    }
+
+    fn touch_lru(&self, index: usize) -> Result<(), String> {
+        let mut lru = self
+            .lru
+            .lock()
+            .map_err(|_| "joint psi direct cache lru poisoned".to_string())?;
+        lru.retain(|&existing| existing != index);
+        lru.push_back(index);
+        while lru.len() > self.limit {
+            let Some(evict_index) = lru.pop_front() else {
+                break;
+            };
+            if evict_index == index {
+                continue;
+            }
+            if let Some(entry) = self.entries.get(evict_index) {
+                let mut guard = entry
+                    .lock()
+                    .map_err(|_| "joint psi direct cache poisoned".to_string())?;
+                *guard = None;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn get_or_try_init<F>(&self, index: usize, init: F) -> Result<Option<Arc<T>>, String>
@@ -3485,6 +3518,8 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
                 .lock()
                 .map_err(|_| "joint psi direct cache poisoned".to_string())?;
             if let Some(cached) = guard.as_ref() {
+                drop(guard);
+                self.touch_lru(index)?;
                 return Ok(cached.clone());
             }
         }
@@ -3494,7 +3529,10 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
             .lock()
             .map_err(|_| "joint psi direct cache poisoned".to_string())?;
         let cached = guard.get_or_insert_with(|| computed.clone());
-        Ok(cached.clone())
+        let out = cached.clone();
+        drop(guard);
+        self.touch_lru(index)?;
+        Ok(out)
     }
 }
 
