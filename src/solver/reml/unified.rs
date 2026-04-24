@@ -3389,12 +3389,8 @@ fn dense_matvec_into(
 ) {
     debug_assert_eq!(matrix.ncols(), x.len());
     debug_assert_eq!(matrix.nrows(), out.len());
-    for row in 0..matrix.nrows() {
-        let mut value = 0.0;
-        for col in 0..matrix.ncols() {
-            value += matrix[[row, col]] * x[col];
-        }
-        out[row] = value;
+    for (row, out_value) in matrix.rows().into_iter().zip(out.iter_mut()) {
+        *out_value = row.dot(&x);
     }
 }
 
@@ -3410,12 +3406,8 @@ fn dense_matvec_scaled_add_into(
     if scale == 0.0 {
         return;
     }
-    for row in 0..matrix.nrows() {
-        let mut value = 0.0;
-        for col in 0..matrix.ncols() {
-            value += matrix[[row, col]] * x[col];
-        }
-        out[row] += scale * value;
+    for (row, out_value) in matrix.rows().into_iter().zip(out.iter_mut()) {
+        *out_value += scale * row.dot(&x);
     }
 }
 
@@ -3427,13 +3419,8 @@ fn dense_transpose_matvec_into(
 ) {
     debug_assert_eq!(matrix.nrows(), x.len());
     debug_assert_eq!(matrix.ncols(), out.len());
-    for col in 0..matrix.ncols() {
-        let mut value = 0.0;
-        for row in 0..matrix.nrows() {
-            value += matrix[[row, col]] * x[row];
-        }
-        out[col] = value;
-    }
+    out.fill(0.0);
+    dense_transpose_matvec_scaled_add_into(matrix, x, 1.0, out);
 }
 
 #[inline]
@@ -3448,12 +3435,14 @@ fn dense_transpose_matvec_scaled_add_into(
     if scale == 0.0 {
         return;
     }
-    for col in 0..matrix.ncols() {
-        let mut value = 0.0;
-        for row in 0..matrix.nrows() {
-            value += matrix[[row, col]] * x[row];
+    for (row, x_value) in matrix.rows().into_iter().zip(x.iter().copied()) {
+        let row_scale = scale * x_value;
+        if row_scale == 0.0 {
+            continue;
         }
-        out[col] += scale * value;
+        for (out_value, entry) in out.iter_mut().zip(row.iter().copied()) {
+            *out_value += row_scale * entry;
+        }
     }
 }
 
@@ -3462,12 +3451,8 @@ fn dense_bilinear(matrix: &Array2<f64>, v: ArrayView1<'_, f64>, u: ArrayView1<'_
     debug_assert_eq!(matrix.ncols(), v.len());
     debug_assert_eq!(matrix.nrows(), u.len());
     let mut total = 0.0;
-    for row in 0..matrix.nrows() {
-        let mut row_dot = 0.0;
-        for col in 0..matrix.ncols() {
-            row_dot += matrix[[row, col]] * v[col];
-        }
-        total += u[row] * row_dot;
+    for (row, u_value) in matrix.rows().into_iter().zip(u.iter().copied()) {
+        total += u_value * row.dot(&v);
     }
     total
 }
