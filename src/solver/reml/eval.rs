@@ -1,33 +1,7 @@
-use super::inner_strategy::{GeometryBackendKind, HessianEvalStrategyKind};
+use super::inner_strategy::GeometryBackendKind;
 use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
-
-// The diagnostic FD reference Hessian uses central-difference quotients of
-// `compute_cost`.  The relevant noise floor is PIRLS inner-loop convergence
-// (`*_inner_tol` ≈ 1e-9 by default for Firth / tightened 1e-12 elsewhere) —
-// for a generic cost of order 1 the roundoff component of the second-
-// difference stencil scales like `tol / h²`.  With `h ≈ 1e-4` the roundoff
-// is ~1e-1 relative, which is exactly the scale that dominated the Firth
-// rank-deficient diagnostic-vs-exact comparison on a 10-observation
-// logistic test.  Raising the relative step to `1e-3` keeps truncation
-// (O(h² · f''')) below 1e-6 while pushing roundoff down by two orders of
-// magnitude, so the FD reference is faithful enough to judge the analytic
-// Hessian on rank-deficient designs where the residual gap between exact
-// and FD is intrinsically O(tol/h²)-dominated at the old step.
-const DIAGNOSTIC_HESSIAN_FD_REL_STEP: f64 = 1e-3;
-const DIAGNOSTIC_HESSIAN_FD_ABS_STEP: f64 = 1e-4;
-const DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD: f64 = 1e-8;
-
-struct EvalCacheInvalidationGuard<'a> {
-    cache_manager: &'a EvalCacheManager,
-}
-
-impl Drop for EvalCacheInvalidationGuard<'_> {
-    fn drop(&mut self) {
-        self.cache_manager.invalidate_eval_bundle();
-    }
-}
 
 impl<'a> RemlState<'a> {
     /// Compute first and second derivatives of the exact pseudo-logdet
@@ -112,92 +86,6 @@ impl<'a> RemlState<'a> {
         Ok((det1, det2))
     }
 
-    fn diagnostic_hessian_fd_step(&self, rho_i: f64) -> Result<f64, EstimationError> {
-        let base = (DIAGNOSTIC_HESSIAN_FD_REL_STEP * (1.0 + rho_i.abs()))
-            .max(DIAGNOSTIC_HESSIAN_FD_ABS_STEP);
-        let symmetric_room = (RHO_BOUND - DIAGNOSTIC_HESSIAN_BOUNDARY_GUARD - rho_i.abs()).max(0.0);
-        let step = base.min(0.5 * symmetric_room);
-        if !step.is_finite() || step <= 0.0 {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "diagnostic numeric Hessian has no symmetric finite-difference room at rho={rho_i:.6e}"
-            )));
-        }
-        Ok(step)
-    }
-
-    pub(super) fn compute_lamlhessian_diagnostic_numeric(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        let k = rho.len();
-        let mut h = Array2::<f64>::zeros((k, k));
-        if k == 0 {
-            return Ok(h);
-        }
-        // This routine probes multiple perturbed rho values via `compute_cost`,
-        // which updates the single-slot eval caches. Drop them on exit so later
-        // callers never observe a bundle or outer eval keyed to a perturbation.
-        let _cache_guard = EvalCacheInvalidationGuard {
-            cache_manager: &self.cache_manager,
-        };
-
-        let f0 = self.compute_cost(rho)?;
-        let mut steps = Vec::with_capacity(k);
-        for i in 0..k {
-            steps.push(self.diagnostic_hessian_fd_step(rho[i])?);
-        }
-
-        for i in 0..k {
-            let hi = steps[i];
-
-            let mut rho_p = rho.clone();
-            rho_p[i] += hi;
-            let f_p = self.compute_cost(&rho_p)?;
-
-            let mut rho_m = rho.clone();
-            rho_m[i] -= hi;
-            let f_m = self.compute_cost(&rho_m)?;
-
-            h[[i, i]] = (f_p - 2.0 * f0 + f_m) / (hi * hi);
-
-            for j in 0..i {
-                let hj = steps[j];
-
-                let mut rho_pp = rho.clone();
-                rho_pp[i] += hi;
-                rho_pp[j] += hj;
-                let f_pp = self.compute_cost(&rho_pp)?;
-
-                let mut rho_pm = rho.clone();
-                rho_pm[i] += hi;
-                rho_pm[j] -= hj;
-                let f_pm = self.compute_cost(&rho_pm)?;
-
-                let mut rho_mp = rho.clone();
-                rho_mp[i] -= hi;
-                rho_mp[j] += hj;
-                let f_mp = self.compute_cost(&rho_mp)?;
-
-                let mut rho_mm = rho.clone();
-                rho_mm[i] -= hi;
-                rho_mm[j] -= hj;
-                let f_mm = self.compute_cost(&rho_mm)?;
-
-                let hij = (f_pp - f_pm - f_mp + f_mm) / (4.0 * hi * hj);
-                h[[i, j]] = hij;
-                h[[j, i]] = hij;
-            }
-        }
-
-        enforce_symmetry(&mut h);
-        if h.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "diagnostic numeric Hessian produced non-finite values".to_string(),
-            ));
-        }
-        Ok(h)
-    }
-
     pub(super) fn compute_lamlhessian_exact_from_bundle(
         &self,
         rho: &Array1<f64>,
@@ -225,22 +113,8 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let decision = self.selecthessian_strategy_policy(rho, &bundle);
-        if decision.strategy != HessianEvalStrategyKind::SpectralExact {
-            log::warn!(
-                "LAML Hessian strategy selected {:?} (reason={}).",
-                decision.strategy,
-                decision.reason
-            );
-        }
-        match decision.strategy {
-            HessianEvalStrategyKind::SpectralExact => {
-                self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
-            }
-            HessianEvalStrategyKind::DiagnosticNumeric => {
-                self.compute_lamlhessian_diagnostic_numeric(rho)
-            }
-        }
+        let _decision = self.selecthessian_strategy_policy(rho, &bundle);
+        self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
     }
 
     pub(crate) fn compute_smoothing_correction_auto(
@@ -494,12 +368,5 @@ impl<'a> RemlState<'a> {
             max_rhovar
         );
         Some(corr)
-    }
-}
-
-impl<'a> RemlState<'a> {
-    pub(super) fn usesobjective_consistentfdgradient(&self, _: &Array1<f64>) -> bool {
-        self.config.link_function() != LinkFunction::Identity
-            && self.config.objective_consistentfdgradient
     }
 }
