@@ -2315,7 +2315,12 @@ impl TensorKroneckerPsiOperator {
                 "missing covariate psi materialization for axis {axis}"
             )));
         };
-        op.materialize_first(deriv.implicit_axis)
+        let mat_op = op.as_materializable().ok_or_else(|| {
+            crate::terms::basis::BasisError::InvalidInput(format!(
+                "covariate psi operator for axis {axis} does not support dense materialization"
+            ))
+        })?;
+        mat_op.materialize_first(deriv.implicit_axis)
     }
 
     fn materialize_cov_second(
@@ -2328,10 +2333,15 @@ impl TensorKroneckerPsiOperator {
             && deriv_d.implicit_group_id.is_some()
             && deriv_d.implicit_group_id == self.cov_deriv(axis_e)?.implicit_group_id
         {
+            let mat_op = op.as_materializable().ok_or_else(|| {
+                crate::terms::basis::BasisError::InvalidInput(format!(
+                    "covariate psi operator for axes {axis_d},{axis_e} does not support dense materialization"
+                ))
+            })?;
             if deriv_d.implicit_axis == self.cov_deriv(axis_e)?.implicit_axis {
-                return op.materialize_second_diag(deriv_d.implicit_axis);
+                return mat_op.materialize_second_diag(deriv_d.implicit_axis);
             }
-            return op.materialize_second_cross(
+            return mat_op.materialize_second_cross(
                 deriv_d.implicit_axis,
                 self.cov_deriv(axis_e)?.implicit_axis,
             );

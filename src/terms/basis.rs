@@ -1445,6 +1445,151 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     k.min(n).min(small_data_cap)
 }
 
+/// Resource-aware plan for a spatial smooth (Duchon / Matérn / TPS).
+///
+/// Returned by [`plan_spatial_basis`]. Captures the resolved center count,
+/// final basis dimension `p`, the dense byte cost for the value matrix and
+/// each derivative tier, and a recommended storage mode that is consistent
+/// with the supplied [`crate::resource::ResourcePolicy`].
+#[derive(Clone, Debug)]
+pub struct SpatialBasisPlan {
+    pub n: usize,
+    pub d: usize,
+    pub centers: usize,
+    pub p_final_estimate: usize,
+    pub dense_design_bytes: usize,
+    pub first_derivative_dense_bytes: usize,
+    pub second_derivative_dense_bytes: usize,
+    pub recommended_storage: SpatialStorageMode,
+}
+
+/// Storage mode recommended by [`plan_spatial_basis`].
+///
+/// * `DenseValueDenseDerivatives` — both the value design and its derivative
+///   matrices fit under the policy's single-materialization budget.
+/// * `LazyValueImplicitDerivatives` — the value design fits dense but the
+///   derivative matrices do not; switch derivatives to the implicit operator.
+/// * `OperatorOnly` — neither the design nor its derivatives fit; everything
+///   must be operator-backed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpatialStorageMode {
+    DenseValueDenseDerivatives,
+    LazyValueImplicitDerivatives,
+    OperatorOnly,
+}
+
+/// How [`plan_spatial_basis`] should pick the spatial center count.
+#[derive(Clone, Copy, Debug)]
+pub enum CenterCountRequest {
+    /// Use the heuristic [`default_num_centers`].
+    Default,
+    /// Use the caller-supplied count exactly.
+    Explicit(usize),
+    /// Use [`default_num_centers`] but cap at `cap` to bound dense cost.
+    HeuristicCapped { cap: usize },
+}
+
+/// Build a resource-aware plan for a spatial smooth basis.
+///
+/// Computes the resolved center count, final basis dimension, dense byte
+/// estimates for the value design and first/second derivative tiers, and a
+/// recommended [`SpatialStorageMode`] derived from `policy`. This is the
+/// resource-aware replacement for ad-hoc calls to [`default_num_centers`] /
+/// [`heuristic_centers`](crate::terms::term_builder::heuristic_centers).
+pub fn plan_spatial_basis(
+    n: usize,
+    d: usize,
+    requested_centers: CenterCountRequest,
+    nullspace_order: DuchonNullspaceOrder,
+    scale_dims: bool,
+    policy: &crate::resource::ResourcePolicy,
+) -> Result<SpatialBasisPlan, BasisError> {
+    if n == 0 {
+        return Err(BasisError::InvalidInput(
+            "plan_spatial_basis: n must be >= 1".to_string(),
+        ));
+    }
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "plan_spatial_basis: d must be >= 1".to_string(),
+        ));
+    }
+
+    // 1. Resolve center count.
+    let centers = match requested_centers {
+        CenterCountRequest::Default => default_num_centers(n, d),
+        CenterCountRequest::Explicit(k) => k,
+        CenterCountRequest::HeuristicCapped { cap } => default_num_centers(n, d).min(cap),
+    };
+
+    // 2. Nullspace dimension (Duchon polynomial null space of degree p-1).
+    //    `duchon_p_from_nullspace_order` returns m such that the null space is
+    //    polynomials of total degree < m, matching `duchon_nullspace_dimension`'s
+    //    `max_total_degree = m - 1` argument.
+    let m = duchon_p_from_nullspace_order(nullspace_order);
+    let nullspace_dim = if m == 0 {
+        0
+    } else {
+        duchon_nullspace_dimension(d, m - 1)
+    };
+
+    let p = centers.saturating_add(nullspace_dim);
+
+    // 3. Dense byte estimates.
+    let derivative_axes = if scale_dims { d } else { 0 };
+    let bytes_per_f64 = std::mem::size_of::<f64>();
+    let dense_design_bytes = bytes_per_f64
+        .saturating_mul(n)
+        .saturating_mul(p);
+    let first_derivative_dense_bytes = dense_design_bytes.saturating_mul(derivative_axes);
+    // Diagonal second derivatives are also (D × n × p); off-diagonal cross terms
+    // would scale as D^2 but the planner reports the diagonal tier here.
+    let second_derivative_dense_bytes = first_derivative_dense_bytes;
+
+    // 4. Pick storage mode based on policy.
+    let recommended_storage = match policy.derivative_storage_mode {
+        crate::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
+            SpatialStorageMode::OperatorOnly
+        }
+        crate::resource::DerivativeStorageMode::MaterializeIfSmall => {
+            let budget = policy.max_single_materialization_bytes;
+            if derivative_axes == 0 {
+                if dense_design_bytes <= budget {
+                    SpatialStorageMode::DenseValueDenseDerivatives
+                } else {
+                    SpatialStorageMode::LazyValueImplicitDerivatives
+                }
+            } else {
+                let total = dense_design_bytes
+                    .saturating_add(first_derivative_dense_bytes)
+                    .saturating_add(second_derivative_dense_bytes);
+                if total <= budget {
+                    SpatialStorageMode::DenseValueDenseDerivatives
+                } else if dense_design_bytes <= budget {
+                    SpatialStorageMode::LazyValueImplicitDerivatives
+                } else {
+                    SpatialStorageMode::OperatorOnly
+                }
+            }
+        }
+        crate::resource::DerivativeStorageMode::DiagnosticsOnly => {
+            // Diagnostic mode still prefers analytic storage for correctness.
+            SpatialStorageMode::OperatorOnly
+        }
+    };
+
+    Ok(SpatialBasisPlan {
+        n,
+        d,
+        centers,
+        p_final_estimate: p,
+        dense_design_bytes,
+        first_derivative_dense_bytes,
+        second_derivative_dense_bytes,
+        recommended_storage,
+    })
+}
+
 pub fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     if d >= 4 {
         CenterStrategy::EqualMassCovarRepresentative { num_centers }
@@ -1908,32 +2053,48 @@ impl AnisoPenaltyCrossProvider {
 //  Implicit derivative operator for scalable anisotropic REML gradients
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Memory threshold (in bytes) above which implicit operators are used
-/// instead of dense materialization of ∂X/∂ψ_d matrices.
+const SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
+
+/// Determine whether implicit operators should be used based on problem size
+/// and the supplied [`ResourcePolicy`].
+///
+/// Returns `true` when the dense materialization of D first-derivative
+/// matrices would exceed `policy.max_single_materialization_bytes`.
 ///
 /// For D axes with n data points and p_smooth basis columns, the dense path
 /// allocates D * n * p_smooth * 8 bytes for first-derivative matrices alone
 /// (plus a similar amount for second derivatives). The implicit path stores
 /// only the compact (n * n_knots) radial jets plus (n * n_knots * D) axis
 /// fractions, which is O(n * k * D) instead of O(n * p * D).
-const IMPLICIT_OPERATOR_MEMORY_THRESHOLD: usize = 1_000_000_000; // 1 GB
-/// Memory threshold (in bytes) above which spatial kernel designs switch to a
-/// lazy chunked operator instead of dense n×p materialization.
-const SPATIAL_LAZY_DESIGN_MEMORY_THRESHOLD: usize = 256 * 1024 * 1024; // 256 MiB
-const SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
-const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
-
-/// Determine whether implicit operators should be used based on problem size.
-///
-/// Returns `true` when the dense materialization of D first-derivative
-/// matrices would exceed the memory threshold (default 1 GB).
-pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
+pub fn should_use_implicit_operators_with_policy(
+    n: usize,
+    p: usize,
+    d: usize,
+    policy: &crate::resource::ResourcePolicy,
+) -> bool {
     // Each first-derivative matrix is (n x p) f64 → n*p*8 bytes.
     // We need D of them for first derivatives, D for second diag, plus
     // the cross-t matrix and s_components. Conservative estimate: 3*D matrices.
-    let dense_bytes = 3 * n * p * d * 8;
-    dense_bytes > IMPLICIT_OPERATOR_MEMORY_THRESHOLD
+    let dense_bytes = 3usize
+        .saturating_mul(n)
+        .saturating_mul(p)
+        .saturating_mul(d)
+        .saturating_mul(8);
+    dense_bytes > policy.max_single_materialization_bytes
+}
+
+/// Backwards-compatible wrapper around [`should_use_implicit_operators_with_policy`]
+/// that uses the default library [`crate::resource::ResourcePolicy`].
+pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
+    // TODO(resource-policy-migration): thread policy through callers
+    should_use_implicit_operators_with_policy(
+        n,
+        p,
+        d,
+        &crate::resource::ResourcePolicy::default_library(),
+    )
 }
 
 pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
@@ -1987,8 +2148,8 @@ fn dense_design_bytes(n: usize, p: usize) -> usize {
         .saturating_mul(std::mem::size_of::<f64>())
 }
 
-fn should_use_lazy_spatial_design(n: usize, p: usize) -> bool {
-    dense_design_bytes(n, p) > SPATIAL_LAZY_DESIGN_MEMORY_THRESHOLD
+fn should_use_lazy_spatial_design(n: usize, p: usize, policy: &crate::resource::ResourcePolicy) -> bool {
+    dense_design_bytes(n, p) > policy.max_single_materialization_bytes
 }
 
 fn wrap_dense_design_with_transform(
@@ -5275,7 +5436,7 @@ pub fn build_thin_plate_basiswithworkspace(
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let base_cols = internal_kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
-    let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
+    let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols, workspace.policy());
     if use_lazy {
         // log::info! — deliberate memory-saving choice, not an anomaly.
         log::info!(
@@ -9753,7 +9914,7 @@ pub fn build_matern_basiswithworkspace(
     let design_cols =
         z_opt.as_ref().map_or(centers.nrows(), Array2::ncols) + usize::from(spec.include_intercept);
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
-    let use_lazy = should_use_lazy_spatial_design(data.nrows(), design_cols);
+    let use_lazy = should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
     let (design, candidates) = if use_lazy {
         // log::info! — deliberate memory-saving choice, not an anomaly.
         log::info!(
@@ -13006,7 +13167,7 @@ pub fn build_duchon_basiswithworkspace(
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let base_cols = kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
-    let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols);
+    let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols, workspace.policy());
     let (design, identifiability_transform) = if use_lazy {
         // log::info! — deliberate memory-saving choice, not an anomaly.
         log::info!(

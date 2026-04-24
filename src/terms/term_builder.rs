@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, HashMap};
 use ndarray::ArrayView1;
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
-    default_num_centers, default_spatial_center_strategy,
-    minimum_duchon_power_for_operator_penalties,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
+    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
+    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
+    minimum_duchon_power_for_operator_penalties, plan_spatial_basis,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -277,11 +277,18 @@ pub fn build_smooth_basis(
             })
         }
         "tps" | "thinplate" | "thin-plate" => {
-            let centers = parse_countwith_basis_alias(
-                options,
-                "centers",
-                heuristic_centers(ds.values.nrows(), cols.len()),
-            )?;
+            // TODO(spatial-plan-migration): thread workspace policy through
+            let plan = plan_spatial_basis(
+                ds.values.nrows(),
+                cols.len(),
+                CenterCountRequest::Default,
+                DuchonNullspaceOrder::Linear,
+                option_bool(options, "scale_dims").unwrap_or(false),
+                &crate::resource::ResourcePolicy::default_library(),
+            )
+            .map_err(|e| e.to_string())?;
+            let centers =
+                parse_countwith_basis_alias(options, "centers", plan.centers)?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
@@ -299,11 +306,18 @@ pub fn build_smooth_basis(
             })
         }
         "matern" => {
-            let centers = parse_countwith_basis_alias(
-                options,
-                "centers",
-                heuristic_centers(ds.values.nrows(), cols.len()),
-            )?;
+            // TODO(spatial-plan-migration): thread workspace policy through
+            let plan = plan_spatial_basis(
+                ds.values.nrows(),
+                cols.len(),
+                CenterCountRequest::Default,
+                DuchonNullspaceOrder::Zero,
+                option_bool(options, "scale_dims").unwrap_or(false),
+                &crate::resource::ResourcePolicy::default_library(),
+            )
+            .map_err(|e| e.to_string())?;
+            let centers =
+                parse_countwith_basis_alias(options, "centers", plan.centers)?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
@@ -336,17 +350,24 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
-            let centers = parse_countwith_basis_alias(
-                options,
-                "centers",
-                heuristic_centers(ds.values.nrows(), cols.len()),
-            )?;
+            let nullspace_order = parse_duchon_order(options)?;
+            // TODO(spatial-plan-migration): thread workspace policy through
+            let plan = plan_spatial_basis(
+                ds.values.nrows(),
+                cols.len(),
+                CenterCountRequest::Default,
+                nullspace_order,
+                option_bool(options, "scale_dims").unwrap_or(false),
+                &crate::resource::ResourcePolicy::default_library(),
+            )
+            .map_err(|e| e.to_string())?;
+            let centers =
+                parse_countwith_basis_alias(options, "centers", plan.centers)?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
-            let nullspace_order = parse_duchon_order(options)?;
             let power = match parse_duchon_power_policy(options)? {
                 DuchonPowerPolicy::Explicit(power) => power,
                 DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {

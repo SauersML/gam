@@ -2,7 +2,7 @@ use crate::faer_ndarray::{
     FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
     fast_av_into, fast_xt_diag_x,
 };
-use crate::resource::{MaterializationPolicy, MatrixMaterializationError};
+use crate::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
 use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::linalg::matmul::matmul;
@@ -24,8 +24,6 @@ const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
-// TODO(material-policy-migration): replace with ResourcePolicy.max_single_materialization_bytes
-const MAX_DENSE_OPERATOR_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
@@ -46,8 +44,24 @@ pub fn panic_or_error_if_biobank_mode_and_to_dense_called(
     n: usize,
     p: usize,
 ) -> Result<(), String> {
+    // TODO(resource-policy-migration): thread policy through callers
+    panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
+        context,
+        n,
+        p,
+        &ResourcePolicy::default_library(),
+    )
+}
+
+pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
+    context: &str,
+    n: usize,
+    p: usize,
+    policy: &ResourcePolicy,
+) -> Result<(), String> {
     let dense_bytes = checked_dense_nbytes(n, p, context)?;
-    if dense_bytes > MAX_DENSE_OPERATOR_TO_DENSE_BYTES {
+    let limit = policy.max_single_materialization_bytes;
+    if dense_bytes > limit {
         let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         return Err(format!(
             "{context}: refusing to densify operator-backed design {n}x{p} (~{gib:.2} GiB); use matrix-free or chunked code"
@@ -74,12 +88,30 @@ pub fn panic_or_error_if_derivative_dense_alloc_called(
     p: usize,
     d: usize,
 ) -> Result<(), String> {
+    // TODO(resource-policy-migration): thread policy through callers
+    panic_or_error_if_derivative_dense_alloc_called_with_policy(
+        context,
+        n,
+        p,
+        d,
+        &ResourcePolicy::default_library(),
+    )
+}
+
+pub fn panic_or_error_if_derivative_dense_alloc_called_with_policy(
+    context: &str,
+    n: usize,
+    p: usize,
+    d: usize,
+    policy: &ResourcePolicy,
+) -> Result<(), String> {
     let dense_bytes = n
         .checked_mul(p)
         .and_then(|cells| cells.checked_mul(d))
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
         .ok_or_else(|| format!("{context}: derivative dense size overflow for {d} x {n}x{p}"))?;
-    if dense_bytes > MAX_DENSE_OPERATOR_TO_DENSE_BYTES {
+    let limit = policy.max_single_materialization_bytes;
+    if dense_bytes > limit {
         let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         return Err(format!(
             "{context}: refusing to allocate {d} dense derivative matrices {n}x{p} (~{gib:.2} GiB); use implicit streaming derivatives"
