@@ -10,7 +10,6 @@ pub(super) enum GeometryBackendKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HessianEvalStrategyKind {
     SpectralExact,
-    DiagnosticNumeric,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -25,12 +24,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> HessianStrategyDecision {
-        if self.usesobjective_consistentfdgradient(rho) {
-            return HessianStrategyDecision {
-                strategy: HessianEvalStrategyKind::DiagnosticNumeric,
-                reason: "objective_consistent_numericgradient",
-            };
-        }
         // When the sparse-exact backend produced the PIRLS result, prefer
         // the sparse Hessian path for consistency (avoids dense→sparse
         // round-trip that loses sparsity structure).

@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_allows_penalty_only_tk_gradient() {
+    fn firth_logit_directional_hypergradient_rejects_penalty_only_without_full_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1145,11 +1145,12 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect("Firth penalty-only directional gradient should not require psi calculus");
+        let gradient_err = single_directional_tau_gradient(&state, &rho, hyper)
+            .expect_err("Firth penalty-only directional gradient must reject frozen TK calculus");
+        let gradient_msg = gradient_err.to_string();
         assert!(
-            gradient.is_finite(),
-            "penalty-only directional gradient must be finite: {gradient}"
+            gradient_msg.contains("full analytic c/d derivative propagation"),
+            "unexpected penalty-only directional gradient error: {gradient_msg}"
         );
 
         let efs_hyper = DirectionalHyperParam::single_penalty(
@@ -1160,13 +1161,13 @@ mod tests {
             None,
         )
         .expect("single-penalty EFS hyper direction");
-        let efs_eval = state
+        let efs_err = state
             .compute_efs_steps_with_psi_ext(&rho, &[efs_hyper])
-            .expect("Firth penalty-only EFS should not require psi calculus");
+            .expect_err("Firth penalty-only EFS must reject frozen TK calculus");
+        let efs_msg = efs_err.to_string();
         assert!(
-            efs_eval.steps.iter().all(|value| value.is_finite()),
-            "penalty-only EFS step must be finite: {:?}",
-            efs_eval.steps
+            efs_msg.contains("full analytic c/d derivative propagation"),
+            "unexpected penalty-only EFS error: {efs_msg}"
         );
     }
 
@@ -1203,9 +1204,7 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
-            ),
+            msg.contains("full analytic c/d derivative propagation"),
             "unexpected design-moving directional-gradient error: {msg}"
         );
     }
@@ -1253,9 +1252,7 @@ mod tests {
         };
         let full_msg = full_err.to_string();
         assert!(
-            full_msg.contains(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
-            ),
+            full_msg.contains("full analytic c/d derivative propagation"),
             "unexpected full-gradient error: {full_msg}"
         );
 
@@ -1265,9 +1262,7 @@ mod tests {
         };
         let efs_msg = efs_err.to_string();
         assert!(
-            efs_msg.contains(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
-            ),
+            efs_msg.contains("full analytic c/d derivative propagation"),
             "unexpected EFS error: {efs_msg}"
         );
     }

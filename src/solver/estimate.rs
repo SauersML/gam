@@ -772,7 +772,6 @@ pub(crate) struct RemlConfig {
     max_iterations: usize,
     reml_convergence_tolerance: f64,
     firth_bias_reduction: bool,
-    objective_consistentfdgradient: bool,
 }
 
 impl RemlConfig {
@@ -784,7 +783,6 @@ impl RemlConfig {
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
-            objective_consistentfdgradient: false,
         }
         .with_max_iterations(100)
     }

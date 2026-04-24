@@ -169,30 +169,56 @@ impl<'a> RemlState<'a> {
         d_array: &Array1<f64>,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     ) -> Result<f64, EstimationError> {
-        let n = x_dense.nrows();
-        let xt = x_dense.t();
+        let (h_diag, x_m, y) = Self::tk_shared_intermediates(
+            x_dense,
+            z,
+            c_array,
+            "Tierney-Kadane correction",
+            h_inv_solve,
+        )?;
+        Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &h_diag, &x_m, &y)
+    }
 
+    fn tk_shared_intermediates(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        c_array: &Array1<f64>,
+        context: &str,
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let n = x_dense.nrows();
         let mut h_diag = Array1::<f64>::zeros(n);
         for i in 0..n {
             let val = x_dense.row(i).dot(&z.column(i));
             if !val.is_finite() {
                 return Err(EstimationError::InvalidInput(format!(
-                    "Tierney-Kadane correction produced non-finite leverage at row {i}: {val}"
+                    "{context} produced non-finite leverage at row {i}: {val}"
                 )));
             }
             h_diag[i] = val;
         }
+        let m_vec = c_array * &h_diag;
+        let x_m = x_dense.t().dot(&m_vec);
+        let y = h_inv_solve(&x_m)?;
+        Ok((h_diag, x_m, y))
+    }
 
+    fn tk_scalar_from_shared(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        h_diag: &Array1<f64>,
+        x_m: &Array1<f64>,
+        y: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        let n = x_dense.nrows();
         let q_term = -0.125
             * d_array
                 .iter()
                 .zip(h_diag.iter())
                 .map(|(&d_i, &h_i)| d_i * h_i * h_i)
                 .sum::<f64>();
-
-        let m_vec = c_array * &h_diag;
-        let x_m = xt.dot(&m_vec);
-        let y = h_inv_solve(&x_m)?;
         let t2_term = 0.125 * x_m.dot(&y);
 
         let mut t1_sum = 0.0_f64;
@@ -276,6 +302,39 @@ impl<'a> RemlState<'a> {
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     ) -> Result<Array1<f64>, EstimationError> {
+        let (h_diag, _x_m, y) = Self::tk_shared_intermediates(
+            x_dense,
+            z,
+            c_array,
+            "Tierney-Kadane gradient",
+            h_inv_solve,
+        )?;
+        Self::tk_gradient_from_shared(
+            x_dense,
+            z,
+            c_array,
+            d_array,
+            tk_penalties,
+            lambdas,
+            ext_drifts,
+            x_vks,
+            &h_diag,
+            &y,
+        )
+    }
+
+    fn tk_gradient_from_shared(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        tk_penalties: &[crate::construction::CanonicalPenalty],
+        lambdas: &[f64],
+        ext_drifts: &[Array2<f64>],
+        x_vks: &[Array1<f64>],
+        h_diag: &Array1<f64>,
+        y: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
@@ -287,22 +346,6 @@ impl<'a> RemlState<'a> {
                 total_k
             )));
         }
-        let xt = x_dense.t();
-
-        let mut h_diag = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let val = x_dense.row(i).dot(&z.column(i));
-            if !val.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "Tierney-Kadane gradient produced non-finite leverage at row {i}: {val}"
-                )));
-            }
-            h_diag[i] = val;
-        }
-
-        let m_vec = c_array * &h_diag;
-        let x_m = xt.dot(&m_vec);
-        let y = h_inv_solve(&x_m)?;
         let x_y = x_dense.dot(&y);
 
         let mut diag_combined = Array1::<f64>::zeros(n);
@@ -454,7 +497,15 @@ impl<'a> RemlState<'a> {
         let p = x_dense.ncols();
         let k = tk_penalties.len();
 
-        let value = Self::tk_scalar_from_intermediates(x_dense, z, c_array, d_array, h_inv_solve)?;
+        let (h_diag, x_m, y) = Self::tk_shared_intermediates(
+            x_dense,
+            z,
+            c_array,
+            "Tierney-Kadane correction",
+            h_inv_solve,
+        )?;
+        let value =
+            Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &h_diag, &x_m, &y)?;
         if !compute_gradient {
             return Ok(TkCorrectionTerms {
                 value,
@@ -502,7 +553,7 @@ impl<'a> RemlState<'a> {
             ext_drifts.push(drift);
         }
 
-        let gradient = Self::tk_gradient_from_intermediates(
+        let gradient = Self::tk_gradient_from_shared(
             x_dense,
             z,
             c_array,
@@ -511,7 +562,8 @@ impl<'a> RemlState<'a> {
             lambdas,
             &ext_drifts,
             &x_vks,
-            h_inv_solve,
+            &h_diag,
+            &y,
         )?;
         Ok(TkCorrectionTerms {
             value,
@@ -744,12 +796,10 @@ impl<'a> RemlState<'a> {
         if self.config.link_function() == LinkFunction::Identity || !compute_gradient_for_tk(mode) {
             return Ok(());
         }
-        for coord in ext_coords {
-            if !coord.is_penalty_like && self.config.firth_bias_reduction {
-                return Err(EstimationError::InvalidInput(
-                    "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
-                ));
-            }
+        if self.config.firth_bias_reduction && !ext_coords.is_empty() {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane external gradients require full analytic c/d derivative propagation; refusing approximate gradients".to_string(),
+            ));
         }
         Ok(())
     }
@@ -3224,13 +3274,14 @@ impl<'a> RemlState<'a> {
         use super::unified::{compute_efs_update, compute_hybrid_efs_update};
 
         let beta_for_barrier = assembly.beta.clone();
+        let has_ext = !assembly.ext_coords.is_empty();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
-        if has_psi
+        if has_ext
             && self.config.firth_bias_reduction
             && self.config.link_function() != LinkFunction::Identity
         {
             return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate EFS psi gradients".to_string(),
+                "Tierney-Kadane external EFS gradients require full analytic c/d derivative propagation; refusing approximate gradients".to_string(),
             ));
         }
         let eval_mode = if has_psi {
@@ -3400,14 +3451,13 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
-        let has_firth_psi_ext = ext_coords.iter().any(|coord| !coord.is_penalty_like)
-            && self.config.firth_bias_reduction;
+        let has_firth_ext = !ext_coords.is_empty() && self.config.firth_bias_reduction;
         if compute_gradient_for_tk(mode)
-            && has_firth_psi_ext
+            && has_firth_ext
             && self.config.link_function() != LinkFunction::Identity
         {
             return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
+                "Tierney-Kadane external gradients require full analytic c/d derivative propagation; refusing approximate gradients".to_string(),
             ));
         }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -3609,10 +3659,6 @@ impl<'a> RemlState<'a> {
 
         let hessian = match decision.map(|decision| decision.strategy) {
             Some(HessianEvalStrategyKind::SpectralExact) => result.hessian,
-            Some(HessianEvalStrategyKind::DiagnosticNumeric) => self
-                .compute_lamlhessian_diagnostic_numeric(p)
-                .map(HessianResult::Analytic)
-                .unwrap_or(HessianResult::Unavailable),
             None => HessianResult::Unavailable,
         };
 
