@@ -6,13 +6,13 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyPsiSecondDesignAction, ExactNewtonJointPsiDirectCache,
+    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
-    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi,
-    resolve_custom_family_x_psi_psi, second_psi_linear_map, shared_dense_arc,
-    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
+    first_psi_linear_map, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    resolve_custom_family_x_psi, resolve_custom_family_x_psi_psi, second_psi_linear_map,
+    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -30,7 +30,7 @@ use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::normal_pdf;
+use crate::probability::{normal_pdf, standard_normal_quantile};
 use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, PenaltyBlockInfo,
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
@@ -924,36 +924,6 @@ fn build_two_block_exact_joint_setup(
     )
 }
 
-fn compose_theta_from_hints(
-    mean_penalty_count: usize,
-    noise_penalty_count: usize,
-    mean_log_lambda_hint: &Option<Array1<f64>>,
-    noise_log_lambda_hint: &Option<Array1<f64>>,
-    extra_rho0: &Array1<f64>,
-) -> Array1<f64> {
-    let layout =
-        GamlssLambdaLayout::withwiggle(mean_penalty_count, noise_penalty_count, extra_rho0.len());
-    let mut theta = Array1::<f64>::zeros(layout.total());
-    if let Some(v) = mean_log_lambda_hint
-        && v.len() == layout.k_mean
-    {
-        theta.slice_mut(s![0..layout.mean_end()]).assign(v);
-    }
-    if let Some(v) = noise_log_lambda_hint
-        && v.len() == layout.k_noise
-    {
-        theta
-            .slice_mut(s![layout.noise_start()..layout.noise_end()])
-            .assign(v);
-    }
-    if layout.kwiggle > 0 {
-        theta
-            .slice_mut(s![layout.wiggle_start()..layout.wiggle_end()])
-            .assign(extra_rho0);
-    }
-    theta
-}
-
 pub(crate) fn solve_penalizedweighted_projection(
     design: &DesignMatrix,
     offset: &Array1<f64>,
@@ -1177,9 +1147,72 @@ fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectio
     });
 }
 
-// Honest warm start for the binomial location-scale model: run a short fit on
-// the actual two-block family instead of introducing a fake surrogate family
-// with a neutral log-sigma block.
+fn binomial_location_scale_link_eta_from_probability(
+    link_kind: &InverseLink,
+    probability: f64,
+) -> Result<f64, String> {
+    let target = probability.clamp(1e-6, 1.0 - 1e-6);
+    match link_kind {
+        InverseLink::Standard(LinkFunction::Logit) => Ok((target / (1.0 - target)).ln()),
+        InverseLink::Standard(LinkFunction::Probit) => standard_normal_quantile(target)
+            .map_err(|err| format!("failed to invert probit warm-start probability: {err}")),
+        InverseLink::Standard(LinkFunction::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
+        other => Err(format!(
+            "binomial location-scale warm start requires logit, probit, or cloglog link, got {other:?}"
+        )),
+    }
+}
+
+fn weighted_binomial_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> Result<f64, String> {
+    if y.len() != weights.len() {
+        return Err(format!(
+            "binomial location-scale warm start dimension mismatch: y has length {}, weights have length {}",
+            y.len(),
+            weights.len()
+        ));
+    }
+    let mut weight_sum = 0.0;
+    let mut success_sum = 0.0;
+    for (&yi, &wi) in y.iter().zip(weights.iter()) {
+        if !yi.is_finite() {
+            return Err(format!(
+                "binomial location-scale warm start encountered non-finite response {yi}"
+            ));
+        }
+        let weight = floor_positiveweight(wi, MIN_WEIGHT);
+        if weight > 0.0 {
+            weight_sum += weight;
+            success_sum += weight * yi;
+        }
+    }
+    if !weight_sum.is_finite() || weight_sum <= 0.0 {
+        return Err(
+            "binomial location-scale warm start requires positive total weight".to_string(),
+        );
+    }
+    Ok(success_sum / weight_sum)
+}
+
+fn project_constant_eta_into_block(
+    block: &ParameterBlockSpec,
+    weights: &Array1<f64>,
+    eta: f64,
+) -> Result<Array1<f64>, String> {
+    let target_eta = Array1::from_elem(block.design.nrows(), eta);
+    solve_penalizedweighted_projection(
+        &block.design,
+        &block.offset,
+        &target_eta,
+        weights,
+        &block.penalties,
+        &block.initial_log_lambdas,
+        1e-10,
+    )
+}
+
+// Deterministic warm start for the binomial location-scale model. This stays
+// out of the optimizer: it projects a prevalence-matched threshold and neutral
+// log-sigma value into the actual penalized block spaces.
 fn binomial_location_scalewarm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -1193,62 +1226,18 @@ fn binomial_location_scalewarm_start(
         return Ok((mean_beta.clone(), noise_beta.clone()));
     }
 
-    let warm_family = BinomialLocationScaleFamily {
-        y: y.clone(),
-        weights: weights.clone(),
-        link_kind: link_kind.clone(),
-        threshold_design: Some(threshold_block.design.clone()),
-        log_sigma_design: Some(log_sigma_block.design.clone()),
+    let beta_threshold = match mean_beta_hint {
+        Some(beta) => beta.clone(),
+        None => {
+            let prevalence = weighted_binomial_prevalence(y, weights)?;
+            let eta = binomial_location_scale_link_eta_from_probability(link_kind, prevalence)?;
+            project_constant_eta_into_block(threshold_block, weights, eta)?
+        }
     };
-    let warm_blocks = vec![
-        ParameterBlockSpec {
-            name: threshold_block.name.clone(),
-            design: threshold_block.design.clone(),
-            offset: threshold_block.offset.clone(),
-            penalties: threshold_block.penalties.clone(),
-            nullspace_dims: threshold_block.nullspace_dims.clone(),
-            initial_log_lambdas: threshold_block.initial_log_lambdas.clone(),
-            initial_beta: mean_beta_hint.cloned(),
-        },
-        ParameterBlockSpec {
-            name: log_sigma_block.name.clone(),
-            design: log_sigma_block.design.clone(),
-            offset: log_sigma_block.offset.clone(),
-            penalties: log_sigma_block.penalties.clone(),
-            nullspace_dims: log_sigma_block.nullspace_dims.clone(),
-            initial_log_lambdas: log_sigma_block.initial_log_lambdas.clone(),
-            initial_beta: noise_beta_hint.cloned(),
-        },
-    ];
-    // Reduced iteration budget: 4×10=40 iterations instead of 8×20=160.
-    // Warm-start only needs rough initialization, not convergence.
-    // Relaxed tolerance further accelerates early exit.
-    let warm_options = BlockwiseFitOptions {
-        inner_max_cycles: 10,
-        inner_tol: 1e-4,
-        outer_max_iter: 4,
-        outer_tol: 1e-4,
-        minweight: MIN_WEIGHT,
-        ridge_floor: 1e-10,
-        ridge_policy: BlockwiseFitOptions::default().ridge_policy,
-        use_remlobjective: false,
-        compute_covariance: false,
-        use_outer_hessian: false,
-        screening_max_inner_iterations: None,
+    let beta_log_sigma = match noise_beta_hint {
+        Some(beta) => beta.clone(),
+        None => project_constant_eta_into_block(log_sigma_block, weights, 0.0)?,
     };
-    let warm_fit = fit_custom_family(&warm_family, &warm_blocks, &warm_options)?;
-    let beta_threshold = warm_fit
-        .block_states
-        .get(BinomialLocationScaleFamily::BLOCK_T)
-        .ok_or_else(|| "binomial location-scale warm start is missing threshold block".to_string())?
-        .beta
-        .clone();
-    let beta_log_sigma = warm_fit
-        .block_states
-        .get(BinomialLocationScaleFamily::BLOCK_LOG_SIGMA)
-        .ok_or_else(|| "binomial location-scale warm start is missing log_sigma block".to_string())?
-        .beta
-        .clone();
     Ok((beta_threshold, beta_log_sigma))
 }
 
@@ -1678,11 +1667,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, String> {
-    let mut mean_log_lambda_hint: Option<Array1<f64>> = None;
-    let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
-    let mut exact_joint_rho0_hint: Option<Array1<f64>> = None;
     let extra_rho0 = builder.extra_rho0()?;
 
     let mean_boot_design =
@@ -1721,43 +1707,6 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
-    // Seed the exact joint solve from a successful fixed-kappa fit when
-    // possible. Starting from zero mean/noise log-lambdas is too brittle for
-    // the binomial wiggle spatial path.
-    let baseline_theta0 = compose_theta_from_hints(
-        mean_penalty_count,
-        noise_penalty_count,
-        &mean_log_lambda_hint,
-        &noise_log_lambda_hint,
-        &extra_rho0,
-    );
-    if let Ok(blocks) = builder.build_blocks(
-        &baseline_theta0,
-        &mean_boot_design,
-        &noise_boot_design,
-        None,
-        None,
-    ) {
-        let family = builder.build_family(&mean_boot_design, &noise_boot_design);
-        if let Ok(fit) = fit_custom_family(&family, &blocks, options) {
-            let layout = GamlssLambdaLayout::withwiggle(
-                mean_penalty_count,
-                noise_penalty_count,
-                extra_rho0.len(),
-            );
-            if fit.log_lambdas.len() >= layout.total() {
-                exact_joint_rho0_hint =
-                    Some(fit.log_lambdas.slice(s![..layout.total()]).to_owned());
-                mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-            }
-            if let Ok((mean_beta, noise_beta)) = builder.extract_primary_betas(&fit) {
-                mean_beta_hint = Some(mean_beta);
-                noise_beta_hint = Some(noise_beta);
-            }
-        }
-    }
-
     // Macro to invoke the exact-joint spatial optimizer with shared closures.
     // The exact path evaluates the full profiled/Laplace objective over
     // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.
@@ -1770,13 +1719,15 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 mean_penalty_count,
                 noise_penalty_count,
                 extra_rho0.as_slice().unwrap_or(&[]),
-                exact_joint_rho0_hint.as_ref(),
+                None,
                 kappa_options,
             );
             let mean_terms = spatial_length_scale_term_indices(builder.meanspec());
             let noise_terms = spatial_length_scale_term_indices(builder.noisespec());
             let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
             let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+            let hyper_warm_start_cell =
+                std::cell::RefCell::new(None::<CustomFamilyWarmStart>);
             // Two-block GAMLSS/location-scale joint likelihoods have a
             // β-dependent cross-block Hessian (the (μ,log σ) / (t,log σ)
             // off-diagonal blocks involve residual/response scalars that
@@ -1795,10 +1746,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &joint_setup,
                 builder.exact_spatial_seed_risk_profile(),
                 analytic_joint_derivatives_available,
-                // This outer problem moves the realized spatial design, so
-                // we intentionally plan it as gradient/fixed-point rather
-                // than an ARC/Newton Hessian solve.
-                false,
+                analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
                 |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
@@ -1810,17 +1758,33 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             mean_beta_hint_cell.borrow().clone(),
                             noise_beta_hint_cell.borrow().clone(),
                         )?;
+                        if mean_beta_hint_cell.borrow().is_none()
+                            && let Some(beta) = blocks.first().and_then(|block| block.initial_beta.clone())
+                        {
+                            *mean_beta_hint_cell.borrow_mut() = Some(beta);
+                        }
+                        if noise_beta_hint_cell.borrow().is_none()
+                            && let Some(beta) =
+                                blocks.get(1).and_then(|block| block.initial_beta.clone())
+                        {
+                            *noise_beta_hint_cell.borrow_mut() = Some(beta);
+                        }
                         let family = builder.build_family(&designs[0], &designs[1]);
-                        fit_custom_family(&family, &blocks, options)?
+                        if joint_setup.log_kappa_dim() > 0 {
+                            let warm_start = hyper_warm_start_cell.borrow().clone();
+                            fit_custom_family_fixed_log_lambdas(
+                                &family,
+                                &blocks,
+                                options,
+                                warm_start.as_ref(),
+                                0,
+                                0.0,
+                                true,
+                            )?
+                        } else {
+                            fit_custom_family(&family, &blocks, options)?
+                        }
                     };
-                    let layout = GamlssLambdaLayout::two_block(
-                        builder.mean_penalty_count(&designs[0]),
-                        builder.noise_penalty_count(&designs[1]),
-                    );
-                    if fit.log_lambdas.len() >= layout.total() {
-                        mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
-                        noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
-                    }
                     let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
                     mean_beta_hint = Some(mean_beta);
                     noise_beta_hint = Some(noise_beta);
@@ -1846,6 +1810,16 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         mean_beta_hint_cell.borrow().clone(),
                         noise_beta_hint_cell.borrow().clone(),
                     )?;
+                    if mean_beta_hint_cell.borrow().is_none()
+                        && let Some(beta) = blocks.first().and_then(|block| block.initial_beta.clone())
+                    {
+                        *mean_beta_hint_cell.borrow_mut() = Some(beta);
+                    }
+                    if noise_beta_hint_cell.borrow().is_none()
+                        && let Some(beta) = blocks.get(1).and_then(|block| block.initial_beta.clone())
+                    {
+                        *noise_beta_hint_cell.borrow_mut() = Some(beta);
+                    }
                     let family = builder.build_family(&designs[0], &designs[1]);
                     let psiderivative_blocks = builder.build_psiderivative_blocks(
                         data,
@@ -1854,19 +1828,21 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &designs[0],
                         &designs[1],
                     )?;
+                    let warm_start = hyper_warm_start_cell.borrow().clone();
                     let eval = evaluate_custom_family_joint_hyper(
                         &family,
                         &blocks,
                         options,
                         &rho,
                         &psiderivative_blocks,
-                        None,
+                        warm_start.as_ref(),
                         if need_hessian {
                             crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
                         } else {
                             crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
                         },
                     )?;
+                    *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
                     if need_hessian && !eval.outer_hessian.is_analytic() {
                         return Err(
                             "exact two-block spatial objective requires a full joint [rho, psi] hessian"
@@ -1890,6 +1866,16 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         mean_beta_hint_cell.borrow().clone(),
                         noise_beta_hint_cell.borrow().clone(),
                     )?;
+                    if mean_beta_hint_cell.borrow().is_none()
+                        && let Some(beta) = blocks.first().and_then(|block| block.initial_beta.clone())
+                    {
+                        *mean_beta_hint_cell.borrow_mut() = Some(beta);
+                    }
+                    if noise_beta_hint_cell.borrow().is_none()
+                        && let Some(beta) = blocks.get(1).and_then(|block| block.initial_beta.clone())
+                    {
+                        *noise_beta_hint_cell.borrow_mut() = Some(beta);
+                    }
                     let family = builder.build_family(&designs[0], &designs[1]);
                     let psiderivative_blocks = builder.build_psiderivative_blocks(
                         data,
@@ -1898,14 +1884,16 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &designs[0],
                         &designs[1],
                     )?;
+                    let warm_start = hyper_warm_start_cell.borrow().clone();
                     let eval = evaluate_custom_family_joint_hyper_efs(
                         &family,
                         &blocks,
                         options,
                         &rho,
                         &psiderivative_blocks,
-                        None,
+                        warm_start.as_ref(),
                     )?;
+                    *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
                     Ok(eval.efs_eval)
                 },
             )
