@@ -235,10 +235,10 @@ impl<'a> RemlState<'a> {
 
     /// Analytic frozen-curvature TK surrogate value + gradient given Z = H⁻¹ X^T.
     ///
-    /// The implemented production TK term is a frozen-curvature surrogate:
+    /// The implemented TK term is a Firth-only frozen-curvature surrogate:
     /// `c = dW/dη` and `d = d²W/dη²` are evaluated at the current PIRLS mode
-    /// and then held fixed while differentiating through `Σ = H⁻¹`, the explicit
-    /// penalty drift. It is not the full derivative
+    /// and then held fixed while differentiating through `Σ = H⁻¹` and explicit
+    /// penalty-like drifts. It is not the full derivative
     /// of a TK objective that also differentiates `c(η(θ))` and `d(η(θ))`.
     ///
     ///   ∂TK/∂ρ_k = tr(Ḣ_k · P_total)
