@@ -3310,6 +3310,15 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
+        let has_psi = ext_coords.iter().any(|c| !c.is_penalty_like);
+        if compute_gradient_for_tk(mode)
+            && has_psi
+            && self.config.link_function() != LinkFunction::Identity
+        {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
+            ));
+        }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
@@ -3317,13 +3326,7 @@ impl<'a> RemlState<'a> {
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
         assembly.fixed_drift_deriv = fixed_drift_deriv;
-        let result = self.assemble_and_evaluate_with_tk_hyper_dirs(
-            rho,
-            &bundle,
-            mode,
-            assembly,
-            (!hyper_dirs.is_empty()).then_some(hyper_dirs),
-        );
+        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         log::info!(
@@ -3360,7 +3363,7 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        self.evaluate_efs(p, &bundle, Vec::new(), None)
+        self.evaluate_efs(p, &bundle, Vec::new())
     }
 
     /// EFS evaluation with anisotropic or isotropic ψ ext_coords injected.
@@ -3405,7 +3408,7 @@ impl<'a> RemlState<'a> {
             return self.compute_efs_steps(rho);
         }
 
-        self.evaluate_efs(rho, &bundle, ext_coords, Some(hyper_dirs))
+        self.evaluate_efs(rho, &bundle, ext_coords)
     }
 
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -3724,7 +3727,7 @@ impl<'a> RemlState<'a> {
         // predicate.
         self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
-        self.evaluate_efs(rho, &bundle, ext_coords, None)
+        self.evaluate_efs(rho, &bundle, ext_coords)
     }
 
     /// Unified EFS bridge: auto-dispatches backend, injects ext_coords,

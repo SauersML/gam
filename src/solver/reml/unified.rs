@@ -2812,37 +2812,29 @@ fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) -> f64 {
     solution.rho_curvature_scale * lambda
 }
 
-fn trace_hinv_penalty_cross(
+fn trace_hinv_penalty_self_terms(
     hop: &dyn HessianOperator,
-    left: &PenaltyCoordinate,
-    left_lambda: f64,
-    right: &PenaltyCoordinate,
-    right_lambda: f64,
-) -> f64 {
-    match (
-        left.uses_operator_fast_path(),
-        right.uses_operator_fast_path(),
-    ) {
-        (true, true) => {
-            let left_op = left.scaled_operator(left_lambda, None);
-            let right_op = right.scaled_operator(right_lambda, None);
-            hop.trace_hinv_operator_cross(&left_op, &right_op)
-        }
-        (true, false) => {
-            let left_op = left.scaled_operator(left_lambda, None);
-            let right_matrix = right.scaled_dense_matrix(right_lambda);
-            hop.trace_hinv_matrix_operator_cross(&right_matrix, &left_op)
-        }
-        (false, true) => {
-            let left_matrix = left.scaled_dense_matrix(left_lambda);
-            let right_op = right.scaled_operator(right_lambda, None);
-            hop.trace_hinv_matrix_operator_cross(&left_matrix, &right_op)
-        }
-        (false, false) => {
-            let left_matrix = left.scaled_dense_matrix(left_lambda);
-            let right_matrix = right.scaled_dense_matrix(right_lambda);
-            hop.trace_hinv_product_cross(&left_matrix, &right_matrix)
-        }
+    coord: &PenaltyCoordinate,
+    lambda: f64,
+) -> (f64, f64) {
+    if coord.uses_operator_fast_path() {
+        let op = coord.scaled_operator(lambda, None);
+        (
+            hop.trace_hinv_operator(&op),
+            hop.trace_hinv_operator_cross(&op, &op),
+        )
+    } else if coord.is_block_local() {
+        let (block, start, end) = coord.scaled_block_local(1.0);
+        (
+            hop.trace_hinv_block_local(&block, lambda, start, end),
+            hop.trace_hinv_block_local_cross(&block, lambda, start, end),
+        )
+    } else {
+        let matrix = coord.scaled_dense_matrix(lambda);
+        (
+            hop.trace_hinv_h_k(&matrix, None),
+            hop.trace_hinv_product_cross(&matrix, &matrix),
+        )
     }
 }
 
@@ -2978,33 +2970,45 @@ fn hyper_coord_total_drift_result(
     drift_parts_into_result(dense, operators, dim_hint)
 }
 
-fn trace_hinv_drift_cross(
-    hop: &dyn HessianOperator,
-    left: &HyperCoordDrift,
-    right: &HyperCoordDrift,
-) -> f64 {
-    let left_op = left
+fn efs_trace_and_denominator(hop: &dyn HessianOperator, drift: &HyperCoordDrift) -> (f64, f64) {
+    if let Some(op) = drift
         .operator_ref()
-        .filter(|_| left.uses_operator_fast_path());
-    let right_op = right
-        .operator_ref()
-        .filter(|_| right.uses_operator_fast_path());
+        .filter(|_| drift.uses_operator_fast_path())
+    {
+        (
+            hop.trace_hinv_operator(op),
+            hop.trace_hinv_operator_cross(op, op),
+        )
+    } else {
+        let matrix = drift.materialize();
+        (
+            hop.trace_hinv_h_k(&matrix, None),
+            hop.trace_hinv_product_cross(&matrix, &matrix),
+        )
+    }
+}
 
+fn trace_hinv_cached_drift_cross(
+    hop: &dyn HessianOperator,
+    left_dense: Option<&Array2<f64>>,
+    left_op: Option<&dyn HyperOperator>,
+    right_dense: Option<&Array2<f64>>,
+    right_op: Option<&dyn HyperOperator>,
+) -> f64 {
     match (left_op, right_op) {
-        (Some(op_left), Some(op_right)) => hop.trace_hinv_operator_cross(op_left, op_right),
-        (Some(op_left), None) => {
-            let right_matrix = right.materialize();
-            hop.trace_hinv_matrix_operator_cross(&right_matrix, op_left)
-        }
-        (None, Some(op_right)) => {
-            let left_matrix = left.materialize();
-            hop.trace_hinv_matrix_operator_cross(&left_matrix, op_right)
-        }
-        (None, None) => {
-            let left_matrix = left.materialize();
-            let right_matrix = right.materialize();
-            hop.trace_hinv_product_cross(&left_matrix, &right_matrix)
-        }
+        (Some(left), Some(right)) => hop.trace_hinv_operator_cross(left, right),
+        (Some(left), None) => hop.trace_hinv_matrix_operator_cross(
+            right_dense.expect("right dense drift should be cached"),
+            left,
+        ),
+        (None, Some(right)) => hop.trace_hinv_matrix_operator_cross(
+            left_dense.expect("left dense drift should be cached"),
+            right,
+        ),
+        (None, None) => hop.trace_hinv_product_cross(
+            left_dense.expect("left dense drift should be cached"),
+            right_dense.expect("right dense drift should be cached"),
+        ),
     }
 }
 
@@ -5278,12 +5282,6 @@ const EFS_MAX_STEP: f64 = 5.0;
 /// the step.
 pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64> {
     let k = rho.len();
-    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let curvature_lambdas: Vec<f64> = lambdas
-        .iter()
-        .copied()
-        .map(|lambda| rho_curvature_lambda(solution, lambda))
-        .collect();
     let hop = &*solution.hessian_op;
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
@@ -5306,9 +5304,11 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
     // ── ρ coordinates ──
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
+        let lambda = rho[idx].exp();
+        let curvature_lambda = rho_curvature_lambda(solution, lambda);
 
         // a_k = ½ β̂ᵀ A_k β̂ = ½ λ_k β̂ᵀ S_k β̂
-        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
+        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
 
         // Rescale a_k for profiled Gaussian: effective a = a_k / φ̂
         let a_k_eff = if is_profiled {
@@ -5318,35 +5318,9 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         };
 
         // Numerator: 2·a_k - tr(H⁻¹ B_k)
-        // We drop the C[β_k] correction for EFS (pass None).
-        let trace_term = if coord.uses_operator_fast_path() {
-            let op = coord.scaled_operator(curvature_lambdas[idx], None);
-            hop.trace_hinv_operator(&op)
-        } else if coord.is_block_local() {
-            let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local(&block, curvature_lambdas[idx], start, end)
-        } else {
-            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-            hop.trace_hinv_h_k(&a_k_matrix, None)
-        };
+        // We drop the C[β_k] correction for EFS.
+        let (trace_term, denominator) = trace_hinv_penalty_self_terms(hop, coord, curvature_lambda);
         let numerator = 2.0 * a_k_eff - trace_term;
-
-        // Denominator: tr(H⁻¹ B_k H⁻¹ B_k)
-        let denominator = if coord.uses_operator_fast_path() {
-            trace_hinv_penalty_cross(
-                hop,
-                coord,
-                curvature_lambdas[idx],
-                coord,
-                curvature_lambdas[idx],
-            )
-        } else if coord.is_block_local() {
-            let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local_cross(&block, curvature_lambdas[idx], start, end)
-        } else {
-            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-            hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
-        };
 
         let step = if denominator.abs() > 1e-30 {
             (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -5382,29 +5356,8 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
         // update stable and cheap.
         // Operator-backed coordinates stay operator-backed here; dense
         // materialization is only the backend default, not the canonical path.
-        let trace_term = if let Some(op) = coord
-            .drift
-            .operator_ref()
-            .filter(|_| coord.drift.uses_operator_fast_path())
-        {
-            hop.trace_hinv_operator(op)
-        } else {
-            let h_i = coord.drift.materialize();
-            hop.trace_hinv_h_k(&h_i, None)
-        };
+        let (trace_term, denominator) = efs_trace_and_denominator(hop, &coord.drift);
         let numerator = 2.0 * a_i_eff - trace_term;
-
-        // Denominator: tr(H⁻¹ B_i H⁻¹ B_i)
-        let denominator = if let Some(op) = coord
-            .drift
-            .operator_ref()
-            .filter(|_| coord.drift.uses_operator_fast_path())
-        {
-            hop.trace_hinv_operator_cross(op, op)
-        } else {
-            let h_i = coord.drift.materialize();
-            hop.trace_hinv_product_cross(&h_i, &h_i)
-        };
 
         let step = if denominator.abs() > 1e-30 {
             (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -5508,12 +5461,6 @@ pub fn compute_hybrid_efs_update(
     gradient: &[f64],
 ) -> HybridEfsResult {
     let k = rho.len();
-    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let curvature_lambdas: Vec<f64> = lambdas
-        .iter()
-        .copied()
-        .map(|lambda| rho_curvature_lambda(solution, lambda))
-        .collect();
     let hop = &*solution.hessian_op;
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
@@ -5533,39 +5480,17 @@ pub fn compute_hybrid_efs_update(
     // ── ρ coordinates: standard EFS (identical to compute_efs_update) ──
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
+        let lambda = rho[idx].exp();
+        let curvature_lambda = rho_curvature_lambda(solution, lambda);
+        let a_k = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
         let a_k_eff = if is_profiled {
             a_k / profiled_scale
         } else {
             a_k
         };
 
-        let trace_term = if coord.uses_operator_fast_path() {
-            let op = coord.scaled_operator(curvature_lambdas[idx], None);
-            hop.trace_hinv_operator(&op)
-        } else if coord.is_block_local() {
-            let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local(&block, curvature_lambdas[idx], start, end)
-        } else {
-            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-            hop.trace_hinv_h_k(&a_k_matrix, None)
-        };
+        let (trace_term, denominator) = trace_hinv_penalty_self_terms(hop, coord, curvature_lambda);
         let numerator = 2.0 * a_k_eff - trace_term;
-        let denominator = if coord.uses_operator_fast_path() {
-            trace_hinv_penalty_cross(
-                hop,
-                coord,
-                curvature_lambdas[idx],
-                coord,
-                curvature_lambdas[idx],
-            )
-        } else if coord.is_block_local() {
-            let (block, start, end) = coord.scaled_block_local(1.0);
-            hop.trace_hinv_block_local_cross(&block, curvature_lambdas[idx], start, end)
-        } else {
-            let a_k_matrix = coord.scaled_dense_matrix(curvature_lambdas[idx]);
-            hop.trace_hinv_product_cross(&a_k_matrix, &a_k_matrix)
-        };
 
         let step = if denominator.abs() > 1e-30 {
             (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -5593,27 +5518,8 @@ pub fn compute_hybrid_efs_update(
                 coord.a
             };
 
-            let trace_term = if let Some(op) = coord
-                .drift
-                .operator_ref()
-                .filter(|_| coord.drift.uses_operator_fast_path())
-            {
-                hop.trace_hinv_operator(op)
-            } else {
-                let h_i = coord.drift.materialize();
-                hop.trace_hinv_h_k(&h_i, None)
-            };
+            let (trace_term, denominator) = efs_trace_and_denominator(hop, &coord.drift);
             let numerator = 2.0 * a_i_eff - trace_term;
-            let denominator = if let Some(op) = coord
-                .drift
-                .operator_ref()
-                .filter(|_| coord.drift.uses_operator_fast_path())
-            {
-                hop.trace_hinv_operator_cross(op, op)
-            } else {
-                let h_i = coord.drift.materialize();
-                hop.trace_hinv_product_cross(&h_i, &h_i)
-            };
 
             let step = if denominator.abs() > 1e-30 {
                 (numerator / denominator).clamp(-EFS_MAX_STEP, EFS_MAX_STEP)
@@ -5646,6 +5552,36 @@ pub fn compute_hybrid_efs_update(
     // the invalid assumption that the Gram norm bounds the true curvature.
     let n_psi = psi_local_indices.len();
     if n_psi > 0 {
+        if n_psi == 1 {
+            let li = psi_local_indices[0];
+            let drift = &solution.ext_coords[li].drift;
+            let op = drift
+                .operator_ref()
+                .filter(|_| drift.uses_operator_fast_path());
+            let dense = op.is_none().then(|| drift.materialize());
+            let gram = if let Some(dense_hop) = hop.as_dense_spectral() {
+                let projected = if let Some(op) = op {
+                    dense_hop.projected_operator(&dense_hop.w_factor, op)
+                } else {
+                    dense_hop
+                        .projected_matrix(dense.as_ref().expect("dense drift should be cached"))
+                };
+                dense_hop.trace_projected_cross(&projected, &projected)
+            } else {
+                trace_hinv_cached_drift_cross(hop, dense.as_ref(), op, dense.as_ref(), op)
+            };
+            if gram.abs() >= PSI_GRAM_PINV_TOL.max(1e-30) {
+                let global_idx = psi_global_indices[0];
+                let raw_step = -PSI_INITIAL_ALPHA * psi_gradient[0] / gram;
+                steps[global_idx] = raw_step.clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
+            }
+            return HybridEfsResult {
+                steps,
+                psi_indices: psi_global_indices,
+                psi_gradient,
+            };
+        }
+
         let total_p = hop.dim();
         let any_psi_operator = psi_local_indices.iter().any(|&li| {
             let drift = &solution.ext_coords[li].drift;
@@ -5695,15 +5631,64 @@ pub fn compute_hybrid_efs_update(
             )
         } else {
             let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
-            for d in 0..n_psi {
-                for e in d..n_psi {
-                    let val = trace_hinv_drift_cross(
-                        hop,
-                        &solution.ext_coords[psi_local_indices[d]].drift,
-                        &solution.ext_coords[psi_local_indices[e]].drift,
-                    );
-                    gram[[d, e]] = val;
-                    gram[[e, d]] = val;
+            let dense_drifts: Vec<Option<Array2<f64>>> = psi_local_indices
+                .iter()
+                .map(|&li| {
+                    let drift = &solution.ext_coords[li].drift;
+                    if drift
+                        .operator_ref()
+                        .is_some_and(|_| drift.uses_operator_fast_path())
+                    {
+                        None
+                    } else {
+                        Some(drift.materialize())
+                    }
+                })
+                .collect();
+            let drift_ops: Vec<Option<&dyn HyperOperator>> = psi_local_indices
+                .iter()
+                .map(|&li| {
+                    let drift = &solution.ext_coords[li].drift;
+                    drift
+                        .operator_ref()
+                        .filter(|_| drift.uses_operator_fast_path())
+                })
+                .collect();
+            if let Some(dense_hop) = hop.as_dense_spectral() {
+                let projected_drifts: Vec<Array2<f64>> = (0..n_psi)
+                    .map(|idx| {
+                        if let Some(op) = drift_ops[idx] {
+                            dense_hop.projected_operator(&dense_hop.w_factor, op)
+                        } else {
+                            dense_hop.projected_matrix(
+                                dense_drifts[idx]
+                                    .as_ref()
+                                    .expect("dense drift should be cached"),
+                            )
+                        }
+                    })
+                    .collect();
+                for d in 0..n_psi {
+                    for e in d..n_psi {
+                        let val = dense_hop
+                            .trace_projected_cross(&projected_drifts[d], &projected_drifts[e]);
+                        gram[[d, e]] = val;
+                        gram[[e, d]] = val;
+                    }
+                }
+            } else {
+                for d in 0..n_psi {
+                    for e in d..n_psi {
+                        let val = trace_hinv_cached_drift_cross(
+                            hop,
+                            dense_drifts[d].as_ref(),
+                            drift_ops[d],
+                            dense_drifts[e].as_ref(),
+                            drift_ops[e],
+                        );
+                        gram[[d, e]] = val;
+                        gram[[e, d]] = val;
+                    }
                 }
             }
             gram
@@ -6486,8 +6471,16 @@ impl DenseSpectralOperator {
     #[inline]
     fn trace_hinv_product_cross_dense(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let a_rot = self.rotate_to_eigenbasis(a);
+        if std::ptr::eq(a, b) {
+            return self.trace_hinv_product_cross_rotated(&a_rot, &a_rot);
+        }
         let b_rot = self.rotate_to_eigenbasis(b);
         self.trace_hinv_product_cross_rotated(&a_rot, &b_rot)
+    }
+
+    #[inline]
+    fn projected_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
+        self.w_factor.t().dot(matrix).dot(&self.w_factor)
     }
 
     #[inline]
