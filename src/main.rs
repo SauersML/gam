@@ -1400,10 +1400,10 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    inference_notes.push(format!(
-        "bernoulli marginal-slope marginal block uses base link {} and is mapped into the internal exact probit target during fitting",
-        inverse_link_to_saved_string(&base_link)
-    ));
+    inference_notes.push(
+        "bernoulli marginal-slope uses link(type=probit) for the calibrated marginal target"
+            .to_string(),
+    );
     inference_notes.extend(marginal_slope_disable_flag_notes(
         "bernoulli marginal-slope",
         "--logslope-formula",
@@ -8304,7 +8304,10 @@ fn resolve_bernoulli_marginal_slope_base_link(
         ));
     }
     if linkspec.sas_init.is_some() {
-        return Err("link(sas_init=...) requires link(type=sas), which marginal-slope does not support".to_string());
+        return Err(
+            "link(sas_init=...) requires link(type=sas), which marginal-slope does not support"
+                .to_string(),
+        );
     }
     if linkspec.beta_logistic_init.is_some() {
         return Err("link(beta_logistic_init=...) requires link(type=beta-logistic), which marginal-slope does not support".to_string());
