@@ -257,11 +257,11 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
 ):
     """Stage 2a: Bernoulli marginal-slope + linkwiggle + logslope score-warp.
 
-    Fit Stage 1 to produce ``PGS_cal`` (the anchored deviation), then fit
+    Fit Stage 1 to produce ``pgs_ctn_z`` (the anchored deviation), then fit
     the disease model with a probit link, a main-formula link-wiggle, and
     a logslope-formula that folds the PC manifold + another linkwiggle
     into the score-warp. Roundtrip the saved model and check predictions
-    are valid probabilities that track ``PGS_cal`` monotonically.
+    are valid probabilities that track ``pgs_ctn_z`` monotonically.
     """
     _require_extension()
     df = synthetic_biobank.copy()
@@ -271,7 +271,7 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
         f"PGS ~ {_pc_duchon(centers=24)}",
         transformation_normal=True,
     )
-    df["PGS_cal"] = np.asarray(
+    df["pgs_ctn_z"] = np.asarray(
         calib.predict(df, return_type="dict")["eta"], dtype=float
     )
 
@@ -287,7 +287,7 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
         disease_formula,
         family="bernoulli-marginal-slope",
         link="probit",
-        z_column="PGS_cal",
+        z_column="pgs_ctn_z",
         logslope_formula=logslope,
     )
 
@@ -302,13 +302,13 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
     assert np.all(np.isfinite(probs))
     assert np.all((probs > 0.0) & (probs < 1.0))
 
-    # Monotone-ish in PGS_cal (loose threshold because Duchon + linkwiggle
+    # Monotone-ish in pgs_ctn_z (loose threshold because Duchon + linkwiggle
     # introduce real flex in the marginal response). Compute Spearman via
     # numpy rank correlation to avoid pulling scipy in as a test dep.
-    pgs_rank = pd.Series(df["PGS_cal"].to_numpy()).rank().to_numpy()
+    pgs_rank = pd.Series(df["pgs_ctn_z"].to_numpy()).rank().to_numpy()
     prob_rank = pd.Series(probs).rank().to_numpy()
     rho = float(np.corrcoef(pgs_rank, prob_rank)[0, 1])
-    assert rho > 0.3, f"spearman(PGS_cal, p) = {rho:.3f} not monotone enough"
+    assert rho > 0.3, f"spearman(pgs_ctn_z, p) = {rho:.3f} not monotone enough"
 
 
 def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
@@ -330,7 +330,7 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         f"PGS ~ {_pc_duchon(centers=24)}",
         transformation_normal=True,
     )
-    df["PGS_cal"] = np.asarray(
+    df["pgs_ctn_z"] = np.asarray(
         calib.predict(df, return_type="dict")["eta"], dtype=float
     )
 
@@ -346,7 +346,7 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         family="survival",
         survival_likelihood="marginal-slope",
         baseline_target="gompertz-makeham",
-        z_column="PGS_cal",
+        z_column="pgs_ctn_z",
     )
 
     pred = model.predict(df)

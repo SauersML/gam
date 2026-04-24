@@ -813,6 +813,42 @@ impl SavedAnchoredDeviationRuntime {
         self.validate_coefficient_matrix(&self.span_c1, "c1", span_count)?;
         self.validate_coefficient_matrix(&self.span_c2, "c2", span_count)?;
         self.validate_coefficient_matrix(&self.span_c3, "c3", span_count)?;
+        self.validate_c2_span_continuity()?;
+        Ok(())
+    }
+
+    fn validate_c2_span_continuity(&self) -> Result<(), String> {
+        const TOL: f64 = 1e-8;
+        for span_idx in 1..self.breakpoints.len() - 1 {
+            let left_span = span_idx - 1;
+            let right_span = span_idx;
+            let width = self.breakpoints[span_idx] - self.breakpoints[left_span];
+            for basis_idx in 0..self.basis_dim {
+                let left_value = self.span_c0[left_span][basis_idx]
+                    + self.span_c1[left_span][basis_idx] * width
+                    + self.span_c2[left_span][basis_idx] * width * width
+                    + self.span_c3[left_span][basis_idx] * width * width * width;
+                let left_d1 = self.span_c1[left_span][basis_idx]
+                    + 2.0 * self.span_c2[left_span][basis_idx] * width
+                    + 3.0 * self.span_c3[left_span][basis_idx] * width * width;
+                let left_d2 = 2.0 * self.span_c2[left_span][basis_idx]
+                    + 6.0 * self.span_c3[left_span][basis_idx] * width;
+                let right_value = self.span_c0[right_span][basis_idx];
+                let right_d1 = self.span_c1[right_span][basis_idx];
+                let right_d2 = 2.0 * self.span_c2[right_span][basis_idx];
+                if (left_value - right_value).abs() > TOL
+                    || (left_d1 - right_d1).abs() > TOL
+                    || (left_d2 - right_d2).abs() > TOL
+                {
+                    return Err(format!(
+                        "saved anchored deviation runtime must be C2 cubic at breakpoint {span_idx}, basis {basis_idx}: value jump={:.3e}, d1 jump={:.3e}, d2 jump={:.3e}",
+                        left_value - right_value,
+                        left_d1 - right_d1,
+                        left_d2 - right_d2
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -889,9 +925,8 @@ impl SavedAnchoredDeviationRuntime {
                 continue;
             }
             let mut span_idx = self.span_index_for(value)?;
-            // LEFT-bias at interior breakpoints mirrors deviation_runtime.rs:186 —
-            // see that comment for rationale (C¹ basis d2 has distinct left/right
-            // limits; paired with LEFT-bias local_cubic_on_span convention).
+            // LEFT-bias at interior breakpoints mirrors DeviationRuntime. The
+            // saved cubic basis is C2, but d3 remains span-local.
             if span_idx > 0 && value == self.breakpoints[span_idx] {
                 span_idx -= 1;
             }

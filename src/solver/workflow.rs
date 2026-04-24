@@ -879,8 +879,9 @@ use crate::families::survival_construction::{
     build_survival_time_basis, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
-    normalize_survival_time_pair, optimize_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
+    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
+    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build,
 };
@@ -2007,7 +2008,30 @@ fn materialize_survival<'a>(
             })
         };
 
-    let baseline_cfg = if baseline_cfg.target != SurvivalBaselineTarget::Linear {
+    let baseline_cfg = if baseline_cfg.target != SurvivalBaselineTarget::Linear
+        && survival_mode == SurvivalLikelihoodMode::MarginalSlope
+    {
+        optimize_survival_baseline_config_with_gradient(
+            &baseline_cfg,
+            "workflow survival marginal-slope baseline",
+            |candidate| {
+                let fit =
+                    fit_survival_marginal_slope_model(build_marginal_slope_request(candidate)?)
+                        .map_err(|e| format!("survival marginal-slope fit failed: {e}"))?;
+                let gradient = marginal_slope_baseline_chain_rule_gradient(
+                    age_entry.view(),
+                    age_exit.view(),
+                    candidate,
+                    &fit.baseline_offset_residuals,
+                )?
+                .ok_or_else(|| {
+                    "workflow survival marginal-slope baseline unexpectedly has no theta gradient"
+                        .to_string()
+                })?;
+                Ok((fit.fit.reml_score, gradient))
+            },
+        )?
+    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
         optimize_survival_baseline_config(
             &baseline_cfg,
             "workflow survival baseline",
@@ -2019,12 +2043,9 @@ fn materialize_survival<'a>(
                 .fit
                 .fit
                 .reml_score),
-                SurvivalLikelihoodMode::MarginalSlope => Ok(fit_survival_marginal_slope_model(
-                    build_marginal_slope_request(candidate)?,
-                )
-                .map_err(|e| format!("survival marginal-slope fit failed: {e}"))?
-                .fit
-                .reml_score),
+                SurvivalLikelihoodMode::MarginalSlope => unreachable!(
+                    "marginal-slope baseline profiling uses analytic GM-probit gradient"
+                ),
                 SurvivalLikelihoodMode::Latent => Ok(fit_latent_survival_model(
                     build_latent_survival_request(candidate)?,
                 )

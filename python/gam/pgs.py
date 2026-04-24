@@ -11,6 +11,8 @@ overridden at construction time:
 
 * A Duchon spline basis over the PC columns with ``len(pc_columns) + 20``
   centers, order ``1``, power ``1``.
+* A fixed Duchon ``length_scale`` so per-axis anisotropy is identifiable
+  separately from the global smoothing scale.
 * Per-axis anisotropic scaling (``scale_dimensions="auto"``).
 * A transformation-normal likelihood so the fitted response is interpretable
   as a conditional standard normal z-score for each row.
@@ -47,6 +49,9 @@ class PgsCalibration:
         Duchon spline order (``m``). Defaults to ``1``.
     duchon_power:
         Duchon spline power (``s``). Defaults to ``1``.
+    duchon_length_scale:
+        Fixed Duchon radial length scale. Defaults to ``1.0`` so anisotropic
+        PC scaling is active but does not duplicate the global smoothing scale.
     scale_dimensions:
         Per-axis length-scale selector forwarded to :func:`gam.fit`. Defaults
         to ``"auto"``.
@@ -73,6 +78,7 @@ class PgsCalibration:
     duchon_centers: int | None = None
     duchon_order: int = 1
     duchon_power: int = 1
+    duchon_length_scale: float = 1.0
     scale_dimensions: str | None = "auto"
     out_column: str = "pgs_ctn_z"
     extra_fit_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -97,7 +103,8 @@ class PgsCalibration:
         pc_args = ", ".join(self.pc_columns)
         duchon = (
             f"duchon({pc_args}, k={self._resolved_centers}, "
-            f"m={self.duchon_order}, s={self.duchon_power})"
+            f"m={self.duchon_order}, s={self.duchon_power}, "
+            f"length_scale={self.duchon_length_scale:g})"
         )
         return f"{self.pgs_column} ~ {duchon}"
 

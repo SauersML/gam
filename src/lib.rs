@@ -30,6 +30,7 @@ pub use families::survival;
 pub use families::survival_construction;
 pub use families::survival_location_scale;
 pub use families::survival_marginal_slope;
+pub use families::survival_predict;
 pub use families::transformation_normal;
 pub use solver::workflow::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitConfig, FitRequest,

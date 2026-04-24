@@ -4117,18 +4117,16 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("DenestedCubicTransport"));
 
-        let quadratic_prepared =
-            crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
-                &seed,
-                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                    degree: 2,
-                    num_internal_knots: 3,
-                    ..Default::default()
-                },
-            )
-            .expect("production quadratic runtime");
-        let quadratic = saved_runtime_from_deviation_runtime(&quadratic_prepared.runtime);
-        assert!(quadratic.design(&array![0.0]).is_ok());
+        let err = crate::families::bernoulli_marginal_slope::build_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                degree: 2,
+                num_internal_knots: 3,
+                ..Default::default()
+            },
+        )
+        .expect_err("non-cubic deviation runtimes should be rejected");
+        assert!(err.contains("degree must be 3"));
 
         let mut structurally_invalid = production_runtime.clone();
         structurally_invalid.span_c0[0].pop();

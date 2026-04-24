@@ -60,6 +60,9 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         mean_formula, logslope_formula = _RUNNER.rust_marginal_slope_formula_classification(spec, centers=20)
         self.assertIn("duchon(pc1_std, pc2_std", mean_formula)
         self.assertIn("centers=20", mean_formula)
+        self.assertIn("order=1", mean_formula)
+        self.assertIn("power=8", mean_formula)
+        self.assertIn("length_scale=1", mean_formula)
         self.assertNotIn("pgs_ctn_z", mean_formula)
         self.assertIn("linkwiggle(internal_knots=8)", mean_formula)
         self.assertIn("linkwiggle(internal_knots=7)", logslope_formula)
@@ -100,6 +103,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
         self.assertEqual(report.status, "PASS")
         text = "\n".join(report.lines)
+        self.assertIn("Duchon tuple: order=1, power=8, length_scale=1", text)
         self.assertIn("Duchon smooth: lazy chunked", text)
         self.assertIn("anisotropy derivatives: implicit streaming", text)
 
