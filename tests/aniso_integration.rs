@@ -117,6 +117,7 @@ fn aniso_matern_recovers_signal_axis() {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),

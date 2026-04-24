@@ -1391,6 +1391,7 @@ fn materialize_standard<'a>(
         tol: 1e-7,
         nullspace_dims: vec![],
         linear_constraints: None,
+        firth_bias_reduction: false,
         adaptive_regularization: None,
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),

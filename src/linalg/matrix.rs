@@ -2450,11 +2450,29 @@ impl ChunkedKernelDesignOperator {
                 centers.ncols(),
             ));
         }
+        if let Some(z) = constraint_transform.as_ref() {
+            if z.nrows() != k {
+                return Err(format!(
+                    "ChunkedKernelDesignOperator: constraint_transform rows {} != centers rows {}",
+                    z.nrows(),
+                    k,
+                ));
+            }
+        }
+        if let Some(poly) = poly_basis.as_ref() {
+            if poly.nrows() != n {
+                return Err(format!(
+                    "ChunkedKernelDesignOperator: poly_basis rows {} != data rows {}",
+                    poly.nrows(),
+                    n,
+                ));
+            }
+        }
         let k_eff = constraint_transform.as_ref().map_or(k, |z| z.ncols());
         let poly_cols = poly_basis.as_ref().map_or(0, |p| p.ncols());
         Ok(Self {
-            data,
-            centers,
+            data: Arc::new(data.as_standard_layout().to_owned()),
+            centers: Arc::new(centers.as_standard_layout().to_owned()),
             kernel_fn,
             constraint_transform,
             poly_basis,
@@ -3458,7 +3476,7 @@ impl SparseHessianSymbolic {
         use std::collections::BTreeSet;
 
         let n = csrs[0].nrows();
-        let mut pattern = BTreeSet::<(usize, usize)>::new();
+        let mut rows_by_col = vec![BTreeSet::<usize>::new(); dim];
 
         let mut cols = Vec::with_capacity(32);
         for i in 0..n {
@@ -3474,22 +3492,28 @@ impl SparseHessianSymbolic {
             cols.sort_unstable();
             cols.dedup();
             for (ai, &ca) in cols.iter().enumerate() {
+                assert!(
+                    ca < dim,
+                    "SparseHessianSymbolic::build: column index {ca} out of Hessian dimension {dim}"
+                );
                 for &cb in &cols[ai..] {
-                    pattern.insert((ca, cb));
+                    assert!(
+                        cb < dim,
+                        "SparseHessianSymbolic::build: column index {cb} out of Hessian dimension {dim}"
+                    );
+                    rows_by_col[cb].insert(ca);
                 }
             }
         }
 
-        // Convert BTreeSet → CSC.
-        let nnz = pattern.len();
-        let mut col_ptrs = vec![0usize; dim + 1];
+        // Convert column buckets to CSC.
+        let nnz = rows_by_col.iter().map(BTreeSet::len).sum();
+        let mut col_ptrs = Vec::with_capacity(dim + 1);
         let mut row_indices = Vec::with_capacity(nnz);
-        for &(r, c) in &pattern {
-            col_ptrs[c + 1] += 1;
-            row_indices.push(r);
-        }
-        for j in 1..=dim {
-            col_ptrs[j] += col_ptrs[j - 1];
+        col_ptrs.push(0);
+        for rows in rows_by_col {
+            row_indices.extend(rows);
+            col_ptrs.push(row_indices.len());
         }
 
         // Detect contiguity and record first_row per column.
@@ -5411,8 +5435,8 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock, SparseDesignMatrix, dense_matvec, dense_transpose_matvec,
-        dense_transpose_weighted_response,
+        EmbeddedColumnBlock, SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
+        dense_transpose_matvec, dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -5517,6 +5541,68 @@ mod tests {
         assert_eq!(operator.ncols(), 3);
         let chunk = operator.row_chunk_combined(0..2);
         assert_eq!(chunk.dim(), (2, 3));
+    }
+
+    #[test]
+    fn sparse_hessian_pattern_is_column_major_csc() {
+        let sparse = SparseColMat::try_new_from_triplets(
+            1,
+            3,
+            &[
+                Triplet::new(0, 0, 1.0),
+                Triplet::new(0, 1, 1.0),
+                Triplet::new(0, 2, 1.0),
+            ],
+        )
+        .expect("sparse column matrix");
+        let csr = sparse.to_row_major().expect("csr conversion");
+        let accumulator = SparseHessianAccumulator::from_single_csr(&csr, 3);
+
+        assert_eq!(accumulator.sym.col_ptrs, vec![0, 1, 3, 6]);
+        assert_eq!(accumulator.sym.row_indices, vec![0, 0, 1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn chunked_kernel_operator_rejects_incompatible_optional_shapes() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
+        let kernel = Arc::new(|_: &[f64], _: &[f64]| 0.0);
+        let bad_constraint = Arc::new(Array2::<f64>::zeros((2, 1)));
+        let bad_poly = Arc::new(Array2::<f64>::zeros((3, 1)));
+
+        let constraint_err = ChunkedKernelDesignOperator::new(
+            data.clone(),
+            centers.clone(),
+            kernel.clone(),
+            Some(bad_constraint),
+            None,
+        )
+        .expect_err("constraint rows should match centers rows");
+        assert!(constraint_err.contains("constraint_transform rows 2 != centers rows 3"));
+
+        let poly_err =
+            ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly))
+                .expect_err("poly rows should match data rows");
+        assert!(poly_err.contains("poly_basis rows 3 != data rows 2"));
+    }
+
+    #[test]
+    fn chunked_kernel_operator_canonicalizes_non_contiguous_inputs() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]].reversed_axes());
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]].reversed_axes());
+        assert!(!data.is_standard_layout());
+        assert!(!centers.is_standard_layout());
+
+        let kernel = Arc::new(|x: &[f64], c: &[f64]| {
+            x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>()
+        });
+        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
+            .expect("chunked kernel operator");
+        let chunk = operator.row_chunk_combined(0..2);
+
+        assert_eq!(chunk.dim(), (2, 3));
+        assert_eq!(chunk[[0, 0]], 0.0);
+        assert_eq!(chunk[[1, 1]], 1.5);
     }
 
     #[test]

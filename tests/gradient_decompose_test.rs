@@ -6,7 +6,7 @@
 //   V(ρ) = -ℓ(β̂) + 0.5*β̂ᵀSβ̂          [penalised fit, term A]
 //        + 0.5*log|H|                    [Hessian logdet, term B]
 //        - 0.5*log|S|_+                  [penalty logdet, term C]
-//        + (Mₚ/2)*log(2π)               [constant]
+//        + optional normalizing constants       [runtime fixed-dispersion omits these]
 //        + TK(ρ)                         [Tierney-Kadane correction]
 //        + prior(ρ)                      [soft prior on ρ]
 //
@@ -14,7 +14,7 @@
 //   gₖ = 0.5*β̂ᵀAₖβ̂                    [A: envelope theorem]
 //      + 0.5*tr(H⁻¹Hₖ)                  [B: with third-derivative contraction]
 //      - 0.5*det1[k]                     [C: penalty logdet derivative]
-//      + dTK/dρₖ                         [missing?]
+//      + dTK/dρₖ                         [runtime TK path]
 //      + dprior/dρₖ                      [included]
 
 use faer::Side;
@@ -883,107 +883,6 @@ fn test_probit_overlapping_penalties_gradient() {
     assert!(
         err < 0.05,
         "Probit overlapping-penalty gradient wrong: rel_l2={err:.3e}"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TK CORRECTION ISOLATION: prove the missing TK derivative
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The TK correction is in the cost but not the gradient.
-/// Verify by computing a standalone cost WITH and WITHOUT TK,
-/// and showing that FD of the "without TK" version matches the analytic gradient
-/// better than FD of the full (with TK) version.
-///
-/// TK correction formula (from runtime.rs:45-119):
-///   TK = -Σ_j (H⁻¹_{jj})³ * [Σ_i c_i * X_{ij}³] / 6
-/// where c_i = dW_i/dη_i.
-fn standalone_tk_correction(x: &Array2<f64>, h_inv: &Array2<f64>, c_vec: &Array1<f64>) -> f64 {
-    let p = x.ncols();
-    let n = x.nrows();
-    let mut correction = 0.0;
-    for j in 0..p {
-        let h_inv_jj = h_inv[[j, j]];
-        let third_deriv: f64 = (0..n)
-            .map(|i| c_vec[i] * x[[i, j]] * x[[i, j]] * x[[i, j]])
-            .sum();
-        correction += h_inv_jj * h_inv_jj * h_inv_jj * third_deriv;
-    }
-    -correction / 6.0
-}
-
-#[test]
-fn test_tk_correction_derivative_missing() {
-    let (x, y) = test_design(60, 5);
-    let s_list = {
-        let mut s1 = Array2::<f64>::zeros((5, 5));
-        for j in 1..5 {
-            s1[[j, j]] = 1.0;
-        }
-        blockwise_penalties(vec![s1])
-    };
-    let rho = array![2.0];
-
-    // Cost WITHOUT TK
-    let cost_no_tk =
-        |rho: &Array1<f64>| -> f64 { standalone_laml_cost(&y, &x, &s_list, rho, &[1]) };
-
-    // Cost WITH TK
-    let cost_with_tk = |rho: &Array1<f64>| -> f64 {
-        let s_total = build_s_total(&s_list, rho);
-        let (beta, _, mu, _, h, log_lik) = solve_pirls_logit(&y, &x, &s_total);
-        let h_inv = invert_spd(&h);
-        let c_vec: Array1<f64> = mu.mapv(|m| m * (1.0 - m) * (1.0 - 2.0 * m));
-        let tk = standalone_tk_correction(&x, &h_inv, &c_vec);
-        // Same as standalone but add TK inside the LAML
-        let penalty = beta.dot(&s_total.dot(&beta));
-        let (eigs_h, _) = h.eigh(Side::Lower).unwrap();
-        let log_det_h: f64 = eigs_h.iter().filter(|v| **v > 1e-14).map(|v| v.ln()).sum();
-        let p = x.ncols();
-        let penalty_rank = p - 1;
-        let (eigs_s, _) = s_total.eigh(Side::Lower).unwrap();
-        let mut sorted: Vec<f64> = eigs_s.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let log_det_s: f64 = sorted
-            .iter()
-            .take(penalty_rank)
-            .map(|v| v.max(1e-14).ln())
-            .sum();
-        let laml = log_lik - 0.5 * penalty + 0.5 * log_det_s - 0.5 * log_det_h
-            + 0.5 * (2.0 * std::f64::consts::PI).ln()
-            + tk;
-        -laml
-    };
-
-    let fd_no_tk = fd_gradient(&cost_no_tk, &rho, 1e-5);
-    let fd_with_tk = fd_gradient(&cost_with_tk, &rho, 1e-5);
-    let tk_derivative = &fd_with_tk - &fd_no_tk;
-
-    // The TK derivative is NOT in the library's analytic gradient.
-    // So the library FD (which includes TK via cost) will differ from the analytic gradient
-    // by approximately tk_derivative.
-    eprintln!("=== TK CORRECTION DERIVATIVE ===");
-    eprintln!("fd_no_tk      = {:?}", fd_no_tk);
-    eprintln!("fd_with_tk    = {:?}", fd_with_tk);
-    eprintln!("tk_derivative = {:?}", tk_derivative);
-    eprintln!(
-        "|tk_deriv|    = {:.6e}",
-        tk_derivative.iter().map(|v| v * v).sum::<f64>().sqrt()
-    );
-
-    // Just document the TK derivative magnitude — even if small, it's a real bug
-    let tk_magnitude = tk_derivative.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let fd_magnitude = fd_no_tk.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let tk_relative = tk_magnitude / fd_magnitude.max(1e-12);
-    eprintln!("TK relative to gradient = {:.3e}", tk_relative);
-
-    // The library's analytic gradient should include dTK/dρ but doesn't.
-    // If TK derivative is non-negligible, this is a provable bug.
-    assert!(
-        tk_relative < 1e-6,
-        "TK correction has non-negligible derivative ({:.3e} relative) \
-         but it is missing from the analytic gradient",
-        tk_relative
     );
 }
 

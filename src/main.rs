@@ -599,6 +599,10 @@ fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
         inf.working_response = Array1::zeros(0);
         inf.reparam_qs = None;
     }
+    if let Some(geom) = fit.geometry.as_mut() {
+        geom.working_weights = Array1::zeros(0);
+        geom.working_response = Array1::zeros(0);
+    }
     fit.artifacts = gam::estimate::FitArtifacts {
         pirls: None,
         ..Default::default()
@@ -1053,6 +1057,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         tol: fit_tol,
         nullspace_dims: vec![],
         linear_constraints: None,
+        firth_bias_reduction: false,
         adaptive_regularization: adaptive_opts,
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),
@@ -3764,6 +3769,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 tol: 1e-6,
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
+                firth_bias_reduction: false,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: Some(1e-6),
                 rho_prior: Default::default(),
@@ -6460,6 +6466,7 @@ fn run_sample_standard(
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
             linear_constraints: design.linear_constraints.clone(),
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
             rho_prior: Default::default(),
@@ -8343,8 +8350,7 @@ fn core_saved_fit_result(
         };
         let covariance_conditional = inf.beta_covariance.clone();
         let covariance_corrected = inf.beta_covariance_corrected.clone();
-        let penalized_objective =
-            -summary.log_likelihood + summary.stable_penalty_term + summary.reml_score;
+        let penalized_objective = summary.reml_score;
         UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
             blocks: vec![gam::estimate::FittedBlock {
                 beta: beta.clone(),
@@ -10144,7 +10150,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
         .inference
         .as_ref()
         .and_then(|inf| inf.beta_covariance_corrected.clone());
-    let penalized_objective = -ext.log_likelihood + ext.stable_penalty_term + ext.reml_score;
+    let penalized_objective = ext.reml_score;
     UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
         blocks: vec![gam::estimate::FittedBlock {
             beta: ext.beta.clone(),
@@ -10472,15 +10478,15 @@ mod tests {
         apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error,
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
-        collect_spatial_smooth_usagewarnings, compact_saved_multiblock_fit_result,
-        compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
-        effectivelinkwiggle_formulaspec, evaluate_survival_baseline, family_to_string, linkname,
-        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-        parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_gam, pretty_familyname, required_columns_for_fit,
-        summarizewiggle_domain, validate_cli_firth_configuration,
-        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
-        write_survival_prediction_csv,
+        collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
+        compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
+        covariance_from_model, effectivelinkwiggle_formulaspec, evaluate_survival_baseline,
+        family_to_string, linkname, load_dataset_projected, parse_formula, parse_link_choice,
+        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_baseline_config,
+        parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
+        pretty_familyname, required_columns_for_fit, summarizewiggle_domain,
+        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+        write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg,
@@ -10494,7 +10500,9 @@ mod tests {
         Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec, MaternNu,
         SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
-    use gam::estimate::{FitGeometry, FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    use gam::estimate::{
+        FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResultParts,
+    };
     use gam::gamlss::{
         buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
     };
@@ -12284,6 +12292,76 @@ mod tests {
             pretty_familyname(LikelihoodFamily::GaussianIdentity),
             "Gaussian Identity"
         );
+    }
+
+    #[test]
+    fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
+        let hessian = array![[4.0, 0.2], [0.2, 3.0]];
+        let working_weights = array![1.0, 0.75, 0.5];
+        let working_response = array![0.2, -0.1, 0.4];
+        let lambdas = array![0.5];
+        let mut fit = gam::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: array![0.1, -0.2],
+                role: BlockRole::Mean,
+                edf: 1.5,
+                lambdas: lambdas.clone(),
+            }],
+            log_lambdas: lambdas.mapv(f64::ln),
+            lambdas,
+            likelihood_family: Some(LikelihoodFamily::BinomialLogit),
+            likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+            log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
+            log_likelihood: -2.0,
+            deviance: 4.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.25,
+            penalized_objective: 2.25,
+            outer_iterations: 2,
+            outer_converged: true,
+            outer_gradient_norm: 1e-8,
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block: vec![1.5],
+                edf_total: 1.5,
+                smoothing_correction: None,
+                penalized_hessian: hessian.clone(),
+                working_weights: working_weights.clone(),
+                working_response: working_response.clone(),
+                reparam_qs: Some(Array2::eye(2)),
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+            }),
+            fitted_link: FittedLinkState::Standard(Some(LinkFunction::Logit)),
+            geometry: Some(FitGeometry {
+                penalized_hessian: hessian,
+                working_weights,
+                working_response,
+            }),
+            block_states: Vec::new(),
+            pirls_status: gam::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.4,
+            constraint_kkt: None,
+            artifacts: Default::default(),
+            inner_cycles: 3,
+        })
+        .expect("construct compactable unified fit result");
+
+        compact_fit_result_for_batch(&mut fit);
+
+        let inf = fit.inference.as_ref().expect("inference kept");
+        let geom = fit.geometry.as_ref().expect("geometry kept");
+        assert_eq!(inf.working_weights.len(), 0);
+        assert_eq!(inf.working_response.len(), 0);
+        assert!(inf.reparam_qs.is_none());
+        assert_eq!(geom.working_weights.len(), 0);
+        assert_eq!(geom.working_response.len(), 0);
+        fit.validate_numeric_finiteness()
+            .expect("compacted fit result remains persistable");
     }
 
     #[test]

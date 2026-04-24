@@ -3065,7 +3065,7 @@ fn outer_gradient_entry(
 ///
 /// where:
 /// - Q_ij = pair_a − g_i·v_j  (penalty quadratic second derivative, with
-///   profiled Gaussian cross-correction: − 2 a_i a_j / (ν φ̂²))
+///   profiled Gaussian chain-rule terms from the smooth deviance floor)
 /// - L_ij = ½ (cross_trace + h2_trace) (logdet Hessian)
 /// - P_ij = −½ pair_ld_s  (penalty logdet second derivative)
 ///
@@ -3083,13 +3083,21 @@ fn outer_hessian_entry(
     pair_ld_s: f64,
     profiled_phi: f64,
     profiled_nu: f64,
+    profiled_dp_cgrad: f64,
+    profiled_dp_cgrad2: f64,
     is_profiled: bool,
     incl_logdet_h: bool,
     incl_logdet_s: bool,
 ) -> f64 {
     let q_raw = pair_a - g_i_dot_v_j;
     let q = if is_profiled {
-        q_raw / profiled_phi - 2.0 * a_i * a_j / (profiled_nu * profiled_phi * profiled_phi)
+        profiled_dp_cgrad * q_raw / profiled_phi
+            + 2.0
+                * (profiled_dp_cgrad2 * profiled_nu * profiled_phi
+                    - profiled_dp_cgrad * profiled_dp_cgrad)
+                * a_i
+                * a_j
+                / (profiled_nu * profiled_phi * profiled_phi)
     } else {
         q_raw
     };
@@ -3175,13 +3183,13 @@ pub fn reml_laml_evaluate(
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
 
-    let (cost, profiled_scale, dp_cgrad) = match &solution.dispersion {
+    let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             // Gaussian REML with profiled scale:
             //   V(ρ) = D_p/(2φ̂) + ½ log|H| − ½ log|S|₊ + ((n−M_p)/2) log(2πφ̂)
             // where D_p = deviance + penalty, φ̂ = D_p/(n−M_p).
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let (dp_c, dp_cgrad) = smooth_floor_dp(dp_raw);
+            let (dp_c, dp_cgrad, dp_cgrad2) = smooth_floor_dp(dp_raw);
             let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             let phi = dp_c / denom;
 
@@ -3189,7 +3197,7 @@ pub fn reml_laml_evaluate(
                 + 0.5 * (log_det_h - log_det_s)
                 + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-            (cost, phi, dp_cgrad)
+            (cost, phi, dp_cgrad, dp_cgrad2)
         }
         DispersionHandling::Fixed {
             phi,
@@ -3230,7 +3238,7 @@ pub fn reml_laml_evaluate(
                         .as_ref()
                         .map_or(0.0, ExactJeffreysTerm::value);
             }
-            (cost, *phi, 0.0)
+            (cost, *phi, 0.0, 0.0)
         }
     };
 
@@ -3693,7 +3701,20 @@ pub fn reml_laml_evaluate(
 ///
 /// When available, tr(H⁻¹ C[u]) for C[u] = Xᵀ diag(c ⊙ Xu) X simplifies to uᵀ z_c,
 /// replacing an O(p²) solve with an O(p) dot product.
-fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator) -> Array1<f64> {
+const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
+
+fn hessian_unavailable(message: impl Into<String>) -> String {
+    format!("{} {}", HESSIAN_UNAVAILABLE_PREFIX, message.into())
+}
+
+fn is_hessian_unavailable(error: &str) -> bool {
+    error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
+}
+
+fn compute_adjoint_z_c(
+    ing: &ScalarGlmIngredients<'_>,
+    hop: &dyn HessianOperator,
+) -> Result<Array1<f64>, String> {
     let x = ing.x.to_dense_arc();
     let x_ref = x.as_ref();
     let n = x_ref.nrows();
@@ -3704,10 +3725,9 @@ fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator
     const ZC_MAX_DENSE_WORK: usize = 50_000_000;
     let dense_work = n.saturating_mul(p).saturating_mul(p);
     if dense_work > ZC_MAX_DENSE_WORK {
-        log::warn!(
-            "compute_adjoint_z_c: skipping (n={n}, p={p}, n*p^2={dense_work}) — too large for dense adjoint solve"
-        );
-        return Array1::zeros(p);
+        return Err(hessian_unavailable(format!(
+            "adjoint GLM trace would require dense O(n*p^2) work (n={n}, p={p}, n*p^2={dense_work})"
+        )));
     }
 
     // Z = H⁻¹ Xᵀ  (p × n)
@@ -3732,7 +3752,7 @@ fn compute_adjoint_z_c(ing: &ScalarGlmIngredients<'_>, hop: &dyn HessianOperator
 
     // z_c = H⁻¹ Xᵀ t
     let x_t_t = x_ref.t().dot(&t);
-    hop.solve(&x_t_t)
+    Ok(hop.solve(&x_t_t))
 }
 
 /// Compute the fourth-derivative trace: tr(H⁻¹ Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
@@ -3743,8 +3763,10 @@ fn compute_fourth_derivative_trace(
     v_k: &Array1<f64>,
     v_l: &Array1<f64>,
     hop: &dyn HessianOperator,
-) -> Option<f64> {
-    let d_array = ing.d_array?;
+) -> Result<Option<f64>, String> {
+    let Some(d_array) = ing.d_array else {
+        return Ok(None);
+    };
 
     let n = ing.x.nrows();
     let p = ing.x.ncols();
@@ -3753,10 +3775,9 @@ fn compute_fourth_derivative_trace(
     const FD_MAX_DENSE_WORK: usize = 50_000_000;
     let dense_work = n.saturating_mul(p).saturating_mul(p);
     if dense_work > FD_MAX_DENSE_WORK {
-        log::warn!(
-            "compute_fourth_derivative_trace: skipping (n={n}, p={p}, n*p^2={dense_work}) — too large for dense Q assembly"
-        );
-        return Some(0.0);
+        return Err(hessian_unavailable(format!(
+            "fourth-derivative GLM trace would require dense O(n*p^2) work (n={n}, p={p}, n*p^2={dense_work})"
+        )));
     }
 
     let x = ing.x.to_dense_arc();
@@ -3793,7 +3814,7 @@ fn compute_fourth_derivative_trace(
         }
     }
 
-    Some(hop.trace_logdet_gradient(&q_mat))
+    Ok(Some(hop.trace_logdet_gradient(&q_mat)))
 }
 
 /// Compute the IFT second-derivative correction contribution to h2_trace.
@@ -3831,9 +3852,10 @@ fn compute_ift_correction_trace(
     // to materialising the correction and tracing through the subspace.
     if let (Some(z_c), None) = (adjoint_z_c, subspace) {
         let c_trace = rhs.dot(z_c);
-        let d_trace = glm_ingredients
-            .and_then(|ing| compute_fourth_derivative_trace(ing, v_i, v_j, hop))
-            .unwrap_or(0.0);
+        let d_trace = match glm_ingredients {
+            Some(ing) => compute_fourth_derivative_trace(ing, v_i, v_j, hop)?.unwrap_or(0.0),
+            None => 0.0,
+        };
         Ok(c_trace + d_trace)
     } else {
         let u = hop.solve(rhs);
@@ -3984,33 +4006,40 @@ fn compute_outer_hessian(
     })?;
 
     // ── Profiled Gaussian precomputation ──
-    let (profiled_phi, profiled_nu, is_profiled) = match &solution.dispersion {
-        DispersionHandling::ProfiledGaussian => {
-            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let nu = (solution.n_observations as f64 - solution.nullspace_dim).max(1.0);
-            let phi_hat = dp_raw.max(1e-30) / nu;
-            (phi_hat, nu, true)
-        }
-        _ => (1.0, 1.0, false),
-    };
+    let (profiled_phi, profiled_nu, profiled_dp_cgrad, profiled_dp_cgrad2, is_profiled) =
+        match &solution.dispersion {
+            DispersionHandling::ProfiledGaussian => {
+                let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+                let (dp_c, dp_cgrad, dp_cgrad2) = smooth_floor_dp(dp_raw);
+                let nu = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
+                let phi_hat = dp_c / nu;
+                (phi_hat, nu, dp_cgrad, dp_cgrad2, true)
+            }
+            _ => (1.0, 1.0, 1.0, 0.0, false),
+        };
 
     // ── ρ precomputation ──
 
-    // Precompute vₖ = H⁻¹(Aₖβ̂) and Aₖβ̂ for all k.
-    let mut a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
+    // Precompute both unscaled penalty derivatives and scaled H-curvature
+    // derivatives.  The former differentiates the quadratic penalty cost; the
+    // latter is only for H/logdet/IFT trace machinery.
+    let mut penalty_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
+    let mut curvature_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
     let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
 
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
-        let v_k = hop.solve(&a_k_beta);
-        a_k_betas.push(a_k_beta);
+        let penalty_a_k_beta_vec = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
+        let curvature_a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
+        let v_k = hop.solve(&curvature_a_k_beta);
+        penalty_a_k_betas.push(penalty_a_k_beta_vec);
+        curvature_a_k_betas.push(curvature_a_k_beta);
         v_ks.push(v_k);
     }
 
     // Precompute a_k = ½ β̂ᵀ Aₖ β̂ for profiled Gaussian correction.
     let rho_a_vals: Vec<f64> = (0..k)
-        .map(|idx| 0.5 * solution.beta.dot(&a_k_betas[idx]))
+        .map(|idx| 0.5 * solution.beta.dot(&penalty_a_k_betas[idx]))
         .collect();
 
     // Build pure Aₖ = λₖ Rₖᵀ Rₖ and Ḣₖ = Aₖ + correction for all k.
@@ -4287,7 +4316,7 @@ fn compute_outer_hessian(
             let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
             rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
             if kk == ll {
-                rhs -= &a_k_betas[kk];
+                rhs -= &curvature_a_k_betas[kk];
             }
 
             let correction = compute_ift_correction_trace(
@@ -4306,13 +4335,15 @@ fn compute_outer_hessian(
             let h_val = outer_hessian_entry(
                 rho_a_vals[kk],
                 rho_a_vals[ll],
-                a_k_betas[ll].dot(&v_ks[kk]),
+                penalty_a_k_betas[ll].dot(&v_ks[kk]),
                 pair_a,
                 cross_trace,
                 h_kl_trace,
                 det2[[kk, ll]],
                 profiled_phi,
                 profiled_nu,
+                profiled_dp_cgrad,
+                profiled_dp_cgrad2,
                 is_profiled,
                 incl_logdet_h,
                 incl_logdet_s,
@@ -4401,13 +4432,15 @@ fn compute_outer_hessian(
                 let h_val = outer_hessian_entry(
                     rho_a_vals[rho_idx],
                     a_ext,
-                    a_k_betas[rho_idx].dot(&ext_v[ext_idx]),
+                    penalty_a_k_betas[rho_idx].dot(&ext_v[ext_idx]),
                     pair.a,
                     cross_trace,
                     h2_trace,
                     pair.ld_s,
                     profiled_phi,
                     profiled_nu,
+                    profiled_dp_cgrad,
+                    profiled_dp_cgrad2,
                     is_profiled,
                     incl_logdet_h,
                     incl_logdet_s,
@@ -4504,6 +4537,8 @@ fn compute_outer_hessian(
                     pair.ld_s,
                     profiled_phi,
                     profiled_nu,
+                    profiled_dp_cgrad,
+                    profiled_dp_cgrad2,
                     is_profiled,
                     incl_logdet_h,
                     incl_logdet_s,
@@ -4627,16 +4662,33 @@ struct OuterHessianCoord {
     b_depends_on_beta: bool,
 }
 
+impl OuterHessianCoord {
+    fn is_ext(&self) -> bool {
+        self.ext_index.is_some()
+    }
+
+    fn correction_v(&self) -> Array1<f64> {
+        if self.is_ext() {
+            -&self.v
+        } else {
+            self.v.clone()
+        }
+    }
+}
+
 struct UnifiedOuterHessianOperator {
     hop: Arc<dyn HessianOperator>,
     coords: Vec<OuterHessianCoord>,
     pair_a: Array2<f64>,
     pair_ld_s: Array2<f64>,
+    g_dot_v: Array2<f64>,
     pair_g: Vec<Vec<Option<Array1<f64>>>>,
     base_h2: Array2<f64>,
     m_pair_trace: Array2<f64>,
     profiled_phi: f64,
     profiled_nu: f64,
+    profiled_dp_cgrad: f64,
+    profiled_dp_cgrad2: f64,
     is_profiled: bool,
     incl_logdet_h: bool,
     incl_logdet_s: bool,
@@ -4689,6 +4741,67 @@ impl UnifiedOuterHessianOperator {
         out
     }
 
+    fn signed_mode_combo_for_correction(&self, alpha: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.hop.dim());
+        for (j, coord) in self.coords.iter().enumerate() {
+            if alpha[j] == 0.0 {
+                continue;
+            }
+            if coord.is_ext() {
+                out.scaled_add(-alpha[j], &coord.v);
+            } else {
+                out.scaled_add(alpha[j], &coord.v);
+            }
+        }
+        out
+    }
+
+    fn pair_rhs(&self, row: usize, col: usize) -> Array1<f64> {
+        let row_coord = &self.coords[row];
+        let col_coord = &self.coords[col];
+        let pair_g = self.pair_g[row][col]
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Array1::<f64>::zeros(self.hop.dim()));
+
+        match (row_coord.is_ext(), col_coord.is_ext()) {
+            (false, false) => {
+                let mut rhs = col_coord.total_drift.apply(&row_coord.v);
+                rhs += &row_coord.base_drift.apply(&col_coord.v);
+                rhs -= &pair_g;
+                rhs
+            }
+            (false, true) => {
+                let mut rhs = pair_g;
+                rhs -= &row_coord.base_drift.apply(&col_coord.v);
+                rhs -= &col_coord.total_drift.apply(&row_coord.v);
+                rhs
+            }
+            (true, false) => {
+                let mut rhs = pair_g;
+                rhs -= &col_coord.base_drift.apply(&row_coord.v);
+                rhs -= &row_coord.total_drift.apply(&col_coord.v);
+                rhs
+            }
+            (true, true) => {
+                let mut rhs = pair_g;
+                rhs -= &row_coord.base_drift.apply(&col_coord.v);
+                rhs -= &col_coord.total_drift.apply(&row_coord.v);
+                rhs
+            }
+        }
+    }
+
+    fn pair_rhs_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.hop.dim());
+        for j in 0..alpha.len() {
+            if alpha[j] != 0.0 {
+                out.scaled_add(alpha[j], &self.pair_rhs(idx, j));
+            }
+        }
+        out
+    }
+
     fn correction_trace(
         &self,
         rhs: &Array1<f64>,
@@ -4710,9 +4823,13 @@ impl UnifiedOuterHessianOperator {
                     x,
                 };
                 let c_trace = rhs.dot(z_c);
-                let d_trace =
-                    compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())
-                        .unwrap_or(0.0);
+                let d_trace = compute_fourth_derivative_trace(
+                    &ingredients,
+                    v_i,
+                    m_alpha,
+                    self.hop.as_ref(),
+                )?
+                .unwrap_or(0.0);
                 Ok(c_trace + d_trace)
             }
             OuterHessianDerivativeKernel::Callback { first, second } => {
@@ -4749,15 +4866,13 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                 self.coords.len()
             ));
         }
-        let mut g_alpha = Array1::<f64>::zeros(self.hop.dim());
         let mut a_alpha = 0.0;
         for (idx, coord) in self.coords.iter().enumerate() {
             if alpha[idx] != 0.0 {
-                g_alpha.scaled_add(alpha[idx], &coord.g);
                 a_alpha += alpha[idx] * coord.a;
             }
         }
-        let m_alpha = self.hop.solve(&g_alpha);
+        let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
         let (alpha_dense, alpha_dense_rotated, alpha_op) = self.combined_drift(alpha);
         let mut out = Array1::<f64>::zeros(self.coords.len());
 
@@ -4765,7 +4880,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             let coord = &self.coords[idx];
             let pair_a = self.pair_a.row(idx).dot(alpha);
             let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
-            let pair_g = self.pair_vector_combo(idx, alpha);
+            let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
             let base_h2 = self.base_h2.row(idx).dot(alpha);
             let m_terms = self.m_pair_trace.row(idx).dot(alpha);
 
@@ -4806,15 +4921,11 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                 value
             };
 
-            let mut rhs = alpha_dense.dot(&coord.v);
-            if let Some(op) = alpha_op.as_ref() {
-                rhs += &op.mul_vec(&coord.v);
-            }
-            rhs += &coord.base_drift.apply(&m_alpha);
-            rhs -= &pair_g;
+            let rhs = self.pair_rhs_combo(idx, alpha);
+            let correction_v = coord.correction_v();
 
             let correction = if self.incl_logdet_h {
-                self.correction_trace(&rhs, &coord.v, &m_alpha)?
+                self.correction_trace(&rhs, &correction_v, &correction_m_alpha)?
             } else {
                 0.0
             };
@@ -4822,13 +4933,15 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             out[idx] = outer_hessian_entry(
                 coord.a,
                 a_alpha,
-                coord.g.dot(&m_alpha),
+                g_dot_v_alpha,
                 pair_a,
                 cross_trace,
                 base_h2 + m_terms + correction,
                 pair_ld_s,
                 self.profiled_phi,
                 self.profiled_nu,
+                self.profiled_dp_cgrad,
+                self.profiled_dp_cgrad2,
                 self.is_profiled,
                 self.incl_logdet_h,
                 self.incl_logdet_s,
@@ -4868,21 +4981,25 @@ fn build_outer_hessian_operator(
         "Outer Hessian requested but penalty second derivatives not provided".to_string()
     })?;
 
-    let (profiled_phi, profiled_nu, is_profiled) = match &solution.dispersion {
-        DispersionHandling::ProfiledGaussian => {
-            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let nu = (solution.n_observations as f64 - solution.nullspace_dim).max(1.0);
-            let phi_hat = dp_raw.max(1e-30) / nu;
-            (phi_hat, nu, true)
-        }
-        _ => (1.0, 1.0, false),
-    };
+    let (profiled_phi, profiled_nu, profiled_dp_cgrad, profiled_dp_cgrad2, is_profiled) =
+        match &solution.dispersion {
+            DispersionHandling::ProfiledGaussian => {
+                let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+                let (dp_c, dp_cgrad, dp_cgrad2) = smooth_floor_dp(dp_raw);
+                let nu = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
+                let phi_hat = dp_c / nu;
+                (phi_hat, nu, dp_cgrad, dp_cgrad2, true)
+            }
+            _ => (1.0, 1.0, 1.0, 0.0, false),
+        };
 
     let mut coords = Vec::with_capacity(total);
+    let mut rho_penalty_a_k_betas: Vec<Array1<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
-        let v_k = hop.solve(&a_k_beta);
+        let penalty_a_k_beta_vec = penalty_a_k_beta(coord, &solution.beta, lambdas[idx]);
+        let curvature_a_k_beta = penalty_a_k_beta(coord, &solution.beta, curvature_lambdas[idx]);
+        let v_k = hop.solve(&curvature_a_k_beta);
         let correction = effective_deriv.hessian_derivative_correction_result(&v_k)?;
         let mut total_dense = None;
         let mut total_operators = Vec::new();
@@ -4900,9 +5017,11 @@ fn build_outer_hessian_operator(
             (Some(dense_hop), Some(matrix)) => Some(dense_hop.rotate_to_eigenbasis(matrix)),
             _ => None,
         };
+        let a_i = 0.5 * solution.beta.dot(&penalty_a_k_beta_vec);
+        rho_penalty_a_k_betas.push(penalty_a_k_beta_vec);
         coords.push(OuterHessianCoord {
-            a: 0.5 * solution.beta.dot(&a_k_beta),
-            g: a_k_beta,
+            a: a_i,
+            g: curvature_a_k_beta,
             v: v_k,
             total_drift: StoredFirstDrift::from_parts(total_dense, dense_rotated, total_operators),
             base_drift: StoredFirstDrift::from_parts(base_dense, None, base_operators),
@@ -4935,9 +5054,32 @@ fn build_outer_hessian_operator(
 
     let mut pair_a = Array2::<f64>::zeros((total, total));
     let mut pair_ld_s = Array2::<f64>::zeros((total, total));
+    let mut g_dot_v = Array2::<f64>::zeros((total, total));
     let mut pair_g = vec![vec![None; total]; total];
     let mut base_h2 = Array2::<f64>::zeros((total, total));
     let mut m_pair_trace = Array2::<f64>::zeros((total, total));
+
+    for ii in 0..total {
+        for jj in ii..total {
+            let value = match (coords[ii].ext_index, coords[jj].ext_index) {
+                (None, None) => {
+                    let rho_j = jj;
+                    rho_penalty_a_k_betas[rho_j].dot(&coords[ii].v)
+                }
+                (None, Some(_)) => {
+                    let rho_i = ii;
+                    rho_penalty_a_k_betas[rho_i].dot(&coords[jj].v)
+                }
+                (Some(_), None) => {
+                    let rho_j = jj;
+                    rho_penalty_a_k_betas[rho_j].dot(&coords[ii].v)
+                }
+                (Some(_), Some(_)) => coords[ii].g.dot(&coords[jj].v),
+            };
+            g_dot_v[[ii, jj]] = value;
+            g_dot_v[[jj, ii]] = value;
+        }
+    }
 
     for idx in 0..k {
         pair_a[[idx, idx]] = coords[idx].a;
@@ -5037,7 +5179,7 @@ fn build_outer_hessian_operator(
                     x,
                 },
                 hop.as_ref(),
-            )),
+            )?),
             OuterHessianDerivativeKernel::Callback { .. } => None,
         }
     } else {
@@ -5049,11 +5191,14 @@ fn build_outer_hessian_operator(
         coords,
         pair_a,
         pair_ld_s,
+        g_dot_v,
         pair_g,
         base_h2,
         m_pair_trace,
         profiled_phi,
         profiled_nu,
+        profiled_dp_cgrad,
+        profiled_dp_cgrad2,
         is_profiled,
         incl_logdet_h,
         incl_logdet_s,
@@ -5146,7 +5291,7 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64]) -> Vec<f64>
     let (profiled_scale, is_profiled) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let (dp_c, _) = smooth_floor_dp(dp_raw);
+            let (dp_c, _, _) = smooth_floor_dp(dp_raw);
             let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             (dp_c / denom, true)
         }
@@ -5373,7 +5518,7 @@ pub fn compute_hybrid_efs_update(
     let (profiled_scale, is_profiled) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let (dp_c, _) = smooth_floor_dp(dp_raw);
+            let (dp_c, _, _) = smooth_floor_dp(dp_raw);
             let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             (dp_c / denom, true)
         }
@@ -8373,17 +8518,17 @@ mod tests {
     #[test]
     fn test_smooth_floor_dp() {
         // Well above floor: should be approximately identity
-        let (val, grad) = smooth_floor_dp(1.0);
+        let (val, grad, _) = smooth_floor_dp(1.0);
         assert!((val - 1.0).abs() < 1e-6);
         assert!((grad - 1.0).abs() < 1e-6);
 
         // At floor: should be approximately DP_FLOOR + tau*ln(2)
-        let (val, grad) = smooth_floor_dp(DP_FLOOR);
+        let (val, grad, _) = smooth_floor_dp(DP_FLOOR);
         assert!(val > DP_FLOOR);
         assert!((grad - 0.5).abs() < 0.1); // sigmoid at 0 ≈ 0.5
 
         // Well below floor: value should stay above DP_FLOOR
-        let (val, _) = smooth_floor_dp(0.0);
+        let (val, _, _) = smooth_floor_dp(0.0);
         assert!(val >= DP_FLOOR);
     }
 

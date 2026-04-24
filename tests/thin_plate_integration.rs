@@ -60,6 +60,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             tol: 1e-6,
             nullspace_dims: vec![0, 0],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -150,6 +151,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             // second ridge penalty has none.
             nullspace_dims: vec![3, 0],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
@@ -275,6 +277,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
             tol: 1e-6,
             nullspace_dims: vec![4, 0],
             linear_constraints: None,
+            firth_bias_reduction: false,
             adaptive_regularization: None,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
