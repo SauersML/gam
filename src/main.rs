@@ -92,7 +92,6 @@ use gam::survival_location_scale::{
 use gam::survival_marginal_slope::{
     DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
 };
-use gam::survival_predict::{SurvivalPredictRequest, SurvivalPredictResult, predict_survival};
 use gam::term_builder::{build_termspec, enable_scale_dimensions};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
@@ -2220,6 +2219,13 @@ fn build_predict_input_for_model(
                 )
             })?;
             let response_new = data.column(response_col_idx).to_owned();
+            for value in response_new.iter().copied() {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "transformation-normal response value in prediction data is not finite: {value}"
+                    ));
+                }
+            }
 
             // Build response basis at new y values
             let (raw_val_basis, _) = gam::basis::create_basis::<gam::basis::Dense>(
@@ -2267,17 +2273,21 @@ fn build_predict_input_for_model(
                 .copied()
                 .filter(|value| value.is_finite())
                 .collect::<Vec<_>>();
-            for value in response_new.iter().copied() {
-                if !value.is_finite() {
-                    return Err(format!(
-                        "transformation-normal response value in prediction data is not finite: {value}"
-                    ));
+            let mut sorted_response_new = response_new.to_vec();
+            sorted_response_new
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let prediction_quantiles = sorted_response_new.len().min(129);
+            if prediction_quantiles == 1 {
+                derivative_grid.push(sorted_response_new[0]);
+            } else if prediction_quantiles > 1 {
+                for q in 0..prediction_quantiles {
+                    let idx = q * (sorted_response_new.len() - 1) / (prediction_quantiles - 1);
+                    derivative_grid.push(sorted_response_new[idx]);
                 }
-                derivative_grid.push(value);
             }
             if derivative_grid.is_empty() {
                 return Err(
-                    "saved transformation-normal model has no finite response knots and prediction data has no finite response values".to_string(),
+                    "saved transformation-normal model has no finite response knots".to_string(),
                 );
             }
             derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2317,6 +2327,19 @@ fn build_predict_input_for_model(
             resp_deriv_grid
                 .slice_mut(ndarray::s![.., 2..])
                 .assign(&dev_deriv);
+            let (raw_obs_deriv_basis, _) = gam::basis::create_basis::<gam::basis::Dense>(
+                response_new.view(),
+                gam::basis::KnotSource::Provided(resp_knots.view()),
+                response_degree,
+                gam::basis::BasisOptions::first_derivative(),
+            )
+            .map_err(|e| e.to_string())?;
+            let dev_obs_deriv = raw_obs_deriv_basis.as_ref().dot(&resp_transform);
+            let mut resp_deriv_obs = ndarray::Array2::<f64>::zeros((n, p_resp));
+            resp_deriv_obs.column_mut(1).fill(1.0);
+            resp_deriv_obs
+                .slice_mut(ndarray::s![.., 2..])
+                .assign(&dev_obs_deriv);
 
             let monotonicity_eps = 1.0e-8;
             let mut min_h_prime = f64::INFINITY;
@@ -2335,6 +2358,17 @@ fn build_predict_input_for_model(
                     }
                     min_h_prime = min_h_prime.min(h_prime);
                 }
+                let resp_deriv_row = resp_deriv_obs.row(i);
+                let mut h_prime = 0.0;
+                for r in 0..p_resp {
+                    if resp_deriv_row[r] == 0.0 {
+                        continue;
+                    }
+                    for c in 0..p_cov {
+                        h_prime += resp_deriv_row[r] * cov_row[c] * beta_mat[[r, c]];
+                    }
+                }
+                min_h_prime = min_h_prime.min(h_prime);
             }
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
@@ -10863,7 +10897,7 @@ mod tests {
             };
             let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
             let a_init = q * (1.0 + (scale * slope) * (scale * slope)).sqrt();
-            let (root, _) = gam::families::monotone_root::solve_monotone_root(
+            let (root, _, residual) = gam::families::monotone_root::solve_monotone_root(
                 eval,
                 a_init,
                 "saved survival intercept",
@@ -10871,6 +10905,29 @@ mod tests {
                 64,
                 64,
             )?;
+            let target_survival = gam::probability::normal_cdf(-q);
+            let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
+            let probability_tol = 1e-12_f64.max(1e-8 * tail_mass);
+            let mut residual_ok = residual.abs() <= probability_tol;
+            if target_survival < 1e-8 {
+                let achieved_survival = target_survival + residual;
+                residual_ok = if target_survival.is_finite()
+                    && target_survival > 0.0
+                    && achieved_survival.is_finite()
+                    && achieved_survival > 0.0
+                {
+                    (achieved_survival.ln() - target_survival.ln()).abs() <= 1e-8
+                } else {
+                    residual_ok
+                };
+            }
+            if !residual_ok {
+                return Err(format!(
+                    "saved survival marginal-slope intercept solve failed: \
+                     residual={residual:.3e} at a={root:.6}, target survival={target_survival:.6e}, \
+                     probability_tol={probability_tol:.3e}"
+                ));
+            }
             Ok(root)
         }
 

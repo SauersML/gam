@@ -3438,7 +3438,7 @@ impl SurvivalMarginalSlopeFamily {
         };
         let probit_scale = self.probit_frailty_scale();
         let a_init = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
-        let (a, abs_deriv) = super::monotone_root::solve_monotone_root(
+        let (a, abs_deriv, residual) = super::monotone_root::solve_monotone_root(
             eval,
             a_init,
             "survival intercept",
@@ -3447,7 +3447,6 @@ impl SurvivalMarginalSlopeFamily {
             64,
         )?;
 
-        let (residual, _, _) = eval(a)?;
         let target_survival = crate::probability::normal_cdf(-q);
         let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
         let probability_tol = SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL
@@ -12823,7 +12822,7 @@ pub fn fit_survival_marginal_slope_terms(
             build_deviation_block_from_knots_design_seed_and_anchor_weights(
                 &q0_seed,
                 &q0_seed,
-                Some(&spec.weights),
+                &spec.weights,
                 cfg,
             )
         })

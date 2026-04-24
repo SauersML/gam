@@ -40,7 +40,6 @@ pub struct DeviationRuntime {
     span_c1: Array2<f64>,
     span_c2: Array2<f64>,
     span_c3: Array2<f64>,
-    coefficient_transform: Array2<f64>,
     monotonicity_constraint_rows: Array2<f64>,
     /// Deviation basis values at the rightmost breakpoint (1 × basis_dim).
     /// Used for constant-tail continuation outside support: the deviation
@@ -52,7 +51,7 @@ enum DeviationMomentAnchor<'a> {
     StandardNormal,
     Empirical {
         values: &'a Array1<f64>,
-        weights: Option<&'a Array1<f64>>,
+        weights: &'a Array1<f64>,
     },
 }
 
@@ -95,29 +94,22 @@ fn anchor_coefficient_nullspace(
                     "deviation empirical moment anchor requires at least one value".to_string(),
                 );
             }
-            if let Some(weights) = weights {
-                if weights.len() != values.len() {
+            if weights.len() != values.len() {
+                return Err(format!(
+                    "deviation empirical moment anchor weight length mismatch: values={}, weights={}",
+                    values.len(),
+                    weights.len()
+                ));
+            }
+            let mut total_weight = 0.0;
+            for (idx, &weight) in weights.iter().enumerate() {
+                if !weight.is_finite() || weight < 0.0 {
                     return Err(format!(
-                        "deviation empirical moment anchor weight length mismatch: values={}, weights={}",
-                        values.len(),
-                        weights.len()
+                        "deviation empirical moment anchor weight at row {idx} must be finite and non-negative, got {weight}"
                     ));
                 }
+                total_weight += weight;
             }
-            let total_weight = if let Some(weights) = weights {
-                let mut total = 0.0;
-                for (idx, &weight) in weights.iter().enumerate() {
-                    if !weight.is_finite() || weight < 0.0 {
-                        return Err(format!(
-                            "deviation empirical moment anchor weight at row {idx} must be finite and non-negative, got {weight}"
-                        ));
-                    }
-                    total += weight;
-                }
-                total
-            } else {
-                values.len() as f64
-            };
             if !total_weight.is_finite() || total_weight <= 0.0 {
                 return Err(
                     "deviation empirical moment anchor requires positive total weight".to_string(),
@@ -138,7 +130,7 @@ fn anchor_coefficient_nullspace(
                     raw_span_c3,
                     raw_right_boundary_value_row,
                 )?;
-                let anchor_weight = weights.map_or(1.0, |weights| weights[idx]) / total_weight;
+                let anchor_weight = weights[idx] / total_weight;
                 for j in 0..raw_dim {
                     c[[0, j]] += anchor_weight * row[j];
                     c[[1, j]] += anchor_weight * q * row[j];
@@ -201,6 +193,47 @@ fn raw_design_row(
     Ok(out)
 }
 
+fn build_quadratic_derivative_bernstein_constraints(
+    endpoint_points: &Array1<f64>,
+    span_c1: &Array2<f64>,
+    span_c2: &Array2<f64>,
+    span_c3: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let n_spans = endpoint_points.len().saturating_sub(1);
+    let basis_dim = span_c1.ncols();
+    let mut rows = Array2::<f64>::zeros((3 * n_spans, basis_dim));
+    for span_idx in 0..n_spans {
+        let width = endpoint_points[span_idx + 1] - endpoint_points[span_idx];
+        if !width.is_finite() || width <= 0.0 {
+            return Err(format!(
+                "DeviationRuntime monotonicity span {span_idx} has invalid width {width}"
+            ));
+        }
+        let left_row = 3 * span_idx;
+        let mid_row = left_row + 1;
+        let right_row = left_row + 2;
+        for basis_idx in 0..basis_dim {
+            let c1 = span_c1[[span_idx, basis_idx]];
+            let c2 = span_c2[[span_idx, basis_idx]];
+            let c3 = span_c3[[span_idx, basis_idx]];
+            // For w(t)=c0+c1*t+c2*t^2+c3*t^3 on t in [0,h],
+            // w'(t)=c1+2*c2*t+3*c3*t^2. In quadratic Bernstein form over
+            // s=t/h, the controls are:
+            //   b0 = c1
+            //   b1 = c1 + c2*h
+            //   b2 = c1 + 2*c2*h + 3*c3*h^2
+            // Since Bernstein basis functions are non-negative and sum to 1,
+            // b_k >= eps-1 is a linear certificate for x + w(x) monotonicity.
+            // `exact_monotonicity_min_slack` below still checks the true
+            // quadratic minimum, including the interior vertex.
+            rows[[left_row, basis_idx]] = c1;
+            rows[[mid_row, basis_idx]] = c1 + c2 * width;
+            rows[[right_row, basis_idx]] = c1 + 2.0 * c2 * width + 3.0 * c3 * width * width;
+        }
+    }
+    Ok(rows)
+}
+
 impl DeviationRuntime {
     pub(crate) fn try_new_standard_normal_anchor(
         knots: Array1<f64>,
@@ -213,19 +246,11 @@ impl DeviationRuntime {
         )
     }
 
-    pub(crate) fn try_new_empirical_anchor(
-        knots: Array1<f64>,
-        monotonicity_eps: f64,
-        reference: &Array1<f64>,
-    ) -> Result<Self, String> {
-        Self::try_new_weighted_empirical_anchor(knots, monotonicity_eps, reference, None)
-    }
-
     pub(crate) fn try_new_weighted_empirical_anchor(
         knots: Array1<f64>,
         monotonicity_eps: f64,
         reference: &Array1<f64>,
-        weights: Option<&Array1<f64>>,
+        weights: &Array1<f64>,
     ) -> Result<Self, String> {
         Self::try_new_with_anchor(
             knots,
@@ -320,7 +345,12 @@ impl DeviationRuntime {
         let span_c2 = fast_ab(&raw_span_c2, &coefficient_transform);
         let span_c3 = fast_ab(&raw_span_c3, &coefficient_transform);
         let right_boundary_value_row = raw_right_boundary_value_row.dot(&coefficient_transform);
-        let monotonicity_constraint_rows = coefficient_transform.clone();
+        let monotonicity_constraint_rows = build_quadratic_derivative_bernstein_constraints(
+            &endpoint_points,
+            &span_c1,
+            &span_c2,
+            &span_c3,
+        )?;
 
         Ok(Self {
             degree: 3,
@@ -332,7 +362,6 @@ impl DeviationRuntime {
             span_c1,
             span_c2,
             span_c3,
-            coefficient_transform,
             monotonicity_constraint_rows,
             right_boundary_value_row,
         })
@@ -370,10 +399,6 @@ impl DeviationRuntime {
 
     pub fn span_c3(&self) -> &Array2<f64> {
         &self.span_c3
-    }
-
-    pub(crate) fn coefficient_transform(&self) -> &Array2<f64> {
-        &self.coefficient_transform
     }
 
     // ── design evaluation ──
