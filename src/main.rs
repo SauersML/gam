@@ -2259,6 +2259,70 @@ fn build_predict_input_for_model(
                 .into_shape_with_order((p_resp, p_cov))
                 .map_err(|e| format!("beta reshape failed: {e}"))?;
             let cov_mat = cov_design_full.design.row_chunk(0..n);
+
+            let mut derivative_grid = resp_knots
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .collect::<Vec<_>>();
+            if derivative_grid.is_empty() {
+                return Err(
+                    "saved transformation-normal model has no finite response knots".to_string(),
+                );
+            }
+            derivative_grid.sort_by(|a, b| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let min_grid = derivative_grid[0];
+            let max_grid = derivative_grid[derivative_grid.len() - 1];
+            let grid_span = (max_grid - min_grid).abs().max(1.0);
+            let grid_guard = 0.25 * grid_span;
+            derivative_grid.push(min_grid - grid_guard);
+            derivative_grid.push(max_grid + grid_guard);
+            derivative_grid.sort_by(|a, b| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            derivative_grid.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12 * grid_span);
+            let derivative_grid = ndarray::Array1::from_vec(derivative_grid);
+            let (raw_deriv_basis, _) = gam::basis::create_basis::<gam::basis::Dense>(
+                derivative_grid.view(),
+                gam::basis::KnotSource::Provided(resp_knots.view()),
+                response_degree,
+                gam::basis::BasisOptions::first_derivative(),
+            )
+            .map_err(|e| e.to_string())?;
+            let dev_deriv = raw_deriv_basis.as_ref().dot(&resp_transform);
+            let mut resp_deriv_grid =
+                ndarray::Array2::<f64>::zeros((derivative_grid.len(), p_resp));
+            resp_deriv_grid.column_mut(1).fill(1.0);
+            resp_deriv_grid
+                .slice_mut(ndarray::s![.., 2..])
+                .assign(&dev_deriv);
+
+            let monotonicity_eps = 1.0e-8;
+            let mut min_h_prime = f64::INFINITY;
+            for i in 0..n {
+                let cov_row = cov_mat.row(i);
+                for g in 0..resp_deriv_grid.nrows() {
+                    let resp_deriv_row = resp_deriv_grid.row(g);
+                    let mut h_prime = 0.0;
+                    for r in 0..p_resp {
+                        if resp_deriv_row[r] == 0.0 {
+                            continue;
+                        }
+                        for c in 0..p_cov {
+                            h_prime += resp_deriv_row[r] * cov_row[c] * beta_mat[[r, c]];
+                        }
+                    }
+                    min_h_prime = min_h_prime.min(h_prime);
+                }
+            }
+            if min_h_prime < monotonicity_eps {
+                return Err(format!(
+                    "transformation-normal prediction violates monotonicity on the response grid for new data: min h'={min_h_prime:.6e}"
+                ));
+            }
+
             let mut h = ndarray::Array1::<f64>::zeros(n);
             for i in 0..n {
                 let resp_row = resp_val.row(i);
