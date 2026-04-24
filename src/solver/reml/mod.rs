@@ -1155,6 +1155,25 @@ mod tests {
             ),
             "unexpected penalty-only directional-gradient error: {msg}"
         );
+
+        let efs_hyper = DirectionalHyperParam::single_penalty(
+            0,
+            Array2::<f64>::zeros((x.nrows(), x.ncols())),
+            array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.03], [0.0, 0.03, 0.12],],
+            None,
+            None,
+        )
+        .expect("single-penalty EFS hyper direction");
+        let efs_err = state
+            .compute_efs_steps_with_psi_ext(&rho, &[efs_hyper])
+            .expect_err("Firth penalty-only EFS must reject incomplete TK ext-coordinate calculus");
+        let efs_msg = efs_err.to_string();
+        assert!(
+            efs_msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
+            "unexpected penalty-only EFS error: {efs_msg}"
+        );
     }
 
     #[test]
