@@ -2559,6 +2559,7 @@ fn build_shape_constraint_design_1d(
                     })
                     .unwrap_or_else(|| spec.identifiability.clone()),
                 aniso_log_scales: aniso_log_scales.clone(),
+                operator_penalties: spec.operator_penalties.clone(),
             };
             build_duchon_basis(grid_2d.view(), &evalspec)?
                 .design

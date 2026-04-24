@@ -1023,17 +1023,26 @@ impl DenseDesignOperator for ReparamOperator {
         None
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.p {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "ReparamOperator::row_chunk_into shape mismatch",
+            });
+        }
         match &self.x_original {
             DesignMatrix::Dense(x) => {
                 let chunk = x.row_chunk(rows);
-                fast_ab(&chunk, &self.qs)
+                out.assign(&fast_ab(&chunk, &self.qs));
             }
             DesignMatrix::Sparse(sdm) => {
                 // Extract rows directly from CSR without densifying the full matrix.
                 let csr = sdm
                     .to_csr_arc()
-                    .expect("ReparamOperator::row_chunk: CSR conversion");
+                    .expect("ReparamOperator::row_chunk_into: CSR conversion");
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();
@@ -1046,9 +1055,10 @@ impl DenseDesignOperator for ReparamOperator {
                         chunk[[local, col_idx[ptr]]] = vals[ptr];
                     }
                 }
-                fast_ab(&chunk.to_owned(), &self.qs)
+                out.assign(&fast_ab(&chunk, &self.qs));
             }
         }
+        Ok(())
     }
 }
 

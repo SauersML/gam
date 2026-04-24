@@ -7788,8 +7788,19 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             }
         }
     }
-    let mut d2 = Array2::<f64>::zeros((p_colloc, total_cols));
+    let mut d2 = Array2::<f64>::zeros((p_colloc * dim * dim, total_cols));
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
+    if poly_cols > 0 {
+        let mut poly_hessian = polynomial_hessian_operator_block(centers, nullspace_order);
+        for (k, &scale_k) in row_scales.iter().enumerate() {
+            for local in 0..(dim * dim) {
+                poly_hessian
+                    .row_mut(k * dim * dim + local)
+                    .mapv_inplace(|v| scale_k * v);
+            }
+        }
+        d2.slice_mut(s![.., kernel_cols..]).assign(&poly_hessian);
+    }
     if let Some(z) = identifiability_transform {
         let z = z.to_owned();
         d0 = fast_ab(&d0, &z);
