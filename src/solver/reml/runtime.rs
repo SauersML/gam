@@ -702,7 +702,16 @@ impl<'a> RemlState<'a> {
         tk_terms: TkCorrectionTerms,
     ) -> super::unified::RemlLamlResult {
         let _ = rho; // kept for API compatibility; lengths come from tk_grad now.
+        if !result.cost.is_finite() || !tk_terms.value.is_finite() {
+            eprintln!(
+                "[TK-debug] pre_cost={} tk_value={}",
+                result.cost, tk_terms.value
+            );
+        }
         result.cost += tk_terms.value;
+        if !result.cost.is_finite() {
+            eprintln!("[TK-debug] post_cost={}", result.cost);
+        }
         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
             let len = grad.len().min(tk_grad.len());
             {

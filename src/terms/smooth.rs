@@ -10558,10 +10558,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                     hessian: hess,
                 })
             }
-            Err(err) => {
-                log::warn!("[spatial-iso-joint] evaluator rejected theta: {err}");
-                Ok(OuterEval::infeasible(theta.len()))
-            }
+            Err(err) => Err(err),
         }
     };
 
@@ -10853,7 +10850,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                     hessian: hess,
                 })
             }
-            Err(_) => Ok(OuterEval::infeasible(theta.len())),
+            Err(err) => Err(err),
         }
     };
 
@@ -16015,7 +16012,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_length_scale_optimization_supports_binomial_logit_matern() {
+    fn spatial_length_scale_optimization_rejects_binomial_logit_matern_without_tk_psi_gradients() {
         let n = 80usize;
         let d = 2usize;
         let mut data = Array2::<f64>::zeros((n, d));
@@ -16073,7 +16070,7 @@ mod tests {
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
 
-        let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
+        let result = fit_term_collectionwith_spatial_length_scale_optimization(
             data.view(),
             y,
             weights,
@@ -16090,15 +16087,18 @@ mod tests {
                 max_length_scale: 1e3,
                 pilot_subsample_threshold: 0,
             },
-        )
-        .expect("binomial-logit Matérn spatial κ optimization should succeed");
-
-        let ls = match &optimized.resolvedspec.smooth_terms[0].basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
-            _ => panic!("expected Matérn term"),
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "binomial-logit Matérn spatial κ optimization requires analytic TK ψ gradients"
+            ),
+            Err(err) => err,
         };
-        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
-        assert!(optimized.fit.beta.iter().all(|v| v.is_finite()));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Tierney-Kadane psi gradients require analytic derivatives"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
