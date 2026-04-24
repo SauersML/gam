@@ -32,7 +32,7 @@
 //! Cholesky-based logdet while gradient uses eigendecomposition-based traces
 //! with a different numerical threshold.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Zip};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, ArrayViewMut2, Zip};
 use std::sync::{Arc, OnceLock};
 
 use crate::faer_ndarray::FaerEigh;
@@ -1234,6 +1234,24 @@ pub trait HyperOperator: Send + Sync {
         out.assign(&self.mul_vec_view(v));
     }
 
+    /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
+    ///
+    /// Sparse exact traces build `B E` in column batches. Operators with
+    /// materialized column storage can override this to copy columns directly
+    /// instead of multiplying one basis vector at a time.
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+        let cols = out.ncols();
+        let dim = out.nrows();
+        debug_assert!(start + cols <= dim);
+        let mut basis = Array1::<f64>::zeros(dim);
+        for local_col in 0..cols {
+            let global_col = start + local_col;
+            basis[global_col] = 1.0;
+            self.mul_vec_into(basis.view(), out.column_mut(local_col));
+            basis[global_col] = 0.0;
+        }
+    }
+
     /// Accumulate `scale * B · v` into caller-owned storage.
     fn scaled_add_mul_vec(
         &self,
@@ -1307,6 +1325,12 @@ impl HyperOperator for DenseMatrixHyperOperator {
         dense_matvec_into(&self.matrix, v, out);
     }
 
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+        let end = start + out.ncols();
+        debug_assert!(end <= self.matrix.ncols());
+        out.assign(&self.matrix.slice(ndarray::s![.., start..end]));
+    }
+
     fn scaled_add_mul_vec(&self, v: ArrayView1<'_, f64>, scale: f64, out: ArrayViewMut1<'_, f64>) {
         dense_matvec_scaled_add_into(&self.matrix, v, scale, out);
     }
@@ -1360,6 +1384,25 @@ impl HyperOperator for CompositeHyperOperator {
         }
         for op in &self.operators {
             op.scaled_add_mul_vec(v, 1.0, out.view_mut());
+        }
+    }
+
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            self.operators[0].mul_basis_columns_into(start, out);
+            return;
+        }
+
+        out.fill(0.0);
+        let cols = out.ncols();
+        let end = start + cols;
+        if let Some(dense) = self.dense.as_ref() {
+            out += &dense.slice(ndarray::s![.., start..end]);
+        }
+        let mut work = Array2::<f64>::zeros((out.nrows(), cols));
+        for op in &self.operators {
+            op.mul_basis_columns_into(start, work.view_mut());
+            out += &work;
         }
     }
 
@@ -1463,6 +1506,29 @@ impl HyperOperator for BlockLocalDrift {
         let v_block = v.slice(ndarray::s![self.start..self.end]);
         let out_block = out.slice_mut(ndarray::s![self.start..self.end]);
         dense_matvec_into(&self.local, v_block, out_block);
+    }
+
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+        out.fill(0.0);
+        let global_end = start + out.ncols();
+        let col_start = start.max(self.start);
+        let col_end = global_end.min(self.end);
+        if col_start >= col_end {
+            return;
+        }
+        let local_col_start = col_start - self.start;
+        let local_col_end = col_end - self.start;
+        let out_col_start = col_start - start;
+        let out_col_end = col_end - start;
+        out.slice_mut(ndarray::s![
+            self.start..self.end,
+            out_col_start..out_col_end
+        ])
+        .assign(
+            &self
+                .local
+                .slice(ndarray::s![.., local_col_start..local_col_end]),
+        );
     }
 
     fn scaled_add_mul_vec(
@@ -5203,6 +5269,29 @@ impl HyperOperator for WeightedHyperOperator {
         }
     }
 
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+        let mut nonzero_terms = self.terms.iter().filter(|(weight, _)| *weight != 0.0);
+        if let Some((weight, op)) = nonzero_terms.next()
+            && nonzero_terms.next().is_none()
+        {
+            op.mul_basis_columns_into(start, out.view_mut());
+            if *weight != 1.0 {
+                out.mapv_inplace(|value| *weight * value);
+            }
+            return;
+        }
+
+        out.fill(0.0);
+        let mut work = Array2::<f64>::zeros((out.nrows(), out.ncols()));
+        for (weight, op) in &self.terms {
+            if *weight == 0.0 {
+                continue;
+            }
+            op.mul_basis_columns_into(start, work.view_mut());
+            out.scaled_add(*weight, &work);
+        }
+    }
+
     fn scaled_add_mul_vec(
         &self,
         v: ArrayView1<'_, f64>,
@@ -7486,26 +7575,18 @@ impl SparseCholeskyOperator {
         self
     }
 
+    const OPERATOR_SOLVE_CHUNK: usize = 64;
+
     fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {
-        let chunk = 32usize;
+        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut trace = 0.0_f64;
-        let mut basis = Array1::<f64>::zeros(self.n_dim);
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
         let mut start = 0usize;
 
         while start < self.n_dim {
             let end = (start + chunk).min(self.n_dim);
             let cols = end - start;
-            rhs_block.slice_mut(ndarray::s![.., ..cols]).fill(0.0);
-            for local_col in 0..cols {
-                let global_col = start + local_col;
-                basis[global_col] = 1.0;
-                op.mul_vec_into(
-                    basis.view(),
-                    rhs_block.slice_mut(ndarray::s![.., local_col]),
-                );
-                basis[global_col] = 0.0;
-            }
+            op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
             let diagonal_sum = if cols == chunk {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
@@ -7539,25 +7620,15 @@ impl SparseCholeskyOperator {
     }
 
     fn solve_operator_columns_exact(&self, op: &dyn HyperOperator) -> Result<Array2<f64>, String> {
-        let chunk = 32usize;
+        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut solved_all = Array2::<f64>::zeros((self.n_dim, self.n_dim));
-        let mut basis = Array1::<f64>::zeros(self.n_dim);
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
         let mut start = 0usize;
 
         while start < self.n_dim {
             let end = (start + chunk).min(self.n_dim);
             let cols = end - start;
-            rhs_block.slice_mut(ndarray::s![.., ..cols]).fill(0.0);
-            for local_col in 0..cols {
-                let global_col = start + local_col;
-                basis[global_col] = 1.0;
-                op.mul_vec_into(
-                    basis.view(),
-                    rhs_block.slice_mut(ndarray::s![.., local_col]),
-                );
-                basis[global_col] = 0.0;
-            }
+            op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
             let solved = if cols == chunk {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)

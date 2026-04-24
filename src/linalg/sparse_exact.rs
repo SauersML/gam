@@ -864,23 +864,23 @@ impl TakahashiInverse {
 
         for j in (0..n).rev() {
             let diag_idx = col_ptr[j];
+            let col_end = col_ptr[j + 1];
             let diag = factor.l_values[diag_idx];
             if !(diag.is_finite() && diag > 0.0) {
                 return Err(EstimationError::HessianNotPositiveDefinite {
                     min_eigenvalue: f64::NAN,
                 });
             }
-            for idx in col_ptr[j]..col_ptr[j + 1] {
+            for idx in (diag_idx + 1)..col_end {
                 let i = row_idx[idx];
-                let rhs = if i == j { 1.0 / diag } else { 0.0 };
                 let mut correction = 0.0;
-                for off_idx in (diag_idx + 1)..col_ptr[j + 1] {
+                for off_idx in (diag_idx + 1)..col_end {
                     let k = row_idx[off_idx];
                     let l_kj = factor.l_values[off_idx];
                     let z_ik = Self::selected_value(&z_values, &col_ptr, &row_idx, i, k)?;
                     correction += l_kj * z_ik;
                 }
-                let value = (rhs - correction) / diag;
+                let value = -correction / diag;
                 if !value.is_finite() {
                     return Err(EstimationError::InvalidInput(format!(
                         "Takahashi selected inverse produced non-finite entry ({i},{j})"
@@ -888,6 +888,17 @@ impl TakahashiInverse {
                 }
                 z_values[idx] = value;
             }
+            let mut correction = 0.0;
+            for off_idx in (diag_idx + 1)..col_end {
+                correction += factor.l_values[off_idx] * z_values[off_idx];
+            }
+            let value = (1.0 / diag - correction) / diag;
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Takahashi selected inverse produced non-finite diagonal entry ({j},{j})"
+                )));
+            }
+            z_values[diag_idx] = value;
         }
 
         Ok(TakahashiInverse {
