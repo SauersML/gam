@@ -2593,14 +2593,9 @@ mod tests {
         assert!(rep.e_transformed[[0, 0]].abs() > 0.0);
         assert!(rep.e_transformed[[0, 1]].abs() <= 1e-12);
         assert!(rep.e_transformed[[0, 2]].abs() <= 1e-12);
-        // Compute expected det1 from the δ-regularized formula rather than
-        // comparing against the idealized rank.  Single rank-1 penalty with
-        // eigenvalue ||rs||² = 1 in the penalized block.
-        let s_k_eig = 1.0_f64; // single eigenvalue of S_k
-        let lambda = 4.0_f64;
-        let max_ev = (lambda * s_k_eig).max(1.0);
-        let delta = 1e-10 * max_ev;
-        let expected_det1 = lambda * s_k_eig / (lambda * s_k_eig + delta);
+        // Exact pseudo-logdet on the structural penalized block has no
+        // delta-dependent nullspace normalization.
+        let expected_det1 = 1.0_f64;
         assert!((rep.det1[0] - expected_det1).abs() <= 1e-12);
 
         let s = rep.s_transformed;
@@ -2642,21 +2637,12 @@ mod tests {
 
         assert_eq!(rep.e_transformed.nrows(), p);
         let det1 = rep.det1[0];
-        // Compute expected det1 from the δ-regularized formula:
-        //   det1 = lambda * sum_l d_l / (lambda*d_l + δ)
-        // where d_l are eigenvalues of S_k and δ = 1e-10 * max(lambda*d_l).
+        // Exact pseudo-logdet on the structural penalized block:
+        //   det1 = lambda * sum_l d_l / (lambda*d_l)
+        // where d_l are eigenvalues of S_k.
         let s_k_eigs = [9.0_f64, 1.0_f64];
         let lambda = 5.0_f64;
-        let max_ev = s_k_eigs
-            .iter()
-            .map(|&d| lambda * d)
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        let delta = 1e-10 * max_ev;
-        let expected_det1: f64 = s_k_eigs
-            .iter()
-            .map(|&d| lambda * d / (lambda * d + delta))
-            .sum();
+        let expected_det1: f64 = s_k_eigs.iter().map(|&d| lambda * d / (lambda * d)).sum();
         assert!(
             (det1 - expected_det1).abs() <= 1e-12,
             "expected det1={expected_det1}, got {det1}",

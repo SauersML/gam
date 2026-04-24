@@ -16012,7 +16012,8 @@ mod tests {
     }
 
     #[test]
-    fn spatial_length_scale_optimization_rejects_binomial_logit_matern_without_tk_psi_gradients() {
+    fn spatial_length_scale_optimization_rejects_binomial_logit_matern_without_full_tk_psi_gradients()
+     {
         let n = 80usize;
         let d = 2usize;
         let mut data = Array2::<f64>::zeros((n, d));
@@ -16090,13 +16091,15 @@ mod tests {
         );
         let err = match result {
             Ok(_) => panic!(
-                "binomial-logit Matérn spatial κ optimization requires analytic TK ψ gradients"
+                "binomial-logit Matérn spatial kappa optimization requires full analytic TK psi gradients"
             ),
             Err(err) => err,
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Tierney-Kadane psi gradients require analytic derivatives"),
+            msg.contains(
+                "Tierney-Kadane psi gradients require full analytic c/d derivative propagation"
+            ),
             "unexpected error: {msg}"
         );
     }
