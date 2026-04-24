@@ -1451,10 +1451,21 @@ fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) {
+fn assert_rowwise_kronecker_dimensions(n: usize, p_resp: usize, p_cov: usize, context: &str) {
     assert!(
-        n > 0 && p_resp > 0 && p_cov > 0,
-        "CTN rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
+        p_resp > 0 && p_cov > 0,
+        "{context} rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
+    );
+}
+
+fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) {
+    let bytes = n
+        .saturating_mul(p_resp)
+        .saturating_mul(p_cov)
+        .saturating_mul(std::mem::size_of::<f64>());
+    panic!(
+        "CTN KroneckerDesign must remain factored; refused persistent n x p_response x p_covariate materialization (n={n}, p_response={p_resp}, p_covariate={p_cov}, dense={:.1} MiB)",
+        bytes as f64 / (1024.0 * 1024.0),
     );
 }
 
@@ -1490,7 +1501,12 @@ impl KroneckerDesign {
                 right.nrows()
             ));
         }
-        assert_no_rowwise_kronecker_materialization(left.nrows(), left.ncols(), right.ncols());
+        assert_rowwise_kronecker_dimensions(
+            left.nrows(),
+            left.ncols(),
+            right.ncols(),
+            "CTN",
+        );
         Ok(KroneckerDesign::Factored {
             left: left.clone(),
             right,
@@ -1603,9 +1619,18 @@ impl KroneckerDesign {
                     }
                     return out;
                 }
-                let dense = self.to_dense();
-                let wm = weight_rows(&dense, w);
-                fast_atb(&wm, &dense)
+                let pa = left.ncols();
+                let pb = right.ncols();
+                let p = pa * pb;
+                let mut out = Array2::<f64>::zeros((p, p));
+                for start in (0..left.nrows()).step_by(1024) {
+                    let end = (start + 1024).min(left.nrows());
+                    let chunk = self.row_chunk(start..end);
+                    let weight_chunk = w.slice(s![start..end]).to_owned();
+                    let weighted_chunk = weight_rows(&chunk, &weight_chunk);
+                    out += &fast_atb(&weighted_chunk, &chunk);
+                }
+                out
             }
         }
     }
@@ -1649,6 +1674,12 @@ impl DenseDesignOperator for KroneckerDesign {
     fn row_chunk(&self, rows: std::ops::Range<usize>) -> Array2<f64> {
         match self {
             KroneckerDesign::Factored { left, right } => {
+                assert_rowwise_kronecker_dimensions(
+                    rows.end.saturating_sub(rows.start),
+                    left.ncols(),
+                    right.ncols(),
+                    "CTN row chunk",
+                );
                 let left_chunk = left.slice(s![rows.clone(), ..]).to_owned();
                 let right_chunk = right.row_chunk(rows);
                 rowwise_kronecker(&left_chunk, &right_chunk)
@@ -1664,9 +1695,6 @@ impl DenseDesignOperator for KroneckerDesign {
                     left.ncols(),
                     right.ncols(),
                 );
-                panic!(
-                    "CTN KroneckerDesign must remain factored; refused persistent n x p_response x p_covariate materialization"
-                )
             }
         }
     }

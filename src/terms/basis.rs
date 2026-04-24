@@ -1909,6 +1909,12 @@ pub fn assert_spatial_centers_below_biobank_cap(
     let center_center_bytes = dense_design_bytes(k, k);
     let data_center_bytes = dense_design_bytes(n, k);
     assert!(
+        centers_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
+        "spatial PC centers exceed center storage cap: K={k}, d_pc={d_pc}, centers={:.1} MiB, cap={:.1} MiB",
+        centers_bytes as f64 / (1024.0 * 1024.0),
+        SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
+    );
+    assert!(
         center_center_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
         "spatial PC centers exceed center-center biobank cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
         center_center_bytes as f64 / (1024.0 * 1024.0),
@@ -1916,10 +1922,10 @@ pub fn assert_spatial_centers_below_biobank_cap(
     );
     assert!(
         data_center_bytes <= SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES
-            || centers_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
-        "spatial PC centers exceed persistent-object cap: n={n}, K={k}, d_pc={d_pc}, centers={:.1} MiB, optional n*K cache={:.1} MiB",
-        centers_bytes as f64 / (1024.0 * 1024.0),
+            || !spatial_distance_cacheable_entry(n, k),
+        "spatial PC n*K distance cache cap mismatch: n={n}, K={k}, d_pc={d_pc}, optional n*K cache={:.1} MiB, cap={:.1} MiB",
         data_center_bytes as f64 / (1024.0 * 1024.0),
+        SPATIAL_DATA_CENTER_DISTANCE_CACHE_MAX_BYTES as f64 / (1024.0 * 1024.0),
     );
 }
 
@@ -8876,6 +8882,9 @@ fn insert_spatial_distance_cache_entry(
     key: SpatialDistanceCacheKey,
     entry: SpatialDistanceCacheEntry,
 ) {
+    cache.map.clear();
+    cache.order.clear();
+    cache.bytes = 0;
     cache.bytes = cache.bytes.saturating_add(entry.bytes);
     cache.map.insert(key, entry);
     cache.order.push(key);

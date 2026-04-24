@@ -364,6 +364,13 @@ struct FitArgs {
     /// full dataset re-optimizes κ/anisotropy jointly. Set to 0 to disable.
     #[arg(long, value_name = "N", default_value_t = 10_000)]
     pilot_subsample_threshold: usize,
+    /// Use exact outer Hessians in blockwise/flexible family optimizers.
+    #[arg(long = "outer-hessian", default_value_t = false)]
+    outer_hessian: bool,
+    /// Fit-time covariance materialization. `full` computes dense covariance
+    /// and is not appropriate for UKB-scale batch fits.
+    #[arg(long = "covariance-mode", value_enum, default_value_t = BlockwiseCovarianceModeArg::None)]
+    covariance_mode: BlockwiseCovarianceModeArg,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -502,6 +509,14 @@ enum CovarianceModeArg {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+enum BlockwiseCovarianceModeArg {
+    None,
+    Diagonal,
+    Block,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 enum PredictModeArg {
     PosteriorMean,
     Map,
@@ -586,11 +601,11 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    _: &FitArgs,
+    args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    options.use_outer_hessian = true;
-    options.compute_covariance = true;
+    options.use_outer_hessian = args.outer_hessian;
+    options.compute_covariance = matches!(args.covariance_mode, BlockwiseCovarianceModeArg::Full);
     Ok(options)
 }
 
@@ -5108,10 +5123,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
             opts
         };
-        let options = gam::families::custom_family::BlockwiseFitOptions {
-            compute_covariance: true,
-            ..Default::default()
-        };
+        let options = blockwise_options_from_fit_args(args)?;
         let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -7729,12 +7741,11 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> DeviationBlockConfig {
-    let (penalty_order, penalty_orders) = split_wiggle_penalty_orders(2, &wiggle.penalty_orders);
     DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
-        penalty_order,
-        penalty_orders,
+        penalty_order: 2,
+        penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
         monotonicity_eps: 1e-4,
     }
@@ -8259,6 +8270,11 @@ fn resolve_bernoulli_marginal_slope_base_link(
     if matches!(choice.mode, LinkMode::Flexible) {
         return Err(format!(
             "{context} does not accept flexible(...) inside link(); use link(type=<base-link>) plus linkwiggle(...) to learn anchored link deviations"
+        ));
+    }
+    if choice.mixture_components.is_some() || choice.link != LinkFunction::Probit {
+        return Err(format!(
+            "{context} requires link(type=probit); non-probit marginal-slope links are not supported by the calibrated de-nested probit kernel"
         ));
     }
     if let Some(components) = choice.mixture_components.as_ref() {

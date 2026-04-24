@@ -264,12 +264,11 @@ fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<()
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> DeviationBlockConfig {
-    let (penalty_order, penalty_orders) = split_wiggle_penalty_orders(2, &wiggle.penalty_orders);
     DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
-        penalty_order,
-        penalty_orders,
+        penalty_order: 2,
+        penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
         monotonicity_eps: 1e-4,
     }
