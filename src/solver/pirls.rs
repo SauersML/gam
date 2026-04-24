@@ -3053,8 +3053,29 @@ where
     // The Laplace approximation int exp(-F(beta)) dbeta uses the actual
     // Hessian nabla^2 F at the actual mode. Replacing with expected Fisher
     // changes the approximation itself --- it becomes a PQL-type surrogate.
+    let pirls_iter_log_info = crate::solver::visualizer::pirls_iter_info_enabled();
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
+        // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
+        // inner work begins, so CI logs show *which* PIRLS iteration is in flight
+        // if the process is killed during `update_with_curvature` or the LM solve.
+        if pirls_iter_log_info {
+            log::info!(
+                "[PIRLS] start iter {:>3} | lm_lambda {:.2e} | last_halving {} | last_dev_change {:.3e}",
+                iter,
+                lambda,
+                last_step_halving,
+                last_deviance_change
+            );
+        } else {
+            log::debug!(
+                "[PIRLS] start iter {:>3} | lm_lambda {:.2e} | last_halving {} | last_dev_change {:.3e}",
+                iter,
+                lambda,
+                last_step_halving,
+                last_deviance_change
+            );
+        }
         let preferred_curvature =
             if model.supports_observed_information_curvature() && !force_fisher_for_rest {
                 HessianCurvatureKind::Observed
