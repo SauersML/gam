@@ -10,12 +10,12 @@
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
-    KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
+    build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar, BSplineBasisSpec,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense, KnotSource,
 };
 use crate::families::gamlss::{
-    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
-    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
+    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
+    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders, WiggleBlockConfig,
 };
 use crate::families::lognormal_kernel::HazardLoading;
 use crate::families::survival_location_scale::{
@@ -24,7 +24,7 @@ use crate::families::survival_location_scale::{
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
-use ndarray::{Array1, Array2, array, s};
+use ndarray::{array, s, Array1, Array2};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2254,16 +2254,16 @@ pub fn build_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_chain_rule_gradient,
-        baseline_offset_theta_partials, build_survival_marginal_slope_baseline_offsets,
-        build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
-        evaluate_survival_marginal_slope_baseline, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config,
+        baseline_chain_rule_gradient, baseline_offset_theta_partials,
+        build_survival_marginal_slope_baseline_offsets, build_survival_timewiggle_from_baseline,
+        evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline,
+        marginal_slope_baseline_offset_theta_partials, survival_baseline_config_from_theta,
+        survival_baseline_theta_from_config, SurvivalBaselineConfig, SurvivalBaselineTarget,
     };
     use crate::families::survival::OffsetChannelResiduals;
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
     use crate::probability::normal_cdf;
-    use ndarray::{Array1, array};
+    use ndarray::{array, Array1};
 
     #[test]
     fn survival_timewiggle_keeps_requested_order_one_penalty() {
@@ -2343,6 +2343,86 @@ mod tests {
             assert!((normal_cdf(-entry[i]) - (-entry_h).exp()).abs() <= 1e-12);
             assert!((normal_cdf(-exit[i]) - (-exit_h).exp()).abs() <= 1e-12);
             assert!(derivative[i].is_finite() && derivative[i] > 0.0);
+        }
+    }
+
+    fn fd_marginal_slope_baseline_offset(
+        age: f64,
+        cfg: &SurvivalBaselineConfig,
+        steps: &[f64],
+    ) -> Vec<(f64, f64)> {
+        let theta = survival_baseline_theta_from_config(cfg)
+            .expect("theta")
+            .expect("non-linear baseline");
+        assert_eq!(
+            steps.len(),
+            theta.len(),
+            "fd_marginal_slope_baseline_offset: step vector length must match θ dimension"
+        );
+        (0..theta.len())
+            .map(|k| {
+                let h = steps[k];
+                let mut theta_plus = theta.clone();
+                theta_plus[k] += h;
+                let mut theta_minus = theta.clone();
+                theta_minus[k] -= h;
+                let cfg_plus =
+                    survival_baseline_config_from_theta(cfg.target, &theta_plus).expect("plus cfg");
+                let cfg_minus = survival_baseline_config_from_theta(cfg.target, &theta_minus)
+                    .expect("minus cfg");
+                let (q_p, qt_p) =
+                    evaluate_survival_marginal_slope_baseline(age, &cfg_plus).expect("q+");
+                let (q_m, qt_m) =
+                    evaluate_survival_marginal_slope_baseline(age, &cfg_minus).expect("q-");
+                ((q_p - q_m) / (2.0 * h), (qt_p - qt_m) / (2.0 * h))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn marginal_slope_baseline_theta_partials_match_fd_for_gompertz_makeham() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.04),
+            rate: Some(0.013),
+            makeham: Some(0.002),
+        };
+        let age = 17.0;
+        let analytic = marginal_slope_baseline_offset_theta_partials(age, &cfg)
+            .expect("partials")
+            .expect("nonlinear");
+        let fd = fd_marginal_slope_baseline_offset(age, &cfg, &[1e-5, 1e-5, 1e-5]);
+        assert_eq!(analytic.len(), fd.len());
+        for (k, ((aq, aqt), (fq, fqt))) in analytic.iter().zip(fd.iter()).enumerate() {
+            assert_close(*aq, *fq, 1e-6, &format!("gm-probit q theta[{k}]"));
+            assert_close(*aqt, *fqt, 1e-6, &format!("gm-probit q' theta[{k}]"));
+        }
+    }
+
+    #[test]
+    fn marginal_slope_baseline_theta_partials_match_fd_near_zero_gompertz_shape() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(1e-14),
+            rate: Some(0.013),
+            makeham: Some(0.002),
+        };
+        let age = 17.0;
+        let analytic = marginal_slope_baseline_offset_theta_partials(age, &cfg)
+            .expect("partials")
+            .expect("nonlinear");
+        let fd = fd_marginal_slope_baseline_offset(age, &cfg, &[1e-5, 1e-11, 1e-5]);
+        assert_eq!(analytic.len(), fd.len());
+        for (k, ((aq, aqt), (fq, fqt))) in analytic.iter().zip(fd.iter()).enumerate() {
+            assert_close(*aq, *fq, 1e-5, &format!("near-zero gm-probit q theta[{k}]"));
+            assert_close(
+                *aqt,
+                *fqt,
+                1e-5,
+                &format!("near-zero gm-probit q' theta[{k}]"),
+            );
         }
     }
 
