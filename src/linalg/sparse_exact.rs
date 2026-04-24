@@ -1,5 +1,7 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerColView, FaerEigh};
+#[cfg(test)]
+use crate::faer_ndarray::FaerEigh;
+use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerColView};
 use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
@@ -68,28 +70,6 @@ pub fn dense_to_sparse(
     }
     SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
         EstimationError::InvalidInput("failed to convert dense matrix to sparse CSC".to_string())
-    })
-}
-
-fn embed_dense_block_to_sparse(
-    local: &Array2<f64>,
-    row_offset: usize,
-    col_offset: usize,
-    nrows: usize,
-    ncols: usize,
-    tol: f64,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    let mut triplets = Vec::new();
-    for row in 0..local.nrows() {
-        for col in 0..local.ncols() {
-            let value = local[[row, col]];
-            if value.abs() > tol {
-                triplets.push(Triplet::new(row_offset + row, col_offset + col, value));
-            }
-        }
-    }
-    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
-        EstimationError::InvalidInput("failed to embed dense block as sparse CSC".to_string())
     })
 }
 
@@ -416,7 +396,8 @@ pub fn assemble_and_factor_sparse_penalized_system(
     })
 }
 
-pub fn build_sparse_penalty_blocks(
+#[cfg(test)]
+fn build_sparse_penalty_blocks(
     s_list: &[Array2<f64>],
 ) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
     let mut ranges = Vec::with_capacity(s_list.len());
