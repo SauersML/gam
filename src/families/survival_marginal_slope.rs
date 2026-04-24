@@ -3430,7 +3430,8 @@ impl SurvivalMarginalSlopeFamily {
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
             self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
         };
-        let a_init = q * rigid_observed_scale(slope, self.probit_frailty_scale());
+        let probit_scale = self.probit_frailty_scale();
+        let a_init = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
         super::monotone_root::solve_monotone_root(eval, a_init, "survival intercept", 1e-12, 64, 64)
     }
 

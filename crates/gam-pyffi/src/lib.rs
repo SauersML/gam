@@ -19,8 +19,7 @@ use gam::smooth::{
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState,
-    SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkState,
 };
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use pyo3::exceptions::PyValueError;
@@ -662,9 +661,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         );
     }
     if py_config.firth.unwrap_or(false) {
-        return Err(
-            "firth bias reduction is not yet plumbed through the Python FFI".to_string(),
-        );
+        return Err("firth bias reduction is not yet plumbed through the Python FFI".to_string());
     }
     Ok(fit_config)
 }
@@ -683,11 +680,9 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::SurvivalLocationScale(_) => {
             ("Survival location-scale", "survival location-scale", false)
         }
-        FitRequest::BernoulliMarginalSlope(_) => (
-            "Bernoulli marginal-slope",
-            "bernoulli marginal-slope",
-            true,
-        ),
+        FitRequest::BernoulliMarginalSlope(_) => {
+            ("Bernoulli marginal-slope", "bernoulli marginal-slope", true)
+        }
         FitRequest::SurvivalMarginalSlope(_) => {
             ("Survival marginal-slope", "survival marginal-slope", true)
         }
@@ -1038,12 +1033,9 @@ fn build_survival_marginal_slope_ffi_payload(
         (spec, _) => spec,
     };
 
-    let logslope_formula = fit_config
-        .logslope_formula
-        .clone()
-        .ok_or_else(|| {
-            "survival marginal-slope requires logslope_formula to persist a saved model".to_string()
-        })?;
+    let logslope_formula = fit_config.logslope_formula.clone().ok_or_else(|| {
+        "survival marginal-slope requires logslope_formula to persist a saved model".to_string()
+    })?;
     let z_column = fit_config
         .z_column
         .clone()
@@ -1269,8 +1261,7 @@ fn build_transformation_normal_predict_input(
     let payload = model.payload();
     if payload.noise_offset_column.is_some() {
         return Err(
-            "noise_offset_column is not supported for transformation-normal prediction"
-                .to_string(),
+            "noise_offset_column is not supported for transformation-normal prediction".to_string(),
         );
     }
     let col_map = build_col_map(dataset);
@@ -1288,9 +1279,7 @@ fn build_transformation_normal_predict_input(
     let response_knots = payload
         .transformation_response_knots
         .as_ref()
-        .ok_or_else(|| {
-            "saved transformation-normal model is missing response_knots".to_string()
-        })?;
+        .ok_or_else(|| "saved transformation-normal model is missing response_knots".to_string())?;
     let response_transform_vecs = payload
         .transformation_response_transform
         .as_ref()
@@ -1302,7 +1291,10 @@ fn build_transformation_normal_predict_input(
     })?;
 
     let t_rows = response_transform_vecs.len();
-    let t_cols = response_transform_vecs.first().map(|row| row.len()).unwrap_or(0);
+    let t_cols = response_transform_vecs
+        .first()
+        .map(|row| row.len())
+        .unwrap_or(0);
     let mut resp_transform = ndarray::Array2::<f64>::zeros((t_rows, t_cols));
     for (i, row) in response_transform_vecs.iter().enumerate() {
         if row.len() != t_cols {

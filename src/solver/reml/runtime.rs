@@ -2063,11 +2063,7 @@ impl<'a> RemlState<'a> {
         let reml_log_info = crate::solver::visualizer::reml_info_enabled();
         let t_eval_start = std::time::Instant::now();
         if reml_log_info {
-            let prefix: Vec<String> = p
-                .iter()
-                .take(4)
-                .map(|v| format!("{:.3}", v))
-                .collect();
+            let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
             log::info!(
                 "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
                 cost_call_idx,
@@ -3569,11 +3565,7 @@ impl<'a> RemlState<'a> {
         let reml_log_info = crate::solver::visualizer::reml_info_enabled();
         let t_eval_start = std::time::Instant::now();
         if reml_log_info {
-            let prefix: Vec<String> = p
-                .iter()
-                .take(4)
-                .map(|v| format!("{:.3}", v))
-                .collect();
+            let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
             log::info!(
                 "[REML] grad-only begin | rho[..4]=[{}] | k={}",
                 prefix.join(","),
@@ -3661,11 +3653,7 @@ impl<'a> RemlState<'a> {
         let reml_log_info = crate::solver::visualizer::reml_info_enabled();
         let t_eval_start = std::time::Instant::now();
         if reml_log_info {
-            let prefix: Vec<String> = p
-                .iter()
-                .take(4)
-                .map(|v| format!("{:.3}", v))
-                .collect();
+            let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
             log::info!(
                 "[REML] outer-eval begin {:?} | rho[..4]=[{}] | k={} | 2nd-order={}",
                 order,

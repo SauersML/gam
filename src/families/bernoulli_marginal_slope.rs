@@ -2744,27 +2744,29 @@ impl BernoulliMarginalSlopeFamily {
 
         let probit_scale = self.probit_frailty_scale();
 
-        // Initial guess: closed-form for rigid probit:
-        //   a₀ = q·√(1 + (s_f b)²),  s_f = 1/√(1+σ²).
+        // Initial guess: closed-form for rigid probit in pre-scale denested
+        // coordinates:
+        //   a₀ = q·√(1 + (s_f b)²) / s_f,  s_f = 1/√(1+σ²).
         // When link deviation is active, upgrade to affine-link warm start:
         //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
         //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
-        let a_rigid = rigid_intercept_from_marginal(marginal.q, slope, probit_scale);
+        let a_rigid_pre_scale =
+            rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
         let a_init = if beta_w.is_some() {
-            let v = Array1::from_vec(vec![a_rigid]);
+            let v = Array1::from_vec(vec![a_rigid_pre_scale]);
             let (l_val, l_d1) = self.link_terms_value_d1(&v, beta_w)?;
             let ell1 = l_d1[0];
             if ell1 > 1e-8 {
-                let ell0 = l_val[0] - ell1 * a_rigid;
+                let ell0 = l_val[0] - ell1 * a_rigid_pre_scale;
                 let observed_logslope = probit_scale * ell1 * slope;
                 (marginal.q * (1.0 + observed_logslope * observed_logslope).sqrt() / probit_scale
                     - ell0)
                     / ell1
             } else {
-                a_rigid
+                a_rigid_pre_scale
             }
         } else {
-            a_rigid
+            a_rigid_pre_scale
         };
 
         let (a, abs_deriv) = super::monotone_root::solve_monotone_root(

@@ -1027,9 +1027,7 @@ pub fn materialize<'a>(
         )
     } else if config.transformation_normal {
         if config.noise_formula.is_some() {
-            return Err(
-                "transformation_normal cannot be combined with noise_formula".to_string(),
-            );
+            return Err("transformation_normal cannot be combined with noise_formula".to_string());
         }
         materialize_transformation_normal(&parsed, data, &col_map, config)
     } else if config.noise_formula.is_some() {
@@ -2070,9 +2068,7 @@ fn materialize_transformation_normal<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
     if parsed.linkspec.is_some() {
-        return Err(
-            "link(...) is not supported for the transformation-normal family".to_string(),
-        );
+        return Err("link(...) is not supported for the transformation-normal family".to_string());
     }
     if parsed.linkwiggle.is_some() {
         return Err(
@@ -2085,9 +2081,7 @@ fn materialize_transformation_normal<'a>(
         );
     }
     if config.frailty.is_some() {
-        return Err(
-            "frailty is not supported for transformation-normal models".to_string(),
-        );
+        return Err("frailty is not supported for transformation-normal models".to_string());
     }
 
     let y_col = *col_map
