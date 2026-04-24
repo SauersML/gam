@@ -151,135 +151,6 @@ fn exact_design_row_chunks(n: usize, p: usize) -> impl Iterator<Item = std::ops:
         .map(move |start| start..(start + rows).min(n))
 }
 
-/// Operator-preserving view of a per-block GAMLSS design matrix.
-///
-/// `Dense` borrows already-materialized storage (zero-cost), while `Operator`
-/// holds a borrow of the underlying `DesignMatrix` so chunked access stays
-/// lazy. This enables shape-only queries (`nrows`/`ncols`) and operator-friendly
-/// matvec / row-chunked weighted cross products without forcing an n×p
-/// allocation up front.
-///
-/// Prefer this over `dense_block_designs_*` helpers (which return
-/// `Cow<'_, Array2<f64>>` and unconditionally densify lazy operators).
-pub(crate) enum BlockDesignView<'a> {
-    Dense(&'a Array2<f64>),
-    Operator(&'a DesignMatrix),
-}
-
-impl<'a> BlockDesignView<'a> {
-    /// Build a view from a `DesignMatrix`, preserving operator laziness when
-    /// possible. If the matrix is already dense and exposes a borrowed array,
-    /// we take the zero-copy `Dense` path; otherwise the operator handle is
-    /// retained for chunked / matvec access.
-    pub(crate) fn from_design(design: &'a DesignMatrix) -> Self {
-        match design {
-            DesignMatrix::Dense(dm) => match dm.as_dense_ref() {
-                Some(arr) => Self::Dense(arr),
-                None => Self::Operator(design),
-            },
-            DesignMatrix::Sparse(_) => Self::Operator(design),
-        }
-    }
-
-    pub(crate) fn nrows(&self) -> usize {
-        match self {
-            Self::Dense(m) => m.nrows(),
-            Self::Operator(dm) => dm.nrows(),
-        }
-    }
-
-    pub(crate) fn ncols(&self) -> usize {
-        match self {
-            Self::Dense(m) => m.ncols(),
-            Self::Operator(dm) => dm.ncols(),
-        }
-    }
-
-    /// `X * beta` without forcing materialization of `X` when it is operator-backed.
-    pub(crate) fn forward_mul(&self, beta: ArrayView1<'_, f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(m) => m.dot(&beta),
-            Self::Operator(dm) => {
-                use crate::matrix::LinearOperator;
-                LinearOperator::apply(*dm, &beta.to_owned())
-            }
-        }
-    }
-
-    /// `X^T * v` without forcing materialization.
-    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(m) => m.t().dot(&v),
-            Self::Operator(dm) => {
-                use crate::matrix::LinearOperator;
-                LinearOperator::apply_transpose(*dm, &v.to_owned())
-            }
-        }
-    }
-
-    /// Owned dense row chunk `X[rows, :]`. Cheap for `Dense` (a slice copy);
-    /// goes through the operator's `try_row_chunk` for `Operator`.
-    pub(crate) fn row_chunk(&self, rows: std::ops::Range<usize>) -> Result<Array2<f64>, String> {
-        match self {
-            Self::Dense(m) => Ok(m.slice(s![rows, ..]).to_owned()),
-            Self::Operator(dm) => {
-                use crate::matrix::DenseDesignOperator;
-                DenseDesignOperator::try_row_chunk(*dm, rows).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    /// Compute `self.t() * diag(weights) * other` row-chunked, preserving
-    /// operator laziness for both sides. Allocates only the `(p_l, p_r)` Gram
-    /// output and per-chunk `(rows_per_chunk, p_*)` working buffers.
-    pub(crate) fn weighted_cross(
-        &self,
-        weights: ArrayView1<'_, f64>,
-        other: &BlockDesignView<'_>,
-        policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Array2<f64>, String> {
-        let n = weights.len();
-        if self.nrows() != n {
-            return Err(format!(
-                "BlockDesignView::weighted_cross: lhs nrows={} != weights len={}",
-                self.nrows(),
-                n
-            ));
-        }
-        if other.nrows() != n {
-            return Err(format!(
-                "BlockDesignView::weighted_cross: rhs nrows={} != weights len={}",
-                other.nrows(),
-                n
-            ));
-        }
-        let p_l = self.ncols();
-        let p_r = other.ncols();
-        let mut out = Array2::<f64>::zeros((p_l, p_r));
-        let rows_per_chunk =
-            crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, p_l + p_r).max(1);
-
-        let mut start = 0usize;
-        while start < n {
-            let end = (start + rows_per_chunk).min(n);
-            let rows = start..end;
-            let xl = self.row_chunk(rows.clone())?;
-            let mut xr = other.row_chunk(rows.clone())?;
-            for local in 0..xr.nrows() {
-                let w = weights[start + local];
-                if w != 1.0 {
-                    for j in 0..p_r {
-                        xr[[local, j]] *= w;
-                    }
-                }
-            }
-            out += &xl.t().dot(&xr);
-            start = end;
-        }
-        Ok(out)
-    }
-}
-
 #[inline]
 fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
     if !rawweight.is_finite() || rawweight <= 0.0 {
@@ -5077,6 +4948,7 @@ fn gaussian_joint_psisecondhessian_fromweights(
     weights_j: &GaussianJointPsiFirstWeights,
     secondweights: &GaussianJointPsiSecondWeights,
 ) -> Result<Array2<f64>, String> {
+    let policy = crate::resource::ResourcePolicy::default_library();
     // Exploit transpose symmetry: X_a^T D X_b and X_b^T D X_a are transposes.
     // For each such pair in the symmetric blocks (hmumu, h_ls_ls), compute one
     // and add its transpose, halving the number of O(np²) products.
@@ -5084,17 +4956,20 @@ fn gaussian_joint_psisecondhessian_fromweights(
         xmu_ab,
         weights_i.hmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
+        &policy,
     )?;
     let a_ij_mu = weighted_crossprod_psi_maps(xmu_i, weights_i.hmumu.view(), xmu_j)?;
     let a_iwj_mu = weighted_crossprod_psi_maps(
         xmu_i,
         weights_j.dhmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
+        &policy,
     )?;
     let a_jwi_mu = weighted_crossprod_psi_maps(
         xmu_j,
         weights_i.dhmumu.view(),
         CustomFamilyPsiLinearMapRef::Dense(xmu),
+        &policy,
     )?;
     let hmumu = &a_ab_mu
         + &a_ab_mu.t()
@@ -5109,44 +4984,52 @@ fn gaussian_joint_psisecondhessian_fromweights(
         xmu_ab,
         weights_i.hmu_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
+        &policy,
     )? + &weighted_crossprod_psi_maps(xmu_i, weights_i.hmu_ls.view(), x_ls_j)?
         + &weighted_crossprod_psi_maps(xmu_j, weights_i.hmu_ls.view(), x_ls_i)?
         + &weighted_crossprod_psi_maps(
             xmu_i,
             weights_j.dhmu_ls.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )?
         + &weighted_crossprod_psi_maps(
             xmu_j,
             weights_i.dhmu_ls.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_i.dhmu_ls.view(),
             x_ls_j,
+            &policy,
         )?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_j.dhmu_ls.view(),
             x_ls_i,
+            &policy,
         )?
         + &xt_diag_y_dense(xmu, &secondweights.d2hmu_ls, x_ls)?
         + &weighted_crossprod_psi_maps(
             CustomFamilyPsiLinearMapRef::Dense(xmu),
             weights_i.hmu_ls.view(),
             x_ls_ab,
+            &policy,
         )?;
     let a_ab_ls = weighted_crossprod_psi_maps(
         x_ls_ab,
         weights_i.h_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
+        &policy,
     )?;
     let a_ij_ls = weighted_crossprod_psi_maps(x_ls_i, weights_i.h_ls_ls.view(), x_ls_j)?;
     let a_iwj_ls = weighted_crossprod_psi_maps(
         x_ls_i,
         weights_j.dh_ls_ls.view(),
         CustomFamilyPsiLinearMapRef::Dense(x_ls),
+        &policy,
     )?;
     let a_jwi_ls = weighted_crossprod_psi_maps(
         x_ls_j,
@@ -7751,17 +7634,20 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_ab_map,
             coeff_mm.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
+            &policy,
         )?;
-        let hmm_ij = weighted_crossprod_psi_maps(xmu_a_map, coeff_mm.view(), xmu_b_map)?;
+        let hmm_ij = weighted_crossprod_psi_maps(xmu_a_map, coeff_mm.view(), xmu_b_map )?;
         let hmm_iwj = weighted_crossprod_psi_maps(
             xmu_a_map,
             coeff_mm_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
+            &policy,
         )?;
         let hmm_jwi = weighted_crossprod_psi_maps(
             xmu_b_map,
             coeff_mm_a.view(),
             CustomFamilyPsiLinearMapRef::Dense(xmu),
+            &policy,
         )?;
         let h_mm = &hmm_ab
             + &hmm_ab.t()
@@ -7776,44 +7662,52 @@ impl GaussianLocationScaleWiggleFamily {
             xmu_ab_map,
             coeff_ml.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
-        )? + &weighted_crossprod_psi_maps(xmu_a_map, coeff_ml.view(), x_ls_b_map)?
-            + &weighted_crossprod_psi_maps(xmu_b_map, coeff_ml.view(), x_ls_a_map)?
+            &policy,
+        )? + &weighted_crossprod_psi_maps(xmu_a_map, coeff_ml.view(), x_ls_b_map )?
+            + &weighted_crossprod_psi_maps(xmu_b_map, coeff_ml.view(), x_ls_a_map )?
             + &weighted_crossprod_psi_maps(
                 xmu_a_map,
                 coeff_ml_b.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 xmu_b_map,
                 coeff_ml_a.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_ls),
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml_a.view(),
                 x_ls_b_map,
+                &policy,
             )?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml_b.view(),
                 x_ls_a_map,
+                &policy,
             )?
             + &xt_diag_y_dense(xmu, &coeff_ml_ab, x_ls)?
             + &weighted_crossprod_psi_maps(
                 CustomFamilyPsiLinearMapRef::Dense(xmu),
                 coeff_ml.view(),
                 x_ls_ab_map,
+                &policy,
             )?;
         let hll_ab = weighted_crossprod_psi_maps(
             x_ls_ab_map,
             coeff_ll.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )?;
-        let hll_ij = weighted_crossprod_psi_maps(x_ls_a_map, coeff_ll.view(), x_ls_b_map)?;
+        let hll_ij = weighted_crossprod_psi_maps(x_ls_a_map, coeff_ll.view(), x_ls_b_map )?;
         let hll_iwj = weighted_crossprod_psi_maps(
             x_ls_a_map,
             coeff_ll_b.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_ls),
+            &policy,
         )?;
         let hll_jwi = weighted_crossprod_psi_maps(
             x_ls_b_map,
@@ -10318,6 +10212,28 @@ impl BinomialLocationScaleFamily {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
 
+    /// Operator-preserving views of the threshold / log-sigma block designs.
+    /// Prefer this over `dense_block_designs` for shape-only or chunked work;
+    /// only force a `Cow<Array2>` when a downstream API still requires
+    /// `&Array2<f64>`.
+    pub(crate) fn threshold_design_view(&self) -> Result<BlockDesignView<'_>, String> {
+        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
+            "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
+        })?;
+        Ok(BlockDesignView::from_design(threshold_design))
+    }
+
+    pub(crate) fn log_sigma_design_view(&self) -> Result<BlockDesignView<'_>, String> {
+        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
+            "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
+        })?;
+        Ok(BlockDesignView::from_design(log_sigma_design))
+    }
+
+    // TODO(block-view-migration): prefer `threshold_design_view()` /
+    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
+    // Cow-returning helper forces an n×p dense materialization on the
+    // operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
@@ -10336,6 +10252,9 @@ impl BinomialLocationScaleFamily {
         Ok((xt, x_ls))
     }
 
+    // TODO(block-view-migration): prefer `BlockDesignView::from_design(&specs[i].design)`
+    // for shape/chunked access; force the Cow only when handing off to
+    // `&Array2<f64>` consumers.
     fn dense_block_designs_fromspecs<'a>(
         &self,
         specs: &'a [ParameterBlockSpec],
