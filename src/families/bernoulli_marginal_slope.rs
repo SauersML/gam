@@ -638,9 +638,8 @@ pub(crate) fn standardize_latent_z_with_policy(
         ));
     }
     let target_norm = match policy.normalization {
-        LatentZNormalizationMode::None | LatentZNormalizationMode::FitWeighted => {
-            LatentZNormalization { mean, sd }
-        }
+        LatentZNormalizationMode::None => LatentZNormalization { mean: 0.0, sd: 1.0 },
+        LatentZNormalizationMode::FitWeighted => LatentZNormalization { mean, sd },
         LatentZNormalizationMode::Frozen {
             mean: frozen_mean,
             sd: frozen_sd,

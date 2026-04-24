@@ -6630,12 +6630,16 @@ fn weighted_operator_gram_from_d1(
 #[cfg(test)]
 fn weighted_operator_gram_from_d2(d2: &Array2<f64>, weight: &Array1<f64>) -> Array2<f64> {
     let mut weighted = d2.clone();
+    let block_dim = d2
+        .nrows()
+        .checked_div(weight.len().max(1))
+        .filter(|block| *block > 0 && *block * weight.len() == d2.nrows())
+        .expect("D2 row count must be an integer number of curvature rows per collocation point");
     for k in 0..weight.len() {
-        // Laplacian block is already one row per collocation point:
-        //   c_k = |Delta f(z_k)|, u_k = 1/sqrt(c_k^2 + eps_c^2), K2 = D2^T diag(u) D2.
-        // Scale each row by sqrt(u_k).
         let w = weight[k].sqrt();
-        weighted.row_mut(k).mapv_inplace(|v| v * w);
+        for local in 0..block_dim {
+            weighted.row_mut(k * block_dim + local).mapv_inplace(|v| v * w);
+        }
     }
     let gram = weighted.t().dot(&weighted);
     (&gram + &gram.t().to_owned()) * 0.5

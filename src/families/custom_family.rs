@@ -2768,6 +2768,28 @@ impl CustomFamilyPsiDesignAction {
                 .expect("radial scalar evaluation failed during implicit psi transpose_mul")
         }
     }
+
+    fn absolute_rows(&self, rows: Range<usize>) -> Range<usize> {
+        (self.row_range.start + rows.start)..(self.row_range.start + rows.end)
+    }
+
+    pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
+        if rows.end > self.nrows() {
+            return Err(format!(
+                "psi design row range {}..{} exceeds available rows {}",
+                rows.start,
+                rows.end,
+                self.nrows()
+            ));
+        }
+        self.operator
+            .row_chunk_first(self.axis, self.absolute_rows(rows))
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
+        self.row_chunk(row..row + 1).map(|m| m.row(0).to_owned())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2887,6 +2909,35 @@ impl CustomFamilyPsiSecondDesignAction {
                 .expect("radial scalar evaluation failed during implicit psi second transpose_mul"),
         }
     }
+
+    fn absolute_rows(&self, rows: Range<usize>) -> Range<usize> {
+        (self.row_range.start + rows.start)..(self.row_range.start + rows.end)
+    }
+
+    pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
+        if rows.end > self.nrows() {
+            return Err(format!(
+                "psi second-design row range {}..{} exceeds available rows {}",
+                rows.start,
+                rows.end,
+                self.nrows()
+            ));
+        }
+        match self.level {
+            CustomFamilyPsiSecondDesignLevel::Diag(axis) => self
+                .operator
+                .row_chunk_second_diag(axis, self.absolute_rows(rows))
+                .map_err(|e| e.to_string()),
+            CustomFamilyPsiSecondDesignLevel::Cross(axis_d, axis_e) => self
+                .operator
+                .row_chunk_second_cross(axis_d, axis_e, self.absolute_rows(rows))
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
+        self.row_chunk(row..row + 1).map(|m| m.row(0).to_owned())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2943,12 +2994,26 @@ impl CustomFamilyPsiLinearMapRef<'_> {
         }
         Ok(match self {
             Self::Dense(mat) => mat.row(row).to_owned(),
-            Self::First(_) | Self::Second(_) => {
-                let mut e = Array1::<f64>::zeros(self.nrows());
-                e[row] = 1.0;
-                self.transpose_mul(e.view())
-            }
+            Self::First(action) => action.row_vector(row)?,
+            Self::Second(action) => action.row_vector(row)?,
             Self::Zero { ncols, .. } => Array1::<f64>::zeros(*ncols),
+        })
+    }
+
+    pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
+        if rows.end > self.nrows() {
+            return Err(format!(
+                "psi linear-map row range {}..{} out of bounds for {} rows",
+                rows.start,
+                rows.end,
+                self.nrows()
+            ));
+        }
+        Ok(match self {
+            Self::Dense(mat) => mat.slice(ndarray::s![rows, ..]).to_owned(),
+            Self::First(action) => action.row_chunk(rows)?,
+            Self::Second(action) => action.row_chunk(rows)?,
+            Self::Zero { ncols, .. } => Array2::<f64>::zeros((rows.end - rows.start, *ncols)),
         })
     }
 }
@@ -2974,30 +3039,21 @@ pub(crate) fn weighted_crossprod_psi_maps(
     {
         return Ok(Array2::<f64>::zeros((left.ncols(), right.ncols())));
     }
-    if let (
-        CustomFamilyPsiLinearMapRef::Dense(left_dense),
-        CustomFamilyPsiLinearMapRef::Dense(right_dense),
-    ) = (&left, &right)
-    {
-        let mut weighted = Array2::<f64>::zeros((right_dense.nrows(), right_dense.ncols()));
-        for i in 0..right_dense.nrows() {
-            let wi = weights[i];
-            for j in 0..right_dense.ncols() {
-                weighted[[i, j]] = wi * right_dense[[i, j]];
+    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+    let row_width = left.ncols().saturating_add(right.ncols()).max(1);
+    let rows_per_chunk = crate::resource::rows_for_target_bytes(8 * 1024 * 1024, row_width);
+    for start in (0..weights.len()).step_by(rows_per_chunk) {
+        let end = (start + rows_per_chunk).min(weights.len());
+        let rows = start..end;
+        let xl = left.row_chunk(rows.clone())?;
+        let mut xr = right.row_chunk(rows.clone())?;
+        for local in 0..xr.nrows() {
+            let w = weights[start + local];
+            for j in 0..xr.ncols() {
+                xr[[local, j]] *= w;
             }
         }
-        return Ok(left_dense.t().dot(&weighted));
-    }
-
-    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
-    let mut basis = Array1::<f64>::zeros(right.ncols());
-    for j in 0..right.ncols() {
-        basis[j] = 1.0;
-        let right_col = right.forward_mul(basis.view());
-        basis[j] = 0.0;
-        let weighted_col = &right_col * &weights;
-        let left_col = left.transpose_mul(weighted_col.view());
-        out.column_mut(j).assign(&left_col);
+        out += &fast_atb(&xl, &xr);
     }
     Ok(out)
 }
