@@ -821,6 +821,9 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
 }
 
 fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+    if lhs.is_empty() || rhs.is_empty() {
+        return Vec::new();
+    }
     let mut out = vec![0.0; lhs.len() + rhs.len() - 1];
     for (i, &lv) in lhs.iter().enumerate() {
         for (j, &rv) in rhs.iter().enumerate() {

@@ -206,6 +206,61 @@ fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<
 }
 
 #[inline]
+fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(matrix.ncols());
+    for i in 0..matrix.nrows() {
+        let vi = vector[i];
+        if vi == 0.0 {
+            continue;
+        }
+        for j in 0..matrix.ncols() {
+            out[j] += matrix[[i, j]] * vi;
+        }
+    }
+    out
+}
+
+#[inline]
+fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
+    let p = matrix.ncols();
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for i in 0..matrix.nrows() {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p {
+            let xa = matrix[[i, a]];
+            for b in a..p {
+                let v = wi * xa * matrix[[i, b]];
+                xtwx[[a, b]] += v;
+                if a != b {
+                    xtwx[[b, a]] += v;
+                }
+            }
+        }
+    }
+    xtwx
+}
+
+#[inline]
+fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
+    let p = matrix.ncols();
+    let mut diag = Array1::<f64>::zeros(p);
+    for i in 0..matrix.nrows() {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        for j in 0..p {
+            let xij = matrix[[i, j]];
+            diag[j] += wi * xij * xij;
+        }
+    }
+    diag
+}
+
+#[inline]
 fn dense_transpose_weighted_response(
     matrix: &Array2<f64>,
     weights: &Array1<f64>,
@@ -218,6 +273,25 @@ fn dense_transpose_weighted_response(
         if let Some(scale) = row_scale {
             scaled *= scale[i];
         }
+        if scaled == 0.0 {
+            continue;
+        }
+        for j in 0..matrix.ncols() {
+            out[j] += matrix[[i, j]] * scaled;
+        }
+    }
+    out
+}
+
+#[inline]
+fn dense_transpose_weighted_response_view(
+    matrix: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    y: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(matrix.ncols());
+    for i in 0..matrix.nrows() {
+        let scaled = y[i] * weights[i].max(0.0);
         if scaled == 0.0 {
             continue;
         }
@@ -712,14 +786,14 @@ pub struct ReparamOperator {
     /// Cached dense materialization of X·Qs.  Populated on first `to_dense()`
     /// call so that repeated outer-loop access (REML hyper derivatives, ALO,
     /// HMC) pays the O(n·p²) cost only once per PIRLS result.
-    dense_cache: OnceLock<Array2<f64>>,
+    dense_cache: OnceLock<Arc<Array2<f64>>>,
 }
 
 impl ReparamOperator {
     pub fn new(x_original: DesignMatrix, qs: Arc<Array2<f64>>) -> Self {
         let n = x_original.nrows();
         let p = qs.ncols();
-        debug_assert_eq!(
+        assert_eq!(
             x_original.ncols(),
             qs.nrows(),
             "ReparamOperator: X cols ({}) must match Qs rows ({})",
@@ -743,6 +817,18 @@ impl ReparamOperator {
     /// Access the Qs orthogonal transform.
     pub fn qs(&self) -> &Array2<f64> {
         &self.qs
+    }
+
+    fn dense_arc(&self) -> Arc<Array2<f64>> {
+        Arc::clone(self.dense_cache.get_or_init(|| {
+            Arc::new(match &self.x_original {
+                DesignMatrix::Dense(x) => fast_ab(x.to_dense_arc().as_ref(), &self.qs),
+                _ => {
+                    let x_dense = self.x_original.to_dense();
+                    fast_ab(&x_dense, &self.qs)
+                }
+            })
+        }))
     }
 }
 
@@ -818,21 +904,21 @@ impl DenseDesignOperator for ReparamOperator {
 
     fn to_dense(&self) -> Array2<f64> {
         // Cached materialization: pay the O(n·p²) cost at most once.
-        self.dense_cache
-            .get_or_init(|| match &self.x_original {
-                DesignMatrix::Dense(x) => fast_ab(x.to_dense_arc().as_ref(), &self.qs),
-                _ => {
-                    let x_dense = self.x_original.to_dense();
-                    fast_ab(&x_dense, &self.qs)
-                }
-            })
-            .clone()
+        self.dense_arc().as_ref().clone()
+    }
+
+    fn to_dense_arc(&self) -> Arc<Array2<f64>> {
+        self.dense_arc()
+    }
+
+    fn as_dense_ref(&self) -> Option<&Array2<f64>> {
+        self.dense_cache.get().map(Arc::as_ref)
     }
 
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         // If the full dense product is already cached, just slice it.
         if let Some(cached) = self.dense_cache.get() {
-            return cached.slice(s![rows, ..]).to_owned();
+            return cached.as_ref().slice(s![rows, ..]).to_owned();
         }
         // Otherwise materialize only the requested rows: X[rows, :] · Qs
         match &self.x_original {
@@ -1851,8 +1937,7 @@ impl LinearOperator for MultiChannelOperator {
         let n = self.n_per_channel;
         let mut out = Array1::<f64>::zeros(self.p);
         for (i, ch) in self.channels.iter().enumerate() {
-            let slice = vector.slice(s![i * n..(i + 1) * n]).to_owned();
-            out += &ch.transpose_vector_multiply(&slice);
+            out += &ch.apply_transpose_view(vector.slice(s![i * n..(i + 1) * n]));
         }
         out
     }
@@ -1868,8 +1953,7 @@ impl LinearOperator for MultiChannelOperator {
         }
         let mut xtwx = Array2::<f64>::zeros((self.p, self.p));
         for (i, ch) in self.channels.iter().enumerate() {
-            let w_slice = weights.slice(s![i * n..(i + 1) * n]).to_owned();
-            let ch_xtwx = ch.compute_xtwx(&w_slice)?;
+            let ch_xtwx = ch.compute_xtwx_view(weights.slice(s![i * n..(i + 1) * n]))?;
             xtwx += &ch_xtwx;
         }
         Ok(xtwx)
@@ -1886,8 +1970,7 @@ impl LinearOperator for MultiChannelOperator {
         }
         let mut diag = Array1::<f64>::zeros(self.p);
         for (i, ch) in self.channels.iter().enumerate() {
-            let w_slice = weights.slice(s![i * n..(i + 1) * n]).to_owned();
-            diag += &<DesignMatrix as LinearOperator>::diag_gram(ch, &w_slice)?;
+            diag += &ch.diag_gram_view(weights.slice(s![i * n..(i + 1) * n]))?;
         }
         Ok(diag)
     }
@@ -1911,9 +1994,10 @@ impl DenseDesignOperator for MultiChannelOperator {
         }
         let mut out = Array1::<f64>::zeros(self.p);
         for (i, ch) in self.channels.iter().enumerate() {
-            let w_slice = weights.slice(s![i * n..(i + 1) * n]).to_owned();
-            let y_slice = y.slice(s![i * n..(i + 1) * n]).to_owned();
-            out += &ch.compute_xtwy(&w_slice, &y_slice)?;
+            out += &ch.compute_xtwy_view(
+                weights.slice(s![i * n..(i + 1) * n]),
+                y.slice(s![i * n..(i + 1) * n]),
+            )?;
         }
         Ok(out)
     }
@@ -2488,10 +2572,17 @@ impl ChunkedKernelDesignOperator {
         let mut kernel_block = Array2::<f64>::zeros((chunk_n, k_raw));
         for (local, global) in rows.clone().enumerate() {
             let data_row = self.data.row(global);
+            let data_row = data_row
+                .as_slice()
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(data_row.to_vec()));
             for j in 0..k_raw {
                 let center_row = self.centers.row(j);
-                kernel_block[[local, j]] =
-                    (self.kernel_fn)(data_row.as_slice().unwrap(), center_row.as_slice().unwrap());
+                let center_row = center_row
+                    .as_slice()
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(center_row.to_vec()));
+                kernel_block[[local, j]] = (self.kernel_fn)(data_row.as_ref(), center_row.as_ref());
             }
         }
         if let Some(z) = self.constraint_transform.as_ref() {
@@ -5435,8 +5526,8 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock, SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
-        dense_transpose_matvec, dense_transpose_weighted_response,
+        EmbeddedColumnBlock, ReparamOperator, SparseDesignMatrix, SparseHessianAccumulator,
+        dense_matvec, dense_transpose_matvec, dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -5526,6 +5617,33 @@ mod tests {
             .try_to_dense_arc("matrix test")
             .expect_err("huge sparse densification should be rejected");
         assert!(err.contains("refusing to densify sparse design"));
+    }
+
+    #[test]
+    fn reparam_operator_to_dense_arc_reuses_cached_materialization() {
+        let x = array![[1.0, 2.0], [0.5, -1.0], [3.0, 0.25]];
+        let qs = Arc::new(array![[0.8, -0.6], [0.6, 0.8]]);
+        let op = ReparamOperator::new(
+            DesignMatrix::Dense(DenseDesignMatrix::from(x.clone())),
+            Arc::clone(&qs),
+        );
+
+        let first = op.to_dense_arc();
+        let second = op.to_dense_arc();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), &x.dot(qs.as_ref()));
+        assert_eq!(op.to_dense(), *first.as_ref());
+
+        let borrowed = op.as_dense_ref().expect("cached dense materialization");
+        assert_eq!(borrowed, first.as_ref());
+    }
+
+    #[test]
+    #[should_panic(expected = "ReparamOperator: X cols (2) must match Qs rows (3)")]
+    fn reparam_operator_rejects_incompatible_transform_shape() {
+        let x = array![[1.0, 2.0], [0.5, -1.0]];
+        let qs = Arc::new(Array2::<f64>::zeros((3, 1)));
+        let _ = ReparamOperator::new(DesignMatrix::Dense(DenseDesignMatrix::from(x)), qs);
     }
 
     #[test]
