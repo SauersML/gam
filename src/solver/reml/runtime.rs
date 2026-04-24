@@ -26,6 +26,13 @@ struct TkCorrectionTerms {
     gradient: Option<Array1<f64>>,
 }
 
+struct TkSharedIntermediates {
+    h_diag: Array1<f64>,
+    x_m: Array1<f64>,
+    y: Array1<f64>,
+    active_blocks: Vec<(usize, usize)>,
+}
+
 /// Family-dependent derivative context shared by all assembly builders.
 ///
 /// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
@@ -157,8 +164,9 @@ impl<'a> RemlState<'a> {
         c_array: &Array1<f64>,
         context: &str,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+    ) -> Result<TkSharedIntermediates, EstimationError> {
         let n = x_dense.nrows();
+        let active_blocks = Self::tk_active_blocks(c_array);
         let mut h_diag = Array1::<f64>::zeros(n);
         for i in 0..n {
             let val = x_dense.row(i).dot(&z.column(i));
@@ -172,7 +180,12 @@ impl<'a> RemlState<'a> {
         let m_vec = c_array * &h_diag;
         let x_m = x_dense.t().dot(&m_vec);
         let y = h_inv_solve(&x_m)?;
-        Ok((h_diag, x_m, y))
+        Ok(TkSharedIntermediates {
+            h_diag,
+            x_m,
+            y,
+            active_blocks,
+        })
     }
 
     fn tk_scalar_from_shared(
@@ -180,26 +193,23 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        h_diag: &Array1<f64>,
-        x_m: &Array1<f64>,
-        y: &Array1<f64>,
+        shared: &TkSharedIntermediates,
+        gram: &mut Array2<f64>,
     ) -> Result<f64, EstimationError> {
         let q_term = -0.125
             * d_array
                 .iter()
-                .zip(h_diag.iter())
+                .zip(shared.h_diag.iter())
                 .map(|(&d_i, &h_i)| d_i * h_i * h_i)
                 .sum::<f64>();
-        let t2_term = 0.125 * x_m.dot(y);
+        let t2_term = 0.125 * shared.x_m.dot(&shared.y);
 
-        let active_blocks = Self::tk_active_blocks(c_array);
         let mut t1_sum = 0.0_f64;
-        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        for (j_block_idx, &(j0, j1)) in active_blocks.iter().enumerate() {
+        for (j_block_idx, &(j0, j1)) in shared.active_blocks.iter().enumerate() {
             let c_j = c_array.slice(s![j0..j1]);
-            for &(i0, i1) in &active_blocks[..=j_block_idx] {
+            for &(i0, i1) in &shared.active_blocks[..=j_block_idx] {
                 let c_i = c_array.slice(s![i0..i1]);
-                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, &mut gram);
+                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
                 let mut block_sum = 0.0_f64;
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
@@ -272,8 +282,8 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         ext_drifts: &[Array2<f64>],
         x_vks: &[Array1<f64>],
-        h_diag: &Array1<f64>,
-        y: &Array1<f64>,
+        shared: &TkSharedIntermediates,
+        gram: &mut Array2<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
@@ -286,11 +296,11 @@ impl<'a> RemlState<'a> {
                 total_k
             )));
         }
-        let x_y = x_dense.dot(y);
+        let x_y = x_dense.dot(&shared.y);
 
         let mut diag_combined = Array1::<f64>::zeros(n);
         for i in 0..n {
-            diag_combined[i] = d_array[i] * h_diag[i] - c_array[i] * x_y[i];
+            diag_combined[i] = d_array[i] * shared.h_diag[i] - c_array[i] * x_y[i];
         }
         let mut p_total = Array2::<f64>::zeros((p, p));
         for i in 0..n {
@@ -313,17 +323,15 @@ impl<'a> RemlState<'a> {
         p_total.mapv_inplace(|v| 0.25 * v);
         for a in 0..p {
             for b in 0..p {
-                p_total[[a, b]] -= 0.125 * y[a] * y[b];
+                p_total[[a, b]] -= 0.125 * shared.y[a] * shared.y[b];
             }
         }
 
-        let active_blocks = Self::tk_active_blocks(c_array);
-        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        for (j_block_idx, &(j0, j1)) in active_blocks.iter().enumerate() {
+        for (j_block_idx, &(j0, j1)) in shared.active_blocks.iter().enumerate() {
             let c_j = c_array.slice(s![j0..j1]);
-            for &(i0, i1) in &active_blocks[..=j_block_idx] {
+            for &(i0, i1) in &shared.active_blocks[..=j_block_idx] {
                 let c_i = c_array.slice(s![i0..i1]);
-                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, &mut gram);
+                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
                 for bi in 0..(i1 - i0) {
                     let ci = c_i[bi];
                     if ci == 0.0 {
@@ -435,14 +443,15 @@ impl<'a> RemlState<'a> {
         let p = x_dense.ncols();
         let k = tk_penalties.len();
 
-        let (h_diag, x_m, y) = Self::tk_shared_intermediates(
+        let shared = Self::tk_shared_intermediates(
             x_dense,
             z,
             c_array,
             "Tierney-Kadane correction",
             h_inv_solve,
         )?;
-        let value = Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &h_diag, &x_m, &y)?;
+        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        let value = Self::tk_scalar_from_shared(x_dense, z, c_array, d_array, &shared, &mut gram)?;
         if !compute_gradient {
             return Ok(TkCorrectionTerms {
                 value,
@@ -499,8 +508,8 @@ impl<'a> RemlState<'a> {
             lambdas,
             &ext_drifts,
             &x_vks,
-            &h_diag,
-            &y,
+            &shared,
+            &mut gram,
         )?;
         Ok(TkCorrectionTerms {
             value,
@@ -1809,14 +1818,11 @@ impl<'a> RemlState<'a> {
                 // Compute Takahashi selected inverse from simplicial factorization.
                 // This precomputes H^{-1} entries on the filled pattern of L, enabling
                 // O(nnz) trace computations instead of O(p) column solves.
-                let takahashi =
-                    crate::linalg::sparse_exact::factorize_simplicial(&sparse_system.h_sparse)
-                        .ok()
-                        .map(|sfactor| {
-                            Arc::new(crate::linalg::sparse_exact::TakahashiInverse::compute(
-                                &sfactor,
-                            ))
-                        });
+                let sfactor =
+                    crate::linalg::sparse_exact::factorize_simplicial(&sparse_system.h_sparse)?;
+                let takahashi = Some(Arc::new(
+                    crate::linalg::sparse_exact::TakahashiInverse::compute(&sfactor),
+                ));
                 SparseExactEvalData {
                     factor,
                     takahashi,
