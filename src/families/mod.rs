@@ -15,4 +15,5 @@ pub mod survival;
 pub mod survival_construction;
 pub mod survival_location_scale;
 pub mod survival_marginal_slope;
+pub mod survival_predict;
 pub mod transformation_normal;
