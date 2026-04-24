@@ -184,7 +184,6 @@ impl<'a> RemlState<'a> {
         x_m: &Array1<f64>,
         y: &Array1<f64>,
     ) -> Result<f64, EstimationError> {
-        let n = x_dense.nrows();
         let q_term = -0.125
             * d_array
                 .iter()
@@ -193,13 +192,12 @@ impl<'a> RemlState<'a> {
                 .sum::<f64>();
         let t2_term = 0.125 * x_m.dot(y);
 
+        let active_blocks = Self::tk_active_blocks(c_array);
         let mut t1_sum = 0.0_f64;
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+        for (j_block_idx, &(j0, j1)) in active_blocks.iter().enumerate() {
             let c_j = c_array.slice(s![j0..j1]);
-            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
-                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+            for &(i0, i1) in &active_blocks[..=j_block_idx] {
                 let c_i = c_array.slice(s![i0..i1]);
                 Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, &mut gram);
                 let mut block_sum = 0.0_f64;
@@ -228,6 +226,18 @@ impl<'a> RemlState<'a> {
             )));
         }
         Ok(value)
+    }
+
+    fn tk_active_blocks(c_array: &Array1<f64>) -> Vec<(usize, usize)> {
+        let n = c_array.len();
+        let mut blocks = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
+        for start in (0..n).step_by(TK_BLOCK_SIZE) {
+            let end = (start + TK_BLOCK_SIZE).min(n);
+            if c_array.slice(s![start..end]).iter().any(|value| *value != 0.0) {
+                blocks.push((start, end));
+            }
+        }
+        blocks
     }
 
     fn tk_fill_gram_block(
@@ -303,12 +313,11 @@ impl<'a> RemlState<'a> {
             }
         }
 
+        let active_blocks = Self::tk_active_blocks(c_array);
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-            let j1 = (j0 + TK_BLOCK_SIZE).min(n);
+        for (j_block_idx, &(j0, j1)) in active_blocks.iter().enumerate() {
             let c_j = c_array.slice(s![j0..j1]);
-            for i0 in (0..=j0).step_by(TK_BLOCK_SIZE) {
-                let i1 = (i0 + TK_BLOCK_SIZE).min(n);
+            for &(i0, i1) in &active_blocks[..=j_block_idx] {
                 let c_i = c_array.slice(s![i0..i1]);
                 Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, &mut gram);
                 for bi in 0..(i1 - i0) {
