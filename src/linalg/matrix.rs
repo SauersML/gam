@@ -2891,10 +2891,6 @@ impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOpera
         Ok(())
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        self.row_chunk_combined(rows)
-    }
-
     fn to_dense(&self) -> Array2<f64> {
         self.row_chunk_combined(0..self.n)
     }

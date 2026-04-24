@@ -979,12 +979,14 @@ impl SavedAnchoredDeviationRuntime {
     }
 
     fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
-        let points = self.breakpoints()?;
-        let mut span_idx =
-            span_index_for_breakpoints(&points, value, "saved anchored deviation span lookup")?;
+        let mut span_idx = span_index_for_breakpoints(
+            &self.breakpoints,
+            value,
+            "saved anchored deviation span lookup",
+        )?;
         // LEFT-bias at interior breakpoints mirrors DeviationRuntime. The
         // saved cubic basis is C2, but d3 remains span-local.
-        if span_idx > 0 && value == points[span_idx] {
+        if span_idx > 0 && value == self.breakpoints[span_idx] {
             span_idx -= 1;
         }
         Ok(span_idx)
@@ -1004,7 +1006,16 @@ impl SavedAnchoredDeviationRuntime {
                 self.basis_dim
             ));
         }
-        let points = self.breakpoints()?;
+        self.local_cubic_on_span_validated(beta, span_idx)
+    }
+
+    fn local_cubic_on_span_validated(
+        &self,
+        beta: &Array1<f64>,
+        span_idx: usize,
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    {
+        let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(format!(
                 "saved anchored deviation span index {} out of range for {} spans",
@@ -1055,7 +1066,16 @@ impl SavedAnchoredDeviationRuntime {
                 basis_idx, self.basis_dim
             ));
         }
-        let points = self.breakpoints()?;
+        self.basis_span_cubic_validated(span_idx, basis_idx)
+    }
+
+    fn basis_span_cubic_validated(
+        &self,
+        span_idx: usize,
+        basis_idx: usize,
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    {
+        let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(format!(
                 "saved anchored deviation span index {} out of range for {} spans",
@@ -1114,7 +1134,7 @@ impl SavedAnchoredDeviationRuntime {
             );
         }
         let span_idx = self.left_biased_span_index_for(value)?;
-        self.basis_span_cubic(span_idx, basis_idx)
+        self.basis_span_cubic_validated(span_idx, basis_idx)
     }
 
     pub fn local_cubic_at(
@@ -1165,7 +1185,7 @@ impl SavedAnchoredDeviationRuntime {
             );
         }
         let span_idx = self.left_biased_span_index_for(value)?;
-        self.local_cubic_on_span(beta, span_idx)
+        self.local_cubic_on_span_validated(beta, span_idx)
     }
 
     fn support_interval(&self) -> Result<(f64, f64), String> {
