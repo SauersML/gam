@@ -8163,6 +8163,7 @@ mod tests {
             frailty: FrailtySpec::None,
             score_warp: None,
             link_dev: None,
+            latent_z_policy: LatentZPolicy::default(),
         }
     }
 
@@ -8280,6 +8281,7 @@ mod tests {
             frailty: FrailtySpec::None,
             score_warp: None,
             link_dev: None,
+            latent_z_policy: LatentZPolicy::default(),
         };
         let err = validate_spec(design.to_dense().view(), &spec)
             .expect_err("non-probit marginal-slope link should be rejected");
