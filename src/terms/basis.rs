@@ -16164,7 +16164,7 @@ mod tests {
         let cache: crate::resource::ByteLruCache<
             SpatialDistanceCacheKey,
             SpatialDistanceCacheEntry,
-        > = crate::resource::ByteLruCache::new(512 * 1024 * 1024);
+        > = crate::resource::ByteLruCache::new(crate::resource::SPATIAL_DISTANCE_CACHE_MAX_BYTES);
 
         cache.insert(key(1), entry());
         cache.insert(key(2), entry());
@@ -16172,7 +16172,7 @@ mod tests {
 
         // Total resident bytes must stay at or below the 512 MiB cap, and the
         // oldest entry must have been evicted.
-        assert!(cache.resident_bytes() <= 512 * 1024 * 1024);
+        assert!(cache.resident_bytes() <= crate::resource::SPATIAL_DISTANCE_CACHE_MAX_BYTES);
         assert!(cache.get(&key(1)).is_none());
         assert!(cache.get(&key(2)).is_some());
         assert!(cache.get(&key(3)).is_some());
