@@ -1327,12 +1327,7 @@ impl HyperOperator for CompositeHyperOperator {
 
     fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
-        if let Some(dense) = self.dense.as_ref() {
-            dense_matvec_into(dense, v, out.view_mut());
-        }
-        for op in &self.operators {
-            out += &op.mul_vec_view(v);
-        }
+        self.mul_vec_into(v, out.view_mut());
         out
     }
 
@@ -1422,12 +1417,7 @@ impl HyperOperator for BlockLocalDrift {
 
     fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::zeros(v.len());
-        let v_block = v.slice(ndarray::s![self.start..self.end]);
-        dense_matvec_into(
-            &self.local,
-            v_block,
-            out.slice_mut(ndarray::s![self.start..self.end]),
-        );
+        self.mul_vec_into(v, out.view_mut());
         out
     }
 
@@ -1650,24 +1640,8 @@ impl HyperOperator for ImplicitHyperOperator {
     }
 
     fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
-
-        let x_v = design_matrix_apply_view(&self.x_design, v);
-        let w_x_v = &*self.w_diag * &x_v;
-        let term1 = self
-            .implicit_deriv
-            .transpose_mul(self.axis, &w_x_v.view())
-            .expect("radial scalar evaluation failed during implicit hyper transpose_mul");
-
-        let dx_v = self
-            .implicit_deriv
-            .forward_mul(self.axis, &v)
-            .expect("radial scalar evaluation failed during implicit hyper forward_mul");
-        let w_dx_v = &*self.w_diag * &dx_v;
-        let mut out = term1 + &self.x_design.transpose_vector_multiply(&w_dx_v);
-        let mut penalty = Array1::<f64>::zeros(self.p);
-        dense_matvec_into(&self.s_psi, v, penalty.view_mut());
-        out += &penalty;
+        let mut out = Array1::<f64>::zeros(self.p);
+        self.mul_vec_into(v, out.view_mut());
         out
     }
 
@@ -1786,7 +1760,7 @@ impl ImplicitHyperOperator {
         }
 
         // Penalty part: u^T S_psi z
-        let penalty = u.dot(&self.s_psi.dot(z));
+        let penalty = dense_bilinear(&self.s_psi, z.view(), u.view());
 
         design + penalty
     }
@@ -5039,11 +5013,7 @@ impl HyperOperator for WeightedHyperOperator {
 
     fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
-        for (weight, op) in &self.terms {
-            if *weight != 0.0 {
-                out.scaled_add(*weight, &op.mul_vec_view(v));
-            }
-        }
+        self.mul_vec_into(v, out.view_mut());
         out
     }
 
@@ -8438,8 +8408,9 @@ impl StochasticTraceEstimator {
         // monitoring convergence of a D x D matrix of estimates is more
         // complex than for a scalar trace. The symmetrization at the end
         // effectively doubles the sample count for variance reduction.
+        let mut z = Array1::<f64>::zeros(p);
         for _ in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
 
             // Step 1: u = H⁻¹ z (shared solve)
             let u = hop.solve(&z);
@@ -8614,8 +8585,9 @@ impl StochasticTraceEstimator {
         let mut q_columns = Array2::zeros((p, total));
         let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
 
+        let mut z = Array1::<f64>::zeros(p);
         for _ in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
             let u = hop.solve(&z);
 
             for e in 0..n_dense {
@@ -8671,9 +8643,10 @@ impl StochasticTraceEstimator {
 
         let mut total = 0.0;
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let mut z = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
         for _ in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
             let u = hop.solve(&z);
             dense_matvec_into(matrix, z.view(), q.view_mut());
             let r = hop.solve(&q);
@@ -8700,9 +8673,10 @@ impl StochasticTraceEstimator {
         let mut x_r = Array1::<f64>::zeros(n_obs);
         let mut n_work = Array1::<f64>::zeros(n_obs);
         let mut p_work = Array1::<f64>::zeros(p);
+        let mut z = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
         for _ in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
             let u = hop.solve(&z);
             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
             op.matvec_with_shared_xz_into(
@@ -8751,9 +8725,10 @@ impl StochasticTraceEstimator {
 
         let mut total = 0.0;
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let mut z = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
         for _ in 0..self.config.n_probes_max {
-            let z = rademacher_probe(p, &mut rng_state);
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
             let u = hop.solve(&z);
             op.mul_vec_into(z.view(), q.view_mut());
             let r = hop.solve(&q);
@@ -8911,16 +8886,11 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Generate a Rademacher probe vector of dimension `p` (entries ±1).
-///
-/// Uses one bit per entry from the xoshiro256** generator. Each u64
-/// provides 64 entries, so this is very efficient for large `p`.
-fn rademacher_probe(p: usize, rng: &mut Xoshiro256SS) -> Array1<f64> {
-    let mut z = Array1::zeros(p);
+fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) {
     let mut bits: u64 = 0;
     let mut remaining_bits = 0u32;
 
-    for i in 0..p {
+    for i in 0..z.len() {
         if remaining_bits == 0 {
             bits = rng.next_u64();
             remaining_bits = 64;
@@ -8929,7 +8899,6 @@ fn rademacher_probe(p: usize, rng: &mut Xoshiro256SS) -> Array1<f64> {
         bits >>= 1;
         remaining_bits -= 1;
     }
-    z
 }
 
 #[cfg(test)]
@@ -9951,7 +9920,8 @@ mod tests {
     fn test_rademacher_probe_properties() {
         // Verify probes have entries +/-1 and are deterministic given the same seed.
         let mut rng = Xoshiro256SS::from_seed(99);
-        let z = rademacher_probe(100, &mut rng);
+        let mut z = Array1::zeros(100);
+        rademacher_probe_into(z.view_mut(), &mut rng);
         assert_eq!(z.len(), 100);
         for &v in z.iter() {
             assert!(v == 1.0 || v == -1.0, "Rademacher entry must be +/-1");
@@ -9959,7 +9929,8 @@ mod tests {
 
         // Same seed produces the same probe.
         let mut rng2 = Xoshiro256SS::from_seed(99);
-        let z2 = rademacher_probe(100, &mut rng2);
+        let mut z2 = Array1::zeros(100);
+        rademacher_probe_into(z2.view_mut(), &mut rng2);
         assert_eq!(z, z2, "Same seed must produce identical probes");
     }
 
