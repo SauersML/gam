@@ -2438,7 +2438,11 @@ fn materialize_location_scale<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::{DuchonNullspaceOrder, minimum_duchon_power_for_operator_penalties};
     use crate::inference::data::load_dataset_projected;
+    use crate::inference::formula_dsl::{
+        default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec,
+    };
     use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
     use crate::solver::outer_strategy::{HessianSource, OuterPlan, OuterResult, Solver};
     use ndarray::Array2;
@@ -2616,11 +2620,11 @@ mod tests {
         assert_eq!(link_dev.degree, 4);
         assert_eq!(link_dev.num_internal_knots, 9);
         assert_eq!(link_dev.penalty_order, 1);
-        assert!(link_dev.penalty_orders.is_empty());
+        assert_eq!(link_dev.penalty_orders, vec![1]);
         assert_eq!(score_warp.degree, 5);
         assert_eq!(score_warp.num_internal_knots, 7);
-        assert_eq!(score_warp.penalty_order, 2);
-        assert_eq!(score_warp.penalty_orders, vec![3]);
+        assert_eq!(score_warp.penalty_order, 3);
+        assert_eq!(score_warp.penalty_orders, vec![2, 3]);
         assert!(
             inference_notes
                 .iter()
@@ -2633,6 +2637,82 @@ mod tests {
                 .any(|note| note.contains("score-warp block")),
             "workflow notes should mention logslope_formula linkwiggle routing"
         );
+    }
+
+    #[test]
+    fn materialize_routes_bernoulli_marginal_slope_when_logslope_and_z_are_set() {
+        let data = workflow_test_dataset();
+        let config = FitConfig {
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            ..FitConfig::default()
+        };
+        let materialized = materialize("event ~ bmi", &data, &config)
+            .expect("Bernoulli marginal-slope materialization should succeed");
+        assert!(matches!(
+            materialized.request,
+            FitRequest::BernoulliMarginalSlope(_)
+        ));
+    }
+
+    #[test]
+    fn linkwiggle_defaults_are_consistent_across_formula_and_runtime() {
+        let parsed = parse_linkwiggle_formulaspec(&Default::default(), "linkwiggle()")
+            .expect("default linkwiggle should parse");
+        let formula_default = default_linkwiggle_formulaspec();
+        let runtime_default = DeviationBlockConfig::default();
+        assert_eq!(parsed.degree, formula_default.degree);
+        assert_eq!(
+            parsed.num_internal_knots,
+            formula_default.num_internal_knots
+        );
+        assert_eq!(parsed.penalty_orders, formula_default.penalty_orders);
+        assert_eq!(parsed.double_penalty, formula_default.double_penalty);
+        assert_eq!(runtime_default.degree, formula_default.degree);
+        assert_eq!(
+            runtime_default.num_internal_knots,
+            formula_default.num_internal_knots
+        );
+        assert_eq!(
+            runtime_default.penalty_orders,
+            formula_default.penalty_orders
+        );
+        assert_eq!(
+            runtime_default.double_penalty,
+            formula_default.double_penalty
+        );
+    }
+
+    #[test]
+    fn survival_marginal_slope_accepts_explicit_probit_link() {
+        let data = workflow_test_dataset();
+        let config = FitConfig {
+            survival_likelihood: "marginal-slope".to_string(),
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            ..FitConfig::default()
+        };
+        let ok = materialize(
+            "Surv(age_entry, age_exit, event) ~ bmi + link(type=probit)",
+            &data,
+            &config,
+        );
+        assert!(ok.is_ok(), "explicit probit should be accepted");
+
+        let err = materialize(
+            "Surv(age_entry, age_exit, event) ~ bmi + link(type=logit)",
+            &data,
+            &config,
+        )
+        .expect_err("non-probit link should be rejected");
+        assert!(err.contains("only link(type=probit)"));
+    }
+
+    #[test]
+    fn high_dimensional_duchon_default_power_is_admissible() {
+        let dim = 16;
+        let power = minimum_duchon_power_for_operator_penalties(dim, DuchonNullspaceOrder::Zero, 2);
+        assert!(2 * (1 + power) > dim + 2);
     }
 
     #[test]

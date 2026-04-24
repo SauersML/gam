@@ -10620,8 +10620,8 @@ mod tests {
     };
     use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
     use gam::predict::PredictableModel;
-    use gam::resource::MatrixMaterializationError;
     use gam::probability::normal_cdf;
+    use gam::resource::MatrixMaterializationError;
     use gam::smooth::{
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
