@@ -12,9 +12,7 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
-use crate::families::gamlss::{
-    ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed, split_wiggle_penalty_orders,
-};
+use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -57,7 +55,7 @@ impl Default for DeviationBlockConfig {
             degree: 3,
             num_internal_knots: 8,
             penalty_order: 2,
-            penalty_orders: vec![1, 2],
+            penalty_orders: vec![1, 2, 3],
             double_penalty: true,
             monotonicity_eps: 1e-4,
         }
@@ -229,11 +227,9 @@ pub(crate) fn bernoulli_marginal_link_map(
     let q1 = mu1 / phi_q;
     let q2 = mu2 / phi_q + q * q1 * q1;
     let q3 = mu3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1.powi(3);
-    let q4 = mu4 / phi_q
-        + (q.powi(3) - 3.0 * q) * q1.powi(4)
-        + 4.0 * q * q1 * q3
-        + 3.0 * q * q2 * q2
-        - 6.0 * (q * q - 1.0) * q1 * q1 * q2;
+    let q4 =
+        mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1.powi(4) + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
+            - 6.0 * (q * q - 1.0) * q1 * q1 * q2;
     Ok(BernoulliMarginalLinkMap {
         mu,
         mu1,
@@ -292,8 +288,7 @@ fn build_deviation_block_from_knots_and_design_seed_with_anchor(
             cfg.degree
         ));
     }
-    let (primary_order, extra_orders) =
-        split_wiggle_penalty_orders(cfg.penalty_order, &cfg.penalty_orders);
+    let penalty_orders = resolve_deviation_operator_orders(cfg)?;
     let knots = initialize_monotone_wiggle_knots_from_seed(
         knot_seed.view(),
         cfg.degree,
@@ -325,14 +320,40 @@ fn build_deviation_block_from_knots_and_design_seed_with_anchor(
         initial_log_lambdas: None,
         initial_beta: Some(Array1::zeros(p)),
     };
-    append_deviation_function_penalty(&mut block, &runtime, primary_order)?;
+    for order in penalty_orders {
+        append_deviation_function_penalty(&mut block, &runtime, order)?;
+    }
     if cfg.double_penalty {
         append_deviation_function_penalty(&mut block, &runtime, 0)?;
     }
-    for order in extra_orders {
-        append_deviation_function_penalty(&mut block, &runtime, order)?;
-    }
     Ok(DeviationPrepared { block, runtime })
+}
+
+fn resolve_deviation_operator_orders(cfg: &DeviationBlockConfig) -> Result<Vec<usize>, String> {
+    let mut orders = Vec::new();
+    let requested = if cfg.penalty_orders.is_empty() {
+        std::slice::from_ref(&cfg.penalty_order)
+    } else {
+        cfg.penalty_orders.as_slice()
+    };
+    for &order in requested {
+        if order == 0 {
+            continue;
+        }
+        if order > cfg.degree {
+            return Err(format!(
+                "deviation function penalty derivative order {order} exceeds basis degree {}",
+                cfg.degree
+            ));
+        }
+        if !orders.contains(&order) {
+            orders.push(order);
+        }
+    }
+    if orders.is_empty() {
+        return Err("deviation block requires at least one positive function-penalty derivative order".to_string());
+    }
+    Ok(orders)
 }
 
 fn append_deviation_function_penalty(
@@ -445,6 +466,7 @@ fn validate_spec(
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite logslope offsets".to_string());
     }
+    require_probit_marginal_slope_link(&spec.base_link, "bernoulli-marginal-slope")?;
     spec.frailty.validate_for_marginal_slope()?;
     match &spec.frailty {
         FrailtySpec::None => {}
