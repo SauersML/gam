@@ -6428,8 +6428,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 )?
                 .mapv(|v| adaptive_params[cache_idx].lambda[1] * v)
             } else {
-                scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag())
-                    .mapv(|v| adaptive_params[cache_idx].lambda[2] * v)
+                grouped_operatorhessian(
+                    &cache.d2,
+                    cache.dimension * cache.dimension,
+                    &state.curvature.betahessian_blocks(),
+                )?
+                .mapv(|v| adaptive_params[cache_idx].lambda[2] * v)
             };
             // Wrap the pre-scaled global penalty matrix as PenaltySpec::Dense.
             local_penalty_blocks.push(PenaltySpec::Dense(penalty_matrixwith_local_block(
@@ -6638,7 +6642,9 @@ fn weighted_operator_gram_from_d2(d2: &Array2<f64>, weight: &Array1<f64>) -> Arr
     for k in 0..weight.len() {
         let w = weight[k].sqrt();
         for local in 0..block_dim {
-            weighted.row_mut(k * block_dim + local).mapv_inplace(|v| v * w);
+            weighted
+                .row_mut(k * block_dim + local)
+                .mapv_inplace(|v| v * w);
         }
     }
     let gram = weighted.t().dot(&weighted);
@@ -7186,9 +7192,19 @@ impl SpatialAdaptiveExactFamily {
             2 => {
                 let lambda = params.lambda[2];
                 let beta_mixed_local = lambda
-                    * scalar_operatorgradient(&cache.d2, &state.curvature.betagradient_coeff());
-                let betahessian_local =
-                    lambda * scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag());
+                    * grouped_operatorgradient(
+                        &cache.d2,
+                        cache.dimension * cache.dimension,
+                        &state.curvature.betagradient_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let betahessian_local = lambda
+                    * grouped_operatorhessian(
+                        &cache.d2,
+                        cache.dimension * cache.dimension,
+                        &state.curvature.betahessian_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
                     &cache.coeff_global_range,
                     &beta_mixed_local,
@@ -7277,15 +7293,19 @@ impl SpatialAdaptiveExactFamily {
             2 => {
                 let lambda = params.lambda[2];
                 let beta_mixed_local = lambda
-                    * scalar_operatorgradient(
+                    * grouped_operatorgradient(
                         &cache.d2,
-                        &state.curvature.log_epsilon_betagradient_coeff(),
-                    );
+                        cache.dimension * cache.dimension,
+                        &state.curvature.log_epsilon_betagradient_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 let betahessian_local = lambda
-                    * scalar_operatorhessian(
+                    * grouped_operatorhessian(
                         &cache.d2,
-                        &state.curvature.log_epsilon_betahessian_diag(),
-                    );
+                        cache.dimension * cache.dimension,
+                        &state.curvature.log_epsilon_betahessian_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
                     &cache.coeff_global_range,
                     &beta_mixed_local,
@@ -7374,15 +7394,19 @@ impl SpatialAdaptiveExactFamily {
             2 => {
                 let lambda = params.lambda[2];
                 let beta_mixed_local = lambda
-                    * scalar_operatorgradient(
+                    * grouped_operatorgradient(
                         &cache.d2,
-                        &state.curvature.log_epsilon_beta_mixed_second_coeff(),
-                    );
+                        cache.dimension * cache.dimension,
+                        &state.curvature.log_epsilon_beta_mixed_second_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 let betahessian_local = lambda
-                    * scalar_operatorhessian(
+                    * grouped_operatorhessian(
                         &cache.d2,
-                        &state.curvature.log_epsilon_betahessian_second_diag(),
-                    );
+                        cache.dimension * cache.dimension,
+                        &state.curvature.log_epsilon_betahessian_second_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
                     &cache.coeff_global_range,
                     &beta_mixed_local,
@@ -7546,10 +7570,15 @@ impl SpatialAdaptiveExactFamily {
             2 => {
                 let d2_u = cache.d2.dot(&direction_local);
                 params.lambda[2]
-                    * scalar_operatorhessian(
+                    * grouped_operatorhessian(
                         &cache.d2,
-                        &state.curvature.directionalhessian_diag(&d2_u),
+                        cache.dimension * cache.dimension,
+                        &state.curvature.directionalhessian_blocks(
+                            &collocationhessian_blocks(&d2_u, cache.dimension)
+                                .map_err(|e| e.to_string())?,
+                        ),
                     )
+                    .map_err(|e| e.to_string())?
             }
             _ => return Err(format!("invalid adaptive component index {}", component)),
         };
@@ -7605,12 +7634,15 @@ impl SpatialAdaptiveExactFamily {
             2 => {
                 let d2_u = cache.d2.dot(&direction_local);
                 params.lambda[2]
-                    * scalar_operatorhessian(
+                    * grouped_operatorhessian(
                         &cache.d2,
-                        &state
-                            .curvature
-                            .log_epsilon_betahessian_directional_diag(&d2_u),
+                        cache.dimension * cache.dimension,
+                        &state.curvature.log_epsilon_betahessian_directional_blocks(
+                            &collocationhessian_blocks(&d2_u, cache.dimension)
+                                .map_err(|e| e.to_string())?,
+                        ),
                     )
+                    .map_err(|e| e.to_string())?
             }
             _ => return Err(format!("invalid adaptive component index {}", component)),
         };
@@ -7727,9 +7759,19 @@ impl SpatialAdaptiveExactFamily {
                 })?;
                 let lambda = params.lambda[2];
                 let beta_mixed_local = lambda
-                    * scalar_operatorgradient(&cache.d2, &state.curvature.betagradient_coeff());
-                let betahessian_local =
-                    lambda * scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag());
+                    * grouped_operatorgradient(
+                        &cache.d2,
+                        cache.dimension * cache.dimension,
+                        &state.curvature.betagradient_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let betahessian_local = lambda
+                    * grouped_operatorhessian(
+                        &cache.d2,
+                        cache.dimension * cache.dimension,
+                        &state.curvature.betahessian_blocks(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 beta_mixed
                     .slice_mut(s![cache.coeff_global_range.clone()])
                     .assign(&beta_mixed_local);
@@ -7793,7 +7835,12 @@ impl SpatialAdaptiveExactFamily {
                 &state.gradient.betagradient_blocks(),
             )
             .map_err(|e| e.to_string())?;
-            let gc = scalar_operatorgradient(&cache.d2, &state.curvature.betagradient_coeff());
+            let gc = grouped_operatorgradient(
+                &cache.d2,
+                cache.dimension * cache.dimension,
+                &state.curvature.betagradient_blocks(),
+            )
+            .map_err(|e| e.to_string())?;
             let h0 = scalar_operatorhessian(&cache.d0, &state.magnitude.betahessian_diag());
             let hg = grouped_operatorhessian(
                 &cache.d1,
@@ -7801,7 +7848,12 @@ impl SpatialAdaptiveExactFamily {
                 &state.gradient.betahessian_blocks(),
             )
             .map_err(|e| e.to_string())?;
-            let hc = scalar_operatorhessian(&cache.d2, &state.curvature.betahessian_diag());
+            let hc = grouped_operatorhessian(
+                &cache.d2,
+                cache.dimension * cache.dimension,
+                &state.curvature.betahessian_blocks(),
+            )
+            .map_err(|e| e.to_string())?;
 
             let lambda0 = params.lambda[0];
             let lambdag = params.lambda[1];
@@ -7913,9 +7965,16 @@ impl SpatialAdaptiveExactFamily {
             )
             .map_err(|e| e.to_string())?
             .mapv(|v| params.lambda[1] * v);
-            let hc =
-                scalar_operatorhessian(&cache.d2, &state.curvature.directionalhessian_diag(&d2_u))
-                    .mapv(|v| params.lambda[2] * v);
+            let hc = grouped_operatorhessian(
+                &cache.d2,
+                cache.dimension * cache.dimension,
+                &state.curvature.directionalhessian_blocks(
+                    &collocationhessian_blocks(&d2_u, cache.dimension)
+                        .map_err(|e| e.to_string())?,
+                ),
+            )
+            .map_err(|e| e.to_string())?
+            .mapv(|v| params.lambda[2] * v);
             let range = cache.coeff_global_range.clone();
             let mut local = total.slice_mut(s![range.clone(), range]);
             local += &h0;

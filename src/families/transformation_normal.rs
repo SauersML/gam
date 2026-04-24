@@ -515,6 +515,35 @@ fn weighted_crossprod_dense(
     fast_atb(left, &weighted_right)
 }
 
+fn weighted_crossprod_operator(
+    op_left: &dyn LinearOperator,
+    weights: &Array1<f64>,
+    op_right: &dyn LinearOperator,
+) -> Result<Array2<f64>, String> {
+    if weights.len() != op_left.nrows() || weights.len() != op_right.nrows() {
+        return Err(format!(
+            "weighted_crossprod_operator dimension mismatch: weights={}, left_rows={}, right_rows={}",
+            weights.len(),
+            op_left.nrows(),
+            op_right.nrows()
+        ));
+    }
+    let p_left = op_left.ncols();
+    let p_right = op_right.ncols();
+    let mut out = Array2::<f64>::zeros((p_left, p_right));
+
+    for j in 0..p_right {
+        let mut e = Array1::<f64>::zeros(p_right);
+        e[j] = 1.0;
+        let col = op_right.apply(&e);
+        let weighted_col = &col * weights;
+        let xt_col = op_left.apply_transpose(&weighted_col);
+        out.column_mut(j).assign(&xt_col);
+    }
+
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // CustomFamily implementation
 // ---------------------------------------------------------------------------
@@ -1616,12 +1645,22 @@ impl KroneckerDesign {
                 let pb = right.ncols();
                 let p = pa * pb;
                 let mut out = Array2::<f64>::zeros((p, p));
-                for start in (0..left.nrows()).step_by(1024) {
-                    let end = (start + 1024).min(left.nrows());
-                    let chunk = self.row_chunk(start..end);
-                    let weight_chunk = w.slice(s![start..end]).to_owned();
-                    let weighted_chunk = weight_rows(&chunk, &weight_chunk);
-                    out += &fast_atb(&weighted_chunk, &chunk);
+                let mut pair_weights = Array1::<f64>::zeros(left.nrows());
+                for a in 0..pa {
+                    for b in 0..=a {
+                        for i in 0..left.nrows() {
+                            pair_weights[i] = w[i] * left[[i, a]] * left[[i, b]];
+                        }
+                        let block =
+                            weighted_crossprod_operator(right, &pair_weights, right)
+                                .expect("validated Kronecker weighted Gram dimensions");
+                        out.slice_mut(s![a * pb..(a + 1) * pb, b * pb..(b + 1) * pb])
+                            .assign(&block);
+                        if a != b {
+                            out.slice_mut(s![b * pb..(b + 1) * pb, a * pb..(a + 1) * pb])
+                                .assign(&block.t());
+                        }
+                    }
                 }
                 out
             }
