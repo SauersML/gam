@@ -12,8 +12,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization,
-    build_deviation_block_from_knots_design_seed_and_anchor_weights,
-    build_deviation_block_from_seed, project_monotone_feasible_beta,
+    build_link_deviation_block_from_knots_design_seed_and_weights,
+    build_score_warp_deviation_block_from_seed, project_monotone_feasible_beta,
     signed_probit_logcdf_and_mills_ratio, signed_probit_neglog_derivatives_up_to_fourth,
     standardize_latent_z, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
@@ -12808,7 +12808,7 @@ pub fn fit_survival_marginal_slope_terms(
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| build_deviation_block_from_seed(&spec.z, cfg))
+        .map(|cfg| build_score_warp_deviation_block_from_seed(&spec.z, cfg))
         .transpose()?;
     let link_dev_prepared = spec
         .link_dev
@@ -12819,7 +12819,7 @@ pub fn fit_survival_marginal_slope_terms(
                 let slope = baseline_slope + spec.logslope_offset[row];
                 rigid_observed_eta(q_exit, slope, spec.z[row], probit_scale)
             }));
-            build_deviation_block_from_knots_design_seed_and_anchor_weights(
+            build_link_deviation_block_from_knots_design_seed_and_weights(
                 &q0_seed,
                 &q0_seed,
                 &spec.weights,
@@ -13299,7 +13299,7 @@ mod tests {
     }
 
     fn test_deviation_runtime() -> DeviationRuntime {
-        build_deviation_block_from_seed(
+        build_score_warp_deviation_block_from_seed(
             &array![-1.0, 0.0, 1.0],
             &DeviationBlockConfig {
                 degree: 3,

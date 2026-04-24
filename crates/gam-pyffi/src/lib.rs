@@ -62,9 +62,6 @@ struct PyFitConfig {
     noise_formula: Option<String>,
     noise_offset: Option<String>,
 
-    // CLI-only flags retained for future plumbing. The underlying workflow
-    // does not currently honour these, but accepting them (and returning a
-    // clear error when set) keeps the surface explicit.
     disable_link_dev: Option<bool>,
     disable_score_warp: Option<bool>,
     firth: Option<bool>,
@@ -657,23 +654,14 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     if let Some(column) = py_config.noise_offset {
         fit_config.noise_offset_column = Some(column);
     }
-    // CLI-only flags: workflow does not honour these in its current form;
-    // return a clear error if the caller tries to set them so we never
-    // silently drop meaningful configuration.
-    if py_config.disable_link_dev.unwrap_or(false) {
-        return Err(
-            "disable_link_dev is not yet plumbed through the Python FFI; drop the linkwiggle(...) term from the main formula instead"
-                .to_string(),
-        );
+    if let Some(flag) = py_config.disable_link_dev {
+        fit_config.disable_link_dev = flag;
     }
-    if py_config.disable_score_warp.unwrap_or(false) {
-        return Err(
-            "disable_score_warp is not yet plumbed through the Python FFI; drop the linkwiggle(...) term from the logslope formula instead"
-                .to_string(),
-        );
+    if let Some(flag) = py_config.disable_score_warp {
+        fit_config.disable_score_warp = flag;
     }
-    if py_config.firth.unwrap_or(false) {
-        return Err("firth bias reduction is not yet plumbed through the Python FFI".to_string());
+    if let Some(flag) = py_config.firth {
+        fit_config.firth = flag;
     }
     Ok(fit_config)
 }

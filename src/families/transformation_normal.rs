@@ -676,13 +676,11 @@ impl CustomFamily for TransformationNormalFamily {
         if block_index != 0 {
             return Ok(None);
         }
-        Ok(Some(LinearInequalityConstraints {
-            a: self.x_deriv_grid_kron.to_dense(),
-            b: Array1::from_elem(
-                self.x_deriv_grid_kron.nrows(),
-                TRANSFORMATION_MONOTONICITY_EPS,
-            ),
-        }))
+        // The CTN tensor design is intentionally factored. The dense active-set
+        // constraint API cannot represent that without persisting the full
+        // n_grid x p_response x p_covariate matrix, so monotonicity is enforced
+        // by the likelihood barrier plus the fraction-to-boundary step rule.
+        Ok(None)
     }
 
     fn exact_newton_hessian_directional_derivative(

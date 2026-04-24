@@ -220,7 +220,7 @@ def _require_extension():
 def _pc_duchon(centers: int = 24) -> str:
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
-        "order=1, power=1, double_penalty=true)"
+        "order=1, power=1, length_scale=1, double_penalty=true)"
     )
 
 
@@ -239,6 +239,7 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank):
         df,
         f"PGS ~ {_pc_duchon(centers=24)}",
         transformation_normal=True,
+        scale_dimensions="auto",
     )
     pred = model.predict(df, return_type="dict")
     z = np.asarray(pred["eta"], dtype=float)
@@ -270,6 +271,7 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
         df,
         f"PGS ~ {_pc_duchon(centers=24)}",
         transformation_normal=True,
+        scale_dimensions="auto",
     )
     df["pgs_ctn_z"] = np.asarray(
         calib.predict(df, return_type="dict")["eta"], dtype=float
@@ -287,6 +289,7 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
         disease_formula,
         family="bernoulli-marginal-slope",
         link="probit",
+        scale_dimensions="auto",
         z_column="pgs_ctn_z",
         logslope_formula=logslope,
     )
@@ -329,6 +332,7 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         df,
         f"PGS ~ {_pc_duchon(centers=24)}",
         transformation_normal=True,
+        scale_dimensions="auto",
     )
     df["pgs_ctn_z"] = np.asarray(
         calib.predict(df, return_type="dict")["eta"], dtype=float
@@ -346,6 +350,7 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         family="survival",
         survival_likelihood="marginal-slope",
         baseline_target="gompertz-makeham",
+        scale_dimensions="auto",
         z_column="pgs_ctn_z",
     )
 

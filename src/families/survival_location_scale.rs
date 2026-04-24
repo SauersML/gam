@@ -2876,14 +2876,10 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
 
 /// Build row-wise Kronecker product: each row of the result is
 /// kron(cov_row[i,:], time_row[i,:]).
-fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: usize) {
-    let bytes = n
-        .saturating_mul(p_resp)
-        .saturating_mul(p_cov)
-        .saturating_mul(std::mem::size_of::<f64>());
+fn assert_rowwise_kronecker_dimensions(n: usize, p_resp: usize, p_cov: usize, context: &str) {
     assert!(
-        bytes > 0,
-        "rowwise Kronecker design dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
+        p_resp > 0 && p_cov > 0,
+        "{context} rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
     );
 }
 
@@ -2891,7 +2887,7 @@ fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> Des
     let n = cov_design.nrows();
     let p_cov = cov_design.ncols();
     let p_time = time_basis.ncols();
-    assert_no_rowwise_kronecker_materialization(n, p_time, p_cov);
+    assert_rowwise_kronecker_dimensions(n, p_time, p_cov, "survival");
     let op = RowwiseKroneckerOperator::new(cov_design.clone(), shared_dense_arc(time_basis))
         .expect("rowwise kronecker design should have matched row counts");
     DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op)))
