@@ -1,11 +1,10 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyJointDesignChannel,
-    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
-    CustomFamilyPsiDesignAction, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart,
-    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyPsiDesignAction,
+    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactOuterDerivativeOrder,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
+    cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
     first_psi_linear_map, fit_custom_family, second_psi_linear_map,
     slice_joint_into_block_working_sets,
@@ -348,7 +347,10 @@ fn resolve_deviation_operator_orders(cfg: &DeviationBlockConfig) -> Result<Vec<u
         }
     }
     if orders.is_empty() {
-        return Err("deviation block requires at least one positive function-penalty derivative order".to_string());
+        return Err(
+            "deviation block requires at least one positive function-penalty derivative order"
+                .to_string(),
+        );
     }
     Ok(orders)
 }
@@ -5533,239 +5535,11 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
+        let Some((block_idx, _)) = self.resolve_psi_location(derivative_blocks, psi_index) else {
             return Ok(None);
         };
         let idx_primary = if block_idx == 0 { 0 } else { 1 };
         let n = self.y.len();
-        let deriv = &derivative_blocks[block_idx][local_idx];
-        let psi_label = if block_idx == 0 {
-            "BernoulliMarginalSlopeFamily marginal"
-        } else {
-            "BernoulliMarginalSlopeFamily log-slope"
-        };
-        let psi_p = if block_idx == 0 {
-            self.marginal_design.ncols()
-        } else {
-            self.logslope_design.ncols()
-        };
-        let psi_action = CustomFamilyPsiDesignAction::from_first_derivative(
-            deriv,
-            self.y.len(),
-            psi_p,
-            0..self.y.len(),
-            psi_label,
-        )
-        .ok();
-        let can_operatorize = psi_action.is_some();
-        let has_hw = primary.h.is_some() || primary.w.is_some();
-
-        if can_operatorize {
-            let (objective_psi, score_psi, w_mm, w_mg, w_gm, w_gg, d_mm, d_mg, d_gg, dense_corr) =
-                (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
-                    .into_par_iter()
-                    .try_fold(
-                        || {
-                            (
-                                0.0,
-                                Array1::<f64>::zeros(slices.total),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array2::<f64>::zeros((slices.total, slices.total)),
-                            )
-                        },
-                        |mut acc, chunk_idx| -> Result<_, String> {
-                            let start = chunk_idx * ROW_CHUNK_SIZE;
-                            let end = (start + ROW_CHUNK_SIZE).min(n);
-                            for row in start..end {
-                                let Some(dir) = self.row_primary_psi_direction(
-                                    row,
-                                    block_states,
-                                    derivative_blocks,
-                                    psi_index,
-                                    primary,
-                                )?
-                                else {
-                                    continue;
-                                };
-                                let row_ctx = Self::row_ctx(cache, row);
-                                let (f_pi, f_pipi) =
-                                    if let Some(row_cache) = Self::row_primary_cache(cache, row) {
-                                        (row_cache.gradient.clone(), row_cache.hessian.clone())
-                                    } else {
-                                        let (_, f_pi, f_pipi) = self
-                                            .compute_row_primary_gradient_hessian(
-                                                row,
-                                                block_states,
-                                                primary,
-                                                row_ctx,
-                                            )?;
-                                        (f_pi, f_pipi)
-                                    };
-                                let third = self.row_primary_third_contracted_recompute(
-                                    row,
-                                    block_states,
-                                    cache,
-                                    row_ctx,
-                                    &dir,
-                                )?;
-                                let psi_row = self.psi_design_row_vector(
-                                    row,
-                                    deriv,
-                                    self.y.len(),
-                                    psi_p,
-                                    psi_label,
-                                )?;
-
-                                acc.0 += f_pi.dot(&dir);
-                                match block_idx {
-                                    0 => {
-                                        let mut score_m =
-                                            acc.1.slice_mut(s![slices.marginal.clone()]);
-                                        score_m.scaled_add(f_pi[idx_primary], &psi_row);
-                                    }
-                                    1 => {
-                                        let mut score_g =
-                                            acc.1.slice_mut(s![slices.logslope.clone()]);
-                                        score_g.scaled_add(f_pi[idx_primary], &psi_row);
-                                    }
-                                    _ => unreachable!(),
-                                }
-                                acc.1 += &self.pullback_primary_vector(
-                                    row,
-                                    slices,
-                                    primary,
-                                    &f_pipi.dot(&dir),
-                                )?;
-
-                                if block_idx == 0 {
-                                    acc.2[row] = f_pipi[[0, 0]];
-                                    acc.3[row] = f_pipi[[0, 1]];
-                                    acc.4[row] = f_pipi[[1, 0]];
-                                } else {
-                                    acc.3[row] = f_pipi[[0, 1]];
-                                    acc.4[row] = f_pipi[[1, 0]];
-                                    acc.5[row] = f_pipi[[1, 1]];
-                                }
-                                acc.6[row] = third[[0, 0]];
-                                acc.7[row] = third[[0, 1]];
-                                acc.8[row] = third[[1, 1]];
-
-                                // h/w cross-block contributions -> dense correction
-                                if has_hw {
-                                    let right_primary = f_pipi.row(idx_primary).to_owned();
-                                    let psi_range = if block_idx == 0 {
-                                        slices.marginal.clone()
-                                    } else {
-                                        slices.logslope.clone()
-                                    };
-                                    if let (Some(ph), Some(bh)) =
-                                        (primary.h.as_ref(), slices.h.as_ref())
-                                    {
-                                        let h_part = right_primary.slice(s![ph.start..ph.end]);
-                                        for (li, gi) in psi_range.clone().enumerate() {
-                                            for (lj, gj) in bh.clone().enumerate() {
-                                                let val = psi_row[li] * h_part[lj];
-                                                acc.9[[gi, gj]] += val;
-                                                acc.9[[gj, gi]] += val;
-                                            }
-                                        }
-                                    }
-                                    if let (Some(pw), Some(bw)) =
-                                        (primary.w.as_ref(), slices.w.as_ref())
-                                    {
-                                        let w_part = right_primary.slice(s![pw.start..pw.end]);
-                                        for (li, gi) in psi_range.enumerate() {
-                                            for (lj, gj) in bw.clone().enumerate() {
-                                                let val = psi_row[li] * w_part[lj];
-                                                acc.9[[gi, gj]] += val;
-                                                acc.9[[gj, gi]] += val;
-                                            }
-                                        }
-                                    }
-                                    self.add_pullback_primary_hessian_hw_only(
-                                        &mut acc.9, row, slices, primary, &third,
-                                    );
-                                }
-                            }
-                            Ok(acc)
-                        },
-                    )
-                    .try_reduce(
-                        || {
-                            (
-                                0.0,
-                                Array1::<f64>::zeros(slices.total),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array1::<f64>::zeros(n),
-                                Array2::<f64>::zeros((slices.total, slices.total)),
-                            )
-                        },
-                        |mut left, right| -> Result<_, String> {
-                            left.0 += right.0;
-                            left.1 += &right.1;
-                            left.2 += &right.2;
-                            left.3 += &right.3;
-                            left.4 += &right.4;
-                            left.5 += &right.5;
-                            left.6 += &right.6;
-                            left.7 += &right.7;
-                            left.8 += &right.8;
-                            left.9 += &right.9;
-                            Ok(left)
-                        },
-                    )?;
-
-            let channels = vec![
-                CustomFamilyJointDesignChannel::new(
-                    slices.marginal.clone(),
-                    self.marginal_design.clone(),
-                    if block_idx == 0 {
-                        psi_action.clone()
-                    } else {
-                        None
-                    },
-                ),
-                CustomFamilyJointDesignChannel::new(
-                    slices.logslope.clone(),
-                    self.logslope_design.clone(),
-                    if block_idx == 1 { psi_action } else { None },
-                ),
-            ];
-            let pair_contributions = vec![
-                CustomFamilyJointDesignPairContribution::new(0, 0, w_mm, d_mm),
-                CustomFamilyJointDesignPairContribution::new(0, 1, w_mg.clone(), d_mg.clone()),
-                CustomFamilyJointDesignPairContribution::new(1, 0, w_gm, d_mg),
-                CustomFamilyJointDesignPairContribution::new(1, 1, w_gg, d_gg),
-            ];
-
-            let dense_correction = if has_hw { Some(dense_corr) } else { None };
-
-            return Ok(Some(ExactNewtonJointPsiTerms {
-                objective_psi,
-                score_psi,
-                hessian_psi: Array2::zeros((0, 0)),
-                hessian_psi_operator: Some(std::sync::Arc::new(
-                    CustomFamilyJointPsiOperator::with_dense_correction(
-                        slices.total,
-                        channels,
-                        pair_contributions,
-                        dense_correction,
-                    ),
-                )),
-            }));
-        }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
         let (objective_psi, score_psi, block_acc) = (0..((n + ROW_CHUNK_SIZE - 1)
@@ -5794,18 +5568,12 @@ impl BernoulliMarginalSlopeFamily {
                             continue;
                         };
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (f_pi, f_pipi) =
-                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
-                                (row_cache.gradient.clone(), row_cache.hessian.clone())
-                            } else {
-                                let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                                    row,
-                                    block_states,
-                                    primary,
-                                    row_ctx,
-                                )?;
-                                (f_pi, f_pipi)
-                            };
+                        let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                        )?;
                         let third = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -5935,18 +5703,12 @@ impl BernoulliMarginalSlopeFamily {
                             )?
                             .unwrap_or_else(|| Array1::<f64>::zeros(primary.total));
                         let row_ctx = Self::row_ctx(cache, row);
-                        let (f_pi, f_pipi) =
-                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
-                                (row_cache.gradient.clone(), row_cache.hessian.clone())
-                            } else {
-                                let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
-                                    row,
-                                    block_states,
-                                    primary,
-                                    row_ctx,
-                                )?;
-                                (f_pi, f_pipi)
-                            };
+                        let (_, f_pi, f_pipi) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                        )?;
                         let third_i = self.row_primary_third_contracted_recompute(
                             row,
                             block_states,
@@ -7189,9 +6951,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
 
         let cache = self.build_exact_eval_cache_with_order(block_states)?;
-        let Some(row_primary_caches) = cache.row_primary_caches.as_ref() else {
-            return Ok(None);
-        };
         let primary = &cache.primary;
         let n = self.y.len();
         let make_acc = || {
@@ -7218,15 +6977,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let start = chunk_idx * ROW_CHUNK_SIZE;
                 let end = (start + ROW_CHUNK_SIZE).min(n);
                 for row in start..end {
-                    let row_cache = &row_primary_caches[row];
-                    acc.0 -= row_cache.neglog;
+                    let row_ctx = Self::row_ctx(&cache, row);
+                    let (neglog, gradient, _) = self.compute_row_primary_gradient_hessian(
+                        row,
+                        block_states,
+                        primary,
+                        row_ctx,
+                    )?;
+                    acc.0 -= neglog;
                     {
                         let mut marginal = acc.1.view_mut();
                         self.marginal_design.axpy_row_into(
                             row,
-                            Self::exact_newton_score_component_from_objective_gradient(
-                                row_cache.gradient[0],
-                            ),
+                            Self::exact_newton_score_component_from_objective_gradient(gradient[0]),
                             &mut marginal,
                         )?;
                     }
@@ -7234,9 +6997,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         let mut logslope = acc.2.view_mut();
                         self.logslope_design.axpy_row_into(
                             row,
-                            Self::exact_newton_score_component_from_objective_gradient(
-                                row_cache.gradient[1],
-                            ),
+                            Self::exact_newton_score_component_from_objective_gradient(gradient[1]),
                             &mut logslope,
                         )?;
                     }
@@ -7244,7 +7005,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         for idx in 0..primary_h.len() {
                             grad_h[idx] +=
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    row_cache.gradient[primary_h.start + idx],
+                                    gradient[primary_h.start + idx],
                                 );
                         }
                     }
@@ -7252,7 +7013,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         for idx in 0..primary_w.len() {
                             grad_w[idx] +=
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    row_cache.gradient[primary_w.start + idx],
+                                    gradient[primary_w.start + idx],
                                 );
                         }
                     }
@@ -8390,7 +8151,7 @@ mod tests {
     #[test]
     fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -8682,6 +8443,15 @@ mod tests {
         .expect("structural deviation basis");
         assert_eq!(prepared.runtime.degree(), 3);
         assert_eq!(prepared.runtime.value_span_degree(), 3);
+        let has_cubic_curvature = prepared
+            .runtime
+            .span_c3()
+            .iter()
+            .any(|value| value.abs() > 1e-12);
+        assert!(
+            has_cubic_curvature,
+            "structural deviation basis must expose true cubic span coefficients"
+        );
     }
 
     #[test]
@@ -8766,8 +8536,9 @@ mod tests {
     #[test]
     fn structural_constraints_match_exact_monotonicity_guard() {
         let seed = array![-1.0, 0.0, 1.0, 2.0];
-        let prepared = build_score_warp_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
-            .expect("build deviation block");
+        let prepared =
+            build_score_warp_deviation_block_from_seed(&seed, &DeviationBlockConfig::default())
+                .expect("build deviation block");
         let constraints = prepared.runtime.structural_monotonicity_constraints();
         let dim = constraints.a.ncols();
         assert_eq!(dim, prepared.runtime.basis_dim());
@@ -8992,15 +8763,9 @@ mod tests {
                     assert!(selected.c3.abs() < 1e-12);
                     assert!((selected.evaluate(x) - expected[i]).abs() < 1e-10);
                 } else {
-                    // Interior or exact boundary point: uses the interior
-                    // span polynomial (value is correct, but c2 may be
-                    // nonzero at the boundary — that is continuity, not
-                    // saturation).
-                    let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
-                        span_idx + 1
-                    } else {
-                        span_idx
-                    };
+                    // Interior or exact boundary point: uses the same
+                    // left-biased span convention as derivative designs.
+                    let expected_span_idx = span_idx;
                     let expected_cubic = prepared
                         .runtime
                         .local_cubic_on_span(&beta, expected_span_idx)
@@ -9051,7 +8816,7 @@ mod tests {
                 assert!(selected.c3.abs() < 1e-12);
                 assert!((selected.evaluate(x) - design[[i, basis_idx]]).abs() < 1e-10);
             } else {
-                let expected_span_idx = if i + 1 == x_eval.len() { 1 } else { 0 };
+                let expected_span_idx = 0;
                 let expected_cubic = prepared
                     .runtime
                     .basis_span_cubic(expected_span_idx, basis_idx)
@@ -9792,7 +9557,7 @@ mod tests {
     #[test]
     fn w_only_gradient_hessian_finite_and_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9982,7 +9747,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10345,7 +10110,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10791,7 +10556,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11418,7 +11183,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11623,7 +11388,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12308,7 +12073,7 @@ mod tests {
     #[test]
     fn w_only_row_primary_third_direction_is_linear() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12612,7 +12377,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_third_direction_is_linear() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12777,7 +12542,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_direction_sign_rules_hold() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12936,7 +12701,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13071,7 +12836,7 @@ mod tests {
     #[test]
     fn w_only_exact_outer_zero_direction_returns_zero() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
+        let prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,

@@ -18,7 +18,9 @@
 //      + dprior/dρₖ                      [included]
 
 use faer::Side;
-use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
+use gam::estimate::{
+    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
+};
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
@@ -72,6 +74,51 @@ fn fd_gradient(f: &dyn Fn(&Array1<f64>) -> f64, rho: &Array1<f64>, h: f64) -> Ar
         rp[i] += h;
         rm[i] -= h;
         grad[i] = (f(&rp) - f(&rm)) / (2.0 * h);
+    }
+    grad
+}
+
+/// Central FD of the external REML cost across rho using the public cost API.
+fn fd_gradient_from_externalcost(
+    y: &Array1<f64>,
+    w: &Array1<f64>,
+    x: &Array2<f64>,
+    offset: &Array1<f64>,
+    s_list: &[BlockwisePenalty],
+    opts: &ExternalOptimOptions,
+    rho: &Array1<f64>,
+    h: f64,
+) -> Array1<f64> {
+    let k = rho.len();
+    let mut grad = Array1::<f64>::zeros(k);
+    for i in 0..k {
+        let mut rp = rho.clone();
+        let mut rm = rho.clone();
+        rp[i] += h;
+        rm[i] -= h;
+        let cp = evaluate_externalcost_andridge(
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            s_list,
+            opts,
+            &rp,
+        )
+        .map(|(c, _)| c)
+        .expect("cost+");
+        let cm = evaluate_externalcost_andridge(
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            s_list,
+            opts,
+            &rm,
+        )
+        .map(|(c, _)| c)
+        .expect("cost-");
+        grad[i] = (cp - cm) / (2.0 * h);
     }
     grad
 }

@@ -1,7 +1,5 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::{
-    bernoulli_marginal_link_map, bernoulli_marginal_slope_eta_from_probability,
-};
+use crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map;
 use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{
@@ -838,41 +836,15 @@ pub struct BernoulliMarginalSlopePredictor {
 
 impl BernoulliMarginalSlopePredictor {
     fn likelihood_family(&self) -> LikelihoodFamily {
-        match &self.base_link {
-            InverseLink::Standard(crate::types::LinkFunction::Logit) => {
-                LikelihoodFamily::BinomialLogit
-            }
-            InverseLink::Standard(crate::types::LinkFunction::Probit) => {
-                LikelihoodFamily::BinomialProbit
-            }
-            InverseLink::Standard(crate::types::LinkFunction::CLogLog) => {
-                LikelihoodFamily::BinomialCLogLog
-            }
-            InverseLink::Standard(crate::types::LinkFunction::Sas) | InverseLink::Sas(_) => {
-                LikelihoodFamily::BinomialSas
-            }
-            InverseLink::Standard(crate::types::LinkFunction::BetaLogistic)
-            | InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-            InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
-            InverseLink::Standard(crate::types::LinkFunction::Identity)
-            | InverseLink::Standard(crate::types::LinkFunction::Log) => {
-                LikelihoodFamily::BinomialProbit
-            }
-        }
+        LikelihoodFamily::BinomialProbit
     }
 
     fn mean_from_eta(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        apply_family_inverse_link(eta, self.likelihood_family(), Some(&self.base_link))
+        Ok(eta.mapv(normal_cdf))
     }
 
     fn mean_derivative_from_eta(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
-        Ok(Array1::from_iter(
-            eta.iter()
-                .map(|&value| strategy.inverse_link_jet(value).map(|jet| jet.d1))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))
+        Ok(eta.mapv(normal_pdf))
     }
 
     fn probit_frailty_scale(&self) -> f64 {
@@ -889,39 +861,7 @@ impl BernoulliMarginalSlopePredictor {
         internal_eta: Array1<f64>,
         internal_grad: Option<Array2<f64>>,
     ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
-        if matches!(
-            self.base_link,
-            InverseLink::Standard(crate::types::LinkFunction::Probit)
-        ) {
-            return Ok((internal_eta, internal_grad));
-        }
-        let mut eta = Array1::<f64>::zeros(internal_eta.len());
-        let mut grad = internal_grad;
-        for i in 0..internal_eta.len() {
-            let probability = normal_cdf(internal_eta[i]);
-            let eta_i = bernoulli_marginal_slope_eta_from_probability(
-                &self.base_link,
-                probability,
-                "saved bernoulli marginal-slope eta transform",
-            )
-            .map_err(EstimationError::InvalidInput)?;
-            let marginal = bernoulli_marginal_link_map(&self.base_link, eta_i)
-                .map_err(EstimationError::InvalidInput)?;
-            if !marginal.mu1.is_finite() || marginal.mu1 <= 0.0 {
-                return Err(EstimationError::InvalidInput(format!(
-                    "saved bernoulli marginal-slope inverse-link derivative must be positive, got {} at eta={eta_i}",
-                    marginal.mu1
-                )));
-            }
-            eta[i] = eta_i;
-            if let Some(grad) = grad.as_mut() {
-                let factor = normal_pdf(internal_eta[i]) / marginal.mu1;
-                for j in 0..grad.ncols() {
-                    grad[[i, j]] *= factor;
-                }
-            }
-        }
-        Ok((eta, grad))
+        Ok((internal_eta, internal_grad))
     }
 
     fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
@@ -4082,15 +4022,16 @@ mod tests {
     #[test]
     fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
         let seed = array![-1.5, -0.2, 0.6, 1.4];
-        let prepared = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
-            &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                degree: 3,
-                num_internal_knots: 3,
-                ..Default::default()
-            },
-        )
-        .expect("production score-warp runtime");
+        let prepared =
+            crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
+                &seed,
+                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                    degree: 3,
+                    num_internal_knots: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("production score-warp runtime");
         let production_runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let score_only = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.8],
@@ -4118,15 +4059,16 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("DenestedCubicTransport"));
 
-        let err = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
-            &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                degree: 2,
-                num_internal_knots: 3,
-                ..Default::default()
-            },
-        )
-        .expect_err("non-cubic deviation runtimes should be rejected");
+        let err =
+            crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
+                &seed,
+                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                    degree: 2,
+                    num_internal_knots: 3,
+                    ..Default::default()
+                },
+            )
+            .expect_err("non-cubic deviation runtimes should be rejected");
         assert!(err.contains("degree must be 3"));
 
         let mut structurally_invalid = production_runtime.clone();
@@ -4141,14 +4083,15 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
-            &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..Default::default()
-            },
-        )
-        .expect("build saved anchored deviation runtime");
+        let prepared =
+            crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
+                &seed,
+                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                    num_internal_knots: 4,
+                    ..Default::default()
+                },
+            )
+            .expect("build saved anchored deviation runtime");
         let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let beta = Array1::from_iter(
             (0..runtime.basis_dim)
@@ -4171,11 +4114,7 @@ mod tests {
                 assert!((cubic.evaluate(x) - expected[i]).abs() < 1e-10);
                 assert!((cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10);
                 let selected = runtime.local_cubic_at(&beta, x).expect("local cubic at x");
-                let expected_span_idx = if i + 1 == x_eval.len() && span_idx + 1 < n_spans {
-                    span_idx + 1
-                } else {
-                    span_idx
-                };
+                let expected_span_idx = span_idx;
                 let expected_cubic = runtime
                     .local_cubic_on_span(&beta, expected_span_idx)
                     .expect("expected local cubic on span");
@@ -4234,7 +4173,7 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_predictor_reports_eta_on_selected_base_link_scale() {
+    fn bernoulli_marginal_slope_predictor_rejects_nonprobit_base_link_scale() {
         let predictor = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.7],
             beta_logslope: array![-0.4],
@@ -4259,81 +4198,24 @@ mod tests {
             auxiliary_scalar: Some(array![-0.3, 1.2]),
         };
 
-        let (eta, grad) = predictor
+        let err = predictor
             .final_eta_and_gradient_from_theta(&input, &theta, true)
-            .expect("logit base-link rigid path should evaluate");
-
-        let scale = predictor.probit_frailty_scale();
-        let marginal_q = array![
-            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
-                &predictor.base_link,
-                0.8,
-            )
-            .expect("map")
-            .q,
-            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
-                &predictor.base_link,
-                0.85,
-            )
-            .expect("map")
-            .q,
-        ];
-        let marginal_q1 = array![
-            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
-                &predictor.base_link,
-                0.8,
-            )
-            .expect("map")
-            .q1,
-            crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
-                &predictor.base_link,
-                0.85,
-            )
-            .expect("map")
-            .q1,
-        ];
-        let logslope_eta = array![-0.6, -0.7];
-        let z = array![-0.3, 1.2];
-        for i in 0..eta.len() {
-            let sb = scale * logslope_eta[i];
-            let c = (1.0 + sb * sb).sqrt();
-            let internal_eta = marginal_q[i] * c + sb * z[i];
-            let probability = normal_cdf(internal_eta);
-            let expected_eta =
-                crate::families::bernoulli_marginal_slope::bernoulli_marginal_slope_eta_from_probability(
-                    &predictor.base_link,
-                    probability,
-                    "predict test",
-                )
-                .expect("invert probability");
-            assert!((eta[i] - expected_eta).abs() <= 1e-12);
-            let eta_internal_dm = c * marginal_q1[i];
-            let eta_internal_dg =
-                marginal_q[i] * scale * scale * logslope_eta[i] / c + scale * z[i];
-            let expected_factor = normal_pdf(internal_eta)
-                / crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map(
-                    &predictor.base_link,
-                    eta[i],
-                )
-                .expect("map")
-                .mu1;
-            let grad = grad.as_ref().expect("gradient should be returned");
-            assert!((grad[[i, 0]] - expected_factor * eta_internal_dm).abs() <= 1e-12);
-            assert!((grad[[i, 1]] - expected_factor * eta_internal_dg).abs() <= 1e-12);
-        }
+            .expect_err("non-probit marginal-slope prediction should be rejected");
+        assert!(err.to_string().contains("requires link(type=probit)"));
     }
 
     #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
-            &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..Default::default()
-            },
-        )
-        .expect("build saved anchored deviation runtime");
+        let prepared =
+            crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
+                &seed,
+                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                    num_internal_knots: 4,
+                    ..Default::default()
+                },
+            )
+            .expect("build saved anchored deviation runtime");
         let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");
         let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
@@ -4346,7 +4228,7 @@ mod tests {
             assert!((cubic.evaluate(x) - design[[i, 1]]).abs() < 1e-10);
             assert!((cubic.first_derivative(x) - d1[[i, 1]]).abs() < 1e-10);
             let selected = runtime.basis_cubic_at(1, x).expect("basis cubic at x");
-            let expected_span_idx = if i + 1 == x_eval.len() { 1 } else { 0 };
+            let expected_span_idx = 0;
             let expected_cubic = runtime
                 .basis_span_cubic(expected_span_idx, 1)
                 .expect("expected basis span cubic");

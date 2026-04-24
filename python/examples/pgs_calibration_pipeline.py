@@ -4,8 +4,8 @@ Methods
 -------
 Stage 1 — conditional Gaussianization. For a polygenic score ``PGS`` and
 ancestry/PC coordinates ``(pc1, pc2, pc3, pc4)`` we fit a transformation-
-normal model ``h(PGS | PCs) ~ N(0, 1)`` using a Duchon spline with triple
-penalty operators on the PC manifold. The anchored deviation invariant is
+normal model ``h(PGS | PCs) ~ N(0, 1)`` using a Duchon radial basis with
+triple operator regularization on the PC manifold. The anchored deviation invariant is
 that, after the fitted conditional-Gaussianization map is applied, the
 predicted z-scores are (a) marginally standard normal and (b) uncorrelated
 with every PC coordinate. The fitted residual, ``pgs_ctn_z``, is an
@@ -56,8 +56,7 @@ def load_biobank_sample(n: int = 2000, seed: int = 0) -> pd.DataFrame:
     pc3 = rng.normal(0.0, 1.0, n)
     pc4 = rng.normal(0.0, 1.0, n)
 
-    raw = 0.4 * pc1 - 0.2 * pc2 + 0.15 * pc3 + rng.normal(0.0, 0.9, n)
-    pgs = (raw - raw.mean()) / raw.std(ddof=0)
+    pgs = 0.4 * pc1 - 0.2 * pc2 + 0.15 * pc3 + rng.normal(0.0, 0.9, n)
 
     def _phi(x: np.ndarray) -> np.ndarray:
         return 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
