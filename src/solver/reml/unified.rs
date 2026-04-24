@@ -7663,10 +7663,18 @@ impl SparseCholeskyOperator {
         block: &Array2<f64>,
         start: usize,
     ) -> f64 {
+        debug_assert_eq!(block.nrows(), block.ncols());
         let mut trace = 0.0;
         for i in 0..block.nrows() {
-            for j in 0..block.ncols() {
-                trace += taka.get(start + i, start + j) * block[[i, j]];
+            let diag = block[[i, i]];
+            if diag.abs() > 1e-30 {
+                trace += taka.get(start + i, start + i) * diag;
+            }
+            for j in (i + 1)..block.ncols() {
+                let pair = block[[i, j]] + block[[j, i]];
+                if pair.abs() > 1e-30 {
+                    trace += taka.get(start + i, start + j) * pair;
+                }
             }
         }
         trace
@@ -7680,12 +7688,14 @@ impl SparseCholeskyOperator {
         let dim = block.nrows();
         let mut out = Array2::<f64>::zeros((dim, dim));
         for i in 0..dim {
-            for k in 0..dim {
-                let mut value = 0.0;
-                for j in 0..dim {
-                    value += taka.get(start + i, start + j) * block[[j, k]];
+            for j in 0..dim {
+                let z = taka.get(start + i, start + j);
+                if z.abs() <= 1e-30 {
+                    continue;
                 }
-                out[[i, k]] = value;
+                for k in 0..dim {
+                    out[[i, k]] += z * block[[j, k]];
+                }
             }
         }
         out
@@ -8050,6 +8060,9 @@ impl HessianOperator for SparseCholeskyOperator {
                 if a_start == b_start && a_end == b_end {
                     // Same block: tr(Z_block * A_local * Z_block * B_local)
                     let za = Self::takahashi_left_multiply_block(taka, a_local, a_start);
+                    if std::ptr::addr_eq(left, right) {
+                        return trace_matrix_product(&za, &za);
+                    }
                     let zb = Self::takahashi_left_multiply_block(taka, b_local, b_start);
                     // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij
                     return (&za * &zb.t()).sum();
@@ -10483,9 +10496,9 @@ mod tests {
             crate::linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
         );
         let sfactor = crate::linalg::sparse_exact::factorize_simplicial(&h_sparse).unwrap();
-        let taka = std::sync::Arc::new(crate::linalg::sparse_exact::TakahashiInverse::compute(
-            &sfactor,
-        ));
+        let taka = std::sync::Arc::new(
+            crate::linalg::sparse_exact::TakahashiInverse::compute(&sfactor).unwrap(),
+        );
         let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows()).with_takahashi(taka);
         let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
