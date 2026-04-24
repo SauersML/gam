@@ -272,12 +272,21 @@ impl<'a> RemlState<'a> {
         d_array: &Array1<f64>,
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
+        extra_penalty_drifts: &[Array2<f64>],
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
+        let total_k = k + extra_penalty_drifts.len();
+        if x_vks.len() != total_k {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane correction internal gradient arity mismatch: {} response modes for {} coordinates",
+                x_vks.len(),
+                total_k
+            )));
+        }
         let xt = x_dense.t();
 
         let mut h_diag = Array1::<f64>::zeros(n);
@@ -383,7 +392,7 @@ impl<'a> RemlState<'a> {
             lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
         }
 
-        let mut gradient = Array1::<f64>::zeros(k);
+        let mut gradient = Array1::<f64>::zeros(total_k);
         for idx in 0..k {
             let cp = &tk_penalties[idx];
             let r = &cp.col_range;
@@ -395,6 +404,28 @@ impl<'a> RemlState<'a> {
                     .sum::<f64>();
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p + correction_trace;
+        }
+        for (extra_idx, drift) in extra_penalty_drifts.iter().enumerate() {
+            if drift.raw_dim() != p_total.raw_dim() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane ext penalty drift shape mismatch: expected {}x{}, got {}x{}",
+                    p,
+                    p,
+                    drift.nrows(),
+                    drift.ncols()
+                )));
+            }
+            let mut trace_ak_p = 0.0;
+            for row in 0..p {
+                for col in 0..p {
+                    trace_ak_p += drift[[row, col]] * p_total[[col, row]];
+                }
+            }
+            let x_vk_idx = k + extra_idx;
+            let correction_trace: f64 = (0..n)
+                .map(|i| c_array[i] * x_vks[x_vk_idx][i] * lev_p[i])
+                .sum();
+            gradient[x_vk_idx] = trace_ak_p + correction_trace;
         }
 
         for g in gradient.iter_mut() {
@@ -415,6 +446,7 @@ impl<'a> RemlState<'a> {
         d_array: &Array1<f64>,
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
+        extra_penalty_drifts: &[Array2<f64>],
         beta: &Array1<f64>,
         compute_gradient: bool,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
@@ -430,7 +462,7 @@ impl<'a> RemlState<'a> {
             });
         }
 
-        let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
+        let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k + extra_penalty_drifts.len());
         for idx in 0..k {
             let cp = &tk_penalties[idx];
             let r = &cp.col_range;
@@ -446,6 +478,20 @@ impl<'a> RemlState<'a> {
             let v_k = h_inv_solve(&a_k_beta)?;
             x_vks.push(x_dense.dot(&v_k));
         }
+        for drift in extra_penalty_drifts {
+            if drift.ncols() != beta.len() || drift.nrows() != beta.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane ext penalty drift shape mismatch: expected {}x{}, got {}x{}",
+                    beta.len(),
+                    beta.len(),
+                    drift.nrows(),
+                    drift.ncols()
+                )));
+            }
+            let a_k_beta = drift.dot(beta);
+            let v_k = h_inv_solve(&a_k_beta)?;
+            x_vks.push(x_dense.dot(&v_k));
+        }
 
         let gradient = Self::tk_gradient_from_intermediates(
             x_dense,
@@ -454,6 +500,7 @@ impl<'a> RemlState<'a> {
             d_array,
             tk_penalties,
             lambdas,
+            extra_penalty_drifts,
             &x_vks,
             h_inv_solve,
         )?;
@@ -468,6 +515,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
+        extra_penalty_drifts: &[Array2<f64>],
     ) -> Result<TkCorrectionTerms, EstimationError> {
         if self.config.link_function() == LinkFunction::Identity {
             return Ok(TkCorrectionTerms {
@@ -500,7 +548,7 @@ impl<'a> RemlState<'a> {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: if compute_gradient {
-                    Some(Array1::zeros(rho.len()))
+                    Some(Array1::zeros(rho.len() + extra_penalty_drifts.len()))
                 } else {
                     None
                 },
@@ -538,6 +586,7 @@ impl<'a> RemlState<'a> {
                 &d_array,
                 &self.canonical_penalties,
                 &lambdas,
+                extra_penalty_drifts,
                 &beta,
                 compute_gradient,
                 &h_inv_solve,
@@ -663,10 +712,31 @@ impl<'a> RemlState<'a> {
             &d_array,
             &tk_penalties,
             &lambdas,
+            extra_penalty_drifts,
             &beta,
             compute_gradient,
             &h_inv_solve,
         )
+    }
+
+    fn tk_penalty_ext_drifts(
+        &self,
+        mode: super::unified::EvalMode,
+        ext_coords: &[super::unified::HyperCoord],
+    ) -> Result<Vec<Array2<f64>>, EstimationError> {
+        if self.config.link_function() == LinkFunction::Identity || !compute_gradient_for_tk(mode) {
+            return Ok(Vec::new());
+        }
+        let mut drifts = Vec::with_capacity(ext_coords.len());
+        for coord in ext_coords {
+            if !coord.is_penalty_like {
+                return Err(EstimationError::InvalidInput(
+                    "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients".to_string(),
+                ));
+            }
+            drifts.push(coord.drift.materialize());
+        }
+        Ok(drifts)
     }
 
     fn apply_tk_to_result(
@@ -3122,7 +3192,8 @@ impl<'a> RemlState<'a> {
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode)?;
+        let extra_tk_drifts = self.tk_penalty_ext_drifts(mode, &assembly.ext_coords)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, &extra_tk_drifts)?;
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
@@ -3150,7 +3221,8 @@ impl<'a> RemlState<'a> {
         } else {
             super::unified::EvalMode::ValueOnly
         };
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode)?;
+        let extra_tk_drifts = self.tk_penalty_ext_drifts(eval_mode, &assembly.ext_coords)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, &extra_tk_drifts)?;
         let inner_solution = assembly.build();
 
         let prior = self.build_prior(rho, eval_mode);
