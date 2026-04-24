@@ -18,7 +18,7 @@ const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
 #[inline]
 fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
-    !matches!(mode, super::unified::EvalMode::ValueOnly)
+    mode != super::unified::EvalMode::ValueOnly
 }
 
 struct TkPsiDirection {
@@ -277,12 +277,10 @@ impl<'a> RemlState<'a> {
         x_vks: &[Array1<f64>],
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
         penalty_coords: Option<&[&super::unified::PenaltyCoordinate]>,
-        psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
-        let ext_dim = psi_dirs.map_or(0, <[TkPsiDirection]>::len);
         let xt = x_dense.t();
 
         // Hat leverages
@@ -393,7 +391,7 @@ impl<'a> RemlState<'a> {
             lev_p[i] = xp.row(i).dot(&x_dense.row(i).to_owned());
         }
 
-        let mut gradient = Array1::<f64>::zeros(k + ext_dim);
+        let mut gradient = Array1::<f64>::zeros(k);
         for idx in 0..k {
             let trace_ak_p = if let Some(coords) = penalty_coords {
                 coords[idx].trace_with_dense(&p_total, lambdas[idx])
@@ -411,71 +409,6 @@ impl<'a> RemlState<'a> {
             let correction_trace: f64 = (0..n).map(|i| c_array[i] * x_vks[idx][i] * lev_p[i]).sum();
             gradient[idx] = trace_ak_p + correction_trace;
         }
-
-        if let Some(psi_dirs) = psi_dirs {
-            let mut b_z_t = Array2::<f64>::zeros((n, p));
-            for i in 0..n {
-                let diag_coeff = -0.25 * d_array[i] * h_diag[i] + 0.25 * c_array[i] * x_y[i];
-                let t2_coeff = 0.125 * m_vec[i];
-                for a in 0..p {
-                    b_z_t[[i, a]] += diag_coeff * z[[a, i]] + t2_coeff * y[a];
-                }
-            }
-
-            for j0 in (0..n).step_by(TK_BLOCK_SIZE) {
-                let j1 = (j0 + TK_BLOCK_SIZE).min(n);
-                let z_block_j = z.slice(s![.., j0..j1]);
-                let c_j = c_array.slice(s![j0..j1]);
-                for i0 in (0..n).step_by(TK_BLOCK_SIZE) {
-                    let i1 = (i0 + TK_BLOCK_SIZE).min(n);
-                    let x_block_i = x_dense.slice(s![i0..i1, ..]);
-                    let c_i = c_array.slice(s![i0..i1]);
-                    let gram = x_block_i.dot(&z_block_j.to_owned());
-                    for bi in 0..(i1 - i0) {
-                        let ci = c_i[bi];
-                        if ci == 0.0 {
-                            continue;
-                        }
-                        let row = i0 + bi;
-                        for bj in 0..(j1 - j0) {
-                            let cj = c_j[bj];
-                            if cj == 0.0 {
-                                continue;
-                            }
-                            let gij = gram[[bi, bj]];
-                            let coeff = 0.25 * ci * cj * gij * gij;
-                            if coeff == 0.0 {
-                                continue;
-                            }
-                            let col = j0 + bj;
-                            for a in 0..p {
-                                b_z_t[[row, a]] += coeff * z[[a, col]];
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (j, dir) in psi_dirs.iter().enumerate() {
-                if dir.h_dot.nrows() != p || dir.h_dot.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "Tierney-Kadane psi Hessian drift shape mismatch for coord {j}: expected {p}x{p}, got {}x{}",
-                        dir.h_dot.nrows(),
-                        dir.h_dot.ncols()
-                    )));
-                }
-                if dir.x_tau.nrows() != n || dir.x_tau.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "Tierney-Kadane psi design derivative shape mismatch for coord {j}: expected {n}x{p}, got {}x{}",
-                        dir.x_tau.nrows(),
-                        dir.x_tau.ncols()
-                    )));
-                }
-                gradient[k + j] =
-                    (&dir.h_dot * &p_total).sum() + 2.0 * (&dir.x_tau * &b_z_t).sum();
-            }
-        }
-
         for g in gradient.iter_mut() {
             if !g.is_finite() {
                 return Err(EstimationError::InvalidInput(
@@ -552,7 +485,6 @@ impl<'a> RemlState<'a> {
             gradient: Some(gradient),
         })
     }
-
     fn tierney_kadane_terms(
         &self,
         rho: &Array1<f64>,
@@ -580,7 +512,7 @@ impl<'a> RemlState<'a> {
                 d_array[idx]
             )));
         }
-        let compute_gradient = !matches!(mode, super::unified::EvalMode::ValueOnly);
+        let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
         let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
         if compute_hessian {
             return Err(EstimationError::InvalidInput(
@@ -3357,7 +3289,6 @@ impl<'a> RemlState<'a> {
         let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
-
     /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
     /// injected into the `InnerSolution`.
     ///
@@ -3424,7 +3355,6 @@ impl<'a> RemlState<'a> {
                 (Vec::new(), None, None, None)
             };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
         let psi_coord_count = if mode != super::unified::EvalMode::ValueOnly {
             ext_coords.len()
         } else {
