@@ -233,7 +233,11 @@ impl<'a> RemlState<'a> {
         let mut blocks = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
         for start in (0..n).step_by(TK_BLOCK_SIZE) {
             let end = (start + TK_BLOCK_SIZE).min(n);
-            if c_array.slice(s![start..end]).iter().any(|value| *value != 0.0) {
+            if c_array
+                .slice(s![start..end])
+                .iter()
+                .any(|value| *value != 0.0)
+            {
                 blocks.push((start, end));
             }
         }
