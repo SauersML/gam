@@ -8154,11 +8154,21 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                 block_states.len()
             ));
         }
-        // Read block shapes via operator-preserving views (no materialization).
-        let mu_view = self.mu_design_view()?;
-        let ls_view = self.log_sigma_design_view()?;
-        let pmu = mu_view.ncols();
-        let p_ls = ls_view.ncols();
+        let pmu = self
+            .mu_design
+            .as_ref()
+            .ok_or_else(|| {
+                "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
+            })?
+            .ncols();
+        let p_ls = self
+            .log_sigma_design
+            .as_ref()
+            .ok_or_else(|| {
+                "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design"
+                    .to_string()
+            })?
+            .ncols();
         let pw = block_states[Self::BLOCK_WIGGLE].beta.len();
         let total = pmu + p_ls + pw;
         let (start, end) = match block_idx {
@@ -8176,9 +8186,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         }
         let mut d_beta_flat = Array1::<f64>::zeros(total);
         d_beta_flat.slice_mut(s![start..end]).assign(d_beta);
-        // The legacy `_from_designs` API still requires `&Array2<f64>`, so
-        // materialize via the legacy helper here. A future migration pass
-        // will switch `_from_designs` to take `BlockDesignView<'_>`.
         let (xmu, x_ls) = self.dense_block_designs()?;
         let d_joint = self
             .exact_newton_joint_hessian_directional_derivative_from_designs(
@@ -10144,10 +10151,10 @@ impl BinomialLocationScaleFamily {
         }
     }
 
-    // TODO(block-view-migration): prefer `threshold_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
+    fn exact_joint_supported(&self) -> bool {
+        self.threshold_design.is_some() && self.log_sigma_design.is_some()
+    }
+
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
@@ -11985,9 +11992,20 @@ impl CustomFamily for BinomialLocationScaleFamily {
         if !self.exact_joint_supported() {
             return Ok(None);
         }
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
+        let pt = self
+            .threshold_design
+            .as_ref()
+            .ok_or_else(|| {
+                "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
+            })?
+            .ncols();
+        let pls = self
+            .log_sigma_design
+            .as_ref()
+            .ok_or_else(|| {
+                "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
+            })?
+            .ncols();
         let total = pt + pls;
         let (start, end, joint_direction) = match block_idx {
             Self::BLOCK_T => {
@@ -12264,12 +12282,12 @@ impl BinomialLocationScaleWiggleFamily {
             return Err(format!(
                 "wiggle fourth-derivative col mismatch: got {}, expected {}",
                 d4.ncols(),
+                beta_link_wiggle.len()
+            ));
+        }
+        Ok(d4.dot(&beta_link_wiggle))
     }
 
-    // TODO(block-view-migration): prefer `threshold_design_view()` /
-    // `log_sigma_design_view()` returning `BlockDesignView<'_>`. This
-    // Cow-returning helper forces an n×p dense materialization on the
-    // operator branch.
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
         let td = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleWiggleFamily exact path is missing threshold design".to_string()
