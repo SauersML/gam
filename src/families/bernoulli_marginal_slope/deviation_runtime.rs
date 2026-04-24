@@ -40,7 +40,6 @@ pub struct DeviationRuntime {
     span_c1: Array2<f64>,
     span_c2: Array2<f64>,
     span_c3: Array2<f64>,
-    coefficient_transform: Array2<f64>,
     monotonicity_constraint_rows: Array2<f64>,
     /// Deviation basis values at the rightmost breakpoint (1 × basis_dim).
     /// Used for constant-tail continuation outside support: the deviation
@@ -50,7 +49,10 @@ pub struct DeviationRuntime {
 
 enum DeviationMomentAnchor<'a> {
     StandardNormal,
-    Empirical(&'a Array1<f64>),
+    Empirical {
+        values: &'a Array1<f64>,
+        weights: Option<&'a Array1<f64>>,
+    },
 }
 
 fn anchor_coefficient_nullspace(
@@ -86,13 +88,40 @@ fn anchor_coefficient_nullspace(
                 }
             }
         }
-        DeviationMomentAnchor::Empirical(values) => {
+        DeviationMomentAnchor::Empirical { values, weights } => {
             if values.is_empty() {
                 return Err(
                     "deviation empirical moment anchor requires at least one value".to_string(),
                 );
             }
-            let inv_n = 1.0 / values.len() as f64;
+            if let Some(weights) = weights {
+                if weights.len() != values.len() {
+                    return Err(format!(
+                        "deviation empirical moment anchor weight length mismatch: values={}, weights={}",
+                        values.len(),
+                        weights.len()
+                    ));
+                }
+            }
+            let total_weight = if let Some(weights) = weights {
+                let mut total = 0.0;
+                for (idx, &weight) in weights.iter().enumerate() {
+                    if !weight.is_finite() || weight < 0.0 {
+                        return Err(format!(
+                            "deviation empirical moment anchor weight at row {idx} must be finite and non-negative, got {weight}"
+                        ));
+                    }
+                    total += weight;
+                }
+                total
+            } else {
+                values.len() as f64
+            };
+            if !total_weight.is_finite() || total_weight <= 0.0 {
+                return Err(
+                    "deviation empirical moment anchor requires positive total weight".to_string(),
+                );
+            }
             for (idx, &q) in values.iter().enumerate() {
                 if !q.is_finite() {
                     return Err(format!(
@@ -108,9 +137,10 @@ fn anchor_coefficient_nullspace(
                     raw_span_c3,
                     raw_right_boundary_value_row,
                 )?;
+                let anchor_weight = weights.map_or(1.0, |weights| weights[idx]) / total_weight;
                 for j in 0..raw_dim {
-                    c[[0, j]] += inv_n * row[j];
-                    c[[1, j]] += inv_n * q * row[j];
+                    c[[0, j]] += anchor_weight * row[j];
+                    c[[1, j]] += anchor_weight * q * row[j];
                 }
             }
         }
@@ -218,10 +248,22 @@ impl DeviationRuntime {
         monotonicity_eps: f64,
         reference: &Array1<f64>,
     ) -> Result<Self, String> {
+        Self::try_new_weighted_empirical_anchor(knots, monotonicity_eps, reference, None)
+    }
+
+    pub(crate) fn try_new_weighted_empirical_anchor(
+        knots: Array1<f64>,
+        monotonicity_eps: f64,
+        reference: &Array1<f64>,
+        weights: Option<&Array1<f64>>,
+    ) -> Result<Self, String> {
         Self::try_new_with_anchor(
             knots,
             monotonicity_eps,
-            DeviationMomentAnchor::Empirical(reference),
+            DeviationMomentAnchor::Empirical {
+                values: reference,
+                weights,
+            },
         )
     }
 
@@ -325,7 +367,6 @@ impl DeviationRuntime {
             span_c1,
             span_c2,
             span_c3,
-            coefficient_transform,
             monotonicity_constraint_rows,
             right_boundary_value_row,
         })
@@ -363,10 +404,6 @@ impl DeviationRuntime {
 
     pub fn span_c3(&self) -> &Array2<f64> {
         &self.span_c3
-    }
-
-    pub(crate) fn coefficient_transform(&self) -> &Array2<f64> {
-        &self.coefficient_transform
     }
 
     // ── design evaluation ──
@@ -458,15 +495,6 @@ impl DeviationRuntime {
 
     pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.evaluate_span_polynomial_design(values, 4)
-    }
-
-    pub(crate) fn integrated_derivative_penalty(
-        &self,
-        derivative_order: usize,
-    ) -> Result<Array2<f64>, String> {
-        Ok(self
-            .integrated_derivative_penalty_with_nullity(derivative_order)?
-            .0)
     }
 
     pub(crate) fn integrated_derivative_penalty_with_nullity(

@@ -98,7 +98,6 @@ impl DenseOrOperator<'_> {
             }
         }
     }
-
 }
 
 fn dense_block_or_operator<'a>(

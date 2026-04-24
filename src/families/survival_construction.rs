@@ -10,12 +10,12 @@
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
 use crate::basis::{
-    build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar, BSplineBasisSpec,
-    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense, KnotSource,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
+    KnotSource, build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
 use crate::families::gamlss::{
-    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
-    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders, WiggleBlockConfig,
+    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
+    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
 use crate::families::lognormal_kernel::HazardLoading;
 use crate::families::survival_location_scale::{
@@ -24,7 +24,7 @@ use crate::families::survival_location_scale::{
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
-use ndarray::{array, s, Array1, Array2};
+use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -523,6 +523,85 @@ where
                 >,
             >,
         );
+    let result = problem
+        .run(&mut obj, context)
+        .map_err(|e| format!("{context} failed: {e}"))?;
+    survival_baseline_config_from_theta(target, &result.rho)
+}
+
+pub fn optimize_survival_baseline_config_with_gradient<F>(
+    initial: &SurvivalBaselineConfig,
+    context: &str,
+    mut objective: F,
+) -> Result<SurvivalBaselineConfig, String>
+where
+    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
+{
+    use crate::solver::outer_strategy::{
+        Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
+    };
+    let Some(seed) = survival_baseline_theta_from_config(initial)? else {
+        return Ok(initial.clone());
+    };
+    let dim = seed.len();
+    let target = initial.target;
+    let lower = seed.mapv(|v| v - 6.0);
+    let upper = seed.mapv(|v| v + 6.0);
+    let problem = OuterProblem::new(dim)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(Derivative::Unavailable)
+        .with_prefer_gradient_only(true)
+        .with_solver_class(SolverClass::Primary)
+        .with_tolerance(1e-4)
+        .with_max_iter(240)
+        .with_bounds(lower, upper)
+        .with_heuristic_lambdas(seed.to_vec());
+    let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
+    let cost_objective = std::rc::Rc::clone(&objective);
+    let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
+        let cfg = survival_baseline_config_from_theta(target, theta)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let (cost, gradient) =
+            cost_objective.borrow_mut()(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)?;
+        if gradient.len() != dim {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{context}: baseline gradient dimension mismatch: got {}, expected {dim}",
+                gradient.len()
+            )));
+        }
+        Ok(cost)
+    };
+    let eval_objective = std::rc::Rc::clone(&objective);
+    let eval_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
+        let cfg = survival_baseline_config_from_theta(target, theta)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let (cost, gradient) = eval_objective
+            .borrow_mut()(&cfg)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        if gradient.len() != dim {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{context}: baseline gradient dimension mismatch: got {}, expected {dim}",
+                gradient.len()
+            )));
+        }
+        Ok(OuterEval {
+            cost,
+            gradient,
+            hessian: HessianResult::Unavailable,
+        })
+    };
+    let mut obj = problem.build_objective(
+        (),
+        cost_fn,
+        eval_fn,
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &ndarray::Array1<f64>,
+            ) -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
+        >,
+    );
     let result = problem
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
@@ -1906,8 +1985,7 @@ pub fn evaluate_survival_marginal_slope_baseline(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<(f64, f64), String> {
-    let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)?
-    else {
+    let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)? else {
         return Ok((0.0, 0.0));
     };
     Ok((point.q, point.q_t))
@@ -1942,8 +2020,7 @@ pub fn marginal_slope_baseline_offset_theta_partials(
             .map(|(d_h_cum, d_h_inst)| {
                 (
                     a * d_h_cum,
-                    a * (d_h_inst
-                        + point.instant_hazard * a_log_derivative_factor * d_h_cum),
+                    a * (d_h_inst + point.instant_hazard * a_log_derivative_factor * d_h_cum),
                 )
             })
             .collect(),
@@ -2319,17 +2396,17 @@ pub fn build_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        baseline_chain_rule_gradient, baseline_offset_theta_partials,
-        build_survival_marginal_slope_baseline_offsets, build_survival_timewiggle_from_baseline,
-        evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline,
-        marginal_slope_baseline_chain_rule_gradient,
+        SurvivalBaselineConfig, SurvivalBaselineTarget, baseline_chain_rule_gradient,
+        baseline_offset_theta_partials, build_survival_marginal_slope_baseline_offsets,
+        build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
+        evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
         marginal_slope_baseline_offset_theta_partials, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config, SurvivalBaselineConfig, SurvivalBaselineTarget,
+        survival_baseline_theta_from_config,
     };
     use crate::families::survival::OffsetChannelResiduals;
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
     use crate::probability::normal_cdf;
-    use ndarray::{array, Array1};
+    use ndarray::{Array1, array};
 
     #[test]
     fn survival_timewiggle_keeps_requested_order_one_penalty() {
@@ -2519,14 +2596,12 @@ mod tests {
 
         let mut expected = Array1::<f64>::zeros(3);
         for i in 0..age_exit.len() {
-            let exit_partials =
-                marginal_slope_baseline_offset_theta_partials(age_exit[i], &cfg)
-                    .expect("exit partials")
-                    .expect("nonlinear");
-            let entry_partials =
-                marginal_slope_baseline_offset_theta_partials(age_entry[i], &cfg)
-                    .expect("entry partials")
-                    .expect("nonlinear");
+            let exit_partials = marginal_slope_baseline_offset_theta_partials(age_exit[i], &cfg)
+                .expect("exit partials")
+                .expect("nonlinear");
+            let entry_partials = marginal_slope_baseline_offset_theta_partials(age_entry[i], &cfg)
+                .expect("entry partials")
+                .expect("nonlinear");
             for k in 0..3 {
                 expected[k] += residuals.exit[i] * exit_partials[k].0
                     + residuals.derivative[i] * exit_partials[k].1

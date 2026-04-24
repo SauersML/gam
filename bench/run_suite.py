@@ -3170,13 +3170,19 @@ def _requires_joint_spatial_term(cfg: dict | None) -> bool:
     return _is_joint_spatial_basis(cfg.get("smooth_basis", "ps")) and len(smooth_cols) >= 2
 
 
+def _rust_duchon_options_for_dimension(dimension: int, dp_opt: str) -> str:
+    if dimension >= 6:
+        return f", order=1, power=8, length_scale=1.0{dp_opt}"
+    return f", order=0, power=1{dp_opt}"
+
+
 def _rust_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int, dp_opt: str) -> str:
     basis = _canonical_smooth_basis(basis)
     cols = ", ".join(str(c) for c in smooth_cols)
     if basis in {"thinplate", "tps"}:
         return f"thinplate({cols}, centers={knot_count}{dp_opt})"
     if basis == "duchon":
-        return f"duchon({cols}, centers={knot_count}, order=0, power=1{dp_opt})"
+        return f"duchon({cols}, centers={knot_count}{_rust_duchon_options_for_dimension(len(smooth_cols), dp_opt)})"
     if basis == "matern":
         return f"matern({cols}, centers={knot_count}{dp_opt})"
     raise RuntimeError(f"Unsupported joint Rust spatial basis '{basis}'")
