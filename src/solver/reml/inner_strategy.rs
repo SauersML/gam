@@ -15,13 +15,12 @@ pub(super) enum HessianEvalStrategyKind {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HessianStrategyDecision {
     pub(super) strategy: HessianEvalStrategyKind,
-    pub(super) reason: &'static str,
 }
 
 impl<'a> RemlState<'a> {
     pub(super) fn selecthessian_strategy_policy(
         &self,
-        rho: &Array1<f64>,
+        _rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> HessianStrategyDecision {
         // When the sparse-exact backend produced the PIRLS result, prefer
@@ -30,12 +29,10 @@ impl<'a> RemlState<'a> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             return HessianStrategyDecision {
                 strategy: HessianEvalStrategyKind::SpectralExact,
-                reason: "sparse_exact_backend_consistency",
             };
         }
         HessianStrategyDecision {
             strategy: HessianEvalStrategyKind::SpectralExact,
-            reason: "exact_preferred",
         }
     }
 
