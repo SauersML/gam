@@ -8518,7 +8518,7 @@ struct BinomialMeanWiggleGeometry {
 }
 
 struct BinomialMeanWiggleJointPsiDirection {
-    x_eta_psi: Array2<f64>,
+    x_eta_psi: Option<Array2<f64>>,
     z_eta_psi: Array1<f64>,
 }
 
@@ -8755,7 +8755,7 @@ impl BinomialMeanWiggleFamily {
                     )?;
                     let z_eta_psi = x_eta_psi.dot(beta_eta);
                     return Ok(Some(BinomialMeanWiggleJointPsiDirection {
-                        x_eta_psi,
+                        x_eta_psi: Some(x_eta_psi),
                         z_eta_psi,
                     }));
                 }
@@ -9570,16 +9570,20 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 
         let dir_a =
             dense_dir.expect("dense psi direction should exist when implicit direction is absent");
+        let x_eta_psi = dir_a
+            .x_eta_psi
+            .as_ref()
+            .expect("dense eta psi design should exist when implicit direction is absent");
         let score_psi = binomial_pack_mean_wiggle_joint_score(
-            &(dir_a.x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
+            &(x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
             &score_w,
         );
-        let a_eta_eta = xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_eta_xa_x, &x_eta)?;
+        let a_eta_eta = xt_diag_y_dense(x_eta_psi, &coeff_eta_eta_xa_x, &x_eta)?;
         let h_eta_eta = &a_eta_eta + &a_eta_eta.t() + &xt_diag_x_dense(&x_eta, &coeff_eta_eta_xx)?;
-        let h_eta_w = xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_w_xa_b, &geom.basis)?
+        let h_eta_w = xt_diag_y_dense(x_eta_psi, &coeff_eta_w_xa_b, &geom.basis)?
             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_b, &geom.basis)?
             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d1, &geom.basis_d1)?
-            + &xt_diag_y_dense(&dir_a.x_eta_psi, &coeff_eta_w_xa_d1, &geom.basis_d1)?
+            + &xt_diag_y_dense(x_eta_psi, &coeff_eta_w_xa_d1, &geom.basis_d1)?
             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d2, &geom.basis_d2)?;
         let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
         let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();

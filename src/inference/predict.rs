@@ -1055,13 +1055,12 @@ impl BernoulliMarginalSlopePredictor {
                 a,
                 slope,
             );
-            let shift = a - partition_cell.link_span.left;
-            let d2c_da2_raw = [
-                2.0 * partition_cell.link_span.c2 + 6.0 * partition_cell.link_span.c3 * shift,
-                6.0 * partition_cell.link_span.c3 * slope,
-                0.0,
-                0.0,
-            ];
+            let (d2c_da2_raw, _, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_second_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
             let dc_da = Self::scale_coeff4(dc_da_raw, scale);
             let d2c_da2 = Self::scale_coeff4(d2c_da2_raw, scale);
             f_a += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
@@ -1110,6 +1109,15 @@ impl BernoulliMarginalSlopePredictor {
                 );
             }
         };
+        if !matches!(
+            base_link,
+            InverseLink::Standard(crate::types::LinkFunction::Probit)
+        ) {
+            return Err(
+                "bernoulli marginal-slope predictor requires link(type=probit); saved non-probit marginal-slope models must be refit"
+                    .to_string(),
+            );
+        }
         if let Some(runtime) = score_warp_runtime.as_ref() {
             runtime.validate_exact_replay_contract().map_err(|e| {
                 format!("bernoulli marginal-slope score-warp runtime is invalid: {e}")
