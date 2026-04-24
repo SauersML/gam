@@ -1263,10 +1263,10 @@ struct SurvivalJointQuantities {
 struct SurvivalJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
-    x_t_exit_psi: Array2<f64>,
-    x_t_entry_psi: Array2<f64>,
-    x_ls_exit_psi: Array2<f64>,
-    x_ls_entry_psi: Array2<f64>,
+    x_t_exit_psi: Option<Array2<f64>>,
+    x_t_entry_psi: Option<Array2<f64>>,
+    x_ls_exit_psi: Option<Array2<f64>>,
+    x_ls_entry_psi: Option<Array2<f64>>,
     z_t_exit_psi: Array1<f64>,
     z_t_entry_psi: Array1<f64>,
     z_ls_exit_psi: Array1<f64>,
@@ -1872,10 +1872,10 @@ impl SurvivalLocationScaleFamily {
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
-                    let mut x_t_exit_psi = Array2::<f64>::zeros((n, pt));
-                    let mut x_t_entry_psi = Array2::<f64>::zeros((n, pt));
-                    let mut x_ls_exit_psi = Array2::<f64>::zeros((n, pls));
-                    let mut x_ls_entry_psi = Array2::<f64>::zeros((n, pls));
+                    let mut x_t_exit_psi = None;
+                    let mut x_t_entry_psi = None;
+                    let mut x_ls_exit_psi = None;
+                    let mut x_ls_entry_psi = None;
                     let mut x_t_exit_action = None;
                     let mut x_t_entry_action = None;
                     let mut x_ls_exit_action = None;
@@ -1920,10 +1920,10 @@ impl SurvivalLocationScaleFamily {
                                     t_time_varying,
                                     "SurvivalLocationScaleFamily threshold",
                                 )?;
-                                x_t_exit_psi.assign(&exit);
-                                x_t_entry_psi.assign(&entry);
-                                z_t_exit_psi = x_t_exit_psi.dot(beta_t);
-                                z_t_entry_psi = x_t_entry_psi.dot(beta_t);
+                                z_t_exit_psi = exit.dot(beta_t);
+                                z_t_entry_psi = entry.dot(beta_t);
+                                x_t_exit_psi = Some(exit);
+                                x_t_entry_psi = Some(entry);
                             }
                         }
                         Self::BLOCK_LOG_SIGMA => {
@@ -1961,10 +1961,10 @@ impl SurvivalLocationScaleFamily {
                                     ls_time_varying,
                                     "SurvivalLocationScaleFamily log-sigma",
                                 )?;
-                                x_ls_exit_psi.assign(&exit);
-                                x_ls_entry_psi.assign(&entry);
-                                z_ls_exit_psi = x_ls_exit_psi.dot(beta_ls);
-                                z_ls_entry_psi = x_ls_entry_psi.dot(beta_ls);
+                                z_ls_exit_psi = exit.dot(beta_ls);
+                                z_ls_entry_psi = entry.dot(beta_ls);
+                                x_ls_exit_psi = Some(exit);
+                                x_ls_entry_psi = Some(entry);
                             }
                         }
                         _ => return Ok(None),
@@ -6543,49 +6543,49 @@ impl SurvivalLocationScaleFamily {
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_i_map = first_psi_linear_map(
             dir_i.x_t_exit_action.as_ref(),
-            Some(&dir_i.x_t_exit_psi),
+            dir_i.x_t_exit_psi.as_ref(),
             self.n,
             x_threshold_exit.ncols(),
         );
         let x_t_entry_i_map = first_psi_linear_map(
             dir_i.x_t_entry_action.as_ref(),
-            Some(&dir_i.x_t_entry_psi),
+            dir_i.x_t_entry_psi.as_ref(),
             self.n,
             x_threshold_entry.ncols(),
         );
         let x_ls_exit_i_map = first_psi_linear_map(
             dir_i.x_ls_exit_action.as_ref(),
-            Some(&dir_i.x_ls_exit_psi),
+            dir_i.x_ls_exit_psi.as_ref(),
             self.n,
             x_log_sigma_exit.ncols(),
         );
         let x_ls_entry_i_map = first_psi_linear_map(
             dir_i.x_ls_entry_action.as_ref(),
-            Some(&dir_i.x_ls_entry_psi),
+            dir_i.x_ls_entry_psi.as_ref(),
             self.n,
             x_log_sigma_entry.ncols(),
         );
         let x_t_exit_j_map = first_psi_linear_map(
             dir_j.x_t_exit_action.as_ref(),
-            Some(&dir_j.x_t_exit_psi),
+            dir_j.x_t_exit_psi.as_ref(),
             self.n,
             x_threshold_exit.ncols(),
         );
         let x_t_entry_j_map = first_psi_linear_map(
             dir_j.x_t_entry_action.as_ref(),
-            Some(&dir_j.x_t_entry_psi),
+            dir_j.x_t_entry_psi.as_ref(),
             self.n,
             x_threshold_entry.ncols(),
         );
         let x_ls_exit_j_map = first_psi_linear_map(
             dir_j.x_ls_exit_action.as_ref(),
-            Some(&dir_j.x_ls_exit_psi),
+            dir_j.x_ls_exit_psi.as_ref(),
             self.n,
             x_log_sigma_exit.ncols(),
         );
         let x_ls_entry_j_map = first_psi_linear_map(
             dir_j.x_ls_entry_action.as_ref(),
-            Some(&dir_j.x_ls_entry_psi),
+            dir_j.x_ls_entry_psi.as_ref(),
             self.n,
             x_log_sigma_entry.ncols(),
         );
@@ -7326,25 +7326,25 @@ impl SurvivalLocationScaleFamily {
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_map = first_psi_linear_map(
             dir.x_t_exit_action.as_ref(),
-            Some(&dir.x_t_exit_psi),
+            dir.x_t_exit_psi.as_ref(),
             self.n,
             x_threshold_exit.ncols(),
         );
         let x_t_entry_map = first_psi_linear_map(
             dir.x_t_entry_action.as_ref(),
-            Some(&dir.x_t_entry_psi),
+            dir.x_t_entry_psi.as_ref(),
             self.n,
             x_threshold_entry.ncols(),
         );
         let x_ls_exit_map = first_psi_linear_map(
             dir.x_ls_exit_action.as_ref(),
-            Some(&dir.x_ls_exit_psi),
+            dir.x_ls_exit_psi.as_ref(),
             self.n,
             x_log_sigma_exit.ncols(),
         );
         let x_ls_entry_map = first_psi_linear_map(
             dir.x_ls_entry_action.as_ref(),
-            Some(&dir.x_ls_entry_psi),
+            dir.x_ls_entry_psi.as_ref(),
             self.n,
             x_log_sigma_entry.ncols(),
         );
