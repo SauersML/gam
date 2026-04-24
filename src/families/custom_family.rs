@@ -3253,6 +3253,36 @@ impl PsiDesignMap {
     pub(crate) fn is_zero(&self) -> bool {
         matches!(self, Self::Zero { .. })
     }
+
+    /// Borrow this map as a `CustomFamilyPsiLinearMapRef`, handling every
+    /// variant. This is the zero-allocation replacement for the pattern
+    /// `first_psi_linear_map(action.as_ref(), dense.as_ref(), n, p)`.
+    pub(crate) fn as_linear_map_ref(&self) -> CustomFamilyPsiLinearMapRef<'_> {
+        match self {
+            Self::Zero { nrows, ncols } => CustomFamilyPsiLinearMapRef::Zero {
+                nrows: *nrows,
+                ncols: *ncols,
+            },
+            Self::Dense { matrix } => CustomFamilyPsiLinearMapRef::Dense(matrix.as_ref()),
+            Self::First { action } => CustomFamilyPsiLinearMapRef::First(action),
+            Self::Second { action } => CustomFamilyPsiLinearMapRef::Second(action),
+        }
+    }
+
+    /// Return a reference to the first-derivative operator action if this map
+    /// holds one. Useful for callers that need to pass ownership of the action
+    /// into downstream operator builders.
+    pub(crate) fn as_first_action(&self) -> Option<&CustomFamilyPsiDesignAction> {
+        match self {
+            Self::First { action } => Some(action),
+            _ => None,
+        }
+    }
+
+    /// Clone the first-derivative operator action if this map holds one.
+    pub(crate) fn cloned_first_action(&self) -> Option<CustomFamilyPsiDesignAction> {
+        self.as_first_action().cloned()
+    }
 }
 
 fn is_zero_array(a: &Array2<f64>) -> bool {
