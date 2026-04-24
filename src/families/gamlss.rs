@@ -99,35 +99,6 @@ impl DenseOrOperator<'_> {
         }
     }
 
-    fn transpose_mul(&self, values: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.nrows();
-        let p = self.ncols();
-        assert_eq!(values.len(), n);
-        match self {
-            Self::Borrowed(dense) => dense.t().dot(&values),
-            Self::Owned(dense) => dense.t().dot(&values),
-            Self::Operator(design) => {
-                let mut out = Array1::<f64>::zeros(p);
-                for rows in exact_design_row_chunks(n, p) {
-                    let chunk = design.row_chunk(rows.clone());
-                    out += &chunk.t().dot(&values.slice(s![rows]));
-                }
-                out
-            }
-        }
-    }
-
-    fn to_design_matrix(&self) -> DesignMatrix {
-        match self {
-            Self::Borrowed(dense) => DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Arc::new((*dense).clone()),
-            )),
-            Self::Owned(dense) => DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Arc::new(dense.clone()),
-            )),
-            Self::Operator(design) => design.clone(),
-        }
-    }
 }
 
 fn dense_block_or_operator<'a>(
@@ -4899,33 +4870,6 @@ fn gaussian_joint_hessian_from_designs(
         let chunk_hessian =
             fast_joint_hessian_2x2(&xmu_chunk, &xls_chunk, &hmumu, &hmu_ls, &h_ls_ls);
         out += &chunk_hessian;
-    }
-    Ok(out)
-}
-
-fn xt_diag_y_designs(
-    left: &DenseOrOperator<'_>,
-    weights: &Array1<f64>,
-    right: &DenseOrOperator<'_>,
-) -> Result<Array2<f64>, String> {
-    if left.nrows() != weights.len() || right.nrows() != weights.len() {
-        return Err(format!(
-            "xt_diag_y_designs row mismatch: left={}, weights={}, right={}",
-            left.nrows(),
-            weights.len(),
-            right.nrows()
-        ));
-    }
-    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
-    for rows in exact_design_row_chunks(left.nrows(), left.ncols().max(right.ncols())) {
-        let left_chunk = left.row_chunk(rows.clone());
-        let right_chunk = right.row_chunk(rows.clone());
-        let weight_chunk = weights.slice(s![rows]);
-        let mut weighted_right = right_chunk;
-        for (mut row, &wi) in weighted_right.outer_iter_mut().zip(weight_chunk.iter()) {
-            row *= wi;
-        }
-        out += &left_chunk.t().dot(&weighted_right);
     }
     Ok(out)
 }

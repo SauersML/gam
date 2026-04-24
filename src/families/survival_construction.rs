@@ -1508,6 +1508,83 @@ pub fn baseline_chain_rule_gradient(
     Ok(Some(grad))
 }
 
+/// Chain-rule θ-gradient for marginal-slope probit baseline offsets.
+///
+/// This is the probit-survival counterpart of [`baseline_chain_rule_gradient`].
+/// It contracts residuals against
+/// [`marginal_slope_baseline_offset_theta_partials`], so the offset channels
+/// are `(q_entry, q_exit, dq_exit/dt)` with `Phi(-q(t)) = exp(-H0(t))`.
+pub fn marginal_slope_baseline_chain_rule_gradient(
+    age_entry: ndarray::ArrayView1<'_, f64>,
+    age_exit: ndarray::ArrayView1<'_, f64>,
+    cfg: &SurvivalBaselineConfig,
+    residuals: &crate::families::survival::OffsetChannelResiduals,
+) -> Result<Option<Array1<f64>>, String> {
+    let n = age_exit.len();
+    if age_entry.len() != n
+        || residuals.exit.len() != n
+        || residuals.entry.len() != n
+        || residuals.derivative.len() != n
+    {
+        return Err(format!(
+            "marginal_slope_baseline_chain_rule_gradient: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={})",
+            age_entry.len(),
+            n,
+            residuals.exit.len(),
+            residuals.entry.len(),
+            residuals.derivative.len(),
+        ));
+    }
+
+    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
+    let theta_dim = match probe_age {
+        Some(t) => match marginal_slope_baseline_offset_theta_partials(t, cfg)? {
+            None => return Ok(None),
+            Some(v) => v.len(),
+        },
+        None => {
+            return Err(
+                "marginal_slope_baseline_chain_rule_gradient: no valid positive age for dim probe"
+                    .to_string(),
+            );
+        }
+    };
+
+    let mut grad = Array1::<f64>::zeros(theta_dim);
+    for i in 0..n {
+        let partials_exit = marginal_slope_baseline_offset_theta_partials(age_exit[i], cfg)?
+            .ok_or_else(|| "unexpected None from marginal-slope baseline partials at exit".to_string())?;
+        if partials_exit.len() != theta_dim {
+            return Err(format!(
+                "marginal_slope_baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
+                partials_exit.len(),
+                theta_dim
+            ));
+        }
+        let r_x = residuals.exit[i];
+        let r_d = residuals.derivative[i];
+        for k in 0..theta_dim {
+            let (d_q_dk, d_qt_dk) = partials_exit[k];
+            grad[k] += r_x * d_q_dk + r_d * d_qt_dk;
+        }
+
+        let r_e = residuals.entry[i];
+        if r_e != 0.0 {
+            let partials_entry =
+                marginal_slope_baseline_offset_theta_partials(age_entry[i], cfg)?.ok_or_else(
+                    || {
+                        "unexpected None from marginal-slope baseline partials at entry"
+                            .to_string()
+                    },
+                )?;
+            for k in 0..theta_dim {
+                grad[k] += r_e * partials_entry[k].0;
+            }
+        }
+    }
+    Ok(Some(grad))
+}
+
 /// Shared Gompertz hazard components `(H_G(t), h_G(t))`.
 /// Mirrors the private helper in `evaluate_survival_baseline` with the
 /// same 1e-10 small-shape pivot.
