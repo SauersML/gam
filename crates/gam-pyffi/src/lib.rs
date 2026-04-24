@@ -1464,12 +1464,9 @@ fn predict_table_survival(
         linear_predictor: result.linear_predictor.to_vec(),
         columns,
     };
-    let _ = _options_reference(options);
     serde_json::to_string(&survival_payload)
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
 }
-
-fn _options_reference(_options: &PyPredictOptions) -> () {}
 
 fn build_col_map(dataset: &EncodedDataset) -> HashMap<String, usize> {
     dataset

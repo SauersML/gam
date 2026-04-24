@@ -1282,7 +1282,7 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
 
-        let (root, _) = crate::families::monotone_root::solve_monotone_root(
+        let (root, _, f_best) = crate::families::monotone_root::solve_monotone_root(
             eval,
             intercept,
             "saved bernoulli intercept",
@@ -1292,13 +1292,6 @@ impl BernoulliMarginalSlopePredictor {
         )
         .map_err(EstimationError::InvalidInput)?;
 
-        let (f_best, _, _) = self.evaluate_denested_calibration(
-            root,
-            marginal_eta,
-            slope,
-            score_warp_beta,
-            link_dev_beta,
-        )?;
         let target = marginal.mu;
         let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
         if f_best.abs() > abs_tol {

@@ -213,7 +213,7 @@ pub(crate) fn bernoulli_marginal_slope_eta_from_probability(
                     .map_err(|e| format!("{context} inverse-link jet failed at eta={eta}: {e}"))?;
                 Ok((jet.mu - target, jet.d1, jet.d2))
             };
-            let (eta, _) =
+            let (eta, _, _) =
                 super::monotone_root::solve_monotone_root(eval, initial, context, 1e-12, 64, 64)?;
             Ok(eta)
         }
@@ -260,23 +260,10 @@ pub(crate) fn bernoulli_marginal_link_map(
     })
 }
 
-pub(crate) fn build_deviation_block_from_knots_and_design_seed(
-    knot_seed: &Array1<f64>,
-    design_seed: &Array1<f64>,
-    cfg: &DeviationBlockConfig,
-) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_design_seed_and_anchor_weights(
-        knot_seed,
-        design_seed,
-        None,
-        cfg,
-    )
-}
-
 pub(crate) fn build_deviation_block_from_knots_design_seed_and_anchor_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
-    anchor_weights: Option<&Array1<f64>>,
+    anchor_weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
     build_deviation_block_from_knots_and_design_seed_with_anchor(
@@ -289,9 +276,7 @@ pub(crate) fn build_deviation_block_from_knots_design_seed_and_anchor_weights(
 
 enum DeviationAnchorKind<'a> {
     StandardNormal,
-    EmpiricalDesign {
-        anchor_weights: Option<&'a Array1<f64>>,
-    },
+    EmpiricalDesign { anchor_weights: &'a Array1<f64> },
 }
 
 fn build_deviation_block_from_knots_and_design_seed_with_anchor(
@@ -1708,11 +1693,6 @@ fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
     ]
 }
 
-#[inline]
-fn cell_coeff4(cell: crate::families::cubic_cell_kernel::DenestedCubicCell) -> [f64; 4] {
-    [cell.c0, cell.c1, cell.c2, cell.c3]
-}
-
 fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     let sigma = gaussian_frailty_sd.unwrap_or(0.0);
     if sigma <= 0.0 {
@@ -2378,81 +2358,14 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        let _ = specs;
-        let Some(sigma) = self.gaussian_frailty_sd else {
-            return Ok(None);
-        };
-        let cache = self.build_exact_eval_cache(block_states)?;
-        let slices = &cache.slices;
-        let primary = &cache.primary;
-        if sigma <= 0.0 {
-            return Ok(Some(ExactNewtonJointPsiTerms {
-                objective_psi: 0.0,
-                score_psi: Array1::zeros(slices.total),
-                hessian_psi: Array2::zeros((slices.total, slices.total)),
-                hessian_psi_operator: None,
-            }));
+        let _ = (block_states, specs);
+        if self.gaussian_frailty_sd.is_some() {
+            return Err(
+                "bernoulli marginal-slope log-sigma hyperderivatives require an analytic implementation; production finite differences are disabled"
+                    .to_string(),
+            );
         }
-        let log_scale_slope =
-            -crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln())
-                .alpha;
-        let (objective_psi, score_psi, block_acc) = (0..self.y.len())
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0f64,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(slices),
-                    )
-                },
-                |mut acc, row| -> Result<_, String> {
-                    let (row_obj, row_score_primary, row_hessian_primary) = self
-                        .compute_row_sigma_primary_terms(
-                            row,
-                            block_states,
-                            primary,
-                            Self::row_ctx(&cache, row),
-                            log_scale_slope,
-                        )?;
-                    acc.0 += row_obj;
-                    acc.1 += &self.pullback_primary_vector(
-                        row,
-                        slices,
-                        primary,
-                        &row_score_primary,
-                    )?;
-                    acc.2.add_pullback(
-                        self,
-                        row,
-                        slices,
-                        primary,
-                        &row_hessian_primary,
-                    );
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0f64,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(slices),
-                    )
-                },
-                |mut left, right| -> Result<_, String> {
-                    left.0 += right.0;
-                    left.1 += &right.1;
-                    left.2.add(&right.2);
-                    Ok(left)
-                },
-            )?;
-        Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi,
-            score_psi,
-            hessian_psi: Array2::zeros((0, 0)),
-            hessian_psi_operator: Some(std::sync::Arc::new(block_acc.into_operator(slices))),
-        }))
+        Ok(None)
     }
 
     #[inline]
@@ -2828,7 +2741,7 @@ impl BernoulliMarginalSlopeFamily {
             a_rigid_pre_scale
         };
 
-        let (a, abs_deriv) = super::monotone_root::solve_monotone_root(
+        let (a, abs_deriv, f_best) = super::monotone_root::solve_monotone_root(
             eval,
             a_init,
             "bernoulli intercept",
@@ -2841,7 +2754,6 @@ impl BernoulliMarginalSlopeFamily {
         // becomes numerically flat and tight absolute precision is not
         // achievable.  Accept the best bracketed solution when the
         // relative residual is small.
-        let (f_best, _, _) = eval(a)?;
         let target = marginal.mu;
         let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
         if f_best.abs() > abs_tol {
@@ -7954,7 +7866,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             build_deviation_block_from_knots_design_seed_and_anchor_weights(
                 &link_dev_seed,
                 &q0_seed,
-                Some(&spec.weights),
+                &spec.weights,
                 cfg,
             )
         })
@@ -8378,7 +8290,7 @@ mod tests {
         let prepared = build_deviation_block_from_knots_design_seed_and_anchor_weights(
             &q,
             &q,
-            Some(&weights),
+            &weights,
             &DeviationBlockConfig {
                 num_internal_knots: 5,
                 ..DeviationBlockConfig::default()
@@ -8893,11 +8805,14 @@ mod tests {
         let constraints = prepared.runtime.structural_monotonicity_constraints();
         let dim = constraints.a.ncols();
         assert_eq!(dim, prepared.runtime.basis_dim());
-        assert_eq!(constraints.a, prepared.runtime.coefficient_transform().clone());
+        assert_eq!(
+            constraints.a.nrows(),
+            3 * prepared.runtime.breakpoints().len().saturating_sub(1)
+        );
         assert_eq!(
             constraints.b,
             Array1::<f64>::from_elem(
-                prepared.runtime.coefficient_transform().nrows(),
+                constraints.a.nrows(),
                 prepared.runtime.monotonicity_eps() - 1.0
             )
         );
@@ -8922,6 +8837,51 @@ mod tests {
                 .monotonicity_feasible(&infeasible, "infeasible structural beta")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn structural_constraints_are_quadratic_derivative_bernstein_controls() {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build deviation block");
+        let constraints = prepared.runtime.structural_monotonicity_constraints();
+        let beta = Array1::from_iter((0..prepared.runtime.basis_dim()).map(|idx| {
+            let centered = idx as f64 - 0.5 * (prepared.runtime.basis_dim() as f64 - 1.0);
+            0.025 * centered
+        }));
+        let controls = constraints.a.dot(&beta);
+        let n_spans = prepared.runtime.breakpoints().len().saturating_sub(1);
+        for span_idx in 0..n_spans {
+            let cubic = prepared
+                .runtime
+                .local_cubic_on_span(&beta, span_idx)
+                .expect("local cubic");
+            let left = cubic.left;
+            let right = cubic.right;
+            let mid = 0.5 * (left + right);
+            let b0 = controls[3 * span_idx];
+            let b1 = controls[3 * span_idx + 1];
+            let b2 = controls[3 * span_idx + 2];
+            assert!(
+                (b0 - cubic.first_derivative(left)).abs() <= 1e-10,
+                "left Bernstein control should equal derivative at span start"
+            );
+            assert!(
+                (b2 - cubic.first_derivative(right)).abs() <= 1e-10,
+                "right Bernstein control should equal derivative at span end"
+            );
+            let midpoint_from_bernstein = 0.25 * b0 + 0.5 * b1 + 0.25 * b2;
+            assert!(
+                (midpoint_from_bernstein - cubic.first_derivative(mid)).abs() <= 1e-10,
+                "quadratic Bernstein controls should reconstruct derivative at span midpoint"
+            );
+        }
     }
 
     #[test]
