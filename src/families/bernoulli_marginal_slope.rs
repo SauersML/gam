@@ -2102,30 +2102,21 @@ fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &Array1<f64>, target: &
 }
 
 /// Chunk size for parallel row accumulation. Rows within a chunk are
-/// processed sequentially. Flexible exact-Newton caches keep the per-row
-/// context plus the current primary gradient/Hessian, so repeated workspace
-/// matvec/diagonal calls do not recompute row jets at a fixed Newton state.
+/// processed sequentially. Flexible exact-Newton caches keep only the
+/// pre-solved row context; primary jets are recomputed in chunk-local work
+/// to avoid retaining O(n * p_primary^2) Hessian storage.
 const ROW_CHUNK_SIZE: usize = 1024;
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
-/// re-solve the Newton intercept equation, and flexible paths can reuse
-/// cached primary jets.
+/// re-solve the Newton intercept equation.
 #[derive(Clone)]
 struct BernoulliMarginalSlopeExactEvalCache {
     slices: BlockSlices,
     primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
     row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
-    row_primary_caches: Option<Vec<BernoulliMarginalSlopeRowPrimaryCache>>,
-}
-
-#[derive(Clone)]
-struct BernoulliMarginalSlopeRowPrimaryCache {
-    neglog: f64,
-    gradient: Array1<f64>,
-    hessian: Array2<f64>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -2813,17 +2804,6 @@ impl BernoulliMarginalSlopeFamily {
         &cache.row_contexts[row]
     }
 
-    #[inline]
-    fn row_primary_cache(
-        cache: &BernoulliMarginalSlopeExactEvalCache,
-        row: usize,
-    ) -> Option<&BernoulliMarginalSlopeRowPrimaryCache> {
-        cache
-            .row_primary_caches
-            .as_ref()
-            .map(|entries| &entries[row])
-    }
-
     fn build_exact_eval_cache_with_order(
         &self,
         block_states: &[ParameterBlockState],
@@ -2837,36 +2817,10 @@ impl BernoulliMarginalSlopeFamily {
             .map(|row| self.build_row_exact_context(row, block_states))
             .collect();
         let row_contexts = row_contexts?;
-        let row_primary_caches = if self.effective_flex_active(block_states)? {
-            let row_primary_caches: Result<Vec<_>, String> = (0..n)
-                .into_par_iter()
-                .map(|row| {
-                    let row_ctx = &row_contexts[row];
-                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-                    let neglog = self.compute_row_analytic_flex_into(
-                        row,
-                        block_states,
-                        &primary,
-                        row_ctx,
-                        true,
-                        &mut scratch,
-                    )?;
-                    Ok(BernoulliMarginalSlopeRowPrimaryCache {
-                        neglog,
-                        gradient: scratch.grad.clone(),
-                        hessian: scratch.hess.clone(),
-                    })
-                })
-                .collect();
-            Some(row_primary_caches?)
-        } else {
-            None
-        };
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
             row_contexts,
-            row_primary_caches,
         })
     }
 
@@ -5427,18 +5381,12 @@ impl BernoulliMarginalSlopeFamily {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_dir =
                             self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                        let row_hessian =
-                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
-                                row_cache.hessian.clone()
-                            } else {
-                                self.compute_row_primary_gradient_hessian(
-                                    row,
-                                    block_states,
-                                    primary,
-                                    row_ctx,
-                                )?
-                                .2
-                            };
+                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                        )?;
                         let row_action = row_hessian.dot(&row_dir);
                         chunk_out +=
                             &self.pullback_primary_vector(row, slices, primary, &row_action)?;
@@ -5520,18 +5468,12 @@ impl BernoulliMarginalSlopeFamily {
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
-                        let row_hessian =
-                            if let Some(row_cache) = Self::row_primary_cache(cache, row) {
-                                row_cache.hessian.clone()
-                            } else {
-                                self.compute_row_primary_gradient_hessian(
-                                    row,
-                                    block_states,
-                                    primary,
-                                    row_ctx,
-                                )?
-                                .2
-                            };
+                        let (_, _, row_hessian) = self.compute_row_primary_gradient_hessian(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                        )?;
 
                         {
                             let mut marginal_diag =
@@ -8300,6 +8242,18 @@ mod tests {
         (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
     }
 
+    fn build_test_link_deviation_block_from_seed(
+        seed: &Array1<f64>,
+        cfg: &DeviationBlockConfig,
+    ) -> Result<DeviationPrepared, String> {
+        build_link_deviation_block_from_knots_design_seed_and_weights(
+            seed,
+            seed,
+            &Array1::ones(seed.len()),
+            cfg,
+        )
+    }
+
     #[test]
     fn score_warp_basis_is_orthogonal_to_standard_normal_location_and_scale() {
         let seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
@@ -8380,81 +8334,35 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_marginal_slope_base_link_reparameterizes_internal_probit_target() {
-        let y = Arc::new(array![0.0, 1.0]);
-        let weights = Arc::new(array![1.0, 1.0]);
-        let z = Arc::new(array![-0.4, 0.9]);
+    fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
+        let y = array![0.0, 1.0];
+        let weights = array![1.0, 1.0];
+        let z = array![-0.4, 0.9];
         let design =
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]]));
-        let probit_family = BernoulliMarginalSlopeFamily {
-            y: Arc::clone(&y),
-            weights: Arc::clone(&weights),
-            z: Arc::clone(&z),
-            gaussian_frailty_sd: Some(0.3),
-            base_link: bernoulli_marginal_slope_probit_link(),
-            marginal_design: design.clone(),
-            logslope_design: design.clone(),
-            score_warp: None,
-            link_dev: None,
-        };
-        let logit_family = BernoulliMarginalSlopeFamily {
+        let spec = BernoulliMarginalSlopeTermSpec {
             y,
             weights,
             z,
-            gaussian_frailty_sd: Some(0.3),
             base_link: InverseLink::Standard(LinkFunction::Logit),
-            marginal_design: design.clone(),
-            logslope_design: design,
+            marginalspec: empty_termspec(),
+            logslopespec: empty_termspec(),
+            marginal_offset: Array1::zeros(2),
+            logslope_offset: Array1::zeros(2),
+            frailty: FrailtySpec::None,
             score_warp: None,
             link_dev: None,
         };
-        let q = array![0.25, -0.7];
-        let logit_eta = Array1::from_iter(q.iter().map(|&value| {
-            bernoulli_marginal_slope_eta_from_probability(
-                &InverseLink::Standard(LinkFunction::Logit),
-                normal_cdf(value),
-                "test logit inverse",
-            )
-            .expect("invert logit probability")
-        }));
-        let b = array![0.4, -0.3];
-        let block_states_probit = vec![
-            ParameterBlockState {
-                beta: array![0.0],
-                eta: q.clone(),
-            },
-            ParameterBlockState {
-                beta: array![0.0],
-                eta: b.clone(),
-            },
-        ];
-        let block_states_logit = vec![
-            ParameterBlockState {
-                beta: array![0.0],
-                eta: logit_eta,
-            },
-            ParameterBlockState {
-                beta: array![0.0],
-                eta: b,
-            },
-        ];
-        let ll_probit = probit_family
-            .log_likelihood_only(&block_states_probit)
-            .expect("probit log-likelihood");
-        let ll_logit = logit_family
-            .log_likelihood_only(&block_states_logit)
-            .expect("logit log-likelihood");
-        assert!((ll_probit - ll_logit).abs() <= 1e-12);
-
-        for row in 0..2 {
-            let ctx_probit = probit_family
-                .build_row_exact_context(row, &block_states_probit)
-                .expect("probit row context");
-            let ctx_logit = logit_family
-                .build_row_exact_context(row, &block_states_logit)
-                .expect("logit row context");
-            assert!((ctx_probit.intercept - ctx_logit.intercept).abs() <= 1e-12);
-        }
+        let err = validate_spec(design.to_dense().view(), &spec)
+            .expect_err("non-probit marginal-slope link should be rejected");
+        assert!(err.contains("requires link(type=probit)"));
+        let err = bernoulli_marginal_slope_eta_from_probability(
+            &InverseLink::Standard(LinkFunction::Logit),
+            0.5,
+            "test logit inverse",
+        )
+        .expect_err("non-probit marginal-slope inverse should be rejected");
+        assert!(err.contains("requires link(type=probit)"));
     }
 
     fn expand_integer_weight_rows(
@@ -8602,7 +8510,7 @@ mod tests {
             },
         )
         .expect("build score-warp block");
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -9240,7 +9148,7 @@ mod tests {
             },
         )
         .expect("build score warp block");
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9323,7 +9231,7 @@ mod tests {
             },
         )
         .expect("build score warp block");
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 3,
@@ -9537,7 +9445,7 @@ mod tests {
     fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_link() {
         let z = array![-0.8, 0.2, 1.1];
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10572,7 +10480,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10719,7 +10627,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -10971,7 +10879,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11053,7 +10961,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11157,7 +11065,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11280,7 +11188,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11834,7 +11742,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -11957,7 +11865,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12067,7 +11975,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12175,7 +12083,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -12517,7 +12425,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13227,7 +13135,7 @@ mod tests {
         let y = array![0.0, 1.0, 1.0];
         let weights = array![1.0, 0.7, 1.3];
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13450,7 +13358,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13591,7 +13499,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13745,7 +13653,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,
@@ -13827,7 +13735,7 @@ mod tests {
         )
         .expect("score warp block");
         let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_score_warp_deviation_block_from_seed(
+        let link_prepared = build_test_link_deviation_block_from_seed(
             &link_seed,
             &DeviationBlockConfig {
                 num_internal_knots: 4,

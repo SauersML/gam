@@ -2,7 +2,9 @@ use csv::StringRecord;
 use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, DeviationRuntime};
 use gam::estimate::{BlockRole, PredictInput};
 use gam::families::family_meta::{family_to_link, pretty_familyname};
-use gam::families::scale_design::{ScaleDeviationTransform, build_scale_deviation_transform};
+use gam::families::scale_design::{
+    ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
+};
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -167,6 +169,8 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "transformation-normal",
             "bernoulli-marginal-slope",
             "survival-marginal-slope",
+            "gaussian-location-scale",
+            "binomial-location-scale",
         ],
     )?;
     Ok(info.unbind())
@@ -351,17 +355,46 @@ fn fit_table_impl(
                 ms_result,
             )?
         }
-        FitRequest::GaussianLocationScale(_) => {
-            return Err(
-                "gaussian location-scale fitting is not yet plumbed through the Python FFI; remove the noise_formula or use the CLI"
-                    .to_string(),
-            );
+        FitRequest::GaussianLocationScale(ls_request) => {
+            let fit_result = fit_model(FitRequest::GaussianLocationScale(ls_request))?;
+            let ls_result = match fit_result {
+                FitResult::GaussianLocationScale(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the gaussian location-scale workflow to return a gaussian location-scale fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_gaussian_location_scale_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                ls_result,
+                1.0,
+            )?
         }
-        FitRequest::BinomialLocationScale(_) => {
-            return Err(
-                "binomial location-scale fitting is not yet plumbed through the Python FFI; remove the noise_formula or use the CLI"
-                    .to_string(),
-            );
+        FitRequest::BinomialLocationScale(ls_request) => {
+            let weights = ls_request.spec.weights.clone();
+            let link_kind = ls_request.spec.link_kind.clone();
+            let fit_result = fit_model(FitRequest::BinomialLocationScale(ls_request))?;
+            let ls_result = match fit_result {
+                FitResult::BinomialLocationScale(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the binomial location-scale workflow to return a binomial location-scale fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_binomial_location_scale_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                link_kind,
+                &weights,
+                ls_result,
+            )?
         }
         FitRequest::SurvivalLocationScale(_) => {
             return Err(
@@ -441,17 +474,8 @@ fn predict_table_impl(
             build_transformation_normal_predict_input(&model, &dataset)?
         }
         PredictModelClass::Survival => unreachable!("survival handled above"),
-        PredictModelClass::GaussianLocationScale => {
-            return Err(
-                "gaussian location-scale prediction is not yet plumbed through the Python FFI"
-                    .to_string(),
-            );
-        }
-        PredictModelClass::BinomialLocationScale => {
-            return Err(
-                "binomial location-scale prediction is not yet plumbed through the Python FFI"
-                    .to_string(),
-            );
+        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
+            build_location_scale_predict_input(&model, &dataset)?
         }
     };
     let predictor = model
@@ -675,10 +699,10 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
             (pretty_familyname(standard_request.family), "standard", true)
         }
         FitRequest::GaussianLocationScale(_) => {
-            ("Gaussian location-scale", "gaussian location-scale", false)
+            ("Gaussian location-scale", "gaussian location-scale", true)
         }
         FitRequest::BinomialLocationScale(_) => {
-            ("Binomial location-scale", "binomial location-scale", false)
+            ("Binomial location-scale", "binomial location-scale", true)
         }
         FitRequest::SurvivalLocationScale(_) => {
             ("Survival location-scale", "survival location-scale", false)
@@ -1064,6 +1088,161 @@ fn build_survival_marginal_slope_ffi_payload(
     Ok(payload)
 }
 
+fn build_gaussian_location_scale_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    ls_result: GaussianLocationScaleFitResult,
+    response_scale: f64,
+) -> Result<FittedModelPayload, String> {
+    let frozen_meanspec = freeze_term_collection_from_design(
+        &ls_result.fit.meanspec_resolved,
+        &ls_result.fit.mean_design,
+    )
+    .map_err(|err| format!("failed to freeze gaussian location-scale mean spec: {err}"))?;
+    let frozen_noisespec = freeze_term_collection_from_design(
+        &ls_result.fit.noisespec_resolved,
+        &ls_result.fit.noise_design,
+    )
+    .map_err(|err| format!("failed to freeze gaussian location-scale noise spec: {err}"))?;
+
+    let noise_formula = fit_config
+        .noise_formula
+        .clone()
+        .ok_or_else(|| "gaussian location-scale requires noise_formula".to_string())?;
+
+    let fit = ls_result.fit.fit;
+    let scale_beta = fit
+        .block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.to_vec());
+    let wiggle_meta = match (
+        ls_result.wiggle_knots,
+        ls_result.wiggle_degree,
+        ls_result.beta_link_wiggle,
+    ) {
+        (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
+        _ => None,
+    };
+
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::LocationScale,
+        FittedFamily::LocationScale {
+            likelihood: LikelihoodFamily::GaussianIdentity,
+            base_link: None,
+        },
+        "gaussian-location-scale".to_string(),
+    );
+    payload.unified = Some(fit.clone());
+    payload.fit_result = Some(fit);
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.link = Some("identity".to_string());
+    payload.formula_noise = Some(noise_formula);
+    payload.beta_noise = scale_beta;
+    payload.gaussian_response_scale = Some(response_scale);
+    payload.training_headers = Some(dataset.headers.clone());
+    payload.resolved_termspec = Some(frozen_meanspec);
+    payload.resolved_termspec_noise = Some(frozen_noisespec);
+    payload.offset_column = fit_config.offset_column.clone();
+    payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
+        payload.linkwiggle_knots = Some(knots.to_vec());
+        payload.linkwiggle_degree = Some(degree);
+        payload.beta_link_wiggle = Some(beta_link_wiggle);
+    }
+    Ok(payload)
+}
+
+fn build_binomial_location_scale_ffi_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    link_kind: InverseLink,
+    weights: &Array1<f64>,
+    ls_result: BinomialLocationScaleFitResult,
+) -> Result<FittedModelPayload, String> {
+    let frozen_meanspec = freeze_term_collection_from_design(
+        &ls_result.fit.meanspec_resolved,
+        &ls_result.fit.mean_design,
+    )
+    .map_err(|err| format!("failed to freeze binomial location-scale threshold spec: {err}"))?;
+    let frozen_noisespec = freeze_term_collection_from_design(
+        &ls_result.fit.noisespec_resolved,
+        &ls_result.fit.noise_design,
+    )
+    .map_err(|err| format!("failed to freeze binomial location-scale noise spec: {err}"))?;
+
+    let noise_formula = fit_config
+        .noise_formula
+        .clone()
+        .ok_or_else(|| "binomial location-scale requires noise_formula".to_string())?;
+
+    let dense_mean = ls_result.fit.mean_design.design.to_dense();
+    let dense_noise = ls_result.fit.noise_design.design.to_dense();
+    let non_intercept_start = ls_result
+        .fit
+        .noise_design
+        .intercept_range
+        .end
+        .min(ls_result.fit.noise_design.design.ncols());
+    let binomial_noise_transform =
+        build_scale_deviation_transform(&dense_mean, &dense_noise, weights, non_intercept_start)
+            .map_err(|err| format!("failed to encode binomial noise transform: {err}"))?;
+
+    let fit = ls_result.fit.fit;
+    let scale_beta = fit
+        .block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.to_vec());
+    let wiggle_meta = match (
+        ls_result.wiggle_knots,
+        ls_result.wiggle_degree,
+        ls_result.beta_link_wiggle,
+    ) {
+        (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
+        _ => None,
+    };
+
+    let mut payload = FittedModelPayload::new(
+        MODEL_VERSION,
+        formula,
+        ModelKind::LocationScale,
+        FittedFamily::LocationScale {
+            likelihood: inverse_link_to_binomial_family(&link_kind),
+            base_link: Some(link_kind.clone()),
+        },
+        "binomial-location-scale".to_string(),
+    );
+    payload.unified = Some(fit.clone());
+    payload.fit_result = Some(fit);
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.link = Some(inverse_link_to_saved_string(&link_kind));
+    payload.formula_noise = Some(noise_formula);
+    payload.beta_noise = scale_beta;
+    payload.noise_projection = Some(
+        binomial_noise_transform
+            .projection_coef
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+    );
+    payload.noise_center = Some(binomial_noise_transform.weighted_column_mean.to_vec());
+    payload.noise_scale = Some(binomial_noise_transform.rescale.to_vec());
+    payload.noise_non_intercept_start = Some(binomial_noise_transform.non_intercept_start);
+    payload.training_headers = Some(dataset.headers.clone());
+    payload.resolved_termspec = Some(frozen_meanspec);
+    payload.resolved_termspec_noise = Some(frozen_noisespec);
+    payload.offset_column = fit_config.offset_column.clone();
+    payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
+        payload.linkwiggle_knots = Some(knots.to_vec());
+        payload.linkwiggle_degree = Some(degree);
+        payload.beta_link_wiggle = Some(beta_link_wiggle);
+    }
+    Ok(payload)
+}
+
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
     SavedAnchoredDeviationRuntime {
         kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
@@ -1235,6 +1414,99 @@ fn build_bernoulli_marginal_slope_predict_input(
         offset_noise: Some(offset_noise),
         auxiliary_scalar: Some(z),
     })
+}
+
+fn build_location_scale_predict_input(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<PredictInput, String> {
+    let payload = model.payload();
+    let col_map = build_col_map(dataset);
+    let training_headers = payload.training_headers.as_ref();
+    let spec = resolve_termspec_for_prediction(
+        &payload.resolved_termspec,
+        training_headers,
+        &col_map,
+        "resolved_termspec",
+    )?;
+    let design = build_term_collection_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("failed to build location-scale prediction design: {err}"))?;
+    let spec_noise = resolve_termspec_for_prediction(
+        &payload.resolved_termspec_noise,
+        training_headers,
+        &col_map,
+        "resolved_termspec_noise",
+    )?;
+    let design_noise_raw = build_term_collection_design(dataset.values.view(), &spec_noise)
+        .map_err(|err| format!("failed to build location-scale noise prediction design: {err}"))?;
+
+    let noise_transform = scale_transform_from_payload(
+        &payload.noise_projection,
+        &payload.noise_center,
+        &payload.noise_scale,
+        payload.noise_non_intercept_start,
+    )?;
+    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+        let pred_d_dense = design.design.as_dense_cow();
+        let pred_dn_dense = design_noise_raw.design.as_dense_cow();
+        apply_scale_deviation_transform(&pred_d_dense, &pred_dn_dense, transform)
+            .map_err(|err| format!("failed to apply scale deviation transform: {err}"))?
+    } else {
+        design_noise_raw.design.to_dense()
+    };
+
+    let offset = resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(dataset, &col_map, payload.noise_offset_column.as_deref())?;
+
+    Ok(PredictInput {
+        design: design.design.clone(),
+        offset,
+        design_noise: Some(DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
+            prepared_noise_design,
+        ))),
+        offset_noise: Some(offset_noise),
+        auxiliary_scalar: None,
+    })
+}
+
+fn scale_transform_from_payload(
+    projection: &Option<Vec<Vec<f64>>>,
+    center: &Option<Vec<f64>>,
+    scale: &Option<Vec<f64>>,
+    non_intercept_start: Option<usize>,
+) -> Result<Option<ScaleDeviationTransform>, String> {
+    let (Some(projection), Some(center), Some(scale), Some(non_intercept_start)) = (
+        projection.as_ref(),
+        center.as_ref(),
+        scale.as_ref(),
+        non_intercept_start,
+    ) else {
+        return Ok(None);
+    };
+    let rows = projection.len();
+    let cols = center.len();
+    if cols != scale.len() {
+        return Err("saved scale transform center/scale length mismatch".to_string());
+    }
+    if rows == 0 && cols > 0 {
+        return Err("saved scale transform projection has zero rows".to_string());
+    }
+    let mut mat = ndarray::Array2::<f64>::zeros((rows, cols));
+    for (i, row) in projection.iter().enumerate() {
+        if row.len() != cols {
+            return Err("saved scale transform projection width mismatch".to_string());
+        }
+        for (j, &value) in row.iter().enumerate() {
+            mat[[i, j]] = value;
+        }
+    }
+    Ok(Some(ScaleDeviationTransform {
+        projection_coef: mat,
+        weighted_column_mean: Array1::from_vec(center.clone()),
+        rescale: Array1::from_vec(scale.clone()),
+        non_intercept_start,
+    }))
 }
 
 fn build_transformation_normal_predict_input(

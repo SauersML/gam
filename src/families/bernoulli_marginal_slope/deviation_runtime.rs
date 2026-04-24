@@ -440,14 +440,7 @@ impl DeviationRuntime {
                 }
                 continue;
             }
-            let mut span_idx = self.span_index_for(value)?;
-            // Bias to the LEFT-hand span at internal breakpoints so the
-            // design / derivative outputs match local_cubic_on_span(k)
-            // evaluated at its right endpoint. The cubic basis is C², but the
-            // third derivative is span-local.
-            if span_idx > 0 && value == self.endpoint_points[span_idx] {
-                span_idx -= 1;
-            }
+            let span_idx = self.left_biased_span_index_for(value)?;
             let left = self.endpoint_points[span_idx];
             let t = value - left;
             for basis_idx in 0..self.basis_dim {
@@ -585,6 +578,17 @@ impl DeviationRuntime {
         )
     }
 
+    fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
+        let mut span_idx = self.span_index_for(value)?;
+        // Bias to the LEFT-hand span at internal breakpoints. The cubic basis
+        // is C², so value, first derivative, and second derivative are
+        // unchanged; only the span-local third derivative needs a convention.
+        if span_idx > 0 && value == self.endpoint_points[span_idx] {
+            span_idx -= 1;
+        }
+        Ok(span_idx)
+    }
+
     fn span_derivative_polynomial_coefficients(
         &self,
         span_idx: usize,
@@ -662,8 +666,8 @@ impl DeviationRuntime {
 
     /// Return the correct per-basis `LocalSpanCubic` for any evaluation
     /// point. Strictly outside the knot support, returns a constant cubic
-    /// (c1=c2=c3=0) at the saturated tail value. Exact support endpoints
-    /// still use the adjacent interior span cubic.
+    /// (c1=c2=c3=0) at the saturated tail value. Interior breakpoints use the
+    /// left span so span-local third derivatives match derivative designs.
     pub fn basis_cubic_at(
         &self,
         basis_idx: usize,
@@ -696,14 +700,14 @@ impl DeviationRuntime {
                 c3: 0.0,
             });
         }
-        let span_idx = self.span_index_for(value)?;
+        let span_idx = self.left_biased_span_index_for(value)?;
         self.basis_span_cubic(span_idx, basis_idx)
     }
 
     /// Return the correct composite `LocalSpanCubic` for any evaluation
     /// point. Strictly outside the knot support, returns a constant cubic
-    /// (c1=c2=c3=0) at the saturated tail value. Exact support endpoints
-    /// still use the adjacent interior span cubic.
+    /// (c1=c2=c3=0) at the saturated tail value. Interior breakpoints use the
+    /// left span so span-local third derivatives match derivative designs.
     pub(crate) fn local_cubic_at(
         &self,
         beta: &Array1<f64>,
@@ -731,7 +735,7 @@ impl DeviationRuntime {
                 c3: 0.0,
             });
         }
-        let span_idx = self.span_index_for(value)?;
+        let span_idx = self.left_biased_span_index_for(value)?;
         self.local_cubic_on_span(beta, span_idx)
     }
 
