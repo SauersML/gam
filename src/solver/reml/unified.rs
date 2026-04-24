@@ -1386,7 +1386,15 @@ impl HyperOperator for BlockLocalDrift {
     fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
         let v_block = v.slice(ndarray::s![self.start..self.end]);
         let u_block = u.slice(ndarray::s![self.start..self.end]);
-        u_block.dot(&self.local.dot(&v_block))
+        let mut total = 0.0;
+        for row in 0..self.local.nrows() {
+            let mut row_dot = 0.0;
+            for col in 0..self.local.ncols() {
+                row_dot += self.local[[row, col]] * v_block[col];
+            }
+            total += u_block[row] * row_dot;
+        }
+        total
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -1469,11 +1477,11 @@ impl HyperCoordDrift {
         self.operator.is_some()
     }
 
-    /// Returns true when the drift can be applied without materializing a full
-    /// p×p dense matrix. This is the case when there is no full-dense component,
-    /// even if a block-local component is present (block-local matvec is O(p_block²)).
+    /// Returns true when some part of the drift can stay operator-backed.
+    /// A dense correction may still be present; callers should compose it with
+    /// the operator pieces instead of materializing those pieces into dense form.
     pub fn uses_operator_fast_path(&self) -> bool {
-        self.dense.is_none() && (self.operator.is_some() || self.block_local.is_some())
+        self.operator.is_some() || self.block_local.is_some()
     }
 
     pub fn operator_ref(&self) -> Option<&dyn HyperOperator> {
@@ -1578,6 +1586,46 @@ impl HyperOperator for ImplicitHyperOperator {
         let term3 = self.s_psi.dot(v); // (p,)
 
         term1 + term2 + term3
+    }
+
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+        self.bilinear_view(v.view(), u.view())
+    }
+
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        debug_assert_eq!(v.len(), self.p);
+        debug_assert_eq!(u.len(), self.p);
+
+        let v_owned = v.to_owned();
+        let u_owned = u.to_owned();
+        let x_v = self.x_design.matrixvectormultiply(&v_owned);
+        let x_u = self.x_design.matrixvectormultiply(&u_owned);
+        let dx_v = self
+            .implicit_deriv
+            .forward_mul(self.axis, &v)
+            .expect("radial scalar evaluation failed during implicit hyper forward_mul");
+        let dx_u = self
+            .implicit_deriv
+            .forward_mul(self.axis, &u)
+            .expect("radial scalar evaluation failed during implicit hyper forward_mul");
+
+        let w = &*self.w_diag;
+        let mut design = 0.0;
+        for i in 0..w.len() {
+            design += dx_v[i] * w[i] * x_u[i];
+            design += dx_u[i] * w[i] * x_v[i];
+        }
+
+        let mut penalty = 0.0;
+        for row in 0..self.p {
+            let mut row_dot = 0.0;
+            for col in 0..self.p {
+                row_dot += self.s_psi[[row, col]] * v[col];
+            }
+            penalty += u[row] * row_dot;
+        }
+
+        design + penalty
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -2966,20 +3014,20 @@ fn hyper_coord_drift_operator_arc(
     drift: &HyperCoordDrift,
     dim_hint: usize,
 ) -> Option<Arc<dyn HyperOperator>> {
-    if drift.dense.is_some() {
+    let mut operators = hyper_coord_drift_operators(drift);
+    if operators.is_empty() {
         return None;
     }
 
-    let mut operators = hyper_coord_drift_operators(drift);
-    match operators.len() {
-        0 => None,
-        1 => Some(operators.pop().expect("single operator drift")),
-        _ => Some(Arc::new(CompositeHyperOperator {
-            dense: None,
-            operators,
-            dim_hint,
-        })),
+    if drift.dense.is_none() && operators.len() == 1 {
+        return Some(operators.pop().expect("single operator drift"));
     }
+
+    Some(Arc::new(CompositeHyperOperator {
+        dense: drift.dense.clone(),
+        operators,
+        dim_hint,
+    }))
 }
 
 fn drift_parts_into_result(
@@ -7091,7 +7139,15 @@ impl HessianOperator for SparseCholeskyOperator {
             }
             return scale * trace;
         }
-        HessianOperator::trace_hinv_block_local(self, block, scale, start, end)
+        let p = self.dim();
+        let bs = end - start;
+        let mut full = Array2::<f64>::zeros((p, p));
+        for i in 0..bs {
+            for j in 0..bs {
+                full[[start + i, start + j]] = scale * block[[i, j]];
+            }
+        }
+        self.trace_hinv_product(&full)
     }
 
     fn trace_hinv_block_local_cross(
@@ -7106,7 +7162,15 @@ impl HessianOperator for SparseCholeskyOperator {
             let za = z.dot(block);
             return scale * scale * trace_matrix_product(&za, &za);
         }
-        HessianOperator::trace_hinv_block_local_cross(self, block, scale, start, end)
+        let p = self.dim();
+        let bs = end - start;
+        let mut full = Array2::<f64>::zeros((p, p));
+        for i in 0..bs {
+            for j in 0..bs {
+                full[[start + i, start + j]] = scale * block[[i, j]];
+            }
+        }
+        self.trace_hinv_product_cross(&full, &full)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
@@ -7475,10 +7539,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let estimator = StochasticTraceEstimator::with_defaults();
         if std::ptr::eq(a, b) {
-            let no_ops: [&dyn HyperOperator; 0] = [];
-            let mats = [a];
-            return estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops)
-                [[0, 0]];
+            return estimator.estimate_second_order_single_dense(self, a);
         }
         let no_ops: [&dyn HyperOperator; 0] = [];
         let mats = [a, b];
@@ -7505,9 +7566,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
         let estimator = StochasticTraceEstimator::with_defaults();
         let no_dense: [&Array2<f64>; 0] = [];
         if std::ptr::addr_eq(left, right) {
-            let cross =
-                estimator.estimate_second_order_traces_with_operators(self, &no_dense, &[left]);
-            return cross[[0, 0]];
+            return estimator.estimate_second_order_single_operator(self, left);
         }
         let cross =
             estimator.estimate_second_order_traces_with_operators(self, &no_dense, &[left, right]);
@@ -7542,9 +7601,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
         let estimator = StochasticTraceEstimator::with_defaults();
         let no_ops: [&dyn HyperOperator; 0] = [];
         if std::ptr::eq(h_i, h_j) {
-            let mats = [h_i];
-            let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
-            return -cross[[0, 0]];
+            return -estimator.estimate_second_order_single_dense(self, h_i);
         }
         let mats = [h_i, h_j];
         let cross = estimator.estimate_second_order_traces_with_operators(self, &mats, &no_ops);
@@ -8069,6 +8126,15 @@ impl StochasticTraceEstimator {
             return Array2::zeros((total, total));
         }
 
+        if total == 1 {
+            let value = if n_dense == 1 {
+                self.estimate_second_order_single_dense(hop, dense_matrices[0])
+            } else {
+                self.estimate_second_order_single_implicit(hop, implicit_ops[0])
+            };
+            return Array2::from_elem((1, 1), value);
+        }
+
         let mut t_sum = Array2::zeros((total, total));
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
 
@@ -8078,6 +8144,14 @@ impl StochasticTraceEstimator {
         } else {
             None
         };
+
+        let mut q_columns = Array2::zeros((p, total));
+        let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
+        let n_obs = implicit_ops.first().map(|op| op.w_diag.len()).unwrap_or(0);
+        let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
+        let mut implicit_dx_u: Vec<Array1<f64>> =
+            (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+        let mut implicit_u_s: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(p)).collect();
 
         // NOTE: uses a fixed probe count (no adaptive stopping) because
         // monitoring convergence of a D x D matrix of estimates is more
@@ -8099,7 +8173,6 @@ impl StochasticTraceEstimator {
             // Step 2: Form q_e = A_e z for all axes e.
             // For dense: q_e = dense_matrix * z
             // For implicit: q_e = op.matvec_with_shared_xz(&x_vec, &z)
-            let mut q_columns = Array2::zeros((p, total));
             for e in 0..n_dense {
                 let q_e = dense_matrices[e].dot(&z);
                 q_columns.column_mut(e).assign(&q_e);
@@ -8125,33 +8198,30 @@ impl StochasticTraceEstimator {
             };
 
             // For dense operators, precompute A_d u once.
-            let mut dense_a_u: Vec<Array1<f64>> = Vec::with_capacity(n_dense);
             for d in 0..n_dense {
-                dense_a_u.push(dense_matrices[d].dot(&u));
+                dense_a_u[d].assign(&dense_matrices[d].dot(&u));
             }
 
             // Precompute X r_e for all axes e (for implicit operators).
-            let x_r: Vec<Array1<f64>> = if let Some(ref x) = x_design {
-                (0..total)
-                    .map(|e| x.matrixvectormultiply(&r.column(e).to_owned()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            if let Some(ref x) = x_design {
+                for (e, x_r_e) in x_r.iter_mut().enumerate() {
+                    x_r_e.assign(&x.matrixvectormultiply(&r.column(e).to_owned()));
+                }
+            }
 
             // Precompute (∂X/∂ψ_d) u for each implicit axis (reused across all e).
-            let implicit_dx_u: Vec<Array1<f64>> = implicit_ops
-                .iter()
-                .map(|op| {
-                    op.implicit_deriv.forward_mul(op.axis, &u.view()).expect(
+            for (idx, op) in implicit_ops.iter().enumerate() {
+                implicit_dx_u[idx].assign(
+                    &op.implicit_deriv.forward_mul(op.axis, &u.view()).expect(
                         "radial scalar evaluation failed during implicit derivative forward_mul",
-                    )
-                })
-                .collect();
+                    ),
+                );
+            }
 
             // Precompute u^T S_psi for each implicit axis (for penalty dot products).
-            let implicit_u_s: Vec<Array1<f64>> =
-                implicit_ops.iter().map(|op| op.s_psi.t().dot(&u)).collect();
+            for (idx, op) in implicit_ops.iter().enumerate() {
+                implicit_u_s[idx].assign(&op.s_psi.t().dot(&u));
+            }
 
             for d in 0..total {
                 for e in d..total {
@@ -8249,14 +8319,25 @@ impl StochasticTraceEstimator {
             return Array2::zeros((total, total));
         }
 
+        if total == 1 {
+            let value = if n_dense == 1 {
+                self.estimate_second_order_single_dense(hop, dense_matrices[0])
+            } else {
+                self.estimate_second_order_single_operator(hop, operators[0])
+            };
+            return Array2::from_elem((1, 1), value);
+        }
+
         let mut t_sum = Array2::zeros((total, total));
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+
+        let mut q_columns = Array2::zeros((p, total));
+        let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
 
         for _ in 0..self.config.n_probes_max {
             let z = rademacher_probe(p, &mut rng_state);
             let u = hop.solve(&z);
 
-            let mut q_columns = Array2::zeros((p, total));
             for e in 0..n_dense {
                 let q_e = dense_matrices[e].dot(&z);
                 q_columns.column_mut(e).assign(&q_e);
@@ -8269,9 +8350,8 @@ impl StochasticTraceEstimator {
 
             let r = hop.solve_multi(&q_columns);
 
-            let mut dense_a_u: Vec<Array1<f64>> = Vec::with_capacity(n_dense);
             for d in 0..n_dense {
-                dense_a_u.push(dense_matrices[d].dot(&u));
+                dense_a_u[d].assign(&dense_matrices[d].dot(&u));
             }
 
             for d in 0..total {
@@ -8299,6 +8379,100 @@ impl StochasticTraceEstimator {
         let n_probes = self.config.n_probes_max as f64;
         t_sum /= n_probes;
         (&t_sum + &t_sum.t()) / 2.0
+    }
+
+    fn estimate_second_order_single_dense(
+        &self,
+        hop: &dyn HessianOperator,
+        matrix: &Array2<f64>,
+    ) -> f64 {
+        let p = hop.dim();
+        if p == 0 {
+            return 0.0;
+        }
+
+        let mut total = 0.0;
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        for _ in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+            let u = hop.solve(&z);
+            let q = matrix.dot(&z);
+            let r = hop.solve(&q);
+            total += matrix.dot(&u).dot(&r);
+        }
+        total / self.config.n_probes_max as f64
+    }
+
+    fn estimate_second_order_single_implicit(
+        &self,
+        hop: &dyn HessianOperator,
+        op: &ImplicitHyperOperator,
+    ) -> f64 {
+        let p = hop.dim();
+        if p == 0 {
+            return 0.0;
+        }
+
+        let mut total = 0.0;
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        for _ in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+            let u = hop.solve(&z);
+            let x_z = op.x_design.matrixvectormultiply(&z);
+            let q = op.matvec_with_shared_xz(&x_z, &z);
+            let r = hop.solve(&q);
+
+            let x_u = op.x_design.matrixvectormultiply(&u);
+            let x_r = op.x_design.matrixvectormultiply(&r);
+            let dx_u = op
+                .implicit_deriv
+                .forward_mul(op.axis, &u.view())
+                .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+            let dx_r = op
+                .implicit_deriv
+                .forward_mul(op.axis, &r.view())
+                .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+
+            let w = &*op.w_diag;
+            let mut value = 0.0;
+            for i in 0..w.len() {
+                let wi = w[i];
+                value += dx_u[i] * wi * x_r[i];
+                value += x_u[i] * wi * dx_r[i];
+            }
+            for row in 0..op.p {
+                let mut row_dot = 0.0;
+                for col in 0..op.p {
+                    row_dot += op.s_psi[[row, col]] * r[col];
+                }
+                value += u[row] * row_dot;
+            }
+
+            total += value;
+        }
+        total / self.config.n_probes_max as f64
+    }
+
+    fn estimate_second_order_single_operator(
+        &self,
+        hop: &dyn HessianOperator,
+        op: &dyn HyperOperator,
+    ) -> f64 {
+        let p = hop.dim();
+        if p == 0 {
+            return 0.0;
+        }
+
+        let mut total = 0.0;
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        for _ in 0..self.config.n_probes_max {
+            let z = rademacher_probe(p, &mut rng_state);
+            let u = hop.solve(&z);
+            let q = op.mul_vec(&z);
+            let r = hop.solve(&q);
+            total += op.bilinear_view(r.view(), u.view());
+        }
+        total / self.config.n_probes_max as f64
     }
 
     /// Check the adaptive stopping criterion.
@@ -9358,6 +9532,88 @@ mod tests {
                     max_relative = 1e-10
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sparse_block_local_trace_without_takahashi_matches_dense_reference() {
+        let h = array![
+            [5.0, 0.2, 0.0, 0.1],
+            [0.2, 4.0, 0.3, 0.0],
+            [0.0, 0.3, 3.0, 0.4],
+            [0.1, 0.0, 0.4, 2.5],
+        ];
+        let h_sparse =
+            crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
+        let factor = std::sync::Arc::new(
+            crate::linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
+        );
+        let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows());
+        let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let block = array![[0.8, 0.15], [0.15, 0.45]];
+        let scale = 1.7;
+        let start = 1;
+        let end = 3;
+        let mut full = Array2::<f64>::zeros(h.raw_dim());
+        for i in 0..block.nrows() {
+            for j in 0..block.ncols() {
+                full[[start + i, start + j]] = scale * block[[i, j]];
+            }
+        }
+
+        assert_relative_eq!(
+            sparse.trace_hinv_block_local(&block, scale, start, end),
+            dense.trace_hinv_product(&full),
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+        assert_relative_eq!(
+            sparse.trace_hinv_block_local_cross(&block, scale, start, end),
+            dense.trace_hinv_product_cross(&full, &full),
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+    }
+
+    #[test]
+    fn hyper_operator_bilinear_view_matches_owned_bilinear() {
+        let dense = DenseMatrixHyperOperator {
+            matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
+        };
+        let block = BlockLocalDrift {
+            local: array![[1.2, 0.2], [0.2, 0.7]],
+            start: 1,
+            end: 3,
+        };
+        let composite = CompositeHyperOperator {
+            dense: Some(array![[0.4, 0.1, 0.0], [0.1, 0.8, -0.2], [0.0, -0.2, 0.6],]),
+            operators: vec![Arc::new(block.clone())],
+            dim_hint: 3,
+        };
+        let weighted = WeightedHyperOperator {
+            terms: vec![
+                (1.7, Arc::new(dense.clone()) as Arc<dyn HyperOperator>),
+                (-0.4, Arc::new(block.clone()) as Arc<dyn HyperOperator>),
+            ],
+            dim_hint: 3,
+        };
+
+        let v_storage = array![9.0, 0.5, -1.2, 0.7, 8.0];
+        let u_storage = array![7.0, -0.3, 1.1, 0.9, 6.0];
+        let v_view = v_storage.slice(ndarray::s![1..4]);
+        let u_view = u_storage.slice(ndarray::s![1..4]);
+        let v_owned = v_view.to_owned();
+        let u_owned = u_view.to_owned();
+
+        let operators: [&dyn HyperOperator; 4] = [&dense, &block, &composite, &weighted];
+        for op in operators {
+            assert_relative_eq!(
+                op.bilinear_view(v_view, u_view),
+                op.bilinear(&v_owned, &u_owned),
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
         }
     }
 
