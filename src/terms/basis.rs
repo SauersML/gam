@@ -8025,6 +8025,13 @@ fn validate_duchon_kernel_orders(
             "Duchon basis requires at least one covariate dimension".to_string(),
         ));
     }
+    if let Some(scale) = length_scale
+        && (!scale.is_finite() || scale <= 0.0)
+    {
+        return Err(BasisError::InvalidInput(
+            "Duchon hybrid length_scale must be finite and positive".to_string(),
+        ));
+    }
     if length_scale.is_none() && 2 * s_order >= k_dim {
         return Err(BasisError::InvalidInput(format!(
             "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
@@ -9772,12 +9779,32 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let mut d2_raw_psi_psi = Array2::<f64>::zeros((p, z_kernel.ncols()));
 
     let aniso = spec.aniso_log_scales.as_deref();
+    if let Some(eta) = aniso
+        && eta.len() != d
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Duchon anisotropy dimension mismatch: got {}, expected {d}",
+            eta.len()
+        )));
+    }
+    let metric_weights: Option<Vec<f64>> = aniso.map(|eta| {
+        eta.iter()
+            .map(|&psi| (2.0 * psi.clamp(-50.0, 50.0)).exp())
+            .collect()
+    });
+    let sum_metric_weights = metric_weights
+        .as_ref()
+        .map(|weights| weights.iter().sum::<f64>())
+        .unwrap_or(d as f64);
     for k in 0..p {
         for j in k..p {
+            let mut s_vec = Vec::new();
             let r = if let Some(eta) = aniso {
                 let row_k: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
                 let row_j: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
-                aniso_distance(&row_k, &row_j, eta)
+                let (r, components) = aniso_distance_and_components(&row_k, &row_j, eta);
+                s_vec = components;
+                r
             } else {
                 stable_euclidean_norm((0..d).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
             };
@@ -9800,23 +9827,39 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 let q = jets.q;
                 let (q_psi, q_psi_psi) =
                     duchon_q_psi_triplet_from_jets(&jets, p_order, s_order, d, r);
-                let lap = jets.lap;
-                let (lap_psi, lap_psi_psi) =
-                    duchon_laplacian_psi_triplet_from_jets(&jets, p_order, s_order, d, r);
+                let (lap, lap_psi, lap_psi_psi) = if let Some(weights) = metric_weights.as_ref() {
+                    let sum_wb_sb: f64 = (0..d).map(|axis| weights[axis] * s_vec[axis]).sum();
+                    let t_exponent = duchon_scaling_exponent(p_order, s_order, d) + 4.0;
+                    let (t_psi, t_psi_psi) =
+                        scaled_log_kappa_derivatives(jets.t, jets.t_r, jets.t_rr, t_exponent, r);
+                    (
+                        q * sum_metric_weights + jets.t * sum_wb_sb,
+                        q_psi * sum_metric_weights + t_psi * sum_wb_sb,
+                        q_psi_psi * sum_metric_weights + t_psi_psi * sum_wb_sb,
+                    )
+                } else {
+                    let (lap_psi, lap_psi_psi) =
+                        duchon_laplacian_psi_triplet_from_jets(&jets, p_order, s_order, d, r);
+                    (jets.lap, lap_psi, lap_psi_psi)
+                };
                 for axis in 0..d {
                     let delta = centers[[k, axis]] - centers[[j, axis]];
+                    let axis_scale = metric_weights
+                        .as_ref()
+                        .map(|weights| weights[axis])
+                        .unwrap_or(1.0);
                     let row = k * d + axis;
                     for col in 0..z_kernel.ncols() {
                         let z_jc = z_kernel[[j, col]];
-                        d1_raw[[row, col]] += q * delta * z_jc;
-                        d1_raw_psi[[row, col]] += q_psi * delta * z_jc;
-                        d1_raw_psi_psi[[row, col]] += q_psi_psi * delta * z_jc;
+                        d1_raw[[row, col]] += q * axis_scale * delta * z_jc;
+                        d1_raw_psi[[row, col]] += q_psi * axis_scale * delta * z_jc;
+                        d1_raw_psi_psi[[row, col]] += q_psi_psi * axis_scale * delta * z_jc;
                         if j != k {
                             let row_sym = j * d + axis;
                             let z_kc = z_kernel[[k, col]];
-                            d1_raw[[row_sym, col]] -= q * delta * z_kc;
-                            d1_raw_psi[[row_sym, col]] -= q_psi * delta * z_kc;
-                            d1_raw_psi_psi[[row_sym, col]] -= q_psi_psi * delta * z_kc;
+                            d1_raw[[row_sym, col]] -= q * axis_scale * delta * z_kc;
+                            d1_raw_psi[[row_sym, col]] -= q_psi * axis_scale * delta * z_kc;
+                            d1_raw_psi_psi[[row_sym, col]] -= q_psi_psi * axis_scale * delta * z_kc;
                         }
                     }
                 }
@@ -9841,16 +9884,31 @@ fn build_duchon_operator_penalty_psi_derivatives(
                     phi_rr_psi_psi,
                     d,
                 );
+                let lap_value = if metric_weights.is_some() {
+                    sum_metric_weights * phi_rr
+                } else {
+                    lap_collision.value
+                };
+                let lap_psi = if metric_weights.is_some() {
+                    sum_metric_weights * phi_rr_psi
+                } else {
+                    lap_collision.psi
+                };
+                let lap_psi_psi = if metric_weights.is_some() {
+                    sum_metric_weights * phi_rr_psi_psi
+                } else {
+                    lap_collision.psi_psi
+                };
                 for col in 0..z_kernel.ncols() {
                     let z_jc = z_kernel[[j, col]];
-                    d2_raw[[k, col]] += lap_collision.value * z_jc;
-                    d2_raw_psi[[k, col]] += lap_collision.psi * z_jc;
-                    d2_raw_psi_psi[[k, col]] += lap_collision.psi_psi * z_jc;
+                    d2_raw[[k, col]] += lap_value * z_jc;
+                    d2_raw_psi[[k, col]] += lap_psi * z_jc;
+                    d2_raw_psi_psi[[k, col]] += lap_psi_psi * z_jc;
                     if j != k {
                         let z_kc = z_kernel[[k, col]];
-                        d2_raw[[j, col]] += lap_collision.value * z_kc;
-                        d2_raw_psi[[j, col]] += lap_collision.psi * z_kc;
-                        d2_raw_psi_psi[[j, col]] += lap_collision.psi_psi * z_kc;
+                        d2_raw[[j, col]] += lap_value * z_kc;
+                        d2_raw_psi[[j, col]] += lap_psi * z_kc;
+                        d2_raw_psi_psi[[j, col]] += lap_psi_psi * z_kc;
                     }
                 }
             }
@@ -17563,10 +17621,10 @@ mod tests {
             [1.0, 1.0, 1.0]
         ];
         let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
             length_scale: None,
             power: 1,
-            nullspace_order: DuchonNullspaceOrder::Zero,
+            nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
         };
@@ -17806,6 +17864,137 @@ mod tests {
         let got_4d = polyharmonic_kernel(r, m_4d, d_4d);
         assert!((got_4d - expected_4d).abs() < 1e-12);
         assert!(got_4d > 0.0);
+    }
+
+    #[test]
+    fn test_pure_duchon_rejects_undefined_gradient_collocation() {
+        let centers = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let err = match build_duchon_collocation_operator_matrices(
+            centers.view(),
+            None,
+            None,
+            1,
+            DuchonNullspaceOrder::Zero,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("d=3, p=1, s=1 has no well-defined collision gradient"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("D1 collocation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
+        let p_order = 1usize;
+        let s_order = 1usize;
+        let dim = 3usize;
+        let length_scale = 1.0;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let got = duchon_matern_kernel_general_from_distance(
+            0.0,
+            Some(length_scale),
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("finite hybrid diagonal");
+        let expected = 1.0 / (4.0 * std::f64::consts::PI);
+        assert_abs_diff_eq!(got, expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_duchon_matern_block_origin_includes_kappa_power() {
+        let kappa = 4.0;
+        let value = duchon_matern_block(0.0, kappa, 1, 1).expect("block value");
+        let (jet_value, _, _, _, _) =
+            duchon_matern_block_jet4(0.0, kappa, 1, 1).expect("block jet");
+        assert_abs_diff_eq!(value, 1.0 / 8.0, epsilon = 1e-14);
+        assert_abs_diff_eq!(jet_value, value, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn test_duchon_aniso_collocation_uses_metric_weights() {
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let eta = vec![2.0_f64.ln(), -2.0_f64.ln()];
+        let ops = build_duchon_collocation_operator_matrices(
+            centers.view(),
+            None,
+            Some(1.0),
+            2,
+            DuchonNullspaceOrder::Linear,
+            Some(&eta),
+            None,
+        )
+        .expect("anisotropic Duchon collocation");
+
+        let mut workspace = BasisWorkspace::default();
+        let z = kernel_constraint_nullspace(
+            centers.view(),
+            DuchonNullspaceOrder::Linear,
+            &mut workspace.cache,
+        )
+        .expect("kernel constraint nullspace");
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 2usize;
+        let dim = 2usize;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0);
+        let weights = [4.0, 0.25];
+        let sum_weights = weights.iter().sum::<f64>();
+
+        for k in 0..centers.nrows() {
+            for col in 0..z.ncols() {
+                let mut expected_d2 = 0.0;
+                let mut expected_d1 = [0.0; 2];
+                for j in 0..centers.nrows() {
+                    let h = [
+                        centers[[k, 0]] - centers[[j, 0]],
+                        centers[[k, 1]] - centers[[j, 1]],
+                    ];
+                    let s_vec = [weights[0] * h[0] * h[0], weights[1] * h[1] * h[1]];
+                    let r = (s_vec[0] + s_vec[1]).sqrt();
+                    let (_, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+                        r,
+                        Some(1.0),
+                        p_order,
+                        s_order,
+                        dim,
+                        Some(&coeffs),
+                    )
+                    .expect("radial triplet");
+                    let lap = if r > 1e-10 {
+                        let q = phi_r / r;
+                        let t = (phi_rr - q) / (r * r);
+                        let sum_wb_sb = weights[0] * s_vec[0] + weights[1] * s_vec[1];
+                        for axis in 0..dim {
+                            expected_d1[axis] += q * weights[axis] * h[axis] * z[[j, col]];
+                        }
+                        q * sum_weights + t * sum_wb_sb
+                    } else {
+                        sum_weights * phi_rr
+                    };
+                    expected_d2 += lap * z[[j, col]];
+                }
+
+                for axis in 0..dim {
+                    assert_abs_diff_eq!(
+                        ops.d1[[k * dim + axis, col]],
+                        expected_d1[axis],
+                        epsilon = 1e-9
+                    );
+                }
+                assert_abs_diff_eq!(ops.d2[[k, col]], expected_d2, epsilon = 1e-9);
+            }
+        }
     }
 
     #[test]
@@ -19102,12 +19291,12 @@ mod tests {
             [0.9, 0.7, 0.1],
             [0.2, 0.8, 0.6],
         ];
-        let centers = data.slice(s![0..4, ..]).to_owned();
+        let centers = data.clone();
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
             power: 1,
-            nullspace_order: DuchonNullspaceOrder::Zero,
+            nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.1, -0.1]),
         };
@@ -19165,7 +19354,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_order_zero_16d_case_builds_with_constant_nullspace() {
+    fn test_duchon_order_zero_16d_case_rejects_infinite_diagonal() {
         let data = array![
             [
                 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30,
@@ -19193,23 +19382,24 @@ mod tests {
             ]
         ];
         let centers = data.slice(s![0..4, ..]).to_owned();
-        let out = create_duchon_spline_basis(
+        let err = match create_duchon_spline_basis(
             data.view(),
             centers.view(),
             Some(1.0),
             1,
             DuchonNullspaceOrder::Zero,
-        )
-        .expect("16D rough Duchon case should build");
-
-        assert_eq!(out.num_polynomial_basis, 1);
-        assert!(out.basis.iter().all(|v| v.is_finite()));
-        assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
-        assert!(out.penalty_ridge.iter().all(|v| v.is_finite()));
+        ) {
+            Ok(_) => panic!("16D rough Duchon case has an infinite diagonal"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("pointwise kernel values"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn test_pure_duchon_default_tuple_builds() {
+    fn test_pure_duchon_default_tuple_rejects_insufficient_nullspace() {
         let data = array![[0.0, 0.1], [0.2, 0.0], [0.4, 0.2], [0.6, 0.4], [0.8, 0.5]];
         let centers = data.slice(s![0..4, ..]).to_owned();
         let spec = DuchonBasisSpec {
@@ -19220,15 +19410,13 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
         };
-        let out =
-            build_duchon_basis(data.view(), &spec).expect("pure Duchon default tuple should build");
-        let out_design = out.design.to_dense();
-        assert!(out_design.iter().all(|v| v.is_finite()));
-        assert_eq!(out.penalties.len(), 3);
+        let err = match build_duchon_basis(data.view(), &spec) {
+            Ok(_) => panic!("pure Duchon default tuple violates the nullspace-order condition"),
+            Err(err) => err,
+        };
         assert!(
-            out.penalties
-                .iter()
-                .all(|penalty| penalty.iter().all(|v| v.is_finite()))
+            err.to_string().contains("power < dimension/2"),
+            "unexpected error: {err}"
         );
     }
 
