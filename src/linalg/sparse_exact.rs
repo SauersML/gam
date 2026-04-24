@@ -1001,11 +1001,9 @@ impl TakahashiInverse {
 /// Compute tr(H⁻¹ Sₖ) using a precomputed Takahashi selected inverse.
 pub fn trace_hinv_sk_takahashi(taka: &TakahashiInverse, penalty: &SparsePenaltyBlock) -> f64 {
     if penalty.block_support_strict {
-        // Fast: block-local trace
-        let block = taka.block(penalty.p_start, penalty.p_end);
         let mut trace = 0.0;
         for &(row, col, val) in penalty.s_k_block_upper_entries.iter() {
-            let z_val = block[[row, col]];
+            let z_val = taka.get(penalty.p_start + row, penalty.p_start + col);
             if row == col {
                 trace += z_val * val;
             } else {
