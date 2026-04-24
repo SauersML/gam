@@ -7577,6 +7577,39 @@ impl SparseCholeskyOperator {
 
     const OPERATOR_SOLVE_CHUNK: usize = 64;
 
+    fn takahashi_block_trace(
+        taka: &crate::linalg::sparse_exact::TakahashiInverse,
+        block: &Array2<f64>,
+        start: usize,
+    ) -> f64 {
+        let mut trace = 0.0;
+        for i in 0..block.nrows() {
+            for j in 0..block.ncols() {
+                trace += taka.get(start + i, start + j) * block[[i, j]];
+            }
+        }
+        trace
+    }
+
+    fn takahashi_left_multiply_block(
+        taka: &crate::linalg::sparse_exact::TakahashiInverse,
+        block: &Array2<f64>,
+        start: usize,
+    ) -> Array2<f64> {
+        let dim = block.nrows();
+        let mut out = Array2::<f64>::zeros((dim, dim));
+        for i in 0..dim {
+            for k in 0..dim {
+                let mut value = 0.0;
+                for j in 0..dim {
+                    value += taka.get(start + i, start + j) * block[[j, k]];
+                }
+                out[[i, k]] = value;
+            }
+        }
+        out
+    }
+
     fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut trace = 0.0_f64;
@@ -7656,16 +7689,43 @@ impl SparseCholeskyOperator {
         op: &dyn HyperOperator,
     ) -> f64 {
         let solved_matrix = self.solve_multi(matrix);
-        let solved_op = match self.solve_operator_columns_exact(op) {
-            Ok(sol) => sol,
-            Err(e) => {
-                log::warn!(
-                    "SparseCholeskyOperator::trace_hinv_matrix_operator_cross_exact failed: {e}"
-                );
-                return f64::NAN;
+        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
+        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
+        let mut trace = 0.0_f64;
+        let mut start = 0usize;
+
+        while start < self.n_dim {
+            let end = (start + chunk).min(self.n_dim);
+            let cols = end - start;
+            op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
+
+            let solved_op = if cols == chunk {
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)
+            } else {
+                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
+                crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
+            };
+
+            let solved_op = match solved_op {
+                Ok(sol) => sol,
+                Err(e) => {
+                    log::warn!(
+                        "SparseCholeskyOperator::trace_hinv_matrix_operator_cross_exact failed: {e}"
+                    );
+                    return f64::NAN;
+                }
+            };
+
+            for local_col in 0..cols {
+                let matrix_row = start + local_col;
+                for row in 0..self.n_dim {
+                    trace += solved_matrix[[matrix_row, row]] * solved_op[[row, local_col]];
+                }
             }
-        };
-        trace_matrix_product(&solved_matrix, &solved_op)
+            start = end;
+        }
+
+        trace
     }
 
     fn trace_hinv_operator_cross_exact(
@@ -7729,16 +7789,9 @@ impl HessianOperator for SparseCholeskyOperator {
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         if let Some(ref taka) = self.takahashi {
-            // For block-local operators: O(p_block²) trace via Takahashi block lookup
             if let Some((local, start, end)) = op.block_local_data() {
-                let z_block = taka.block(start, end);
-                let mut trace = 0.0;
-                for i in 0..z_block.nrows() {
-                    for j in 0..z_block.ncols() {
-                        trace += z_block[[i, j]] * local[[i, j]];
-                    }
-                }
-                return trace;
+                debug_assert_eq!(local.nrows(), end - start);
+                return Self::takahashi_block_trace(taka, local, start);
             }
             // For other non-implicit operators: materialize and use Takahashi lookups
             if !op.is_implicit() {
@@ -7761,14 +7814,8 @@ impl HessianOperator for SparseCholeskyOperator {
         end: usize,
     ) -> f64 {
         if let Some(ref taka) = self.takahashi {
-            let z_block = taka.block(start, end);
-            let mut trace = 0.0;
-            for i in 0..z_block.nrows() {
-                for j in 0..z_block.ncols() {
-                    trace += z_block[[i, j]] * block[[i, j]];
-                }
-            }
-            return scale * trace;
+            debug_assert_eq!(block.nrows(), end - start);
+            return scale * Self::takahashi_block_trace(taka, block, start);
         }
         let p = self.dim();
         let bs = end - start;
@@ -7789,8 +7836,8 @@ impl HessianOperator for SparseCholeskyOperator {
         end: usize,
     ) -> f64 {
         if let Some(ref taka) = self.takahashi {
-            let z = taka.block(start, end);
-            let za = z.dot(block);
+            debug_assert_eq!(block.nrows(), end - start);
+            let za = Self::takahashi_left_multiply_block(taka, block, start);
             return scale * scale * trace_matrix_product(&za, &za);
         }
         let p = self.dim();
@@ -7860,9 +7907,8 @@ impl HessianOperator for SparseCholeskyOperator {
             {
                 if a_start == b_start && a_end == b_end {
                     // Same block: tr(Z_block * A_local * Z_block * B_local)
-                    let z = taka.block(a_start, a_end);
-                    let za = z.dot(a_local);
-                    let zb = z.dot(b_local);
+                    let za = Self::takahashi_left_multiply_block(taka, a_local, a_start);
+                    let zb = Self::takahashi_left_multiply_block(taka, b_local, b_start);
                     // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij
                     return (&za * &zb.t()).sum();
                 }
