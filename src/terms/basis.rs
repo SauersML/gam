@@ -7626,7 +7626,7 @@ impl PolyharmonicBlockCoeff {
     #[inline(always)]
     fn eval(&self, r: f64) -> f64 {
         if r <= 0.0 {
-            return 0.0;
+            return polyharmonic_origin_value(self.c, self.power, self.is_log_case);
         }
         if self.is_log_case {
             self.c * r.powf(self.power) * r.max(1e-300).ln()
@@ -7637,9 +7637,6 @@ impl PolyharmonicBlockCoeff {
 }
 
 fn polyharmonic_kernel(r: f64, m: usize, k_dim: usize) -> f64 {
-    if r <= 0.0 {
-        return 0.0;
-    }
     let k_half = 0.5 * k_dim as f64;
     let power_i = 2_i64 * (m as i64) - (k_dim as i64);
     let power_f = power_i as f64;
@@ -7650,11 +7647,46 @@ fn polyharmonic_kernel(r: f64, m: usize, k_dim: usize) -> f64 {
                 * std::f64::consts::PI.powf(k_half)
                 * gamma_lanczos(m as f64)
                 * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        if r <= 0.0 {
+            return polyharmonic_origin_value(c, power_f, true);
+        }
         return c * r.powf(power_f) * r.max(1e-300).ln();
     }
     let c = gamma_lanczos(k_half - m as f64)
         / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
+    if r <= 0.0 {
+        return polyharmonic_origin_value(c, power_f, false);
+    }
     c * r.powf(power_f)
+}
+
+#[inline(always)]
+fn signed_infinity(sign: f64) -> f64 {
+    if sign.is_sign_negative() {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    }
+}
+
+#[inline(always)]
+fn polyharmonic_origin_value(c: f64, power: f64, is_log_case: bool) -> f64 {
+    if is_log_case {
+        if power > 0.0 {
+            0.0
+        } else {
+            // r^0 log(r) -> -inf; for negative powers the logarithm has the
+            // same sign-dominant divergence. Even-dimensional log cases have
+            // power >= 0, but keep the branch explicit for robustness.
+            signed_infinity(-c)
+        }
+    } else if power < 0.0 {
+        signed_infinity(c)
+    } else if power == 0.0 {
+        c
+    } else {
+        0.0
+    }
 }
 
 #[inline(always)]
@@ -19432,6 +19464,22 @@ mod tests {
         assert!(
             err.to_string().contains("power < dimension/2"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pure_duchon_10d_a2_diagonal_is_infinite_not_zero() {
+        let value = polyharmonic_kernel(0.0, 2, 10);
+        assert!(
+            value.is_infinite() && value.is_sign_positive(),
+            "d=10, a=2 pure polyharmonic diagonal should be +inf, got {value}"
+        );
+
+        let near_zero = polyharmonic_kernel(1.0e-3, 2, 10);
+        let expected = 1.0 / (8.0 * std::f64::consts::PI.powi(5)) * 1.0e18;
+        assert!(
+            ((near_zero - expected) / expected).abs() < 1e-12,
+            "unexpected d=10, a=2 near-origin value: got {near_zero}, expected {expected}"
         );
     }
 
