@@ -13209,6 +13209,13 @@ mod tests {
         DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
     }
 
+    #[test]
+    fn poly_mul_treats_empty_inputs_as_zero_polynomials() {
+        assert!(poly_mul(&[], &[1.0, 2.0]).is_empty());
+        assert!(poly_mul(&[1.0, 2.0], &[]).is_empty());
+        assert_eq!(poly_mul(&[1.0, 2.0], &[3.0, 4.0]), vec![3.0, 10.0, 8.0]);
+    }
+
     fn dummy_blockspec(cols: usize) -> ParameterBlockSpec {
         ParameterBlockSpec {
             name: "dummy".to_string(),
