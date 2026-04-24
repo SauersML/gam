@@ -7737,20 +7737,23 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn solve_operator_column_range_exact(
+    fn solve_operator_column_range_rows_exact(
         &self,
         op: &dyn HyperOperator,
-        range_start: usize,
-        range_end: usize,
+        col_start: usize,
+        col_end: usize,
+        row_start: usize,
+        row_end: usize,
     ) -> Result<Array2<f64>, String> {
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
-        let cols_total = range_end - range_start;
-        let mut solved = Array2::<f64>::zeros((self.n_dim, cols_total));
+        let cols_total = col_end - col_start;
+        let rows_total = row_end - row_start;
+        let mut solved = Array2::<f64>::zeros((rows_total, cols_total));
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
-        let mut start = range_start;
+        let mut start = col_start;
 
-        while start < range_end {
-            let end = (start + chunk).min(range_end);
+        while start < col_end {
+            let end = (start + chunk).min(col_end);
             let cols = end - start;
             op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
@@ -7762,12 +7765,12 @@ impl SparseCholeskyOperator {
             }
             .map_err(|e| {
                 format!(
-                    "SparseCholeskyOperator::solve_operator_column_range_exact multi-solve failed: {e}"
+                    "SparseCholeskyOperator::solve_operator_column_range_rows_exact multi-solve failed: {e}"
                 )
             })?;
             solved
-                .slice_mut(ndarray::s![.., start - range_start..end - range_start])
-                .assign(&solved_block);
+                .slice_mut(ndarray::s![.., start - col_start..end - col_start])
+                .assign(&solved_block.slice(ndarray::s![row_start..row_end, ..]));
             start = end;
         }
 
@@ -7837,7 +7840,13 @@ impl SparseCholeskyOperator {
             .map(|(_, start, end)| (start, end))
             .unwrap_or((0, self.n_dim));
 
-        let solved_left = match self.solve_operator_column_range_exact(left, left_start, left_end) {
+        let solved_left = match self.solve_operator_column_range_rows_exact(
+            left,
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+        ) {
             Ok(sol) => sol,
             Err(e) => {
                 log::warn!(
@@ -7851,7 +7860,13 @@ impl SparseCholeskyOperator {
         let solved_right = if same_operator {
             None
         } else {
-            match self.solve_operator_column_range_exact(right, right_start, right_end) {
+            match self.solve_operator_column_range_rows_exact(
+                right,
+                right_start,
+                right_end,
+                left_start,
+                left_end,
+            ) {
                 Ok(sol) => Some(sol),
                 Err(e) => {
                     log::warn!(
@@ -7865,14 +7880,12 @@ impl SparseCholeskyOperator {
         let right_cols = right_end - right_start;
         let mut trace = 0.0;
         for left_col in 0..(left_end - left_start) {
-            let global_left_col = left_start + left_col;
             for right_col in 0..right_cols {
-                let global_right_col = right_start + right_col;
                 let right_value = match solved_right.as_ref() {
-                    Some(solved) => solved[[global_left_col, right_col]],
-                    None => solved_left[[global_left_col, right_col]],
+                    Some(solved) => solved[[left_col, right_col]],
+                    None => solved_left[[left_col, right_col]],
                 };
-                trace += solved_left[[global_right_col, left_col]] * right_value;
+                trace += solved_left[[right_col, left_col]] * right_value;
             }
         }
         trace
@@ -7938,15 +7951,12 @@ impl HessianOperator for SparseCholeskyOperator {
             debug_assert_eq!(block.nrows(), end - start);
             return scale * Self::takahashi_block_trace(taka, block, start);
         }
-        let p = self.dim();
-        let bs = end - start;
-        let mut full = Array2::<f64>::zeros((p, p));
-        for i in 0..bs {
-            for j in 0..bs {
-                full[[start + i, start + j]] = scale * block[[i, j]];
-            }
-        }
-        self.trace_hinv_product(&full)
+        let op = BlockLocalDrift {
+            local: block.mapv(|value| scale * value),
+            start,
+            end,
+        };
+        self.trace_hinv_operator_exact(&op)
     }
 
     fn trace_hinv_block_local_cross(
@@ -7961,15 +7971,12 @@ impl HessianOperator for SparseCholeskyOperator {
             let za = Self::takahashi_left_multiply_block(taka, block, start);
             return scale * scale * trace_matrix_product(&za, &za);
         }
-        let p = self.dim();
-        let bs = end - start;
-        let mut full = Array2::<f64>::zeros((p, p));
-        for i in 0..bs {
-            for j in 0..bs {
-                full[[start + i, start + j]] = scale * block[[i, j]];
-            }
-        }
-        self.trace_hinv_product_cross(&full, &full)
+        let op = BlockLocalDrift {
+            local: block.mapv(|value| scale * value),
+            start,
+            end,
+        };
+        self.trace_hinv_operator_cross_exact(&op, &op)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
@@ -10411,6 +10418,42 @@ mod tests {
         );
         assert_relative_eq!(
             sparse.trace_hinv_block_local_cross(&block, scale, start, end),
+            dense.trace_hinv_product_cross(&full, &full),
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
+    }
+
+    #[test]
+    fn sparse_block_local_operator_cross_without_takahashi_matches_dense_reference() {
+        let h = array![
+            [5.0, 0.2, 0.0, 0.1],
+            [0.2, 4.0, 0.3, 0.0],
+            [0.0, 0.3, 3.0, 0.4],
+            [0.1, 0.0, 0.4, 2.5],
+        ];
+        let h_sparse =
+            crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
+        let factor = std::sync::Arc::new(
+            crate::linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
+        );
+        let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows());
+        let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let local = array![[0.8, 0.15], [0.15, 0.45]];
+        let start = 1;
+        let end = 3;
+        let op = BlockLocalDrift {
+            local: local.clone(),
+            start,
+            end,
+        };
+        let mut full = Array2::<f64>::zeros(h.raw_dim());
+        full.slice_mut(ndarray::s![start..end, start..end])
+            .assign(&local);
+
+        assert_relative_eq!(
+            sparse.trace_hinv_operator_cross(&op, &op),
             dense.trace_hinv_product_cross(&full, &full),
             epsilon = 1e-10,
             max_relative = 1e-10
