@@ -24,10 +24,7 @@ fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
 struct TkCorrectionTerms {
     value: f64,
     gradient: Option<Array1<f64>>,
-    hessian: Option<Array2<f64>>,
 }
-
-struct TkPsiDirection;
 
 /// Family-dependent derivative context shared by all assembly builders.
 ///
@@ -164,21 +161,26 @@ impl<'a> RemlState<'a> {
     ///
     /// The function takes the (X, Z, c, d) tuple plus a `h_inv_solve` closure
     /// used exclusively for the T2 term's `y = H⁻¹ w` step.  Both the analytic
-    /// gradient core and the numerical ψ-gradient FD helper share this.
+    /// gradient core share this.
     fn tk_scalar_from_intermediates(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
-    ) -> f64 {
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+    ) -> Result<f64, EstimationError> {
         let n = x_dense.nrows();
         let xt = x_dense.t();
 
         let mut h_diag = Array1::<f64>::zeros(n);
         for i in 0..n {
             let val = x_dense.row(i).dot(&z.column(i));
-            h_diag[i] = if val.is_finite() { val } else { 0.0 };
+            if !val.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane correction produced non-finite leverage at row {i}: {val}"
+                )));
+            }
+            h_diag[i] = val;
         }
 
         let q_term = -0.125
@@ -190,7 +192,7 @@ impl<'a> RemlState<'a> {
 
         let m_vec = c_array * &h_diag;
         let x_m = xt.dot(&m_vec);
-        let y = h_inv_solve(&x_m);
+        let y = h_inv_solve(&x_m)?;
         let t2_term = 0.125 * x_m.dot(&y);
 
         let mut t1_sum = 0.0_f64;
@@ -223,7 +225,12 @@ impl<'a> RemlState<'a> {
         }
 
         let value = q_term + t1_sum / 12.0 + t2_term;
-        if value.is_finite() { value } else { 0.0 }
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane correction produced non-finite value: {value}"
+            )));
+        }
+        Ok(value)
     }
 
     /// Analytic TK value + gradient given Z = H⁻¹ X^T.
@@ -254,9 +261,7 @@ impl<'a> RemlState<'a> {
     /// provides this.
     /// Compute the TK gradient given Z, precomputed v_ks and x_vks.
     ///
-    /// Returns the k-vector of gradient entries. This helper is called by the
-    /// main analytic core for the base gradient, and again with perturbed
-    /// inputs to build the Hessian via matrix-level differentiation.
+    /// Returns the k-vector of gradient entries.
     fn tk_gradient_from_intermediates(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -265,9 +270,9 @@ impl<'a> RemlState<'a> {
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         x_vks: &[Array1<f64>],
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
         penalty_coords: Option<&[&super::unified::PenaltyCoordinate]>,
-    ) -> Array1<f64> {
+    ) -> Result<Array1<f64>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
@@ -277,13 +282,18 @@ impl<'a> RemlState<'a> {
         let mut h_diag = Array1::<f64>::zeros(n);
         for i in 0..n {
             let val = x_dense.row(i).dot(&z.column(i));
-            h_diag[i] = if val.is_finite() { val } else { 0.0 };
+            if !val.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane gradient produced non-finite leverage at row {i}: {val}"
+                )));
+            }
+            h_diag[i] = val;
         }
 
         // y = H⁻¹ X^T(c⊙h)
         let m_vec = c_array * &h_diag;
         let x_m = xt.dot(&m_vec);
-        let y = h_inv_solve(&x_m);
+        let y = h_inv_solve(&x_m)?;
         let x_y = x_dense.dot(&y);
 
         // P_total (Q + T2a combined, then T2b, then T1)
@@ -397,10 +407,12 @@ impl<'a> RemlState<'a> {
 
         for g in gradient.iter_mut() {
             if !g.is_finite() {
-                *g = 0.0;
+                return Err(EstimationError::InvalidInput(
+                    "Tierney-Kadane correction produced a non-finite gradient entry".to_string(),
+                ));
             }
         }
-        gradient
+        Ok(gradient)
     }
 
     fn tierney_kadane_analytic_core(
@@ -413,26 +425,23 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         beta: &Array1<f64>,
         compute_gradient: bool,
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
 
-        let value = Self::tk_scalar_from_intermediates(x_dense, z, c_array, d_array, h_inv_solve);
+        let value = Self::tk_scalar_from_intermediates(x_dense, z, c_array, d_array, h_inv_solve)?;
 
         if !compute_gradient {
             return Ok(TkCorrectionTerms {
                 value,
                 gradient: None,
-                hessian: None,
             });
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Precompute v_k = H⁻¹(A_k β̂) and x_vk = X v_k for all k.
+        // Precompute x_vk = X H⁻¹(A_k β̂) for all k.
         // ══════════════════════════════════════════════════════════════════
-        let mut v_ks: Vec<Array1<f64>> = Vec::with_capacity(k);
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k);
         for idx in 0..k {
             // Block-local: A_k β = λ_k R^T (R β[block]), embedded into p-vector.
@@ -447,9 +456,8 @@ impl<'a> RemlState<'a> {
                     .sum::<f64>();
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
-            let v_k = h_inv_solve(&a_k_beta);
+            let v_k = h_inv_solve(&a_k_beta)?;
             let x_vk = x_dense.dot(&v_k);
-            v_ks.push(v_k);
             x_vks.push(x_vk);
         }
 
@@ -466,12 +474,11 @@ impl<'a> RemlState<'a> {
             &x_vks,
             h_inv_solve,
             None,
-        );
+        )?;
 
         Ok(TkCorrectionTerms {
             value,
             gradient: Some(gradient),
-            hessian: None,
         })
     }
 
@@ -480,13 +487,12 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
-        psi_dirs: Option<&[TkPsiDirection]>,
+        psi_coord_count: usize,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         if self.config.link_function() == LinkFunction::Identity {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
-                hessian: None,
             });
         }
 
@@ -504,21 +510,30 @@ impl<'a> RemlState<'a> {
                 d_array[idx]
             )));
         }
+        let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
+        let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
+        if compute_hessian {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane outer Hessian requires analytic second derivatives; production finite-difference stencils are disabled".to_string(),
+            ));
+        }
+        if compute_gradient && psi_coord_count > 0 {
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane psi gradients require analytic derivatives; production finite-difference stencils are disabled".to_string(),
+            ));
+        }
+
         if c_array.is_empty() || d_array.is_empty() {
-            let ext_dim = psi_dirs.map_or(0, |d| d.len());
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: if mode != super::unified::EvalMode::ValueOnly {
-                    Some(Array1::zeros(rho.len() + ext_dim))
+                    Some(Array1::zeros(rho.len()))
                 } else {
                     None
                 },
-                hessian: None,
             });
         }
 
-        let compute_gradient = mode != super::unified::EvalMode::ValueOnly;
-        let compute_hessian = mode == super::unified::EvalMode::ValueGradientHessian;
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
         let dense_work = n_x.saturating_mul(p_x);
@@ -540,9 +555,8 @@ impl<'a> RemlState<'a> {
             let z_mat =
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(sparse.factor.as_ref(), &xt)?;
             let factor_ref = sparse.factor.clone();
-            let h_inv_solve = |rhs: &Array1<f64>| -> Array1<f64> {
+            let h_inv_solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
                 crate::linalg::sparse_exact::solve_sparse_spd(&factor_ref, rhs)
-                    .unwrap_or_else(|_| Array1::zeros(rhs.len()))
             };
 
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
@@ -557,9 +571,7 @@ impl<'a> RemlState<'a> {
                 &lambdas,
                 &beta,
                 compute_gradient,
-                compute_hessian,
                 &h_inv_solve,
-                psi_dirs,
             );
         }
 
@@ -587,14 +599,20 @@ impl<'a> RemlState<'a> {
                 evals: Array1<f64>,
                 evecs: Array2<f64>,
             },
-            None(usize),
         }
         let h_factor = if let Ok(chol) = h_eff_eval.cholesky(Side::Lower) {
             HFactor::Cholesky(chol)
         } else if let Ok((evals, evecs)) = h_eff_eval.eigh(Side::Lower) {
+            if let Some((idx, ev)) = evals.iter().enumerate().find(|(_, ev)| **ev <= 1e-12) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane correction requires a positive definite Hessian; eigenvalue {idx} is {ev}"
+                )));
+            }
             HFactor::Eigh { evals, evecs }
         } else {
-            HFactor::None(p)
+            return Err(EstimationError::InvalidInput(
+                "Tierney-Kadane correction could not factor the effective Hessian".to_string(),
+            ));
         };
 
         // Build Z = H⁻¹ Xᵀ using the pre-computed factorization.
@@ -605,13 +623,9 @@ impl<'a> RemlState<'a> {
                 solved
             }
             HFactor::Eigh { evals, evecs } => {
-                let floor = 1e-12;
                 let mut solved = Array2::<f64>::zeros((p, n));
                 for m in 0..evals.len() {
                     let ev = evals[m];
-                    if ev <= floor {
-                        continue;
-                    }
                     let u = evecs.column(m).to_owned();
                     let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
                     for row in 0..p {
@@ -623,26 +637,21 @@ impl<'a> RemlState<'a> {
                 }
                 solved
             }
-            HFactor::None(_) => Array2::<f64>::zeros((p, n)),
         };
 
         // Reuse the same factorization for the solve closure.
-        let h_inv_solve = move |rhs: &Array1<f64>| -> Array1<f64> {
+        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
             match &h_factor {
-                HFactor::Cholesky(chol) => chol.solvevec(rhs),
+                HFactor::Cholesky(chol) => Ok(chol.solvevec(rhs)),
                 HFactor::Eigh { evals, evecs } => {
-                    let floor = 1e-12;
                     let mut sol = Array1::<f64>::zeros(rhs.len());
                     for m in 0..evals.len() {
-                        if evals[m] > floor {
-                            let u = evecs.column(m);
-                            let coeff = u.dot(rhs) / evals[m];
-                            sol.scaled_add(coeff, &u.to_owned());
-                        }
+                        let u = evecs.column(m);
+                        let coeff = u.dot(rhs) / evals[m];
+                        sol.scaled_add(coeff, &u.to_owned());
                     }
-                    sol
+                    Ok(sol)
                 }
-                HFactor::None(p) => Array1::zeros(*p),
             }
         };
 
@@ -671,7 +680,7 @@ impl<'a> RemlState<'a> {
             pirls_result.beta_transformed.as_ref().clone()
         };
 
-        let mut terms = self.tierney_kadane_analytic_core(
+        let terms = self.tierney_kadane_analytic_core(
             &x_eff_dense,
             &z_mat,
             &c_array,
@@ -680,9 +689,7 @@ impl<'a> RemlState<'a> {
             &lambdas,
             &beta,
             compute_gradient,
-            compute_hessian,
             &h_inv_solve,
-            psi_dirs,
         )?;
 
         Ok(terms)
@@ -697,29 +704,10 @@ impl<'a> RemlState<'a> {
         let _ = rho; // kept for API compatibility; lengths come from tk_grad now.
         result.cost += tk_terms.value;
         if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
-            // tk_grad carries `rho.len() + ext_dim` entries (ψ entries present
-            // only when `tierney_kadane_terms` was invoked with ψ directions).
-            // Align by the minimum available length so that ρ-only callers
-            // (which pass no ψ directions) continue to write only the ρ block.
             let len = grad.len().min(tk_grad.len());
             {
                 let mut sl = grad.slice_mut(s![..len]);
                 sl += &tk_grad.slice(s![..len]);
-            }
-        }
-        if let Some(tk_hess) = tk_terms.hessian {
-            // TK Hessian is (rho.len() + ext_dim) square when ψ directions were
-            // provided, else (rho.len(), rho.len()).  `add_rho_block_dense`
-            // treats the block as the top-left corner of the target Hessian,
-            // so passing the full TK block correctly injects BOTH the ρ-ρ
-            // contribution (which has always been present) AND the ψ-ψ (and
-            // ρ-ψ) blocks added by the numerical FD path.
-            let dim = tk_hess.nrows().min(tk_hess.ncols());
-            if dim > 0 {
-                let tk_block = tk_hess.slice(s![..dim, ..dim]).to_owned();
-                if let Err(error) = result.hessian.add_rho_block_dense(&tk_block) {
-                    log::warn!("skipping TK Hessian correction: {error}");
-                }
             }
         }
         result
@@ -3166,22 +3154,22 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        self.assemble_and_evaluate_with_psi_dirs(rho, bundle, mode, assembly, None)
+        self.assemble_and_evaluate_with_psi_coords(rho, bundle, mode, assembly, 0)
     }
 
-    fn assemble_and_evaluate_with_psi_dirs(
+    fn assemble_and_evaluate_with_psi_coords(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
-        psi_dirs: Option<&[TkPsiDirection]>,
+        psi_coord_count: usize,
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
         let result = assembly
             .evaluate(rho.as_slice().unwrap(), mode, prior)
             .map_err(EstimationError::InvalidInput)?;
-        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, psi_dirs)?;
+        let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, psi_coord_count)?;
         Ok(self.apply_tk_to_result(result, rho, tk_terms))
     }
 
@@ -3253,7 +3241,7 @@ impl<'a> RemlState<'a> {
         };
 
         let tk_terms =
-            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly, None)?;
+            self.tierney_kadane_terms(rho, bundle, super::unified::EvalMode::ValueOnly, 0)?;
         Ok(self.apply_tk_cost_to_efs(efs_eval, tk_terms.value))
     }
 
@@ -3281,7 +3269,7 @@ impl<'a> RemlState<'a> {
         // nor `λ S_t β_t`. That fed a miscalibrated `½ βᵀ Sβ` first partial
         // into BFGS on unconstrained dense problems (n=320k, p=71, duchon),
         // which accepted only 2/200 line-search steps before stalling while
-        // the finite-difference gradient on the *same* cost made steady
+        // an independent numeric check on the same cost showed descent
         // progress. `build_auto_assembly` routes unconstrained
         // `TransformedQs` fits through `build_dense_original_assembly`, which
         // maps β and H back to the original basis so every ingredient agrees
@@ -3368,141 +3356,11 @@ impl<'a> RemlState<'a> {
             };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-        // Capture ψ-direction TK inputs *before* consuming ext_coords into the
-        // assembly.  The TK ψ-gradient reuses the P_total / lev_P intermediates
-        // computed inside `tierney_kadane_analytic_core`, and needs (B_ψ_j, v_ψ_j)
-        // in the SAME basis as the TK core's `x_eff_dense`.
-        //
-        // TK core works in the PIRLS transformed basis (`x_transformed`).
-        // ext_coords returned by `build_tau_hyper_coords_original_basis` live in
-        // the ORIGINAL basis, so we rotate them via Qs before handing them to
-        // the TK ψ-gradient path.  When PIRLS runs in `OriginalSparseNative`,
-        // Qs is the identity and the rotation is a no-op.
-        //
-        // SCOPE NOTE — design-moving coords (`is_penalty_like = false`) have an
-        // additional ∂TK/∂X · X_τ direct contribution that is not yet derived
-        // here.  Including the partial formula regresses design-moving tests, so
-        // we restrict the ψ-gradient augmentation to penalty-like coords
-        // (τ-direction = S-perturbation only, X_τ = 0) where the direct term
-        // vanishes exactly.  `hyper_dirs[j].is_penalty_like` and the mirroring
-        // `ext_coords[j].is_penalty_like` are kept in sync by
-        // `build_tau_hyper_coords_*`.
-        let psi_dirs_vec: Option<Vec<TkPsiDirection>> =
-            if !ext_coords.is_empty() && compute_gradient_for_tk(mode) {
-                let pirls_result = bundle.pirls_result.as_ref();
-                let h_eff = bundle.h_eff.as_ref();
-                let chol = h_eff.cholesky(Side::Lower).ok();
-                if let Some(chol) = chol {
-                    let p_dim = pirls_result.beta_transformed.len();
-                    let needs_transform = matches!(
-                        pirls_result.coordinate_frame,
-                        pirls::PirlsCoordinateFrame::TransformedQs
-                    );
-                    let qs = &pirls_result.reparam_result.qs;
-                    let c_array = &pirls_result.solve_c_array;
-                    let x_transformed = pirls_result.x_transformed.to_dense();
-                    let mut list = Vec::with_capacity(ext_coords.len());
-                    for (coord_idx, coord) in ext_coords.iter().enumerate() {
-                        let g_orig = coord.g.clone();
-                        let b_orig = coord.drift.materialize();
-                        if b_orig.nrows() == 0 || b_orig.ncols() == 0 {
-                            list.clear();
-                            break;
-                        }
-                        let (g_trans, b_trans) = if needs_transform {
-                            if g_orig.len() != qs.nrows() {
-                                list.clear();
-                                break;
-                            }
-                            let g_t = qs.t().dot(&g_orig);
-                            let b_t = qs.t().dot(&b_orig).dot(qs);
-                            (g_t, b_t)
-                        } else {
-                            (g_orig, b_orig)
-                        };
-                        if g_trans.len() != p_dim
-                            || b_trans.nrows() != p_dim
-                            || b_trans.ncols() != p_dim
-                        {
-                            list.clear();
-                            break;
-                        }
-                        let v_psi = chol.solvevec(&g_trans);
-
-                        // X_τ in the transformed basis:
-                        //   X_τ_trans = X_τ_original · Qs,
-                        // because η = (X_original · Qs) · β_transformed and the
-                        // row patterns of X_τ don't depend on β.
-                        let x_tau_eff = match hyper_dirs.get(coord_idx) {
-                            Some(dir) if dir.x_tau_original.any_nonzero() => {
-                                let arr = dir.x_tau_original.materialize();
-                                if needs_transform { arr.dot(qs) } else { arr }
-                            }
-                            _ => Array2::<f64>::zeros((x_transformed.nrows(), p_dim)),
-                        };
-
-                        // S_τ in the transformed basis:
-                        //   S_τ_trans = Qs^T · S_τ_original · Qs,
-                        // because β^T S β = β_trans^T (Qs^T S Qs) β_trans under
-                        // the reparameterisation β = Qs · β_trans.  The
-                        // directional S-derivative at fixed ρ is
-                        // Σ_k λ_k · (dS_k/dψ_j) which `penalty_total_at`
-                        // returns in original coordinates.
-                        let s_tau_original = match hyper_dirs.get(coord_idx) {
-                            Some(dir) => dir
-                                .penalty_total_at(rho, p_dim)
-                                .unwrap_or_else(|_| Array2::<f64>::zeros((p_dim, p_dim))),
-                            None => Array2::<f64>::zeros((p_dim, p_dim)),
-                        };
-                        let s_tau_eff = if needs_transform {
-                            if s_tau_original.nrows() == qs.nrows()
-                                && s_tau_original.ncols() == qs.nrows()
-                            {
-                                qs.t().dot(&s_tau_original).dot(qs)
-                            } else {
-                                Array2::<f64>::zeros((p_dim, p_dim))
-                            }
-                        } else {
-                            s_tau_original
-                        };
-
-                        // Total Hessian drift Ḣ_ψ = B_ψ + D_β H[+v_ψ]
-                        //                         = B_ψ + X'·diag(c ⊙ X v_ψ)·X
-                        // in the transformed basis.
-                        let x_v = x_transformed.dot(&v_psi);
-                        let mut c_xv = Array1::<f64>::zeros(c_array.len());
-                        for i in 0..c_array.len() {
-                            c_xv[i] = c_array[i] * x_v[i];
-                        }
-                        let mut h_dot = b_trans;
-                        for a in 0..p_dim {
-                            for b in 0..p_dim {
-                                let mut val = 0.0;
-                                for i in 0..c_xv.len() {
-                                    val += x_transformed[[i, a]] * c_xv[i] * x_transformed[[i, b]];
-                                }
-                                h_dot[[a, b]] += val;
-                            }
-                        }
-
-                        list.push(TkPsiDirection {
-                            h_dot,
-                            v_psi,
-                            x_tau_eff,
-                            s_tau_eff,
-                        });
-                    }
-                    if list.len() == ext_coords.len() {
-                        Some(list)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+        let psi_coord_count = if compute_gradient_for_tk(mode) {
+            ext_coords.len()
+        } else {
+            0
+        };
 
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
@@ -3510,12 +3368,12 @@ impl<'a> RemlState<'a> {
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
         assembly.fixed_drift_deriv = fixed_drift_deriv;
-        let result = self.assemble_and_evaluate_with_psi_dirs(
+        let result = self.assemble_and_evaluate_with_psi_coords(
             rho,
             &bundle,
             mode,
             assembly,
-            psi_dirs_vec.as_deref(),
+            psi_coord_count,
         );
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
