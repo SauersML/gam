@@ -10008,10 +10008,8 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
 struct BinomialLocationScaleWiggleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
-    x_t_action: Option<CustomFamilyPsiDesignAction>,
-    x_ls_action: Option<CustomFamilyPsiDesignAction>,
-    x_t_psi: Option<Array2<f64>>,
-    x_ls_psi: Option<Array2<f64>>,
+    x_t_psi: PsiDesignMap,
+    x_ls_psi: PsiDesignMap,
     z_t_psi: Array1<f64>,
     z_ls_psi: Array1<f64>,
 }
@@ -10750,67 +10748,56 @@ impl BinomialLocationScaleFamily {
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
 
         let mut global = 0usize;
+        let policy = crate::resource::ResourcePolicy::default_library();
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
             for (local_idx, deriv) in block_derivs.iter().enumerate() {
                 if global == psi_index {
-                    let mut x_t_psi = None;
-                    let mut x_ls_psi = None;
-                    let mut x_t_action = None;
-                    let mut x_ls_action = None;
-                    let mut z_t_psi = Array1::<f64>::zeros(n);
-                    let mut z_ls_psi = Array1::<f64>::zeros(n);
+                    let x_t_psi;
+                    let x_ls_psi;
+                    let z_t_psi;
+                    let z_ls_psi;
                     match block_idx {
                         Self::BLOCK_T => {
-                            x_t_action = CustomFamilyPsiDesignAction::from_first_derivative(
+                            x_t_psi = resolve_custom_family_x_psi_map(
                                 deriv,
                                 n,
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleFamily threshold",
-                            )
-                            .ok();
-                            if let Some(action) = x_t_action.as_ref() {
-                                z_t_psi = action.forward_mul(beta_t.view());
-                            } else {
-                                let dense = resolve_custom_family_x_psi(
-                                    deriv,
-                                    n,
-                                    pt,
-                                    "BinomialLocationScaleFamily threshold",
-                                )?;
-                                z_t_psi = dense.dot(beta_t);
-                                x_t_psi = Some(dense);
-                            }
+                                &policy,
+                            )?;
+                            z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
+                                format!("BinomialLocationScaleFamily threshold forward_mul: {e}")
+                            })?;
+                            x_ls_psi = PsiDesignMap::Zero {
+                                nrows: n,
+                                ncols: pls,
+                            };
+                            z_ls_psi = Array1::<f64>::zeros(n);
                         }
                         Self::BLOCK_LOG_SIGMA => {
-                            x_ls_action = CustomFamilyPsiDesignAction::from_first_derivative(
+                            x_ls_psi = resolve_custom_family_x_psi_map(
                                 deriv,
                                 n,
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleFamily log-sigma",
-                            )
-                            .ok();
-                            if let Some(action) = x_ls_action.as_ref() {
-                                z_ls_psi = action.forward_mul(beta_ls.view());
-                            } else {
-                                let dense = resolve_custom_family_x_psi(
-                                    deriv,
-                                    n,
-                                    pls,
-                                    "BinomialLocationScaleFamily log-sigma",
-                                )?;
-                                z_ls_psi = dense.dot(beta_ls);
-                                x_ls_psi = Some(dense);
-                            }
+                                &policy,
+                            )?;
+                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
+                                format!("BinomialLocationScaleFamily log-sigma forward_mul: {e}")
+                            })?;
+                            x_t_psi = PsiDesignMap::Zero {
+                                nrows: n,
+                                ncols: pt,
+                            };
+                            z_t_psi = Array1::<f64>::zeros(n);
                         }
                         _ => return Ok(None),
                     }
                     return Ok(Some(BinomialLocationScaleJointPsiDirection {
                         block_idx,
                         local_idx,
-                        x_t_action,
-                        x_ls_action,
                         x_t_psi,
                         x_ls_psi,
                         z_t_psi,
@@ -11097,8 +11084,8 @@ impl BinomialLocationScaleFamily {
         }
 
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
-            dir_a.x_t_action.clone(),
-            dir_a.x_ls_action.clone(),
+            dir_a.x_t_psi.cloned_first_action(),
+            dir_a.x_ls_psi.cloned_first_action(),
             0..pt,
             pt..pt + pls,
             x_t,
@@ -11110,10 +11097,8 @@ impl BinomialLocationScaleFamily {
             &dh_tl,
             &dh_ll,
         )?;
-        let x_t_map =
-            first_psi_linear_map(dir_a.x_t_action.as_ref(), dir_a.x_t_psi.as_ref(), n, pt);
-        let x_ls_map =
-            first_psi_linear_map(dir_a.x_ls_action.as_ref(), dir_a.x_ls_psi.as_ref(), n, pls);
+        let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
+        let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_t = x_t_map.transpose_mul(r_t.view()) + x_t.t().dot(&dr_t);
         let score_ls = x_ls_map.transpose_mul(r_ls.view()) + x_ls.t().dot(&dr_ls);
         let mut score_psi = Array1::<f64>::zeros(total);
@@ -11242,14 +11227,10 @@ impl BinomialLocationScaleFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let total = pt + pls;
-        let x_t_i_map =
-            first_psi_linear_map(dir_i.x_t_action.as_ref(), dir_i.x_t_psi.as_ref(), n, pt);
-        let x_t_j_map =
-            first_psi_linear_map(dir_j.x_t_action.as_ref(), dir_j.x_t_psi.as_ref(), n, pt);
-        let x_ls_i_map =
-            first_psi_linear_map(dir_i.x_ls_action.as_ref(), dir_i.x_ls_psi.as_ref(), n, pls);
-        let x_ls_j_map =
-            first_psi_linear_map(dir_j.x_ls_action.as_ref(), dir_j.x_ls_psi.as_ref(), n, pls);
+        let x_t_i_map = dir_i.x_t_psi.as_linear_map_ref();
+        let x_t_j_map = dir_j.x_t_psi.as_linear_map_ref();
+        let x_ls_i_map = dir_i.x_ls_psi.as_linear_map_ref();
+        let x_ls_j_map = dir_j.x_ls_psi.as_linear_map_ref();
         let x_t_ab_map = second_psi_linear_map(
             second_drifts.x_t_ab_action.as_ref(),
             second_drifts.x_t_ab.as_ref(),
@@ -11660,10 +11641,8 @@ impl BinomialLocationScaleFamily {
         }
         let xi_t = x_t.dot(&d_beta_flat.slice(s![0..pt]));
         let xi_ls = x_ls.dot(&d_beta_flat.slice(s![pt..pt + pls]));
-        let x_t_map =
-            first_psi_linear_map(dir_a.x_t_action.as_ref(), dir_a.x_t_psi.as_ref(), n, pt);
-        let x_ls_map =
-            first_psi_linear_map(dir_a.x_ls_action.as_ref(), dir_a.x_ls_psi.as_ref(), n, pls);
+        let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
+        let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
 
         // Mixed contraction T_a[u] = D_beta H_{psi_a}[u].
         //
