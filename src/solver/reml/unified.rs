@@ -1779,6 +1779,57 @@ impl HyperOperator for ImplicitHyperOperator {
         self.matvec_with_shared_xz_into(&x_v, v, out, n_work.view_mut(), p_work.view_mut());
     }
 
+    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
+        let cols = out.ncols();
+        debug_assert!(start + cols <= self.p);
+
+        let n_obs = self.w_diag.len();
+        let mut basis = Array1::<f64>::zeros(self.p);
+        let mut x_col = Array1::<f64>::zeros(n_obs);
+        let mut dx_col = Array1::<f64>::zeros(n_obs);
+        let mut weighted = Array1::<f64>::zeros(n_obs);
+        let mut term = Array1::<f64>::zeros(self.p);
+
+        for local_col in 0..cols {
+            let global_col = start + local_col;
+            let mut out_col = out.column_mut(local_col);
+            out_col.assign(&self.s_psi.column(global_col));
+
+            design_matrix_column_into(&self.x_design, global_col, x_col.view_mut());
+            Zip::from(weighted.view_mut())
+                .and(self.w_diag.view())
+                .and(x_col.view())
+                .for_each(|dst, &w, &x| *dst = w * x);
+            term.assign(
+                &self
+                    .implicit_deriv
+                    .transpose_mul(self.axis, &weighted.view())
+                    .expect("radial scalar evaluation failed during implicit hyper transpose_mul"),
+            );
+            out_col += &term;
+
+            basis[global_col] = 1.0;
+            dx_col.assign(
+                &self
+                    .implicit_deriv
+                    .forward_mul(self.axis, &basis.view())
+                    .expect("radial scalar evaluation failed during implicit hyper forward_mul"),
+            );
+            basis[global_col] = 0.0;
+
+            Zip::from(weighted.view_mut())
+                .and(self.w_diag.view())
+                .and(dx_col.view())
+                .for_each(|dst, &w, &dx| *dst = w * dx);
+            design_matrix_transpose_apply_view_into(
+                &self.x_design,
+                weighted.view(),
+                term.view_mut(),
+            );
+            out_col += &term;
+        }
+    }
+
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         self.bilinear_view(v.view(), u.view())
     }
@@ -3527,6 +3578,36 @@ fn design_matrix_apply_view(design: &DesignMatrix, vector: ArrayView1<'_, f64>) 
     let mut output = Array1::<f64>::zeros(design.nrows());
     design_matrix_apply_view_into(design, vector, output.view_mut());
     output
+}
+
+fn design_matrix_column_into(
+    design: &DesignMatrix,
+    col: usize,
+    mut output: ArrayViewMut1<'_, f64>,
+) {
+    debug_assert!(col < design.ncols());
+    debug_assert_eq!(design.nrows(), output.len());
+
+    if let Some(dense) = design.as_dense() {
+        output.assign(&dense.column(col));
+        return;
+    }
+
+    if let Some(sparse) = design.as_sparse() {
+        let matrix = sparse.as_ref();
+        output.fill(0.0);
+        let (symbolic, values) = matrix.parts();
+        let col_ptr = symbolic.col_ptr();
+        let row_idx = symbolic.row_idx();
+        for idx in col_ptr[col]..col_ptr[col + 1] {
+            output[row_idx[idx]] = values[idx];
+        }
+        return;
+    }
+
+    let mut basis = Array1::<f64>::zeros(design.ncols());
+    basis[col] = 1.0;
+    output.assign(&design.matrixvectormultiply(&basis));
 }
 
 fn design_matrix_apply_view_into(
@@ -7611,13 +7692,17 @@ impl SparseCholeskyOperator {
     }
 
     fn trace_hinv_operator_exact(&self, op: &dyn HyperOperator) -> f64 {
+        let (range_start, range_end) = op
+            .block_local_data()
+            .map(|(_, start, end)| (start, end))
+            .unwrap_or((0, self.n_dim));
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut trace = 0.0_f64;
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
-        let mut start = 0usize;
+        let mut start = range_start;
 
-        while start < self.n_dim {
-            let end = (start + chunk).min(self.n_dim);
+        while start < range_end {
+            let end = (start + chunk).min(range_end);
             let cols = end - start;
             op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
@@ -7652,18 +7737,24 @@ impl SparseCholeskyOperator {
         trace
     }
 
-    fn solve_operator_columns_exact(&self, op: &dyn HyperOperator) -> Result<Array2<f64>, String> {
+    fn solve_operator_column_range_exact(
+        &self,
+        op: &dyn HyperOperator,
+        range_start: usize,
+        range_end: usize,
+    ) -> Result<Array2<f64>, String> {
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
-        let mut solved_all = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+        let cols_total = range_end - range_start;
+        let mut solved = Array2::<f64>::zeros((self.n_dim, cols_total));
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
-        let mut start = 0usize;
+        let mut start = range_start;
 
-        while start < self.n_dim {
-            let end = (start + chunk).min(self.n_dim);
+        while start < range_end {
+            let end = (start + chunk).min(range_end);
             let cols = end - start;
             op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
-            let solved = if cols == chunk {
+            let solved_block = if cols == chunk {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_block)
             } else {
                 let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
@@ -7671,15 +7762,28 @@ impl SparseCholeskyOperator {
             }
             .map_err(|e| {
                 format!(
-                    "SparseCholeskyOperator::solve_operator_columns_exact multi-solve failed: {e}"
+                    "SparseCholeskyOperator::solve_operator_column_range_exact multi-solve failed: {e}"
                 )
             })?;
-            solved_all
-                .slice_mut(ndarray::s![.., start..end])
-                .assign(&solved);
+            solved
+                .slice_mut(ndarray::s![.., start - range_start..end - range_start])
+                .assign(&solved_block);
             start = end;
         }
 
+        Ok(solved)
+    }
+
+    fn solve_operator_columns_exact(&self, op: &dyn HyperOperator) -> Result<Array2<f64>, String> {
+        let mut solved_all = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+        let (range_start, range_end) = op
+            .block_local_data()
+            .map(|(_, start, end)| (start, end))
+            .unwrap_or((0, self.n_dim));
+        let solved = self.solve_operator_column_range_exact(op, range_start, range_end)?;
+        solved_all
+            .slice_mut(ndarray::s![.., range_start..range_end])
+            .assign(&solved);
         Ok(solved_all)
     }
 
@@ -7692,10 +7796,14 @@ impl SparseCholeskyOperator {
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(self.n_dim.max(1));
         let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
         let mut trace = 0.0_f64;
-        let mut start = 0usize;
+        let (range_start, range_end) = op
+            .block_local_data()
+            .map(|(_, start, end)| (start, end))
+            .unwrap_or((0, self.n_dim));
+        let mut start = range_start;
 
-        while start < self.n_dim {
-            let end = (start + chunk).min(self.n_dim);
+        while start < range_end {
+            let end = (start + chunk).min(range_end);
             let cols = end - start;
             op.mul_basis_columns_into(start, rhs_block.slice_mut(ndarray::s![.., ..cols]));
 
