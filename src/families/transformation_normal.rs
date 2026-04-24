@@ -648,29 +648,42 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
 
-        // Log-likelihood: Σ [-½ h² + log(h')]
+        // Single fused pass over rows: accumulate ℓ = Σ w·(-½h² + log h') and
+        // build the weighted vectors the gradient and Hessian consume. The
+        // unfused version allocated five full-length O(n) temporaries
+        // (inv_h_prime, weighted_h, weighted_inv_h_prime, inv_h_prime_sq,
+        // weighted_inv_h_prime_sq) with two reciprocals per row; at biobank n
+        // that is ~40·n bytes of allocator churn and 2·n divisions per call.
+        // Here we allocate three vectors, divide once, and derive the squared
+        // quantity by multiplication.
         let mut log_likelihood = 0.0;
+        let mut weighted_h = Array1::<f64>::zeros(n);
+        let mut weighted_inv_hp = Array1::<f64>::zeros(n);
+        let mut weighted_inv_hp_sq = Array1::<f64>::zeros(n);
         for i in 0..n {
-            log_likelihood += self.weights[i] * (-0.5 * h[i] * h[i] + h_prime[i].ln());
+            let hi = h[i];
+            let hpi = h_prime[i];
+            let wi = self.weights[i];
+            let inv = 1.0 / hpi;
+            let w_inv = wi * inv;
+            log_likelihood += wi * (-0.5 * hi * hi + hpi.ln());
+            weighted_h[i] = wi * hi;
+            weighted_inv_hp[i] = w_inv;
+            weighted_inv_hp_sq[i] = w_inv * inv;
         }
 
-        // Gradient of log-likelihood: ∇ℓ = -X_val^T h + X_deriv^T (1/h')
-        let inv_h_prime = h_prime.mapv(|v| 1.0 / v);
-        let weighted_h = &h * self.weights.as_ref();
-        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
-        // gradient = -X_val^T h + X_deriv^T inv_h_prime
+        // Gradient of log-likelihood: ∇ℓ = -X_val^T (w·h) + X_deriv^T (w/h')
         let grad = {
-            let neg_xvt_h = self.x_val_kron.transpose_mul(&weighted_h).mapv(|v| -v);
-            let xdt_inv = self.x_deriv_kron.transpose_mul(&weighted_inv_h_prime);
-            neg_xvt_h + &xdt_inv
+            let xdt_inv = self.x_deriv_kron.transpose_mul(&weighted_inv_hp);
+            let xvt_h = self.x_val_kron.transpose_mul(&weighted_h);
+            xdt_inv - xvt_h
         };
 
-        // Hessian of negative log-likelihood: -∇²ℓ = X_val^T X_val + X_deriv^T diag(1/h'²) X_deriv
-        let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
-        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+        // Negative Hessian of log-likelihood:
+        //   -∇²ℓ = X_val^T diag(w) X_val + X_deriv^T diag(w/h'²) X_deriv
+        // The first term is precomputed once as `x_val_weighted_gram`.
         let hessian = {
-            // X_deriv^T diag(w) X_deriv where w = 1/h'^2
-            let mut xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
+            let mut xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_hp_sq);
             xtx_deriv += &self.x_val_weighted_gram;
             xtx_deriv
         };
@@ -2525,6 +2538,7 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         self.lifted_transpose_second(&self.response_deriv_basis, axis_d, axis_e, v)
     }
+
 }
 
 #[cfg(test)]

@@ -2699,12 +2699,14 @@ mod tests {
         );
         assert!(ok.is_ok(), "explicit probit should be accepted");
 
-        let err = materialize(
+        let err = match materialize(
             "Surv(age_entry, age_exit, event) ~ bmi + link(type=logit)",
             &data,
             &config,
-        )
-        .expect_err("non-probit link should be rejected");
+        ) {
+            Ok(_) => panic!("non-probit link should be rejected"),
+            Err(err) => err,
+        };
         assert!(err.contains("only link(type=probit)"));
     }
 

@@ -22,8 +22,8 @@ pub use data::{
 pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{
-    DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError, ResidentBytes,
-    ResourcePolicy,
+    ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
+    ResidentBytes, ResourcePolicy,
 };
 pub use solver::{estimate, mixture_link, pirls, seeding, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
