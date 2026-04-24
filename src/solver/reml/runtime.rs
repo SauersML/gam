@@ -26,6 +26,11 @@ struct TkCorrectionTerms {
     gradient: Option<Array1<f64>>,
 }
 
+struct TkPsiDirection {
+    h_dot: Array2<f64>,
+    x_tau: Array2<f64>,
+}
+
 /// Family-dependent derivative context shared by all assembly builders.
 ///
 /// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
@@ -3734,7 +3739,7 @@ impl<'a> RemlState<'a> {
         // predicate.
         self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
-        self.evaluate_efs(rho, &bundle, ext_coords, None)
+        self.evaluate_efs(rho, &bundle, ext_coords)
     }
 
     /// Unified EFS bridge: auto-dispatches backend, injects ext_coords,
@@ -3744,7 +3749,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         ext_coords: Vec<super::unified::HyperCoord>,
-        tk_psi_dirs: Option<&[TkPsiDirection]>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         let mut assembly = self.build_auto_assembly(
             rho,
@@ -3754,6 +3758,6 @@ impl<'a> RemlState<'a> {
         )?;
         assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
-        self.assemble_and_evaluate_efs(rho, bundle, assembly, tk_psi_dirs)
+        self.assemble_and_evaluate_efs(rho, bundle, assembly, None)
     }
 }
