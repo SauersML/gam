@@ -111,14 +111,16 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-/// Byte-limited LRU cache.
+/// Byte-limited LRU cache with an optional entry cap.
 ///
 /// Unlike an entry-count-limited LRU, this cache tracks the resident byte cost
 /// of each value (via [`ResidentBytes`]) and evicts the least-recently-used
 /// entries until the total resident bytes fit under `max_bytes`. This is the
 /// correct policy for biobank-scale payloads where a single cache entry (e.g.
 /// an n*K distance matrix) can itself be multiple gigabytes and an entry-count
-/// cap would silently blow the memory budget.
+/// cap would silently blow the memory budget. Small entry caps are still useful
+/// for payloads with known shape, such as owned PC data matrices shared across
+/// model blocks.
 pub struct ByteLruCache<K: Eq + Hash + Clone, V> {
     inner: Mutex<ByteLruInner<K, V>>,
     max_bytes: usize,
