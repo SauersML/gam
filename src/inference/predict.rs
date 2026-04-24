@@ -1557,6 +1557,9 @@ impl BernoulliMarginalSlopePredictor {
                             intercept,
                             slope,
                         );
+                        // `denested_partition_cells` scales the cell itself for
+                        // Gaussian frailty, so every coefficient partial of
+                        // F(a, theta) must carry the same probit scale as F_a.
                         let dc_db = Self::scale_coeff4(dc_db_raw, scale);
                         f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                             &dc_db,

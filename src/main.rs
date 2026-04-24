@@ -2276,6 +2276,19 @@ fn build_predict_input_for_model(
             let min_grid = derivative_grid[0];
             let max_grid = derivative_grid[derivative_grid.len() - 1];
             let grid_span = (max_grid - min_grid).abs().max(1.0);
+            let base_grid = derivative_grid.clone();
+            for window in base_grid.windows(2) {
+                let left = window[0];
+                let right = window[1];
+                let width = right - left;
+                if width <= 1.0e-12 * grid_span {
+                    continue;
+                }
+                for sidx in 1..4 {
+                    let frac = sidx as f64 / 4.0;
+                    derivative_grid.push(left + frac * width);
+                }
+            }
             let grid_guard = 0.25 * grid_span;
             derivative_grid.push(min_grid - grid_guard);
             derivative_grid.push(max_grid + grid_guard);

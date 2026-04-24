@@ -1,4 +1,5 @@
 use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, rrqr_nullspace_basis};
+use crate::basis::create_ispline_derivative_dense;
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
 use crate::quadrature::compute_gauss_hermite_n;
@@ -19,16 +20,15 @@ fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f64) -> f64 
 /// Precomputed per-span polynomial coefficient matrices for a structurally
 /// monotone anchored deviation basis.
 ///
-/// Raw coefficients are quadratic Bernstein control values for the deviation
-/// derivative `w'(x)`: interior endpoint controls shared across adjacent spans,
-/// plus one midpoint control per span. The left and right endpoint controls
-/// are fixed at `0`, so `w(x)` has constant tails and zero still means the
-/// identity map. The fitted coefficients live in the configured moment-anchor
-/// nullspace and are mapped back to these raw controls for monotonicity.
+/// Raw coefficients are monotone I-spline coefficients. The deviation
+/// derivative `w'(x)` is a nonnegative quadratic B-spline combination, so
+/// `w(x)` is a cubic I-spline combination with `C2` continuity at knots and
+/// constant tails. Zero coefficients still mean the identity map. The fitted
+/// coefficients live in the configured moment-anchor nullspace and are mapped
+/// back to these raw coefficients for monotonicity.
 ///
-/// On each knot span `w'(x)` is a quadratic Bernstein polynomial, so `w(x)` is
-/// truly piecewise cubic.  Exact monotonicity of the full transform `x + w(x)`
-/// is guaranteed by lower bounds on every raw derivative control value.
+/// Exact monotonicity of the full transform `x + w(x)` is guaranteed by lower
+/// bounds on every raw I-spline coefficient.
 #[derive(Clone, Debug)]
 pub struct DeviationRuntime {
     degree: usize,
@@ -219,15 +219,6 @@ impl DeviationRuntime {
             );
         }
         let n_spans = endpoint_points.len() - 1;
-        let interior_endpoint_controls = endpoint_points.len() - 2;
-        let midpoint_control_offset = interior_endpoint_controls;
-        let raw_basis_dim = interior_endpoint_controls + n_spans;
-        let mut raw_span_c0 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
-        let mut raw_span_c1 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
-        let mut raw_span_c2 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
-        let mut raw_span_c3 = Array2::<f64>::zeros((n_spans, raw_basis_dim));
-        let mut raw_right_boundary_value_row = Array1::<f64>::zeros(raw_basis_dim);
-
         for span_idx in 0..n_spans {
             let left = endpoint_points[span_idx];
             let right = endpoint_points[span_idx + 1];
@@ -237,40 +228,31 @@ impl DeviationRuntime {
                     "DeviationRuntime requires strictly increasing span endpoints at span {span_idx}: left={left}, right={right}"
                 ));
             }
-            let inv_width = 1.0 / width;
-            let inv_width_sq = inv_width * inv_width;
-            let mut active_controls = Vec::with_capacity(3);
-            if span_idx > 0 {
-                active_controls.push((span_idx - 1, 1.0, -inv_width, inv_width_sq / 3.0));
-            }
-            active_controls.push((
-                midpoint_control_offset + span_idx,
-                0.0,
-                inv_width,
-                -2.0 * inv_width_sq / 3.0,
-            ));
-            if span_idx + 1 < n_spans {
-                active_controls.push((span_idx, 0.0, 0.0, inv_width_sq / 3.0));
-            }
-
-            for &(basis_idx, c1, c2, c3) in &active_controls {
-                raw_span_c1[[span_idx, basis_idx]] = c1;
-                raw_span_c2[[span_idx, basis_idx]] = c2;
-                raw_span_c3[[span_idx, basis_idx]] = c3;
-            }
-
-            for basis_idx in 0..raw_basis_dim {
-                let full_span_integral = (raw_span_c1[[span_idx, basis_idx]] * width
-                    + raw_span_c2[[span_idx, basis_idx]] * width * width
-                    + raw_span_c3[[span_idx, basis_idx]] * width * width * width)
-                    / 1.0;
-                let next_value = raw_right_boundary_value_row[basis_idx] + full_span_integral;
-                if span_idx + 1 < n_spans {
-                    raw_span_c0[[span_idx + 1, basis_idx]] = next_value;
-                }
-                raw_right_boundary_value_row[basis_idx] = next_value;
-            }
         }
+        let span_lefts = Array1::from_iter((0..n_spans).map(|idx| endpoint_points[idx]));
+        let span_midpoints = Array1::from_iter(
+            (0..n_spans).map(|idx| 0.5 * (endpoint_points[idx] + endpoint_points[idx + 1])),
+        );
+        let right_endpoint = Array1::from_vec(vec![endpoint_points[n_spans]]);
+        let internal_degree = 2usize;
+        let raw_span_c0 =
+            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 0)
+                .map_err(|e| format!("DeviationRuntime cubic I-spline values failed: {e}"))?;
+        let raw_span_c1 =
+            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 1)
+                .map_err(|e| format!("DeviationRuntime cubic I-spline first derivatives failed: {e}"))?;
+        let raw_span_c2 =
+            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 2)
+                .map_err(|e| format!("DeviationRuntime cubic I-spline second derivatives failed: {e}"))?
+                .mapv(|value| 0.5 * value);
+        let raw_span_c3 =
+            create_ispline_derivative_dense(span_midpoints.view(), &knots, internal_degree, 3)
+                .map_err(|e| format!("DeviationRuntime cubic I-spline third derivatives failed: {e}"))?
+                .mapv(|value| value / 6.0);
+        let raw_right_boundary_values =
+            create_ispline_derivative_dense(right_endpoint.view(), &knots, internal_degree, 0)
+                .map_err(|e| format!("DeviationRuntime cubic I-spline right boundary failed: {e}"))?;
+        let raw_right_boundary_value_row = raw_right_boundary_values.row(0).to_owned();
 
         let coefficient_transform = anchor_coefficient_nullspace(
             &endpoint_points,
