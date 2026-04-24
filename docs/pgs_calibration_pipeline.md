@@ -58,8 +58,10 @@ $$
 **Anchor.** Zero transformation-normal deviation coefficients give
 $h(Y \mid x) = a(x) + b(x)\,Y$, i.e. affine Gaussianisation.
 
-**Duchon spline on PC space.** Multivariate penalised spline with a mixed
-polyharmonic-Matern penalty. Spectrum and partial-fraction coefficients are
+**Duchon radial basis on PC space.** Multivariate radial-basis spline with
+triple operator regularization on the final function. This is not the native
+spectral Duchon seminorm. For the hybrid Duchon-Matern kernel, the radial
+kernel spectrum and partial-fraction coefficients are
 $$
 \frac{1}{\rho^{2p}(\kappa^2 + \rho^2)^{s}}
 = \sum_{m=1}^{p} \frac{a_m}{\rho^{2m}} + \sum_{n=1}^{s} \frac{b_n}{(\kappa^2 + \rho^2)^{n}},

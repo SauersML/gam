@@ -41,8 +41,7 @@ def _build_synthetic_biobank(seed: int = 0, n: int = 200) -> pd.DataFrame:
     pc3 = rng.normal(0.0, 1.0, n)
     pc4 = rng.normal(0.0, 1.0, n)
 
-    raw_score = 0.4 * pc1 - 0.2 * pc2 + 0.15 * pc3 + rng.normal(0.0, 0.9, n)
-    pgs = (raw_score - raw_score.mean()) / raw_score.std(ddof=0)
+    pgs = 0.4 * pc1 - 0.2 * pc2 + 0.15 * pc3 + rng.normal(0.0, 0.9, n)
 
     # Bernoulli via probit so marginal-slope + probit-link has real signal.
     from math import erf, sqrt

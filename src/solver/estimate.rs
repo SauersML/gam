@@ -4296,15 +4296,8 @@ fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
     (epsilon, d_epsilon_d_raw)
 }
 
-fn computefdgradient(
-    reml_state: &RemlState,
-    rho: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    compute_fd_gradient(reml_state, rho, true)
-}
-
-/// Evaluate both analytic and finite-difference gradients for the external REML objective.
-pub fn evaluate_externalgradients<X>(
+/// Evaluate the analytic gradient of the external REML objective.
+pub fn evaluate_externalgradient<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -4312,7 +4305,7 @@ pub fn evaluate_externalgradients<X>(
     s_list: &[BlockwisePenalty],
     opts: &ExternalOptimOptions,
     rho: &Array1<f64>,
-) -> Result<(Array1<f64>, Array1<f64>), EstimationError>
+) -> Result<Array1<f64>, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
@@ -4323,12 +4316,12 @@ where
     }
 
     let p = x.ncols();
-    validate_penalty_specs(&specs, p, "evaluate_externalgradients")?;
+    validate_penalty_specs(&specs, p, "evaluate_externalgradient")?;
     let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
         &specs,
         &opts.nullspace_dims,
         p,
-        "evaluate_externalgradients",
+        "evaluate_externalgradient",
     )?;
     if rho.len() != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
@@ -4366,10 +4359,7 @@ where
         cfg.link_kind.sas_state().copied(),
     );
 
-    let analytic_grad = reml_state.compute_gradient(rho)?;
-    let fdgrad = computefdgradient(&reml_state, rho)?;
-
-    Ok((analytic_grad, fdgrad))
+    reml_state.compute_gradient(rho)
 }
 
 /// Evaluate the external cost and report the stabilization ridge used.
@@ -4442,7 +4432,7 @@ where
 }
 
 #[cfg(test)]
-mod fd_policy_tests {
+mod estimate_policy_tests {
     use super::reml::hyper::{LINK_BINOMIAL_AUX_MU_EPS, link_binomial_aux};
     use super::*;
     use crate::linalg::utils::max_abs_diag;
@@ -4451,63 +4441,6 @@ mod fd_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-    use std::cell::Cell;
-
-    struct NonFiniteFdState;
-
-    impl FdGradientState<String> for NonFiniteFdState {
-        fn compute_cost(&self, _rho: &Array1<f64>) -> Result<f64, String> {
-            Ok(f64::NAN)
-        }
-
-        fn last_ridge_used(&self) -> Option<f64> {
-            Some(0.0)
-        }
-
-        fn fd_gradient_error(message: String) -> String {
-            message
-        }
-    }
-
-    struct JitterFdState {
-        calls: Cell<usize>,
-    }
-
-    impl FdGradientState<String> for JitterFdState {
-        fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, String> {
-            let next = self.calls.get() + 1;
-            self.calls.set(next);
-            Ok(rho[0] * rho[0])
-        }
-
-        fn last_ridge_used(&self) -> Option<f64> {
-            Some(if self.calls.get() % 2 == 0 { 1e-6 } else { 0.0 })
-        }
-
-        fn fd_gradient_error(message: String) -> String {
-            message
-        }
-    }
-
-    #[test]
-    fn fd_gradient_rejects_non_finite_stencil() {
-        let err = compute_fd_gradient(&NonFiniteFdState, &array![0.0], false)
-            .expect_err("non-finite FD stencil should fail");
-        assert!(err.contains("non-finite stencil derivative"), "err={err}");
-    }
-
-    #[test]
-    fn fd_gradient_rejects_solver_ridge_jitter() {
-        let err = compute_fd_gradient(
-            &JitterFdState {
-                calls: Cell::new(0),
-            },
-            &array![1.0],
-            false,
-        )
-        .expect_err("ridge jitter should fail FD diagnostics");
-        assert!(err.contains("solver ridge jitter"), "err={err}");
-    }
 
     fn decode_invariant_test_fit() -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {

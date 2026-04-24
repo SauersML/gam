@@ -1283,7 +1283,9 @@ pub struct MaternSplineBasis {
     pub dimension: usize,
 }
 
-/// Duchon-like radial basis and penalties with explicit low-frequency null-space order.
+/// Duchon radial basis with triple operator regularization and explicit
+/// low-frequency null-space order. The penalty blocks are collocation
+/// operator Gram matrices, not the native spectral Duchon seminorm.
 #[derive(Debug, Clone)]
 pub struct DuchonSplineBasis {
     pub basis: Array2<f64>,
@@ -12744,6 +12746,9 @@ pub fn build_duchon_basiswithworkspace(
         identifiability_transform.as_ref().map(|z| z.view()),
         workspace,
     )?;
+    // Duchon radial basis with triple operator regularization. These are
+    // collocation operator penalties on the fitted function, not the native
+    // Fourier-space Duchon seminorm.
     let candidates = operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2);
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {

@@ -586,11 +586,16 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    _: &FitArgs,
+    _args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
-    options.use_outer_hessian = true;
-    options.compute_covariance = true;
+    Ok(options)
+}
+
+fn blockwise_options_from_survival_args(
+    _args: &SurvivalArgs,
+) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
+    let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
 
@@ -4815,6 +4820,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         &age_exit,
                         candidate,
                         SurvivalLikelihoodMode::LocationScale,
+                        Some(&survival_inverse_link),
                         time_anchor,
                         exact_derivative_guard,
                         &time_build,
@@ -4855,6 +4861,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_exit,
             &baseline_cfg,
             SurvivalLikelihoodMode::LocationScale,
+            Some(&survival_inverse_link),
             time_anchor,
             exact_derivative_guard,
             &time_build,
@@ -5135,7 +5142,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
             opts
         };
-        let options = blockwise_options_from_fit_args(args)?;
+        let options = gam::families::custom_family::BlockwiseFitOptions {
+            compute_covariance: true,
+            ..Default::default()
+        };
         let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -5182,6 +5192,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         &age_exit,
                         candidate,
                         SurvivalLikelihoodMode::MarginalSlope,
+                        None,
                         time_anchor,
                         exact_derivative_guard,
                         &time_build,
@@ -5231,6 +5242,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_exit,
             &baseline_cfg,
             SurvivalLikelihoodMode::MarginalSlope,
+            None,
             time_anchor,
             exact_derivative_guard,
             &time_build,
@@ -5446,6 +5458,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         &age_exit,
                         candidate,
                         likelihood_mode,
+                        None,
                         time_anchor,
                         latent_derivative_guard,
                         &time_build,
@@ -5488,6 +5501,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &age_exit,
             &baseline_cfg,
             likelihood_mode,
+            None,
             time_anchor,
             latent_derivative_guard,
             &time_build,
