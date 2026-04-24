@@ -2730,13 +2730,13 @@ pub struct InnerSolution<'dp> {
     pub deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
 
     // === Corrections ===
-    /// Frozen-curvature Tierney-Kadane surrogate correction to the Laplace approximation.
-    /// The runtime evaluates the TK scalar at the current PIRLS mode and holds
-    /// the observed-information derivative arrays fixed for its gradient.
+    /// Firth-only frozen-curvature Tierney-Kadane surrogate correction.
+    /// Standard non-Firth LAML leaves this at zero so the production objective
+    /// stays paired with the exact analytic unified derivatives.
     pub tk_correction: f64,
 
-    /// Gradient of the frozen-curvature TK surrogate with respect to active
-    /// outer coordinates.
+    /// Gradient of the Firth-only frozen-curvature TK surrogate with respect
+    /// to active outer coordinates.
     pub tk_gradient: Option<Array1<f64>>,
 
     /// Optional exact Jeffreys/Firth term in the active coefficient basis.
@@ -8476,6 +8476,9 @@ impl StochasticTraceEstimator {
         let mut x_r: Vec<Array1<f64>> = (0..total).map(|_| Array1::zeros(n_obs)).collect();
         let mut implicit_dx_u: Vec<Array1<f64>> =
             (0..n_ops).map(|_| Array1::zeros(n_obs)).collect();
+        let mut implicit_dx_r: Vec<Vec<Array1<f64>>> = (0..n_ops)
+            .map(|_| (0..total).map(|_| Array1::zeros(n_obs)).collect())
+            .collect();
         let mut implicit_u_s: Vec<Array1<f64>> = (0..n_ops).map(|_| Array1::zeros(p)).collect();
         let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
         let mut implicit_p_work = Array1::<f64>::zeros(p);
@@ -8543,6 +8546,13 @@ impl StochasticTraceEstimator {
                         "radial scalar evaluation failed during implicit derivative forward_mul",
                     ),
                 );
+                for e in 0..total {
+                    implicit_dx_r[idx][e].assign(
+                        &op.implicit_deriv.forward_mul(op.axis, &r.column(e)).expect(
+                            "radial scalar evaluation failed during implicit derivative forward_mul",
+                        ),
+                    );
+                }
             }
 
             // Precompute u^T S_psi for each implicit axis (for penalty dot products).
@@ -8566,8 +8576,7 @@ impl StochasticTraceEstimator {
                         let x_re = &x_r[e];
 
                         let dx_u = &implicit_dx_u[oi];
-                        let dx_re = op.implicit_deriv.forward_mul(op.axis, &r_e)
-                            .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+                        let dx_re = &implicit_dx_r[oi][e];
 
                         let w = &*op.w_diag;
                         let mut design_val = 0.0f64;
@@ -8596,8 +8605,7 @@ impl StochasticTraceEstimator {
                             let x_rd = &x_r[d];
 
                             let dx_u = &implicit_dx_u[oi];
-                            let dx_rd = op.implicit_deriv.forward_mul(op.axis, &r_d)
-                                .expect("radial scalar evaluation failed during implicit derivative forward_mul");
+                            let dx_rd = &implicit_dx_r[oi][d];
 
                             let w = &*op.w_diag;
                             let mut design_val = 0.0f64;
