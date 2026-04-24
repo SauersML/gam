@@ -196,3 +196,171 @@ def test_predict_rejects_schema_mismatch():
     model = gam.fit(training_rows(), "y ~ x")
     with pytest.raises(gam.SchemaMismatchError):
         model.predict([{"z": 1.0}])
+
+
+# ---------------------------------------------------------------------------
+# Pipeline smoke tests (task #14 / task #17).
+#
+# These three tests exercise the full PGS -> disease / survival pipeline
+# that the Nature-Genetics-style methods section is built around: Stage 1
+# conditional Gaussianization of the PGS on the PC manifold, Stage 2a
+# Bernoulli marginal-slope with a link-wiggle + logslope score-warp, and
+# Stage 2b survival marginal-slope with a Gompertz-Makeham baseline plus a
+# timewiggle. They go through the Python binding (``gam.fit`` /
+# ``model.predict``), not the CLI — the CLI contract is covered
+# separately by ``tests/integration_pit_pipeline.py``.
+# ---------------------------------------------------------------------------
+
+
+def _require_extension():
+    if not gam.build_info().get("available"):
+        pytest.skip("rust extension not built")
+
+
+def _pc_duchon(centers: int = 24) -> str:
+    return (
+        f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
+        "order=1, power=1, double_penalty=true)"
+    )
+
+
+def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank):
+    """Stage 1: fit h(PGS | PCs) ~ N(0, 1) and verify PIT properties.
+
+    After conditional Gaussianization on the PC manifold the predicted
+    z-scores should be approximately standard normal AND decorrelated
+    from each PC — that's the defining property of the anchored
+    deviation invariant used throughout the methods section.
+    """
+    _require_extension()
+    df = synthetic_biobank
+
+    model = gam.fit(
+        df,
+        f"PGS ~ {_pc_duchon(centers=24)}",
+        transformation_normal=True,
+    )
+    pred = model.predict(df, return_type="dict")
+    z = np.asarray(pred["eta"], dtype=float)
+
+    assert z.shape == (len(df),)
+    assert np.all(np.isfinite(z))
+    assert -0.3 < float(z.mean()) < 0.3
+    assert 0.7 < float(z.std(ddof=0)) < 1.3
+    for pc in ("pc1", "pc2", "pc3", "pc4"):
+        corr = float(np.corrcoef(z, df[pc].to_numpy())[0, 1])
+        assert abs(corr) < 0.3, f"|corr(z, {pc})| = {abs(corr):.3f} too large"
+
+
+def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
+    synthetic_biobank, tmp_path
+):
+    """Stage 2a: Bernoulli marginal-slope + linkwiggle + logslope score-warp.
+
+    Fit Stage 1 to produce ``PGS_cal`` (the anchored deviation), then fit
+    the disease model with a probit link, a main-formula link-wiggle, and
+    a logslope-formula that folds the PC manifold + another linkwiggle
+    into the score-warp. Roundtrip the saved model and check predictions
+    are valid probabilities that track ``PGS_cal`` monotonically.
+    """
+    _require_extension()
+    df = synthetic_biobank.copy()
+
+    calib = gam.fit(
+        df,
+        f"PGS ~ {_pc_duchon(centers=24)}",
+        transformation_normal=True,
+    )
+    df["PGS_cal"] = np.asarray(
+        calib.predict(df, return_type="dict")["eta"], dtype=float
+    )
+
+    disease_formula = (
+        f"disease ~ z + {_pc_duchon(centers=24)} "
+        "+ linkwiggle(degree=3, internal_knots=8)"
+    )
+    logslope = (
+        f"{_pc_duchon(centers=24)} + linkwiggle(degree=3, internal_knots=8)"
+    )
+    model = gam.fit(
+        df,
+        disease_formula,
+        family="bernoulli-marginal-slope",
+        link="probit",
+        z_column="PGS_cal",
+        logslope_formula=logslope,
+    )
+
+    path = tmp_path / "bernoulli_ms.gam"
+    model.save(path)
+    loaded = gam.load(path)
+    assert getattr(loaded, "is_marginal_slope", False) is True
+
+    pred = loaded.predict(df, return_type="dict")
+    probs = np.asarray(pred["mean"], dtype=float)
+    assert probs.shape == (len(df),)
+    assert np.all(np.isfinite(probs))
+    assert np.all((probs > 0.0) & (probs < 1.0))
+
+    # Monotone-ish in PGS_cal (loose threshold because Duchon + linkwiggle
+    # introduce real flex in the marginal response). Compute Spearman via
+    # numpy rank correlation to avoid pulling scipy in as a test dep.
+    pgs_rank = pd.Series(df["PGS_cal"].to_numpy()).rank().to_numpy()
+    prob_rank = pd.Series(probs).rank().to_numpy()
+    rho = float(np.corrcoef(pgs_rank, prob_rank)[0, 1])
+    assert rho > 0.3, f"spearman(PGS_cal, p) = {rho:.3f} not monotone enough"
+
+
+def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
+    synthetic_biobank,
+):
+    """Stage 2b: survival marginal-slope with GM baseline + timewiggle.
+
+    Fit left-truncated survival with a Gompertz-Makeham baseline, a
+    PC-manifold Duchon, a linkwiggle, and a timewiggle. Check that the
+    prediction object exposes hazard / survival queries at arbitrary
+    time grids and that the returned surfaces are finite, positive, and
+    monotone in time (survival decreasing, hazard finite).
+    """
+    _require_extension()
+    df = synthetic_biobank.copy()
+
+    calib = gam.fit(
+        df,
+        f"PGS ~ {_pc_duchon(centers=24)}",
+        transformation_normal=True,
+    )
+    df["PGS_cal"] = np.asarray(
+        calib.predict(df, return_type="dict")["eta"], dtype=float
+    )
+
+    formula = (
+        "Surv(age_entry, age_exit, event) ~ z "
+        f"+ {_pc_duchon(centers=24)} "
+        "+ linkwiggle(degree=3, internal_knots=8) "
+        "+ timewiggle(degree=3, internal_knots=6)"
+    )
+    model = gam.fit(
+        df,
+        formula,
+        family="survival",
+        survival_likelihood="marginal-slope",
+        baseline_target="gompertz-makeham",
+        z_column="PGS_cal",
+    )
+
+    pred = model.predict(df)
+    grid = np.array([45.0, 55.0, 65.0], dtype=float)
+
+    hazard = pred.hazard_at(grid)
+    assert hazard.shape == (len(df), grid.shape[0])
+    assert np.all(np.isfinite(hazard))
+    assert np.all(hazard > 0.0)
+
+    survival = pred.survival_at(grid)
+    assert survival.shape == (len(df), grid.shape[0])
+    assert np.all(np.isfinite(survival))
+    assert np.all((survival > 0.0) & (survival <= 1.0 + 1e-9))
+    # Survival is non-increasing in time for every sample.
+    deltas = np.diff(survival, axis=1)
+    assert np.all(deltas <= 1e-9)

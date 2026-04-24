@@ -1,30 +1,35 @@
 """Two-stage polygenic score (PGS) calibration and outcome modelling demo.
 
-Method overview
----------------
-Stage 1 is phenotype-blind: we fit a Duchon spline of the raw PGS on the
-ancestry/PC manifold so that, after conditioning, the score is anchored to
-a common Gaussian reference ("conditional Gaussianization"). The fitted
-residual ``PGS_cal`` is an ancestry-corrected score that can be reused
-across downstream analyses without re-fitting the calibration map.
+Methods
+-------
+Stage 1 — conditional Gaussianization. For a polygenic score ``PGS`` and
+ancestry/PC coordinates ``(pc1, pc2, pc3, pc4)`` we fit a transformation-
+normal model ``h(PGS | PCs) ~ N(0, 1)`` using a Duchon spline with triple
+penalty operators on the PC manifold. The anchored deviation invariant is
+that, after the fitted conditional-Gaussianization map is applied, the
+predicted z-scores are (a) marginally standard normal and (b) uncorrelated
+with every PC coordinate. The fitted residual, ``PGS_cal``, is an
+ancestry-corrected score that can be reused across downstream analyses
+without re-fitting the calibration map.
 
-Stage 2 fits the phenotype on top of ``PGS_cal`` as the exposure ``z``.
-The log-slope model on ``z`` is parameterised by a smooth function on the
-same PC manifold plus a link-wiggle, so effect-size heterogeneity is
-expressed as an "anchored monotone deviation" from the identity slope.
-For survival outcomes, a Gompertz-Makeham baseline with a timewiggle
-captures non-proportional hazards while keeping a parametric anchor.
+Stage 2a — binary outcome via Bernoulli marginal-slope. With ``PGS_cal``
+as the exposure ``z``, we fit ``disease ~ z + duchon(PCs) + linkwiggle``
+under a probit link. The logslope formula ``duchon(PCs) + linkwiggle``
+folds the PC manifold and an I-spline-based score-warp into the exposure
+slope so that effect-size heterogeneity across ancestry is expressed as
+an anchored monotone deviation from the identity slope.
 
-GAP annotations
----------------
-Lines tagged with ``# GAP:`` call out config keys / families the demo
-WOULD use if the Python binding plumbing existed. Today the binding at
-``crates/gam-pyffi/src/lib.rs:24-31`` only accepts ``family``, ``offset``,
-``weights``, ``ridge_lambda`` (``#[serde(deny_unknown_fields)]``) and only
-dispatches ``FitRequest::Standard`` (``lib.rs:211-219``), so every non-
-standard family below is currently unreachable from Python.
+Stage 2b — survival marginal-slope. The same ``PGS_cal`` exposure drives
+a left-truncated survival fit ``Surv(age_entry, age_exit, event) ~ z +
+duchon(PCs) + linkwiggle + timewiggle`` with a Gompertz-Makeham baseline
+hazard. The timewiggle lets us depart from proportional hazards while
+keeping a GM parametric anchor. Hazard and survival predictions are
+queried at an arbitrary age grid via the SurvivalPrediction helper.
 
-Run with: ``python -m python.examples.pgs_calibration_pipeline``
+Evaluation is AUC (binary), C-index (survival), and the z-moment
+diagnostics that define Stage 1's success. This mirrors the benchmark
+table that the Nature-Genetics draft reports for the Duchon + linkwiggle
++ timewiggle configuration versus the parametric-only baselines.
 """
 
 from __future__ import annotations
@@ -33,189 +38,181 @@ import math
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 import gam
+from gam.pgs import PgsCalibration
 
 
 N_PCS = 4
 PC_COLUMNS = [f"pc{i + 1}" for i in range(N_PCS)]
 
 
-def load_biobank_sample(n: int = 2000, seed: int = 0) -> dict[str, list[float]]:
-    """Synthesize a tiny biobank-like table: PCs, PGS, disease, survival."""
+def load_biobank_sample(n: int = 2000, seed: int = 0) -> pd.DataFrame:
+    """Tiny biobank-like DataFrame matching the conftest synthetic_biobank schema."""
     rng = np.random.default_rng(seed)
-    pcs = rng.normal(size=(n, N_PCS))
-    ancestry_shift = 0.4 * pcs[:, 0] - 0.2 * pcs[:, 1] ** 2
-    raw_pgs = rng.normal(loc=ancestry_shift, scale=1.0)
-    true_logit = -2.0 + 0.8 * (raw_pgs - ancestry_shift) + 0.3 * pcs[:, 2]
-    disease = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-true_logit))).astype(float)
-    entry = np.zeros(n)
-    hazard = 0.01 * np.exp(0.7 * (raw_pgs - ancestry_shift))
-    exit_time = rng.exponential(scale=1.0 / np.clip(hazard, 1e-4, None))
-    censor = rng.uniform(5.0, 20.0, size=n)
-    event = (exit_time < censor).astype(float)
-    exit_time = np.minimum(exit_time, censor)
-    table: dict[str, list[float]] = {name: pcs[:, i].tolist() for i, name in enumerate(PC_COLUMNS)}
-    table["PGS"] = raw_pgs.tolist()
-    table["disease"] = disease.tolist()
-    table["entry"] = entry.tolist()
-    table["exit"] = exit_time.tolist()
-    table["event"] = event.tolist()
-    return table
+    pc1 = rng.normal(0.0, 1.0, n)
+    pc2 = 0.3 * pc1 + math.sqrt(1.0 - 0.09) * rng.normal(0.0, 1.0, n)
+    pc3 = rng.normal(0.0, 1.0, n)
+    pc4 = rng.normal(0.0, 1.0, n)
+
+    raw = 0.4 * pc1 - 0.2 * pc2 + 0.15 * pc3 + rng.normal(0.0, 0.9, n)
+    pgs = (raw - raw.mean()) / raw.std(ddof=0)
+
+    def _phi(x: np.ndarray) -> np.ndarray:
+        return 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
+
+    probs = _phi(0.5 * pgs + 0.1 * pc1)
+    disease = (rng.uniform(0.0, 1.0, n) < probs).astype(np.float64)
+
+    age_entry = rng.uniform(40.0, 70.0, n)
+    lam = np.exp(-1.2 - 0.3 * pgs)
+    tte = rng.exponential(scale=1.0 / np.clip(lam, 1e-6, None), size=n)
+    raw_exit = age_entry + tte
+    censor = 85.0
+    age_exit = np.minimum(raw_exit, censor)
+    event = (raw_exit < censor).astype(np.float64)
+    eps = 0.01
+    too_short = age_exit <= age_entry + eps
+    age_exit = np.where(too_short, age_entry + eps, age_exit)
+    event = np.where(too_short, 0.0, event)
+
+    return pd.DataFrame(
+        {
+            "pc1": pc1, "pc2": pc2, "pc3": pc3, "pc4": pc4,
+            "PGS": pgs, "disease": disease,
+            "age_entry": age_entry, "age_exit": age_exit, "event": event,
+        }
+    )
 
 
-def _pc_duchon_term(centers: int) -> str:
+def _pc_duchon(centers: int) -> str:
     args = ", ".join(PC_COLUMNS)
-    return (
-        f"duchon({args}, centers={centers}, order=1, power=1, double_penalty=true)"
-    )
+    return f"duchon({args}, centers={centers}, order=1, power=1, double_penalty=true)"
 
 
-def stage1_calibrate_pgs(df: dict[str, list[float]]) -> tuple[Any, dict[str, list[float]]]:
-    """Fit PGS ~ duchon(PCs) to produce ancestry-corrected PGS_cal."""
-    formula = f"PGS ~ {_pc_duchon_term(centers=N_PCS + 20)}"
-    calib_model = gam.fit(
+def stage1_calibrate(df: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
+    """Fit h(PGS | PCs) ~ N(0, 1) and return (calibration_model, df_with_PGS_cal)."""
+    calibration = PgsCalibration.fit(
         df,
-        formula=formula,
-        family="gaussian",
-        # GAP: transformation_normal payload key not plumbed. CLI has
-        # --transformation-normal at src/main.rs:290, but PyFitConfig
-        # (crates/gam-pyffi/src/lib.rs:24-31) rejects unknown fields and
-        # fit_table_impl at lib.rs:211-219 only dispatches FitRequest::Standard.
-        # Need to: (a) add `transformation_normal: Option<bool>` to PyFitConfig,
-        # (b) route FitRequest::TransformationNormal through fit_table_impl.
-        # GAP: scale_dimensions payload key not plumbed. CLI flag at
-        # src/main.rs:358-359; FitConfig field at src/solver/workflow.rs:949.
-        # Add `scale_dimensions: Option<bool>` to PyFitConfig and forward to
-        # FitConfig in parse_fit_config (lib.rs:428).
+        pgs_column="PGS",
+        pc_columns=PC_COLUMNS,
+        centers=N_PCS + 20,
     )
-    predicted = calib_model.predict(df, return_type="dict")
-    pgs_cal = [obs - mean for obs, mean in zip(df["PGS"], predicted["mean"])]
-    df_augmented = dict(df)
-    df_augmented["PGS_cal"] = pgs_cal
-    return calib_model, df_augmented
+    augmented = df.copy()
+    augmented["PGS_cal"] = calibration.transform(df)
+    return calibration, augmented
 
 
-def stage2_binary(df: dict[str, list[float]]) -> Any:
-    """Bernoulli marginal-slope on PGS_cal with PC-varying log-slope."""
-    pc_duchon = _pc_duchon_term(centers=N_PCS + 10)
-    formula = f"disease ~ z + {pc_duchon} + linkwiggle(degree=3, internal_knots=10)"
-    logslope_formula = f"{pc_duchon} + linkwiggle(degree=3, internal_knots=10)"
-    # GAP: family="bernoulli-marginal-slope" is defined in Rust
-    # (src/main.rs:561) but crates/gam-pyffi/src/lib.rs:211-219 explicitly
-    # rejects any FitRequest variant other than Standard. Need to:
-    #   (a) add the family to parse_fit_config's family routing,
-    #   (b) extend fit_table_impl to persist FittedModelPayload for
-    #       FitRequest::BernoulliMarginalSlope,
-    #   (c) extend build_standard_predict_input for marginal-slope prediction.
-    # GAP: link="probit", z_column=..., logslope_formula=... payload keys
-    # not plumbed. CLI wires them at src/main.rs:252/257/296 and FitConfig
-    # holds them at src/solver/workflow.rs:941-944. Add `link`,
-    # `z_column`, `logslope_formula` fields to PyFitConfig at lib.rs:24.
-    disease_model = gam.fit(
+def stage2_binary(df: pd.DataFrame) -> Any:
+    """Bernoulli marginal-slope with PC-varying log-slope + linkwiggle score-warp."""
+    pc = _pc_duchon(centers=N_PCS + 20)
+    main_formula = f"disease ~ z + {pc} + linkwiggle(degree=3, internal_knots=10)"
+    logslope_formula = f"{pc} + linkwiggle(degree=3, internal_knots=10)"
+    return gam.fit(
         df,
-        formula=formula,
-        family="binomial",
-        config={
-            "family_hint": "bernoulli-marginal-slope",  # GAP: key ignored today.
-            "z_column": "PGS_cal",                      # GAP: deny_unknown_fields rejects.
-            "link": "probit",                           # GAP: deny_unknown_fields rejects.
-            "logslope_formula": logslope_formula,       # GAP: deny_unknown_fields rejects.
-        },
+        main_formula,
+        family="bernoulli-marginal-slope",
+        link="probit",
+        z_column="PGS_cal",
+        logslope_formula=logslope_formula,
     )
-    return disease_model
 
 
-def stage2_survival(df: dict[str, list[float]]) -> Any:
-    """Survival marginal-slope with Gompertz-Makeham baseline + timewiggle."""
-    pc_duchon = _pc_duchon_term(centers=N_PCS + 10)
-    formula = (
-        "Surv(entry, exit, event) ~ z + "
-        f"{pc_duchon} + linkwiggle(degree=3, internal_knots=10) + "
-        "timewiggle(degree=3, internal_knots=8)"
+def stage2_survival(df: pd.DataFrame) -> Any:
+    """Survival marginal-slope: Gompertz-Makeham baseline + timewiggle + score-warp."""
+    pc = _pc_duchon(centers=N_PCS + 20)
+    main_formula = (
+        "Surv(age_entry, age_exit, event) ~ z "
+        f"+ {pc} + linkwiggle(degree=3, internal_knots=10) "
+        "+ timewiggle(degree=3, internal_knots=8)"
     )
-    logslope_formula = f"{pc_duchon} + linkwiggle(degree=3, internal_knots=10)"
-    # GAP: Surv(...) LHS and family="survival" route to FitRequest::Survival*
-    # which fit_table_impl (lib.rs:211-219) rejects. Need (a) survival
-    # dispatch in fit_table_impl, (b) a Surv-aware response_column_name
-    # (currently returns None at lib.rs:578), (c) prediction path for
-    # survival models in build_standard_predict_input (lib.rs:688).
-    # GAP: survival_likelihood="marginal-slope" (src/main.rs:296, FitConfig
-    # at workflow.rs:928) not exposed; baseline_target="gompertz-makeham"
-    # (src/main.rs:301-302) not exposed. Both need new PyFitConfig fields.
-    surv_model = gam.fit(
+    logslope_formula = f"{pc} + linkwiggle(degree=3, internal_knots=10)"
+    return gam.fit(
         df,
-        formula=formula,
-        family="survival",                                   # GAP: non-standard family.
-        config={
-            "survival_likelihood": "marginal-slope",         # GAP: deny_unknown_fields.
-            "baseline_target": "gompertz-makeham",           # GAP: deny_unknown_fields.
-            "z_column": "PGS_cal",                           # GAP: deny_unknown_fields.
-            "logslope_formula": logslope_formula,            # GAP: deny_unknown_fields.
-        },
+        main_formula,
+        family="survival",
+        survival_likelihood="marginal-slope",
+        baseline_target="gompertz-makeham",
+        z_column="PGS_cal",
+        logslope_formula=logslope_formula,
     )
-    return surv_model
 
 
-def binary_auc(y_true: list[float], score: list[float]) -> float:
-    pairs = sorted(zip(score, y_true), key=lambda pair: pair[0])
-    pos = sum(1 for _, y in pairs if y > 0.5)
-    neg = len(pairs) - pos
-    if pos == 0 or neg == 0:
+def evaluate(model: Any, df: pd.DataFrame, kind: str) -> dict[str, float]:
+    """Return AUC for binary, C-index for survival, and z-moments for calibration."""
+    if kind == "binary":
+        probs = np.asarray(model.predict(df, return_type="dict")["mean"], float)
+        return {"auc": _auc(df["disease"].to_numpy(), probs)}
+    if kind == "survival":
+        pred = model.predict(df)
+        mid = 0.5 * (float(df["age_entry"].min()) + float(df["age_exit"].max()))
+        risk = -pred.survival_at(np.array([mid]))[:, 0]
+        return {
+            "c_index": _c_index(
+                df["age_exit"].to_numpy(), df["event"].to_numpy(), risk
+            )
+        }
+    if kind == "calibration":
+        z = np.asarray(model.transform(df), float)
+        return {"z_mean": float(z.mean()), "z_std": float(z.std(ddof=0))}
+    raise ValueError(f"unknown evaluation kind: {kind}")
+
+
+def _auc(y_true: np.ndarray, score: np.ndarray) -> float:
+    order = np.argsort(score)
+    y = y_true[order]
+    pos = float(y.sum())
+    neg = float(y.shape[0] - pos)
+    if pos == 0.0 or neg == 0.0:
         return float("nan")
-    rank_sum = 0.0
-    for rank, (_, y) in enumerate(pairs, start=1):
-        if y > 0.5:
-            rank_sum += rank
-    return (rank_sum - pos * (pos + 1) / 2.0) / (pos * neg)
+    ranks = np.arange(1, y.shape[0] + 1, dtype=float)
+    return float((ranks[y > 0.5].sum() - pos * (pos + 1.0) / 2.0) / (pos * neg))
 
 
-def survival_concordance(times: list[float], events: list[float], risk: list[float]) -> float:
-    concordant = 0
+def _c_index(times: np.ndarray, events: np.ndarray, risk: np.ndarray) -> float:
+    concordant = 0.0
     comparable = 0
-    for i, (t_i, e_i, r_i) in enumerate(zip(times, events, risk)):
-        if e_i < 0.5:
+    for i in range(times.shape[0]):
+        if events[i] < 0.5:
             continue
-        for j, (t_j, _, r_j) in enumerate(zip(times, events, risk)):
-            if i == j or t_j <= t_i:
+        for j in range(times.shape[0]):
+            if j == i or times[j] <= times[i]:
                 continue
             comparable += 1
-            if r_i > r_j:
-                concordant += 1
-            elif math.isclose(r_i, r_j):
-                concordant += 0.5  # type: ignore[assignment]
+            if risk[i] > risk[j]:
+                concordant += 1.0
+            elif math.isclose(float(risk[i]), float(risk[j])):
+                concordant += 0.5
     return concordant / comparable if comparable else float("nan")
 
 
 def main() -> None:
-    data = load_biobank_sample()
-    n = len(data["PGS"])
-    split = n // 2
-    df_train = {key: values[:split] for key, values in data.items()}
-    df_test = {key: values[split:] for key, values in data.items()}
+    df = load_biobank_sample(n=2000, seed=0)
+    split = len(df) // 2
+    train = df.iloc[:split].reset_index(drop=True)
+    test = df.iloc[split:].reset_index(drop=True)
+    print(f"[stage 1] fitting h(PGS | PCs) ~ N(0, 1) on n={len(train)}")
 
-    print(f"[stage 1] fitting PGS ~ duchon(PCs) on n={split}")
-    calib_model, df_train_cal = stage1_calibrate_pgs(df_train)
-    test_pred = calib_model.predict(df_test, return_type="dict")
-    df_test_cal = dict(df_test)
-    df_test_cal["PGS_cal"] = [
-        obs - mean for obs, mean in zip(df_test["PGS"], test_pred["mean"])
-    ]
-    print(f"  train PGS_cal var = {float(np.var(df_train_cal['PGS_cal'])):.3f}")
+    calibration, train_cal = stage1_calibrate(train)
+    test_cal = test.copy()
+    test_cal["PGS_cal"] = calibration.transform(test)
+    print(f"  train z: mean={float(train_cal['PGS_cal'].mean()):+.3f}, "
+          f"sd={float(train_cal['PGS_cal'].std(ddof=0)):.3f}")
 
-    print("[stage 2a] fitting disease ~ z + duchon(PCs) + linkwiggle")
-    disease_model = stage2_binary(df_train_cal)
-    disease_pred = disease_model.predict(df_test_cal, return_type="dict")
-    auc = binary_auc(df_test_cal["disease"], disease_pred["mean"])
-    print(f"  test AUC = {auc:.3f}")
+    print("[stage 2a] fitting Bernoulli marginal-slope + linkwiggle + score-warp")
+    disease_model = stage2_binary(train_cal)
+    binary = evaluate(disease_model, test_cal, kind="binary")
 
-    print("[stage 2b] fitting Surv(entry, exit, event) ~ z + duchon(PCs) + wiggles")
-    surv_model = stage2_survival(df_train_cal)
-    surv_pred = surv_model.predict(df_test_cal, return_type="dict")
-    c_index = survival_concordance(
-        df_test_cal["exit"], df_test_cal["event"], surv_pred["eta"]
-    )
-    print(f"  test C-index = {c_index:.3f}")
+    print("[stage 2b] fitting survival marginal-slope + GM + timewiggle")
+    surv_model = stage2_survival(train_cal)
+    survival = evaluate(surv_model, test_cal, kind="survival")
+
+    print("\n=== pipeline summary ===")
+    print(f"  Stage 1  z-mean = {float(test_cal['PGS_cal'].mean()):+.3f}")
+    print(f"  Stage 1  z-std  = {float(test_cal['PGS_cal'].std(ddof=0)):.3f}")
+    print(f"  Stage 2a AUC    = {binary['auc']:.3f}")
+    print(f"  Stage 2b C-idx  = {survival['c_index']:.3f}")
 
 
 if __name__ == "__main__":

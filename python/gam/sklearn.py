@@ -13,6 +13,14 @@ from ._tables import attach_target, response_column_name, table_columns
 
 __all__ = ["GAMClassifier", "GAMRegressor"]
 
+# No GAMSurvival wrapper: survival responses (e.g. Surv(time, event)) are a
+# two-column construct that does not fit scikit-learn's (X, y) contract, and
+# survival prediction is a per-time-grid hazard surface rather than a single
+# response vector. Users who want a scikit-style API for survival should call
+# gam.fit(...) directly with family="cox" (or equivalent) and operate on the
+# SurvivalPrediction object returned by Model.predict. For the common
+# polygenic-score calibration pipeline prefer gam.pgs.PgsCalibration.
+
 
 def _resolved_formula(formula: str, target_name: str) -> str:
     if "~" in formula:

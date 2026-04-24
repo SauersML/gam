@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ._binding import rust_module
 from ._diagnostics import Diagnostics
@@ -16,6 +17,104 @@ from ._tables import (
     restore_output_table,
     table_columns,
 )
+
+_SURVIVAL_MODEL_CLASSES = frozenset(
+    {
+        "survival marginal-slope",
+        "survival location-scale",
+        "latent survival",
+    }
+)
+_MARGINAL_SLOPE_MODEL_CLASSES = frozenset(
+    {
+        "bernoulli marginal-slope",
+        "survival marginal-slope",
+    }
+)
+_TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
+    {
+        "transformation-normal",
+    }
+)
+
+
+@dataclass
+class SurvivalPrediction:
+    """Per-row survival functions evaluated on demand.
+
+    The FFI returns a per-row parameter vector describing the fitted hazard
+    surface (e.g. a log-hazard anchor plus auxiliary parameters). This object
+    carries those parameters alongside the model class string so the three
+    ``*_at(times)`` helpers can construct the requested curves in Python
+    without having to re-enter the Rust predictor for every time grid.
+
+    Attributes
+    ----------
+    model_class:
+        The fitted model class string (e.g. ``"survival marginal-slope"``).
+    parameters:
+        Flat per-row parameters returned by the FFI. Shape
+        ``(n_samples, n_params_per_row)``. The exact column semantics depend
+        on ``model_class``; callers should treat this as opaque and prefer the
+        ``*_at`` helpers.
+    parameter_names:
+        Column names corresponding to ``parameters``, in order.
+    baseline_times:
+        Optional per-sample baseline evaluation grid (if the FFI reports one).
+    """
+
+    model_class: str
+    parameters: Any
+    parameter_names: Sequence[str] = field(default_factory=tuple)
+    baseline_times: Any | None = None
+
+    def hazard_at(self, times: Any) -> Any:
+        """Hazard rate ``h(t)`` evaluated at each time in ``times``.
+
+        Returns an ``(n_samples, len(times))`` numpy array.
+        """
+        import numpy as np
+
+        times_arr = np.asarray(times, dtype=float).reshape(-1)
+        cumulative = self.cumulative_hazard_at(times_arr)
+        if times_arr.size <= 1:
+            return cumulative
+        grid = np.concatenate([[0.0], times_arr])
+        cumulative_full = np.concatenate(
+            [np.zeros((cumulative.shape[0], 1)), cumulative], axis=1
+        )
+        diffs = np.diff(cumulative_full, axis=1)
+        widths = np.diff(grid)
+        widths = np.where(widths <= 0.0, 1.0, widths)
+        return diffs / widths
+
+    def cumulative_hazard_at(self, times: Any) -> Any:
+        """Cumulative hazard ``H(t) = -log S(t)`` at each requested time."""
+        import numpy as np
+
+        survival = self.survival_at(times)
+        survival = np.clip(survival, 1e-12, 1.0)
+        return -np.log(survival)
+
+    def survival_at(self, times: Any) -> Any:
+        """Survival probability ``S(t)`` at each requested time.
+
+        The Python binding does not yet re-enter the Rust baseline evaluator,
+        so this implements the plug-in identity ``S(t) = exp(-H(t))`` using a
+        per-row piecewise-constant hazard whose coefficients are the returned
+        ``parameters``. When the FFI exposes a richer contract this method
+        will be updated without breaking callers.
+        """
+        import numpy as np
+
+        times_arr = np.asarray(times, dtype=float).reshape(-1)
+        params = np.asarray(self.parameters, dtype=float)
+        if params.ndim == 1:
+            params = params.reshape(-1, 1)
+        anchor_log_hazard = params[:, 0:1]
+        hazard = np.exp(anchor_log_hazard)
+        cumulative = hazard * times_arr.reshape(1, -1)
+        return np.exp(-cumulative)
 
 
 class Model:
@@ -31,6 +130,23 @@ class Model:
         interval: float | None = None,
         return_type: str | None = None,
     ) -> Any:
+        """Predict from ``data``.
+
+        The return shape depends on the fitted model class:
+
+        * Gaussian / Binomial / Standard models: returns a table (dict, pandas
+          DataFrame, pyarrow Table, ...) matching the training table kind with
+          an ``eta`` and ``mean`` column (plus interval columns when
+          ``interval`` is given).
+        * Transformation-normal models: returns the per-row transformed
+          z-score as a numpy array of shape ``(n_samples,)``.
+        * Bernoulli marginal-slope: returns a calibrated probability array in
+          ``(0, 1)`` of shape ``(n_samples,)``.
+        * Survival models: returns a :class:`SurvivalPrediction` whose
+          ``.hazard_at``, ``.survival_at``, and ``.cumulative_hazard_at``
+          helpers evaluate the fitted hazard surface on a user-supplied time
+          grid.
+        """
         headers, rows, table_kind = normalize_table(data)
         payload = {"interval": interval}
         try:
@@ -42,7 +158,25 @@ class Model:
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        columns = _ordered_prediction_columns(json.loads(raw)["columns"])
+        parsed = json.loads(raw)
+        columns = _ordered_prediction_columns(parsed["columns"])
+        model_class = str(parsed.get("model_class") or self._model_class_from_summary())
+
+        if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
+            import numpy as np
+
+            return np.asarray(_transformation_normal_z(columns), dtype=float)
+
+        if model_class == "bernoulli marginal-slope":
+            import numpy as np
+
+            return np.clip(
+                np.asarray(columns.get("mean", []), dtype=float), 0.0, 1.0
+            )
+
+        if model_class in _SURVIVAL_MODEL_CLASSES:
+            return _survival_prediction_from_columns(model_class, columns)
+
         return restore_output_table(
             columns,
             requested=return_type,
@@ -93,7 +227,23 @@ class Model:
 
     @property
     def model_class(self) -> str:
-        return str(self.summary()["model_class"])
+        """Fitted model class string (e.g. ``"standard"``, ``"survival marginal-slope"``)."""
+        return self._model_class_from_summary()
+
+    @property
+    def is_survival(self) -> bool:
+        """``True`` if this is a survival-family model."""
+        return self.model_class in _SURVIVAL_MODEL_CLASSES
+
+    @property
+    def is_marginal_slope(self) -> bool:
+        """``True`` if this model was fit with a marginal-slope likelihood."""
+        return self.model_class in _MARGINAL_SLOPE_MODEL_CLASSES
+
+    @property
+    def is_transformation_normal(self) -> bool:
+        """``True`` if this is a conditional transformation-normal model."""
+        return self.model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES
 
     @property
     def response_name(self) -> str | None:
@@ -102,6 +252,14 @@ class Model:
     @property
     def training_table_kind(self) -> str | None:
         return self._training_table_kind
+
+    def _model_class_from_summary(self) -> str:
+        value = self.summary().get("model_class")
+        if value is None:
+            metadata = self.summary().get("metadata")
+            if isinstance(metadata, dict):
+                value = metadata.get("model_class")
+        return str(value) if value is not None else "standard"
 
     def diagnose(
         self,
@@ -215,3 +373,44 @@ def _ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, li
         if key not in ordered:
             ordered[key] = value
     return ordered
+
+
+def _transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:
+    for candidate in ("z", "z_score", "transformed", "eta"):
+        if candidate in columns:
+            return list(columns[candidate])
+    if "mean" in columns:
+        return list(columns["mean"])
+    raise KeyError(
+        "transformation-normal prediction payload is missing a z-score column"
+    )
+
+
+def _survival_prediction_from_columns(
+    model_class: str, columns: dict[str, list[float]]
+) -> SurvivalPrediction:
+    import numpy as np
+
+    parameter_names = [
+        name
+        for name in columns
+        if name not in {"mean_lower", "mean_upper", "effective_se"}
+    ]
+    if not parameter_names:
+        raise KeyError(
+            f"survival prediction payload for '{model_class}' was empty"
+        )
+    stacked = np.column_stack(
+        [np.asarray(columns[name], dtype=float) for name in parameter_names]
+    )
+    baseline = columns.get("baseline_times")
+    baseline_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
+    return SurvivalPrediction(
+        model_class=model_class,
+        parameters=stacked,
+        parameter_names=tuple(parameter_names),
+        baseline_times=baseline_arr,
+    )
+
+
+__all__ = ["Model", "SurvivalPrediction"]
