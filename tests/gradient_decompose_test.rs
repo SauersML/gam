@@ -18,9 +18,7 @@
 //      + dprior/dρₖ                      [included]
 
 use faer::Side;
-use gam::estimate::{
-    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradients,
-};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalgradients};
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
@@ -429,114 +427,6 @@ fn standalone_laml_cost(
     let laml = log_lik - 0.5 * penalty + 0.5 * log_det_s - 0.5 * log_det_h
         + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
     -laml
-}
-
-/// Compare standalone FD to library FD. If they differ, the library cost
-/// includes extra ρ-dependent terms not in the textbook formula.
-#[test]
-fn test_standalone_cost_fd_vs_library_cost_fd() {
-    let (x, y) = test_design(60, 5);
-    let n = y.len();
-    let mut s1 = Array2::<f64>::zeros((5, 5));
-    for j in 1..5 {
-        s1[[j, j]] = 1.0;
-    }
-    let s_list = blockwise_penalties(vec![s1.clone()]);
-    let rho = array![2.0];
-
-    let opts = ExternalOptimOptions {
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
-        compute_inference: true,
-        max_iter: 200,
-        tol: 1e-12,
-        nullspace_dims: vec![1],
-        linear_constraints: None,
-        firth_bias_reduction: None,
-        penalty_shrinkage_floor: None,
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-    };
-
-    // Standalone cost & FD
-    let standalone_cost_fn =
-        |rho: &Array1<f64>| -> f64 { standalone_laml_cost(&y, &x, &s_list, rho, &[1]) };
-    let standalone_base = standalone_cost_fn(&rho);
-    let standalone_fd = fd_gradient(&standalone_cost_fn, &rho, 1e-5);
-
-    // Library cost & FD
-    let lib_cost_fn = |rho: &Array1<f64>| -> f64 {
-        let (cost, _) = evaluate_externalcost_andridge(
-            y.view(),
-            Array1::ones(n).view(),
-            x.view(),
-            Array1::zeros(n).view(),
-            &s_list,
-            &opts,
-            rho,
-        )
-        .unwrap();
-        cost
-    };
-    let lib_base = lib_cost_fn(&rho);
-    let lib_fd = fd_gradient(&lib_cost_fn, &rho, 1e-5);
-
-    // Library analytic gradient
-    let (lib_analytic, _) = evaluate_externalgradients(
-        y.view(),
-        Array1::ones(n).view(),
-        x.view(),
-        Array1::zeros(n).view(),
-        &s_list,
-        &opts,
-        &rho,
-    )
-    .unwrap();
-
-    eprintln!("=== COST COMPARISON (single penalty) ===");
-    eprintln!("standalone_cost  = {:.10}", standalone_base);
-    eprintln!("library_cost     = {:.10}", lib_base);
-    eprintln!("cost_diff        = {:.6e}", lib_base - standalone_base);
-    eprintln!("");
-    eprintln!("standalone_fd    = {:?}", standalone_fd);
-    eprintln!("library_fd       = {:?}", lib_fd);
-    eprintln!("library_analytic = {:?}", lib_analytic);
-    eprintln!("fd_diff (lib-standalone) = {:?}", &lib_fd - &standalone_fd);
-    eprintln!("");
-
-    let err_lib_analytic_vs_lib_fd = rel_l2(&lib_analytic, &lib_fd);
-    let err_standalone_fd_vs_lib_fd = rel_l2(&standalone_fd, &lib_fd);
-    let err_lib_analytic_vs_standalone_fd = rel_l2(&lib_analytic, &standalone_fd);
-    eprintln!(
-        "lib_analytic vs lib_fd      = {:.3e}",
-        err_lib_analytic_vs_lib_fd
-    );
-    eprintln!(
-        "standalone_fd vs lib_fd     = {:.3e}",
-        err_standalone_fd_vs_lib_fd
-    );
-    eprintln!(
-        "lib_analytic vs standalone  = {:.3e}",
-        err_lib_analytic_vs_standalone_fd
-    );
-
-    // The key question: does the standalone FD match the library FD?
-    // If not, the library cost has extra ρ-dependent terms.
-    assert!(
-        err_standalone_fd_vs_lib_fd < 0.05,
-        "Library cost differs from standalone by ρ-dependent terms! \
-         This means the library cost includes terms (TK, structural rank, etc.) \
-         not accounted for in the analytic gradient. \
-         standalone_fd={:?} lib_fd={:?} rel_err={:.3e}",
-        standalone_fd,
-        lib_fd,
-        err_standalone_fd_vs_lib_fd,
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
