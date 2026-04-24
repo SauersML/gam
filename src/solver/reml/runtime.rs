@@ -3396,9 +3396,10 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
-        let has_ext = !ext_coords.is_empty();
+        let has_firth_psi_ext = ext_coords.iter().any(|coord| !coord.is_penalty_like)
+            && self.config.firth_bias_reduction;
         if compute_gradient_for_tk(mode)
-            && has_ext
+            && has_firth_psi_ext
             && self.config.link_function() != LinkFunction::Identity
         {
             return Err(EstimationError::InvalidInput(

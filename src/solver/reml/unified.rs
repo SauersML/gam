@@ -4995,8 +4995,15 @@ impl StoredFirstDrift {
         }
     }
 
-    fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
+    fn scaled_add_apply_with_work(
+        &self,
+        v: ArrayView1<'_, f64>,
+        scale: f64,
+        out: &mut Array1<f64>,
+        work: &mut Array1<f64>,
+    ) {
         debug_assert_eq!(v.len(), out.len());
+        debug_assert_eq!(work.len(), out.len());
         if scale == 0.0 {
             return;
         }
@@ -5012,10 +5019,9 @@ impl StoredFirstDrift {
             }
         }
         if !self.operators.is_empty() {
-            let mut work = Array1::<f64>::zeros(out.len());
             for op in &self.operators {
                 op.mul_vec_into(v, work.view_mut());
-                out.scaled_add(scale, &work);
+                out.scaled_add(scale, work);
             }
         }
     }
@@ -5208,64 +5214,99 @@ impl UnifiedOuterHessianOperator {
         out
     }
 
-    fn pair_rhs(&self, row: usize, col: usize) -> Array1<f64> {
+    fn scaled_add_pair_rhs(
+        &self,
+        row: usize,
+        col: usize,
+        scale: f64,
+        out: &mut Array1<f64>,
+        work: &mut Array1<f64>,
+    ) {
+        if scale == 0.0 {
+            return;
+        }
         let row_coord = &self.coords[row];
         let col_coord = &self.coords[col];
-        let pair_g = self.pair_g[row][col]
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| Array1::<f64>::zeros(self.hop.dim()));
+        let pair_g = self.pair_g[row][col].as_ref();
 
         match (row_coord.is_ext(), col_coord.is_ext()) {
             (false, false) => {
-                let mut rhs = Array1::<f64>::zeros(self.hop.dim());
-                col_coord
-                    .total_drift
-                    .scaled_add_apply(row_coord.v.view(), 1.0, &mut rhs);
-                row_coord
-                    .base_drift
-                    .scaled_add_apply(col_coord.v.view(), 1.0, &mut rhs);
-                rhs -= &pair_g;
-                rhs
+                col_coord.total_drift.scaled_add_apply_with_work(
+                    row_coord.v.view(),
+                    scale,
+                    out,
+                    work,
+                );
+                row_coord.base_drift.scaled_add_apply_with_work(
+                    col_coord.v.view(),
+                    scale,
+                    out,
+                    work,
+                );
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(-scale, pair_g);
+                }
             }
             (false, true) => {
-                let mut rhs = pair_g;
-                row_coord
-                    .base_drift
-                    .scaled_add_apply(col_coord.v.view(), -1.0, &mut rhs);
-                col_coord
-                    .total_drift
-                    .scaled_add_apply(row_coord.v.view(), -1.0, &mut rhs);
-                rhs
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(scale, pair_g);
+                }
+                row_coord.base_drift.scaled_add_apply_with_work(
+                    col_coord.v.view(),
+                    -scale,
+                    out,
+                    work,
+                );
+                col_coord.total_drift.scaled_add_apply_with_work(
+                    row_coord.v.view(),
+                    -scale,
+                    out,
+                    work,
+                );
             }
             (true, false) => {
-                let mut rhs = pair_g;
-                col_coord
-                    .base_drift
-                    .scaled_add_apply(row_coord.v.view(), -1.0, &mut rhs);
-                row_coord
-                    .total_drift
-                    .scaled_add_apply(col_coord.v.view(), -1.0, &mut rhs);
-                rhs
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(scale, pair_g);
+                }
+                col_coord.base_drift.scaled_add_apply_with_work(
+                    row_coord.v.view(),
+                    -scale,
+                    out,
+                    work,
+                );
+                row_coord.total_drift.scaled_add_apply_with_work(
+                    col_coord.v.view(),
+                    -scale,
+                    out,
+                    work,
+                );
             }
             (true, true) => {
-                let mut rhs = pair_g;
-                row_coord
-                    .base_drift
-                    .scaled_add_apply(col_coord.v.view(), -1.0, &mut rhs);
-                col_coord
-                    .total_drift
-                    .scaled_add_apply(row_coord.v.view(), -1.0, &mut rhs);
-                rhs
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(scale, pair_g);
+                }
+                row_coord.base_drift.scaled_add_apply_with_work(
+                    col_coord.v.view(),
+                    -scale,
+                    out,
+                    work,
+                );
+                col_coord.total_drift.scaled_add_apply_with_work(
+                    row_coord.v.view(),
+                    -scale,
+                    out,
+                    work,
+                );
             }
         }
     }
 
     fn pair_rhs_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.hop.dim());
+        let mut work = Array1::<f64>::zeros(self.hop.dim());
         for j in 0..alpha.len() {
             if alpha[j] != 0.0 {
-                out.scaled_add(alpha[j], &self.pair_rhs(idx, j));
+                self.scaled_add_pair_rhs(idx, j, alpha[j], &mut out, &mut work);
             }
         }
         out
