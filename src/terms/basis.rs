@@ -12159,22 +12159,6 @@ fn build_duchon_basis_designwithworkspace(
         None
     };
 
-    // When 2(p+s) > d the RKHS admits classical pointwise evaluation and the
-    // center-collision diagonal has a closed-form scaling shortcut.  When
-    // 2(p+s) <= d the kernel is still well-defined and fully supported; the
-    // diagonal values are computed from the assembled partial-fraction expansion
-    // instead of the scaling shortcut.
-    let regularity_margin = 2 * p_order + 2 * s_order;
-    if regularity_margin <= d {
-        log::debug!(
-            "Duchon basis using assembled diagonal convention (2p+2s={} <= d={}, p={}, s={})",
-            regularity_margin,
-            d,
-            p_order,
-            s_order
-        );
-    }
-
     // Practical safe operating range (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min]
     // where r_min/r_max are pairwise center distance extrema. Under
@@ -19412,6 +19396,37 @@ mod tests {
         };
         let err = match build_duchon_basis(data.view(), &spec) {
             Ok(_) => panic!("pure Duchon default tuple violates the nullspace-order condition"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("power < dimension/2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pure_duchon_default_counterexample_is_rejected() {
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let block_order =
+            pure_duchon_block_order(duchon_p_from_nullspace_order(DuchonNullspaceOrder::Zero), 2);
+        let k23 = polyharmonic_kernel(2.0_f64.sqrt(), block_order, 2);
+        let alpha = [-2.0, 1.0, 1.0];
+        let qform = 2.0 * alpha[1] * alpha[2] * k23;
+        assert!(
+            qform < 0.0,
+            "the raw pure Duchon default tuple is indefinite under the constant-only side condition"
+        );
+
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: None,
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+        };
+        let err = match build_duchon_basis(centers.view(), &spec) {
+            Ok(_) => panic!("indefinite pure Duchon counterexample should be rejected"),
             Err(err) => err,
         };
         assert!(
