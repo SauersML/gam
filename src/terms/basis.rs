@@ -3969,8 +3969,8 @@ fn build_aniso_design_psi_derivatives_shared(
     // recomputes (q, t, s_a) on the fly during every matvec.
     if use_implicit {
         let op = ImplicitDesignPsiDerivative::new_streaming(
-            Arc::new(data.to_owned()),
-            Arc::new(centers.to_owned()),
+            shared_owned_data_matrix_from_view(data),
+            shared_owned_centers_matrix_from_view(centers),
             eta.to_vec(),
             radial_kind,
             ident_transform,

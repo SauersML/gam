@@ -537,31 +537,28 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     }
 
     /// Fill a dense row chunk without materializing the full matrix.
+    /// Required: every implementor must provide row-local access here.
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        mut out: ArrayViewMut2<'_, f64>,
-    ) -> Result<(), MatrixMaterializationError> {
-        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "DenseDesignOperator::row_chunk_into shape mismatch",
-            });
-        }
-        let chunk = self.row_chunk(rows);
-        out.assign(&chunk);
-        Ok(())
-    }
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError>;
 
     /// Extract a dense row chunk without materializing the full matrix.
+    /// Non-panicking owned-chunk API; preferred over the legacy `row_chunk`.
     fn try_row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, MatrixMaterializationError> {
         let mut out = Array2::<f64>::zeros((rows.end - rows.start, self.ncols()));
         self.row_chunk_into(rows, out.view_mut())?;
         Ok(out)
     }
 
-    /// Extract a dense row chunk. Implementations must provide true row-local
-    /// access; there is intentionally no default full-dense fallback.
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64>;
+    /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
+    /// `try_row_chunk(...)?` to propagate materialization errors.
+    // TODO(material-policy-migration): replace call sites with try_row_chunk
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.try_row_chunk(rows)
+            .expect("DenseDesignOperator::row_chunk (legacy; migrate to try_row_chunk)")
+    }
 
     /// Borrow dense storage when this operator already owns it.
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
