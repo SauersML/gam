@@ -3648,8 +3648,10 @@ pub fn reml_laml_evaluate(
         }
     }
 
-    if grad.iter().any(|v| !v.is_finite()) {
-        return Err("REML/LAML gradient contains non-finite entries".to_string());
+    if let Some((idx, value)) = grad.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(format!(
+            "REML/LAML gradient contains non-finite entry at index {idx}: {value}"
+        ));
     }
 
     // Outer Hessian (if requested).

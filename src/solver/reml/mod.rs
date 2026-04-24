@@ -420,8 +420,12 @@ mod tests {
     ) -> Result<f64, EstimationError> {
         let mut theta = Array1::<f64>::zeros(rho.len() + 1);
         theta.slice_mut(s![..rho.len()]).assign(rho);
-        let (_, gradient, _) =
-            compute_joint_hypercostgradienthessian(state, &theta, rho.len(), &[hyper])?;
+        let (_, gradient, _) = state.compute_joint_hyper_eval_with_order(
+            &theta,
+            rho.len(),
+            &[hyper],
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        )?;
         Ok(gradient[rho.len()])
     }
 
@@ -932,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_exacthessian_matchesfd_on_rank_deficient_design() {
+    fn firth_exacthessian_rejects_without_tk_second_derivatives() {
         // Rank-deficient X: the 4th column is 2x the 2nd column.
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
@@ -990,36 +994,13 @@ mod tests {
         .expect("state");
         let rho = array![0.1, -0.2];
         let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
-        let h_exact = state
+        let err = state
             .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
-            .expect("exact firth hessian");
-        let h_fallback = state
-            .compute_lamlhessian_diagnostic_numeric(&rho)
-            .expect("diagnostic numeric hessian");
-
-        assert!(h_exact.iter().all(|v: &f64| v.is_finite()));
-        assert!(h_fallback.iter().all(|v: &f64| v.is_finite()));
-        for i in 0..h_exact.nrows() {
-            for j in 0..i {
-                assert!(
-                    (h_exact[[i, j]] - h_exact[[j, i]]).abs() < 1e-8,
-                    "exact Hessian asymmetry at ({i},{j})"
-                );
-            }
-        }
-
-        let diff = &h_exact - &h_fallback;
-        let num = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let den = h_fallback
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt()
-            .max(1e-8);
-        let rel = num / den;
+            .expect_err("Firth exact Hessian should require analytic TK second derivatives");
+        let msg = err.to_string();
         assert!(
-            rel < 8.0e-1,
-            "Firth exact-vs-diagnostic-numeric Hessian mismatch too large: rel={rel:.3e}, exact={h_exact:?}, fallback={h_fallback:?}"
+            msg.contains("Tierney-Kadane outer Hessian requires analytic second derivatives"),
+            "unexpected error: {msg}"
         );
     }
 
@@ -1137,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_supports_penalty_only_direction() {
+    fn firth_logit_directional_hypergradient_rejects_penalty_only_without_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1164,16 +1145,17 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let g = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect("firth penalty-only directional gradient should evaluate");
+        let err = single_directional_tau_gradient(&state, &rho, hyper)
+            .expect_err("Firth penalty-only directional gradient should require analytic TK psi derivatives");
+        let msg = err.to_string();
         assert!(
-            g.is_finite(),
-            "non-finite Firth penalty-only directional gradient"
+            msg.contains("Tierney-Kadane psi gradients require analytic derivatives"),
+            "unexpected error: {msg}"
         );
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_supports_design_moving_direction() {
+    fn firth_logit_directional_hypergradient_rejects_design_moving_without_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1200,11 +1182,12 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let g = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect("firth design-moving directional gradient should evaluate");
+        let err = single_directional_tau_gradient(&state, &rho, hyper)
+            .expect_err("Firth design-moving directional gradient should require analytic TK psi derivatives");
+        let msg = err.to_string();
         assert!(
-            g.is_finite(),
-            "non-finite Firth design-moving directional gradient"
+            msg.contains("Tierney-Kadane psi gradients require analytic derivatives"),
+            "unexpected error: {msg}"
         );
     }
 
