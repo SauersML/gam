@@ -175,6 +175,9 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "transformation-normal",
             "bernoulli-marginal-slope",
             "survival-marginal-slope",
+            "survival-location-scale",
+            "latent-survival",
+            "latent-binary",
             "gaussian-location-scale",
             "binomial-location-scale",
         ],
@@ -402,23 +405,65 @@ fn fit_table_impl(
                 ls_result,
             )?
         }
-        FitRequest::SurvivalLocationScale(_) => {
-            return Err(
-                "survival location-scale fitting is not yet plumbed through the Python FFI; use survival_likelihood='marginal-slope' or the CLI"
-                    .to_string(),
-            );
+        FitRequest::SurvivalLocationScale(ls_request) => {
+            let weights = ls_request.spec.weights.clone();
+            let fit_result = fit_model(FitRequest::SurvivalLocationScale(ls_request))?;
+            let ls_result = match fit_result {
+                FitResult::SurvivalLocationScale(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the survival location-scale workflow to return a survival location-scale fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_survival_location_scale_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                &weights,
+                ls_result,
+            )?
         }
-        FitRequest::LatentSurvival(_) => {
-            return Err(
-                "latent survival fitting is not yet plumbed through the Python FFI; use the CLI"
-                    .to_string(),
-            );
+        FitRequest::LatentSurvival(lat_request) => {
+            let frailty = lat_request.frailty.clone();
+            let fit_result = fit_model(FitRequest::LatentSurvival(lat_request))?;
+            let lat_result = match fit_result {
+                FitResult::LatentSurvival(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the latent survival workflow to return a latent survival fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_latent_survival_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                frailty,
+                lat_result,
+            )?
         }
-        FitRequest::LatentBinary(_) => {
-            return Err(
-                "latent binary fitting is not yet plumbed through the Python FFI; use the CLI"
-                    .to_string(),
-            );
+        FitRequest::LatentBinary(lat_request) => {
+            let frailty = lat_request.frailty.clone();
+            let fit_result = fit_model(FitRequest::LatentBinary(lat_request))?;
+            let lat_result = match fit_result {
+                FitResult::LatentBinary(result) => result,
+                _ => {
+                    return Err(
+                        "python binding expected the latent binary workflow to return a latent binary fit result"
+                            .to_string(),
+                    );
+                }
+            };
+            build_latent_binary_ffi_payload(
+                formula,
+                &dataset,
+                &fit_config,
+                frailty,
+                lat_result,
+            )?
         }
     };
     let model = FittedModel::from_payload(payload);
@@ -711,7 +756,7 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
             ("Binomial location-scale", "binomial location-scale", true)
         }
         FitRequest::SurvivalLocationScale(_) => {
-            ("Survival location-scale", "survival location-scale", false)
+            ("Survival location-scale", "survival location-scale", true)
         }
         FitRequest::BernoulliMarginalSlope(_) => {
             ("Bernoulli marginal-slope", "bernoulli marginal-slope", true)
@@ -719,8 +764,8 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::SurvivalMarginalSlope(_) => {
             ("Survival marginal-slope", "survival marginal-slope", true)
         }
-        FitRequest::LatentSurvival(_) => ("Latent survival", "latent survival", false),
-        FitRequest::LatentBinary(_) => ("Latent binary", "latent binary", false),
+        FitRequest::LatentSurvival(_) => ("Latent survival", "latent survival", true),
+        FitRequest::LatentBinary(_) => ("Latent binary", "latent binary", true),
         FitRequest::TransformationNormal(_) => {
             ("Transformation-normal", "transformation-normal", true)
         }
