@@ -912,22 +912,28 @@ fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
 ///
 /// The representation is
 ///
-///     E[sigmoid(η)] = Φ(m/s)
-///         + (1/2) · exp(-m²/(2s²))
-///           · Σ_{k≥1} (-1)^(k-1) · [erfcx((k s² + m)/(√2 s))
-///                                 − erfcx((k s² − m)/(√2 s))],
+/// ```text
+/// E[sigmoid(η)] = Φ(m/s)
+///     + (1/2) · exp(-m²/(2s²))
+///       · Σ_{k≥1} (-1)^(k-1) · [erfcx((k s² + m)/(√2 s))
+///                             − erfcx((k s² − m)/(√2 s))]
+/// ```
 ///
 /// with m = |μ|, s = σ > 0 (the reflection μ→−μ is applied at the callsite).
 /// The two erfcx arguments scale as k·s/√2 with a fixed offset, so both tend
 /// to +∞ linearly in k. Using the asymptotic erfcx(x) = (1/(x√π))·[1 + O(1/x²)]
 /// for large x, the k-th (signed) term has magnitude
 ///
-///     |T_k|  =  |m| · √(2/π) · exp(-m²/(2s²)) / (k² · s³)  + O(1/k⁴).
+/// ```text
+/// |T_k| = |m| · √(2/π) · exp(-m²/(2s²)) / (k² · s³) + O(1/k⁴)
+/// ```
 ///
 /// Since the series alternates in sign, the truncation tail after N terms is
 /// bounded by the first omitted term:
 ///
-///     |R_N|  ≤  |m| · √(2/π) · exp(-m²/(2s²)) / ((N+1)² · s³).
+/// ```text
+/// |R_N| ≤ |m| · √(2/π) · exp(-m²/(2s²)) / ((N+1)² · s³)
+/// ```
 ///
 /// Solving |R_N| ≤ δ for the smallest admissible N yields the value returned
 /// here. Reaching this N therefore certifies the truncation error against the
