@@ -8,9 +8,9 @@ use crate::custom_family::{
     ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
-    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi,
+    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi_map,
     resolve_custom_family_x_psi_psi, second_psi_linear_map, shared_dense_arc,
-    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
+    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps, PsiDesignMap,
     wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
@@ -1089,8 +1089,6 @@ struct SurvivalLocationScaleFamily {
     x_link_wiggle: Option<DesignMatrix>,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
-    /// Resource policy threaded into PsiDesignMap construction during
-    /// exact-Newton joint psi evaluation.
     policy: crate::resource::ResourcePolicy,
 }
 
@@ -1890,84 +1888,94 @@ impl SurvivalLocationScaleFamily {
                     match block_idx {
                         Self::BLOCK_THRESHOLD => {
                             let total_rows = if t_time_varying { 3 * n } else { n };
-                            if let Ok(action) = CustomFamilyPsiDesignAction::from_first_derivative(
+                            match resolve_custom_family_x_psi_map(
                                 deriv,
                                 total_rows,
                                 pt,
                                 0..total_rows,
                                 "SurvivalLocationScaleFamily threshold",
-                            ) {
-                                if t_time_varying {
-                                    let exit_action = action.slice_rows(0..n)?;
-                                    let entry_action = action.slice_rows(n..2 * n)?;
-                                    z_t_exit_psi = exit_action.forward_mul(beta_t.view());
-                                    z_t_entry_psi = entry_action.forward_mul(beta_t.view());
-                                    x_t_exit_action = Some(exit_action);
-                                    x_t_entry_action = Some(entry_action);
-                                } else {
-                                    z_t_exit_psi = action.forward_mul(beta_t.view());
-                                    z_t_entry_psi = z_t_exit_psi.clone();
-                                    x_t_exit_action = Some(action.clone());
-                                    x_t_entry_action = Some(action);
+                                &self.policy,
+                            )? {
+                                PsiDesignMap::First { action } => {
+                                    if t_time_varying {
+                                        let exit_action = action.slice_rows(0..n)?;
+                                        let entry_action = action.slice_rows(n..2 * n)?;
+                                        z_t_exit_psi = exit_action.forward_mul(beta_t.view());
+                                        z_t_entry_psi = entry_action.forward_mul(beta_t.view());
+                                        x_t_exit_action = Some(exit_action);
+                                        x_t_entry_action = Some(entry_action);
+                                    } else {
+                                        z_t_exit_psi = action.forward_mul(beta_t.view());
+                                        z_t_entry_psi = z_t_exit_psi.clone();
+                                        x_t_exit_action = Some(action.clone());
+                                        x_t_entry_action = Some(action);
+                                    }
                                 }
-                            } else {
-                                let x_psi = resolve_custom_family_x_psi(
-                                    deriv,
-                                    total_rows,
-                                    pt,
-                                    "SurvivalLocationScaleFamily threshold",
-                                )?;
-                                let (exit, entry) = split_survival_psi_design(
-                                    &x_psi,
-                                    n,
-                                    t_time_varying,
-                                    "SurvivalLocationScaleFamily threshold",
-                                )?;
-                                z_t_exit_psi = exit.dot(beta_t);
-                                z_t_entry_psi = entry.dot(beta_t);
-                                x_t_exit_psi = Some(exit);
-                                x_t_entry_psi = Some(entry);
+                                PsiDesignMap::Dense { matrix } => {
+                                    let (exit, entry) = split_survival_psi_design(
+                                        &matrix,
+                                        n,
+                                        t_time_varying,
+                                        "SurvivalLocationScaleFamily threshold",
+                                    )?;
+                                    z_t_exit_psi = exit.dot(beta_t);
+                                    z_t_entry_psi = entry.dot(beta_t);
+                                    x_t_exit_psi = Some(exit);
+                                    x_t_entry_psi = Some(entry);
+                                }
+                                PsiDesignMap::Zero { .. } => {}
+                                PsiDesignMap::Second { .. } => {
+                                    return Err(
+                                        "SurvivalLocationScaleFamily threshold: unexpected Second variant from _psi_map"
+                                            .to_string(),
+                                    );
+                                }
                             }
                         }
                         Self::BLOCK_LOG_SIGMA => {
                             let total_rows = if ls_time_varying { 3 * n } else { n };
-                            if let Ok(action) = CustomFamilyPsiDesignAction::from_first_derivative(
+                            match resolve_custom_family_x_psi_map(
                                 deriv,
                                 total_rows,
                                 pls,
                                 0..total_rows,
                                 "SurvivalLocationScaleFamily log-sigma",
-                            ) {
-                                if ls_time_varying {
-                                    let exit_action = action.slice_rows(0..n)?;
-                                    let entry_action = action.slice_rows(n..2 * n)?;
-                                    z_ls_exit_psi = exit_action.forward_mul(beta_ls.view());
-                                    z_ls_entry_psi = entry_action.forward_mul(beta_ls.view());
-                                    x_ls_exit_action = Some(exit_action);
-                                    x_ls_entry_action = Some(entry_action);
-                                } else {
-                                    z_ls_exit_psi = action.forward_mul(beta_ls.view());
-                                    z_ls_entry_psi = z_ls_exit_psi.clone();
-                                    x_ls_exit_action = Some(action.clone());
-                                    x_ls_entry_action = Some(action);
+                                &self.policy,
+                            )? {
+                                PsiDesignMap::First { action } => {
+                                    if ls_time_varying {
+                                        let exit_action = action.slice_rows(0..n)?;
+                                        let entry_action = action.slice_rows(n..2 * n)?;
+                                        z_ls_exit_psi = exit_action.forward_mul(beta_ls.view());
+                                        z_ls_entry_psi = entry_action.forward_mul(beta_ls.view());
+                                        x_ls_exit_action = Some(exit_action);
+                                        x_ls_entry_action = Some(entry_action);
+                                    } else {
+                                        z_ls_exit_psi = action.forward_mul(beta_ls.view());
+                                        z_ls_entry_psi = z_ls_exit_psi.clone();
+                                        x_ls_exit_action = Some(action.clone());
+                                        x_ls_entry_action = Some(action);
+                                    }
                                 }
-                            } else {
-                                let x_psi = resolve_custom_family_x_psi(
-                                    deriv,
-                                    total_rows,
-                                    pls,
-                                    "SurvivalLocationScaleFamily log-sigma",
-                                )?;
-                                let (exit, entry) = split_survival_psi_design(
-                                    &x_psi,
-                                    n,
-                                    ls_time_varying,
-                                    "SurvivalLocationScaleFamily log-sigma",
-                                )?;
-                                z_ls_exit_psi = exit.dot(beta_ls);
-                                z_ls_entry_psi = entry.dot(beta_ls);
-                                x_ls_exit_psi = Some(exit);
-                                x_ls_entry_psi = Some(entry);
+                                PsiDesignMap::Dense { matrix } => {
+                                    let (exit, entry) = split_survival_psi_design(
+                                        &matrix,
+                                        n,
+                                        ls_time_varying,
+                                        "SurvivalLocationScaleFamily log-sigma",
+                                    )?;
+                                    z_ls_exit_psi = exit.dot(beta_ls);
+                                    z_ls_entry_psi = entry.dot(beta_ls);
+                                    x_ls_exit_psi = Some(exit);
+                                    x_ls_entry_psi = Some(entry);
+                                }
+                                PsiDesignMap::Zero { .. } => {}
+                                PsiDesignMap::Second { .. } => {
+                                    return Err(
+                                        "SurvivalLocationScaleFamily log-sigma: unexpected Second variant from _psi_map"
+                                            .to_string(),
+                                    );
+                                }
                             }
                         }
                         _ => return Ok(None),
