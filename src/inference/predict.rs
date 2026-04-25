@@ -1354,8 +1354,13 @@ impl BernoulliMarginalSlopePredictor {
             let mut start = 0usize;
             while start < n {
                 let end = (start + chunk_size).min(n);
-                let mc = input.design.row_chunk(start..end);
-                let lc = design_logslope.row_chunk(start..end);
+                let mc = input
+                    .design
+                    .try_row_chunk(start..end)
+                    .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+                let lc = design_logslope
+                    .try_row_chunk(start..end)
+                    .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
 
                 for li in 0..(end - start) {
                     let i = start + li;
@@ -1630,11 +1635,16 @@ impl BernoulliMarginalSlopePredictor {
         }
         let grad_chunks = (0..num_chunks)
             .into_par_iter()
-            .map(|chunk_idx| {
+            .map(|chunk_idx| -> Result<FlexGradientChunk, String> {
                 let start = chunk_idx * chunk_size;
                 let end = (start + chunk_size).min(n);
-                let mc = input.design.row_chunk(start..end);
-                let lc = design_logslope.row_chunk(start..end);
+                let mc = input
+                    .design
+                    .try_row_chunk(start..end)
+                    .map_err(|e| e.to_string())?;
+                let lc = design_logslope
+                    .try_row_chunk(start..end)
+                    .map_err(|e| e.to_string())?;
                 let rows = end - start;
                 let mut grad = Array2::<f64>::zeros((rows, theta.len()));
 
@@ -1683,9 +1693,10 @@ impl BernoulliMarginalSlopePredictor {
                     }
                 }
 
-                FlexGradientChunk { start, end, grad }
+                Ok(FlexGradientChunk { start, end, grad })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(EstimationError::InvalidInput)?;
         let mut grad = Array2::<f64>::zeros((n, theta.len()));
         for chunk in grad_chunks {
             grad.slice_mut(ndarray::s![chunk.start..chunk.end, ..])

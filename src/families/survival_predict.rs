@@ -551,40 +551,43 @@ fn evaluate_marginal_slope_row(
         + primary_offset_row;
     let qd_exit_base = row_time.x_derivative_time.dot(&beta_time_base)[0] + r_deriv_exit[0];
 
-    let (_q_with_wiggle, qd_with_wiggle, exit_wiggle_design) =
-        if let Some(runtime) = ctx.saved_timewiggle.as_ref() {
-            let knots = Array1::from_vec(runtime.knots.clone());
-            let beta_w = beta_time.slice(s![p_time_base..]).to_owned();
-            let eta_exit_row = Array1::from_elem(1, q_exit_base);
-            let deriv_row = Array1::from_elem(1, qd_exit_base);
-            let exit_design = match buildwiggle_block_input_from_knots(
-                eta_exit_row.view(),
-                &knots,
-                runtime.degree,
-                2,
-                false,
-            )?
-            .design
-            {
-                DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-                _ => {
-                    return Err("saved baseline-timewiggle exit design must be dense".to_string());
-                }
-            };
-            let derivative_design = build_survival_timewiggle_derivative_design(
-                &eta_exit_row,
-                &deriv_row,
-                &knots,
-                runtime.degree,
-            )?;
-            (
-                q_exit_base + exit_design.dot(&beta_w)[0],
-                qd_exit_base + derivative_design.dot(&beta_w)[0],
-                Some(exit_design),
-            )
-        } else {
-            (q_exit_base, qd_exit_base, None)
+    // For timewiggle the `exit_design` row enters the predictor's q-design;
+    // the `derivative_design` row enters the time-derivative used to build the
+    // hazard. Both are evaluated at the wiggle anchor `q_exit_base`.
+    let (qd_with_wiggle, exit_wiggle_design) = if let Some(runtime) =
+        ctx.saved_timewiggle.as_ref()
+    {
+        let knots = Array1::from_vec(runtime.knots.clone());
+        let beta_w = beta_time.slice(s![p_time_base..]).to_owned();
+        let eta_exit_row = Array1::from_elem(1, q_exit_base);
+        let deriv_row = Array1::from_elem(1, qd_exit_base);
+        let exit_design = match buildwiggle_block_input_from_knots(
+            eta_exit_row.view(),
+            &knots,
+            runtime.degree,
+            2,
+            false,
+        )?
+        .design
+        {
+            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
+            _ => {
+                return Err("saved baseline-timewiggle exit design must be dense".to_string());
+            }
         };
+        let derivative_design = build_survival_timewiggle_derivative_design(
+            &eta_exit_row,
+            &deriv_row,
+            &knots,
+            runtime.degree,
+        )?;
+        (
+            qd_exit_base + derivative_design.dot(&beta_w)[0],
+            Some(exit_design),
+        )
+    } else {
+        (qd_exit_base, None)
+    };
 
     // Build a 1-row PredictInput for this (row, t) cell and call the saved
     // predictor. The predictor's `marginal_eta` formula is
