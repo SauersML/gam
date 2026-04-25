@@ -10353,6 +10353,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             &lower,
             &upper,
             rho_dim,
+            kappa_options,
         )?
     } else {
         // Isotropic analytic path: use the unified REML evaluator with
@@ -10453,6 +10454,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     rho_dim: usize,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<Array1<f64>, EstimationError> {
     // Use bounds and design metadata for validation.
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
@@ -10654,8 +10656,8 @@ fn try_exact_joint_spatial_aniso_optimization(
         // for single-block families with β-independent joint H_L.
         false,
         seed_risk_profile_for_likelihood_family(family),
-        1e-6,
-        50,
+        kappa_options.rel_tol.max(1e-6),
+        kappa_options.max_outer_iter.max(1),
     );
 
     let eval_outer = |ctx: &mut &mut AnisoJointContext<'_>,
