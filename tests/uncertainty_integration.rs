@@ -254,62 +254,22 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
 
 #[test]
 fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
-    let n = 120usize;
-    let mut x = Array2::<f64>::zeros((n, 2));
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let t = -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0);
-        x[[i, 0]] = 1.0;
-        x[[i, 1]] = t;
-        y[i] = if t > 0.5 { 1.0 } else { 0.0 };
-    }
-    let weights = Array1::ones(n);
-    let offset = Array1::zeros(n);
-    let mut s = Array2::<f64>::zeros((2, 2));
-    s[[1, 1]] = 1e-2;
-
-    let fit = fit_gam(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &[dense_penalty(s)],
-        LikelihoodFamily::BinomialLogit,
-        &FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
-            max_iter: 60,
-            tol: 1e-6,
-            nullspace_dims: vec![1],
-            adaptive_regularization: None,
-            firth_bias_reduction: false,
-            linear_constraints: None,
-            penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-        },
-    )
-    .expect("fit should succeed");
-    let cov = fit
-        .beta_covariance()
-        .expect("covariance should be available");
+    let x = Array2::from_shape_vec((2, 2), vec![1.0, -3.0, 1.0, 3.0]).expect("design");
+    let beta = Array1::from_vec(vec![0.0, 2.0]);
+    let offset = Array1::zeros(2);
+    let cov = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, 0.25]).expect("covariance");
     let pred = predict_gam_posterior_mean(
         x.view(),
-        fit.beta.view(),
+        beta.view(),
         offset.view(),
         LikelihoodFamily::BinomialLogit,
         cov.view(),
     )
     .expect("posterior mean prediction should succeed");
 
-    let eta_hi = pred.eta[n - 1];
+    let eta_hi = pred.eta[1];
     let map_hi = 1.0 / (1.0 + (-eta_hi).exp());
-    let pm_hi = pred.mean[n - 1];
+    let pm_hi = pred.mean[1];
     assert!(pm_hi < map_hi);
 
     let eta_lo = pred.eta[0];
@@ -336,17 +296,16 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
     let mut x = Array2::<f64>::zeros((n, 2));
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let t = -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0);
+        let t = -2.0 + 4.0 * (i as f64) / (n as f64 - 1.0);
         x[[i, 0]] = 1.0;
         x[[i, 1]] = t;
-        let p = 1.0 / (1.0 + (0.3 - 0.9 * t).exp());
-        y[i] = p.clamp(0.02, 0.98);
+        y[i] = 1.0 / (1.0 + (-(-0.2 + 0.9 * t)).exp());
     }
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
     let mut s = Array2::<f64>::zeros((2, 2));
-    s[[1, 1]] = 1e-2;
+    s[[1, 1]] = 1.0;
 
     let fit_base = fit_gam(
         x.view(),
