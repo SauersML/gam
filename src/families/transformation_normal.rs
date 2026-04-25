@@ -610,7 +610,7 @@ fn chunked_weighted_bt_d_designmatrix(
     weights: ndarray::ArrayView1<'_, f64>,
     d: &DesignMatrix,
     policy: &ResourcePolicy,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let n = weights.len();
     let pb = b.ncols();
     let pd = d.ncols();
@@ -619,8 +619,8 @@ fn chunked_weighted_bt_d_designmatrix(
     let mut out = Array2::<f64>::zeros((pb, pd));
     for start in (0..n).step_by(rows_per_chunk) {
         let end = (start + rows_per_chunk).min(n);
-        let bl = b.row_chunk(start..end);
-        let dl = d.row_chunk(start..end);
+        let bl = b.try_row_chunk(start..end).map_err(|e| e.to_string())?;
+        let dl = d.try_row_chunk(start..end).map_err(|e| e.to_string())?;
         let mut dw = dl;
         for local in 0..(end - start) {
             let w = weights[start + local];
@@ -632,7 +632,7 @@ fn chunked_weighted_bt_d_designmatrix(
         }
         out += &bl.t().dot(&dw);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,7 +1573,9 @@ fn build_monotonicity_derivative_grid_kron(
         evaluate_response_derivative_basis(&response_grid, knots, degree, transform)?;
     let n_covariate_rows = covariate_design.nrows();
     let left = expand_response_derivative_grid(&response_deriv_grid, n_covariate_rows);
-    let covariate_rows = covariate_design.row_chunk(0..n_covariate_rows);
+    let covariate_rows = covariate_design
+        .try_row_chunk(0..n_covariate_rows)
+        .map_err(|e| e.to_string())?;
     let right = expand_covariate_rows_for_response_grid(&covariate_rows, response_grid.len());
     KroneckerDesign::new(&left, DesignMatrix::Dense(DenseDesignMatrix::from(right)))
 }
@@ -1868,7 +1870,7 @@ impl KroneckerDesign {
                         // operator-backed covariate factors stay row-chunkable
                         // and never materialize n × p_cov in one shot.
                         let block =
-                            chunked_weighted_bt_d_designmatrix(b, pair_weights.view(), d, policy);
+                            chunked_weighted_bt_d_designmatrix(b, pair_weights.view(), d, policy)?;
                         out.slice_mut(s![ia * pb..(ia + 1) * pb, ic * pd..(ic + 1) * pd])
                             .assign(&block);
                     }
@@ -1937,7 +1939,7 @@ impl DenseDesignOperator for KroneckerDesign {
                     "CTN row chunk",
                 );
                 let left_chunk = left.slice(s![rows.clone(), ..]).to_owned();
-                let right_chunk = right.row_chunk(rows);
+                let right_chunk = right.try_row_chunk(rows)?;
                 out.assign(&rowwise_kronecker(&left_chunk, &right_chunk));
             }
         }
