@@ -1123,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_rejects_penalty_only_without_full_tk_psi_gradient() {
+    fn firth_logit_directional_hypergradient_accepts_penalty_only_with_full_tk_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1150,13 +1150,9 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let gradient_err = single_directional_tau_gradient(&state, &rho, hyper)
-            .expect_err("Firth penalty-only directional gradient must reject frozen TK calculus");
-        let gradient_msg = gradient_err.to_string();
-        assert!(
-            gradient_msg.contains("full analytic c/d derivative propagation"),
-            "unexpected penalty-only directional gradient error: {gradient_msg}"
-        );
+        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
+            .expect("Firth penalty-only directional gradient should use analytic TK propagation");
+        assert!(gradient.is_finite(), "gradient={gradient}");
 
         let efs_hyper = DirectionalHyperParam::single_penalty(
             0,
@@ -1166,18 +1162,14 @@ mod tests {
             None,
         )
         .expect("single-penalty EFS hyper direction");
-        let efs_err = state
+        let efs = state
             .compute_efs_steps_with_psi_ext(&rho, &[efs_hyper])
-            .expect_err("Firth penalty-only EFS must reject frozen TK calculus");
-        let efs_msg = efs_err.to_string();
-        assert!(
-            efs_msg.contains("full analytic c/d derivative propagation"),
-            "unexpected penalty-only EFS error: {efs_msg}"
-        );
+            .expect("Firth penalty-only EFS should use analytic TK propagation");
+        assert!(efs.cost.is_finite(), "efs cost={}", efs.cost);
     }
 
     #[test]
-    fn firth_logit_directional_hypergradient_rejects_design_moving_without_full_tk_psi_gradient() {
+    fn firth_logit_directional_hypergradient_accepts_design_moving_with_full_tk_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1204,18 +1196,13 @@ mod tests {
             true,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let err = single_directional_tau_gradient(&state, &rho, hyper).expect_err(
-            "Firth design-moving directional gradient must reject incomplete TK psi calculus",
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("full analytic c/d derivative propagation"),
-            "unexpected design-moving directional-gradient error: {msg}"
-        );
+        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
+            .expect("Firth design-moving directional gradient should use analytic TK propagation");
+        assert!(gradient.is_finite(), "gradient={gradient}");
     }
 
     #[test]
-    fn firth_logit_hybrid_efs_rejects_incomplete_tk_psi_gradient() {
+    fn firth_logit_hybrid_efs_accepts_full_tk_psi_gradient() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1247,29 +1234,23 @@ mod tests {
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
 
-        let full_err = match state.evaluate_unified_with_psi_ext(
+        let full = state.evaluate_unified_with_psi_ext(
             &rho,
             crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
             &hyper_dirs,
-        ) {
-            Ok(_) => panic!("full Firth psi gradient must reject incomplete TK psi calculus"),
-            Err(err) => err,
-        };
-        let full_msg = full_err.to_string();
+        )
+        .expect("full Firth psi gradient should use analytic TK propagation");
+        assert!(full.cost.is_finite(), "full cost={}", full.cost);
+        let full_grad = full.gradient.expect("gradient should be present");
         assert!(
-            full_msg.contains("full analytic c/d derivative propagation"),
-            "unexpected full-gradient error: {full_msg}"
+            full_grad.iter().all(|value| value.is_finite()),
+            "full gradient={full_grad:?}"
         );
 
-        let efs_err = match state.compute_efs_steps_with_psi_ext(&rho, &hyper_dirs) {
-            Ok(_) => panic!("hybrid EFS must reject incomplete TK psi calculus"),
-            Err(err) => err,
-        };
-        let efs_msg = efs_err.to_string();
-        assert!(
-            efs_msg.contains("full analytic c/d derivative propagation"),
-            "unexpected EFS error: {efs_msg}"
-        );
+        let efs = state
+            .compute_efs_steps_with_psi_ext(&rho, &hyper_dirs)
+            .expect("hybrid EFS should use analytic TK propagation");
+        assert!(efs.cost.is_finite(), "efs cost={}", efs.cost);
     }
 
     #[test]
