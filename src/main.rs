@@ -4883,10 +4883,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         progress.advance_workflow(3);
         if let Some(out) = args.out {
             progress.set_stage("fit", "writing survival model");
-            let fit_result = compact_saved_survival_location_scale_fit_result(
+            let mut fit_result = compact_saved_survival_location_scale_fit_result(
                 &fit.fit.fit,
                 &fitted_inverse_link,
             )?;
+            fit_result.artifacts.survival_link_wiggle_knots = fit.wiggle_knots.clone();
+            fit_result.artifacts.survival_link_wiggle_degree = fit.wiggle_degree;
             let mut payload = FittedModelPayload::new(
                 MODEL_VERSION,
                 formula,

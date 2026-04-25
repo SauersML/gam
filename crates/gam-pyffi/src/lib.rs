@@ -71,8 +71,6 @@ struct PyFitConfig {
     noise_formula: Option<String>,
     noise_offset: Option<String>,
 
-    disable_link_dev: Option<bool>,
-    disable_score_warp: Option<bool>,
     firth: Option<bool>,
 
     // Frailty (only consumed by survival families today). When provided as a
@@ -724,12 +722,6 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(column) = py_config.noise_offset {
         fit_config.noise_offset_column = Some(column);
-    }
-    if let Some(flag) = py_config.disable_link_dev {
-        fit_config.disable_link_dev = flag;
-    }
-    if let Some(flag) = py_config.disable_score_warp {
-        fit_config.disable_score_warp = flag;
     }
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
@@ -1439,6 +1431,8 @@ fn build_survival_location_scale_ffi_payload(
     // compact_saved_survival_location_scale_fit_result helper.
     let mut fit_result = ls_result.fit.fit.clone();
     apply_inverse_link_state_to_fit_result(&mut fit_result, &fitted_inverse_link);
+    fit_result.artifacts.survival_link_wiggle_knots = ls_result.wiggle_knots.clone();
+    fit_result.artifacts.survival_link_wiggle_degree = ls_result.wiggle_degree;
 
     // Reconstruct survival_noise_projection / center / scale by replaying the
     // CLI's build_scale_deviation_transform on the time + threshold + log_sigma
@@ -2095,7 +2089,10 @@ fn build_transformation_normal_predict_input(
         .view()
         .into_shape_with_order((p_resp, p_cov))
         .map_err(|err| format!("beta reshape failed: {err}"))?;
-    let cov_mat = covariate_design.design.row_chunk(0..n);
+    let cov_mat = covariate_design
+        .design
+        .try_row_chunk(0..n)
+        .map_err(|err| err.to_string())?;
     let mut h = ndarray::Array1::<f64>::zeros(n);
     for i in 0..n {
         let resp_row = resp_val.row(i);
