@@ -9273,7 +9273,7 @@ mod tests {
         )
         .expect("build deviation block");
 
-        let expected_orders = [1, 0, 2, 3];
+        let expected_orders = [1, 2, 3, 0];
         assert_eq!(prepared.block.penalties.len(), expected_orders.len());
 
         for ((penalty, &nullity), &order) in prepared
@@ -14066,7 +14066,7 @@ mod tests {
             &z,
             &weights,
             "bernoulli-marginal-slope",
-            &LatentZPolicy::default(),
+            &LatentZPolicy::exploratory_fit_weighted(),
         )
         .expect("normalize z");
         let replayed = normalization

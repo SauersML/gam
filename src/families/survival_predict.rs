@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ndarray::{Array1, Array2, ArrayView2, s};
 
-use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
 use crate::families::scale_design::ScaleDeviationTransform;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
@@ -29,7 +29,9 @@ use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
-use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
+use crate::inference::predict::{
+    BernoulliMarginalSlopePredictor, PredictInput, PredictableModel, predict_gam,
+};
 use crate::linalg::matrix::DesignMatrix;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::probability::normal_cdf;
@@ -199,6 +201,39 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
     let mut cumulative_hazard = Array2::<f64>::zeros((n, t_cols));
     let mut linear_predictor = Array1::<f64>::zeros(n);
 
+    // For marginal-slope, build the saved predictor (with link-deviation +
+    // score-warp blocks plumbed in) once. The per-(row, t) loop reuses this
+    // predictor and only assembles the per-cell q-design slice. Without this,
+    // the library skipped link-deviation and score-warp replay entirely and
+    // disagreed with the CLI's `gam predict` on every flex model.
+    let marginal_slope_ctx = if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        // Baseline offsets at the predict-data's age_entry / age_exit. Used to
+        // build the predictor's `pred_input` (which we discard) — the actual
+        // per-(row, t) offset is rebuilt inside `evaluate_marginal_slope_row`.
+        let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+            build_baseline_offsets_by_mode(
+                &age_entry,
+                &age_exit,
+                &baseline_cfg,
+                saved_likelihood_mode,
+            )?;
+        Some(build_marginal_slope_predict_context(
+            model,
+            data,
+            col_map,
+            training_headers,
+            &cov_design.design,
+            primary_offset,
+            noise_offset,
+            &time_build,
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+        )?)
+    } else {
+        None
+    };
+
     // Evaluate each (row, t) cell.
     for i in 0..n {
         let row_eta_exit_input = if per_row_eval {
@@ -229,14 +264,20 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
             let cov_row = cov_design.design.as_dense_cow().row(i).to_owned();
 
             let (eta_t, cum_t, haz_t) = match saved_likelihood_mode {
-                SurvivalLikelihoodMode::MarginalSlope => evaluate_marginal_slope_row(
-                    model,
-                    &row_time,
-                    &cov_row,
-                    &r_eta_exit,
-                    &r_deriv_exit,
-                    primary_offset[i],
-                )?,
+                SurvivalLikelihoodMode::MarginalSlope => {
+                    let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
+                        "internal error: marginal-slope context missing for marginal-slope mode"
+                            .to_string()
+                    })?;
+                    evaluate_marginal_slope_row(
+                        i,
+                        ctx,
+                        &row_time,
+                        &r_eta_exit,
+                        &r_deriv_exit,
+                        primary_offset[i],
+                    )?
+                }
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
                     evaluate_rp_row(
                         model,
@@ -287,14 +328,20 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
             )?;
             let cov_row = cov_design.design.as_dense_cow().row(i).to_owned();
             let (eta_t, _, _) = match saved_likelihood_mode {
-                SurvivalLikelihoodMode::MarginalSlope => evaluate_marginal_slope_row(
-                    model,
-                    &row_time,
-                    &cov_row,
-                    &r_eta_exit,
-                    &r_deriv_exit,
-                    primary_offset[i],
-                )?,
+                SurvivalLikelihoodMode::MarginalSlope => {
+                    let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
+                        "internal error: marginal-slope context missing for marginal-slope mode"
+                            .to_string()
+                    })?;
+                    evaluate_marginal_slope_row(
+                        i,
+                        ctx,
+                        &row_time,
+                        &r_eta_exit,
+                        &r_deriv_exit,
+                        primary_offset[i],
+                    )?
+                }
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
                     evaluate_rp_row(
                         model,
@@ -334,6 +381,131 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
 // ---------------------------------------------------------------------------
 // Per-mode single-row evaluators.
 // ---------------------------------------------------------------------------
+
+/// Precomputed context for evaluating the saved survival marginal-slope
+/// predictor row-by-row. Built once per call to `predict_survival` so the
+/// per-(row, t) loop only assembles the per-time q-design slice.
+struct MarginalSlopePredictContext {
+    predictor: BernoulliMarginalSlopePredictor,
+    /// Time-block coefficients (length `p_time_base + p_timewiggle`).
+    beta_time: Array1<f64>,
+    /// Covariate (marginal) coefficients.
+    beta_marginal: Array1<f64>,
+    saved_timewiggle: Option<SavedBaselineTimeWiggleRuntime>,
+    /// Dense covariate design (n × p_marginal). Stored once so per-row eta
+    /// assembly can copy the row without re-building the design.
+    cov_design_dense: Array2<f64>,
+    /// Dense logslope design (n × p_logslope), built once from the saved
+    /// `resolved_termspec_logslope`.
+    logslope_design_dense: Array2<f64>,
+    /// Per-row covariate eta = `cov_design[i] · beta_marginal`. Used to
+    /// pre-compute `q_exit_base`.
+    cov_eta: Array1<f64>,
+    /// Per-row logslope eta = `logslope_design[i] · beta_logslope +
+    /// baseline_logslope + noise_offset[i]`. Used to compute the rigid-path
+    /// hazard scale `c = sqrt(1 + (s · b)^2)`.
+    slope_eta: Array1<f64>,
+    /// Per-row latent z (raw, un-normalized — the predictor's
+    /// `latent_z_normalization` is applied internally).
+    z_raw: Array1<f64>,
+    /// Per-row noise offset, mirroring the `pred_input.offset_noise` slice
+    /// used by the CLI.
+    noise_offset: Array1<f64>,
+    /// Probit frailty scale `s = 1/sqrt(1 + sigma_frailty^2)`. Used for the
+    /// rigid-path hazard derivative.
+    probit_scale: f64,
+}
+
+fn build_marginal_slope_predict_context(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    cov_design: &DesignMatrix,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+    time_build: &SurvivalTimeBuildOutput,
+    eta_offset_entry: &Array1<f64>,
+    eta_offset_exit: &Array1<f64>,
+    derivative_offset_exit: &Array1<f64>,
+) -> Result<MarginalSlopePredictContext, String> {
+    let z_name = model
+        .z_column
+        .as_ref()
+        .ok_or_else(|| "saved survival marginal-slope model missing z_column".to_string())?;
+    let z_col = *col_map
+        .get(z_name)
+        .ok_or_else(|| format!("prediction data is missing z column '{}'", z_name))?;
+    let z_raw = data.column(z_col).to_owned();
+
+    let logslopespec = resolve_termspec_for_prediction(
+        &model.resolved_termspec_logslope.as_ref().cloned(),
+        training_headers,
+        col_map,
+        "resolved_termspec_logslope",
+    )?;
+    let logslope_design = build_term_collection_design(data, &logslopespec)
+        .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
+
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let (predictor, _pred_input, _predictor_fit) = build_saved_survival_marginal_slope_predictor(
+        model,
+        &fit_saved,
+        z_name,
+        &z_raw,
+        cov_design,
+        &logslope_design.design,
+        time_build,
+        eta_offset_entry,
+        eta_offset_exit,
+        derivative_offset_exit,
+        primary_offset,
+        noise_offset,
+    )?;
+
+    let blocks = &fit_saved.blocks;
+    if blocks.len() < 3 {
+        return Err(format!(
+            "saved survival marginal-slope model requires at least 3 blocks [time, marginal, slope], got {}",
+            blocks.len()
+        ));
+    }
+    let beta_time = blocks[0].beta.clone();
+    let beta_marginal = blocks[1].beta.clone();
+    let beta_logslope = blocks[2].beta.clone();
+    let saved_runtime = model.saved_prediction_runtime()?;
+    let saved_timewiggle = saved_runtime.baseline_time_wiggle.clone();
+
+    let cov_design_dense = cov_design.to_dense();
+    let logslope_design_dense = logslope_design.design.to_dense();
+
+    // Per-row precomputed accumulations. cov_eta and slope_eta are time-
+    // independent so doing them here avoids `O(n × T)` re-multiplications
+    // inside the per-cell loop.
+    let cov_eta = cov_design.dot(&beta_marginal);
+    let baseline_logslope = model.logslope_baseline.ok_or_else(|| {
+        "saved survival marginal-slope model missing logslope_baseline".to_string()
+    })?;
+    let slope_eta = logslope_design.design.dot(&beta_logslope) + noise_offset + baseline_logslope;
+
+    let frailty = model.family_state.frailty();
+    let sigma = gaussian_frailty_sigma_from_frailty(frailty);
+    let probit_scale = ProbitFrailtyScale::new(sigma.unwrap_or(0.0)).s;
+
+    Ok(MarginalSlopePredictContext {
+        predictor,
+        beta_time,
+        beta_marginal,
+        saved_timewiggle,
+        cov_design_dense,
+        logslope_design_dense,
+        cov_eta,
+        slope_eta,
+        z_raw,
+        noise_offset: noise_offset.clone(),
+        probit_scale,
+    })
+}
 
 /// Evaluate one (row, t) cell for the saved survival marginal-slope kernel.
 ///
@@ -379,7 +551,7 @@ fn evaluate_marginal_slope_row(
         + primary_offset_row;
     let qd_exit_base = row_time.x_derivative_time.dot(&beta_time_base)[0] + r_deriv_exit[0];
 
-    let (q_with_wiggle, qd_with_wiggle, exit_wiggle_design) =
+    let (_q_with_wiggle, qd_with_wiggle, exit_wiggle_design) =
         if let Some(runtime) = ctx.saved_timewiggle.as_ref() {
             let knots = Array1::from_vec(runtime.knots.clone());
             let beta_w = beta_time.slice(s![p_time_base..]).to_owned();
@@ -479,7 +651,7 @@ fn evaluate_marginal_slope_row(
 
     let surv = normal_cdf(-eta).clamp(1e-300, 1.0);
     let cum = -surv.ln();
-    let phi_eta = (-0.5 * eta * eta).exp() / (2.0f64 * std::f64::consts::PI).sqrt();
+    let phi_eta = (-0.5f64 * eta * eta).exp() / (2.0f64 * std::f64::consts::PI).sqrt();
     let haz = phi_eta * eta_derivative;
     if !(eta_derivative.is_finite() && eta_derivative > 0.0 && haz.is_finite() && haz > 0.0) {
         return Err(format!(

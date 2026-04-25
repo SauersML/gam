@@ -12118,6 +12118,7 @@ fn duchon_q_psi_triplet_from_jets(
     )
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn duchon_laplacian_psi_triplet_from_jets(
     jets: &DuchonRadialJets,
@@ -12142,6 +12143,7 @@ fn duchon_laplacian_psi_triplet_from_jets(
     )
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn duchon_collision_operator_core_fromphi_rr(
     phi_rr: f64,

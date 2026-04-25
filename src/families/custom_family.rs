@@ -6586,23 +6586,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        let iter_log_info = crate::solver::visualizer::pirls_iter_info_enabled();
         for cycle in 0..inner_max_cycles {
-            if iter_log_info {
-                // Env-gated diagnostic emission at `info` — see
-                // `solver::visualizer::pirls_iter_info_enabled` for the
-                // rationale. Fires at the top of each inner joint-Newton
-                // cycle so CI logs can distinguish "inner spin" (thousands
-                // of these) from "outer-assembly spin" (zero of these).
-                log::info!(
-                    "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
-                    cycle,
-                    inner_max_cycles,
-                    -current_log_likelihood,
-                    current_penalty,
-                    lastobjective,
-                );
-            }
+            // Fires at the top of each inner joint-Newton cycle so CI logs can
+            // distinguish "inner spin" (thousands of these) from "outer-assembly
+            // spin" (zero of these).
+            log::info!(
+                "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
+                cycle,
+                inner_max_cycles,
+                -current_log_likelihood,
+                current_penalty,
+                lastobjective,
+            );
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
@@ -6971,23 +6966,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     lastobjective = -current_log_likelihood + current_penalty;
 
     let is_dynamic = family.block_geometry_is_dynamic();
-    let iter_log_info_blockwise = crate::solver::visualizer::pirls_iter_info_enabled();
     for cycle in 0..inner_max_cycles {
-        if iter_log_info_blockwise {
-            // Env-gated diagnostic emission — see the joint-Newton copy
-            // above and `solver::visualizer::pirls_iter_info_enabled` for
-            // the rationale. Fires at the top of each blockwise coordinate
-            // cycle so we can count iterations from CI logs when a
-            // benchmark hangs inside the first outer-eval.
-            log::info!(
-                "[PIRLS/blockwise coord] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
-                cycle,
-                inner_max_cycles,
-                -current_log_likelihood,
-                current_penalty,
-                lastobjective,
-            );
-        }
+        // Fires at the top of each blockwise coordinate cycle so we can count
+        // iterations from CI logs when a benchmark hangs inside the first
+        // outer-eval.
+        log::info!(
+            "[PIRLS/blockwise coord] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
+            cycle,
+            inner_max_cycles,
+            -current_log_likelihood,
+            current_penalty,
+            lastobjective,
+        );
         let mut max_beta_step = 0.0_f64;
 
         let mut objective_cycle_prev = lastobjective;
