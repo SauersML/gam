@@ -114,7 +114,7 @@ def stage2_binary(df: pd.DataFrame) -> Any:
         main_formula,
         family="bernoulli-marginal-slope",
         link="probit",
-        scale_dimensions="auto",
+        scale_dimensions=True,
         z_column="pgs_ctn_z",
         logslope_formula=logslope_formula,
     )
@@ -135,7 +135,7 @@ def stage2_survival(df: pd.DataFrame) -> Any:
         family="survival",
         survival_likelihood="marginal-slope",
         baseline_target="gompertz-makeham",
-        scale_dimensions="auto",
+        scale_dimensions=True,
         z_column="pgs_ctn_z",
         logslope_formula=logslope_formula,
     )

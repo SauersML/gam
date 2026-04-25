@@ -13,7 +13,7 @@ overridden at construction time:
   centers, order ``1``, power ``1``, and triple operator regularization.
 * A fixed Duchon ``length_scale`` so per-axis anisotropy is identifiable
   separately from the global smoothing scale.
-* Per-axis anisotropic scaling (``scale_dimensions="auto"``).
+* Per-axis anisotropic scaling (``scale_dimensions=True``).
 * A transformation-normal likelihood so the fitted response is interpretable
   as a conditional standard normal z-score for each row.
 """
@@ -53,8 +53,8 @@ class PgsCalibration:
         Fixed Duchon radial length scale. Defaults to ``1.0`` so anisotropic
         PC scaling is active but does not duplicate the global smoothing scale.
     scale_dimensions:
-        Per-axis length-scale selector forwarded to :func:`gam.fit`. Defaults
-        to ``"auto"``.
+        Forwarded to :func:`gam.fit`. When ``True`` (the default), enables
+        learned per-axis anisotropic length scales on the Duchon smooth.
     out_column:
         Name of the calibrated column appended by :meth:`transform`. Defaults
         to ``"pgs_ctn_z"``.
@@ -79,7 +79,7 @@ class PgsCalibration:
     duchon_order: int = 1
     duchon_power: int = 1
     duchon_length_scale: float = 1.0
-    scale_dimensions: str | None = "auto"
+    scale_dimensions: bool | None = True
     out_column: str = "pgs_ctn_z"
     extra_fit_kwargs: dict[str, Any] = field(default_factory=dict)
 
