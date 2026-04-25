@@ -298,9 +298,12 @@ impl<'a> RemlState<'a> {
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
+        e_array: &Array1<f64>,
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ext_drifts: &[Array2<f64>],
+        ext_eta_fixed: &[Option<Array1<f64>>],
+        ext_x_fixed: &[Option<Array2<f64>>],
         x_vks: &[Array1<f64>],
         shared: &TkSharedIntermediates,
         gram: &mut Array2<f64>,
@@ -407,7 +410,19 @@ impl<'a> RemlState<'a> {
                     .sum::<f64>();
             let correction_trace =
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
-            gradient[idx] = trace_ak_p - correction_trace;
+            let eta_total = x_vks[idx].mapv(|value| -value);
+            let direct = Self::tk_direct_gradient_from_cd_and_design(
+                x_dense,
+                z,
+                c_array,
+                d_array,
+                e_array,
+                &eta_total,
+                None,
+                shared,
+                gram,
+            )?;
+            gradient[idx] = trace_ak_p - correction_trace + direct;
         }
         for (extra_idx, drift) in ext_drifts.iter().enumerate() {
             if drift.raw_dim() != p_total.raw_dim() {
@@ -428,7 +443,41 @@ impl<'a> RemlState<'a> {
             let x_vk_idx = k + extra_idx;
             let correction_trace =
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
-            gradient[x_vk_idx] = trace_ak_p + correction_trace;
+            let mut eta_total = x_vks[x_vk_idx].clone();
+            if let Some(eta_fixed) = ext_eta_fixed.get(extra_idx).and_then(|value| value.as_ref()) {
+                if eta_fixed.len() != n {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "Tierney-Kadane ext fixed eta length mismatch: expected {}, got {}",
+                        n,
+                        eta_fixed.len()
+                    )));
+                }
+                eta_total += eta_fixed;
+            }
+            let x_fixed = ext_x_fixed.get(extra_idx).and_then(|value| value.as_ref());
+            if let Some(x_fixed) = x_fixed {
+                if x_fixed.raw_dim() != x_dense.raw_dim() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "Tierney-Kadane ext fixed design shape mismatch: expected {}x{}, got {}x{}",
+                        x_dense.nrows(),
+                        x_dense.ncols(),
+                        x_fixed.nrows(),
+                        x_fixed.ncols()
+                    )));
+                }
+            }
+            let direct = Self::tk_direct_gradient_from_cd_and_design(
+                x_dense,
+                z,
+                c_array,
+                d_array,
+                e_array,
+                &eta_total,
+                x_fixed,
+                shared,
+                gram,
+            )?;
+            gradient[x_vk_idx] = trace_ak_p + correction_trace + direct;
         }
 
         for g in gradient.iter_mut() {
@@ -441,12 +490,167 @@ impl<'a> RemlState<'a> {
         Ok(gradient)
     }
 
+    fn tk_direct_gradient_from_cd_and_design(
+        x_dense: &Array2<f64>,
+        z: &Array2<f64>,
+        c_array: &Array1<f64>,
+        d_array: &Array1<f64>,
+        e_array: &Array1<f64>,
+        eta_total: &Array1<f64>,
+        x_fixed: Option<&Array2<f64>>,
+        shared: &TkSharedIntermediates,
+        gram: &mut Array2<f64>,
+    ) -> Result<f64, EstimationError> {
+        let n = x_dense.nrows();
+        if eta_total.len() != n || e_array.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane direct derivative length mismatch: n={}, eta={}, e={}",
+                n,
+                eta_total.len(),
+                e_array.len()
+            )));
+        }
+
+        let mut c_prime = Array1::<f64>::zeros(n);
+        let mut d_prime = Array1::<f64>::zeros(n);
+        Zip::from(&mut c_prime)
+            .and(d_array)
+            .and(eta_total)
+            .for_each(|out, &d, &eta| *out = d * eta);
+        Zip::from(&mut d_prime)
+            .and(e_array)
+            .and(eta_total)
+            .for_each(|out, &e, &eta| *out = e * eta);
+
+        let mut h_prime = Array1::<f64>::zeros(n);
+        let mut design_q_prime = Array1::<f64>::zeros(x_dense.ncols());
+        let has_design_deriv = x_fixed.is_some();
+        if let Some(x_theta) = x_fixed {
+            let ch = c_array * &shared.h_diag;
+            design_q_prime += &x_theta.t().dot(&ch);
+            for i in 0..n {
+                h_prime[i] = 2.0 * x_theta.row(i).dot(&z.column(i));
+            }
+        }
+
+        let q_weight_prime = &(&c_prime * &shared.h_diag) + &(c_array * &h_prime);
+        let q_prime = x_dense.t().dot(&q_weight_prime) + design_q_prime;
+        let q_term_prime = 0.25 * q_prime.dot(&shared.y);
+
+        let d_term_prime = -0.125
+            * d_prime
+                .iter()
+                .zip(shared.h_diag.iter())
+                .map(|(&dp, &h)| dp * h * h)
+                .sum::<f64>()
+            - 0.25
+                * d_array
+                    .iter()
+                    .zip(shared.h_diag.iter())
+                    .zip(h_prime.iter())
+                    .map(|((&d, &h), &hp)| d * h * hp)
+                    .sum::<f64>();
+
+        let direct_blocks = Self::tk_cd_direct_active_blocks(c_array, &c_prime);
+        let mut c_term_prime = 0.0_f64;
+        for (j_block_idx, j_block) in direct_blocks.iter().enumerate() {
+            let j0 = j_block.start;
+            let j1 = j_block.end;
+            for i_block in &direct_blocks[..=j_block_idx] {
+                let i0 = i_block.start;
+                let i1 = i_block.end;
+                Self::tk_fill_gram_block(x_dense, z, i0, i1, j0, j1, gram);
+
+                let design_gram = if has_design_deriv {
+                    let x_theta = x_fixed.expect("design derivative checked above");
+                    let rows = i1 - i0;
+                    let cols = j1 - j0;
+                    let mut block = Array2::<f64>::zeros((rows, cols));
+                    let x_theta_i = x_theta.slice(s![i0..i1, ..]);
+                    let z_j = z.slice(s![.., j0..j1]);
+                    ndarray::linalg::general_mat_mul(1.0, &x_theta_i, &z_j, 0.0, &mut block);
+                    let x_theta_j = x_theta.slice(s![j0..j1, ..]);
+                    let z_i = z.slice(s![.., i0..i1]);
+                    let mut reverse = Array2::<f64>::zeros((cols, rows));
+                    ndarray::linalg::general_mat_mul(
+                        1.0,
+                        &x_theta_j,
+                        &z_i,
+                        0.0,
+                        &mut reverse,
+                    );
+                    Some((block, reverse))
+                } else {
+                    None
+                };
+
+                let mut block_sum = 0.0_f64;
+                for &(bi, _) in &i_block.entries {
+                    let ii = i0 + bi;
+                    let ci = c_array[ii];
+                    let cpi = c_prime[ii];
+                    for &(bj, _) in &j_block.entries {
+                        let jj = j0 + bj;
+                        let cj = c_array[jj];
+                        let gij = gram[[bi, bj]];
+                        let cpj = c_prime[jj];
+                        let c_direct = (cpi * cj + ci * cpj) * gij * gij * gij / 12.0;
+                        let k_direct = if let Some((forward, reverse)) = design_gram.as_ref() {
+                            let kp = forward[[bi, bj]] + reverse[[bj, bi]];
+                            0.25 * ci * cj * gij * gij * kp
+                        } else {
+                            0.0
+                        };
+                        block_sum += c_direct + k_direct;
+                    }
+                }
+                let sym_factor = if i0 == j0 { 1.0 } else { 2.0 };
+                c_term_prime += sym_factor * block_sum;
+            }
+        }
+
+        let value = d_term_prime + c_term_prime + q_term_prime;
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane direct c/d derivative produced non-finite value: {value}"
+            )));
+        }
+        Ok(value)
+    }
+
+    fn tk_cd_direct_active_blocks(
+        c_array: &Array1<f64>,
+        c_prime: &Array1<f64>,
+    ) -> Vec<TkActiveBlock> {
+        let n = c_array.len();
+        let mut blocks = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
+        for start in (0..n).step_by(TK_BLOCK_SIZE) {
+            let end = (start + TK_BLOCK_SIZE).min(n);
+            let mut entries = Vec::new();
+            for offset in 0..(end - start) {
+                let idx = start + offset;
+                if c_array[idx] != 0.0 || c_prime[idx] != 0.0 {
+                    entries.push((offset, 0.0));
+                }
+            }
+            if !entries.is_empty() {
+                blocks.push(TkActiveBlock {
+                    start,
+                    end,
+                    entries,
+                });
+            }
+        }
+        blocks
+    }
+
     fn tierney_kadane_analytic_core(
         &self,
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
+        e_array: &Array1<f64>,
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ext_coords: &[super::unified::HyperCoord],
@@ -490,6 +694,8 @@ impl<'a> RemlState<'a> {
             x_vks.push(x_dense.dot(&v_k));
         }
         let mut ext_drifts = Vec::with_capacity(ext_coords.len());
+        let mut ext_eta_fixed = Vec::with_capacity(ext_coords.len());
+        let mut ext_x_fixed = Vec::with_capacity(ext_coords.len());
         for coord in ext_coords {
             let drift = coord.drift.materialize();
             if drift.ncols() != beta.len() || drift.nrows() != beta.len() {
@@ -511,6 +717,8 @@ impl<'a> RemlState<'a> {
             let beta_theta = h_inv_solve(&coord.g)?;
             x_vks.push(x_dense.dot(&beta_theta));
             ext_drifts.push(drift);
+            ext_eta_fixed.push(coord.tk_eta_fixed.clone());
+            ext_x_fixed.push(coord.tk_x_fixed.clone());
         }
 
         let gradient = Self::tk_gradient_from_shared(
@@ -518,9 +726,12 @@ impl<'a> RemlState<'a> {
             z,
             c_array,
             d_array,
+            e_array,
             tk_penalties,
             lambdas,
             &ext_drifts,
+            &ext_eta_fixed,
+            &ext_x_fixed,
             &x_vks,
             &shared,
             &mut gram,

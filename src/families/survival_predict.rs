@@ -234,7 +234,12 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         None
     };
 
-    // Evaluate each (row, t) cell.
+    // Evaluate each (row, t) cell. The natural vectorization (T outer × n inner
+    // calls into the predictor) is a meaningful refactor: each cell currently
+    // builds a 1-row time basis for `t_entry = age_entry[i].min(t_query)` which
+    // differs per row, so the inversion would require batching the time-basis
+    // build across rows for each fixed `t_query`. Leaving the per-cell shape in
+    // place — measure first if survival predict becomes a hot path.
     for i in 0..n {
         let row_eta_exit_input = if per_row_eval {
             vec![age_exit[i]]
@@ -845,7 +850,7 @@ pub fn saved_survival_location_scale_fit_result(
     Ok(fit)
 }
 
-fn apply_inverse_link_state_to_fit_result(
+pub fn apply_inverse_link_state_to_fit_result(
     fit_result: &mut UnifiedFitResult,
     inverse_link: &InverseLink,
 ) {
