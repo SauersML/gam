@@ -763,7 +763,7 @@ impl<'a> RemlState<'a> {
         }
 
         let pirls_result = bundle.pirls_result.as_ref();
-        let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
         if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "Tierney-Kadane correction received non-finite c derivative at row {idx}: {}",
@@ -822,6 +822,7 @@ impl<'a> RemlState<'a> {
                 &z_mat,
                 &c_array,
                 &d_array,
+                &e_array,
                 &self.canonical_penalties,
                 &lambdas,
                 ext_coords,
@@ -950,6 +951,7 @@ impl<'a> RemlState<'a> {
             &z_mat,
             &c_array,
             &d_array,
+            &e_array,
             &tk_penalties,
             &lambdas,
             ext_coords,
@@ -964,13 +966,18 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<(), EstimationError> {
-        if self.config.link_function() == LinkFunction::Identity || !compute_gradient_for_tk(mode) {
+        if self.config.link_function() == LinkFunction::Identity
+            || !self.config.firth_bias_reduction
+            || !compute_gradient_for_tk(mode)
+        {
             return Ok(());
         }
-        if self.config.firth_bias_reduction && !ext_coords.is_empty() {
-            return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane external gradients require full analytic c/d derivative propagation; refusing approximate gradients".to_string(),
-            ));
+        for (idx, coord) in ext_coords.iter().enumerate() {
+            if coord.tk_eta_fixed.is_none() || coord.tk_x_fixed.is_none() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane external gradient coordinate {idx} is missing analytic fixed-beta design/eta derivative carriers"
+                )));
+            }
         }
         Ok(())
     }
@@ -1045,6 +1052,38 @@ impl<'a> RemlState<'a> {
             pirls_result.solve_c_array.clone(),
             pirls_result.solve_d_array.clone(),
         ))
+    }
+
+    fn hessian_cde_arrays(
+        &self,
+        pirls_result: &PirlsResult,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let c_array = pirls_result.solve_c_array.clone();
+        let d_array = pirls_result.solve_d_array.clone();
+        let n = d_array.len();
+        let mut e_array = Array1::<f64>::zeros(n);
+
+        match self.config.link_function() {
+            LinkFunction::Logit => {
+                for i in 0..n {
+                    let eta_raw = pirls_result.final_eta[i];
+                    let eta_used = eta_raw.clamp(-700.0, 700.0);
+                    if eta_raw != eta_used {
+                        e_array[i] = 0.0;
+                    } else {
+                        let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
+                        e_array[i] = self.weights[i].max(0.0) * jet.d4;
+                    }
+                }
+            }
+            other => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tierney-Kadane c/d derivative propagation requires analytic d³W/deta³ for {other:?}; only logit is currently wired"
+                )));
+            }
+        }
+
+        Ok((c_array, d_array, e_array))
     }
 
     /// Compute soft prior cost without needing workspace
@@ -3484,14 +3523,6 @@ impl<'a> RemlState<'a> {
         let beta_for_barrier = assembly.beta.clone();
         let has_ext = !assembly.ext_coords.is_empty();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
-        if has_ext
-            && self.config.firth_bias_reduction
-            && self.config.link_function() != LinkFunction::Identity
-        {
-            return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane external EFS gradients require full analytic c/d derivative propagation; refusing approximate gradients".to_string(),
-            ));
-        }
         let eval_mode = if has_psi {
             super::unified::EvalMode::ValueAndGradient
         } else {
@@ -3659,15 +3690,6 @@ impl<'a> RemlState<'a> {
             } else {
                 (Vec::new(), None, None, None)
             };
-        let has_firth_ext = !ext_coords.is_empty() && self.config.firth_bias_reduction;
-        if compute_gradient_for_tk(mode)
-            && has_firth_ext
-            && self.config.link_function() != LinkFunction::Identity
-        {
-            return Err(EstimationError::InvalidInput(
-                "Tierney-Kadane external gradients require full analytic c/d derivative propagation; refusing approximate gradients".to_string(),
-            ));
-        }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
