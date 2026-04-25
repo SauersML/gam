@@ -13362,6 +13362,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let specs = vec![thresholdspec, log_sigmaspec, wigglespec];
@@ -13527,6 +13528,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let specs = vec![thresholdspec, log_sigmaspec, wigglespec];
@@ -13635,6 +13637,7 @@ mod tests {
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];
@@ -13738,6 +13741,7 @@ mod tests {
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];
@@ -13841,6 +13845,7 @@ mod tests {
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];
@@ -14020,6 +14025,7 @@ mod tests {
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];

@@ -2105,35 +2105,6 @@ pub fn should_use_implicit_operators_with_policy(
     dense_bytes > policy.max_single_materialization_bytes
 }
 
-/// Default-policy wrapper around [`should_use_implicit_operators_with_policy`].
-//
-// Remaining call sites:
-//   * `src/solver/reml/hyper.rs:~1286` — invoked from
-//     `EvaluationCtx::compute_directional_derivatives`; the `ReshapedReml` /
-//     `EvaluationCtx` chain does not currently carry a `ResourcePolicy`.
-//   * `src/solver/reml/mod.rs:~117` — inside
-//     `exact_tau_tau_hessian_policy_with_firth`, a free function that takes
-//     only `(n_obs, p_coeff, hyper_dirs)` and is itself called from many
-//     places without policy in scope.
-//   * `src/terms/basis.rs:~4182` (`build_aniso_design_psi_derivatives_shared`)
-//     and `~4336` (`build_scalar_design_psi_derivatives_shared`) — both are
-//     deep helpers reached via 5+ levels of `build_*_design_psi_derivatives`
-//     wrappers; none of those intermediates take a `BasisWorkspace` or
-//     `ResourcePolicy` today.
-// Properly threading the policy requires either (a) plumbing
-// `&ResourcePolicy` through `EvaluationCtx` and the `psi_derivatives`
-// builder chain, or (b) attaching the policy to the upstream model spec so
-// the helpers can read it. Tracked as a follow-up; the default-library
-// fallback is preserved here until that lands.
-pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
-    should_use_implicit_operators_with_policy(
-        n,
-        p,
-        d,
-        &crate::resource::ResourcePolicy::default_library(),
-    )
-}
-
 pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
     let first = dense_design_bytes(n, p).saturating_mul(d_pc);
     let second = dense_design_bytes(n, p).saturating_mul(d_pc.saturating_mul(d_pc));
@@ -4219,7 +4190,13 @@ fn build_aniso_design_psi_derivatives_shared(
     }
 
     let force_operator = radial_kind.is_duchon_family();
-    let use_implicit = force_operator || should_use_implicit_operators(n, p_final, dim);
+    let use_implicit = force_operator
+        || should_use_implicit_operators_with_policy(
+            n,
+            p_final,
+            dim,
+            &crate::resource::ResourcePolicy::default_library(),
+        );
 
     // ── Streaming path: biobank scale ─────────────────────────────────────
     // When dense materialization would exceed the memory threshold, build a
@@ -4373,7 +4350,14 @@ fn build_scalar_design_psi_derivatives_shared(
     }
 
     let force_operator = radial_kind.is_duchon_family();
-    if force_operator || should_use_implicit_operators(n, p_final, 1) {
+    if force_operator
+        || should_use_implicit_operators_with_policy(
+            n,
+            p_final,
+            1,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+    {
         let metric_eta = fixed_eta
             .map(|eta| eta.to_vec())
             .unwrap_or_else(|| vec![0.0; dim]);
@@ -10641,7 +10625,9 @@ fn build_matern_operator_penalty_psi_derivatives(
                 _lap_psi,
                 _lap_psi_psi,
             ) = matern_operator_psi_triplet(r, length_scale, nu, d)?;
-            let (_, q, t, t_r, t_rr) = matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+            let (_, _q_shape, t, t_r, t_rr) =
+                matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+            let q = ratio;
             let q_psi = ratio_psi;
             let q_psi_psi = ratio_psi_psi;
             let t_psi = 4.0 * t + r * t_r;
@@ -10810,13 +10796,13 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let d = centers.ncols();
     let mut d0_raw = Array2::<f64>::zeros((p, z_kernel.ncols()));
     let mut d1_raw = Array2::<f64>::zeros((p * d, z_kernel.ncols()));
-    let mut d2_raw = Array2::<f64>::zeros((p, z_kernel.ncols()));
+    let mut d2_raw = Array2::<f64>::zeros((p * d * d, z_kernel.ncols()));
     let mut d0_raw_psi = Array2::<f64>::zeros((p, z_kernel.ncols()));
     let mut d1_raw_psi = Array2::<f64>::zeros((p * d, z_kernel.ncols()));
-    let mut d2_raw_psi = Array2::<f64>::zeros((p, z_kernel.ncols()));
+    let mut d2_raw_psi = Array2::<f64>::zeros((p * d * d, z_kernel.ncols()));
     let mut d0_raw_psi_psi = Array2::<f64>::zeros((p, z_kernel.ncols()));
     let mut d1_raw_psi_psi = Array2::<f64>::zeros((p * d, z_kernel.ncols()));
-    let mut d2_raw_psi_psi = Array2::<f64>::zeros((p, z_kernel.ncols()));
+    let mut d2_raw_psi_psi = Array2::<f64>::zeros((p * d * d, z_kernel.ncols()));
 
     let aniso = spec.aniso_log_scales.as_deref();
     if let Some(eta) = aniso
@@ -10828,18 +10814,12 @@ fn build_duchon_operator_penalty_psi_derivatives(
         )));
     }
     let metric_weights: Option<Vec<f64>> = aniso.map(centered_aniso_metric_weights);
-    let sum_metric_weights = metric_weights
-        .as_ref()
-        .map(|weights| weights.iter().sum::<f64>())
-        .unwrap_or(d as f64);
     for k in 0..p {
         for j in k..p {
-            let mut s_vec = Vec::new();
             let r = if let Some(eta) = aniso {
                 let row_k: Vec<f64> = (0..d).map(|a| centers[[k, a]]).collect();
                 let row_j: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
-                let (r, components) = aniso_distance_and_components(&row_k, &row_j, eta);
-                s_vec = components;
+                let (r, _) = aniso_distance_and_components(&row_k, &row_j, eta);
                 r
             } else {
                 stable_euclidean_norm((0..d).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
@@ -10863,21 +10843,9 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 let q = jets.q;
                 let (q_psi, q_psi_psi) =
                     duchon_q_psi_triplet_from_jets(&jets, p_order, s_order, d, r);
-                let (lap, lap_psi, lap_psi_psi) = if let Some(weights) = metric_weights.as_ref() {
-                    let sum_wb_sb: f64 = (0..d).map(|axis| weights[axis] * s_vec[axis]).sum();
-                    let t_exponent = duchon_scaling_exponent(p_order, s_order, d) + 4.0;
-                    let (t_psi, t_psi_psi) =
-                        scaled_log_kappa_derivatives(jets.t, jets.t_r, jets.t_rr, t_exponent, r);
-                    (
-                        q * sum_metric_weights + jets.t * sum_wb_sb,
-                        q_psi * sum_metric_weights + t_psi * sum_wb_sb,
-                        q_psi_psi * sum_metric_weights + t_psi_psi * sum_wb_sb,
-                    )
-                } else {
-                    let (lap_psi, lap_psi_psi) =
-                        duchon_laplacian_psi_triplet_from_jets(&jets, p_order, s_order, d, r);
-                    (jets.lap, lap_psi, lap_psi_psi)
-                };
+                let t_exponent = duchon_scaling_exponent(p_order, s_order, d) + 4.0;
+                let (t_psi, t_psi_psi) =
+                    scaled_log_kappa_derivatives(jets.t, jets.t_r, jets.t_rr, t_exponent, r);
                 for axis in 0..d {
                     let delta = centers[[k, axis]] - centers[[j, axis]];
                     let axis_scale = metric_weights
@@ -10901,50 +10869,85 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 }
                 for col in 0..z_kernel.ncols() {
                     let z_jc = z_kernel[[j, col]];
-                    d2_raw[[k, col]] += lap * z_jc;
-                    d2_raw_psi[[k, col]] += lap_psi * z_jc;
-                    d2_raw_psi_psi[[k, col]] += lap_psi_psi * z_jc;
+                    for axis_b in 0..d {
+                        let h_b = centers[[k, axis_b]] - centers[[j, axis_b]];
+                        let w_b = metric_weights
+                            .as_ref()
+                            .map(|weights| weights[axis_b])
+                            .unwrap_or(1.0);
+                        for axis_c in 0..d {
+                            let h_c = centers[[k, axis_c]] - centers[[j, axis_c]];
+                            let w_c = metric_weights
+                                .as_ref()
+                                .map(|weights| weights[axis_c])
+                                .unwrap_or(1.0);
+                            let row = (k * d + axis_b) * d + axis_c;
+                            d2_raw[[row, col]] += hessian_operator_entry(
+                                q, jets.t, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                            ) * z_jc;
+                            d2_raw_psi[[row, col]] += hessian_operator_entry(
+                                q_psi, t_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                            ) * z_jc;
+                            d2_raw_psi_psi[[row, col]] += hessian_operator_entry(
+                                q_psi_psi, t_psi_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                            ) * z_jc;
+                        }
+                    }
                     if j != k {
                         let z_kc = z_kernel[[k, col]];
-                        d2_raw[[j, col]] += lap * z_kc;
-                        d2_raw_psi[[j, col]] += lap_psi * z_kc;
-                        d2_raw_psi_psi[[j, col]] += lap_psi_psi * z_kc;
+                        for axis_b in 0..d {
+                            let h_b = centers[[j, axis_b]] - centers[[k, axis_b]];
+                            let w_b = metric_weights
+                                .as_ref()
+                                .map(|weights| weights[axis_b])
+                                .unwrap_or(1.0);
+                            for axis_c in 0..d {
+                                let h_c = centers[[j, axis_c]] - centers[[k, axis_c]];
+                                let w_c = metric_weights
+                                    .as_ref()
+                                    .map(|weights| weights[axis_c])
+                                    .unwrap_or(1.0);
+                                let row = (j * d + axis_b) * d + axis_c;
+                                d2_raw[[row, col]] += hessian_operator_entry(
+                                    q, jets.t, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                                ) * z_kc;
+                                d2_raw_psi[[row, col]] += hessian_operator_entry(
+                                    q_psi, t_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                                ) * z_kc;
+                                d2_raw_psi_psi[[row, col]] += hessian_operator_entry(
+                                    q_psi_psi, t_psi_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                                ) * z_kc;
+                            }
+                        }
                     }
                 }
             } else {
                 let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
                     duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, d, &coeffs)?;
-                let (_, lap_collision) = duchon_collision_operator_core_fromphi_rr(
-                    phi_rr,
-                    phi_rr_psi,
-                    phi_rr_psi_psi,
-                    d,
-                );
-                let lap_value = if metric_weights.is_some() {
-                    sum_metric_weights * phi_rr
-                } else {
-                    lap_collision.value
-                };
-                let lap_psi = if metric_weights.is_some() {
-                    sum_metric_weights * phi_rr_psi
-                } else {
-                    lap_collision.psi
-                };
-                let lap_psi_psi = if metric_weights.is_some() {
-                    sum_metric_weights * phi_rr_psi_psi
-                } else {
-                    lap_collision.psi_psi
-                };
                 for col in 0..z_kernel.ncols() {
                     let z_jc = z_kernel[[j, col]];
-                    d2_raw[[k, col]] += lap_value * z_jc;
-                    d2_raw_psi[[k, col]] += lap_psi * z_jc;
-                    d2_raw_psi_psi[[k, col]] += lap_psi_psi * z_jc;
+                    for axis in 0..d {
+                        let w_axis = metric_weights
+                            .as_ref()
+                            .map(|weights| weights[axis])
+                            .unwrap_or(1.0);
+                        let row = (k * d + axis) * d + axis;
+                        d2_raw[[row, col]] += w_axis * phi_rr * z_jc;
+                        d2_raw_psi[[row, col]] += w_axis * phi_rr_psi * z_jc;
+                        d2_raw_psi_psi[[row, col]] += w_axis * phi_rr_psi_psi * z_jc;
+                    }
                     if j != k {
                         let z_kc = z_kernel[[k, col]];
-                        d2_raw[[j, col]] += lap_value * z_kc;
-                        d2_raw_psi[[j, col]] += lap_psi * z_kc;
-                        d2_raw_psi_psi[[j, col]] += lap_psi_psi * z_kc;
+                        for axis in 0..d {
+                            let w_axis = metric_weights
+                                .as_ref()
+                                .map(|weights| weights[axis])
+                                .unwrap_or(1.0);
+                            let row = (j * d + axis) * d + axis;
+                            d2_raw[[row, col]] += w_axis * phi_rr * z_kc;
+                            d2_raw_psi[[row, col]] += w_axis * phi_rr_psi * z_kc;
+                            d2_raw_psi_psi[[row, col]] += w_axis * phi_rr_psi_psi * z_kc;
+                        }
                     }
                 }
             }
@@ -10957,13 +10960,13 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let total_cols = kernel_cols + poly_cols;
     let mut d0 = Array2::<f64>::zeros((p, total_cols));
     let mut d1 = Array2::<f64>::zeros((p * d, total_cols));
-    let mut d2 = Array2::<f64>::zeros((p, total_cols));
+    let mut d2 = Array2::<f64>::zeros((p * d * d, total_cols));
     let mut d0_psi = Array2::<f64>::zeros((p, total_cols));
     let mut d1_psi = Array2::<f64>::zeros((p * d, total_cols));
-    let mut d2_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d2_psi = Array2::<f64>::zeros((p * d * d, total_cols));
     let mut d0_psi_psi = Array2::<f64>::zeros((p, total_cols));
     let mut d1_psi_psi = Array2::<f64>::zeros((p * d, total_cols));
-    let mut d2_psi_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d2_psi_psi = Array2::<f64>::zeros((p * d * d, total_cols));
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_raw);
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_raw);
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_raw);
@@ -10981,6 +10984,8 @@ fn build_duchon_operator_penalty_psi_derivatives(
         .assign(&d2_raw_psi_psi);
     if poly_cols > 0 {
         d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
+        let poly_hessian = polynomial_hessian_operator_block(centers, effective_nullspace_order);
+        d2.slice_mut(s![.., kernel_cols..]).assign(&poly_hessian);
         if poly_cols > 1 {
             for k in 0..p {
                 for axis in 0..d {
