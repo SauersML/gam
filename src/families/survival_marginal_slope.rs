@@ -8707,13 +8707,25 @@ impl SurvivalMarginalSlopeFamily {
         let time_tail = self.time_wiggle_range();
         let p_base = time_tail.start;
         let beta_time_w = beta_time.slice(s![time_tail.clone()]);
-        let ec = self.design_entry.row_chunk(row..row + 1);
-        let xc = self.design_exit.row_chunk(row..row + 1);
-        let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+        let ec = self
+            .design_entry
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("timewiggle_psi_action design_entry: {e}"))?;
+        let xc = self
+            .design_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("timewiggle_psi_action design_exit: {e}"))?;
+        let dc = self
+            .design_derivative_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("timewiggle_psi_action design_derivative_exit: {e}"))?;
         let x_e = ec.row(0).slice(s![..p_base]).to_owned();
         let x_x = xc.row(0).slice(s![..p_base]).to_owned();
         let x_d = dc.row(0).slice(s![..p_base]).to_owned();
-        let mc = self.marginal_design.row_chunk(row..row + 1);
+        let mc = self
+            .marginal_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("timewiggle_psi_action marginal_design: {e}"))?;
         let x_m = mc.row(0).to_owned();
         let bm = block_states[1].eta[row];
         let h0 = x_e.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
@@ -10820,13 +10832,25 @@ impl SurvivalMarginalSlopeFamily {
                         &mut acc,
                     )?;
 
-                    let ec = self.design_entry.row_chunk(row..row + 1);
-                    let xc = self.design_exit.row_chunk(row..row + 1);
-                    let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+                    let ec = self
+                        .design_entry
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_entry try_row_chunk: {e}"))?;
+                    let xc = self
+                        .design_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_exit try_row_chunk: {e}"))?;
+                    let dc = self
+                        .design_derivative_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_derivative_exit try_row_chunk: {e}"))?;
                     let xe = ec.row(0).slice(s![..p_base]).to_owned();
                     let xx = xc.row(0).slice(s![..p_base]).to_owned();
                     let xd = dc.row(0).slice(s![..p_base]).to_owned();
-                    let mc = self.marginal_design.row_chunk(row..row + 1);
+                    let mc = self
+                        .marginal_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("marginal_design try_row_chunk: {e}"))?;
                     let mr = mc.row(0).to_owned();
                     let dh0 = xe.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
                     let dh1 = xx.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
@@ -11119,13 +11143,25 @@ impl SurvivalMarginalSlopeFamily {
                     let h_ue = h_pi.dot(&ue);
 
                     // ── Timewiggle geometry ─────────────────────────────
-                    let ec = self.design_entry.row_chunk(row..row + 1);
-                    let xc = self.design_exit.row_chunk(row..row + 1);
-                    let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+                    let ec = self
+                        .design_entry
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_entry try_row_chunk: {e}"))?;
+                    let xc = self
+                        .design_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_exit try_row_chunk: {e}"))?;
+                    let dc = self
+                        .design_derivative_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_derivative_exit try_row_chunk: {e}"))?;
                     let xe = ec.row(0).slice(s![..p_base]).to_owned();
                     let xx = xc.row(0).slice(s![..p_base]).to_owned();
                     let xd = dc.row(0).slice(s![..p_base]).to_owned();
-                    let mc = self.marginal_design.row_chunk(row..row + 1);
+                    let mc = self
+                        .marginal_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("marginal_design try_row_chunk: {e}"))?;
                     let mr = mc.row(0).to_owned();
 
                     let bm = block_states[1].eta[row];
@@ -11201,7 +11237,7 @@ impl SurvivalMarginalSlopeFamily {
                         gamma.view(),
                         psi.view(),
                         &mut acc,
-                    );
+                    )?;
 
                     let jt = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
                     let jm = [
@@ -11620,7 +11656,7 @@ impl SurvivalMarginalSlopeFamily {
                         h_ud.view(),
                         t_ud.view(),
                         &mut acc,
-                    );
+                    )?;
                     // Identity block Hessian: cross + diagonal + cross-cross
                     for (primary_range, joint_range) in &identity_blocks {
                         for local in 0..primary_range.len() {
@@ -11632,7 +11668,7 @@ impl SurvivalMarginalSlopeFamily {
                                 joint_range,
                                 local,
                                 &mut acc,
-                            );
+                            )?;
                         }
                         self.add_dense_submatrix(
                             &mut acc,
@@ -11709,7 +11745,7 @@ impl SurvivalMarginalSlopeFamily {
                         gamma.view(),
                         q_de.view(),
                         &mut acc,
-                    );
+                    )?;
                     for (primary_range, joint_range) in &identity_blocks {
                         for local in 0..primary_range.len() {
                             self.accumulate_identity_primary_cross_hessian(
@@ -11720,7 +11756,7 @@ impl SurvivalMarginalSlopeFamily {
                                 joint_range,
                                 local,
                                 &mut acc,
-                            );
+                            )?;
                         }
                         self.add_dense_submatrix(
                             &mut acc,
