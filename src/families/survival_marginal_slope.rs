@@ -5160,7 +5160,7 @@ impl SurvivalMarginalSlopeFamily {
         primary_gradient: ndarray::ArrayView1<'_, f64>,
         primary_hessian: ArrayView2<'_, f64>,
         joint_hessian: &mut Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
@@ -5219,7 +5219,7 @@ impl SurvivalMarginalSlopeFamily {
                 primary_hessian[[3, 3]],
                 joint_hessian.slice_mut(s![slices.logslope.clone(), slices.logslope.clone()]),
             )
-            .expect("survival logslope block syr");
+            .map_err(|e| format!("accumulate_dynamic_q_core_hessian logslope syr: {e}"))?;
 
         for a in 0..p_t {
             for b in 0..p_m {
@@ -5236,7 +5236,12 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+        let logslope_chunk = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| {
+                format!("accumulate_dynamic_q_core_hessian logslope try_row_chunk: {e}")
+            })?;
         let logslope_row = logslope_chunk.row(0);
         for a in 0..p_t {
             let mut weight = 0.0;
@@ -5261,6 +5266,7 @@ impl SurvivalMarginalSlopeFamily {
                 joint_hessian[[slices.logslope.start + b, slices.marginal.start + a]] += value;
             }
         }
+        Ok(())
     }
 
     fn accumulate_dynamic_q_blockwise_gradient(
@@ -5413,7 +5419,7 @@ impl SurvivalMarginalSlopeFamily {
         joint_block: &std::ops::Range<usize>,
         joint_local: usize,
         joint_hessian: &mut Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         let joint_idx = joint_block.start + joint_local;
         let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
         let dq_marginal = [
@@ -5438,7 +5444,12 @@ impl SurvivalMarginalSlopeFamily {
             joint_hessian[[slices.marginal.start + coeff_idx, joint_idx]] += value;
             joint_hessian[[joint_idx, slices.marginal.start + coeff_idx]] += value;
         }
-        let logslope_chunk = self.logslope_design.row_chunk(row..row + 1);
+        let logslope_chunk = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| {
+                format!("accumulate_identity_primary_cross_hessian logslope try_row_chunk: {e}")
+            })?;
         let logslope_row = logslope_chunk.row(0);
         let logslope_weight = core_hessian_column[3];
         if logslope_weight != 0.0 {
@@ -5448,6 +5459,7 @@ impl SurvivalMarginalSlopeFamily {
                 joint_hessian[[joint_idx, slices.logslope.start + coeff_idx]] += value;
             }
         }
+        Ok(())
     }
 
     fn add_dense_submatrix(
@@ -5512,7 +5524,7 @@ impl SurvivalMarginalSlopeFamily {
             primary_gradient.slice(s![0..N_PRIMARY]),
             primary_hessian.slice(s![0..N_PRIMARY, 0..N_PRIMARY]),
             joint_hessian,
-        );
+        )?;
 
         for (primary_range, joint_range) in identity_blocks {
             for local in 0..primary_range.len() {
@@ -5526,7 +5538,7 @@ impl SurvivalMarginalSlopeFamily {
                     joint_range,
                     local,
                     joint_hessian,
-                );
+                )?;
             }
             self.add_dense_submatrix(
                 joint_hessian,
@@ -10538,16 +10550,28 @@ impl SurvivalMarginalSlopeFamily {
                         h_ud.view(),
                         t_ud.view(),
                         &mut acc,
-                    );
+                    )?;
 
                     // ── Timewiggle Jacobian derivatives ────────────────
-                    let ec = self.design_entry.row_chunk(row..row + 1);
-                    let xc = self.design_exit.row_chunk(row..row + 1);
-                    let dc = self.design_derivative_exit.row_chunk(row..row + 1);
+                    let ec = self
+                        .design_entry
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_entry try_row_chunk: {e}"))?;
+                    let xc = self
+                        .design_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_exit try_row_chunk: {e}"))?;
+                    let dc = self
+                        .design_derivative_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("design_derivative_exit try_row_chunk: {e}"))?;
                     let xe = ec.row(0).slice(s![..p_base]).to_owned();
                     let xx = xc.row(0).slice(s![..p_base]).to_owned();
                     let xd = dc.row(0).slice(s![..p_base]).to_owned();
-                    let mc = self.marginal_design.row_chunk(row..row + 1);
+                    let mc = self
+                        .marginal_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("marginal_design try_row_chunk: {e}"))?;
                     let mr = mc.row(0).to_owned();
                     let dh0 = xe.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
                     let dh1 = xx.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
@@ -10637,7 +10661,10 @@ impl SurvivalMarginalSlopeFamily {
                             acc[[slices.marginal.start + b, slices.time.start + a]] += v;
                         }
                     }
-                    let gc = self.logslope_design.row_chunk(row..row + 1);
+                    let gc = self
+                        .logslope_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
                     let gr = gc.row(0);
                     for a in 0..p_time {
                         let mut w = 0.0;
@@ -10887,7 +10914,10 @@ impl SurvivalMarginalSlopeFamily {
                             acc[[slices.marginal.start + b, slices.time.start + a]] += v;
                         }
                     }
-                    let gc = self.logslope_design.row_chunk(row..row + 1);
+                    let gc = self
+                        .logslope_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
                     let gr = gc.row(0);
                     for a in 0..p_time {
                         let mut w = 0.0;
@@ -11179,7 +11209,10 @@ impl SurvivalMarginalSlopeFamily {
                         &q_geom.dq1_marginal,
                         &q_geom.dqd1_marginal,
                     ];
-                    let gc = self.logslope_design.row_chunk(row..row + 1);
+                    let gc = self
+                        .logslope_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
                     let gr = gc.row(0);
 
                     // ── Helper: accumulate a symmetrized bilinear term ──

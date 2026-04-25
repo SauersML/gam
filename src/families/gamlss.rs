@@ -91,7 +91,9 @@ impl DenseOrOperator<'_> {
             Self::Operator(design) => {
                 let mut out = Array1::<f64>::zeros(n);
                 for rows in exact_design_row_chunks(n, p) {
-                    let chunk = design.row_chunk(rows.clone());
+                    let chunk = design
+                        .try_row_chunk(rows.clone())
+                        .expect("gamlss DesignSlot::dot: design row chunk materialization failed");
                     out.slice_mut(s![rows]).assign(&chunk.dot(&beta));
                 }
                 out
