@@ -95,6 +95,7 @@ use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
     LogLikelihoodNormalization, MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
+    WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -7725,13 +7726,14 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> DeviationBlockConfig {
+    let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
     DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
-        penalty_order: 2,
+        penalty_order: *wiggle.penalty_orders.iter().max().unwrap_or(&2),
         penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
-        monotonicity_eps: 1e-4,
+        monotonicity_eps: defaults.monotonicity_eps,
     }
 }
 
@@ -10349,7 +10351,7 @@ mod tests {
     };
     use gam::types::{
         InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
-        LogLikelihoodNormalization,
+        LogLikelihoodNormalization, WigglePenaltyConfig,
     };
     use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
     use rand::SeedableRng;
@@ -12745,8 +12747,8 @@ mod tests {
         );
         assert_eq!(routed.degree, 4);
         assert_eq!(routed.num_internal_knots, 9);
-        assert_eq!(routed.penalty_order, 1);
-        assert_eq!(routed.penalty_orders, vec![3]);
+        assert_eq!(routed.penalty_order, 3);
+        assert_eq!(routed.penalty_orders, vec![1, 3]);
         assert!(!routed.double_penalty);
     }
 
@@ -12771,13 +12773,13 @@ mod tests {
         let score_warp = routed.score_warp.expect("logslope score-warp config");
         assert_eq!(link_dev.degree, 4);
         assert_eq!(link_dev.num_internal_knots, 9);
-        assert_eq!(link_dev.penalty_order, 1);
-        assert_eq!(link_dev.penalty_orders, vec![3]);
+        assert_eq!(link_dev.penalty_order, 3);
+        assert_eq!(link_dev.penalty_orders, vec![1, 3]);
         assert!(!link_dev.double_penalty);
         assert_eq!(score_warp.degree, 5);
         assert_eq!(score_warp.num_internal_knots, 7);
-        assert_eq!(score_warp.penalty_order, 2);
-        assert_eq!(score_warp.penalty_orders, vec![3]);
+        assert_eq!(score_warp.penalty_order, 3);
+        assert_eq!(score_warp.penalty_orders, vec![2, 3]);
         assert!(score_warp.double_penalty);
     }
 
@@ -15133,8 +15135,9 @@ mod tests {
             parse_link_choice(Some("flexible(logit)"), false).expect("parse flexible link choice");
         let cfg = effectivelinkwiggle_formulaspec(None, link_choice.as_ref())
             .expect("flexible link should inject wiggle config");
+        let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
         assert_eq!(cfg.degree, 3);
-        assert_eq!(cfg.num_internal_knots, 10);
+        assert_eq!(cfg.num_internal_knots, defaults.num_internal_knots);
         assert_eq!(cfg.penalty_orders, vec![1, 2, 3]);
         assert!(cfg.double_penalty);
     }
