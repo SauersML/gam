@@ -992,8 +992,17 @@ impl<'a> RemlState<'a> {
             if tk_grad.len() == grad.len() {
                 **grad += &tk_grad;
             } else {
+                // The unified evaluator returns one gradient entry per
+                // (ρ, ext_coord) coordinate; the analytic Tierney–Kadane
+                // propagation in `tk_gradient_from_shared` produces exactly
+                // the same per-coordinate layout (`tk_penalties.len() +
+                // ext_drifts.len()`).  An arity mismatch means the two
+                // sides were assembled against different coordinate sets,
+                // which would yield a structurally inconsistent total
+                // gradient and is therefore rejected outright instead of
+                // silently zero-padding or truncating.
                 return Err(EstimationError::InvalidInput(format!(
-                    "Tierney-Kadane psi gradients require full analytic c/d derivative propagation; refusing approximate psi gradients (evaluator returned {} gradient coordinates, correction returned {})",
+                    "Tierney-Kadane gradient coordinate count mismatch: evaluator produced {} entries, analytic c/d propagation produced {}; this indicates the TK term and the unified evaluator were assembled against different coordinate sets",
                     grad.len(),
                     tk_grad.len()
                 )));
