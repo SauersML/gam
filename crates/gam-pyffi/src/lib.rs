@@ -1379,11 +1379,29 @@ fn build_survival_location_scale_ffi_payload(
         )?
     };
     let time_anchor = resolve_survival_time_anchor_value(&age_entry, None)?;
-    let time_build = build_survival_time_basis(
+    let mut time_build = build_survival_time_basis(
         &age_entry,
         &age_exit,
         time_cfg,
         Some((fit_config.time_num_internal_knots, fit_config.time_smooth_lambda)),
+    )?;
+    let resolved_time_cfg =
+        gam::families::survival_construction::resolved_survival_time_basis_config_from_build(
+            &time_build.basisname,
+            time_build.degree,
+            time_build.knots.as_ref(),
+            time_build.keep_cols.as_ref(),
+            time_build.smooth_lambda,
+        )?;
+    let time_anchor_row =
+        gam::families::survival_construction::evaluate_survival_time_basis_row(
+            time_anchor,
+            &resolved_time_cfg,
+        )?;
+    gam::families::survival_construction::center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &time_anchor_row,
     )?;
 
     let fitted_inverse_link = ls_result.inverse_link.clone();
