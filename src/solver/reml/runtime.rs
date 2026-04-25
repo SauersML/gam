@@ -4242,3 +4242,116 @@ impl<'a> RemlState<'a> {
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
 }
+
+#[cfg(test)]
+mod tk_math_tests {
+    use super::*;
+    use crate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+    use ndarray::array;
+
+    fn solve_vec(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
+        h.cholesky(Side::Lower).expect("chol(H)").solvevec(rhs)
+    }
+
+    fn solve_xt(h: &Array2<f64>, x: &Array2<f64>) -> Array2<f64> {
+        let mut xt = x.t().to_owned();
+        h.cholesky(Side::Lower)
+            .expect("chol(H)")
+            .solve_mat_in_place(&mut xt);
+        xt
+    }
+
+    fn tk_scalar_for(
+        h: &Array2<f64>,
+        x: &Array2<f64>,
+        c: &Array1<f64>,
+        d: &Array1<f64>,
+    ) -> f64 {
+        let z = solve_xt(h, x);
+        let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(solve_vec(h, rhs))
+        };
+        let shared = RemlState::tk_shared_intermediates(x, &z, c, "tk scalar test", &solve)
+            .expect("shared TK intermediates");
+        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        RemlState::tk_scalar_from_shared(x, &z, d, &shared, &mut gram)
+            .expect("TK scalar")
+    }
+
+    #[test]
+    fn tierney_kadane_gradient_matches_full_scalar_finite_difference() {
+        let x = array![
+            [1.0, -0.35, 0.22],
+            [0.4, 0.8, -0.5],
+            [-0.7, 0.15, 0.9],
+            [0.2, -0.6, -0.3],
+        ];
+        let h = array![
+            [3.4, 0.25, -0.12],
+            [0.25, 2.7, 0.31],
+            [-0.12, 0.31, 2.2],
+        ];
+        let h_dot = array![
+            [0.11, -0.04, 0.03],
+            [-0.04, 0.08, -0.02],
+            [0.03, -0.02, -0.05],
+        ];
+        let x_dot = array![
+            [0.03, -0.02, 0.01],
+            [-0.01, 0.025, -0.015],
+            [0.02, 0.01, -0.03],
+            [-0.015, -0.01, 0.02],
+        ];
+        let c = array![0.17, -0.09, 0.13, 0.05];
+        let d = array![-0.04, 0.08, 0.03, -0.06];
+        let e = array![0.025, -0.035, 0.02, 0.015];
+        let eta_dot = array![0.12, -0.07, 0.05, -0.09];
+
+        let z = solve_xt(&h, &x);
+        let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(solve_vec(&h, rhs))
+        };
+        let shared = RemlState::tk_shared_intermediates(&x, &z, &c, "tk derivative test", &solve)
+            .expect("shared TK intermediates");
+        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        let gradient = RemlState::tk_gradient_from_shared(
+            &x,
+            &z,
+            &c,
+            &d,
+            &e,
+            &[],
+            &[],
+            &[h_dot.clone()],
+            &[Some(eta_dot.clone())],
+            &[Some(x_dot.clone())],
+            &[Array1::<f64>::zeros(h.nrows())],
+            &shared,
+            &mut gram,
+        )
+        .expect("analytic TK derivative");
+        let analytic = gradient[0];
+
+        let h_step = 2.0e-6;
+        let c_dot = &d * &eta_dot;
+        let d_dot = &e * &eta_dot;
+        let h_plus = &h + &h_dot.mapv(|v| h_step * v);
+        let h_minus = &h - &h_dot.mapv(|v| h_step * v);
+        let x_plus = &x + &x_dot.mapv(|v| h_step * v);
+        let x_minus = &x - &x_dot.mapv(|v| h_step * v);
+        let c_plus = &c + &c_dot.mapv(|v| h_step * v);
+        let c_minus = &c - &c_dot.mapv(|v| h_step * v);
+        let d_plus = &d + &d_dot.mapv(|v| h_step * v);
+        let d_minus = &d - &d_dot.mapv(|v| h_step * v);
+        let fd = (tk_scalar_for(&h_plus, &x_plus, &c_plus, &d_plus)
+            - tk_scalar_for(&h_minus, &x_minus, &c_minus, &d_minus))
+            / (2.0 * h_step);
+
+        let rel = (analytic - fd).abs() / analytic.abs().max(fd.abs()).max(1.0e-12);
+        assert!(
+            rel < 2.0e-7,
+            "TK derivative mismatch: analytic={analytic:.12e}, fd={fd:.12e}, rel={rel:.3e}"
+        );
+    }
+}
