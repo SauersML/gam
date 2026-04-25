@@ -3885,29 +3885,6 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
 }
 
 // Remaining callers in `survival_location_scale.rs`
-// (lines 1911, 1952) and `gamlss.rs` (line 8653) materialize the dense matrix and
-// must move to `resolve_custom_family_x_psi_map` with an upstream `ResourcePolicy`.
-// Those files are owned by sibling agents; once they migrate, delete this adapter
-// (do not add `#[allow(dead_code)]`). The inlined `permissive_small_data()` policy
-// is a temporary back-compat scaffold — every preserved callsite should plumb a
-// real policy through and call the `_map` variant directly.
-pub(crate) fn resolve_custom_family_x_psi(
-    deriv: &CustomFamilyBlockPsiDerivative,
-    n: usize,
-    p: usize,
-    label: &str,
-) -> Result<Array2<f64>, String> {
-    let policy = crate::resource::ResourcePolicy::permissive_small_data();
-    let map = resolve_custom_family_x_psi_map(deriv, n, p, 0..n, label, &policy)?;
-    match map {
-        PsiDesignMap::Zero { nrows, ncols } => Ok(Array2::<f64>::zeros((nrows, ncols))),
-        PsiDesignMap::Dense { matrix } => Ok((*matrix).clone()),
-        PsiDesignMap::First { action } => action.row_chunk(0..n),
-        PsiDesignMap::Second { action } => action.row_chunk(0..n),
-    }
-}
-
-// Remaining callers in `survival_location_scale.rs`
 // (lines 2041, 2077) and `gamlss.rs` (lines 5559, 5579, 6938, 6958, 10856, 10876,
 // 12542, 12562) materialize the dense matrix and must move to
 // `resolve_custom_family_x_psi_psi_map` with an upstream `ResourcePolicy`. Those

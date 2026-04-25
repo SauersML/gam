@@ -6,11 +6,11 @@ use crate::custom_family::{
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_embedded_dense_psi_operator, build_rowwise_kronecker_psi_operator,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
-    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi_map,
-    resolve_custom_family_x_psi_psi, second_psi_linear_map, shared_dense_arc,
-    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps, PsiDesignMap,
+    PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
+    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi, second_psi_linear_map,
+    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
     wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
@@ -1866,6 +1866,7 @@ impl SurvivalLocationScaleFamily {
         let pls = self.x_log_sigma.ncols();
         let beta_t = &block_states[Self::BLOCK_THRESHOLD].beta;
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
+        let _row_chunk_target_bytes = self.policy.row_chunk_target_bytes;
         let t_time_varying = self.x_threshold_entry.is_some();
         let ls_time_varying = self.x_log_sigma_entry.is_some();
 
