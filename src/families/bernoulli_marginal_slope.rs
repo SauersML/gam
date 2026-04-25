@@ -238,6 +238,12 @@ struct BernoulliMarginalSlopeFamily {
     logslope_design: DesignMatrix,
     score_warp: Option<DeviationRuntime>,
     link_dev: Option<DeviationRuntime>,
+    /// Resource policy controlling materialization decisions for psi design
+    /// resolution and other size-sensitive helpers invoked during exact-Newton
+    /// joint psi calculus. Threaded from the fit entry point so biobank-scale
+    /// runs pick up the caller's analytic-operator preference instead of an
+    /// inline default.
+    policy: crate::resource::ResourcePolicy,
 }
 
 #[derive(Clone, Default)]
@@ -6049,14 +6055,13 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build the psi design map once; per-row calls use direct row_vector(row).
-        let policy = crate::resource::ResourcePolicy::default_library();
         let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
             p_psi,
             0..n,
             psi_label,
-            &policy,
+            &self.policy,
         )?;
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
@@ -8139,6 +8144,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     spec: BernoulliMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     let data_view = data;
@@ -8328,6 +8334,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
             link_dev: link_dev_runtime.clone(),
+            policy: policy.clone(),
         }
     };
 

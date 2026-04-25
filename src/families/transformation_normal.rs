@@ -1096,7 +1096,7 @@ impl CustomFamily for TransformationNormalFamily {
             // never materialize n x (p_resp * p_cov) rowwise-Kronecker matrices.
             // The resource policy is the one stored on the family so chunk
             // sizing matches the surrounding workload.
-            let policy = &self.policy;
+            let policy: &ResourcePolicy = &self.policy;
             let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
                 "TransformationNormalFamily exact Hessian requires dense covariate design"
                     .to_string()
@@ -1117,15 +1117,15 @@ impl CustomFamily for TransformationNormalFamily {
             let w_inv_h2_view = weighted_inv_h_prime_sq.view();
 
             let mut hess =
-                factored_weighted_cross(resp_val, &cov_i, w_view, resp_val, &cov_j, &policy)?;
-            hess += &factored_weighted_cross(resp_val, &cov_j, w_view, resp_val, &cov_i, &policy)?;
+                factored_weighted_cross(resp_val, &cov_i, w_view, resp_val, &cov_j, policy)?;
+            hess += &factored_weighted_cross(resp_val, &cov_j, w_view, resp_val, &cov_i, policy)?;
             hess += &factored_weighted_cross(
                 resp_val,
                 &cov_ij,
                 w_view,
                 resp_val,
                 cov_design_dense,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_val,
@@ -1133,7 +1133,7 @@ impl CustomFamily for TransformationNormalFamily {
                 w_view,
                 resp_val,
                 &cov_ij,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_deriv,
@@ -1141,7 +1141,7 @@ impl CustomFamily for TransformationNormalFamily {
                 w_inv_h2_view,
                 resp_deriv,
                 &cov_j,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_deriv,
@@ -1149,7 +1149,7 @@ impl CustomFamily for TransformationNormalFamily {
                 w_inv_h2_view,
                 resp_deriv,
                 &cov_i,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_deriv,
@@ -1157,7 +1157,7 @@ impl CustomFamily for TransformationNormalFamily {
                 w_inv_h2_view,
                 resp_deriv,
                 cov_design_dense,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_deriv,
@@ -1165,7 +1165,7 @@ impl CustomFamily for TransformationNormalFamily {
                 w_inv_h2_view,
                 resp_deriv,
                 &cov_ij,
-                &policy,
+                policy,
             )?;
 
             let cubic_i =
@@ -1176,7 +1176,7 @@ impl CustomFamily for TransformationNormalFamily {
                 cubic_i.view(),
                 resp_deriv,
                 cov_design_dense,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_deriv,
@@ -1184,7 +1184,7 @@ impl CustomFamily for TransformationNormalFamily {
                 cubic_i.view(),
                 resp_deriv,
                 &cov_i,
-                &policy,
+                policy,
             )?;
 
             let cubic_j =
@@ -1195,7 +1195,7 @@ impl CustomFamily for TransformationNormalFamily {
                 cubic_j.view(),
                 resp_deriv,
                 cov_design_dense,
-                &policy,
+                policy,
             )?;
             hess += &factored_weighted_cross(
                 resp_deriv,
@@ -1203,16 +1203,16 @@ impl CustomFamily for TransformationNormalFamily {
                 cubic_j.view(),
                 resp_deriv,
                 &cov_j,
-                &policy,
+                policy,
             )?;
 
             let cubic_second =
                 ((&v_ij_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            hess += &self.x_deriv_kron.weighted_gram(&cubic_second, &self.policy);
+            hess += &self.x_deriv_kron.weighted_gram(&cubic_second, policy);
 
             let quartic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_qu * self.weights.as_ref())
                 .mapv(|v| 6.0 * v);
-            hess += &self.x_deriv_kron.weighted_gram(&quartic, &self.policy);
+            hess += &self.x_deriv_kron.weighted_gram(&quartic, policy);
             0.5 * (&hess + &hess.t())
         };
 
@@ -1259,10 +1259,7 @@ impl CustomFamily for TransformationNormalFamily {
             format!("tensor psi hessian drift directional forward_mul_deriv failed: {e}")
         })?;
 
-        // Stay factored: build cross-products from (response_deriv_basis,
-        // covariate_factor) pairs instead of materializing n x p_out.
-        // TODO(ctn-factored-migration): thread ResourcePolicy through this API.
-        let policy = ResourcePolicy::default_library();
+        let policy = &self.policy;
         let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
             "TransformationNormalFamily hessian drift requires dense covariate design".to_string()
         })?;
@@ -1278,7 +1275,7 @@ impl CustomFamily for TransformationNormalFamily {
             cubic_h.view(),
             resp_deriv,
             cov_design_dense,
-            &policy,
+            policy,
         )?;
         hess += &factored_weighted_cross(
             resp_deriv,
@@ -1286,7 +1283,7 @@ impl CustomFamily for TransformationNormalFamily {
             cubic_h.view(),
             resp_deriv,
             &cov_psi,
-            &policy,
+            policy,
         )?;
 
         let cubic_v = ((&d_v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
