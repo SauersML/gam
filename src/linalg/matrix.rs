@@ -39,29 +39,6 @@ fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usi
         .ok_or_else(|| format!("{context}: dense size overflow for {nrows}x{ncols}"))
 }
 
-/// Default-policy wrapper around
-/// [`panic_or_error_if_biobank_mode_and_to_dense_called_with_policy`].
-///
-/// The sole holdout caller is [`DenseDesignMatrix::try_to_dense_arc`], which is
-/// itself invoked from 30+ sites across `solver/reml/`, `terms/smooth.rs`,
-/// `solver/pirls.rs`, `inference/`, etc. None of those callers thread a
-/// [`ResourcePolicy`] today, and `DenseDesignMatrix` does not own one. The
-/// migration path is to add a `policy: &ResourcePolicy` argument to
-/// `try_to_dense_arc` and propagate to every call site, or attach a policy
-/// to `DenseDesignMatrix` itself.
-pub fn panic_or_error_if_biobank_mode_and_to_dense_called(
-    context: &str,
-    n: usize,
-    p: usize,
-) -> Result<(), String> {
-    panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
-        context,
-        n,
-        p,
-        &ResourcePolicy::default_library(),
-    )
-}
-
 pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
     context: &str,
     n: usize,
@@ -695,10 +672,11 @@ impl DenseDesignMatrix {
         match self {
             Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
             Self::Lazy(op) => {
-                panic_or_error_if_biobank_mode_and_to_dense_called(
+                panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
                     context,
                     op.nrows(),
                     op.ncols(),
+                    &ResourcePolicy::default_library(),
                 )?;
                 Ok(op.to_dense_arc())
             }
