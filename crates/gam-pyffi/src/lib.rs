@@ -74,6 +74,13 @@ struct PyFitConfig {
     disable_link_dev: Option<bool>,
     disable_score_warp: Option<bool>,
     firth: Option<bool>,
+
+    // Frailty (only consumed by survival families today). When provided as a
+    // string, accepts: "hazard-multiplier", "hazard-multiplier:learnable",
+    // "gaussian-shift:<sigma>". For richer frailty configs, use the CLI.
+    frailty: Option<String>,
+    frailty_sigma: Option<f64>,
+    frailty_loading: Option<f64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -738,6 +745,31 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
+    }
+    if let Some(kind) = py_config.frailty {
+        let trimmed = kind.trim().to_ascii_lowercase();
+        let loading = py_config.frailty_loading.unwrap_or(1.0);
+        let sigma = py_config.frailty_sigma;
+        let frailty = match trimmed.as_str() {
+            "none" | "" => gam::families::lognormal_kernel::FrailtySpec::None,
+            "hazard-multiplier" => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                sigma_fixed: sigma,
+                loading: gam::families::lognormal_kernel::HazardLoading::Multiplicative { gamma: loading },
+            },
+            "hazard-multiplier:learnable" => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                sigma_fixed: None,
+                loading: gam::families::lognormal_kernel::HazardLoading::Multiplicative { gamma: loading },
+            },
+            "gaussian-shift" => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
+                sigma_fixed: sigma,
+            },
+            other => {
+                return Err(format!(
+                    "unknown frailty kind '{other}'; supported: 'none', 'hazard-multiplier', 'hazard-multiplier:learnable', 'gaussian-shift'"
+                ));
+            }
+        };
+        fit_config.frailty = Some(frailty);
     }
     Ok(fit_config)
 }
