@@ -513,11 +513,11 @@ impl<'a> RemlState<'a> {
 
         let mut c_prime = Array1::<f64>::zeros(n);
         let mut d_prime = Array1::<f64>::zeros(n);
-        Zip::from(&mut c_prime)
+        ndarray::Zip::from(&mut c_prime)
             .and(d_array)
             .and(eta_total)
             .for_each(|out, &d, &eta| *out = d * eta);
-        Zip::from(&mut d_prime)
+        ndarray::Zip::from(&mut d_prime)
             .and(e_array)
             .and(eta_total)
             .for_each(|out, &e, &eta| *out = e * eta);
