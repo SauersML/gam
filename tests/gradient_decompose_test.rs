@@ -236,12 +236,11 @@ fn test_component_a_envelope_theorem() {
         analytic_a[k] = 0.5 * rho[k].exp() * beta.dot(&s_list[k].local.dot(&beta));
     }
 
-    eprintln!("=== COMPONENT A: envelope theorem ===");
-    eprintln!("analytic = {:?}", analytic_a);
-    eprintln!("fd       = {:?}", fd_a);
     let err = rel_l2(&analytic_a, &fd_a);
-    eprintln!("rel_l2   = {err:.3e}");
-    assert!(err < 1e-4, "Envelope theorem failed: rel_l2={err:.3e}");
+    assert!(
+        err < 1e-4,
+        "Envelope theorem failed: rel_l2={err:.3e}\nanalytic={analytic_a:?}\nfd={fd_a:?}"
+    );
 }
 
 /// Component B: Hessian log-determinant. 0.5*log|H(ρ)|.
@@ -309,14 +308,10 @@ fn test_component_b_hessian_logdet() {
         analytic_b[k] = 0.5 * (lambda_k * trace_h_inv_s_k - tracethird);
     }
 
-    eprintln!("=== COMPONENT B: hessian logdet derivative ===");
-    eprintln!("analytic = {:?}", analytic_b);
-    eprintln!("fd       = {:?}", fd_b);
     let err = rel_l2(&analytic_b, &fd_b);
-    eprintln!("rel_l2   = {err:.3e}");
     assert!(
         err < 1e-3,
-        "Hessian logdet derivative failed: rel_l2={err:.3e}"
+        "Hessian logdet derivative failed: rel_l2={err:.3e}\nanalytic={analytic_b:?}\nfd={fd_b:?}"
     );
 }
 
@@ -371,12 +366,11 @@ fn test_component_b1_simple_trace() {
         analytic_b1[k] = 0.5 * lambda_k * trace;
     }
 
-    eprintln!("=== COMPONENT B1: simple Hessian trace (fixed β) ===");
-    eprintln!("analytic = {:?}", analytic_b1);
-    eprintln!("fd       = {:?}", fd_b1);
     let err = rel_l2(&analytic_b1, &fd_b1);
-    eprintln!("rel_l2   = {err:.3e}");
-    assert!(err < 1e-4, "Simple Hessian trace failed: rel_l2={err:.3e}");
+    assert!(
+        err < 1e-4,
+        "Simple Hessian trace failed: rel_l2={err:.3e}\nanalytic={analytic_b1:?}\nfd={fd_b1:?}"
+    );
 }
 
 /// Component C: Penalty log-determinant. -0.5*log|S(ρ)|_+.
@@ -428,14 +422,10 @@ fn test_component_c_penalty_logdet() {
         analytic_c[k] = -0.5 * lambda_k * det1_k;
     }
 
-    eprintln!("=== COMPONENT C: penalty logdet derivative ===");
-    eprintln!("analytic = {:?}", analytic_c);
-    eprintln!("fd       = {:?}", fd_c);
     let err = rel_l2(&analytic_c, &fd_c);
-    eprintln!("rel_l2   = {err:.3e}");
     assert!(
         err < 1e-4,
-        "Penalty logdet derivative failed: rel_l2={err:.3e}"
+        "Penalty logdet derivative failed: rel_l2={err:.3e}\nanalytic={analytic_c:?}\nfd={fd_c:?}"
     );
 }
 
@@ -525,11 +515,9 @@ fn test_single_penalty_logit_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
-    eprintln!("=== SINGLE PENALTY: logit ===");
-    eprintln!("analytic={:?} fd={:?} rel_l2={err:.3e}", analytic, fd);
     assert!(
         err < 0.05,
-        "Single-penalty logit gradient wrong: rel_l2={err:.3e}"
+        "Single-penalty logit gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
     );
 }
 
@@ -583,14 +571,9 @@ fn test_two_overlapping_penalties_logit_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
-    eprintln!("=== OVERLAPPING PENALTIES: logit ===");
-    eprintln!("analytic={:?}", analytic);
-    eprintln!("fd      ={:?}", fd);
-    eprintln!("rel_l2  ={err:.3e}");
-    // Expected to FAIL if structural_rank bug is the cause
     assert!(
         err < 0.05,
-        "Overlapping-penalty logit gradient wrong: rel_l2={err:.3e}"
+        "Overlapping-penalty logit gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
     );
 }
 
@@ -644,13 +627,9 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
-    eprintln!("=== NON-OVERLAPPING PENALTIES: logit ===");
-    eprintln!("analytic={:?}", analytic);
-    eprintln!("fd      ={:?}", fd);
-    eprintln!("rel_l2  ={err:.3e}");
     assert!(
         err < 0.05,
-        "Non-overlapping-penalty logit gradient wrong: rel_l2={err:.3e}"
+        "Non-overlapping-penalty logit gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
     );
 }
 
@@ -720,11 +699,10 @@ fn test_gaussian_gradient_vs_fd() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
-    eprintln!("=== GAUSSIAN (overlapping penalties) ===");
-    eprintln!("analytic={:?}", analytic);
-    eprintln!("fd      ={:?}", fd);
-    eprintln!("rel_l2  ={err:.3e}");
-    assert!(err < 1e-3, "Gaussian gradient wrong: rel_l2={err:.3e}");
+    assert!(
+        err < 1e-3,
+        "Gaussian gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -775,11 +753,9 @@ fn test_probit_single_penalty_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
-    eprintln!("=== PROBIT (single penalty) ===");
-    eprintln!("analytic={:?} fd={:?} rel_l2={err:.3e}", analytic, fd);
     assert!(
         err < 0.05,
-        "Probit single-penalty gradient wrong: rel_l2={err:.3e}"
+        "Probit single-penalty gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
     );
 }
 
@@ -831,13 +807,9 @@ fn test_probit_overlapping_penalties_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
-    eprintln!("=== PROBIT (overlapping penalties) ===");
-    eprintln!("analytic={:?}", analytic);
-    eprintln!("fd      ={:?}", fd);
-    eprintln!("rel_l2  ={err:.3e}");
     assert!(
         err < 0.05,
-        "Probit overlapping-penalty gradient wrong: rel_l2={err:.3e}"
+        "Probit overlapping-penalty gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
     );
 }
 
@@ -919,12 +891,8 @@ fn test_standalone_gradient_matches_own_fd() {
     }
 
     let err = rel_l2(&analytic, &standalone_fd);
-    eprintln!("=== STANDALONE FORMULA VALIDATION ===");
-    eprintln!("analytic     = {:?}", analytic);
-    eprintln!("standalone_fd= {:?}", standalone_fd);
-    eprintln!("rel_l2       = {err:.3e}");
     assert!(
         err < 1e-4,
-        "Standalone gradient formula is wrong: rel_l2={err:.3e}"
+        "Standalone gradient formula is wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nstandalone_fd={standalone_fd:?}"
     );
 }

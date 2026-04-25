@@ -5113,10 +5113,6 @@ mod tests {
         for &(mu, sigma) in &cases {
             let approx = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
             let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
-            eprintln!(
-                "DBG cloglog_ctrl: mu={} sigma={} approx.mean={} expected_mean={} approx.deriv={} expected_deriv={}",
-                mu, sigma, approx.mean, expected_mean, approx.dmean_dmu, expected_deriv
-            );
             assert_relative_eq!(
                 approx.mean,
                 expected_mean,

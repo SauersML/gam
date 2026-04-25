@@ -147,13 +147,6 @@ fn aniso_matern_recovers_signal_axis() {
     // therefore shortens the effective length scale on that axis.
     //
     // We use a soft threshold: eta_signal > eta_noise + 0.1
-    eprintln!(
-        "aniso eta: signal(x1) = {:.4}, noise(x2) = {:.4}, diff = {:.4}",
-        eta_signal,
-        eta_noise,
-        eta_signal - eta_noise,
-    );
-
     assert!(
         eta_signal > eta_noise + 0.1,
         "signal axis eta ({eta_signal:.4}) should be meaningfully larger than \
