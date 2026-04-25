@@ -2209,7 +2209,9 @@ fn design_constraint_cross(
     let mut cross = Array2::<f64>::zeros((k, q));
     for start in (0..n).step_by(DESIGN_CROSS_CHUNK_SIZE) {
         let end = (start + DESIGN_CROSS_CHUNK_SIZE).min(n);
-        let basis_chunk = design.row_chunk(start..end);
+        let basis_chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         let mut constraint_chunk = constraint_matrix.slice(s![start..end, ..]).to_owned();
         if let Some(w) = weights {
             for (mut row, &weight) in constraint_chunk
@@ -2224,16 +2226,18 @@ fn design_constraint_cross(
     Ok(cross)
 }
 
-fn design_gram_matrix(design: &DesignMatrix) -> Array2<f64> {
+fn design_gram_matrix(design: &DesignMatrix) -> Result<Array2<f64>, BasisError> {
     let n = design.nrows();
     let p = design.ncols();
     let mut gram = Array2::<f64>::zeros((p, p));
     for start in (0..n).step_by(DESIGN_CROSS_CHUNK_SIZE) {
         let end = (start + DESIGN_CROSS_CHUNK_SIZE).min(n);
-        let chunk = design.row_chunk(start..end);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         gram += &chunk.t().dot(&chunk);
     }
-    gram
+    Ok(gram)
 }
 
 fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
@@ -2304,7 +2308,7 @@ pub(crate) fn orthogonality_transform_for_design(
         return Ok(Array2::eye(k));
     }
     let constraint_cross = design_constraint_cross(design, constraint_matrix, weights)?;
-    let gram = design_gram_matrix(design);
+    let gram = design_gram_matrix(design)?;
     orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
 }
 

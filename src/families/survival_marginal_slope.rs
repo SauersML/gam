@@ -30,7 +30,7 @@ use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
     structural_time_coefficient_constraints,
 };
-use crate::matrix::{DenseDesignOperator, DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -2048,6 +2048,7 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+        Ok(())
     }
 
     /// U^α cross terms (eq 47, terms 1+2)
@@ -2058,7 +2059,7 @@ impl BlockHessianAccumulator {
         qg: &SurvivalMarginalSlopeDynamicRow,
         lift: &TimewiggleMarginalPsiRowLift,
         ph: &Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
         let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
         let ut = [&lift.u_q0_time, &lift.u_q1_time, &lift.u_qd1_time];
@@ -2102,7 +2103,10 @@ impl BlockHessianAccumulator {
                 self.h_tm[[a, b]] += v;
             }
         }
-        let gc = family.logslope_design.row_chunk(row..row + 1);
+        let gc = family
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("add_timewiggle_psi_u_cross logslope try_row_chunk: {e}"))?;
         let gr = gc.row(0);
         for a in 0..pt {
             let mut wt = 0.0;
@@ -2165,6 +2169,7 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+        Ok(())
     }
 
     /// K^{BC,α} terms (eq 47, term 5)
@@ -2361,7 +2366,7 @@ impl BlockHessianAccumulator {
         psi_block: usize,
         psi_row: &Array1<f64>,
         rp: &Array1<f64>,
-    ) {
+    ) -> Result<(), String> {
         let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
         let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
         let pt = jt[0].len();
@@ -2406,7 +2411,12 @@ impl BlockHessianAccumulator {
                 _ => {}
             }
         }
-        let gc = family.logslope_design.row_chunk(row..row + 1);
+        let gc = family
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| {
+                format!("add_rank1_psi_cross_with_q_geometry logslope try_row_chunk: {e}")
+            })?;
         let gr = gc.row(0);
         let gw = rp[3];
         if gw != 0.0 {
@@ -2472,6 +2482,7 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -3187,7 +3198,7 @@ impl SurvivalMarginalSlopeFamily {
                     self.accumulate_score_with_q_geometry(
                         row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
                     )?;
-                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess);
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
                     Ok(a)
                 },
             )
@@ -3275,7 +3286,7 @@ impl SurvivalMarginalSlopeFamily {
                     self.accumulate_score_with_q_geometry(
                         row, &q_geom, &grad, &mut a.1, &mut a.2, &mut a.3,
                     )?;
-                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess);
+                    a.6.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
                     Ok(a)
                 },
             )
@@ -3382,7 +3393,7 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &grad, &hess)?;
                     Ok(acc)
                 },
             )
@@ -8851,19 +8862,19 @@ impl SurvivalMarginalSlopeFamily {
                         block_idx,
                         &psi_row,
                         &right_primary,
-                    );
+                    )?;
                 } else {
-                    a.6.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                    a.6.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
                 }
                 if let Some(q) = q_geom.as_ref() {
                     let zero_grad = Array1::zeros(third.nrows());
-                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third);
+                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third)?;
                 } else {
-                    a.6.add_pullback(self, row, &third);
+                    a.6.add_pullback(self, row, &third)?;
                 }
                 if let Some(lift) = psi_lift.as_ref() {
                     let q = q_geom.as_ref().unwrap();
-                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift, &f_pipi);
+                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift, &f_pipi)?;
                     a.6.add_second_pullback_weighted(q, &pb);
                     a.6.add_timewiggle_psi_kappa_alpha(self, lift, &f_pi);
                 }
@@ -9199,7 +9210,7 @@ impl SurvivalMarginalSlopeFamily {
                             block_idx_i,
                             psi_row_ij.as_ref().unwrap(),
                             &rp_ij,
-                        );
+                        )?;
                     } else {
                         a.6.add_rank1_psi_cross(
                             self,
@@ -9207,7 +9218,7 @@ impl SurvivalMarginalSlopeFamily {
                             block_idx_i,
                             psi_row_ij.as_ref().unwrap(),
                             &rp_ij,
-                        );
+                        )?;
                     }
                 }
                 let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
@@ -9221,9 +9232,9 @@ impl SurvivalMarginalSlopeFamily {
                         block_idx_i,
                         &psi_row_i,
                         &rp_i,
-                    );
+                    )?;
                 } else {
-                    a.6.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i);
+                    a.6.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i)?;
                 }
                 let rp_j = third_i.t().dot(&loading_j);
                 if let Some(q) = q_geom.as_ref() {
@@ -9234,30 +9245,30 @@ impl SurvivalMarginalSlopeFamily {
                         block_idx_j,
                         &psi_row_j,
                         &rp_j,
-                    );
+                    )?;
                 } else {
-                    a.6.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j);
+                    a.6.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j)?;
                 }
                 if let Some(q) = q_geom.as_ref() {
                     let zero_grad = Array1::zeros(fourth.nrows());
-                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth);
+                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
                 } else {
-                    a.6.add_pullback(self, row, &fourth);
+                    a.6.add_pullback(self, row, &fourth)?;
                 }
                 let third_ij =
                     self.row_primary_third_contracted_general(row, block_states, &dir_ij)?;
                 if let Some(q) = q_geom.as_ref() {
                     let zero_grad = Array1::zeros(third_ij.nrows());
-                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_ij);
+                    a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_ij)?;
                 } else {
-                    a.6.add_pullback(self, row, &third_ij);
+                    a.6.add_pullback(self, row, &third_ij)?;
                 }
 
                 // Timewiggle psi corrections for ψ_i (terms 1,2,4,5 of eq 47)
                 if let Some(lift_i) = psi_lift_i.as_ref() {
                     let q = q_geom.as_ref().unwrap();
                     // U_i^α cross terms with third_j Hessian
-                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift_i, &third_j);
+                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift_i, &third_j)?;
                     // Second pullback weighted by T_j[dir_j] applied to dir_i
                     let hu_i = f_pipi.dot(&dir_i);
                     a.6.add_second_pullback_weighted(q, &hu_i);
@@ -9267,7 +9278,7 @@ impl SurvivalMarginalSlopeFamily {
                 // Timewiggle psi corrections for ψ_j
                 if let Some(lift_j) = psi_lift_j.as_ref() {
                     let q = q_geom.as_ref().unwrap();
-                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift_j, &third_i);
+                    a.6.add_timewiggle_psi_u_cross(self, row, q, lift_j, &third_i)?;
                     let hu_j = f_pipi.dot(&dir_j);
                     a.6.add_second_pullback_weighted(q, &hu_j);
                     if psi_lift_i.is_none() {
@@ -9473,29 +9484,29 @@ impl SurvivalMarginalSlopeFamily {
                             block_idx,
                             &psi_row,
                             &right_primary,
-                        );
+                        )?;
                     } else {
-                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
                     }
                     if let Some(q) = q_geom.as_ref() {
                         let zero_grad = Array1::zeros(fourth.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth);
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
                     } else {
-                        acc.add_pullback(self, row, &fourth);
+                        acc.add_pullback(self, row, &fourth)?;
                     }
                     let third_action =
                         self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
                     if let Some(q) = q_geom.as_ref() {
                         let zero_grad = Array1::zeros(third_action.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action);
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
                     } else {
-                        acc.add_pullback(self, row, &third_action);
+                        acc.add_pullback(self, row, &third_action)?;
                     }
                     // Timewiggle psi corrections
                     if let Some(lift) = psi_lift.as_ref() {
                         let q = q_geom.as_ref().unwrap();
                         // U^α cross with third_beta (D_β H term)
-                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta);
+                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
                         let second_pullback_weight =
                             third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
                         acc.add_second_pullback_weighted(q, &second_pullback_weight);
@@ -9664,27 +9675,27 @@ impl SurvivalMarginalSlopeFamily {
                             block_idx,
                             &psi_row,
                             &right_primary,
-                        );
+                        )?;
                     } else {
-                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary);
+                        acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
                     }
                     if let Some(q) = q_geom.as_ref() {
                         let zero_grad = Array1::zeros(fourth.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth);
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
                     } else {
-                        acc.add_pullback(self, row, &fourth);
+                        acc.add_pullback(self, row, &fourth)?;
                     }
                     let third_action =
                         self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
                     if let Some(q) = q_geom.as_ref() {
                         let zero_grad = Array1::zeros(third_action.nrows());
-                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action);
+                        acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
                     } else {
-                        acc.add_pullback(self, row, &third_action);
+                        acc.add_pullback(self, row, &third_action)?;
                     }
                     if let Some(lift) = psi_lift.as_ref() {
                         let q = q_geom.as_ref().unwrap();
-                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta);
+                        acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
                         let second_pullback_weight =
                             third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
                         acc.add_second_pullback_weighted(q, &second_pullback_weight);
@@ -9731,7 +9742,7 @@ impl SurvivalMarginalSlopeFamily {
                         &q_geom,
                         &primary,
                     )?;
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h)?;
                     Ok(acc)
                 })
                 .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
@@ -9745,7 +9756,7 @@ impl SurvivalMarginalSlopeFamily {
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                     let (_, g, h) =
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h)?;
                     Ok(acc)
                 })
                 .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
@@ -9796,7 +9807,7 @@ impl SurvivalMarginalSlopeFamily {
                     let t_ud =
                         self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
                     let h_ud = h_pi.dot(&u_d);
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &h_ud, &t_ud);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &h_ud, &t_ud)?;
                     Ok(acc)
                 },
             )
@@ -9845,7 +9856,7 @@ impl SurvivalMarginalSlopeFamily {
                     let t_d =
                         self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
                     let gamma = t_d.dot(&ue);
-                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &gamma, &q_de);
+                    acc.add_pullback_with_q_geometry(self, row, &q_geom, &gamma, &q_de)?;
                     Ok(acc)
                 },
             )
