@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ndarray::{Array1, Array2, ArrayView2, s};
 
-use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
+use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::ScaleDeviationTransform;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
@@ -30,7 +30,7 @@ use crate::inference::model::{
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
 use crate::inference::predict::{
-    BernoulliMarginalSlopePredictor, PredictInput, PredictableModel, predict_gam,
+    BernoulliMarginalSlopePredictor, PredictInput, predict_gam,
 };
 use crate::linalg::matrix::DesignMatrix;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
