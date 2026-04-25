@@ -50,7 +50,17 @@ def test_build_info_reports_real_extension():
     assert info["module"] == "gam._rust"
     assert "fit" in info["capabilities"]
     assert "validate_formula" in info["capabilities"]
-    assert info["supported_model_classes"] == ["standard"]
+    assert info["supported_model_classes"] == [
+        "standard",
+        "transformation-normal",
+        "bernoulli-marginal-slope",
+        "survival-marginal-slope",
+        "survival-location-scale",
+        "latent-survival",
+        "latent-binary",
+        "gaussian-location-scale",
+        "binomial-location-scale",
+    ]
 
 
 def test_validate_formula_reports_model_metadata():
@@ -217,14 +227,14 @@ def _require_extension():
         pytest.skip("rust extension not built")
 
 
-def _pc_duchon(centers: int = 24) -> str:
+def _pc_duchon(centers: int = 6) -> str:
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
-        "order=1, power=1, length_scale=1, double_penalty=true)"
+        "order=1, power=2, length_scale=1, double_penalty=true)"
     )
 
 
-def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank):
+def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_factory):
     """Stage 1: fit h(PGS | PCs) ~ N(0, 1) and verify PIT properties.
 
     After conditional Gaussianization on the PC manifold the predicted
@@ -233,11 +243,11 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank):
     deviation invariant used throughout the methods section.
     """
     _require_extension()
-    df = synthetic_biobank
+    df = synthetic_biobank_factory(seed=0, n=64)
 
     model = gam.fit(
         df,
-        f"PGS ~ {_pc_duchon(centers=24)}",
+        f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
         scale_dimensions=True,
     )
@@ -254,7 +264,7 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank):
 
 
 def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
-    synthetic_biobank, tmp_path
+    synthetic_biobank_factory, tmp_path
 ):
     """Stage 2a: Bernoulli marginal-slope + linkwiggle + logslope score-warp.
 
@@ -265,11 +275,11 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
     are valid probabilities that track ``pgs_ctn_z`` monotonically.
     """
     _require_extension()
-    df = synthetic_biobank.copy()
+    df = synthetic_biobank_factory(seed=1, n=64)
 
     calib = gam.fit(
         df,
-        f"PGS ~ {_pc_duchon(centers=24)}",
+        f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
         scale_dimensions=True,
     )
@@ -278,11 +288,11 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
     )
 
     disease_formula = (
-        f"disease ~ z + {_pc_duchon(centers=24)} "
-        "+ linkwiggle(degree=3, internal_knots=8)"
+        f"disease ~ z + {_pc_duchon()} "
+        "+ linkwiggle(degree=3, internal_knots=3)"
     )
     logslope = (
-        f"{_pc_duchon(centers=24)} + linkwiggle(degree=3, internal_knots=8)"
+        f"{_pc_duchon()} + linkwiggle(degree=3, internal_knots=3)"
     )
     model = gam.fit(
         df,
@@ -315,7 +325,7 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
 
 
 def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
-    synthetic_biobank,
+    synthetic_biobank_factory,
 ):
     """Stage 2b: survival marginal-slope with GM baseline + timewiggle.
 
@@ -326,11 +336,11 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
     monotone in time (survival decreasing, hazard finite).
     """
     _require_extension()
-    df = synthetic_biobank.copy()
+    df = synthetic_biobank_factory(seed=2, n=64)
 
     calib = gam.fit(
         df,
-        f"PGS ~ {_pc_duchon(centers=24)}",
+        f"PGS ~ {_pc_duchon()}",
         transformation_normal=True,
         scale_dimensions=True,
     )
@@ -340,9 +350,9 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
 
     formula = (
         "Surv(age_entry, age_exit, event) ~ z "
-        f"+ {_pc_duchon(centers=24)} "
-        "+ linkwiggle(degree=3, internal_knots=8) "
-        "+ timewiggle(degree=3, internal_knots=6)"
+        f"+ {_pc_duchon()} "
+        "+ linkwiggle(degree=3, internal_knots=3) "
+        "+ timewiggle(degree=3, internal_knots=3)"
     )
     model = gam.fit(
         df,

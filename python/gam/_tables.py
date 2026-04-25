@@ -104,16 +104,34 @@ def preferred_output_kind(input_kind: str, training_kind: str | None) -> str:
 def detect_table_kind(data: Any) -> str:
     if data is None:
         return "unknown"
-    module = type(data).__module__
-    name = type(data).__name__
-    if module.startswith("pandas.") and name == "DataFrame":
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = None
+    if pd is not None and isinstance(data, pd.DataFrame):
         return "pandas"
-    if module.startswith("polars.") and name == "DataFrame":
+
+    try:
+        import polars as pl
+    except ImportError:
+        pl = None
+    if pl is not None and isinstance(data, pl.DataFrame):
         return "polars"
-    if module.startswith("pyarrow.") and name == "Table":
+
+    try:
+        import pyarrow as pa
+    except ImportError:
+        pa = None
+    if pa is not None and isinstance(data, pa.Table):
         return "pyarrow"
-    if (module == "numpy" or module.startswith("numpy.")) and name == "ndarray":
+
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None and isinstance(data, np.ndarray):
         return "numpy"
+
     return "unknown"
 
 
