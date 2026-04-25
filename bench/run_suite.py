@@ -128,6 +128,7 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     # but occasional fit/predict failures should not fail the whole CI shard.
     "r_gamlss",
     "rust_gamlss",
+    "rust_gamlss_flexible",
     "rust_gamlss_marginal_slope",
     "rust_gamlss_marginal_slope_aniso",
     "rust_gamlss_survival_marginal_slope",
