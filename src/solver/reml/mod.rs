@@ -434,6 +434,28 @@ mod tests {
         Ok(gradient[rho.len()])
     }
 
+    fn fd_directional_tau_cost_gradient(
+        y: &Array1<f64>,
+        w: &Array1<f64>,
+        x: &Array2<f64>,
+        s0: &Array2<f64>,
+        cfg: &RemlConfig,
+        rho: &Array1<f64>,
+        x_tau: &Array2<f64>,
+        s_tau: &Array2<f64>,
+    ) -> f64 {
+        let h = 2e-5;
+        let x_plus = x + &x_tau.mapv(|v| h * v);
+        let x_minus = x - &x_tau.mapv(|v| h * v);
+        let s_plus = s0 + &s_tau.mapv(|v| h * v);
+        let s_minus = s0 - &s_tau.mapv(|v| h * v);
+        let state_plus = build_logit_state(y, w, &x_plus, &s_plus, cfg);
+        let state_minus = build_logit_state(y, w, &x_minus, &s_minus, cfg);
+        let v_plus = state_plus.compute_cost(rho).expect("cost+");
+        let v_minus = state_minus.compute_cost(rho).expect("cost-");
+        (v_plus - v_minus) / (2.0 * h)
+    }
+
     fn directional_tau_hessian_fd_reference(
         y: &Array1<f64>,
         w: &Array1<f64>,
@@ -1153,6 +1175,21 @@ mod tests {
         let gradient = single_directional_tau_gradient(&state, &rho, hyper)
             .expect("Firth penalty-only directional gradient should use analytic TK propagation");
         assert!(gradient.is_finite(), "gradient={gradient}");
+        let fd = fd_directional_tau_cost_gradient(
+            &y,
+            &w,
+            &x,
+            &s0,
+            &cfg,
+            &rho,
+            &Array2::<f64>::zeros((x.nrows(), x.ncols())),
+            &array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.03], [0.0, 0.03, 0.12],],
+        );
+        let rel = (gradient - fd).abs() / gradient.abs().max(fd.abs()).max(1.0e-10);
+        assert!(
+            rel < 1.0e-3,
+            "Firth penalty-only directional gradient mismatch: analytic={gradient:.12e}, fd={fd:.12e}, rel={rel:.3e}"
+        );
 
         let efs_hyper = DirectionalHyperParam::single_penalty(
             0,
@@ -1199,6 +1236,14 @@ mod tests {
         let gradient = single_directional_tau_gradient(&state, &rho, hyper)
             .expect("Firth design-moving directional gradient should use analytic TK propagation");
         assert!(gradient.is_finite(), "gradient={gradient}");
+        let x_tau = Array2::from_elem((x.nrows(), x.ncols()), 1e-3);
+        let s_tau = Array2::<f64>::zeros((x.ncols(), x.ncols()));
+        let fd = fd_directional_tau_cost_gradient(&y, &w, &x, &s0, &cfg, &rho, &x_tau, &s_tau);
+        let rel = (gradient - fd).abs() / gradient.abs().max(fd.abs()).max(1.0e-10);
+        assert!(
+            rel < 2.0e-2,
+            "Firth design-moving directional gradient mismatch: analytic={gradient:.12e}, fd={fd:.12e}, rel={rel:.3e}"
+        );
     }
 
     #[test]
