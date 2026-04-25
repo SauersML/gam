@@ -34,8 +34,8 @@ use crate::estimate::{
 use crate::faer_ndarray::{fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
-    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
-    RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
+    BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
+    DesignMatrix, RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
 };
 use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
@@ -3940,7 +3940,7 @@ fn build_constraint_block(
     n: usize,
     parametric_block: Option<&Array2<f64>>,
     owner_blocks: &[&DesignMatrix],
-) -> Array2<f64> {
+) -> Result<Array2<f64>, BasisError> {
     let param_cols = parametric_block.map_or(0, |mat| mat.ncols());
     let owner_cols: usize = owner_blocks.iter().map(|design| design.ncols()).sum();
     let mut block = Array2::<f64>::zeros((n, param_cols + owner_cols));
@@ -3957,14 +3957,16 @@ fn build_constraint_block(
         let col_end = col_start + owner.ncols();
         for row_start in (0..n).step_by(CHUNK) {
             let row_end = (row_start + CHUNK).min(n);
-            let chunk = owner.row_chunk(row_start..row_end);
+            let chunk = (*owner)
+                .try_row_chunk(row_start..row_end)
+                .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
             block
                 .slice_mut(s![row_start..row_end, col_start..col_end])
                 .assign(&chunk);
         }
         col_start = col_end;
     }
-    block
+    Ok(block)
 }
 
 fn design_cross_relative_residual(
@@ -3984,8 +3986,12 @@ fn design_cross_relative_residual(
     let mut rhs_sumsq = 0.0;
     for start in (0..n).step_by(CHUNK) {
         let end = (start + CHUNK).min(n);
-        let lhs_chunk = lhs.row_chunk(start..end);
-        let rhs_chunk = rhs.row_chunk(start..end);
+        let lhs_chunk = lhs
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
+        let rhs_chunk = rhs
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         cross += &lhs_chunk.t().dot(&rhs_chunk);
         lhs_sumsq += lhs_chunk.iter().map(|v| v * v).sum::<f64>();
         rhs_sumsq += rhs_chunk.iter().map(|v| v * v).sum::<f64>();
@@ -4104,7 +4110,7 @@ fn apply_global_smooth_identifiability(
                     data.nrows(),
                     parametric_block.as_ref(),
                     &owner_blocks,
-                ))
+                )?)
             };
         let z_opt = if skip_global_transform {
             None
@@ -4414,23 +4420,27 @@ fn design_constraint_cross(
     const CHUNK: usize = 1024;
     for start in (0..n).step_by(CHUNK) {
         let end = (start + CHUNK).min(n);
-        let design_chunk = design.row_chunk(start..end);
+        let design_chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         let constraint_chunk = constraint_matrix.slice(s![start..end, ..]).to_owned();
         cross += &design_chunk.t().dot(&constraint_chunk);
     }
     Ok(cross)
 }
 
-fn design_frobenius_norm(design: &DesignMatrix) -> f64 {
+fn design_frobenius_norm(design: &DesignMatrix) -> Result<f64, BasisError> {
     let n = design.nrows();
     const CHUNK: usize = 1024;
     let mut sumsq = 0.0;
     for start in (0..n).step_by(CHUNK) {
         let end = (start + CHUNK).min(n);
-        let chunk = design.row_chunk(start..end);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         sumsq += chunk.iter().map(|v| v * v).sum::<f64>();
     }
-    sumsq.sqrt()
+    Ok(sumsq.sqrt())
 }
 
 fn maybe_smooth_identifiability_transform(
@@ -4593,7 +4603,7 @@ fn orthogonality_relative_residual_for_design(
 ) -> Result<f64, BasisError> {
     let cross = design_constraint_cross(design, constraint_matrix)?;
     let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let b_norm = design_frobenius_norm(design);
+    let b_norm = design_frobenius_norm(design)?;
     let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     let denom = (b_norm * c_norm).max(1e-300);
     Ok(num / denom)

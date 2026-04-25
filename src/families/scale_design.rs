@@ -1,4 +1,5 @@
 use crate::faer_ndarray::{FaerArrayView, default_rrqr_rank_alpha, fast_ab};
+use crate::linalg::matrix::DenseDesignOperator;
 use crate::matrix::DesignMatrix;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::Unbind;
@@ -46,10 +47,12 @@ impl ScaleDesignMatrixRef<'_> {
         }
     }
 
-    fn row_chunk(self, rows: Range<usize>) -> Array2<f64> {
+    fn row_chunk(self, rows: Range<usize>) -> Result<Array2<f64>, String> {
         match self {
-            Self::Dense(matrix) => matrix.slice(s![rows, ..]).to_owned(),
-            Self::Design(matrix) => matrix.row_chunk(rows),
+            Self::Dense(matrix) => Ok(matrix.slice(s![rows, ..]).to_owned()),
+            Self::Design(matrix) => matrix
+                .try_row_chunk(rows)
+                .map_err(|e| format!("scale deviation row materialization failed: {e}")),
         }
     }
 }
@@ -153,7 +156,7 @@ fn weighted_column_stats(
     let chunk_rows = scale_design_row_chunk_size(design.nrows(), p);
     for start in (0..design.nrows()).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(design.nrows());
-        let chunk = design.row_chunk(start..end);
+        let chunk = design.row_chunk(start..end)?;
         for local in 0..(end - start) {
             let w = weights[start + local];
             if w == 0.0 {
@@ -196,13 +199,13 @@ fn build_weighted_primary_design(
     primary_design: ScaleDesignMatrixRef<'_>,
     sqrtw: &Array1<f64>,
     chunk_rows: usize,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let n = primary_design.nrows();
     let p_primary = primary_design.ncols();
     let mut wx = Array2::<f64>::zeros((n, p_primary));
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
-        let x_chunk = primary_design.row_chunk(start..end);
+        let x_chunk = primary_design.row_chunk(start..end)?;
         for local in 0..(end - start) {
             let sw = sqrtw[start + local];
             for col in 0..p_primary {
@@ -210,7 +213,7 @@ fn build_weighted_primary_design(
             }
         }
     }
-    wx
+    Ok(wx)
 }
 
 fn scale_projection_rank_tolerance(leading_diag: f64, major_dim: usize) -> f64 {
@@ -236,14 +239,14 @@ fn solve_scale_projection_for_rank(
     rank: usize,
     first_active: usize,
     chunk_rows: usize,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let n = primary_design.nrows();
     let p_primary = primary_design.ncols();
     let p_noise = noise_design.ncols();
     let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
     let active_cols = p_noise.saturating_sub(first_active);
     if active_cols == 0 || p_primary == 0 || rank == 0 {
-        return projection_coef;
+        return Ok(projection_coef);
     }
     let r = qr.thin_R();
     let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))
@@ -255,7 +258,7 @@ fn solve_scale_projection_for_rank(
         let mut rhs = Array2::<f64>::zeros((n, width));
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
-            let noise_chunk = noise_design.row_chunk(start..end);
+            let noise_chunk = noise_design.row_chunk(start..end)?;
             for local in 0..(end - start) {
                 let sw = sqrtw[start + local];
                 for col in 0..width {
@@ -303,7 +306,7 @@ fn solve_scale_projection_for_rank(
         }
     }
 
-    projection_coef
+    Ok(projection_coef)
 }
 
 fn solve_scale_projection(
@@ -324,7 +327,7 @@ fn solve_scale_projection(
     }
 
     let sqrtw = weights.mapv(f64::sqrt);
-    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows);
+    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows)?;
     let wx_faer = FaerArrayView::new(&wx);
     // Keep one explicit RRQR factorization and one explicit rank policy for all
     // projection coefficients so dense and operator-backed paths reuse the same solve.
@@ -347,7 +350,7 @@ fn solve_scale_projection(
             rank,
             first_active,
             chunk_rows,
-        );
+        )?;
         let max_abs_coef = projection_coef
             .iter()
             .fold(0.0_f64, |acc, value| acc.max(value.abs()));
@@ -420,8 +423,8 @@ fn build_scale_deviation_transform_impl(
 
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
-            let x_chunk = primary_design.row_chunk(start..end);
-            let noise_chunk = noise_design.row_chunk(start..end);
+            let x_chunk = primary_design.row_chunk(start..end)?;
+            let noise_chunk = noise_design.row_chunk(start..end)?;
             let resid_chunk = apply_scale_deviation_reparam_chunk(
                 &x_chunk,
                 &noise_chunk,
@@ -452,8 +455,8 @@ fn build_scale_deviation_transform_impl(
 
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
-            let x_chunk = primary_design.row_chunk(start..end);
-            let noise_chunk = noise_design.row_chunk(start..end);
+            let x_chunk = primary_design.row_chunk(start..end)?;
+            let noise_chunk = noise_design.row_chunk(start..end)?;
             let resid_chunk = apply_scale_deviation_reparam_chunk(
                 &x_chunk,
                 &noise_chunk,
@@ -599,8 +602,12 @@ pub fn build_scale_deviation_operator(
     let mut out = Array2::<f64>::zeros((n, p_noise));
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
-        let primary_chunk = primary_design.row_chunk(start..end);
-        let noise_chunk = rawnoise_design.row_chunk(start..end);
+        let primary_chunk = primary_design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("scale deviation operator primary chunk: {e}"))?;
+        let noise_chunk = rawnoise_design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("scale deviation operator noise chunk: {e}"))?;
         let chunk = apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
         out.slice_mut(s![start..end, ..]).assign(&chunk);
     }
@@ -837,7 +844,8 @@ mod tests {
             ScaleDesignMatrixRef::Dense(&primary),
             &sqrtw,
             chunk_rows,
-        );
+        )
+        .expect("weighted primary design should materialize");
         let qr = FaerArrayView::new(&wx).as_ref().col_piv_qr();
         let r = qr.thin_R();
         let diag_len = r.nrows().min(r.ncols());
@@ -861,7 +869,8 @@ mod tests {
             rank,
             1,
             chunk_rows,
-        );
+        )
+        .expect("uncapped projection solve should succeed");
         let uncapped_max_abs = uncapped_projection
             .iter()
             .fold(0.0_f64, |acc, value| acc.max(value.abs()));
