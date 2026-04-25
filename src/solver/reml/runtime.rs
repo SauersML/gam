@@ -3521,7 +3521,6 @@ impl<'a> RemlState<'a> {
         use super::unified::{compute_efs_update, compute_hybrid_efs_update};
 
         let beta_for_barrier = assembly.beta.clone();
-        let has_ext = !assembly.ext_coords.is_empty();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
         let eval_mode = if has_psi {
             super::unified::EvalMode::ValueAndGradient
