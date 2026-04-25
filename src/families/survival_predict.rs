@@ -335,28 +335,28 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
 // Per-mode single-row evaluators.
 // ---------------------------------------------------------------------------
 
+/// Evaluate one (row, t) cell for the saved survival marginal-slope kernel.
+///
+/// Calls the saved [`BernoulliMarginalSlopePredictor`] (built once and held in
+/// `ctx`) to obtain `eta` — this is the same code path the CLI's `gam predict`
+/// uses, so the link-deviation and score-warp blocks are replayed at predict
+/// time. The hazard time-derivative `c · qd` is the rigid-path probit-frailty
+/// correction; in flex mode (score-warp / link-deviation active) it is the
+/// leading-order rigid approximation, since the exact ∂eta/∂t requires the
+/// IFT pull-back through the per-row implicit-function intercept (see
+/// `compute_survival_timepoint_exact` in `survival_marginal_slope.rs`).
 fn evaluate_marginal_slope_row(
-    model: &SavedModel,
+    row_index: usize,
+    ctx: &MarginalSlopePredictContext,
     row_time: &SurvivalTimeBuildOutput,
-    cov_row: &Array1<f64>,
     r_eta_exit: &Array1<f64>,
     r_deriv_exit: &Array1<f64>,
     primary_offset_row: f64,
 ) -> Result<(f64, f64, f64), String> {
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let saved_runtime = model.saved_prediction_runtime()?;
-    let blocks = &fit_saved.blocks;
-    if blocks.len() < 3 {
-        return Err(format!(
-            "saved survival marginal-slope model requires at least 3 blocks [time, marginal, slope], got {}",
-            blocks.len()
-        ));
-    }
-    let beta_time = &blocks[0].beta;
-    let beta_marginal = &blocks[1].beta;
+    let beta_time = &ctx.beta_time;
     let p_time_base = row_time.x_exit_time.ncols();
-    let saved_timewiggle = saved_runtime.baseline_time_wiggle.clone();
-    let p_timewiggle = saved_timewiggle
+    let p_timewiggle = ctx
+        .saved_timewiggle
         .as_ref()
         .map_or(0, |runtime| runtime.beta.len());
     if beta_time.len() != p_time_base + p_timewiggle {
@@ -368,44 +368,114 @@ fn evaluate_marginal_slope_row(
         ));
     }
     let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
+
+    // Pre-wiggle q-eta for this (row, t) cell. Mirrors the CLI's `q_exit_base`
+    // construction in `build_saved_survival_marginal_slope_predictor`:
+    //   q = time_basis(t) · beta_time_base + cov[row] · beta_marginal
+    //       + r_eta_exit + primary_offset_row.
     let q_exit_base = row_time.x_exit_time.dot(&beta_time_base)[0]
-        + cov_row.dot(beta_marginal)
+        + ctx.cov_eta[row_index]
         + r_eta_exit[0]
         + primary_offset_row;
     let qd_exit_base = row_time.x_derivative_time.dot(&beta_time_base)[0] + r_deriv_exit[0];
 
-    let (eta, eta_derivative) = if let Some(runtime) = saved_timewiggle.as_ref() {
-        let knots = Array1::from_vec(runtime.knots.clone());
-        let beta_w = beta_time.slice(s![p_time_base..]).to_owned();
-        let eta_exit_row = Array1::from_elem(1, q_exit_base);
-        let deriv_row = Array1::from_elem(1, qd_exit_base);
-        let exit_design = match buildwiggle_block_input_from_knots(
-            eta_exit_row.view(),
-            &knots,
-            runtime.degree,
-            2,
-            false,
-        )?
-        .design
-        {
-            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-            _ => {
-                return Err("saved baseline-timewiggle exit design must be dense".to_string());
-            }
+    let (q_with_wiggle, qd_with_wiggle, exit_wiggle_design) =
+        if let Some(runtime) = ctx.saved_timewiggle.as_ref() {
+            let knots = Array1::from_vec(runtime.knots.clone());
+            let beta_w = beta_time.slice(s![p_time_base..]).to_owned();
+            let eta_exit_row = Array1::from_elem(1, q_exit_base);
+            let deriv_row = Array1::from_elem(1, qd_exit_base);
+            let exit_design = match buildwiggle_block_input_from_knots(
+                eta_exit_row.view(),
+                &knots,
+                runtime.degree,
+                2,
+                false,
+            )?
+            .design
+            {
+                DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
+                _ => {
+                    return Err("saved baseline-timewiggle exit design must be dense".to_string());
+                }
+            };
+            let derivative_design = build_survival_timewiggle_derivative_design(
+                &eta_exit_row,
+                &deriv_row,
+                &knots,
+                runtime.degree,
+            )?;
+            (
+                q_exit_base + exit_design.dot(&beta_w)[0],
+                qd_exit_base + derivative_design.dot(&beta_w)[0],
+                Some(exit_design),
+            )
+        } else {
+            (q_exit_base, qd_exit_base, None)
         };
-        let derivative_design = build_survival_timewiggle_derivative_design(
-            &eta_exit_row,
-            &deriv_row,
-            &knots,
-            runtime.degree,
-        )?;
-        (
-            q_exit_base + exit_design.dot(&beta_w)[0],
-            qd_exit_base + derivative_design.dot(&beta_w)[0],
-        )
-    } else {
-        (q_exit_base, qd_exit_base)
+
+    // Build a 1-row PredictInput for this (row, t) cell and call the saved
+    // predictor. The predictor's `marginal_eta` formula is
+    //   marginal_eta = q_design · combined_q_beta + baseline_marginal + offset
+    // with `combined_q_beta = [beta_time | beta_marginal]` and the survival
+    // predictor sets `baseline_marginal = 0`. We supply the full per-row
+    // q_design = [time_basis(t) | timewiggle | cov_design[row]] so the
+    // predictor reproduces `q_with_wiggle` exactly with `offset = r_eta_exit[0]
+    // + primary_offset_row`.
+    let cov_dim = ctx.beta_marginal.len();
+    let q_design_ncols = p_time_base + p_timewiggle + cov_dim;
+    let mut q_design_full = Array2::<f64>::zeros((1, q_design_ncols));
+    q_design_full
+        .slice_mut(s![.., ..p_time_base])
+        .assign(&row_time.x_exit_time.to_dense());
+    if let Some(exit_w) = exit_wiggle_design.as_ref() {
+        q_design_full
+            .slice_mut(s![.., p_time_base..p_time_base + p_timewiggle])
+            .assign(exit_w);
+    }
+    if cov_dim > 0 {
+        q_design_full
+            .slice_mut(s![.., p_time_base + p_timewiggle..])
+            .row_mut(0)
+            .assign(&ctx.cov_design_dense.row(row_index));
+    }
+
+    // Logslope design row + offset chosen so that the predictor's logslope_eta
+    // equals our precomputed `slope_eta[row]`.  The predictor computes:
+    //   logslope_eta = design_noise · beta_logslope + baseline_logslope
+    //                  + offset_noise.
+    // We feed the actual saved logslope row + the row's noise offset, matching
+    // exactly the CLI's `pred_input.design_noise` / `offset_noise` slice.
+    let logslope_row = ctx.logslope_design_dense.row(row_index).to_owned();
+    let mut logslope_design_2d = Array2::<f64>::zeros((1, logslope_row.len()));
+    logslope_design_2d.row_mut(0).assign(&logslope_row);
+
+    let pred_input = PredictInput {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(q_design_full)),
+        offset: Array1::from_elem(1, r_eta_exit[0] + primary_offset_row),
+        design_noise: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            logslope_design_2d,
+        ))),
+        offset_noise: Some(Array1::from_elem(1, ctx.noise_offset[row_index])),
+        auxiliary_scalar: Some(Array1::from_elem(1, ctx.z_raw[row_index])),
     };
+
+    let pred = ctx
+        .predictor
+        .predict_plugin_response(&pred_input)
+        .map_err(|e| format!("saved survival marginal-slope predictor eta failed: {e}"))?;
+    let eta = pred.eta[0];
+
+    // Rigid-path time derivative: d(eta)/dt = c · qd, with
+    //   c = sqrt(1 + (s · b)^2),  s = 1/sqrt(1 + sigma_frailty^2),
+    //   b = slope_eta[row].
+    // In flex mode (score-warp / link-deviation active) this is the leading-order
+    // rigid approximation; the exact ∂eta/∂t additionally picks up the implicit-
+    // function pull-back (∂eta/∂a)·(∂a/∂q)·qd. Flagged for review — see the
+    // training kernel's `compute_survival_timepoint_exact` for the full IFT path.
+    let s_b = ctx.probit_scale * ctx.slope_eta[row_index];
+    let c = (1.0 + s_b * s_b).sqrt();
+    let eta_derivative = c * qd_with_wiggle;
 
     let surv = normal_cdf(-eta).clamp(1e-300, 1.0);
     let cum = -surv.ln();
