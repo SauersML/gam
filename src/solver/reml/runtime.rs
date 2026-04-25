@@ -2060,9 +2060,8 @@ impl<'a> RemlState<'a> {
             *calls += 1;
             *calls
         };
-        let reml_log_info = crate::solver::visualizer::reml_info_enabled();
         let t_eval_start = std::time::Instant::now();
-        if reml_log_info {
+        {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
             log::info!(
                 "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
@@ -2073,14 +2072,12 @@ impl<'a> RemlState<'a> {
         }
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
-            if reml_log_info {
-                log::info!(
-                    "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
-                    cost_call_idx,
-                    eval.cost,
-                    t_eval_start.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            log::info!(
+                "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
+                cost_call_idx,
+                eval.cost,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
             return Ok(eval.cost);
         }
         let t_pirls = std::time::Instant::now();
@@ -2125,27 +2122,23 @@ impl<'a> RemlState<'a> {
             }
         };
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        if reml_log_info {
-            log::info!(
-                "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?}",
-                cost_call_idx,
-                pirls_ms,
-                bundle.backend_kind()
-            );
-        }
+        log::info!(
+            "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?}",
+            cost_call_idx,
+            pirls_ms,
+            bundle.backend_kind()
+        );
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let t_assemble = std::time::Instant::now();
             let result =
                 self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
-            if reml_log_info {
-                log::info!(
-                    "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
-                    cost_call_idx,
-                    result.cost,
-                    t_assemble.elapsed().as_secs_f64() * 1000.0,
-                    t_eval_start.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            log::info!(
+                "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+                cost_call_idx,
+                result.cost,
+                t_assemble.elapsed().as_secs_f64() * 1000.0,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
             return Ok(result.cost);
         }
         {
@@ -2208,15 +2201,13 @@ impl<'a> RemlState<'a> {
         // This ensures cost and gradient share the exact same formula.
         let t_assemble = std::time::Instant::now();
         let result = self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?;
-        if reml_log_info {
-            log::info!(
-                "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
-                cost_call_idx,
-                result.cost,
-                t_assemble.elapsed().as_secs_f64() * 1000.0,
-                t_eval_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        log::info!(
+            "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+            cost_call_idx,
+            result.cost,
+            t_assemble.elapsed().as_secs_f64() * 1000.0,
+            t_eval_start.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(result.cost)
     }
 
