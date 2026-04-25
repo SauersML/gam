@@ -12822,6 +12822,27 @@ mod tests {
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
     use ndarray::array;
 
+    fn assert_spatial_derivative_width(
+        label: &str,
+        dense: &Array2<f64>,
+        implicit: Option<&crate::terms::basis::ImplicitDesignPsiDerivative>,
+        expected: usize,
+    ) {
+        if let Some(op) = implicit {
+            assert_eq!(
+                op.p_out(),
+                expected,
+                "{label} implicit derivative width should match term coefficient width"
+            );
+        } else {
+            assert_eq!(
+                dense.ncols(),
+                expected,
+                "{label} dense derivative width should match term coefficient width"
+            );
+        }
+    }
+
     fn numerical_rank(x: &Array2<f64>) -> usize {
         let (_, s, _) = x
             .svd(false, false)
@@ -15980,7 +16001,7 @@ mod tests {
         let BasisPsiDerivativeResult {
             design_derivative: local_x_psi,
             penalties_derivative: local_s_psi,
-            ..
+            implicit_operator: local_implicit_psi,
         } = match &termspec.basis {
             SmoothBasisSpec::Duchon {
                 feature_cols, spec, ..
@@ -15995,7 +16016,7 @@ mod tests {
         let BasisPsiSecondDerivativeResult {
             designsecond_derivative: local_x_psi_psi,
             penaltiessecond_derivative: local_s_psi_psi,
-            ..
+            implicit_operator: local_implicit_psi_psi,
         } = match &termspec.basis {
             SmoothBasisSpec::Duchon {
                 feature_cols, spec, ..
@@ -16007,8 +16028,18 @@ mod tests {
             }
             _ => panic!("expected Duchon term"),
         };
-        assert_eq!(local_x_psi.ncols(), smooth_term.coeff_range.len());
-        assert_eq!(local_x_psi_psi.ncols(), smooth_term.coeff_range.len());
+        assert_spatial_derivative_width(
+            "Duchon first log-kappa",
+            &local_x_psi,
+            local_implicit_psi.as_ref(),
+            smooth_term.coeff_range.len(),
+        );
+        assert_spatial_derivative_width(
+            "Duchon second log-kappa",
+            &local_x_psi_psi,
+            local_implicit_psi_psi.as_ref(),
+            smooth_term.coeff_range.len(),
+        );
         assert!(!local_s_psi.is_empty());
         assert_eq!(local_s_psi.len(), local_s_psi_psi.len());
         assert!(local_s_psi.iter().all(|s| {
