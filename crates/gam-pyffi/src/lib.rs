@@ -1323,13 +1323,10 @@ fn build_survival_location_scale_ffi_payload(
     ls_result: gam::SurvivalLocationScaleFitResult,
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival_construction::{
-        build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
-        build_survival_time_basis, parse_survival_baseline_config, parse_survival_distribution,
+        build_survival_time_basis, parse_survival_baseline_config,
         parse_survival_likelihood_mode, parse_survival_time_basis_config,
         resolve_survival_time_anchor_value, survival_baseline_targetname,
     };
-    use gam::families::survival_location_scale::residual_distribution_inverse_link;
-    use gam::types::LinkFunction;
     use ndarray::{Array2, s};
 
     // Re-derive survival metadata from the formula and FitConfig so we can
@@ -1419,11 +1416,6 @@ fn build_survival_location_scale_ffi_payload(
         infer_non_intercept_start(&dense_log_sigma, weights),
     )
     .map_err(|err| format!("failed to encode survival noise transform: {err}"))?;
-    // Side-effect-free call to keep parity with the CLI's residual checks.
-    let _ = build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg);
-    let _ = build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &baseline_cfg);
-    let _ = parse_survival_distribution(&fit_config.survival_distribution);
-    let _ = LinkFunction::Identity;
 
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -1561,8 +1553,8 @@ fn build_latent_window_ffi_payload(
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival_construction::{
         build_survival_time_basis, parse_survival_baseline_config,
-        parse_survival_likelihood_mode, parse_survival_time_basis_config,
-        resolve_survival_time_anchor_value, survival_baseline_targetname,
+        parse_survival_time_basis_config, resolve_survival_time_anchor_value,
+        survival_baseline_targetname,
     };
 
     let parsed = gam::inference::formula_dsl::parse_formula(&formula)
@@ -1601,7 +1593,6 @@ fn build_latent_window_ffi_payload(
         fit_config.baseline_rate,
         fit_config.baseline_makeham,
     )?;
-    let likelihood_mode = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
     let time_cfg = parse_survival_time_basis_config(
         &fit_config.time_basis,
         fit_config.time_degree,
@@ -1685,7 +1676,6 @@ fn build_latent_window_ffi_payload(
     );
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    let _ = likelihood_mode;
     Ok(payload)
 }
 

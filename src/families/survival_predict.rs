@@ -124,22 +124,34 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
 
     // Latent modes emit binary event-window probabilities, not survival
-    // curves. They stay in the CLI's dedicated `run_predict_saved_latent_*`
-    // helpers for now. Location-scale survival requires a link resolver
-    // that is still CLI-specific (parses CLI args like `--sas-init`);
-    // expose through the library as soon as a library-first link
-    // resolver ships.
+    // curves. The CLI's `run_predict_saved_latent_*` helpers wrap them with
+    // window quadrature + uncertainty pipelines that aren't ported yet.
     if matches!(
         saved_likelihood_mode,
-        SurvivalLikelihoodMode::Latent
-            | SurvivalLikelihoodMode::LatentBinary
-            | SurvivalLikelihoodMode::LocationScale
+        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
     ) {
         return Err(format!(
             "survival prediction via predict_survival does not support likelihood_mode={} yet; \
-             use the CLI predict command",
+             latent window prediction lives in the CLI's run_predict_saved_latent_window_impl \
+             pipeline and has not yet been ported to the library. Use the CLI predict command.",
             survival_likelihood_modename(saved_likelihood_mode)
         ));
+    }
+    // Location-scale: handled via a dedicated batch path that calls
+    // `predict_survival_location_scale` directly.
+    if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
+        return predict_survival_location_scale_batch(
+            model,
+            &age_entry,
+            &age_exit,
+            &cov_design,
+            primary_offset,
+            noise_offset,
+            training_headers,
+            col_map,
+            data,
+            time_grid,
+        );
     }
 
     // Ambient time basis: built once with (age_entry, age_exit) so that
