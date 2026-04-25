@@ -490,6 +490,19 @@ impl<'a> RemlState<'a> {
         Ok(gradient)
     }
 
+    /// Direct analytic derivative of the TK scalar through the per-row
+    /// curvature carriers and design rows, with `H⁻¹` held fixed.
+    ///
+    /// For
+    ///   V_TK = -1/8 Σ d_i h_i^2 + 1/12 Σ c_i c_j K_ij^3 + 1/8 qᵀH⁻¹q,
+    /// where `h_i = K_ii`, `K_ij = x_iᵀH⁻¹x_j`, and `q = Xᵀ(c ⊙ h)`,
+    /// the direct terms are:
+    ///   c' = d ⊙ η',  d' = e ⊙ η',
+    ///   h'_i = 2 x'ᵢᵀH⁻¹x_i,
+    ///   K'_ij = x'ᵢᵀH⁻¹x_j + x'ⱼᵀH⁻¹x_i,
+    ///   q' = Xᵀ(c'⊙h + c⊙h') + X'ᵀ(c⊙h).
+    /// The remaining `H`-drift part of dV_TK/dθ is assembled by
+    /// `tk_gradient_from_shared`.
     fn tk_direct_gradient_from_cd_and_design(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -1063,6 +1076,33 @@ impl<'a> RemlState<'a> {
         ))
     }
 
+    /// Returns the (c, d, e) per-row mode-curvature carriers required for
+    /// the analytic Tierney–Kadane c/d derivative propagation.
+    ///
+    /// `c` and `d` are the same observed-information arrays returned by
+    /// [`hessian_cd_arrays`] (cᵢ = ∂Wᵢ/∂ηᵢ, dᵢ = ∂²Wᵢ/∂ηᵢ²); `e` is the
+    /// next term in the η-Taylor expansion, eᵢ = ∂³Wᵢ/∂ηᵢ³, so that
+    /// ∂c/∂θ |_β = d ⊙ ∂η/∂θ and ∂d/∂θ |_β = e ⊙ ∂η/∂θ along any chain
+    /// rule that flows through η.  This is precisely what
+    /// `tk_direct_gradient_from_cd_and_design` consumes.
+    ///
+    /// For canonical logit on a binomial likelihood, W = h'(η)² / V(μ)
+    /// with h'(η) = μ(1−μ).  The closed-form 5-jet of the inverse link
+    /// (`mixture_link::logit_inverse_link_jet5`) gives ∂³W/∂η³ exactly,
+    /// so we return that — clamped to zero in saturated tails where the
+    /// jet is dominated by floating-point noise (matching the existing
+    /// `c_array`/`d_array` saturation handling).  No finite-difference
+    /// stencil is involved.
+    ///
+    /// Non-canonical / non-logit links currently lack the analytic third
+    /// derivative wiring, so we surface that as a typed error rather
+    /// than silently fall back to a finite-difference estimate.  The
+    /// gap is structural — it lives in the per-family link-jet code,
+    /// not in this helper — and is documented for future families to
+    /// fill in (`mixture_link.rs`, SAS, blended).  Once the analytic
+    /// `d³W/dη³` is exposed, dropping a new arm into this match is the
+    /// only change required to enable Tierney–Kadane outer gradients
+    /// for that family.
     fn hessian_cde_arrays(
         &self,
         pirls_result: &PirlsResult,

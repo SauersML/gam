@@ -1317,7 +1317,7 @@ fn build_binomial_location_scale_ffi_payload(
 
 fn build_survival_location_scale_ffi_payload(
     formula: String,
-    dataset: &gam::data::EncodedDataset,
+    dataset: &EncodedDataset,
     fit_config: &FitConfig,
     weights: &Array1<f64>,
     ls_result: gam::SurvivalLocationScaleFitResult,
@@ -1520,7 +1520,7 @@ fn build_survival_location_scale_ffi_payload(
 
 fn build_latent_survival_ffi_payload(
     formula: String,
-    dataset: &gam::data::EncodedDataset,
+    dataset: &EncodedDataset,
     fit_config: &FitConfig,
     request_frailty: gam::families::lognormal_kernel::FrailtySpec,
     lat_result: gam::families::latent_survival::LatentSurvivalTermFitResult,
@@ -1540,7 +1540,7 @@ fn build_latent_survival_ffi_payload(
 
 fn build_latent_binary_ffi_payload(
     formula: String,
-    dataset: &gam::data::EncodedDataset,
+    dataset: &EncodedDataset,
     fit_config: &FitConfig,
     request_frailty: gam::families::lognormal_kernel::FrailtySpec,
     lat_result: gam::families::latent_survival::LatentBinaryTermFitResult,
@@ -1560,7 +1560,7 @@ fn build_latent_binary_ffi_payload(
 
 fn build_latent_window_ffi_payload(
     formula: String,
-    dataset: &gam::data::EncodedDataset,
+    dataset: &EncodedDataset,
     fit_config: &FitConfig,
     request_frailty: gam::families::lognormal_kernel::FrailtySpec,
     fit: gam::estimate::UnifiedFitResult,
