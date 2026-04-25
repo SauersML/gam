@@ -116,38 +116,6 @@ impl<'a> StableSolver<'a> {
         None
     }
 
-    pub(crate) fn inversewithridge_retries(
-        &self,
-        matrix: &Array2<f64>,
-        baseridge: f64,
-        max_retry: usize,
-    ) -> Option<Array2<f64>> {
-        let p = matrix.nrows();
-        if p == 0 || matrix.ncols() != p {
-            return None;
-        }
-        for retry in 0..max_retry {
-            let ridge = if baseridge > 0.0 {
-                baseridge * 10f64.powi(retry as i32)
-            } else {
-                0.0
-            };
-            let h = addridge(matrix, ridge);
-            let factor = match self.factorize(&h) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let mut inv = Array2::<f64>::eye(p);
-            let mut invview = array2_to_matmut(&mut inv);
-            factor.solve_in_place(invview.as_mut());
-            if inv.iter().all(|v| v.is_finite()) {
-                enforce_symmetry(&mut inv);
-                return Some(inv);
-            }
-        }
-        None
-    }
-
     fn factorize_with_ridge_plan(
         &self,
         matrix: &Array2<f64>,

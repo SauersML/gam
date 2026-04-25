@@ -2739,7 +2739,7 @@ pub struct UnifiedFitResult {
     #[serde(default)]
     pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
     /// Solver artifacts (e.g. cached PIRLS result for ALO).
-    #[serde(skip)]
+    #[serde(default)]
     pub artifacts: FitArtifacts,
     /// Inner cycle count (blockwise path).
     #[serde(default)]

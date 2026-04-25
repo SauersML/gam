@@ -9989,7 +9989,7 @@ pub fn create_matern_spline_basiswithworkspace(
         let kappa_lo = 1e-2 / r_max;
         let kappa_hi = 1e2 / r_min;
         if kappa < kappa_lo || kappa > kappa_hi {
-            log::warn!(
+            log::debug!(
                 "Matérn κ={} is outside recommended range [{}, {}] derived from centers (r_min={}, r_max={}); kernel conditioning may degrade",
                 kappa,
                 kappa_lo,
@@ -13297,7 +13297,7 @@ fn build_duchon_basis_designwithworkspace(
         let kappa_lo = 1e-2 / r_max;
         let kappa_hi = 1e2 / r_min;
         if kappa < kappa_lo || kappa > kappa_hi {
-            log::warn!(
+            log::debug!(
                 "Duchon κ={} is outside recommended range [{}, {}] derived from centers (r_min={}, r_max={}); numerical conditioning may degrade",
                 kappa,
                 kappa_lo,

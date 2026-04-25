@@ -203,12 +203,12 @@ impl SparsePirlsDecision {
         let key = self.format_fields(path);
         let repetition_count = pirls_decision_repetition_count(key.clone());
         if repetition_count == 1 {
-            log::info!("[pirls-path] {key}");
+            log::debug!("[pirls-path] {key}");
             return;
         }
 
         if should_log_pirls_decision_summary(repetition_count) {
-            log::info!(
+            log::debug!(
                 "[pirls-path] repeated path={} reason={} count={} (suppressing identical decisions)",
                 path,
                 self.reason,
@@ -2954,6 +2954,11 @@ where
     F: FnMut(&WorkingModelIterationInfo),
 {
     const LM_MAX_LAMBDA: f64 = 1e12;
+    // Hard cap on |eta|. For most GLM/survival links (logit, probit,
+    // cloglog, Φ-transform), |eta| > 40 drives the link response to 0/1,
+    // making gradients overflow. Even for the identity link this is a
+    // sensible guard against runaway underdetermined systems.
+    const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
     fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
@@ -2965,6 +2970,7 @@ where
                     || message.contains("non-finite")
                     || message.contains("infinite")
                     || message.contains("overflow")
+                    || message.contains("exceeds f64 range")
             }
             // A candidate step that drives the linear predictor into a region
             // where the model's likelihood is structurally infeasible (e.g.
@@ -3058,7 +3064,7 @@ where
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
         // if the process is killed during `update_with_curvature` or the LM solve.
-        log::info!(
+        log::debug!(
             "[PIRLS] start iter {:>3} | lm_lambda {:.2e} | last_halving {} | last_dev_change {:.3e}",
             iter,
             lambda,
@@ -3275,13 +3281,7 @@ where
                         .copied()
                         .map(f64::abs)
                         .fold(0.0_f64, f64::max);
-                    // Hard cap on |eta|.  For most GLM/survival links (logit,
-                    // probit, cloglog, Φ-transform), |eta| > 40 drives the
-                    // link response to 0/1, making gradients overflow.
-                    // Even for the identity link this is a sensible guard
-                    // against runaway underdetermined systems.
-                    const ETA_ABS_CAP: f64 = 40.0;
-                    let eta_ok = candidate_max_eta <= ETA_ABS_CAP;
+                    let eta_ok = candidate_max_eta <= PIRLS_ETA_ABS_CAP;
 
                     if screening_rho > 0.0
                         && screening_penalized.is_finite()
@@ -3550,6 +3550,15 @@ where
             // The objective has plateaued and the projected gradient is
             // already inside the near-stationary band, so accept this as a
             // stalled but usable minimum.
+            status = PirlsStatus::StalledAtValidMinimum;
+        } else if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12)
+            && last_deviance_change.abs()
+                < options.convergence_tolerance
+                    * state.deviance.abs().max(state.penalty_term.abs()).max(1.0)
+        {
+            // The objective has flattened against the explicit eta guard. This
+            // is the same saturated boundary class as separated binomial fits:
+            // extra Newton work only re-tries the clipped boundary.
             status = PirlsStatus::StalledAtValidMinimum;
         }
     }
@@ -4632,7 +4641,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
-        log::info!(
+        log::debug!(
             "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
             info.iteration,
             info.deviance,

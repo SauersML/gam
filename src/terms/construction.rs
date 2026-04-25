@@ -1817,7 +1817,7 @@ pub fn stable_reparameterizationwith_invariant(
         }
         // Log when the floor materially changes the smallest eigenvalue (>1% relative shift).
         if min_eig_before > 0.0 && shrinkage_ridge / min_eig_before > 0.01 {
-            log::info!(
+            log::debug!(
                 "Penalty shrinkage floor active: ridge={:.3e} (min_eig_before={:.3e}, ratio={:.1e}, max_bal_eig={:.3e})",
                 shrinkage_ridge,
                 min_eig_before,
