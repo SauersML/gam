@@ -4404,7 +4404,6 @@ impl<'a> RemlState<'a> {
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
-
 }
 
 #[cfg(test)]
