@@ -17,7 +17,8 @@ use std::path::Path;
 use tempfile::tempdir;
 
 const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 4;
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 68;
+const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 70;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
@@ -26,21 +27,40 @@ fn read_saved_model_json(path: &Path) -> Value {
 }
 
 fn assert_saved_model_schema_is_pinned(saved: &Value) {
-    let payload = saved.as_object().expect("saved model payload object");
+    let root = saved.as_object().expect("saved model root object");
+    assert_eq!(
+        root.len(),
+        EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT,
+        "saved model root fields changed; audit enum envelope coverage before updating this test"
+    );
+    assert_eq!(
+        saved.get("model_type").and_then(Value::as_str),
+        Some("standard"),
+        "saved model envelope changed; audit stateful sync coverage before updating this test"
+    );
+    let payload = saved_model_payload(saved);
     assert_eq!(
         payload.len(),
         EXPECTED_MODEL_PAYLOAD_FIELD_COUNT,
         "saved model payload fields changed; audit stateful sync coverage before updating this test"
     );
     assert_eq!(
-        saved.get("version").and_then(Value::as_u64),
+        payload.get("version").and_then(Value::as_u64),
         Some(EXPECTED_MODEL_PAYLOAD_VERSION),
         "saved model schema version changed; audit stateful payload fields before updating this test"
     );
 }
 
+fn saved_model_payload(saved: &Value) -> &serde_json::Map<String, Value> {
+    saved
+        .get("payload")
+        .and_then(Value::as_object)
+        .expect("saved model payload object")
+}
+
 fn standard_family_state(saved: &Value) -> &serde_json::Map<String, Value> {
-    let family_state = saved
+    let payload = saved_model_payload(saved);
+    let family_state = payload
         .get("family_state")
         .and_then(Value::as_object)
         .expect("family_state object");
@@ -151,11 +171,7 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
 #[test]
 fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     let log_delta = -0.4;
-    let sas_state = SasLinkState {
-        epsilon: 0.25,
-        log_delta,
-        delta: log_delta.exp(),
-    };
+    let sas_state = SasLinkState::new(0.25, log_delta).expect("valid sas state");
     let covariance =
         Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
     let mut payload = FittedModelPayload::new(
@@ -190,7 +206,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         .expect("expected synchronized sas state");
     assert_eq!(saved_state.epsilon, sas_state.epsilon);
     assert_eq!(saved_state.log_delta, sas_state.log_delta);
-    assert!((saved_state.delta - sas_state.log_delta.exp()).abs() < 1e-15);
+    assert_eq!(saved_state.delta, sas_state.delta);
 
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("model.json");
@@ -215,7 +231,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     assert_eq!(family_state.get("latent_cloglog_state"), Some(&Value::Null));
     assert_eq!(family_state.get("mixture_state"), Some(&Value::Null));
     assert_eq!(
-        saved.get("sas_param_covariance"),
+        saved_model_payload(&saved).get("sas_param_covariance"),
         Some(&serde_json::json!([[0.1, 0.02], [0.02, 0.2]]))
     );
 
@@ -226,7 +242,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         .expect("expected loaded sas state");
     assert_eq!(loaded_state.epsilon, sas_state.epsilon);
     assert_eq!(loaded_state.log_delta, sas_state.log_delta);
-    assert!((loaded_state.delta - sas_state.log_delta.exp()).abs() < 1e-15);
+    assert_eq!(loaded_state.delta, sas_state.delta);
     let FittedModel::Standard { payload } = loaded else {
         panic!("expected standard model");
     };
