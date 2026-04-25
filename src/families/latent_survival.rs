@@ -28,7 +28,7 @@ use crate::families::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from
 use crate::families::survival_location_scale::{
     TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
 };
-use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DenseDesignMatrix, DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
 use crate::smooth::{
@@ -1728,7 +1728,10 @@ impl LatentSurvivalFamily {
             )
             .expect("latent survival mean pullback dimension mismatch");
 
-        let mean_row = self.x_mean.row_chunk(row..row + 1);
+        let mean_row = self
+            .x_mean
+            .try_row_chunk(row..row + 1)
+            .expect("latent survival mean pullback row_chunk must succeed");
         let mean_vec = mean_row.row(0);
         let time_mean_weights = [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
