@@ -1725,21 +1725,6 @@ mod tests {
     fn profiled_gaussian_penalty_only_gradient_matches_fd() {
         let f = GaussianRemlFixture::new();
         let state = f.state();
-        let bundle = state.obtain_eval_bundle(&f.rho).expect("bundle");
-        let pr = bundle.pirls_result.as_ref();
-        let (penalty_rank, _) = state
-            .fixed_subspace_penalty_rank_and_logdet(
-                &pr.reparam_result.e_transformed,
-                pr.ridge_passport,
-            )
-            .expect("penalty rank");
-        let h_trans = bundle.h_eff.as_ref();
-        let h_orig = h_original_from_bundle(&bundle);
-        let h_trans_cross = if penalty_rank < h_trans.ncols() {
-            h_trans.slice(s![..penalty_rank, penalty_rank..]).to_owned()
-        } else {
-            Array2::<f64>::zeros((penalty_rank, 0))
-        };
         let x_tau = Array2::<f64>::zeros(f.x.raw_dim());
         let hyper = DirectionalHyperParam::single_penalty(
             0,
@@ -1753,15 +1738,6 @@ mod tests {
         let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
             .expect("analytic directional gradient");
         let v_taufd = f.fd_directional_gradient(&x_tau, &f.s_tau_penalty);
-        println!(
-            "GAUSS penalty-only analytic={v_tau_analytic:.12e} fd={v_taufd:.12e} penalty_rank={} p={} e_shape={:?} frame={:?} h_trans_cross={:?} h_orig_cross={:?}",
-            penalty_rank,
-            f.x.ncols(),
-            pr.reparam_result.e_transformed.dim(),
-            pr.coordinate_frame,
-            h_trans_cross,
-            h_orig.slice(s![1.., 0..1]).to_owned()
-        );
 
         let v_rel = (v_tau_analytic - v_taufd).abs() / v_taufd.abs().max(1e-10);
         assert!(
@@ -2191,21 +2167,6 @@ mod tests {
         // explicit X_τ contribution is zero.
         let f = BinomialLogitDesignMotionFixture::new();
         let state = f.state();
-        let bundle = state.obtain_eval_bundle(&f.rho).expect("bundle");
-        let pr = bundle.pirls_result.as_ref();
-        let (penalty_rank, _) = state
-            .fixed_subspace_penalty_rank_and_logdet(
-                &pr.reparam_result.e_transformed,
-                pr.ridge_passport,
-            )
-            .expect("penalty rank");
-        let h_trans = bundle.h_eff.as_ref();
-        let h_orig = h_original_from_bundle(&bundle);
-        let h_trans_cross = if penalty_rank < h_trans.ncols() {
-            h_trans.slice(s![..penalty_rank, penalty_rank..]).to_owned()
-        } else {
-            Array2::<f64>::zeros((penalty_rank, 0))
-        };
         let x_tau = Array2::<f64>::zeros(f.x.raw_dim());
         let hyper = DirectionalHyperParam::single_penalty(
             0,
@@ -2219,15 +2180,6 @@ mod tests {
         let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
             .expect("analytic directional gradient");
         let v_tau_fd = f.fd_directional_gradient(&x_tau, &f.s_tau_penalty);
-        println!(
-            "BINOM penalty-only analytic={v_tau_analytic:.12e} fd={v_tau_fd:.12e} penalty_rank={} p={} e_shape={:?} frame={:?} h_trans_cross={:?} h_orig_cross={:?}",
-            penalty_rank,
-            f.x.ncols(),
-            pr.reparam_result.e_transformed.dim(),
-            pr.coordinate_frame,
-            h_trans_cross,
-            h_orig.slice(s![1.., 0..1]).to_owned()
-        );
 
         let v_rel = (v_tau_analytic - v_tau_fd).abs() / v_tau_fd.abs().max(1e-10);
         assert!(

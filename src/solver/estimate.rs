@@ -4709,14 +4709,9 @@ mod estimate_policy_tests {
             .obtain_eval_bundle(&rho)
             .map(|b| b.pirls_result.clone())
             .expect("pirls_result");
-        println!(
-            "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19 lastgradient_norm={:.6e} status={:?} iteration={}",
-            pirls_result.lastgradient_norm, pirls_result.status, pirls_result.iteration
-        );
         let eta = &pirls_result.final_eta;
         let x_t = &pirls_result.x_transformed;
         let mut du_by_eps = Array1::<f64>::zeros(eta.len());
-        let mut clampedobs = 0usize;
         for i in 0..eta.len() {
             let jets = sas_inverse_link_jetwith_param_partials(
                 eta[i],
@@ -4725,12 +4720,6 @@ mod estimate_policy_tests {
             );
             let mu = jets.jet.mu;
             let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
-            if (mu.is_finite()
-                && (mu <= LINK_BINOMIAL_AUX_MU_EPS || mu >= 1.0 - LINK_BINOMIAL_AUX_MU_EPS))
-                || !mu.is_finite()
-            {
-                clampedobs += 1;
-            }
             let d1 = jets.jet.d1;
             let dmu = jets.djet_depsilon.mu;
             let dd1 = jets.djet_depsilon.d1;
@@ -4768,7 +4757,6 @@ mod estimate_policy_tests {
             "sas du / d raw epsilon at fixed eta",
         );
         let rhs = x_t.transpose_vector_multiply(&du_by_eps);
-        println!("sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19 clampedobs={clampedobs}");
         let mut neg_du_deta = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {
             let jets = sas_inverse_link_jetwith_param_partials(
