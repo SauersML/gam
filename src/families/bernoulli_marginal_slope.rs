@@ -8813,6 +8813,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -8926,6 +8927,7 @@ mod tests {
             )),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -8991,6 +8993,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -9044,6 +9047,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let current = Array1::<f64>::zeros(score_dim);
         let mut proposed = current.clone();
@@ -9873,6 +9877,7 @@ mod tests {
                 )),
                 score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
 
         let a = 0.35;
@@ -10036,6 +10041,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime),
                 link_dev: None,
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let specs = vec![
             dummy_blockspec(1, 3),
@@ -10093,6 +10099,7 @@ mod tests {
             ]])),
             score_warp: None,
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -10223,6 +10230,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
@@ -10320,6 +10328,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let block_states = vec![
@@ -10412,6 +10421,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -10547,6 +10557,7 @@ mod tests {
             logslope_design: scalar_design(),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -10651,6 +10662,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let block_states = vec![
@@ -10775,6 +10787,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let block_states = vec![
@@ -10903,6 +10916,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11050,6 +11064,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11150,6 +11165,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11227,6 +11243,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11302,6 +11319,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11384,6 +11402,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11488,6 +11507,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11611,6 +11631,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -11757,6 +11778,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11854,6 +11876,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -11951,6 +11974,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12059,6 +12083,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12165,6 +12190,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12288,6 +12314,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12398,6 +12425,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12506,6 +12534,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12638,6 +12667,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12744,6 +12774,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -12848,6 +12879,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -12968,6 +13000,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13048,6 +13081,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13128,6 +13162,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13213,6 +13248,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13298,6 +13334,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13372,6 +13409,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -13446,6 +13484,7 @@ mod tests {
             )),
             score_warp: Some(prepared.runtime.clone()),
             link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -13507,6 +13546,7 @@ mod tests {
             )),
             score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -13558,6 +13598,7 @@ mod tests {
                 )),
                 score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
@@ -13665,6 +13706,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: None,
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -13781,6 +13823,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -13922,6 +13965,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -14086,6 +14130,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -14152,6 +14197,7 @@ mod tests {
                 )),
                 score_warp: None,
                 link_dev: None,
+                policy: crate::resource::ResourcePolicy::default_library(),
             };
         let family = make_family(sigma);
         let block_states = vec![

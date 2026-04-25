@@ -3242,7 +3242,6 @@ impl CustomFamilyPsiLinearMapRef<'_> {
     }
 }
 
-// TODO(row-local-api-dep): depends on impl-row-local agent adding row_chunk/row_vector to actions
 #[derive(Clone)]
 pub(crate) enum PsiDesignMap {
     Zero {
@@ -3885,7 +3884,7 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
     })
 }
 
-// TODO(psi-design-map-migration): remaining callers in `survival_location_scale.rs`
+// Remaining callers in `survival_location_scale.rs`
 // (lines 1911, 1952) and `gamlss.rs` (line 8653) materialize the dense matrix and
 // must move to `resolve_custom_family_x_psi_map` with an upstream `ResourcePolicy`.
 // Those files are owned by sibling agents; once they migrate, delete this adapter
@@ -3908,7 +3907,7 @@ pub(crate) fn resolve_custom_family_x_psi(
     }
 }
 
-// TODO(psi-design-map-migration): remaining callers in `survival_location_scale.rs`
+// Remaining callers in `survival_location_scale.rs`
 // (lines 2041, 2077) and `gamlss.rs` (lines 5559, 5579, 6938, 6958, 10856, 10876,
 // 12542, 12562) materialize the dense matrix and must move to
 // `resolve_custom_family_x_psi_psi_map` with an upstream `ResourcePolicy`. Those

@@ -16568,6 +16568,7 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let beta_t = array![250.0];
         let beta_ls = array![0.0];
@@ -17469,6 +17470,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,
             wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let eta_t = Array1::from_vec(vec![0.4; n]);
@@ -17558,6 +17560,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let beta_t = Array1::from_vec(vec![0.25]);
@@ -17669,6 +17672,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots.clone(),
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let beta_t0 = 0.25;
@@ -18079,6 +18083,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let beta_t = Array1::from_vec(vec![0.25]);
@@ -18176,6 +18181,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let rebuild_states = |beta_t: &Array1<f64>,
@@ -18311,6 +18317,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let rebuild_states = |beta_t: &Array1<f64>,
@@ -18449,6 +18456,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let beta_t = Array1::from_vec(vec![0.25]);
@@ -18564,6 +18572,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 4,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let rebuild_states = |beta_t: &Array1<f64>,
@@ -18677,6 +18686,7 @@ mod tests {
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
             wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let rebuild_states = |beta_t: &Array1<f64>,
@@ -18838,6 +18848,7 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let beta_t = array![0.2, -0.15];
@@ -18908,6 +18919,7 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let rebuild_states = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>| {
@@ -18981,6 +18993,7 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let rebuild_states = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>| {
@@ -19165,6 +19178,7 @@ mod tests {
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: None,
             log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
         let states = vec![
             ParameterBlockState {
@@ -19216,6 +19230,7 @@ mod tests {
             log_sigma_design: None,
             wiggle_knots: knots,
             wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let core_for_q0 =
@@ -19317,6 +19332,7 @@ mod tests {
             log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 design.clone(),
             ))),
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         // Extreme eta values → fitted probs ≈ 0 or 1 → zero working weights

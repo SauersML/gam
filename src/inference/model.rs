@@ -1965,12 +1965,7 @@ impl FittedModel {
                         .to_string(),
                 );
             }
-            if self
-                .resolved_termspec_logslope
-                .as_ref()
-                .or(self.resolved_termspec_noise.as_ref())
-                .is_none()
-            {
+            if self.resolved_termspec_logslope.as_ref().is_none() {
                 return Err(
                     "marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
                         .to_string(),
@@ -2041,12 +2036,7 @@ impl FittedModel {
                             .to_string(),
                     );
                 }
-                if self
-                    .resolved_termspec_logslope
-                    .as_ref()
-                    .or(self.resolved_termspec_noise.as_ref())
-                    .is_none()
-                {
+                if self.resolved_termspec_logslope.as_ref().is_none() {
                     return Err(
                         "survival marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
                             .to_string(),
