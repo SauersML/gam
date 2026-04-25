@@ -4433,7 +4433,7 @@ where
 
 #[cfg(test)]
 mod estimate_policy_tests {
-    use super::reml::hyper::{LINK_BINOMIAL_AUX_MU_EPS, link_binomial_aux};
+    use super::reml::hyper::link_binomial_aux;
     use super::*;
     use crate::linalg::utils::max_abs_diag;
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
