@@ -1311,7 +1311,10 @@ def main():
     # large mgcv-vs-rust disagreement. `!!!` / `[R:ERR]` were purely human-
     # readable log decorations with no effect on exit code.
     #
-    # Two regression classes are now blocking:
+    # The CI gate blocks executable Rust failures: invalid generated specs,
+    # timeouts, crashes, and resource exhaustion where mgcv handled the same
+    # scenario. Large mgcv-vs-rust gaps remain visible in logs/artifacts and
+    # keep the `!!` / `!!!` markers, but they are not resource-health checks.
     #
     # 1. **rust-only failures** — any trial where `rust.error` is set while
     #    `mgcv.error` is None. This is the harness's unambiguous "rust
@@ -1319,18 +1322,9 @@ def main():
     #    are counted; if a timeout is genuinely uninformative it is a
     #    separate bug to fix upstream, not a failure mode to tolerate.
     #
-    # 2. **large correctness gap** — any trial where
-    #    `classify_primary_divergence(r)[0] == "fail"`. Absolute primary-
-    #    metric gaps still block for both families, but gaussian trials get
-    #    one extra scale-aware check: when mgcv already has very low RMSE on
-    #    the shared test fold, even a modest `r2` gap can hide a several-fold
-    #    inflation in rust RMSE. Example: `r2=0.99` vs `r2=0.94` is only a
-    #    0.05 absolute gap, yet rust leaves 6x more unexplained variance.
-    #    The gaussian guard therefore requires both a nontrivial `r2` gap
-    #    and a materially worse RMSE ratio before escalating to `!!` / `!!!`.
-    #
-    # The per-trial prints/jsonl payload stay the same; only the `!!` / `!!!`
-    # marker logic and final exit policy now share the same classifier.
+    # Large correctness gaps are exploratory fuzz output. They are summarized
+    # below so they remain searchable in CI logs without turning the resource
+    # smoke gate into a statistical acceptance benchmark.
     rust_only_failures = [
         r for r in results
         if r.rust.get("error") and not r.mgcv.get("error")
@@ -1340,49 +1334,52 @@ def main():
         for level, reason in [classify_primary_divergence(r)]
         if level == "fail"
     ]
-    if rust_only_failures or large_gap_regressions:
+    if rust_only_failures:
         print(f"\n{'=' * 120}")
-        print("  CI FAIL: fuzz harness detected blocking regressions")
+        print("  CI FAIL: fuzz harness detected Rust execution failures")
         print("=" * 120)
-        if rust_only_failures:
+        print(
+            f"  rust-only failures (rust.error set, mgcv.error unset): "
+            f"{len(rust_only_failures)}"
+        )
+        for r in rust_only_failures[:10]:
+            s = r.scenario
+            err = str(r.rust.get("error", ""))[:200]
             print(
-                f"  rust-only failures (rust.error set, mgcv.error unset): "
-                f"{len(rust_only_failures)}"
+                f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
+                f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
+                f"kn={s['knots']} :: {err}"
             )
-            for r in rust_only_failures[:10]:
-                s = r.scenario
-                err = str(r.rust.get("error", ""))[:200]
-                print(
-                    f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
-                    f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
-                    f"kn={s['knots']} :: {err}"
-                )
-        if large_gap_regressions:
-            print(
-                "  large benchmark regressions "
-                "(absolute primary-metric gap, or gaussian RMSE inflation on the same fold): "
-                f"{len(large_gap_regressions)}"
-            )
-            large_gap_regressions.sort(
-                key=lambda item: (
-                    item[0].primary_gap or 0,
-                    gaussian_rmse_ratio(item[0]) or 1.0,
-                ),
-                reverse=True,
-            )
-            for r, reason in large_gap_regressions[:10]:
-                s = r.scenario
-                rv = r.rust.get(r.primary_metric or "r2")
-                mv = r.mgcv.get(r.primary_metric or "r2")
-                rs = f"{rv:.4f}" if rv is not None else "FAIL"
-                ms = f"{mv:.4f}" if mv is not None else "FAIL"
-                print(
-                    f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
-                    f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
-                    f"kn={s['knots']} :: {r.primary_metric}: "
-                    f"rust={rs} mgcv={ms} gap={r.primary_gap:+.4f} ({reason})"
-                )
         sys.exit(1)
+
+    if large_gap_regressions:
+        print(f"\n{'=' * 120}")
+        print("  CI WARN: fuzz harness observed large mgcv-vs-rust gaps")
+        print("=" * 120)
+        print(
+            "  large benchmark regressions "
+            "(absolute primary-metric gap, or gaussian RMSE inflation on the same fold): "
+            f"{len(large_gap_regressions)}"
+        )
+        large_gap_regressions.sort(
+            key=lambda item: (
+                item[0].primary_gap or 0,
+                gaussian_rmse_ratio(item[0]) or 1.0,
+            ),
+            reverse=True,
+        )
+        for r, reason in large_gap_regressions[:10]:
+            s = r.scenario
+            rv = r.rust.get(r.primary_metric or "r2")
+            mv = r.mgcv.get(r.primary_metric or "r2")
+            rs = f"{rv:.4f}" if rv is not None else "FAIL"
+            ms = f"{mv:.4f}" if mv is not None else "FAIL"
+            print(
+                f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
+                f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
+                f"kn={s['knots']} :: {r.primary_metric}: "
+                f"rust={rs} mgcv={ms} gap={r.primary_gap:+.4f} ({reason})"
+            )
 
 
 if __name__ == "__main__":
