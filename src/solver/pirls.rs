@@ -6000,7 +6000,7 @@ fn fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
 }
 
 #[inline]
-fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> WeightFamily {
+pub fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> WeightFamily {
     match likelihood.family {
         GlmLikelihoodFamily::GaussianIdentity => WeightFamily::Gaussian,
         GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
@@ -6530,7 +6530,7 @@ pub enum WeightLink {
 }
 
 #[inline]
-fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> VarianceJet {
+pub fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> VarianceJet {
     match family {
         WeightFamily::Gaussian => VarianceJet::gaussian(),
         WeightFamily::Binomial => VarianceJet::binomial_n(mu),

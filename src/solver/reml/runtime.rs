@@ -922,12 +922,17 @@ impl<'a> RemlState<'a> {
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
         ) && free_basis_opt.is_none();
-        let h_tk_eval = if use_original_basis {
-            self.bundle_matrix_in_original_basis(pirls_result, bundle.h_total.as_ref())
-        } else if let Some(z) = free_basis_opt.as_ref() {
-            Self::projectwith_basis(bundle.h_total.as_ref(), z)
+        let h_tk_source = if self.config.firth_bias_reduction {
+            bundle.h_total.as_ref()
         } else {
-            bundle.h_total.as_ref().clone()
+            bundle.h_eff.as_ref()
+        };
+        let h_tk_eval = if use_original_basis {
+            self.bundle_matrix_in_original_basis(pirls_result, h_tk_source)
+        } else if let Some(z) = free_basis_opt.as_ref() {
+            Self::projectwith_basis(h_tk_source, z)
+        } else {
+            h_tk_source.clone()
         };
         let x_eff_dense = if use_original_basis {
             self.x()
@@ -1170,23 +1175,24 @@ impl<'a> RemlState<'a> {
     /// rule that flows through η.  This is precisely what
     /// `tk_direct_gradient_from_cd_and_design` consumes.
     ///
-    /// For canonical logit on a binomial likelihood, W = h'(η)² / V(μ)
-    /// with h'(η) = μ(1−μ).  The closed-form 5-jet of the inverse link
-    /// (`mixture_link::logit_inverse_link_jet5`) gives ∂³W/∂η³ exactly,
-    /// so we return that — clamped to zero in saturated tails where the
-    /// jet is dominated by floating-point noise (matching the existing
-    /// `c_array`/`d_array` saturation handling).  No finite-difference
-    /// stencil is involved.
+    /// For canonical Logit on a binomial likelihood, W = h'(η)²/V(μ)
+    /// reduces to W = h'(η) (because V(μ) = h'(η) for the canonical
+    /// pairing μ(1−μ)), so ∂³W/∂η³ = h''''(η) and the closed-form 5-jet
+    /// (`mixture_link::logit_inverse_link_jet5`) gives that exactly. We
+    /// clamp to zero in saturated tails where the jet is dominated by
+    /// floating-point noise (matching the existing `c_array`/`d_array`
+    /// saturation handling).
     ///
-    /// Non-canonical / non-logit links currently lack the analytic third
-    /// derivative wiring, so we surface that as a typed error rather
-    /// than silently fall back to a finite-difference estimate.  The
-    /// gap is structural — it lives in the per-family link-jet code,
-    /// not in this helper — and is documented for future families to
-    /// fill in (`mixture_link.rs`, SAS, blended).  Once the analytic
-    /// `d³W/dη³` is exposed, dropping a new arm into this match is the
-    /// only change required to enable Tierney–Kadane outer gradients
-    /// for that family.
+    /// For non-canonical Bernoulli links (Probit, CLogLog, SAS,
+    /// BetaLogistic, Mixture) and non-Bernoulli families with
+    /// non-trivial observed corrections we use the analytic
+    /// [`pirls::e_obs_from_jets`] formula. It expresses
+    ///   ∂³W_obs/∂η³ = W_F''' + h₃ T₁ + 3 h₂ T₂ + 3 h₁ T₃ − (y−μ) T₄
+    /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
+    /// is closed-form in h₁..h₅ (inverse-link jet plus
+    /// `inverse_link_pdf{third,fourth}_derivative_for_inverse_link`)
+    /// and the variance jet V, V₁..V₄. No finite-difference stencil is
+    /// involved.
     fn hessian_cde_arrays(
         &self,
         pirls_result: &PirlsResult,
@@ -1196,24 +1202,119 @@ impl<'a> RemlState<'a> {
         let n = d_array.len();
         let mut e_array = Array1::<f64>::zeros(n);
 
-        match self.config.link_function() {
-            LinkFunction::Logit => {
-                for i in 0..n {
-                    let eta_raw = pirls_result.final_eta[i];
-                    let eta_used = eta_raw.clamp(-700.0, 700.0);
-                    if eta_raw != eta_used {
-                        e_array[i] = 0.0;
-                    } else {
-                        let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
-                        e_array[i] = self.weights[i].max(0.0) * jet.d4;
-                    }
+        let link_function = self.config.link_function();
+        let inverse_link =
+            if let Some(state) = self.runtime_mixture_link_state.clone() {
+                InverseLink::Mixture(state)
+            } else if let Some(state) = self.runtime_sas_link_state {
+                if matches!(link_function, LinkFunction::BetaLogistic) {
+                    InverseLink::BetaLogistic(state)
+                } else {
+                    InverseLink::Sas(state)
+                }
+            } else {
+                InverseLink::Standard(link_function)
+            };
+
+        // Saturation guard mirrors `eta_for_observed_hessian_jet` in pirls:
+        // for non-Logit / non-Log links eta is clamped to ±30 to keep the
+        // jets within numerically tractable territory; outside that window
+        // we report 0 to match the c/d saturation policy.
+        let (clamp_lo, clamp_hi) = match link_function {
+            LinkFunction::Logit | LinkFunction::Log => (-700.0_f64, 700.0_f64),
+            LinkFunction::Identity => (f64::NEG_INFINITY, f64::INFINITY),
+            LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas
+            | LinkFunction::BetaLogistic => (-30.0_f64, 30.0_f64),
+        };
+
+        // Canonical-Logit fast path: W = h'(η), so ∂³W/∂η³ = h''''(η)
+        // taken from the dedicated 5-jet (no variance-jet machinery).
+        // Mixture links advertise `link_function() == Logit` but are
+        // non-canonical; route them through the general path below.
+        let canonical_logit = matches!(link_function, LinkFunction::Logit)
+            && self.runtime_mixture_link_state.is_none();
+
+        if canonical_logit {
+            for i in 0..n {
+                let eta_raw = pirls_result.final_eta[i];
+                let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
+                if eta_raw != eta_used {
+                    e_array[i] = 0.0;
+                } else {
+                    let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
+                    e_array[i] = self.weights[i].max(0.0) * jet.d4;
                 }
             }
-            other => {
-                return Err(EstimationError::InvalidInput(format!(
-                    "Tierney-Kadane c/d derivative propagation requires analytic d³W/deta³ for {other:?}; only logit is currently wired"
-                )));
+            return Ok((c_array, d_array, e_array));
+        }
+
+        // General observed-information path for non-canonical Bernoulli
+        // links and other GLM families that support the observed Hessian
+        // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
+        let likelihood = pirls_result.likelihood;
+        let weight_family = pirls::weight_family_for_glm_likelihood(likelihood);
+        let phi = likelihood.fixed_phi().unwrap_or(1.0);
+        let dmu_deta = &pirls_result.solve_dmu_deta;
+        let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
+        let d3mu_deta3 = &pirls_result.solve_d3mu_deta3;
+        if dmu_deta.len() != n || d2mu_deta2.len() != n || d3mu_deta3.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane e_obs requires populated solve_*mu_deta arrays (n={}, dmu={}, d2mu={}, d3mu={}); ensure PIRLS rehydration ran",
+                n,
+                dmu_deta.len(),
+                d2mu_deta2.len(),
+                d3mu_deta3.len(),
+            )));
+        }
+        let mu = &pirls_result.solvemu;
+        if mu.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane e_obs requires solvemu populated (n={}, len={})",
+                n,
+                mu.len(),
+            )));
+        }
+        for i in 0..n {
+            let eta_raw = pirls_result.final_eta[i];
+            let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
+            if eta_raw != eta_used {
+                e_array[i] = 0.0;
+                continue;
             }
+            let h1 = dmu_deta[i];
+            let h2 = d2mu_deta2[i];
+            let h3 = d3mu_deta3[i];
+            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                &inverse_link,
+                eta_used,
+            )?;
+            let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                &inverse_link,
+                eta_used,
+            )?;
+            if !h1.is_finite()
+                || !h2.is_finite()
+                || !h3.is_finite()
+                || !h4.is_finite()
+                || !h5.is_finite()
+            {
+                e_array[i] = 0.0;
+                continue;
+            }
+            let mu_i = mu[i];
+            let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i);
+            if !(vj.v.is_finite() && vj.v > 0.0) {
+                e_array[i] = 0.0;
+                continue;
+            }
+            let pw = self.weights[i].max(0.0);
+            let y_i = self.y[i];
+            let e_i = pirls::e_obs_from_jets(
+                y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw,
+            );
+            e_array[i] = if e_i.is_finite() { e_i } else { 0.0 };
         }
 
         Ok((c_array, d_array, e_array))
