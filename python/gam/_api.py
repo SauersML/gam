@@ -30,7 +30,7 @@ def _build_fit_payload(
     z_column: str | None,
     link: str | None,
     logslope_formula: str | None,
-    scale_dimensions: str | None,
+    scale_dimensions: bool | None,
     disable_link_dev: bool | None,
     disable_score_warp: bool | None,
     firth: bool | None,
