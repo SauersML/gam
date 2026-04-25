@@ -20762,11 +20762,12 @@ mod tests {
         data: &Array2<f64>,
         centers: &Array2<f64>,
         eta: Vec<f64>,
+        power: usize,
     ) -> Array2<f64> {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
-            power: 1,
+            power,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta),
@@ -20805,11 +20806,12 @@ mod tests {
         data: Array2<f64>,
         centers: Array2<f64>,
         eta: Vec<f64>,
+        power: usize,
     ) {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
-            power: 1,
+            power,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta.clone()),
@@ -20822,18 +20824,20 @@ mod tests {
             .as_ref()
             .expect("pure Duchon contrast operator");
         let h = 1e-4;
-        let x0 = pure_duchon_design_for_eta(&data, &centers, eta.clone());
+        let x0 = pure_duchon_design_for_eta(&data, &centers, eta.clone(), power);
 
         for axis in 0..op.n_axes() {
             let x_plus = pure_duchon_design_for_eta(
                 &data,
                 &centers,
                 perturb_contrast_eta(&eta, &[(axis, h)]),
+                power,
             );
             let x_minus = pure_duchon_design_for_eta(
                 &data,
                 &centers,
                 perturb_contrast_eta(&eta, &[(axis, -h)]),
+                power,
             );
             let finite_diff = (&x_plus - &(x0.mapv(|value| 2.0 * value)) + &x_minus)
                 .mapv(|value| value / (h * h));
@@ -20848,21 +20852,25 @@ mod tests {
                 &data,
                 &centers,
                 perturb_contrast_eta(&eta, &[(0, h), (1, h)]),
+                power,
             );
             let x_pm = pure_duchon_design_for_eta(
                 &data,
                 &centers,
                 perturb_contrast_eta(&eta, &[(0, h), (1, -h)]),
+                power,
             );
             let x_mp = pure_duchon_design_for_eta(
                 &data,
                 &centers,
                 perturb_contrast_eta(&eta, &[(0, -h), (1, h)]),
+                power,
             );
             let x_mm = pure_duchon_design_for_eta(
                 &data,
                 &centers,
                 perturb_contrast_eta(&eta, &[(0, -h), (1, -h)]),
+                power,
             );
             let finite_diff = (&x_pp - &x_pm - &x_mp + &x_mm).mapv(|value| value / (4.0 * h * h));
             let analytic = op
@@ -20874,12 +20882,18 @@ mod tests {
 
     #[test]
     fn test_pure_duchon_dim2_contrast_hessian_matches_finite_difference() {
+        // Pure Duchon in dim=2 with Linear (m=2) nullspace requires power=0
+        // (the standard 2D thin-plate spline kernel r²log(r)). Power≥1 in
+        // dim=2 violates the Duchon admissibility 2*s_order < dim and is
+        // rejected by the kernel-order validator (the resulting `r⁴ log r`
+        // kernel is not conditionally PD on the Linear nullspace).
         let data = array![[0.1, 0.2], [0.4, 0.8], [0.9, 0.3], [1.2, 0.7]];
         let centers = array![[0.0, 0.0], [0.8, 0.1], [0.2, 1.0], [1.1, 0.9]];
         assert_pure_duchon_contrast_hessian_matches_finite_difference(
             data,
             centers,
             vec![0.17, -0.17],
+            0,
         );
     }
 
@@ -20903,6 +20917,7 @@ mod tests {
             data,
             centers,
             vec![0.2, -0.05, -0.15],
+            1,
         );
     }
 
