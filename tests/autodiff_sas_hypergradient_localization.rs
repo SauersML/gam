@@ -306,10 +306,6 @@ fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
 
     for (eta, epsilon, log_delta) in cases {
         let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta);
-        let h = 1e-6;
-        let ep_p = gam::mixture_link::sas_inverse_link_jet(eta, epsilon + h, log_delta);
-        let ep_m = gam::mixture_link::sas_inverse_link_jet(eta, epsilon - h, log_delta);
-        let fd_d1 = (ep_p.d1 - ep_m.d1) / (2.0 * h);
 
         let (_, d1_nd) = first_derivative(|eps| sas_eta_d1_numdual(eta, eps, log_delta), epsilon);
         let (_, d2_nd) = first_derivative(|eps| sas_eta_d2_numdual(eta, eps, log_delta), epsilon);
