@@ -7,6 +7,7 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
+use std::env;
 use std::io::{self, IsTerminal, Stdout, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -62,6 +63,22 @@ pub fn init_logging() {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(LevelFilter::Info);
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var_os(name).is_some()
+}
+
+pub fn pirls_iter_info_enabled() -> bool {
+    env_flag_enabled("GAM_LOG_PIRLS_INFO")
+}
+
+pub fn reml_info_enabled() -> bool {
+    env_flag_enabled("GAM_LOG_REML_INFO")
+}
+
+pub fn data_info_enabled() -> bool {
+    env_flag_enabled("GAM_LOG_DATA_INFO")
 }
 
 fn install_multiprogress(mp: Option<MultiProgress>) {

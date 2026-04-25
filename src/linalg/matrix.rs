@@ -45,14 +45,10 @@ fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usi
 /// The sole holdout caller is [`DenseDesignMatrix::try_to_dense_arc`], which is
 /// itself invoked from 30+ sites across `solver/reml/`, `terms/smooth.rs`,
 /// `solver/pirls.rs`, `inference/`, etc. None of those callers thread a
-/// [`ResourcePolicy`] today, and `DenseDesignMatrix` does not own one. A proper
-/// migration would either (a) add a `policy: &ResourcePolicy` argument to
-/// `try_to_dense_arc` and propagate to every call site, or (b) attach a policy
-/// to `DenseDesignMatrix` itself. Both are large surgeries and are tracked
-/// separately; until then, this wrapper preserves the legacy default.
-// TODO(resource-policy-migration): migrate `DenseDesignMatrix::try_to_dense_arc`
-// to take a `&ResourcePolicy` (or attach one to `DenseDesignMatrix`), then drop
-// this wrapper in favour of `..._with_policy` directly.
+/// [`ResourcePolicy`] today, and `DenseDesignMatrix` does not own one. The
+/// migration path is to add a `policy: &ResourcePolicy` argument to
+/// `try_to_dense_arc` and propagate to every call site, or attach a policy
+/// to `DenseDesignMatrix` itself.
 pub fn panic_or_error_if_biobank_mode_and_to_dense_called(
     context: &str,
     n: usize,
@@ -552,16 +548,12 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
     /// `try_row_chunk(...)?` to propagate materialization errors.
     //
-    // TODO(material-policy-migration): >100 in-tree callers across
-    // `families/*marginal_slope.rs`, `families/scale_design.rs`,
-    // `families/latent_survival.rs`, `terms/smooth.rs`, `inference/predict.rs`,
-    // `solver/pirls.rs`, and several inherent `row_chunk` shims on
-    // `DenseDesignMatrix` (line ~706), `SparseDesignMatrix` (line ~1339), and
-    // `DesignMatrix` (line ~4963). The migration also requires a per-call-site
-    // decision between `try_row_chunk(rows)?` (fallible context) and the
-    // mandatory `row_chunk_into(rows, view)` allocation-free path for hot
-    // loops. Tracking as a separate full-tree pass; do not delete this default
-    // until that pass lands.
+    // Remaining in-tree callers span `families/*marginal_slope.rs`,
+    // `families/scale_design.rs`, `families/latent_survival.rs`,
+    // `terms/smooth.rs`, `inference/predict.rs`, `solver/pirls.rs`, and several
+    // inherent `row_chunk` shims. Each site needs a local decision between
+    // `try_row_chunk(rows)?` and the allocation-free `row_chunk_into(rows, view)`
+    // path for hot loops.
     fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         self.try_row_chunk(rows)
             .expect("DenseDesignOperator::row_chunk (legacy; migrate to try_row_chunk)")
