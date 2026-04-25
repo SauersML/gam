@@ -62,6 +62,13 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
             "y ~ s(x0, type=tps, centers=6, double_penalty=true) + s(x1, type=tps, centers=6, double_penalty=true)",
         )
 
+    def test_select_scenarios_applies_cost_cap_before_sorting(self) -> None:
+        scenarios, skipped = _FUZZ.select_scenarios([56, 73, 130], max_scenario_cost=75_000)
+
+        self.assertEqual([sc.seed for sc in scenarios], [73])
+        self.assertEqual([sc.seed for sc, _ in skipped], [56, 130])
+        self.assertGreater(skipped[0][1], 75_000)
+
 
 if __name__ == "__main__":
     unittest.main()

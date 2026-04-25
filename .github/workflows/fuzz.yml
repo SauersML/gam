@@ -5,14 +5,24 @@ on:
     branches: [main]
     paths:
       - "src/**"
+      - "bench/fuzz_vs_mgcv.py"
+      - "bench/run_suite.py"
+      - "tests/bench_fuzz_vs_mgcv_test.py"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+      - ".github/actions/setup-bench-r/**"
   pull_request:
     branches: [main]
     paths:
       - "src/**"
+      - "bench/fuzz_vs_mgcv.py"
+      - "bench/run_suite.py"
+      - "tests/bench_fuzz_vs_mgcv_test.py"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+      - ".github/actions/setup-bench-r/**"
   workflow_dispatch:
 
 concurrency:
@@ -70,6 +80,7 @@ jobs:
             --top 30 \
             --rust-timeout 60 \
             --r-timeout 60 \
+            --max-scenario-cost 75000 \
             --max-total-seconds 3300 \
             2>&1 | tee fuzz_output.txt
 
