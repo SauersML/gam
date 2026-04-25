@@ -305,6 +305,8 @@ impl<'a> RemlState<'a> {
         ext_eta_fixed: &[Option<Array1<f64>>],
         ext_x_fixed: &[Option<Array2<f64>>],
         x_vks: &[Array1<f64>],
+        beta_dirs: &[Array1<f64>],
+        firth_op: Option<&super::FirthDenseOperator>,
         shared: &TkSharedIntermediates,
         gram: &mut Array2<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -316,6 +318,13 @@ impl<'a> RemlState<'a> {
             return Err(EstimationError::InvalidInput(format!(
                 "Tierney-Kadane correction internal gradient arity mismatch: {} response modes for {} coordinates",
                 x_vks.len(),
+                total_k
+            )));
+        }
+        if beta_dirs.len() != total_k {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane correction internal beta-direction arity mismatch: {} beta directions for {} coordinates",
+                beta_dirs.len(),
                 total_k
             )));
         }
@@ -410,6 +419,8 @@ impl<'a> RemlState<'a> {
                     .sum::<f64>();
             let correction_trace =
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
+            let firth_trace =
+                Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[idx], &p_total)?;
             let eta_total = x_vks[idx].mapv(|value| -value);
             let direct = Self::tk_direct_gradient_from_cd_and_design(
                 x_dense,
@@ -422,7 +433,7 @@ impl<'a> RemlState<'a> {
                 shared,
                 gram,
             )?;
-            gradient[idx] = trace_ak_p - correction_trace + direct;
+            gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
         }
         for (extra_idx, drift) in ext_drifts.iter().enumerate() {
             if drift.raw_dim() != p_total.raw_dim() {
@@ -443,6 +454,8 @@ impl<'a> RemlState<'a> {
             let x_vk_idx = k + extra_idx;
             let correction_trace =
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
+            let firth_trace =
+                Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
             let mut eta_total = x_vks[x_vk_idx].clone();
             if let Some(eta_fixed) = ext_eta_fixed.get(extra_idx).and_then(|value| value.as_ref()) {
                 if eta_fixed.len() != n {
@@ -477,7 +490,7 @@ impl<'a> RemlState<'a> {
                 shared,
                 gram,
             )?;
-            gradient[x_vk_idx] = trace_ak_p + correction_trace + direct;
+            gradient[x_vk_idx] = trace_ak_p + correction_trace + firth_trace + direct;
         }
 
         for g in gradient.iter_mut() {
@@ -488,6 +501,43 @@ impl<'a> RemlState<'a> {
             }
         }
         Ok(gradient)
+    }
+
+    fn tk_firth_beta_hessian_trace(
+        firth_op: Option<&super::FirthDenseOperator>,
+        beta_dir: &Array1<f64>,
+        p_total: &Array2<f64>,
+    ) -> Result<f64, EstimationError> {
+        let Some(firth_op) = firth_op else {
+            return Ok(0.0);
+        };
+        if beta_dir.len() != p_total.nrows() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane Firth beta-direction length mismatch: expected {}, got {}",
+                p_total.nrows(),
+                beta_dir.len()
+            )));
+        }
+        let deta = firth_op.x_dense.dot(beta_dir);
+        let dir = firth_op.direction_from_deta(deta);
+        let hphi = firth_op.hphi_direction(&dir);
+        if hphi.raw_dim() != p_total.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tierney-Kadane Firth Hessian derivative shape mismatch: expected {}x{}, got {}x{}",
+                p_total.nrows(),
+                p_total.ncols(),
+                hphi.nrows(),
+                hphi.ncols()
+            )));
+        }
+
+        let mut trace = 0.0;
+        for row in 0..hphi.nrows() {
+            for col in 0..hphi.ncols() {
+                trace -= hphi[[row, col]] * p_total[[col, row]];
+            }
+        }
+        Ok(trace)
     }
 
     /// Direct analytic derivative of the TK scalar through the per-row
@@ -668,6 +718,7 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         ext_coords: &[super::unified::HyperCoord],
         beta: &Array1<f64>,
+        firth_op: Option<&super::FirthDenseOperator>,
         compute_gradient: bool,
         h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     ) -> Result<TkCorrectionTerms, EstimationError> {
@@ -691,6 +742,7 @@ impl<'a> RemlState<'a> {
         }
 
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
+        let mut beta_dirs: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
         for idx in 0..k {
             let cp = &tk_penalties[idx];
             let r = &cp.col_range;
@@ -705,6 +757,7 @@ impl<'a> RemlState<'a> {
             let a_k_beta = &s_k_beta * lambdas[idx];
             let v_k = h_inv_solve(&a_k_beta)?;
             x_vks.push(x_dense.dot(&v_k));
+            beta_dirs.push(v_k.mapv(|value| -value));
         }
         let mut ext_drifts = Vec::with_capacity(ext_coords.len());
         let mut ext_eta_fixed = Vec::with_capacity(ext_coords.len());
@@ -729,6 +782,7 @@ impl<'a> RemlState<'a> {
             }
             let beta_theta = h_inv_solve(&coord.g)?;
             x_vks.push(x_dense.dot(&beta_theta));
+            beta_dirs.push(beta_theta);
             ext_drifts.push(drift);
             ext_eta_fixed.push(coord.tk_eta_fixed.clone());
             ext_x_fixed.push(coord.tk_x_fixed.clone());
@@ -746,6 +800,8 @@ impl<'a> RemlState<'a> {
             &ext_eta_fixed,
             &ext_x_fixed,
             &x_vks,
+            &beta_dirs,
+            firth_op,
             &shared,
             &mut gram,
         )?;
@@ -830,6 +886,21 @@ impl<'a> RemlState<'a> {
             };
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
+            let firth_op = if self.config.firth_bias_reduction
+                && matches!(self.config.link_function(), LinkFunction::Logit)
+            {
+                if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
+                    Some(cached.clone())
+                } else {
+                    Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                        x_dense.as_ref(),
+                        &pirls_result.final_eta,
+                        self.weights,
+                    )?))
+                }
+            } else {
+                None
+            };
             return self.tierney_kadane_analytic_core(
                 x_dense.as_ref(),
                 &z_mat,
@@ -840,6 +911,7 @@ impl<'a> RemlState<'a> {
                 &lambdas,
                 ext_coords,
                 &beta,
+                firth_op.as_deref(),
                 compute_gradient,
                 &h_inv_solve,
             );
@@ -958,6 +1030,17 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
+        let firth_op = if self.config.firth_bias_reduction
+            && matches!(self.config.link_function(), LinkFunction::Logit)
+        {
+            Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                &x_eff_dense,
+                &pirls_result.final_eta,
+                self.weights,
+            )?))
+        } else {
+            None
+        };
 
         self.tierney_kadane_analytic_core(
             &x_eff_dense,
@@ -969,6 +1052,7 @@ impl<'a> RemlState<'a> {
             &lambdas,
             ext_coords,
             &beta,
+            firth_op.as_deref(),
             compute_gradient,
             &h_inv_solve,
         )
@@ -4249,6 +4333,7 @@ mod tk_math_tests {
     use crate::faer_ndarray::FaerCholesky;
     use faer::Side;
     use ndarray::array;
+    use num_dual::{Dual64, DualNum};
 
     fn solve_vec(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
         h.cholesky(Side::Lower).expect("chol(H)").solvevec(rhs)
@@ -4262,96 +4347,157 @@ mod tk_math_tests {
         xt
     }
 
-    fn tk_scalar_for(
-        h: &Array2<f64>,
-        x: &Array2<f64>,
-        c: &Array1<f64>,
-        d: &Array1<f64>,
-    ) -> f64 {
-        let z = solve_xt(h, x);
-        let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(solve_vec(h, rhs))
-        };
-        let shared = RemlState::tk_shared_intermediates(x, &z, c, "tk scalar test", &solve)
-            .expect("shared TK intermediates");
-        let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        RemlState::tk_scalar_from_shared(x, &z, d, &shared, &mut gram)
-            .expect("TK scalar")
+    /// Closed-form TK scalar V_TK in any DualNum-compatible field, for a
+    /// scalar (1×1) Hessian H.  Restricting to p = 1 keeps the matrix
+    /// solve to a single division, which lets us evaluate the entire
+    /// V_TK formula in Dual64 and read the analytic derivative directly
+    /// from the dual part — no finite differences anywhere.
+    ///
+    /// All quantities derive from the same closed forms used by
+    /// `tk_scalar_from_shared`, just expanded for the n×1 case:
+    ///   K_ij = (x_i * x_j) / h
+    ///   h_ii = K_ii = x_i² / h
+    ///   m_i  = c_i * h_ii
+    ///   y    = (Σ x_i m_i) / h          (since H⁻¹ is 1/h)
+    ///   q    = Σ x_i m_i
+    ///   V_TK = −¹⁄₈ Σ d_i h_ii²
+    ///          + ¹⁄₁₂ Σᵢⱼ c_i c_j K_ij³
+    ///          + ¹⁄₈ q · y
+    fn tk_scalar_dual<D: DualNum<f64> + Copy>(
+        h: D,
+        x: &[D],
+        c: &[D],
+        d_arr: &[D],
+    ) -> D {
+        let n = x.len();
+        let inv_h = D::one() / h;
+        let mut h_diag = vec![D::from(0.0); n];
+        for i in 0..n {
+            h_diag[i] = x[i] * x[i] * inv_h;
+        }
+        let mut d_term = D::from(0.0);
+        for i in 0..n {
+            d_term += d_arr[i] * h_diag[i] * h_diag[i];
+        }
+        d_term *= D::from(-0.125);
+
+        let mut c_term = D::from(0.0);
+        for i in 0..n {
+            for j in 0..n {
+                let k_ij = x[i] * x[j] * inv_h;
+                c_term += c[i] * c[j] * k_ij * k_ij * k_ij;
+            }
+        }
+        c_term *= D::from(1.0 / 12.0);
+
+        let mut q = D::from(0.0);
+        for i in 0..n {
+            q += x[i] * c[i] * h_diag[i];
+        }
+        let q_term = D::from(0.125) * q * q * inv_h;
+
+        d_term + c_term + q_term
     }
 
+    /// Verify that `tk_gradient_from_shared` computes the exact analytic
+    /// directional derivative ∂V_TK/∂θ along a hand-chosen direction
+    /// (h_dot, x_dot, c_dot = d⊙η_dot, d_dot = e⊙η_dot).
+    ///
+    /// Reference is computed via dual-number AD on the closed-form
+    /// scalar in [`tk_scalar_dual`] — there is no finite-difference
+    /// stencil involved.  The setup uses p = 1 so the matrix solve
+    /// inside H reduces to a scalar division, which Dual64 handles
+    /// natively.
     #[test]
-    fn tierney_kadane_gradient_matches_full_scalar_finite_difference() {
-        let x = array![
-            [1.0, -0.35, 0.22],
-            [0.4, 0.8, -0.5],
-            [-0.7, 0.15, 0.9],
-            [0.2, -0.6, -0.3],
-        ];
-        let h = array![
-            [3.4, 0.25, -0.12],
-            [0.25, 2.7, 0.31],
-            [-0.12, 0.31, 2.2],
-        ];
-        let h_dot = array![
-            [0.11, -0.04, 0.03],
-            [-0.04, 0.08, -0.02],
-            [0.03, -0.02, -0.05],
-        ];
-        let x_dot = array![
-            [0.03, -0.02, 0.01],
-            [-0.01, 0.025, -0.015],
-            [0.02, 0.01, -0.03],
-            [-0.015, -0.01, 0.02],
-        ];
-        let c = array![0.17, -0.09, 0.13, 0.05];
-        let d = array![-0.04, 0.08, 0.03, -0.06];
-        let e = array![0.025, -0.035, 0.02, 0.015];
-        let eta_dot = array![0.12, -0.07, 0.05, -0.09];
+    fn tierney_kadane_gradient_matches_dual_ad_reference_scalarhessian() {
+        // p = 1, n = 4 toy problem.
+        let x_vec = vec![1.3_f64, -0.4, 0.7, -0.9];
+        let h_val = 2.5_f64;
+        let c = array![0.21_f64, -0.13, 0.18, 0.07];
+        let d = array![-0.05_f64, 0.09, 0.04, -0.07];
+        let e = array![0.03_f64, -0.04, 0.02, 0.018];
+        let eta_dot = array![0.11_f64, -0.06, 0.07, -0.085];
+        let x_dot_vec = vec![0.025_f64, -0.018, 0.022, -0.014];
+        let h_dot_val = 0.07_f64;
 
-        let z = solve_xt(&h, &x);
+        // Build dual versions of (h, x, c, d) at θ = 0 with derivatives
+        // (h_dot, x_dot, c_dot = d ⊙ η_dot, d_dot = e ⊙ η_dot).  This is
+        // the same chain rule the production code applies internally.
+        let h_dual = Dual64::new(h_val, h_dot_val);
+        let x_dual: Vec<Dual64> = x_vec
+            .iter()
+            .zip(x_dot_vec.iter())
+            .map(|(&v, &dv)| Dual64::new(v, dv))
+            .collect();
+        let c_dual: Vec<Dual64> = c
+            .iter()
+            .zip(d.iter().zip(eta_dot.iter()))
+            .map(|(&cv, (&dv, &edot))| Dual64::new(cv, dv * edot))
+            .collect();
+        let d_dual: Vec<Dual64> = d
+            .iter()
+            .zip(e.iter().zip(eta_dot.iter()))
+            .map(|(&dv, (&ev, &edot))| Dual64::new(dv, ev * edot))
+            .collect();
+
+        let v_tk_dual = tk_scalar_dual(h_dual, &x_dual, &c_dual, &d_dual);
+        let dv_tk_ad = v_tk_dual.eps;
+        let v_tk_value = v_tk_dual.re;
+
+        // Sanity-check the closed-form scalar against the production
+        // `tk_scalar_from_shared` at θ = 0.
+        let x_mat = Array2::from_shape_vec((4, 1), x_vec.clone()).unwrap();
+        let h_mat = Array2::from_shape_vec((1, 1), vec![h_val]).unwrap();
+        let z_mat = solve_xt(&h_mat, &x_mat);
         let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(solve_vec(&h, rhs))
+            Ok(solve_vec(&h_mat, rhs))
         };
-        let shared = RemlState::tk_shared_intermediates(&x, &z, &c, "tk derivative test", &solve)
-            .expect("shared TK intermediates");
+        let shared = RemlState::tk_shared_intermediates(
+            &x_mat, &z_mat, &c, "tk scalar dual baseline", &solve,
+        )
+        .expect("shared TK intermediates");
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        let v_tk_prod =
+            RemlState::tk_scalar_from_shared(&x_mat, &z_mat, &d, &shared, &mut gram)
+                .expect("TK scalar (production)");
+        let scalar_rel = (v_tk_value - v_tk_prod).abs()
+            / v_tk_value.abs().max(v_tk_prod.abs()).max(1.0e-14);
+        assert!(
+            scalar_rel < 1.0e-12,
+            "TK scalar mismatch (production vs closed-form): prod={v_tk_prod:.12e}, dual_re={v_tk_value:.12e}, rel={scalar_rel:.3e}"
+        );
+
+        // Production analytic derivative through the same
+        // `tk_gradient_from_shared` path that runs in REML evaluation.
+        // We treat the derivative as a single ext coordinate so the
+        // returned gradient[0] is precisely ∂V_TK/∂θ.
+        let h_dot_mat = Array2::from_shape_vec((1, 1), vec![h_dot_val]).unwrap();
+        let x_dot_mat = Array2::from_shape_vec((4, 1), x_dot_vec.clone()).unwrap();
         let gradient = RemlState::tk_gradient_from_shared(
-            &x,
-            &z,
+            &x_mat,
+            &z_mat,
             &c,
             &d,
             &e,
             &[],
             &[],
-            &[h_dot.clone()],
+            &[h_dot_mat],
             &[Some(eta_dot.clone())],
-            &[Some(x_dot.clone())],
-            &[Array1::<f64>::zeros(h.nrows())],
+            &[Some(x_dot_mat)],
+            &[Array1::<f64>::zeros(x_mat.nrows())],
+            &[Array1::<f64>::zeros(x_mat.ncols())],
+            None,
             &shared,
             &mut gram,
         )
         .expect("analytic TK derivative");
         let analytic = gradient[0];
 
-        let h_step = 2.0e-6;
-        let c_dot = &d * &eta_dot;
-        let d_dot = &e * &eta_dot;
-        let h_plus = &h + &h_dot.mapv(|v| h_step * v);
-        let h_minus = &h - &h_dot.mapv(|v| h_step * v);
-        let x_plus = &x + &x_dot.mapv(|v| h_step * v);
-        let x_minus = &x - &x_dot.mapv(|v| h_step * v);
-        let c_plus = &c + &c_dot.mapv(|v| h_step * v);
-        let c_minus = &c - &c_dot.mapv(|v| h_step * v);
-        let d_plus = &d + &d_dot.mapv(|v| h_step * v);
-        let d_minus = &d - &d_dot.mapv(|v| h_step * v);
-        let fd = (tk_scalar_for(&h_plus, &x_plus, &c_plus, &d_plus)
-            - tk_scalar_for(&h_minus, &x_minus, &c_minus, &d_minus))
-            / (2.0 * h_step);
-
-        let rel = (analytic - fd).abs() / analytic.abs().max(fd.abs()).max(1.0e-12);
+        let rel = (analytic - dv_tk_ad).abs()
+            / analytic.abs().max(dv_tk_ad.abs()).max(1.0e-14);
         assert!(
-            rel < 2.0e-7,
-            "TK derivative mismatch: analytic={analytic:.12e}, fd={fd:.12e}, rel={rel:.3e}"
+            rel < 1.0e-12,
+            "Tierney-Kadane analytic c/d propagation does not match Dual64 AD reference: analytic={analytic:.12e}, ad={dv_tk_ad:.12e}, rel={rel:.3e}"
         );
     }
 }
