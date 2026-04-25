@@ -626,6 +626,36 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
     )
 
 
+def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
+    if basis_filter is None:
+        return
+    sc.basis_type = basis_filter
+    if basis_filter == "duchon" and sc.n_smooths < 2:
+        sc.n_smooths = 2
+        sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
+
+
+def select_scenarios(
+    seeds: list[int],
+    family_filter: Optional[str] = None,
+    model_type_filter: Optional[str] = None,
+    basis_filter: Optional[str] = None,
+    max_scenario_cost: Optional[float] = None,
+) -> tuple[list[FuzzScenario], list[tuple[FuzzScenario, float]]]:
+    scenarios: list[FuzzScenario] = []
+    skipped: list[tuple[FuzzScenario, float]] = []
+    for seed in seeds:
+        sc = generate_scenario(seed, family_filter=family_filter, model_type_filter=model_type_filter)
+        _apply_basis_filter(sc, basis_filter)
+        cost = estimate_scenario_cost(sc)
+        if max_scenario_cost is not None and cost > max_scenario_cost:
+            skipped.append((sc, cost))
+            continue
+        scenarios.append(sc)
+    scenarios.sort(key=estimate_scenario_cost)
+    return scenarios, skipped
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1142,6 +1172,7 @@ def main():
     parser.add_argument("--rust-timeout", type=int, default=DEFAULT_RUST_TIMEOUT)
     parser.add_argument("--r-timeout", type=int, default=DEFAULT_R_TIMEOUT)
     parser.add_argument("--max-total-seconds", type=int, default=None)
+    parser.add_argument("--max-scenario-cost", type=float, default=None)
     args = parser.parse_args()
 
     if not RUST_BINARY.exists():
@@ -1184,20 +1215,28 @@ def main():
     print(f"  Rust timeout:      {args.rust_timeout}s")
     print(f"  R timeout:         {args.r_timeout}s")
     print(f"  Time budget:       {args.max_total_seconds}s" if args.max_total_seconds else "  Time budget:       none")
+    print(f"  Scenario cost cap: {args.max_scenario_cost:g}" if args.max_scenario_cost is not None else "  Scenario cost cap: none")
     print(f"  Results: {RESULTS_FILE}\n")
 
     # Pre-generate all scenarios so we can sort by estimated cost
     # (smallest/cheapest first) while keeping the randomized generation
-    scenarios = []
-    for seed in seeds:
-        sc = generate_scenario(seed, family_filter=args.family, model_type_filter=args.model_type)
-        if args.basis:
-            sc.basis_type = args.basis
-            if args.basis == "duchon" and sc.n_smooths < 2:
-                sc.n_smooths = 2
-                sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
-        scenarios.append(sc)
-    scenarios.sort(key=estimate_scenario_cost)
+    scenarios, skipped_scenarios = select_scenarios(
+        seeds,
+        family_filter=args.family,
+        model_type_filter=args.model_type,
+        basis_filter=args.basis,
+        max_scenario_cost=args.max_scenario_cost,
+    )
+    if skipped_scenarios:
+        max_skipped = max(cost for _, cost in skipped_scenarios)
+        print(
+            f"Skipped {len(skipped_scenarios)} trial(s) above scenario cost cap "
+            f"{args.max_scenario_cost:g}; max skipped cost={max_skipped:.0f}",
+            flush=True,
+        )
+    if not scenarios:
+        print("No scenarios selected after filters and cost cap")
+        sys.exit(2)
 
     started_at = time.time()
     with open(RESULTS_FILE, "a") as out_f:
