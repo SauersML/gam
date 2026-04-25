@@ -2,7 +2,9 @@
 //!
 //! Every nonlinear family decomposes its coefficient-space Hessian as
 //!
-//!     H_β = Σ_i  Jᵢᵀ Hᵢ Jᵢ
+//! ```text
+//! H_β = Σ_i  Jᵢᵀ Hᵢ Jᵢ
+//! ```
 //!
 //! where Hᵢ is a small (K×K) row Hessian in "primary space" and Jᵢ is the
 //! (sparse, linear) row Jacobian mapping coefficients → primary scalars.
