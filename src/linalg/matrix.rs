@@ -496,7 +496,7 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         let mut start = 0;
         while start < n {
             let end = (start + chunk_size).min(n);
-            let x_chunk = self.row_chunk(start..end);
+            let x_chunk = self.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let xm_chunk = fast_ab(&x_chunk, middle);
             for i in 0..(end - start) {
                 out[start + i] = x_chunk.row(i).dot(&xm_chunk.row(i)).max(0.0);
@@ -1035,7 +1035,7 @@ impl DenseDesignOperator for ReparamOperator {
         }
         match &self.x_original {
             DesignMatrix::Dense(x) => {
-                let chunk = x.row_chunk(rows);
+                let chunk = x.try_row_chunk(rows)?;
                 out.assign(&fast_ab(&chunk, &self.qs));
             }
             DesignMatrix::Sparse(sdm) => {
@@ -1339,13 +1339,19 @@ impl DesignBlock {
         }
     }
 
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    fn try_row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, MatrixMaterializationError> {
         match self {
-            Self::Dense(d) => d.row_chunk(rows),
-            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).row_chunk(rows),
-            Self::RandomEffect(op) => op.row_chunk(rows),
-            Self::Intercept(_) => Array2::ones((rows.end - rows.start, 1)),
+            Self::Dense(d) => d.try_row_chunk(rows),
+            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).try_row_chunk(rows),
+            Self::RandomEffect(op) => op.try_row_chunk(rows),
+            Self::Intercept(_) => Ok(Array2::ones((rows.end - rows.start, 1))),
         }
+    }
+
+    /// Legacy panicking wrapper. Migrate callers to `try_row_chunk`.
+    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.try_row_chunk(rows)
+            .expect("DesignBlock::row_chunk (legacy; migrate to try_row_chunk)")
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
