@@ -114,7 +114,12 @@ pub(crate) fn exact_tau_tau_hessian_policy_with_firth(
     let gradient_uses_implicit_design = hyper_dirs
         .iter()
         .any(DirectionalHyperParam::has_implicit_operator)
-        && crate::terms::basis::should_use_implicit_operators(n_obs, p_coeff, implicit_n_axes);
+        && crate::terms::basis::should_use_implicit_operators_with_policy(
+            n_obs,
+            p_coeff,
+            implicit_n_axes,
+            &crate::resource::ResourcePolicy::default_library(),
+        );
     let dense_first_order_count = hyper_dirs
         .iter()
         .filter(|dir| !dir.has_implicit_operator())
