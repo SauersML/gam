@@ -2130,8 +2130,8 @@ impl NewtonTrustRegionCore {
     where
         ObjFn: SecondOrderObjective,
     {
-        eprintln!(
-            "[OPT-TRACE] NewtonTrustRegion -> BFGS fallback (iter_used={}, dim={})",
+        log::debug!(
+            "[OPT] NewtonTrustRegion -> BFGS fallback (iter_used={}, dim={})",
             iter_used,
             x_start.len()
         );
@@ -2481,8 +2481,8 @@ impl ArcCore {
     where
         ObjFn: SecondOrderObjective,
     {
-        eprintln!(
-            "[OPT-TRACE] ARC -> BFGS fallback (iter_used={}, dim={})",
+        log::debug!(
+            "[OPT] ARC -> BFGS fallback (iter_used={}, dim={})",
             iter_used,
             x_start.len()
         );
@@ -8132,7 +8132,6 @@ mod tests {
     fn test_non_convex_function_is_handled() {
         let x0 = array![2.0];
         let result = Bfgs::new(x0.clone(), bfgs_oracle(non_convex_max)).run();
-        eprintln!("non_convex result: {:?}", result);
         // The robust solver should not fail. It gets stuck trying to minimize a function with no minimum.
         // It will hit the max iteration limit because it can't find steps that satisfy the descent condition.
         assert!(matches!(
