@@ -944,33 +944,47 @@ def predict_native_survival_matrix(
     grid: np.ndarray,
     out_dir: Path,
 ) -> tuple[np.ndarray, Path]:
-    matrix = np.empty((len(base_rows), grid.shape[0]), dtype=float)
-    last_pred_path = out_dir / f"{spec.name}.native_survival_grid_last.pred.csv"
-    for j, horizon in enumerate(grid):
-        input_path = out_dir / f"{spec.name}.native_survival_grid_{j:03d}.csv"
-        pred_path = out_dir / f"{spec.name}.native_survival_grid_{j:03d}.pred.csv"
-        write_survival_benchmark_csv(input_path, base_rows, prediction_horizon=float(horizon))
-        pred_cmd = [
-            str(rust_bin),
-            "predict",
-            str(model_path),
-            str(input_path),
-            "--out",
-            str(pred_path),
-        ]
-        rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
-        if rc != 0:
-            raise RuntimeError(
-                err.strip()
-                or out.strip()
-                or f"{spec.name} native survival-grid prediction failed at t={horizon:.6g}"
+    n = len(base_rows)
+    if n == 0 or grid.shape[0] == 0:
+        raise RuntimeError(f"{spec.name} native survival scoring requires non-empty rows and grid")
+    stacked_rows: list[dict[str, Any]] = []
+    for horizon in grid:
+        stacked_rows.extend(
+            prepare_survival_benchmark_rows(
+                base_rows,
+                prediction_horizon=float(horizon),
             )
-        matrix[:, j] = _survival_probability_column(
-            read_csv_rows(pred_path),
-            method_name=spec.name,
         )
-        last_pred_path = pred_path
-    return matrix, last_pred_path
+    input_path = out_dir / f"{spec.name}.native_survival_grid.csv"
+    pred_path = out_dir / f"{spec.name}.native_survival_grid.pred.csv"
+    if not stacked_rows:
+        raise RuntimeError(f"{spec.name} cannot write an empty native survival scoring frame")
+    fieldnames = [SURVIVAL_ENTRY_COLUMN] + [
+        key for key in stacked_rows[0].keys() if key != SURVIVAL_ENTRY_COLUMN
+    ]
+    write_csv_rows(input_path, stacked_rows, fieldnames)
+    pred_cmd = [
+        str(rust_bin),
+        "predict",
+        str(model_path),
+        str(input_path),
+        "--out",
+        str(pred_path),
+    ]
+    rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
+    if rc != 0:
+        raise RuntimeError(
+            err.strip()
+            or out.strip()
+            or f"{spec.name} native survival-grid prediction failed"
+        )
+    values = _survival_probability_column(read_csv_rows(pred_path), method_name=spec.name)
+    expected = n * grid.shape[0]
+    if values.shape[0] != expected:
+        raise RuntimeError(
+            f"{spec.name} native survival-grid prediction returned {values.shape[0]} rows; expected {expected}"
+        )
+    return values.reshape((grid.shape[0], n)).T, pred_path
 
 
 def ps_snapshot(pid: int) -> dict[str, Any]:

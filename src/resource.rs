@@ -60,6 +60,13 @@ pub trait ResidentBytes {
 
 impl ResourcePolicy {
     /// Conservative default suitable for general-purpose use.
+    ///
+    /// Uses `MaterializeIfSmall`: dense materialization is allowed only when the
+    /// matrix fits under `max_single_materialization_bytes`. This lets small-data
+    /// families that lack an implicit operator work out of the box, while
+    /// biobank-scale problems error out and force the analytic-operator path.
+    /// Set `derivative_storage_mode = AnalyticOperatorRequired` explicitly to
+    /// reject all dense fallback.
     pub fn default_library() -> Self {
         Self {
             max_single_materialization_bytes: 256 * 1024 * 1024, // 256 MiB
@@ -67,7 +74,17 @@ impl ResourcePolicy {
             max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
             max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MiB
             row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MiB per chunk
+            derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
+        }
+    }
+
+    /// Strict mode that rejects every dense fallback. Use when you intend to
+    /// run only on operator-backed bases (biobank-scale Duchon/TPS, exact
+    /// GAMLSS marginal slope, CTN, etc.).
+    pub fn analytic_operator_required() -> Self {
+        Self {
             derivative_storage_mode: DerivativeStorageMode::AnalyticOperatorRequired,
+            ..Self::default_library()
         }
     }
 
