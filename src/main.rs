@@ -7978,18 +7978,6 @@ fn fixed_hazard_multiplier_from_saved_family(
     }
 }
 
-fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
-    let total: usize = parts.iter().map(|part| part.len()).sum();
-    let mut out = Array1::<f64>::zeros(total);
-    let mut offset = 0usize;
-    for part in parts {
-        let width = part.len();
-        out.slice_mut(s![offset..offset + width]).assign(part);
-        offset += width;
-    }
-    out
-}
-
 fn build_saved_survival_marginal_slope_predictor(
     model: &SavedModel,
     fit_saved: &UnifiedFitResult,
@@ -8011,197 +7999,24 @@ fn build_saved_survival_marginal_slope_predictor(
     ),
     String,
 > {
-    let saved_runtime = model.saved_prediction_runtime()?;
-    if saved_runtime.link_wiggle.is_some() {
-        return Err(
-            "saved survival marginal-slope model contains legacy linkwiggle metadata; refit with the anchored link-deviation runtime"
-                .to_string(),
-        );
-    }
-
-    let saved_score_runtime = saved_runtime.score_warp;
-    let saved_link_runtime = saved_runtime.link_deviation;
-    let blocks = &fit_saved.blocks;
-    let expected_blocks =
-        3 + usize::from(saved_score_runtime.is_some()) + usize::from(saved_link_runtime.is_some());
-    if blocks.len() != expected_blocks {
-        return Err(format!(
-            "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
-            expected_blocks,
-            if saved_score_runtime.is_some() {
-                ", score-warp"
-            } else {
-                ""
-            },
-            if saved_link_runtime.is_some() {
-                ", link-deviation"
-            } else {
-                ""
-            },
-            blocks.len(),
-        ));
-    }
-
-    let beta_time = &blocks[0].beta;
-    let beta_marginal = &blocks[1].beta;
-    let beta_logslope = &blocks[2].beta;
-    if let Some(runtime) = saved_score_runtime.as_ref() {
-        let beta = &blocks[3].beta;
-        if beta.len() != runtime.basis_dim {
-            return Err(format!(
-                "saved survival marginal-slope score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ));
-        }
-    }
-    if let Some(runtime) = saved_link_runtime.as_ref() {
-        let idx = 3 + usize::from(saved_score_runtime.is_some());
-        let beta = &blocks[idx].beta;
-        if beta.len() != runtime.basis_dim {
-            return Err(format!(
-                "saved survival marginal-slope link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ));
-        }
-    }
-
-    if beta_marginal.len() != cov_design.ncols() {
-        return Err(format!(
-            "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
-            beta_marginal.len(),
-            cov_design.ncols()
-        ));
-    }
-    if beta_logslope.len() != logslope_design.ncols() {
-        return Err(format!(
-            "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
-            beta_logslope.len(),
-            logslope_design.ncols()
-        ));
-    }
-
-    let p_time_base = time_build.x_exit_time.ncols();
-    let saved_timewiggle = saved_runtime.baseline_time_wiggle;
-    let p_timewiggle = saved_timewiggle
-        .as_ref()
-        .map_or(0, |runtime| runtime.beta.len());
-    if beta_time.len() != p_time_base + p_timewiggle {
-        return Err(format!(
-            "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
-            beta_time.len(),
-            p_time_base,
-            p_timewiggle
-        ));
-    }
-
-    let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
-    let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
-        + cov_design.dot(beta_marginal)
-        + eta_offset_entry
-        + primary_offset;
-    let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
-        + cov_design.dot(beta_marginal)
-        + eta_offset_exit
-        + primary_offset;
-    let qd_exit_base = time_build.x_derivative_time.dot(&beta_time_base) + derivative_offset_exit;
-
-    let mut q_design_parts = vec![time_build.x_exit_time.clone()];
-    if saved_timewiggle.is_some() {
-        let (_, exit_w, _) = saved_baseline_timewiggle_components(
-            &q_entry_base,
-            &q_exit_base,
-            &qd_exit_base,
-            model,
-        )?
-        .ok_or_else(|| {
-            "saved survival marginal-slope model is missing baseline-timewiggle runtime metadata"
-                .to_string()
-        })?;
-        if exit_w.ncols() != p_timewiggle {
-            return Err(format!(
-                "saved survival marginal-slope timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
-                exit_w.ncols(),
-                p_timewiggle
-            ));
-        }
-        q_design_parts.push(DesignMatrix::from(exit_w));
-    }
-    q_design_parts.push(cov_design.clone());
-    let q_design = DesignMatrix::hstack(q_design_parts)?;
-
-    let combined_q_beta = concat_array1_refs(&[beta_time, beta_marginal]);
-    let combined_q_lambdas = concat_array1_refs(&[&blocks[0].lambdas, &blocks[1].lambdas]);
-    let mut predictor_blocks = Vec::with_capacity(
-        2 + usize::from(saved_score_runtime.is_some()) + usize::from(saved_link_runtime.is_some()),
-    );
-    predictor_blocks.push(gam::estimate::FittedBlock {
-        beta: combined_q_beta.clone(),
-        role: BlockRole::Mean,
-        edf: blocks[0].edf + blocks[1].edf,
-        lambdas: combined_q_lambdas,
-    });
-    predictor_blocks.push(gam::estimate::FittedBlock {
-        beta: beta_logslope.clone(),
-        role: BlockRole::Scale,
-        edf: blocks[2].edf,
-        lambdas: blocks[2].lambdas.clone(),
-    });
-    if saved_score_runtime.is_some() {
-        let mut block = blocks[3].clone();
-        block.role = BlockRole::Mean;
-        predictor_blocks.push(block);
-    }
-    if saved_link_runtime.is_some() {
-        let idx = 3 + usize::from(saved_score_runtime.is_some());
-        let mut block = blocks[idx].clone();
-        block.role = BlockRole::LinkWiggle;
-        predictor_blocks.push(block);
-    }
-
-    let mut predictor_fit = fit_saved.clone();
-    predictor_fit.blocks = predictor_blocks;
-    predictor_fit.beta = concat_array1_refs(
-        &predictor_fit
-            .blocks
-            .iter()
-            .map(|block| &block.beta)
-            .collect::<Vec<_>>(),
-    );
-    predictor_fit.block_states.clear();
-
-    let predictor = gam::predict::BernoulliMarginalSlopePredictor::from_unified(
-        &predictor_fit,
-        z_name.to_string(),
-        model.latent_z_normalization.ok_or_else(|| {
-            "saved survival marginal-slope model missing latent_z_normalization".to_string()
-        })?,
-        0.0,
-        model.logslope_baseline.ok_or_else(|| {
-            "saved survival marginal-slope model missing logslope_baseline".to_string()
-        })?,
-        model
-            .resolved_inverse_link()?
-            .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
-        model
-            .family_state
-            .frailty()
-            .cloned()
-            .unwrap_or(gam::families::lognormal_kernel::FrailtySpec::None),
-        saved_score_runtime,
-        saved_link_runtime,
-    )?;
-
-    let pred_input = PredictInput {
-        design: q_design,
-        offset: eta_offset_exit + primary_offset,
-        design_noise: Some(logslope_design.clone()),
-        offset_noise: Some(noise_offset.clone()),
-        auxiliary_scalar: Some(z.clone()),
-    };
-
-    Ok((predictor, pred_input, predictor_fit))
+    // Delegate to the library-side helper so the CLI's `gam predict` and the
+    // library's `predict_survival` share bit-identical predictor / pred_input
+    // assembly (link-deviation + score-warp blocks plumbed through the same
+    // code path).
+    gam::survival_predict::build_saved_survival_marginal_slope_predictor(
+        model,
+        fit_saved,
+        z_name,
+        z,
+        cov_design,
+        logslope_design,
+        time_build,
+        eta_offset_entry,
+        eta_offset_exit,
+        derivative_offset_exit,
+        primary_offset,
+        noise_offset,
+    )
 }
 
 fn build_bernoulli_marginal_slope_saved_model(
