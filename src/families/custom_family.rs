@@ -1,5 +1,4 @@
 use crate::faer_ndarray::FaerEigh;
-use crate::faer_ndarray::FaerSvd;
 use crate::faer_ndarray::{FaerCholesky, fast_atb};
 use crate::linalg::utils::{StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd};
 use crate::matrix::{
@@ -5386,10 +5385,28 @@ fn inverse_spdwith_retry(
     baseridge: f64,
     max_retry: usize,
 ) -> Result<Array2<f64>, String> {
-    let solver = StableSolver::new("custom-family inverse spd");
-    solver
-        .inversewithridge_retries(matrix, baseridge, max_retry)
-        .ok_or_else(|| "failed to invert SPD system after ridge retries".to_string())
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    for attempt in 0..=max_retry {
+        let ridge = if attempt == 0 {
+            0.0
+        } else {
+            baseridge * 10.0_f64.powi((attempt - 1) as i32)
+        };
+        let mut candidate = sym.clone();
+        if ridge > 0.0 {
+            for i in 0..candidate.nrows() {
+                candidate[[i, i]] += ridge;
+            }
+        }
+        if let Ok(chol) = candidate.cholesky(Side::Lower) {
+            let mut ident = Array2::<f64>::eye(candidate.nrows());
+            chol.solve_mat_in_place(&mut ident);
+            symmetrize_dense_in_place(&mut ident);
+            return Ok(ident);
+        }
+    }
+    Err("failed to invert SPD system after Cholesky ridge retries".to_string())
 }
 
 pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
@@ -6050,29 +6067,28 @@ fn strict_logdet_spd_with_semidefinite_option(
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
-    // SVD-based pseudoinverse: unconditionally convergent, unlike eigh which
-    // can fail on pathological matrices from degenerate GAMLSS Hessians.
-    let (u_opt, singular, vt_opt) = matrix
-        .svd(true, true)
-        .map_err(|e| format!("SVD failed in positive-part pseudoinverse: {e}"))?;
-    let u = u_opt.ok_or("SVD did not produce left singular vectors")?;
-    let vt = vt_opt.ok_or("SVD did not produce right singular vectors")?;
-    let max_sv = singular.iter().fold(0.0_f64, |a, &b| a.max(b));
-    let tol = (max_sv * 1e-12).max(ridge_floor.max(1e-14));
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let (eigenvalues, eigenvectors) = sym
+        .eigh(Side::Lower)
+        .map_err(|e| format!("positive-part covariance eigendecomposition failed: {e}"))?;
+    let max_abs_eigenvalue = eigenvalues.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let tol = (max_abs_eigenvalue * 1e-12).max(ridge_floor.max(1e-14));
     let p = matrix.nrows();
     let mut pinv = Array2::<f64>::zeros((p, p));
-    for k in 0..p.min(singular.len()) {
-        let sv = singular[k];
-        if sv > tol {
-            let inv_sv = 1.0 / sv;
-            for i in 0..p {
-                let vik = vt[(k, i)]; // V^T row k = V column k
-                for j in 0..p {
-                    pinv[[i, j]] += inv_sv * vik * u[(j, k)];
-                }
+    for (k, &ev) in eigenvalues.iter().enumerate() {
+        if ev <= tol {
+            continue;
+        }
+        let inv_ev = 1.0 / ev;
+        for i in 0..p {
+            let vi = eigenvectors[[i, k]];
+            for j in 0..p {
+                pinv[[i, j]] += inv_ev * vi * eigenvectors[[j, k]];
             }
         }
     }
+    symmetrize_dense_in_place(&mut pinv);
     Ok(pinv)
 }
 
@@ -6540,7 +6556,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Fires at the top of each inner joint-Newton cycle so CI logs can
             // distinguish "inner spin" (thousands of these) from "outer-assembly
             // spin" (zero of these).
-            log::info!(
+            log::debug!(
                 "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
                 cycle,
                 inner_max_cycles,
@@ -6777,10 +6793,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut delta = &candidate_beta - &beta_joint;
 
             // Trust region: cap step size
-            let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            let mut step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
             const MAX_JOINT_STEP: f64 = 20.0;
             if step_inf > MAX_JOINT_STEP {
                 delta.mapv_inplace(|v| v * (MAX_JOINT_STEP / step_inf));
+                step_inf = MAX_JOINT_STEP;
             }
 
             // A small Newton proposal is not enough for exact outer calculus:
@@ -6789,6 +6806,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // KKT residual is still above tolerance.
             // Line search: try full step, then halve
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
+            let old_objective = lastobjective;
             let mut accepted = false;
             let mut barrier_ceiling = 1.0_f64;
             for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
@@ -6866,6 +6884,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             current_penalty =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
             lastobjective = -current_log_likelihood + current_penalty;
+            let objective_change = (lastobjective - old_objective).abs();
+            let accepted_step_inf = states
+                .iter()
+                .zip(old_beta.iter())
+                .flat_map(|(state, old)| {
+                    state
+                        .beta
+                        .iter()
+                        .zip(old.iter())
+                        .map(|(new, old)| (new - old).abs())
+                })
+                .fold(0.0_f64, f64::max);
             cycles_done = cycle + 1;
 
             // Check convergence via joint stationarity
@@ -6883,6 +6913,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             if residual <= inner_tol && step_inf <= inner_tol {
                 converged = true;
+                break;
+            }
+            let objective_tol = inner_tol * (1.0 + lastobjective.abs());
+            if accepted_step_inf <= inner_tol && objective_change <= objective_tol {
+                if residual <= inner_tol {
+                    converged = true;
+                }
                 break;
             }
         }
@@ -6920,7 +6957,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Fires at the top of each blockwise coordinate cycle so we can count
         // iterations from CI logs when a benchmark hangs inside the first
         // outer-eval.
-        log::info!(
+        log::debug!(
             "[PIRLS/blockwise coord] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
             cycle,
             inner_max_cycles,
@@ -6928,7 +6965,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             current_penalty,
             lastobjective,
         );
-        let mut max_beta_step = 0.0_f64;
+        let mut max_proposed_beta_step = 0.0_f64;
+        let mut max_accepted_beta_step = 0.0_f64;
 
         let mut objective_cycle_prev = lastobjective;
         // Reuse cached evaluation from end of previous cycle (or initial eval).
@@ -7009,7 +7047,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let old_block_penalty =
                 block_quadratic_penalty(&beta_old, s_lambda, ridge, options.ridge_policy);
             let step = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
-            max_beta_step = max_beta_step.max(step);
+            max_proposed_beta_step = max_proposed_beta_step.max(step);
             if step <= inner_tol {
                 continue;
             }
@@ -7149,6 +7187,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);
             } else {
+                let accepted_step = states[b]
+                    .beta
+                    .iter()
+                    .zip(beta_old.iter())
+                    .map(|(new, old)| (new - old).abs())
+                    .fold(0.0_f64, f64::max);
+                max_accepted_beta_step = max_accepted_beta_step.max(accepted_step);
                 any_block_modified = true;
             }
             // Recycle the checkpoint's buffer back into the pre-allocated pool.
@@ -7190,11 +7235,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             true
         };
-        if max_beta_step <= inner_tol
-            && objective_change <= objective_tol
-            && exact_joint_stationarity_ok
-        {
-            converged = true;
+        if max_accepted_beta_step <= inner_tol && objective_change <= objective_tol {
+            if exact_joint_stationarity_ok || max_proposed_beta_step <= inner_tol {
+                converged = true;
+            }
             break;
         }
     }

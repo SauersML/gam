@@ -1048,7 +1048,7 @@ impl<'a> RemlState<'a> {
             let grad = result
                 .gradient
                 .unwrap_or_else(|| Array1::zeros(theta.len()));
-            log::info!(
+            log::debug!(
                 "[outer-timing] compute_joint_hyper_eval (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 hyper_dirs.len(),
@@ -1067,7 +1067,7 @@ impl<'a> RemlState<'a> {
         } else {
             let cost = self.compute_cost(&rho)?;
             let grad = self.compute_gradient(&rho)?;
-            log::info!(
+            log::debug!(
                 "[outer-timing] compute_joint_hyper_eval (rho-only, dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 t_outer_start.elapsed().as_secs_f64(),
@@ -1169,7 +1169,7 @@ impl<'a> RemlState<'a> {
             };
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         };
-        log::info!(
+        log::debug!(
             "[outer-timing] build_tau_unified_objects_from_bundle ({}, n={}, p={}, psi_dim={}): {:.1}ms",
             backend_label,
             n_x,
