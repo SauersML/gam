@@ -12579,6 +12579,7 @@ mod tests {
             x_link_wiggle: None,
             wiggle_knots: None,
             wiggle_degree: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         // Build initial states with beta=0 and a feasible positive derivative offset.
@@ -12727,6 +12728,7 @@ mod tests {
             x_link_wiggle: None,
             wiggle_knots: None,
             wiggle_degree: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         };
 
         let mut eta_time = Array1::<f64>::zeros(3 * n);
