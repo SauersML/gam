@@ -2453,13 +2453,9 @@ fn run_outer_with_plan(
 
     let mut best: Option<OuterResult> = None;
     // Accumulate every per-seed rejection with its 0-based seed index and the
-    // phase that rejected it (validation vs solver run). Previously only the
-    // LAST reason was retained via `Option<String>`; the final error then
-    // reported one message, masking earlier seeds' distinct failure modes.
-    // When all seeds fail systematically (bad analytic gradient, rank-deficient
-    // penalty, etc.) the first rejection's rho + error is often the most
-    // diagnostic — losing it forced users to re-run with RUST_LOG=warn and
-    // scrape stderr, which is not available from CI-captured error messages.
+    // phase that rejected it (validation vs solver run). When all seeds fail
+    // systematically (bad analytic gradient, rank-deficient penalty, etc.) the
+    // first rejection's rho + error is often the most diagnostic.
     let mut rejection_reasons: Vec<(usize, &'static str, String)> = Vec::new();
     let layout = cap.theta_layout();
     let mut started_seeds = 0usize;

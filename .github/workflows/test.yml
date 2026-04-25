@@ -17,7 +17,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  GAM_SKIP_LINT_CHECKS: "1"
 
 jobs:
   fmt:

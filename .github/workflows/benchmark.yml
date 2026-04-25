@@ -21,7 +21,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  GAM_SKIP_LINT_CHECKS: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_PYTHON_VERSION_WARNING: "1"
   R_LIBS_USER: ${{ github.workspace }}/.r-lib

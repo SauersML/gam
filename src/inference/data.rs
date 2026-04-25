@@ -158,7 +158,6 @@ fn load_delimited_inferred(
     delimiter: u8,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
-    let verbose = crate::solver::visualizer::data_info_enabled();
     let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
@@ -179,7 +178,7 @@ fn load_delimited_inferred(
     let headers = projected_headers(&all_headers, &selected_indices);
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
-    if verbose || open_ms > 100.0 {
+    if open_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] delim_open+headers | n_headers={} | n_proj={} | {:.1}ms",
             all_headers.len(),
@@ -282,7 +281,7 @@ fn load_delimited_inferred(
     }
 
     let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
-    if verbose || stream_ms > 100.0 {
+    if stream_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] delim_stream+infer | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
@@ -343,7 +342,7 @@ fn load_delimited_inferred(
         }
     }
     let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
-    if verbose || schema_ms > 100.0 {
+    if schema_ms > 100.0 {
         let n_cat = column_kinds
             .iter()
             .filter(|k| matches!(k, ColumnKindTag::Categorical))
@@ -372,7 +371,7 @@ fn load_delimited_inferred(
         }
     }
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
-    if verbose || assemble_ms > 100.0 {
+    if assemble_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] delim_assemble_array2 | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
@@ -399,7 +398,6 @@ fn load_delimited_with_schema(
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
-    let verbose = crate::solver::visualizer::data_info_enabled();
     let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
@@ -420,7 +418,7 @@ fn load_delimited_with_schema(
     let headers = projected_headers(&all_headers, &selected_indices);
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
-    if verbose || open_ms > 100.0 {
+    if open_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] delim_schema_open+headers | n_headers={} | n_proj={} | {:.1}ms",
             all_headers.len(),
@@ -548,7 +546,7 @@ fn load_delimited_with_schema(
     }
 
     let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
-    if verbose || stream_ms > 100.0 {
+    if stream_ms > 100.0 {
         let n_inf = needs_inference.iter().filter(|x| **x).count();
         log::info!(
             "[DATA-LOAD] delim_schema_stream | n_rows={} | n_cols={} | n_inf={} | {:.1}ms",
@@ -591,7 +589,7 @@ fn load_delimited_with_schema(
         column_kinds.push(col_meta[j].kind);
     }
     let finalize_ms = t_finalize.elapsed().as_secs_f64() * 1000.0;
-    if verbose || finalize_ms > 100.0 {
+    if finalize_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] delim_schema_finalize | n_cols={} | {:.1}ms",
             p,
@@ -615,7 +613,7 @@ fn load_delimited_with_schema(
         }
     }
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
-    if verbose || assemble_ms > 100.0 {
+    if assemble_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] delim_schema_assemble | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
@@ -715,7 +713,6 @@ fn load_parquet_inferred(
     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
     use std::fs::File;
 
-    let verbose = crate::solver::visualizer::data_info_enabled();
     let t_open = std::time::Instant::now();
     let file = File::open(path)
         .map_err(|e| format!("failed to open parquet '{}': {e}", path.display()))?;
@@ -742,7 +739,7 @@ fn load_parquet_inferred(
         .map_err(|e| format!("failed to build parquet reader: {e}"))?;
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
-    if verbose || open_ms > 100.0 {
+    if open_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] parquet_open+meta | n_headers={} | n_proj={} | {:.1}ms",
             all_headers.len(),
@@ -905,7 +902,7 @@ fn load_parquet_inferred(
 
     let total_rows = col_vecs[0].len();
     let batches_ms = t_batches.elapsed().as_secs_f64() * 1000.0;
-    if verbose || batches_ms > 100.0 {
+    if batches_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] parquet_batches_decode | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
@@ -963,7 +960,7 @@ fn load_parquet_inferred(
         }
     }
     let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
-    if verbose || schema_ms > 100.0 {
+    if schema_ms > 100.0 {
         let n_cat = column_kinds
             .iter()
             .filter(|k| matches!(k, ColumnKindTag::Categorical))
@@ -985,7 +982,7 @@ fn load_parquet_inferred(
         }
     }
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
-    if verbose || assemble_ms > 100.0 {
+    if assemble_ms > 100.0 {
         log::info!(
             "[DATA-LOAD] parquet_assemble_array2 | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
