@@ -17463,7 +17463,18 @@ mod tests {
             stiffness_penalty_global_idx: 2,
             d0: array![[5e-10, 0.0], [6e-10, 0.0]],
             d1: array![[1e-10, 0.0], [0.0, 1e-10], [2e-10, 0.0], [0.0, 2e-10]],
-            d2: array![[3e-10, 0.0], [4e-10, 0.0]],
+            // d2 layout: rows = (point k, axis a, axis b) with row = (k*d + a)*d + b.
+            // For P=2 points and d=2 axes that is 2*2*2 = 8 rows.
+            d2: array![
+                [3e-10, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [3e-10, 0.0],
+                [4e-10, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [4e-10, 0.0],
+            ],
             collocation_points: array![[0.0, 0.0], [1.0, 1.0]],
             dimension: 2,
         };
@@ -17596,7 +17607,9 @@ mod tests {
             stiffness_penalty_global_idx: 2,
             d0: array![[0.0, 0.0]],
             d1: array![[0.0, 0.0], [0.0, 0.0]],
-            d2: array![[0.0, 0.0]],
+            // d2 layout: P=1 collocation point and d=2 axes give 1*2*2 = 4 rows
+            // ordered (axis_a, axis_b) = (0,0), (0,1), (1,0), (1,1).
+            d2: array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
             collocation_points: array![[0.0, 0.0]],
             dimension: 2,
         };
@@ -17626,7 +17639,19 @@ mod tests {
             stiffness_penalty_global_idx: 2,
             d0: array![[1.0, 0.0], [2.0, 0.0]],
             d1: array![[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]],
-            d2: array![[1.0, 0.0], [2.0, 0.0]],
+            // d2 layout: rows = (point k, axis a, axis b) with row = (k*d + a)*d + b.
+            // P=2 and d=2 gives 8 rows; row 0 (point 0, a=b=0) and row 4 (point 1, a=b=0)
+            // carry the original diagonal-curvature signals.
+            d2: array![
+                [1.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [2.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
             collocation_points: array![[0.0, 0.0], [1.0, 1.0]],
             dimension: 2,
         };
@@ -17663,7 +17688,10 @@ mod tests {
             stiffness_penalty_global_idx: 2,
             d0: array![[1.0, 0.0]],
             d1: array![[1.0, 0.0], [0.0, 1.0]],
-            d2: array![[1.0, 0.0]],
+            // d2 layout: P=1 collocation point and d=2 axes give 4 rows ordered
+            // (axis_a, axis_b) = (0,0), (0,1), (1,0), (1,1). Row 0 carries the
+            // diagonal curvature signal so monotonicity in beta is preserved.
+            d2: array![[1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
             collocation_points: array![[0.0, 0.0]],
             dimension: 2,
         };

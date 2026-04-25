@@ -83,7 +83,7 @@ def fit(
     z_column: str | None = None,
     link: str | None = None,
     logslope_formula: str | None = None,
-    scale_dimensions: str | None = None,
+    scale_dimensions: bool | None = None,
     disable_link_dev: bool | None = None,
     disable_score_warp: bool | None = None,
     firth: bool | None = None,
@@ -136,8 +136,9 @@ def fit(
         Secondary formula for the logslope / score-warp submodel. Corresponds to
         ``--logslope-formula``.
     scale_dimensions:
-        Per-axis anisotropic length-scale selector. Either ``"auto"`` or a
-        comma-separated list. Corresponds to ``--scale-dimensions``.
+        When ``True``, enables learned per-axis anisotropic length scales on
+        spatial smooths (e.g. multi-dim Duchon / Matern / TPS). Per-axis
+        scales are learned, not specified. Corresponds to ``--scale-dimensions``.
     disable_link_dev:
         Disable the link-deviation correction. Corresponds to
         ``--disable-link-dev``.
@@ -217,7 +218,7 @@ def validate_formula(
     z_column: str | None = None,
     link: str | None = None,
     logslope_formula: str | None = None,
-    scale_dimensions: str | None = None,
+    scale_dimensions: bool | None = None,
     disable_link_dev: bool | None = None,
     disable_score_warp: bool | None = None,
     firth: bool | None = None,
