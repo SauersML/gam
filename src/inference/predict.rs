@@ -1876,9 +1876,10 @@ impl BernoulliMarginalSlopePredictor {
             a_q[i] = marginal_map[i].mu1 / m_a;
         }
 
-        let score_dev_obs = if let (Some(runtime), Some(beta)) =
-            (self.score_warp_runtime.as_ref(), self.beta_score_warp.as_ref())
-        {
+        let score_dev_obs = if let (Some(runtime), Some(beta)) = (
+            self.score_warp_runtime.as_ref(),
+            self.beta_score_warp.as_ref(),
+        ) {
             runtime
                 .design(&z)
                 .map_err(EstimationError::InvalidInput)?
