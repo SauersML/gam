@@ -5921,13 +5921,14 @@ fn computeworkingweight_derivatives_from_eta(
 // inverse-link jet (h₁…h₄) and the variance-function jet (V…V₃), it returns
 // (w_obs, c_obs, d_obs) without any family- or link-specific dispatch.
 
-/// Variance-function jet evaluated at μ: V(μ), V'(μ), V''(μ), V'''(μ).
+/// Variance-function jet evaluated at μ: V(μ), V'(μ), V''(μ), V'''(μ), V''''(μ).
 #[derive(Clone, Copy, Debug)]
 pub struct VarianceJet {
     pub v: f64,
     pub v1: f64,
     pub v2: f64,
     pub v3: f64,
+    pub v4: f64,
 }
 
 impl VarianceJet {
@@ -5939,6 +5940,7 @@ impl VarianceJet {
             v1: 1.0 - 2.0 * mu,
             v2: -2.0,
             v3: 0.0,
+            v4: 0.0,
         }
     }
 
@@ -5950,6 +5952,7 @@ impl VarianceJet {
             v1: 1.0,
             v2: 0.0,
             v3: 0.0,
+            v4: 0.0,
         }
     }
 
@@ -5961,6 +5964,7 @@ impl VarianceJet {
             v1: 2.0 * mu,
             v2: 2.0,
             v3: 0.0,
+            v4: 0.0,
         }
     }
 
@@ -5972,6 +5976,7 @@ impl VarianceJet {
             v1: 0.0,
             v2: 0.0,
             v3: 0.0,
+            v4: 0.0,
         }
     }
 
@@ -6209,7 +6214,13 @@ pub fn observed_weight_noncanonical(
     phi: f64,
     pw: f64,
 ) -> (f64, f64, f64) {
-    let VarianceJet { v, v1, v2, v3 } = vj;
+    let VarianceJet {
+        v,
+        v1,
+        v2,
+        v3,
+        v4: _,
+    } = vj;
     let phi_v = phi * v;
     let phi_v2 = phi * v * v;
     let phi_v3 = phi * v * v * v;
@@ -6280,6 +6291,91 @@ pub fn observed_weight_noncanonical(
     let d_obs = d_f + h2 * b + 2.0 * h1 * b_eta - resid * b_etaeta;
 
     (pw * w_obs, pw * c_obs, pw * d_obs)
+}
+
+/// Per-observation third η-derivative of the observed-information weight,
+/// `e_obs := ∂³W_obs/∂η³`, for a general exponential-dispersion family with
+/// any (canonical or non-canonical) link.
+///
+/// Closed-form derivation:
+///   Define `T(η) := h₁(η)/(φ V(μ(η)))`. Then
+///   * Fisher weight `W_F = h₁ · T`
+///   * Observed correction `B = T'`, so `B_η = T''`, `B_ηη = T'''`,
+///     `B_ηηη = T''''`
+///   * `W_obs = W_F − (y−μ) · T'`
+///
+/// Differentiating three times:
+///   `∂³W_obs/∂η³ = W_F''' + h₃·T' + 3 h₂·T'' + 3 h₁·T''' − (y−μ)·T''''`
+///
+/// `T` is computed via Leibniz on `T·Q = h₁` with `Q = φV`; `W_F` via
+/// Leibniz on `W_F·1 = h₁·T` (product rule).
+///
+/// All inverse-link derivatives `h₁..h₅` and variance-function derivatives
+/// `V..V₄` are required as inputs. Caller supplies them.
+///
+/// Returns `pw * e_obs` (pre-multiplied by the prior weight) so the result
+/// scales identically to `(w_obs, c_obs, d_obs)` from
+/// `observed_weight_noncanonical`.
+#[inline]
+pub fn e_obs_from_jets(
+    y: f64,
+    mu: f64,
+    h1: f64,
+    h2: f64,
+    h3: f64,
+    h4: f64,
+    h5: f64,
+    vj: VarianceJet,
+    phi: f64,
+    pw: f64,
+) -> f64 {
+    let VarianceJet { v, v1, v2, v3, v4 } = vj;
+    let q = phi * v;
+
+    // Q = φV and its η-derivatives.
+    //   Q'    = φ V₁ h₁
+    //   Q''   = φ (V₁ h₂ + V₂ h₁²)
+    //   Q'''  = φ (V₁ h₃ + 3 V₂ h₁ h₂ + V₃ h₁³)
+    //   Q'''' = φ (V₁ h₄ + 4 V₂ h₁ h₃ + 3 V₂ h₂² + 6 V₃ h₁² h₂ + V₄ h₁⁴)
+    let h1_sq = h1 * h1;
+    let h1_cu = h1_sq * h1;
+    let h1_qu = h1_sq * h1_sq;
+
+    let q1 = phi * v1 * h1;
+    let q2 = phi * (v1 * h2 + v2 * h1_sq);
+    let q3 = phi * (v1 * h3 + 3.0 * v2 * h1 * h2 + v3 * h1_cu);
+    let q4 = phi
+        * (v1 * h4
+            + 4.0 * v2 * h1 * h3
+            + 3.0 * v2 * h2 * h2
+            + 6.0 * v3 * h1_sq * h2
+            + v4 * h1_qu);
+
+    // T = h₁/Q and T', T'', T''', T'''' via Leibniz on T·Q = h₁.
+    //   T'    = (h₂  − T·Q')/Q
+    //   T''   = (h₃  − 2 T'·Q' − T·Q'')/Q
+    //   T'''  = (h₄  − 3 T''·Q' − 3 T'·Q'' − T·Q''')/Q
+    //   T'''' = (h₅  − 4 T'''·Q' − 6 T''·Q'' − 4 T'·Q''' − T·Q'''')/Q
+    let t0 = h1 / q;
+    let t1 = (h2 - t0 * q1) / q;
+    let t2 = (h3 - 2.0 * t1 * q1 - t0 * q2) / q;
+    let t3 = (h4 - 3.0 * t2 * q1 - 3.0 * t1 * q2 - t0 * q3) / q;
+    let t4 = (h5 - 4.0 * t3 * q1 - 6.0 * t2 * q2 - 4.0 * t1 * q3 - t0 * q4) / q;
+
+    // Fisher weight derivatives via product rule on W_F = h₁·T.
+    //   W_F^(0) = h₁ T
+    //   W_F^(1) = h₁ T₁ + h₂ T
+    //   W_F^(2) = h₁ T₂ + 2 h₂ T₁ + h₃ T
+    //   W_F^(3) = h₁ T₃ + 3 h₂ T₂ + 3 h₃ T₁ + h₄ T
+    let w_f3 = h1 * t3 + 3.0 * h2 * t2 + 3.0 * h3 * t1 + h4 * t0;
+
+    // Observed third derivative: differentiate W_obs = W_F − (y−μ)·T₁ thrice.
+    // (resid)' = −h₁, so iterating product rule yields
+    //   ∂³((y−μ)·T₁)/∂η³ = −h₃·T₁ − 3 h₂·T₂ − 3 h₁·T₃ + (y−μ)·T₄
+    let resid = y - mu;
+    let e_obs = w_f3 + h3 * t1 + 3.0 * h2 * t2 + 3.0 * h1 * t3 - resid * t4;
+
+    pw * e_obs
 }
 
 /// Vectorised wrapper: compute per-observation observed-information weights
