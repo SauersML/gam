@@ -1451,10 +1451,6 @@ impl FirthDenseOperator {
     /// (to realize the 9-term D² expansion) and therefore owns both
     /// `x_tau_{i,j}_reduced` and their η̇_i / η̇_j.
     ///
-    /// Non-test callers use `exact_tau_tau_kernel` which builds the kernel
-    /// inline (with the same field initializers).  Kept `pub(crate)` for
-    /// FD-test access and future out-of-band callers.
-    #[allow(dead_code)]
     pub(crate) fn hphi_tau_tau_partial_prepare_from_partials(
         &self,
         x_tau_i_reduced: Array2<f64>,
@@ -2009,8 +2005,6 @@ impl FirthDenseOperator {
         //   K̇_{r,α} = −K_r İ_{r,α} K_r,
         //   K̈_{r,ij} = −K_r Ï_{r,ij} K_r + K_r İ_{r,i} K_r İ_{r,j} K_r
         //                                 + K_r İ_{r,j} K_r İ_{r,i} K_r.
-        // (Same expression used by Primitive A; rebuilt here so we don't
-        //  depend on a pre-built FirthTauTauPartialKernel.)
         let dot_k_i = -k.dot(&dot_i_i).dot(k);
         let dot_k_j = -k.dot(&dot_i_j).dot(k);
         let a_i_red = -&dot_k_i; // K İ_i K
@@ -2066,20 +2060,18 @@ impl FirthDenseOperator {
         gphi_tau_tau = gphi_tau_tau + 0.5 * self.x_dense.t().dot(&v_dot_ij);
 
         let tau_tau_kernel = if include_hphi_tau_tau_kernel {
-            Some(FirthTauTauPartialKernel {
+            Some(self.hphi_tau_tau_partial_prepare_from_partials(
                 x_tau_i_reduced,
                 x_tau_j_reduced,
-                deta_i_partial: deta_i,
-                deta_j_partial: deta_j,
-                dot_h_i_partial: dot_h_i,
-                dot_h_j_partial: dot_h_j,
-                dot_k_i_reduced: dot_k_i,
-                dot_k_j_reduced: dot_k_j,
-                dot_i_i_partial: dot_i_i,
-                dot_i_j_partial: dot_i_j,
+                &deta_i,
+                &deta_j,
+                dot_h_i,
+                dot_h_j,
+                dot_i_i,
+                dot_i_j,
                 x_tau_tau_reduced,
-                deta_ij_partial: deta_ij,
-            })
+                deta_ij,
+            ))
         } else {
             None
         };
@@ -2097,7 +2089,6 @@ impl FirthDenseOperator {
     /// This mirrors the body of `apply_mtau_to_matrix` but accepts the
     /// x_tau/dot_k pieces directly, letting Primitive A reuse the same
     /// matrix-free Ṗ_τ applies without owning a `FirthTauPartialKernel`.
-    #[allow(dead_code)]
     fn apply_mtau_from_reduced(
         &self,
         x_tau_reduced: &Array2<f64>,
@@ -2138,7 +2129,6 @@ impl FirthDenseOperator {
     ///
     /// with S := row-wise reducedweighted Gram.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     fn apply_p_ddot_ij(
         &self,
         x_r: &Array2<f64>,
@@ -2301,7 +2291,6 @@ impl FirthDenseOperator {
     /// β-τ reduced quantities A_v, dh_v, D_β(İ_τ)[v], D_β(K̇_τ)[v],
     /// D_β(ḣ_τ)[v], and the w-chain derivatives needed by
     /// `d_beta_hphi_tau_partial_apply`.
-    #[allow(dead_code)]
     pub(crate) fn d_beta_hphi_tau_partial_prepare_from_partials(
         &self,
         tau_kernel: &FirthTauPartialKernel,
@@ -2388,7 +2377,6 @@ impl FirthDenseOperator {
     /// Hadamard-Gram pieces are evaluated column-wise via
     ///   ((Z M_A Wᵀ) ⊙ (Y M_B Xᵀ)) v row-i
     ///       = z_iᵀ M_A (Wᵀ diag(v) X) M_Bᵀ y_i.
-    #[allow(dead_code)]
     fn apply_p_tau_v_to_matrix(
         &self,
         kernel: &FirthTauBetaPartialKernel,
@@ -2441,7 +2429,6 @@ impl FirthDenseOperator {
         out
     }
 
-    #[allow(dead_code)]
     pub(crate) fn d_beta_hphi_tau_partial_apply(
         &self,
         x_tau: &Array2<f64>,

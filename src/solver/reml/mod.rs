@@ -3627,7 +3627,6 @@ pub(crate) struct FirthTauExactKernel {
 /// into Primitive A (`hphi_tau_tau_partial_apply`) for the operator-
 /// valued Hessian 2nd drift without recomputing shared reduced Grams.
 ///
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct FirthTauTauExactKernel {
     pub(super) phi_tau_tau_partial: f64,
