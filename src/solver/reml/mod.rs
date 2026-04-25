@@ -1279,12 +1279,13 @@ mod tests {
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
 
-        let full = state.evaluate_unified_with_psi_ext(
-            &rho,
-            crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
-            &hyper_dirs,
-        )
-        .expect("full Firth psi gradient should use analytic TK propagation");
+        let full = state
+            .evaluate_unified_with_psi_ext(
+                &rho,
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+                &hyper_dirs,
+            )
+            .expect("full Firth psi gradient should use analytic TK propagation");
         assert!(full.cost.is_finite(), "full cost={}", full.cost);
         let full_grad = full.gradient.expect("gradient should be present");
         assert!(

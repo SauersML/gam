@@ -423,15 +423,7 @@ impl<'a> RemlState<'a> {
                 Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[idx], &p_total)?;
             let eta_total = x_vks[idx].mapv(|value| -value);
             let direct = Self::tk_direct_gradient_from_cd_and_design(
-                x_dense,
-                z,
-                c_array,
-                d_array,
-                e_array,
-                &eta_total,
-                None,
-                shared,
-                gram,
+                x_dense, z, c_array, d_array, e_array, &eta_total, None, shared, gram,
             )?;
             gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
         }
@@ -457,7 +449,10 @@ impl<'a> RemlState<'a> {
             let firth_trace =
                 Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
             let mut eta_total = x_vks[x_vk_idx].clone();
-            if let Some(eta_fixed) = ext_eta_fixed.get(extra_idx).and_then(|value| value.as_ref()) {
+            if let Some(eta_fixed) = ext_eta_fixed
+                .get(extra_idx)
+                .and_then(|value| value.as_ref())
+            {
                 if eta_fixed.len() != n {
                     return Err(EstimationError::InvalidInput(format!(
                         "Tierney-Kadane ext fixed eta length mismatch: expected {}, got {}",
@@ -480,15 +475,7 @@ impl<'a> RemlState<'a> {
                 }
             }
             let direct = Self::tk_direct_gradient_from_cd_and_design(
-                x_dense,
-                z,
-                c_array,
-                d_array,
-                e_array,
-                &eta_total,
-                x_fixed,
-                shared,
-                gram,
+                x_dense, z, c_array, d_array, e_array, &eta_total, x_fixed, shared, gram,
             )?;
             gradient[x_vk_idx] = trace_ak_p + correction_trace + firth_trace + direct;
         }
@@ -635,13 +622,7 @@ impl<'a> RemlState<'a> {
                     let x_theta_j = x_theta.slice(s![j0..j1, ..]);
                     let z_i = z.slice(s![.., i0..i1]);
                     let mut reverse = Array2::<f64>::zeros((cols, rows));
-                    ndarray::linalg::general_mat_mul(
-                        1.0,
-                        &x_theta_j,
-                        &z_i,
-                        0.0,
-                        &mut reverse,
-                    );
+                    ndarray::linalg::general_mat_mul(1.0, &x_theta_j, &z_i, 0.0, &mut reverse);
                     Some((block, reverse))
                 } else {
                     None
@@ -1203,18 +1184,17 @@ impl<'a> RemlState<'a> {
         let mut e_array = Array1::<f64>::zeros(n);
 
         let link_function = self.config.link_function();
-        let inverse_link =
-            if let Some(state) = self.runtime_mixture_link_state.clone() {
-                InverseLink::Mixture(state)
-            } else if let Some(state) = self.runtime_sas_link_state {
-                if matches!(link_function, LinkFunction::BetaLogistic) {
-                    InverseLink::BetaLogistic(state)
-                } else {
-                    InverseLink::Sas(state)
-                }
+        let inverse_link = if let Some(state) = self.runtime_mixture_link_state.clone() {
+            InverseLink::Mixture(state)
+        } else if let Some(state) = self.runtime_sas_link_state {
+            if matches!(link_function, LinkFunction::BetaLogistic) {
+                InverseLink::BetaLogistic(state)
             } else {
-                InverseLink::Standard(link_function)
-            };
+                InverseLink::Sas(state)
+            }
+        } else {
+            InverseLink::Standard(link_function)
+        };
 
         // Saturation guard mirrors `eta_for_observed_hessian_jet` in pirls:
         // for non-Logit / non-Log links eta is clamped to ±30 to keep the
@@ -1311,9 +1291,7 @@ impl<'a> RemlState<'a> {
             }
             let pw = self.weights[i].max(0.0);
             let y_i = self.y[i];
-            let e_i = pirls::e_obs_from_jets(
-                y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw,
-            );
+            let e_i = pirls::e_obs_from_jets(y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw);
             e_array[i] = if e_i.is_finite() { e_i } else { 0.0 };
         }
 
@@ -4464,12 +4442,7 @@ mod tk_math_tests {
     ///   V_TK = −¹⁄₈ Σ d_i h_ii²
     ///          + ¹⁄₁₂ Σᵢⱼ c_i c_j K_ij³
     ///          + ¹⁄₈ q · y
-    fn tk_scalar_dual<D: DualNum<f64> + Copy>(
-        h: D,
-        x: &[D],
-        c: &[D],
-        d_arr: &[D],
-    ) -> D {
+    fn tk_scalar_dual<D: DualNum<f64> + Copy>(h: D, x: &[D], c: &[D], d_arr: &[D]) -> D {
         let n = x.len();
         let inv_h = D::one() / h;
         let mut h_diag = vec![D::from(0.0); n];
@@ -4554,15 +4527,18 @@ mod tk_math_tests {
             Ok(solve_vec(&h_mat, rhs))
         };
         let shared = RemlState::tk_shared_intermediates(
-            &x_mat, &z_mat, &c, "tk scalar dual baseline", &solve,
+            &x_mat,
+            &z_mat,
+            &c,
+            "tk scalar dual baseline",
+            &solve,
         )
         .expect("shared TK intermediates");
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        let v_tk_prod =
-            RemlState::tk_scalar_from_shared(&x_mat, &z_mat, &d, &shared, &mut gram)
-                .expect("TK scalar (production)");
-        let scalar_rel = (v_tk_value - v_tk_prod).abs()
-            / v_tk_value.abs().max(v_tk_prod.abs()).max(1.0e-14);
+        let v_tk_prod = RemlState::tk_scalar_from_shared(&x_mat, &z_mat, &d, &shared, &mut gram)
+            .expect("TK scalar (production)");
+        let scalar_rel =
+            (v_tk_value - v_tk_prod).abs() / v_tk_value.abs().max(v_tk_prod.abs()).max(1.0e-14);
         assert!(
             scalar_rel < 1.0e-12,
             "TK scalar mismatch (production vs closed-form): prod={v_tk_prod:.12e}, dual_re={v_tk_value:.12e}, rel={scalar_rel:.3e}"
@@ -4594,8 +4570,7 @@ mod tk_math_tests {
         .expect("analytic TK derivative");
         let analytic = gradient[0];
 
-        let rel = (analytic - dv_tk_ad).abs()
-            / analytic.abs().max(dv_tk_ad.abs()).max(1.0e-14);
+        let rel = (analytic - dv_tk_ad).abs() / analytic.abs().max(dv_tk_ad.abs()).max(1.0e-14);
         assert!(
             rel < 1.0e-12,
             "Tierney-Kadane analytic c/d propagation does not match Dual64 AD reference: analytic={analytic:.12e}, ad={dv_tk_ad:.12e}, rel={rel:.3e}"
