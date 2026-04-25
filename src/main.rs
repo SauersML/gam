@@ -4339,72 +4339,14 @@ fn saved_baseline_timewiggle_components(
     derivative_exit: &Array1<f64>,
     model: &SavedModel,
 ) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
-    match model.saved_baseline_time_wiggle()? {
-        None => Ok(None),
-        Some(runtime) => {
-            runtime.validate_global_monotonicity()?;
-            let SavedBaselineTimeWiggleRuntime {
-                knots,
-                degree,
-                beta,
-                ..
-            } = runtime;
-            let knots = Array1::from_vec(knots);
-            let entry = match buildwiggle_block_input_from_knots(
-                eta_entry.view(),
-                &knots,
-                degree,
-                2,
-                false,
-            )?
-            .design
-            {
-                DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-                _ => return Err("saved baseline-timewiggle entry design must be dense".to_string()),
-            };
-            let exit = match buildwiggle_block_input_from_knots(
-                eta_exit.view(),
-                &knots,
-                degree,
-                2,
-                false,
-            )?
-            .design
-            {
-                DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-                _ => return Err("saved baseline-timewiggle exit design must be dense".to_string()),
-            };
-            let betaw = beta;
-            if entry.ncols() != betaw.len() || exit.ncols() != betaw.len() {
-                return Err(format!(
-                    "saved baseline-timewiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
-                    betaw.len(),
-                    entry.ncols(),
-                    exit.ncols()
-                ));
-            }
-            let derivative = build_survival_timewiggle_derivative_design(
-                eta_exit,
-                derivative_exit,
-                &knots,
-                degree,
-            )
-            .map_err(|e| {
-                e.replace(
-                    "build baseline-timewiggle",
-                    "evaluate saved baseline-timewiggle",
-                )
-            })?;
-            if derivative.ncols() != betaw.len() {
-                return Err(format!(
-                    "saved baseline-timewiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
-                    betaw.len(),
-                    derivative.ncols()
-                ));
-            }
-            Ok(Some((entry, exit, derivative)))
-        }
-    }
+    // Delegate to the library-side helper (single source of truth for the
+    // timewiggle-design rebuild).
+    gam::survival_predict::saved_baseline_timewiggle_components(
+        eta_entry,
+        eta_exit,
+        derivative_exit,
+        model,
+    )
 }
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
