@@ -30,7 +30,7 @@ use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
     structural_time_coefficient_constraints,
 };
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DenseDesignOperator, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
@@ -1706,6 +1706,7 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+        Ok(())
     }
 
     /// Add outer product of two psi block-local rows (possibly in different blocks).
@@ -1890,7 +1891,7 @@ impl BlockHessianAccumulator {
         qg: &SurvivalMarginalSlopeDynamicRow,
         fg: &Array1<f64>,
         ph: &Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         let jt = [&qg.dq0_time, &qg.dq1_time, &qg.dqd1_time];
         let jm = [&qg.dq0_marginal, &qg.dq1_marginal, &qg.dqd1_marginal];
         let ktt = [&qg.d2q0_time_time, &qg.d2q1_time_time, &qg.d2qd1_time_time];
@@ -1937,7 +1938,7 @@ impl BlockHessianAccumulator {
         family
             .logslope_design
             .syr_row_into(row, ph[[3, 3]], &mut self.h_gg)
-            .expect("gg syr");
+            .map_err(|e| format!("add_pullback_with_q_geometry gg syr: {e}"))?;
         for a in 0..pt {
             for b in 0..pm {
                 let mut v = 0.0;
@@ -1952,7 +1953,10 @@ impl BlockHessianAccumulator {
                 self.h_tm[[a, b]] += v;
             }
         }
-        let gc = family.logslope_design.row_chunk(row..row + 1);
+        let gc = family
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("add_pullback_with_q_geometry logslope try_row_chunk: {e}"))?;
         let gr = gc.row(0);
         for a in 0..pt {
             let mut w = 0.0;

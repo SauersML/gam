@@ -1689,6 +1689,7 @@ fn fit_binomial_mean_wiggle(
         link_kind: spec.link_kind,
         wiggle_knots: spec.wiggle_knots,
         wiggle_degree: spec.wiggle_degree,
+        policy: crate::resource::ResourcePolicy::default_library(),
     };
     let blocks = vec![
         spec.eta_block.intospec("eta")?,
@@ -3112,6 +3113,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         link_kind: link_kind_cloned.clone(),
         wiggle_knots: wiggle_knots_cloned.clone(),
         wiggle_degree,
+        policy: crate::resource::ResourcePolicy::default_library(),
     };
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();
@@ -8435,6 +8437,11 @@ pub struct BinomialMeanWiggleFamily {
     pub link_kind: InverseLink,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
+    /// Resource policy threaded into PsiDesignMap construction during
+    /// exact-Newton joint psi evaluation. Defaults to
+    /// `ResourcePolicy::default_library()` when the family is built without
+    /// an explicit policy.
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 struct BinomialMeanWiggleGeometry {
@@ -8678,12 +8685,15 @@ impl BinomialMeanWiggleFamily {
                     if block_idx != Self::BLOCK_ETA {
                         return Ok(None);
                     }
-                    let x_eta_psi = resolve_custom_family_x_psi(
+                    let x_eta_psi_map = resolve_custom_family_x_psi_map(
                         deriv,
                         n,
                         p_eta,
+                        0..n,
                         "BinomialMeanWiggleFamily eta",
+                        &self.policy,
                     )?;
+                    let x_eta_psi = x_eta_psi_map.row_chunk(0..n)?;
                     let z_eta_psi = x_eta_psi.dot(beta_eta);
                     return Ok(Some(BinomialMeanWiggleJointPsiDirection {
                         x_eta_psi: Some(x_eta_psi),

@@ -683,11 +683,34 @@ impl DenseDesignMatrix {
         }
     }
 
-    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    pub fn try_row_chunk(
+        &self,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, MatrixMaterializationError> {
         match self {
-            Self::Materialized(matrix) => matrix.slice(s![rows, ..]).to_owned(),
-            Self::Lazy(op) => op.row_chunk(rows),
+            Self::Materialized(matrix) => Ok(matrix.slice(s![rows, ..]).to_owned()),
+            Self::Lazy(op) => op.try_row_chunk(rows),
         }
+    }
+
+    pub fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        match self {
+            Self::Materialized(matrix) => {
+                let mut out = out;
+                out.assign(&matrix.slice(s![rows, ..]));
+                Ok(())
+            }
+            Self::Lazy(op) => op.row_chunk_into(rows, out),
+        }
+    }
+
+    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.try_row_chunk(rows)
+            .expect("DenseDesignMatrix::row_chunk (legacy; migrate to try_row_chunk)")
     }
 }
 
@@ -4940,13 +4963,20 @@ impl DesignMatrix {
     /// Returns a `(rows.len(), ncols())` dense `Array2` for the requested row
     /// range. For lazy dense designs this delegates to the operator-backed
     /// implementation, which should remain O(chunk).
-    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+    pub fn try_row_chunk(
+        &self,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, MatrixMaterializationError> {
         match self {
-            Self::Dense(matrix) => matrix.row_chunk(rows),
+            Self::Dense(matrix) => matrix.try_row_chunk(rows),
             Self::Sparse(matrix) => {
-                let csr = matrix.to_csr_arc().unwrap_or_else(|| {
-                    panic!("DesignMatrix::row_chunk: failed to obtain CSR view")
-                });
+                let csr = matrix.to_csr_arc().ok_or(MatrixMaterializationError::TooLarge {
+                    context: "DesignMatrix::try_row_chunk: failed to obtain CSR view",
+                    nrows: matrix.nrows(),
+                    ncols: matrix.ncols(),
+                    bytes: 0,
+                    limit_bytes: 0,
+                })?;
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();
@@ -4959,9 +4989,16 @@ impl DesignMatrix {
                         out[[local_row, col_idx[ptr]]] = vals[ptr];
                     }
                 }
-                out
+                Ok(out)
             }
         }
+    }
+
+    /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
+    /// `try_row_chunk(...)?` to propagate materialization errors.
+    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        self.try_row_chunk(rows)
+            .expect("DesignMatrix::row_chunk (legacy; migrate to try_row_chunk)")
     }
 
     /// Dot a single design row against a coefficient vector without allocating
