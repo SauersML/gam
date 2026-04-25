@@ -11,9 +11,8 @@ use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
     build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
-    resolve_custom_family_x_psi, resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi,
-    second_psi_linear_map, shared_dense_arc, slice_joint_into_block_working_sets,
-    weighted_crossprod_psi_maps,
+    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
+    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -74,11 +73,11 @@ impl DenseOrOperator<'_> {
         }
     }
 
-    fn row_chunk(&self, rows: std::ops::Range<usize>) -> Array2<f64> {
+    fn row_chunk(&self, rows: std::ops::Range<usize>) -> Result<Array2<f64>, String> {
         match self {
-            Self::Borrowed(dense) => dense.slice(s![rows, ..]).to_owned(),
-            Self::Owned(dense) => dense.slice(s![rows, ..]).to_owned(),
-            Self::Operator(design) => design.row_chunk(rows),
+            Self::Borrowed(dense) => Ok(dense.slice(s![rows, ..]).to_owned()),
+            Self::Owned(dense) => Ok(dense.slice(s![rows, ..]).to_owned()),
+            Self::Operator(design) => design.try_row_chunk(rows).map_err(|e| e.to_string()),
         }
     }
 
@@ -4837,8 +4836,8 @@ fn gaussian_joint_hessian_from_designs(
     let total = pmu + p_ls;
     let mut out = Array2::<f64>::zeros((total, total));
     for rows in exact_design_row_chunks(n, pmu.max(p_ls)) {
-        let xmu_chunk = xmu.row_chunk(rows.clone());
-        let xls_chunk = x_ls.row_chunk(rows.clone());
+        let xmu_chunk = xmu.row_chunk(rows.clone())?;
+        let xls_chunk = x_ls.row_chunk(rows.clone())?;
         let hmumu = hmumu_coeff.slice(s![rows.clone()]);
         let hmu_ls = hmu_ls_coeff.slice(s![rows.clone()]);
         let h_ls_ls = h_ls_ls_coeff.slice(s![rows.clone()]);
@@ -5561,43 +5560,47 @@ impl GaussianLocationScaleFamily {
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
                 Self::BLOCK_MU => {
-                    xmu_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         pmu,
                         0..n,
                         "GaussianLocationScaleFamily mu",
-                    )?;
-                    if xmu_ab_action.is_none() {
-                        xmu_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            pmu,
-                            "GaussianLocationScaleFamily mu",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => xmu_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => xmu_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "GaussianLocationScaleFamily mu: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 Self::BLOCK_LOG_SIGMA => {
-                    x_ls_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         p_ls,
                         0..n,
                         "GaussianLocationScaleFamily log-sigma",
-                    )?;
-                    if x_ls_ab_action.is_none() {
-                        x_ls_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            p_ls,
-                            "GaussianLocationScaleFamily log-sigma",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => x_ls_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => x_ls_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "GaussianLocationScaleFamily log-sigma: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -6952,43 +6955,47 @@ impl GaussianLocationScaleWiggleFamily {
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
                 Self::BLOCK_MU => {
-                    xmu_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         pmu,
                         0..n,
                         "GaussianLocationScaleWiggleFamily mu",
-                    )?;
-                    if xmu_ab_action.is_none() {
-                        xmu_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            pmu,
-                            "GaussianLocationScaleWiggleFamily mu",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => xmu_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => xmu_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "GaussianLocationScaleWiggleFamily mu: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 Self::BLOCK_LOG_SIGMA => {
-                    x_ls_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         p_ls,
                         0..n,
                         "GaussianLocationScaleWiggleFamily log-sigma",
-                    )?;
-                    if x_ls_ab_action.is_none() {
-                        x_ls_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            p_ls,
-                            "GaussianLocationScaleWiggleFamily log-sigma",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => x_ls_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => x_ls_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "GaussianLocationScaleWiggleFamily log-sigma: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -10890,43 +10897,47 @@ impl BinomialLocationScaleFamily {
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
                 Self::BLOCK_T => {
-                    x_t_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         pt,
                         0..n,
                         "BinomialLocationScaleFamily threshold",
-                    )?;
-                    if x_t_ab_action.is_none() {
-                        x_t_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            pt,
-                            "BinomialLocationScaleFamily threshold",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => x_t_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => x_t_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "BinomialLocationScaleFamily threshold: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 Self::BLOCK_LOG_SIGMA => {
-                    x_ls_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         pls,
                         0..n,
                         "BinomialLocationScaleFamily log-sigma",
-                    )?;
-                    if x_ls_ab_action.is_none() {
-                        x_ls_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            pls,
-                            "BinomialLocationScaleFamily log-sigma",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => x_ls_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => x_ls_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "BinomialLocationScaleFamily log-sigma: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -12587,43 +12598,47 @@ impl BinomialLocationScaleWiggleFamily {
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
                 Self::BLOCK_T => {
-                    x_t_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         pt,
                         0..n,
                         "BinomialLocationScaleWiggleFamily threshold",
-                    )?;
-                    if x_t_ab_action.is_none() {
-                        x_t_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            pt,
-                            "BinomialLocationScaleWiggleFamily threshold",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => x_t_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => x_t_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "BinomialLocationScaleWiggleFamily threshold: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 Self::BLOCK_LOG_SIGMA => {
-                    x_ls_ab_action = CustomFamilyPsiSecondDesignAction::from_second_derivative(
+                    match resolve_custom_family_x_psi_psi_map(
                         deriv,
                         deriv_b,
+                        psi_b.local_idx,
                         n,
                         pls,
                         0..n,
                         "BinomialLocationScaleWiggleFamily log-sigma",
-                    )?;
-                    if x_ls_ab_action.is_none() {
-                        x_ls_ab = Some(resolve_custom_family_x_psi_psi(
-                            deriv,
-                            deriv_b,
-                            psi_b.local_idx,
-                            n,
-                            pls,
-                            "BinomialLocationScaleWiggleFamily log-sigma",
-                        )?);
+                        &self.policy,
+                    )? {
+                        PsiDesignMap::Second { action } => x_ls_ab_action = Some(action),
+                        PsiDesignMap::Dense { matrix } => x_ls_ab = Some((*matrix).clone()),
+                        PsiDesignMap::Zero { .. } => {}
+                        PsiDesignMap::First { .. } => {
+                            return Err(
+                                "BinomialLocationScaleWiggleFamily log-sigma: unexpected First variant from _psi_psi_map"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 _ => {}

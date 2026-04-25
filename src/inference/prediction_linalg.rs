@@ -83,7 +83,7 @@ pub(crate) fn design_row_chunk(
             design.nrows()
         ));
     }
-    Ok(design.row_chunk(rows))
+    design.try_row_chunk(rows).map_err(|e| e.to_string())
 }
 
 pub(crate) fn prediction_chunk_rows(

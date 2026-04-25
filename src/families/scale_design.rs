@@ -1,5 +1,4 @@
 use crate::faer_ndarray::{FaerArrayView, default_rrqr_rank_alpha, fast_ab};
-use crate::linalg::matrix::DenseDesignOperator;
 use crate::matrix::DesignMatrix;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::Unbind;
