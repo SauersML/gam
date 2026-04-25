@@ -10006,6 +10006,8 @@ mod tests {
                 b_depends_on_beta: false,
                 is_penalty_like: false,
                 firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
             }],
             ext_coord_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
                 a: 0.09,

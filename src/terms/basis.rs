@@ -19382,7 +19382,15 @@ mod tests {
                         epsilon = 1e-9
                     );
                 }
-                assert_abs_diff_eq!(ops.d2[[k, col]], expected_d2, epsilon = 1e-9);
+                // D2 is now a full p*d*d Hessian; the previous Laplacian
+                // operator was the plain trace sum_b H_{bb} (the "sum of
+                // diagonal Hessian entries"), not the metric-weighted trace.
+                let mut lap = 0.0;
+                for axis in 0..dim {
+                    let row = (k * dim + axis) * dim + axis;
+                    lap += ops.d2[[row, col]];
+                }
+                assert_abs_diff_eq!(lap, expected_d2, epsilon = 1e-9);
             }
         }
     }
@@ -19835,7 +19843,16 @@ mod tests {
         let base_design = base.design.to_dense();
         let minus_design = minus.design.to_dense();
         let fd_design = (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
-        let design_err = (&second_derivative.designsecond_derivative - &fd_design)
+        // Same as the first-derivative test: the Duchon design path is now
+        // operator-only, so we materialize the diagonal second derivative for
+        // axis 0 to match the dense central-difference shape.
+        let analytic_second = second_derivative
+            .implicit_operator
+            .as_ref()
+            .expect("Duchon design second derivative must expose an implicit operator")
+            .materialize_second_diag(0)
+            .expect("materialize second-diag design derivative");
+        let design_err = (&analytic_second - &fd_design)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
