@@ -25,7 +25,7 @@ use crate::families::sigma_link::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::linalg::utils::solve_spd_pcg_with_info;
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DenseDesignOperator, DesignMatrix};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
 };
@@ -107,6 +107,7 @@ fn dense_block_or_operator<'a>(
     n: usize,
     p: usize,
     budget_bytes: usize,
+    policy: &crate::resource::ResourcePolicy,
 ) -> DenseOrOperator<'a> {
     if let Some(dense) = design.as_dense_ref() {
         return DenseOrOperator::Borrowed(dense);
@@ -114,7 +115,12 @@ fn dense_block_or_operator<'a>(
 
     let dense_bytes = 8usize.saturating_mul(n).saturating_mul(p);
     if dense_bytes <= budget_bytes {
-        return DenseOrOperator::Owned(design.to_dense());
+        if let Ok(arc) = design.try_to_dense_with_policy(
+            &policy.material_policy(),
+            "gamlss dense_block_or_operator",
+        ) {
+            return DenseOrOperator::Owned(arc.as_ref().clone());
+        }
     }
 
     DenseOrOperator::Operator(design.clone())
@@ -5154,13 +5160,19 @@ impl GaussianLocationScaleFamily {
             "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
         })?;
         let planned = dense_blocks_planned_budget(&[mu_design, log_sigma_design]);
-        let xmu =
-            dense_block_or_operator(mu_design, mu_design.nrows(), mu_design.ncols(), planned[0]);
+        let xmu = dense_block_or_operator(
+            mu_design,
+            mu_design.nrows(),
+            mu_design.ncols(),
+            planned[0],
+            &self.policy,
+        );
         let x_ls = dense_block_or_operator(
             log_sigma_design,
             log_sigma_design.nrows(),
             log_sigma_design.ncols(),
             planned[1],
+            &self.policy,
         );
         Ok((xmu, x_ls))
     }
@@ -5178,13 +5190,19 @@ impl GaussianLocationScaleFamily {
         let mu_design = &specs[Self::BLOCK_MU].design;
         let log_sigma_design = &specs[Self::BLOCK_LOG_SIGMA].design;
         let planned = dense_blocks_planned_budget(&[mu_design, log_sigma_design]);
-        let xmu =
-            dense_block_or_operator(mu_design, mu_design.nrows(), mu_design.ncols(), planned[0]);
+        let xmu = dense_block_or_operator(
+            mu_design,
+            mu_design.nrows(),
+            mu_design.ncols(),
+            planned[0],
+            &self.policy,
+        );
         let x_ls = dense_block_or_operator(
             log_sigma_design,
             log_sigma_design.nrows(),
             log_sigma_design.ncols(),
             planned[1],
+            &self.policy,
         );
         Ok((xmu, x_ls))
     }
@@ -6756,11 +6774,29 @@ impl GaussianLocationScaleWiggleFamily {
         })?;
         let xmu = match mu_design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(mu_design.to_dense()),
+            None => Cow::Owned(
+                mu_design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "GaussianLocationScaleWiggle dense_block_designs mu",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         let x_ls = match log_sigma_design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(log_sigma_design.to_dense()),
+            None => Cow::Owned(
+                log_sigma_design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "GaussianLocationScaleWiggle dense_block_designs log_sigma",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         Ok((xmu, x_ls))
     }
@@ -6776,11 +6812,31 @@ impl GaussianLocationScaleWiggleFamily {
         }
         let xmu = match specs[Self::BLOCK_MU].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_MU].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_MU]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "GaussianLocationScaleWiggle dense_block_designs_fromspecs mu",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         let x_ls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_LOG_SIGMA].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_LOG_SIGMA]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "GaussianLocationScaleWiggle dense_block_designs_fromspecs log_sigma",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         Ok((xmu, x_ls))
     }
@@ -8666,7 +8722,17 @@ impl BinomialMeanWiggleFamily {
         }
         Ok(match specs[Self::BLOCK_ETA].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_ETA].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_ETA]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialMeanWiggle dense_eta_design_fromspecs eta",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         })
     }
 
@@ -10215,11 +10281,29 @@ impl BinomialLocationScaleFamily {
         })?;
         let xt = match threshold_design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(threshold_design.to_dense()),
+            None => Cow::Owned(
+                threshold_design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialLocationScale dense_block_designs threshold",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         let x_ls = match log_sigma_design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(log_sigma_design.to_dense()),
+            None => Cow::Owned(
+                log_sigma_design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialLocationScale dense_block_designs log_sigma",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         Ok((xt, x_ls))
     }
@@ -10236,11 +10320,31 @@ impl BinomialLocationScaleFamily {
         }
         let xt = match specs[Self::BLOCK_T].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_T].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_T]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialLocationScale dense_block_designs_fromspecs threshold",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         let x_ls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_LOG_SIGMA].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_LOG_SIGMA]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialLocationScale dense_block_designs_fromspecs log_sigma",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         Ok((xt, x_ls))
     }
@@ -12362,11 +12466,27 @@ impl BinomialLocationScaleWiggleFamily {
         })?;
         let xt = match td.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(td.to_dense()),
+            None => Cow::Owned(
+                td.try_to_dense_with_policy(
+                    &self.policy.material_policy(),
+                    "BinomialLocationScaleWiggle dense_block_designs threshold",
+                )
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                .clone(),
+            ),
         };
         let xls = match lsd.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(lsd.to_dense()),
+            None => Cow::Owned(
+                lsd.try_to_dense_with_policy(
+                    &self.policy.material_policy(),
+                    "BinomialLocationScaleWiggle dense_block_designs log_sigma",
+                )
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                .clone(),
+            ),
         };
         Ok((xt, xls))
     }
@@ -12383,11 +12503,31 @@ impl BinomialLocationScaleWiggleFamily {
         }
         let xt = match specs[Self::BLOCK_T].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_T].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_T]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialLocationScaleWiggle dense_block_designs_fromspecs threshold",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         let xls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(specs[Self::BLOCK_LOG_SIGMA].design.to_dense()),
+            None => Cow::Owned(
+                specs[Self::BLOCK_LOG_SIGMA]
+                    .design
+                    .try_to_dense_with_policy(
+                        &self.policy.material_policy(),
+                        "BinomialLocationScaleWiggle dense_block_designs_fromspecs log_sigma",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    .clone(),
+            ),
         };
         Ok((xt, xls))
     }
