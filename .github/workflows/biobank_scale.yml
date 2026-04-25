@@ -3,7 +3,7 @@ name: Biobank Scale
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 5 * * *"
+    - cron: "0 * * * *"
 
 concurrency:
   group: biobank-scale-${{ github.ref }}
@@ -16,6 +16,7 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       cache_key: ${{ steps.cache_key.outputs.cache_key }}
@@ -93,7 +94,7 @@ jobs:
   bootstrap-runtime:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,7 +124,7 @@ jobs:
       - prepare
       - bootstrap-runtime
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -203,6 +204,7 @@ jobs:
   aggregate:
     needs: benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v4
