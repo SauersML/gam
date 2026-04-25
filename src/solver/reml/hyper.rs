@@ -306,7 +306,6 @@ fn drift_deriv_result_from_parts(
 /// and an `Arc` to the Firth operator.  The sign convention mirrors the
 /// single-τ wiring at `build_tau_hyper_coords` (B_j += −Hφ_τ_j|β for the
 /// diagonal; here we apply the same sign to the pair drift).
-#[allow(dead_code)]
 struct FirthAugmentedPairHyperOperator {
     base: Box<dyn super::unified::HyperOperator>,
     firth_op: std::sync::Arc<super::FirthDenseOperator>,

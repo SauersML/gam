@@ -3258,17 +3258,7 @@ pub(crate) enum PsiDesignMap {
     },
 }
 
-#[allow(dead_code)]
 impl PsiDesignMap {
-    pub(crate) fn nrows(&self) -> usize {
-        match self {
-            Self::Zero { nrows, .. } => *nrows,
-            Self::Dense { matrix } => matrix.nrows(),
-            Self::First { action } => action.nrows(),
-            Self::Second { action } => action.nrows(),
-        }
-    }
-
     pub(crate) fn ncols(&self) -> usize {
         match self {
             Self::Zero { ncols, .. } => *ncols,
@@ -3284,15 +3274,6 @@ impl PsiDesignMap {
             Self::Dense { matrix } => Ok(matrix.dot(&u)),
             Self::First { action } => Ok(action.forward_mul(u)),
             Self::Second { action } => Ok(action.forward_mul(u)),
-        }
-    }
-
-    pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-        match self {
-            Self::Zero { ncols, .. } => Ok(Array1::<f64>::zeros(*ncols)),
-            Self::Dense { matrix } => Ok(matrix.t().dot(&v)),
-            Self::First { action } => Ok(action.transpose_mul(v)),
-            Self::Second { action } => Ok(action.transpose_mul(v)),
         }
     }
 
@@ -3313,18 +3294,6 @@ impl PsiDesignMap {
             Self::First { action } => action.row_vector(row),
             Self::Second { action } => action.row_vector(row),
         }
-    }
-
-    pub(crate) fn resident_bytes(&self) -> usize {
-        match self {
-            Self::Zero { .. } => 0,
-            Self::Dense { matrix } => 8 * matrix.nrows() * matrix.ncols(),
-            Self::First { .. } | Self::Second { .. } => 0,
-        }
-    }
-
-    pub(crate) fn is_zero(&self) -> bool {
-        matches!(self, Self::Zero { .. })
     }
 
     /// Borrow this map as a `CustomFamilyPsiLinearMapRef`, handling every
