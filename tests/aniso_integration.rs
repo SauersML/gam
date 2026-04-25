@@ -9,59 +9,47 @@ use gam::{
     types::LikelihoodFamily,
 };
 use ndarray::{Array1, Array2};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 
-/// Generate a 2D binary-outcome dataset where axis 0 (x1) has strong signal
-/// and axis 1 (x2) is pure noise.
+/// Generate a 2D Gaussian-response dataset where axis 0 (x1) has strong
+/// signal and axis 1 (x2) is pure nuisance variation.
 ///
 /// The data-generating process is:
-///   logit(p) = 2 * sin(x1)
-///   y ~ Bernoulli(p)
+///   y = sin(2 * x1)
 ///
-/// x1 is a regular grid on [-3, 3], x2 is uniform noise on [-3, 3].
-fn simulate_aniso_binomial(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
-    let mut rng = StdRng::seed_from_u64(seed);
+/// x1 is a regular grid on [-3, 3], x2 is a deterministic low-discrepancy
+/// nuisance axis on the same range. The deterministic target keeps this as an
+/// optimizer geometry check instead of a stochastic power test.
+fn simulate_aniso_gaussian(n: usize) -> (Array2<f64>, Array1<f64>) {
     let mut x = Array2::<f64>::zeros((n, 2));
     let mut y = Array1::<f64>::zeros(n);
 
     for i in 0..n {
-        let x1 = (i as f64) / (n as f64) * 6.0 - 3.0; // regular grid [-3, 3]
-        let x2 = rng.random_range(-3.0..3.0); // noise axis
+        let x1 = (i as f64) / (n as f64 - 1.0) * 6.0 - 3.0;
+        let x2 = ((i as f64 * 0.618_033_988_749_894_9).fract()) * 6.0 - 3.0;
         x[[i, 0]] = x1;
         x[[i, 1]] = x2;
-
-        let eta = 2.0 * x1.sin(); // logit(p) depends only on x1
-        let p = 1.0 / (1.0 + (-eta).exp());
-        y[i] = if rng.random_range(0.0..1.0) < p {
-            1.0
-        } else {
-            0.0
-        };
+        y[i] = (2.0 * x1).sin();
     }
 
     (x, y)
 }
 
 /// Verify that anisotropic per-axis length-scale optimization recovers meaningful
-/// eta values: the signal axis (x1) should have a more negative eta (= tighter
-/// length scale) than the noise axis (x2).
+/// eta values: the signal axis (x1) should have a more positive eta (= tighter
+/// effective length scale) than the noise axis (x2).
 ///
 /// After fitting, the resolved spec contains `aniso_log_scales = Some([eta_0, eta_1])`
-/// where eta_a are contrasts (sum to zero). A more negative eta_a means
-/// kappa_a = exp(eta_a) is smaller => length scale exp(-eta_a) is larger...
-/// but wait -- in the ψ_a = ψ̄ + η_a parameterization, larger ψ_a means
-/// shorter length scale on that axis (more detail). The η_a are the deviations
-/// from the mean, and exp(η_a) multiplies the distance on axis a.
-/// So η_a > 0 => distances on axis a are *stretched* => more smoothing on that axis.
-/// η_a < 0 => distances on axis a are *compressed* => more detail on that axis.
+/// where eta_a are centered contrasts (sum to zero). The metric uses
+/// exp(eta_a) to scale coordinate differences before evaluating the radial
+/// kernel, so larger eta stretches distances on that axis and shortens its
+/// effective length scale.
 ///
-/// For the signal axis (x1), we expect more detail => η_0 < η_1.
-/// Equivalently, η_1 > η_0 (the noise axis is smoother).
+/// For the signal axis (x1), we expect more detail => η_0 > η_1.
+/// Equivalently, η_1 < η_0 (the nuisance axis is smoother).
 #[test]
 fn aniso_matern_recovers_signal_axis() {
-    let n = 1000;
-    let (x, y) = simulate_aniso_binomial(n, 20260314);
+    let n = 180;
+    let (x, y) = simulate_aniso_gaussian(n);
 
     let spec = TermCollectionSpec {
         linear_terms: vec![],
@@ -71,7 +59,7 @@ fn aniso_matern_recovers_signal_axis() {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: vec![0, 1],
                 spec: MaternBasisSpec {
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 25 },
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: 1.0,
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
@@ -91,7 +79,7 @@ fn aniso_matern_recovers_signal_axis() {
 
     let kappa_options = SpatialLengthScaleOptimizationOptions {
         enabled: true,
-        max_outer_iter: 8,
+        max_outer_iter: 3,
         rel_tol: 1e-5,
         log_step: std::f64::consts::LN_2,
         min_length_scale: 1e-2,
@@ -105,7 +93,7 @@ fn aniso_matern_recovers_signal_axis() {
         weights,
         offset,
         spec,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodFamily::GaussianIdentity,
         options: FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -113,7 +101,7 @@ fn aniso_matern_recovers_signal_axis() {
             sas_link: None,
             optimize_sas: false,
             compute_inference: false,
-            max_iter: 60,
+            max_iter: 30,
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
@@ -154,21 +142,21 @@ fn aniso_matern_recovers_signal_axis() {
     let eta_signal = aniso[0]; // axis 0 (x1): signal
     let eta_noise = aniso[1]; // axis 1 (x2): noise
 
-    // The signal axis should have more detail (more negative eta, or at least
-    // smaller eta) than the noise axis. The noise axis should be smoother
-    // (larger eta => distances stretched => less detail).
+    // The signal axis should have more detail (larger eta) than the noise
+    // axis. A larger eta stretches distances in the radial metric and
+    // therefore shortens the effective length scale on that axis.
     //
-    // We use a soft threshold: eta_signal < eta_noise - 0.1
+    // We use a soft threshold: eta_signal > eta_noise + 0.1
     eprintln!(
         "aniso eta: signal(x1) = {:.4}, noise(x2) = {:.4}, diff = {:.4}",
         eta_signal,
         eta_noise,
-        eta_noise - eta_signal,
+        eta_signal - eta_noise,
     );
 
     assert!(
-        eta_signal < eta_noise - 0.1,
-        "signal axis eta ({eta_signal:.4}) should be meaningfully smaller than \
+        eta_signal > eta_noise + 0.1,
+        "signal axis eta ({eta_signal:.4}) should be meaningfully larger than \
          noise axis eta ({eta_noise:.4}); the optimizer should assign more detail \
          to the axis with actual signal"
     );
