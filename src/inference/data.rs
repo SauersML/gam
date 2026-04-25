@@ -200,7 +200,7 @@ fn load_delimited_inferred(
     let mut level_index: Vec<HashMap<String, usize>> = vec![HashMap::new(); p];
     let mut levels: Vec<Vec<String>> = vec![Vec::new(); p];
 
-    let _t_stream = std::time::Instant::now();
+    let t_stream = std::time::Instant::now();
     let mut record = StringRecord::new();
     while rdr
         .read_record(&mut record)

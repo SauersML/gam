@@ -2118,6 +2118,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 preparednoise_design,
             ))),
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
     }
@@ -2304,6 +2305,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             ))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
     }
@@ -2464,6 +2466,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 identifiednoise_design,
             ))),
+            policy: crate::resource::ResourcePolicy::default_library(),
         }
     }
 
@@ -2662,6 +2665,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             ))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
+            policy: crate::resource::ResourcePolicy::default_library(),
         }
     }
 
@@ -4293,6 +4297,11 @@ pub struct GaussianLocationScaleFamily {
     pub weights: Array1<f64>,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+    /// Resource policy threaded into PsiDesignMap construction (and any other
+    /// per-call materialization decision) made during exact-Newton joint psi
+    /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
+    /// when the family is built without an explicit policy.
+    pub policy: crate::resource::ResourcePolicy,
     /// Cached per-observation row scalars keyed by 6-element fingerprint
     /// (first, mid, last elements of both eta vectors).
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
@@ -4307,6 +4316,7 @@ impl Clone for GaussianLocationScaleFamily {
             weights: self.weights.clone(),
             mu_design: self.mu_design.clone(),
             log_sigma_design: self.log_sigma_design.clone(),
+            policy: self.policy.clone(),
             cached_row_scalars: std::sync::RwLock::new(
                 self.cached_row_scalars
                     .read()
@@ -6537,6 +6547,11 @@ pub struct GaussianLocationScaleWiggleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
+    /// Resource policy threaded into PsiDesignMap construction (and any other
+    /// per-call materialization decision) made during exact-Newton joint psi
+    /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
+    /// when the family is built without an explicit policy.
+    pub policy: crate::resource::ResourcePolicy,
     cached_row_scalars:
         std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
@@ -6550,6 +6565,7 @@ impl Clone for GaussianLocationScaleWiggleFamily {
             log_sigma_design: self.log_sigma_design.clone(),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
+            policy: self.policy.clone(),
             cached_row_scalars: std::sync::RwLock::new(
                 self.cached_row_scalars
                     .read()
@@ -9892,6 +9908,11 @@ pub struct BinomialLocationScaleFamily {
     pub link_kind: InverseLink,
     pub threshold_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+    /// Resource policy threaded into PsiDesignMap construction (and any other
+    /// per-call materialization decision) made during exact-Newton joint psi
+    /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
+    /// when the family is built without an explicit policy.
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 struct BinomialLocationScaleJointPsiDirection {
@@ -12155,6 +12176,11 @@ pub struct BinomialLocationScaleWiggleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
+    /// Resource policy threaded into PsiDesignMap construction (and any other
+    /// per-call materialization decision) made during exact-Newton joint psi
+    /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
+    /// when the family is built without an explicit policy.
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 impl BinomialLocationScaleWiggleFamily {
@@ -12356,6 +12382,7 @@ impl BinomialLocationScaleWiggleFamily {
             ))),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
+            policy: self.policy.clone(),
         }))
     }
 
@@ -15943,6 +15970,7 @@ mod tests {
             weights: weights.clone(),
             mu_design: None,
             log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let gaussian_eval = gaussian
@@ -16089,6 +16117,7 @@ mod tests {
             weights: Array1::from_vec(vec![1.0]),
             mu_design: None,
             log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let states = vec![
@@ -16121,6 +16150,7 @@ mod tests {
             weights: Array1::from_vec(vec![1.0]),
             mu_design: None,
             log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let etamu = Array1::from_vec(vec![0.1]);
@@ -16242,6 +16272,7 @@ mod tests {
             weights: array![1.0],
             mu_design: None,
             log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let eta_mu = array![0.0];
@@ -16312,6 +16343,7 @@ mod tests {
             weights: array![1.0],
             mu_design: Some(mu_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let beta_mu = array![0.0];
@@ -17708,6 +17740,7 @@ mod tests {
             log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 x_ls0_mat.clone(),
             ))),
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let specs = vec![
@@ -17908,6 +17941,7 @@ mod tests {
             log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 x_ls0_mat.clone(),
             ))),
+            policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
         let specs = vec![

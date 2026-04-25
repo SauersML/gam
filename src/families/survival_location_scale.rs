@@ -6505,7 +6505,6 @@ impl SurvivalLocationScaleFamily {
         dir_i: &SurvivalJointPsiDirection,
         dir_j: &SurvivalJointPsiDirection,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
-        // TODO(resource-policy-migration): thread real policy through caller
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -7218,7 +7217,6 @@ impl SurvivalLocationScaleFamily {
         dir: &SurvivalJointPsiDirection,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        // TODO(resource-policy-migration): thread real policy through caller
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -7834,7 +7832,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        // TODO(resource-policy-migration): thread real policy through caller
         if specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {

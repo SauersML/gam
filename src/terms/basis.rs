@@ -1839,6 +1839,29 @@ pub fn minimum_duchon_power_for_operator_penalties(
     s
 }
 
+/// Returns the maximum derivative order required by the *active* operator
+/// penalties: 2 if stiffness is Active, else 1 if tension is Active, else 0.
+/// Mass-only (or no active operator) penalties only require kernel validity
+/// (`2(p+s) > d`), tension requires D1 collocation (`2(p+s) > d+1`), and
+/// stiffness requires D2 collocation (`2(p+s) > d+2`).
+pub fn duchon_max_active_operator_derivative_order(
+    operator_penalties: &DuchonOperatorPenaltySpec,
+) -> usize {
+    if matches!(
+        operator_penalties.stiffness,
+        OperatorPenaltySpec::Active { .. }
+    ) {
+        2
+    } else if matches!(
+        operator_penalties.tension,
+        OperatorPenaltySpec::Active { .. }
+    ) {
+        1
+    } else {
+        0
+    }
+}
+
 /// Metadata returned by generic basis builders.
 #[derive(Debug, Clone)]
 pub enum BasisMetadata {
@@ -8768,15 +8791,16 @@ fn validate_duchon_collocation_orders(
     p_order: usize,
     s_order: usize,
     k_dim: usize,
+    max_operator_derivative_order: usize,
 ) -> Result<(), BasisError> {
     validate_duchon_kernel_orders(length_scale, p_order, s_order, k_dim)?;
     let spectral_order = 2 * (p_order + s_order);
-    if spectral_order <= k_dim + 1 {
+    if max_operator_derivative_order >= 1 && spectral_order <= k_dim + 1 {
         return Err(BasisError::InvalidInput(format!(
             "Duchon D1 collocation requires 2*(p+s) > dimension+1; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
         )));
     }
-    if spectral_order <= k_dim + 2 {
+    if max_operator_derivative_order >= 2 && spectral_order <= k_dim + 2 {
         return Err(BasisError::InvalidInput(format!(
             "Duchon D2 collocation requires 2*(p+s) > dimension+2; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
         )));
