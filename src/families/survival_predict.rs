@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use ndarray::{Array1, Array2, ArrayView2, s};
 
-use crate::families::scale_design::ScaleDeviationTransform;
 use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::scale_design::ScaleDeviationTransform;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
     build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
@@ -35,7 +35,9 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, stat
 use crate::probability::normal_cdf;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
-use crate::types::{InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec};
+use crate::types::{
+    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
+};
 
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
@@ -780,7 +782,7 @@ pub fn scale_transform_from_payload(
 }
 
 /// Concatenate referenced 1-D arrays into a single owned `Array1<f64>`.
-pub(crate) fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
+pub fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
     let total: usize = parts.iter().map(|part| part.len()).sum();
     let mut out = Array1::<f64>::zeros(total);
     let mut offset = 0usize;
@@ -795,7 +797,7 @@ pub(crate) fn concat_array1_refs(parts: &[&Array1<f64>]) -> Array1<f64> {
 /// Rebuild the saved baseline-timewiggle entry/exit/derivative design blocks
 /// from the saved runtime metadata. Returns `None` when the saved model has no
 /// baseline-timewiggle.
-pub(crate) fn saved_baseline_timewiggle_components(
+pub fn saved_baseline_timewiggle_components(
     eta_entry: &Array1<f64>,
     eta_exit: &Array1<f64>,
     derivative_exit: &Array1<f64>,
@@ -877,7 +879,7 @@ pub(crate) fn saved_baseline_timewiggle_components(
 /// predictor at predict time. The CLI's `gam predict` flow and the
 /// library-side `predict_survival` both call into this helper so they share
 /// bit-identical eta math (link-deviation + score-warp replay included).
-pub(crate) fn build_saved_survival_marginal_slope_predictor(
+pub fn build_saved_survival_marginal_slope_predictor(
     model: &SavedModel,
     fit_saved: &UnifiedFitResult,
     z_name: &str,
@@ -1094,7 +1096,7 @@ pub(crate) fn build_saved_survival_marginal_slope_predictor(
 /// Extract the fixed Gaussian-shift sigma (if any) from a frailty spec. Used
 /// to compute the rigid-path probit frailty scale that mirrors the predictor's
 /// internal `probit_frailty_scale()`.
-pub(crate) fn gaussian_frailty_sigma_from_frailty(frailty: Option<&FrailtySpec>) -> Option<f64> {
+pub fn gaussian_frailty_sigma_from_frailty(frailty: Option<&FrailtySpec>) -> Option<f64> {
     match frailty {
         Some(FrailtySpec::GaussianShift {
             sigma_fixed: Some(sigma),
