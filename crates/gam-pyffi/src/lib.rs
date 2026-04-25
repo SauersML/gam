@@ -748,17 +748,25 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(kind) = py_config.frailty {
         let trimmed = kind.trim().to_ascii_lowercase();
-        let loading = py_config.frailty_loading.unwrap_or(1.0);
         let sigma = py_config.frailty_sigma;
+        let loading_kind = py_config
+            .frailty_loading
+            .map(|raw| raw)
+            .unwrap_or(0.0);
+        let hazard_loading = if loading_kind > 0.5 {
+            gam::families::lognormal_kernel::HazardLoading::LoadedVsUnloaded
+        } else {
+            gam::families::lognormal_kernel::HazardLoading::Full
+        };
         let frailty = match trimmed.as_str() {
             "none" | "" => gam::families::lognormal_kernel::FrailtySpec::None,
             "hazard-multiplier" => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
                 sigma_fixed: sigma,
-                loading: gam::families::lognormal_kernel::HazardLoading::Multiplicative { gamma: loading },
+                loading: hazard_loading,
             },
             "hazard-multiplier:learnable" => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
                 sigma_fixed: None,
-                loading: gam::families::lognormal_kernel::HazardLoading::Multiplicative { gamma: loading },
+                loading: hazard_loading,
             },
             "gaussian-shift" => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
                 sigma_fixed: sigma,
