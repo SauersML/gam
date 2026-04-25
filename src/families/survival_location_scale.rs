@@ -12492,13 +12492,6 @@ mod tests {
 
         match fit_survival_location_scale(spec) {
             Ok(result) => {
-                eprintln!(
-                    "fit succeeded: log_likelihood={:.6e}",
-                    result.log_likelihood
-                );
-                eprintln!("beta_time: {:?}", result.beta_time());
-                eprintln!("beta_threshold: {:?}", result.beta_threshold());
-                eprintln!("beta_log_sigma: {:?}", result.beta_log_sigma());
                 // Structural-monotonicity invariant implied by the test's
                 // name: the I-spline-like time block carries structural
                 // lower bounds of zero (see
@@ -12624,7 +12617,6 @@ mod tests {
         let eval = family
             .evaluate(&states)
             .expect("initial evaluate with positive d_eta/dt should succeed");
-        eprintln!("initial log-likelihood: {:.6e}", eval.log_likelihood);
 
         // Step 2: Extract time block gradient and Hessian.
         let (grad, hess) = match &eval.blockworking_sets[0] {
@@ -12633,12 +12625,6 @@ mod tests {
             }
             _ => panic!("expected exact-newton for time block"),
         };
-        eprintln!("time block gradient: {:?}", grad);
-        eprintln!(
-            "time block Hessian diagonal: {:?}",
-            (0..hess.nrows()).map(|i| hess[[i, i]]).collect::<Vec<_>>()
-        );
-        eprintln!("time block Hessian:\n{:.6e}", hess);
 
         // Step 3: Simulate Newton step (H + ridge*I) * delta = grad - S*beta.
         // With beta=0 and no penalty: (H + ridge*I) * delta = grad.
@@ -12650,7 +12636,6 @@ mod tests {
         }
         // Solve via direct inversion (2x2).
         let det = lhs[[0, 0]] * lhs[[1, 1]] - lhs[[0, 1]] * lhs[[1, 0]];
-        eprintln!("LHS determinant: {:.6e}", det);
         let delta = if det.abs() > 1e-30 {
             let inv00 = lhs[[1, 1]] / det;
             let inv01 = -lhs[[0, 1]] / det;
@@ -12661,10 +12646,8 @@ mod tests {
                 inv10 * grad[0] + inv11 * grad[1]
             ]
         } else {
-            eprintln!("SINGULAR: det={:.6e}", det);
             Array1::zeros(p)
         };
-        eprintln!("Newton delta: {:?}", delta);
         assert!(
             delta.iter().all(|v| v.is_finite()),
             "Newton delta has non-finite entries: {:?}",
@@ -12673,7 +12656,6 @@ mod tests {
 
         // Step 4: Compute new d_raw after the step.
         let new_d_raw = x_deriv.dot(&delta) + &offset_deriv;
-        eprintln!("new d_raw after Newton step: {:?}", new_d_raw);
         for (i, &v) in new_d_raw.iter().enumerate() {
             assert!(
                 v.is_finite(),
@@ -12701,15 +12683,9 @@ mod tests {
             states[1].clone(),
             states[2].clone(),
         ];
-        match family.evaluate(&new_states) {
-            Ok(eval2) => eprintln!("post-step log-likelihood: {:.6e}", eval2.log_likelihood),
-            Err(e) => {
-                eprintln!("post-step evaluate FAILED: {e}");
-                eprintln!("delta was: {:?}", delta);
-                eprintln!("new d_raw was: {:?}", new_d_raw);
-                panic!("evaluate failed after Newton step: {e}");
-            }
-        }
+        family
+            .evaluate(&new_states)
+            .unwrap_or_else(|e| panic!("evaluate failed after Newton step: {e}"));
     }
 
     #[test]
