@@ -563,6 +563,12 @@ def estimate_scenario_cost(sc: FuzzScenario) -> float:
         "tps": 3.2,
         "duchon": 1.2,
     }[sc.basis_type]
+    if sc.basis_type == "duchon":
+        # Hybrid Duchon scenarios add separate one-dimensional smooth terms
+        # after the joint Duchon block. The REML surface grows with those
+        # extra penalties, not just with raw n * k * knots.
+        extra_terms = max(0, sc.n_smooths - sc.n_duchon_dims)
+        cost *= 1.0 + float(extra_terms * extra_terms)
     if sc.double_penalty:
         cost *= 1.15
     if sc.signal_structure in {"surface_2d", "stacked", "regime"}:

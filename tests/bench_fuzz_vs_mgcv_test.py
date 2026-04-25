@@ -63,11 +63,20 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         )
 
     def test_select_scenarios_applies_cost_cap_before_sorting(self) -> None:
-        scenarios, skipped = _FUZZ.select_scenarios([56, 73, 130], max_scenario_cost=75_000)
+        scenarios, skipped = _FUZZ.select_scenarios([56, 83, 84, 130], max_scenario_cost=75_000)
 
-        self.assertEqual([sc.seed for sc in scenarios], [73])
-        self.assertEqual([sc.seed for sc, _ in skipped], [56, 130])
+        self.assertEqual([sc.seed for sc in scenarios], [83])
+        self.assertEqual([sc.seed for sc, _ in skipped], [56, 84, 130])
         self.assertGreater(skipped[0][1], 75_000)
+
+    def test_duchon_extra_terms_raise_estimated_cost(self) -> None:
+        low_dim = _FUZZ.generate_scenario(121)
+        high_dim = _FUZZ.generate_scenario(84)
+
+        self.assertEqual(low_dim.basis_type, "duchon")
+        self.assertEqual(high_dim.basis_type, "duchon")
+        self.assertGreater(_FUZZ.estimate_scenario_cost(high_dim), 75_000)
+        self.assertLess(_FUZZ.estimate_scenario_cost(low_dim), 75_000)
 
 
 if __name__ == "__main__":
