@@ -434,28 +434,6 @@ mod tests {
         Ok(gradient[rho.len()])
     }
 
-    fn single_directional_tau_cost_fd(
-        y: &Array1<f64>,
-        w: &Array1<f64>,
-        x: &Array2<f64>,
-        s0: &Array2<f64>,
-        cfg: &RemlConfig,
-        rho: &Array1<f64>,
-        x_tau: &Array2<f64>,
-        s_tau: &Array2<f64>,
-        h: f64,
-    ) -> Result<f64, EstimationError> {
-        let x_plus = x + &x_tau.mapv(|v| h * v);
-        let x_minus = x - &x_tau.mapv(|v| h * v);
-        let s_plus = s0 + &s_tau.mapv(|v| h * v);
-        let s_minus = s0 - &s_tau.mapv(|v| h * v);
-        let state_plus = build_logit_state(y, w, &x_plus, &s_plus, cfg);
-        let state_minus = build_logit_state(y, w, &x_minus, &s_minus, cfg);
-        let cost_plus = state_plus.compute_cost(rho)?;
-        let cost_minus = state_minus.compute_cost(rho)?;
-        Ok((cost_plus - cost_minus) / (2.0 * h))
-    }
-
     fn directional_tau_hessian_fd_reference(
         y: &Array1<f64>,
         w: &Array1<f64>,
