@@ -6207,14 +6207,13 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build psi design maps once outside the row loop.
-        let policy = crate::resource::ResourcePolicy::default_library();
         let psi_map_i = crate::families::custom_family::resolve_custom_family_x_psi_map(
             deriv_i,
             n,
             p_psi_i,
             0..n,
             label_i,
-            &policy,
+            &self.policy,
         )?;
         let psi_map_j = crate::families::custom_family::resolve_custom_family_x_psi_map(
             deriv_j,
@@ -6222,7 +6221,7 @@ impl BernoulliMarginalSlopeFamily {
             p_psi_j,
             0..n,
             label_j,
-            &policy,
+            &self.policy,
         )?;
         let psi_map_ij = if block_i == block_j {
             Some(
@@ -6234,7 +6233,7 @@ impl BernoulliMarginalSlopeFamily {
                     p_psi_i,
                     0..n,
                     label_i,
-                    &policy,
+                    &self.policy,
                 )?,
             )
         } else {

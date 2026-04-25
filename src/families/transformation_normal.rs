@@ -601,6 +601,40 @@ fn chunked_weighted_bt_d(
     out
 }
 
+/// Chunked weighted `B^T diag(w) D` product where `B` and `D` are
+/// operator-backed `DesignMatrix` instances. Materializes only one row chunk
+/// at a time using the operator's `row_chunk` primitive, so neither factor's
+/// full dense form ever lives in memory.
+fn chunked_weighted_bt_d_designmatrix(
+    b: &DesignMatrix,
+    weights: ndarray::ArrayView1<'_, f64>,
+    d: &DesignMatrix,
+    policy: &ResourcePolicy,
+) -> Array2<f64> {
+    let n = weights.len();
+    let pb = b.ncols();
+    let pd = d.ncols();
+    let rows_per_chunk =
+        crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
+    let mut out = Array2::<f64>::zeros((pb, pd));
+    for start in (0..n).step_by(rows_per_chunk) {
+        let end = (start + rows_per_chunk).min(n);
+        let bl = b.row_chunk(start..end);
+        let dl = d.row_chunk(start..end);
+        let mut dw = dl;
+        for local in 0..(end - start) {
+            let w = weights[start + local];
+            if w != 1.0 {
+                for j in 0..pd {
+                    dw[[local, j]] *= w;
+                }
+            }
+        }
+        out += &bl.t().dot(&dw);
+    }
+    out
+}
+
 fn weighted_crossprod_operator(
     op_left: &dyn LinearOperator,
     weights: &Array1<f64>,
@@ -1859,14 +1893,19 @@ impl KroneckerDesign {
                         for r in 0..n {
                             pair_weights[r] = weights[r] * a_col[r] * c_col[r];
                         }
-                        let block = weighted_crossprod_operator(b, &pair_weights, d)?;
+                        // Route through the chunked DesignMatrix helper so the
+                        // operator-backed covariate factors stay row-chunkable
+                        // and never materialize n × p_cov in one shot.
+                        let block = chunked_weighted_bt_d_designmatrix(
+                            b,
+                            pair_weights.view(),
+                            d,
+                            policy,
+                        );
                         out.slice_mut(s![ia * pb..(ia + 1) * pb, ic * pd..(ic + 1) * pd])
                             .assign(&block);
                     }
                 }
-                // TODO(ctn-factored-migration): chunk the operator fallback once
-                // DesignMatrix exposes a chunked B^T diag(w) D primitive.
-                let _ = policy;
                 Ok(out)
             }
         }
