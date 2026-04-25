@@ -1245,6 +1245,8 @@ impl<'a> RemlState<'a> {
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
                     firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
                 })
                 .collect::<Vec<_>>());
         }
@@ -1541,6 +1543,15 @@ impl<'a> RemlState<'a> {
             // Uses the exact pseudoinverse (via fixed_subspace_penalty_trace).
             let ld_s_j =
                 self.fixed_subspace_penalty_trace(&e_eval, &s_tau_j, pirls_result.ridge_passport)?;
+            let tk_x_fixed = Some(
+                Self::ensure_transformed_x_tau_dense(
+                    &mut x_tau_j_dense,
+                    &hyper_dirs[j],
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )?
+                .clone(),
+            );
 
             coords.push(super::unified::HyperCoord {
                 a: a_j,
@@ -1550,6 +1561,8 @@ impl<'a> RemlState<'a> {
                 b_depends_on_beta,
                 is_penalty_like: hyper_dirs[j].is_penalty_like,
                 firth_g: firth_g_j,
+                tk_eta_fixed: Some(x_tau_beta_j.clone()),
+                tk_x_fixed,
             });
         }
 
@@ -1726,6 +1739,8 @@ impl<'a> RemlState<'a> {
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
                     firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
                 })
                 .collect());
         }
@@ -1841,6 +1856,8 @@ impl<'a> RemlState<'a> {
                 b_depends_on_beta: !is_gaussian_identity,
                 is_penalty_like: dir.is_penalty_like,
                 firth_g: firth_g_j,
+                tk_eta_fixed: Some(x_tau_beta_j),
+                tk_x_fixed: Some(dir.x_tau_dense()),
             });
         }
 
@@ -2392,6 +2409,8 @@ impl<'a> RemlState<'a> {
                     b_depends_on_beta: true,
                     is_penalty_like: false,
                     firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
                 })
                 .collect());
         }
@@ -2507,6 +2526,8 @@ impl<'a> RemlState<'a> {
                 // penalty matrix derivatives. Not eligible for EFS.
                 is_penalty_like: false,
                 firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
             });
         }
 
@@ -2576,6 +2597,8 @@ impl<'a> RemlState<'a> {
                     b_depends_on_beta: true,
                     is_penalty_like: false,
                     firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
                 })
                 .collect());
         }
@@ -2675,6 +2698,8 @@ impl<'a> RemlState<'a> {
                 b_depends_on_beta: true,
                 is_penalty_like: false,
                 firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
             });
         }
 

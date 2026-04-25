@@ -1875,19 +1875,35 @@ pub fn stable_reparameterizationwith_invariant(
         }
     }
 
-    // Exact pseudo-logdet on the structural penalized block.  The null block is
-    // split out above, so there is no δ-dependent nullspace normalization here.
-    let delta = 0.0;
+    // Pseudo-logdet on the structural penalized block.  The null block is split
+    // out above, so there is no nullspace normalization here.  Spectrally-noisy
+    // directions (eigenvalues clamped to 0 by `clamp_eigenvalues_for_stability`
+    // because they fall below `scale * 1e-12` in the lambda-weighted sum) are
+    // floored to `eigenvalue_floor` to keep the log-det finite and consistent
+    // with the floored values used to construct `e_transformed_mat` above.
+    // This avoids spurious P-IRLS failures when the lambda dynamic range is
+    // wide (e.g. during BFGS line search probing extreme rho candidates) while
+    // still rejecting genuinely non-finite or large negative eigenvalues.
+    //
+    // The same floored spectrum is used in the trace formula tr(S⁺ S_k) below,
+    // matching the rank structure embedded in `e_transformed_mat` and avoiding
+    // a 1/0 in the trace contraction when an eigenvalue was clamped to 0.
+    let mut floored_eigs: Vec<f64> = Vec::with_capacity(range_eigs_sorted.len());
     let mut log_det_sum = KahanSum::default();
-    for (idx, &ev) in range_eigs_sorted.iter().take(penalized_rank).enumerate() {
-        if !ev.is_finite() || ev <= 0.0 {
+    for (idx, &ev) in range_eigs_sorted.iter().enumerate() {
+        if !ev.is_finite() || ev < -eigenvalue_floor {
             return Err(EstimationError::LayoutError(format!(
-                "Penalty pseudo-logdet has a non-positive structural eigenvalue at index {idx}: {ev:.3e}"
+                "Penalty pseudo-logdet has a non-finite or large-negative structural eigenvalue at index {idx}: {ev:.3e}"
             )));
         }
-        log_det_sum.add(ev.ln());
+        let safe_ev = ev.max(eigenvalue_floor);
+        floored_eigs.push(safe_ev);
+        if idx < penalized_rank {
+            log_det_sum.add(safe_ev.ln());
+        }
     }
     let log_det = log_det_sum.sum();
+    let delta = 0.0;
 
     let mut det1vec = vec![0.0; lambdas.len()];
 
@@ -1900,7 +1916,7 @@ pub fn stable_reparameterizationwith_invariant(
             s_k,
             penalized_rank,
             &range_rotation,
-            &range_eigs_sorted,
+            &floored_eigs,
             delta,
         );
         det1vec[k] = *lambda * trace;
@@ -1922,7 +1938,7 @@ pub fn stable_reparameterizationwith_invariant(
             );
             let mut trace = KahanSum::default();
             for l in 0..penalized_rank {
-                trace.add(s_k_eigenbasis[(l, l)] / (range_eigs_sorted[l] + delta));
+                trace.add(s_k_eigenbasis[(l, l)] / (floored_eigs[l] + delta));
             }
             let reference = *lambda * trace.sum();
             maxdet1_mismatch = maxdet1_mismatch.max((reference - det1vec[k]).abs());
