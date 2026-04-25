@@ -372,7 +372,7 @@ impl<'a> RemlState<'a> {
                         let weight = ci * cj * gij * gij;
                         let ii = i0 + bi;
                         let jj = j0 + bj;
-                        let sym_factor = if ii == jj { 1.0 } else { 2.0 };
+                        let sym_factor = if i0 == j0 { 1.0 } else { 2.0 };
                         let scale = -0.25 * weight * sym_factor;
                         if ii == jj {
                             let z_i = z.column(ii);
