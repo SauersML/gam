@@ -409,10 +409,10 @@ mod tests {
     fn h_original_from_bundle(bundle: &EvalShared) -> Array2<f64> {
         let pr = bundle.pirls_result.as_ref();
         match pr.coordinate_frame {
-            PirlsCoordinateFrame::OriginalSparseNative => bundle.h_eff.as_ref().clone(),
+            PirlsCoordinateFrame::OriginalSparseNative => bundle.h_total.as_ref().clone(),
             PirlsCoordinateFrame::TransformedQs => {
                 let qs = &pr.reparam_result.qs;
-                let tmp = qs.dot(bundle.h_eff.as_ref());
+                let tmp = qs.dot(bundle.h_total.as_ref());
                 tmp.dot(&qs.t())
             }
         }
@@ -3654,9 +3654,9 @@ pub(crate) struct EvalShared {
     pub(crate) pirls_result: Arc<PirlsResult>,
     ridge_passport: RidgePassport,
     geometry: RemlGeometry,
-    h_eff: Arc<Array2<f64>>,
     /// The exact H_total matrix used for LAML cost computation.
-    /// For Firth: h_eff - hphi. For non-Firth: h_eff.
+    /// For Firth: effective Hessian minus hphi (plus any barrier curvature).
+    /// For non-Firth: the effective Hessian itself (plus any barrier curvature).
     h_total: Arc<Array2<f64>>,
     sparse_exact: Option<Arc<SparseExactEvalData>>,
     firth_dense_operator: Option<Arc<FirthDenseOperator>>,
