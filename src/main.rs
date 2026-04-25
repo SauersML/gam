@@ -852,7 +852,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
 
-    let mut family = resolve_family(FamilyArg::Auto, link_choice.clone(), y.view())?;
+    let family = resolve_family(FamilyArg::Auto, link_choice.clone(), y.view())?;
     if link_choice.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
@@ -866,18 +866,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             ));
         }
     }
-    let mut effective_link = link_choice
+    let effective_link = link_choice
         .as_ref()
         .map(|c| c.link)
         .unwrap_or_else(|| family_to_link(family));
-
-    if args.predict_noise.is_some()
-        && family == LikelihoodFamily::BinomialLogit
-        && link_choice.is_none()
-    {
-        family = LikelihoodFamily::BinomialProbit;
-        effective_link = family_to_link(family);
-    }
 
     let formula_linkwiggle = parsed.linkwiggle.clone();
     if parsed.timewiggle.is_some() {
@@ -11341,7 +11333,7 @@ mod tests {
         run_fit(FitArgs {
             data: train_path,
             formula_positional:
-                "y ~ x + link(type=logit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
+                "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
             predict_noise: None,
             logslope_formula: Some(
                 "1 + linkwiggle(degree=3, internal_knots=4, penalty_order=\"2\")".to_string(),
@@ -11391,7 +11383,7 @@ mod tests {
             saved
                 .resolved_inverse_link()
                 .expect("resolved inverse link"),
-            Some(InverseLink::Standard(LinkFunction::Logit))
+            Some(InverseLink::Standard(LinkFunction::Probit))
         );
     }
 
