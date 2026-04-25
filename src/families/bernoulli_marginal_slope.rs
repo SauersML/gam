@@ -15,7 +15,7 @@ use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DenseDesignOperator, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
@@ -7268,8 +7268,14 @@ impl BernoulliMarginalSlopeFamily {
                 let start = chunk_idx * ROW_CHUNK_SIZE;
                 let end = (start + ROW_CHUNK_SIZE).min(n);
                 let rows = end - start;
-                let marginal_chunk = self.marginal_design.row_chunk(start..end);
-                let logslope_chunk = self.logslope_design.row_chunk(start..end);
+                let marginal_chunk = self
+                    .marginal_design
+                    .try_row_chunk(start..end)
+                    .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                let logslope_chunk = self
+                    .logslope_design
+                    .try_row_chunk(start..end)
+                    .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
                 let mut grad_marginal_weights = Array1::<f64>::zeros(rows);
                 let mut grad_logslope_weights = Array1::<f64>::zeros(rows);
                 let mut hess_marginal_weights = Array1::<f64>::zeros(rows);

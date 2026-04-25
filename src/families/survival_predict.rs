@@ -554,8 +554,7 @@ fn evaluate_marginal_slope_row(
     // For timewiggle the `exit_design` row enters the predictor's q-design;
     // the `derivative_design` row enters the time-derivative used to build the
     // hazard. Both are evaluated at the wiggle anchor `q_exit_base`.
-    let (qd_with_wiggle, exit_wiggle_design) = if let Some(runtime) =
-        ctx.saved_timewiggle.as_ref()
+    let (qd_with_wiggle, exit_wiggle_design) = if let Some(runtime) = ctx.saved_timewiggle.as_ref()
     {
         let knots = Array1::from_vec(runtime.knots.clone());
         let beta_w = beta_time.slice(s![p_time_base..]).to_owned();

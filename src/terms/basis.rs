@@ -10344,8 +10344,8 @@ fn matern_operator_psi_triplet(
     // Operator-level analytic identities used by Thread-1 penalties:
     //   D0 uses phi,
     //   D1 uses phi'(r)/r,
-    //   D2 uses Laplacian:
-    //       Delta phi = phi''(r) + (d-1) * phi'(r)/r.
+    //   D2 uses full Hessian rows:
+    //       ∂²φ/∂x_b∂x_c = δ_bc w_b q + (w_b h_b)(w_c h_c)t.
     //
     // For each half-integer nu, we use closed forms:
     //   phi''(r)      = s^2 * e^{-a} * R_nu(a),

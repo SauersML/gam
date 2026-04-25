@@ -1288,7 +1288,7 @@ impl BlockHessianAccumulator {
         family: &SurvivalMarginalSlopeFamily,
         row: usize,
         primary_hessian: &Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         // Time×time block: 3×3 design cross-products
         let time_designs = [
             &family.design_entry,
@@ -1304,7 +1304,7 @@ impl BlockHessianAccumulator {
                         primary_hessian[[a, b]],
                         &mut self.h_tt,
                     )
-                    .expect("time block row_outer_into dimension mismatch");
+                    .map_err(|e| format!("add_pullback time row_outer_into: {e}"))?;
             }
         }
 
@@ -1316,20 +1316,26 @@ impl BlockHessianAccumulator {
         family
             .marginal_design
             .syr_row_into(row, mm_weight, &mut self.h_mm)
-            .expect("marginal syr_row_into dimension mismatch");
+            .map_err(|e| format!("add_pullback marginal syr_row_into: {e}"))?;
 
         // Logslope×logslope: single rank-1
         family
             .logslope_design
             .syr_row_into(row, primary_hessian[[3, 3]], &mut self.h_gg)
-            .expect("logslope syr_row_into dimension mismatch");
+            .map_err(|e| format!("add_pullback logslope syr_row_into: {e}"))?;
 
         // Marginal×logslope cross-block
         let mg_weight = primary_hessian[[0, 3]] + primary_hessian[[1, 3]];
         if mg_weight != 0.0 {
-            let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+            let m_chunk = family
+                .marginal_design
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_pullback marginal_design try_row_chunk: {e}"))?;
             let m_row = m_chunk.row(0);
-            let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+            let g_chunk = family
+                .logslope_design
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
             let g_row = g_chunk.row(0);
             ndarray::linalg::general_mat_mul(
                 mg_weight,
@@ -1346,13 +1352,18 @@ impl BlockHessianAccumulator {
             primary_hessian[[1, 3]],
             primary_hessian[[2, 3]],
         ];
-        let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+        let g_chunk = family
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
         let g_row = g_chunk.row(0);
         for (des, alpha) in time_designs.iter().zip(tg_weights.iter()) {
             if *alpha == 0.0 {
                 continue;
             }
-            let t_chunk = des.row_chunk(row..row + 1);
+            let t_chunk = des
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_pullback time design try_row_chunk: {e}"))?;
             let t_row = t_chunk.row(0);
             ndarray::linalg::general_mat_mul(
                 *alpha,
@@ -1369,13 +1380,18 @@ impl BlockHessianAccumulator {
             primary_hessian[[1, 0]] + primary_hessian[[1, 1]],
             primary_hessian[[2, 0]] + primary_hessian[[2, 1]],
         ];
-        let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+        let m_chunk = family
+            .marginal_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("add_pullback marginal_design try_row_chunk: {e}"))?;
         let m_row = m_chunk.row(0);
         for (des, alpha) in time_designs.iter().zip(tm_weights.iter()) {
             if *alpha == 0.0 {
                 continue;
             }
-            let t_chunk = des.row_chunk(row..row + 1);
+            let t_chunk = des
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_pullback time design try_row_chunk: {e}"))?;
             let t_row = t_chunk.row(0);
             ndarray::linalg::general_mat_mul(
                 *alpha,
@@ -1399,7 +1415,9 @@ impl BlockHessianAccumulator {
                     if *alpha == 0.0 {
                         continue;
                     }
-                    let t_chunk = des.row_chunk(row..row + 1);
+                    let t_chunk = des
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback time design try_row_chunk: {e}"))?;
                     let t_row = t_chunk.row(0);
                     for coeff_idx in 0..t_row.len() {
                         self.h_th[[coeff_idx, local_idx]] += *alpha * t_row[coeff_idx];
@@ -1408,7 +1426,10 @@ impl BlockHessianAccumulator {
 
                 let mh_weight = primary_hessian[[0, idx]] + primary_hessian[[1, idx]];
                 if mh_weight != 0.0 {
-                    let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+                    let m_chunk = family
+                        .marginal_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback marginal_design try_row_chunk: {e}"))?;
                     let m_row = m_chunk.row(0);
                     for coeff_idx in 0..m_row.len() {
                         self.h_mh[[coeff_idx, local_idx]] += mh_weight * m_row[coeff_idx];
@@ -1417,7 +1438,10 @@ impl BlockHessianAccumulator {
 
                 let gh_weight = primary_hessian[[3, idx]];
                 if gh_weight != 0.0 {
-                    let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+                    let g_chunk = family
+                        .logslope_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
                     let g_row = g_chunk.row(0);
                     for coeff_idx in 0..g_row.len() {
                         self.h_gh[[coeff_idx, local_idx]] += gh_weight * g_row[coeff_idx];
@@ -1445,7 +1469,9 @@ impl BlockHessianAccumulator {
                     if *alpha == 0.0 {
                         continue;
                     }
-                    let t_chunk = des.row_chunk(row..row + 1);
+                    let t_chunk = des
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback time design try_row_chunk: {e}"))?;
                     let t_row = t_chunk.row(0);
                     for coeff_idx in 0..t_row.len() {
                         self.h_tw[[coeff_idx, local_idx]] += *alpha * t_row[coeff_idx];
@@ -1454,7 +1480,10 @@ impl BlockHessianAccumulator {
 
                 let mw_weight = primary_hessian[[0, idx]] + primary_hessian[[1, idx]];
                 if mw_weight != 0.0 {
-                    let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+                    let m_chunk = family
+                        .marginal_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback marginal_design try_row_chunk: {e}"))?;
                     let m_row = m_chunk.row(0);
                     for coeff_idx in 0..m_row.len() {
                         self.h_mw[[coeff_idx, local_idx]] += mw_weight * m_row[coeff_idx];
@@ -1463,7 +1492,10 @@ impl BlockHessianAccumulator {
 
                 let gw_weight = primary_hessian[[3, idx]];
                 if gw_weight != 0.0 {
-                    let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+                    let g_chunk = family
+                        .logslope_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
                     let g_row = g_chunk.row(0);
                     for coeff_idx in 0..g_row.len() {
                         self.h_gw[[coeff_idx, local_idx]] += gw_weight * g_row[coeff_idx];
@@ -1487,6 +1519,8 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Add a rank-1 update from psi_row (in the psi block) crossed with the
@@ -1498,7 +1532,7 @@ impl BlockHessianAccumulator {
         psi_block_idx: usize,
         psi_row: &Array1<f64>,
         right_primary: &Array1<f64>,
-    ) {
+    ) -> Result<(), String> {
         // right_primary components mapped to blocks:
         // time:     entry*rp[0] + exit*rp[1] + deriv*rp[2]
         // marginal: marginal*(rp[0] + rp[1])
@@ -1516,7 +1550,9 @@ impl BlockHessianAccumulator {
             if *alpha == 0.0 {
                 continue;
             }
-            let t_chunk = des.row_chunk(row..row + 1);
+            let t_chunk = des
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_rank1_psi_cross time design try_row_chunk: {e}"))?;
             let t_row = t_chunk.row(0);
             let t_col = t_row.view().insert_axis(Axis(1));
             match psi_block_idx {
@@ -1549,7 +1585,10 @@ impl BlockHessianAccumulator {
         // Block (psi, marginal) or (marginal, psi)
         let m_alpha = right_primary[0] + right_primary[1];
         if m_alpha != 0.0 {
-            let m_chunk = family.marginal_design.row_chunk(row..row + 1);
+            let m_chunk = family
+                .marginal_design
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_rank1_psi_cross marginal_design try_row_chunk: {e}"))?;
             let m_row = m_chunk.row(0);
             match psi_block_idx {
                 1 => {
@@ -1587,7 +1626,10 @@ impl BlockHessianAccumulator {
 
         // Block (psi, logslope) or (logslope, psi)
         if right_primary[3] != 0.0 {
-            let g_chunk = family.logslope_design.row_chunk(row..row + 1);
+            let g_chunk = family
+                .logslope_design
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| format!("add_rank1_psi_cross logslope_design try_row_chunk: {e}"))?;
             let g_row = g_chunk.row(0);
             match psi_block_idx {
                 1 => {
