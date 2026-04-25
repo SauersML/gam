@@ -903,11 +903,9 @@ impl<'a> RemlState<'a> {
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
         ) && free_basis_opt.is_none();
-        let h_tk_source = if self.config.firth_bias_reduction {
-            bundle.h_total.as_ref()
-        } else {
-            bundle.h_eff.as_ref()
-        };
+        // `firth_bias_reduction == true` here: the early return above bails
+        // out otherwise, so h_total is the only TK-relevant operator.
+        let h_tk_source = bundle.h_total.as_ref();
         let h_tk_eval = if use_original_basis {
             self.bundle_matrix_in_original_basis(pirls_result, h_tk_source)
         } else if let Some(z) = free_basis_opt.as_ref() {
@@ -2091,9 +2089,7 @@ impl<'a> RemlState<'a> {
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
-        let (h_eff, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
-
-        let mut h_total = h_eff.clone();
+        let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit)
@@ -2183,7 +2179,6 @@ impl<'a> RemlState<'a> {
             pirls_result,
             ridge_passport,
             geometry: RemlGeometry::DenseSpectral,
-            h_eff: Arc::new(h_eff),
             h_total: Arc::new(h_total),
             sparse_exact: None,
             firth_dense_operator,
@@ -2287,7 +2282,6 @@ impl<'a> RemlState<'a> {
             pirls_result,
             ridge_passport,
             geometry: RemlGeometry::SparseExactSpd,
-            h_eff: Arc::new(Array2::zeros((0, 0))),
             h_total: Arc::new(Array2::zeros((0, 0))),
             sparse_exact: Some(Arc::new({
                 let factor = Arc::new(sparse_system.factor);
@@ -2937,7 +2931,7 @@ impl<'a> RemlState<'a> {
     ///
     /// # Arguments
     /// - `pirls_result`: the inner-loop solution
-    /// - `bundle`: the evaluation bundle (carries h_eff, firth operator, etc.)
+    /// - `bundle`: the evaluation bundle (carries h_total, firth operator, etc.)
     /// - `free_basis_opt`: optional constraint-projection basis
     /// - `include_firth_derivs`: whether to wrap the derivative provider with
     ///   Firth-aware derivatives
