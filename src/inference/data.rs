@@ -200,7 +200,7 @@ fn load_delimited_inferred(
     let mut level_index: Vec<HashMap<String, usize>> = vec![HashMap::new(); p];
     let mut levels: Vec<Vec<String>> = vec![Vec::new(); p];
 
-    let t_stream = std::time::Instant::now();
+    let _t_stream = std::time::Instant::now();
     let mut record = StringRecord::new();
     while rdr
         .read_record(&mut record)
@@ -962,13 +962,36 @@ fn load_parquet_inferred(
             });
         }
     }
+    let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
+    if verbose || schema_ms > 100.0 {
+        let n_cat = column_kinds
+            .iter()
+            .filter(|k| matches!(k, ColumnKindTag::Categorical))
+            .count();
+        log::info!(
+            "[DATA-LOAD] parquet_finalize_schema | n_cols={} | n_cat={} | {:.1}ms",
+            p,
+            n_cat,
+            schema_ms
+        );
+    }
 
+    let t_assemble = std::time::Instant::now();
     // Assemble Array2.
     let mut values = Array2::<f64>::zeros((total_rows, p));
     for j in 0..p {
         for (i, &v) in col_vecs[j].iter().enumerate() {
             values[[i, j]] = v;
         }
+    }
+    let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
+    if verbose || assemble_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] parquet_assemble_array2 | n_rows={} | n_cols={} | {:.1}ms",
+            total_rows,
+            p,
+            assemble_ms
+        );
     }
 
     Ok(EncodedDataset {

@@ -2342,7 +2342,9 @@ fn materialize_transformation_normal<'a>(
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
-    let mut covariate_spec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
+    let policy = resolved_resource_policy(config);
+    let mut covariate_spec =
+        build_termspec(&parsed.terms, data, col_map, &mut inference_notes, &policy)?;
     if config.scale_dimensions {
         enable_scale_dimensions(&mut covariate_spec);
     }
@@ -2390,9 +2392,15 @@ fn materialize_location_scale<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let mut meanspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes)?;
-    let mut log_sigmaspec =
-        build_termspec(&noise_parsed.terms, data, col_map, &mut inference_notes)?;
+    let policy = resolved_resource_policy(config);
+    let mut meanspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes, &policy)?;
+    let mut log_sigmaspec = build_termspec(
+        &noise_parsed.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        &policy,
+    )?;
     if config.scale_dimensions {
         enable_scale_dimensions(&mut meanspec);
         enable_scale_dimensions(&mut log_sigmaspec);

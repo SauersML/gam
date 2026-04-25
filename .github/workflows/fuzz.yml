@@ -32,6 +32,11 @@ env:
   # them. See solver/visualizer.rs::{pirls,reml}_info_enabled.
   GAM_LOG_PIRLS_INFO: "1"
   GAM_LOG_REML_INFO: "1"
+  # Verbose data-loading instrumentation: emits per-substage timings
+  # (delim_open+headers, delim_stream+infer, delim_finalize_schema,
+  # delim_assemble_array2, ffi_string_records, ffi_encode_inferred, parquet_*)
+  # below the default 100ms threshold. See solver/visualizer.rs::data_info_enabled.
+  GAM_LOG_DATA_INFO: "1"
   RUST_LOG: "info"
 
 jobs:
