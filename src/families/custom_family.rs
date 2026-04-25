@@ -7648,6 +7648,12 @@ fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
     if let Some(firth_g) = coord.firth_g.as_mut() {
         *firth_g *= scale;
     }
+    if let Some(tk_eta_fixed) = coord.tk_eta_fixed.as_mut() {
+        *tk_eta_fixed *= scale;
+    }
+    if let Some(tk_x_fixed) = coord.tk_x_fixed.as_mut() {
+        *tk_x_fixed *= scale;
+    }
     coord.drift = scale_hypercoord_drift(coord.drift, scale);
     coord
 }
@@ -9081,6 +9087,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 b_depends_on_beta: !hessian_beta_independent,
                 is_penalty_like: false,
                 firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
             });
 
             psi_global += 1;
