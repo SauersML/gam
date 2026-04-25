@@ -635,35 +635,6 @@ fn chunked_weighted_bt_d_designmatrix(
     out
 }
 
-fn weighted_crossprod_operator(
-    op_left: &dyn LinearOperator,
-    weights: &Array1<f64>,
-    op_right: &dyn LinearOperator,
-) -> Result<Array2<f64>, String> {
-    if weights.len() != op_left.nrows() || weights.len() != op_right.nrows() {
-        return Err(format!(
-            "weighted_crossprod_operator dimension mismatch: weights={}, left_rows={}, right_rows={}",
-            weights.len(),
-            op_left.nrows(),
-            op_right.nrows()
-        ));
-    }
-    let p_left = op_left.ncols();
-    let p_right = op_right.ncols();
-    let mut out = Array2::<f64>::zeros((p_left, p_right));
-
-    for j in 0..p_right {
-        let mut e = Array1::<f64>::zeros(p_right);
-        e[j] = 1.0;
-        let col = op_right.apply(&e);
-        let weighted_col = &col * weights;
-        let xt_col = op_left.apply_transpose(&weighted_col);
-        out.column_mut(j).assign(&xt_col);
-    }
-
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // CustomFamily implementation
 // ---------------------------------------------------------------------------
@@ -1896,12 +1867,8 @@ impl KroneckerDesign {
                         // Route through the chunked DesignMatrix helper so the
                         // operator-backed covariate factors stay row-chunkable
                         // and never materialize n × p_cov in one shot.
-                        let block = chunked_weighted_bt_d_designmatrix(
-                            b,
-                            pair_weights.view(),
-                            d,
-                            policy,
-                        );
+                        let block =
+                            chunked_weighted_bt_d_designmatrix(b, pair_weights.view(), d, policy);
                         out.slice_mut(s![ia * pb..(ia + 1) * pb, ic * pd..(ic + 1) * pd])
                             .assign(&block);
                     }

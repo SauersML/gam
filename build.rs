@@ -50,10 +50,21 @@ fn scan_for_banned_marker(
     for entry in read.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+        if path
+            .strip_prefix(root)
+            .ok()
+            .is_some_and(|rel| rel.starts_with("bench/runtime/pydeps"))
+        {
+            continue;
+        }
         if name.starts_with('.')
             || name == "target"
+            || name.starts_with("target-")
             || name == "node_modules"
             || name == "__pycache__"
+            || name == "pydeps"
+            || name == "site-packages"
+            || name == "venv"
             || name == "dist"
             || name == "build"
         {

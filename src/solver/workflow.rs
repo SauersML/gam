@@ -133,6 +133,7 @@ pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub spec: BernoulliMarginalSlopeTermSpec,
     pub options: BlockwiseFitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 pub struct SurvivalMarginalSlopeFitRequest<'a> {
@@ -284,32 +285,10 @@ struct MarginalSlopeDeviationRouting {
 fn route_marginal_slope_deviation_blocks(
     main_linkwiggle: Option<&LinkWiggleFormulaSpec>,
     logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
-    disable_link_dev: bool,
-    disable_score_warp: bool,
-    family_label: &str,
-    logslope_flag: &str,
 ) -> Result<MarginalSlopeDeviationRouting, String> {
-    if main_linkwiggle.is_some() && disable_link_dev {
-        return Err(format!(
-            "{family_label} main-formula linkwiggle(...) routes into the anchored internal link-deviation block; remove disable_link_dev or remove linkwiggle(...) from the main formula"
-        ));
-    }
-    if logslope_linkwiggle.is_some() && disable_score_warp {
-        return Err(format!(
-            "{family_label} {logslope_flag} linkwiggle(...) routes into the anchored internal score-warp block; remove disable_score_warp or remove linkwiggle(...) from {logslope_flag}"
-        ));
-    }
     Ok(MarginalSlopeDeviationRouting {
-        score_warp: if disable_score_warp {
-            None
-        } else {
-            logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle)
-        },
-        link_dev: if disable_link_dev {
-            None
-        } else {
-            main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle)
-        },
+        score_warp: logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
+        link_dev: main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
     })
 }
 
@@ -808,6 +787,7 @@ fn fit_bernoulli_marginal_slope_model(
         request.spec,
         &request.options,
         &request.kappa_options,
+        &request.policy,
     )
 }
 
@@ -980,14 +960,6 @@ pub struct FitConfig {
     /// `noise_formula` and with `Surv(...)` responses.
     pub transformation_normal: bool,
 
-    /// Disable routing the main formula's `linkwiggle(...)` term into the
-    /// anchored internal link-deviation block for marginal-slope families.
-    /// Errors if the main formula still contains `linkwiggle(...)`.
-    pub disable_link_dev: bool,
-    /// Disable routing the `logslope_formula`'s `linkwiggle(...)` term into
-    /// the anchored internal score-warp block for marginal-slope families.
-    /// Errors if `logslope_formula` still contains `linkwiggle(...)`.
-    pub disable_score_warp: bool,
     /// Enable Firth bias reduction for standard single-parameter families.
     pub firth: bool,
 
@@ -1028,8 +1000,6 @@ impl Default for FitConfig {
             scale_dimensions: false,
             ridge_lambda: 1e-6,
             transformation_normal: false,
-            disable_link_dev: false,
-            disable_score_warp: false,
             firth: false,
             resource_policy: None,
         }
@@ -1631,10 +1601,6 @@ fn materialize_bernoulli_marginal_slope<'a>(
     let routing = route_marginal_slope_deviation_blocks(
         parsed.linkwiggle.as_ref(),
         parsed_logslope.linkwiggle.as_ref(),
-        config.disable_link_dev,
-        config.disable_score_warp,
-        "Bernoulli marginal-slope",
-        "logslope_formula",
     )?;
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
@@ -1660,6 +1626,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
                 ..Default::default()
             },
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            policy,
         }),
         inference_notes,
     })
@@ -1909,10 +1876,6 @@ fn materialize_survival<'a>(
                 route_marginal_slope_deviation_blocks(
                     parsed.linkwiggle.as_ref(),
                     ls_parsed.linkwiggle.as_ref(),
-                    config.disable_link_dev,
-                    config.disable_score_warp,
-                    "survival marginal-slope",
-                    "logslope_formula",
                 )?,
             )
         } else {
@@ -1925,14 +1888,7 @@ fn materialize_survival<'a>(
             )?;
             (
                 Some(termspec.clone()),
-                route_marginal_slope_deviation_blocks(
-                    parsed.linkwiggle.as_ref(),
-                    None,
-                    config.disable_link_dev,
-                    config.disable_score_warp,
-                    "survival marginal-slope",
-                    "logslope_formula",
-                )?,
+                route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)?,
             )
         }
     } else {

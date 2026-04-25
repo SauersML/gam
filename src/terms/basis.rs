@@ -2105,10 +2105,9 @@ pub fn should_use_implicit_operators_with_policy(
     dense_bytes > policy.max_single_materialization_bytes
 }
 
-/// Backwards-compatible wrapper around [`should_use_implicit_operators_with_policy`]
-/// that uses the default library [`crate::resource::ResourcePolicy`].
+/// Default-policy wrapper around [`should_use_implicit_operators_with_policy`].
 //
-// TODO(resource-policy-migration): four real call sites
+// Remaining call sites:
 //   * `src/solver/reml/hyper.rs:~1286` — invoked from
 //     `EvaluationCtx::compute_directional_derivatives`; the `ReshapedReml` /
 //     `EvaluationCtx` chain does not currently carry a `ResourcePolicy`.
@@ -6119,15 +6118,15 @@ fn matern_aniso_radial_scalars(
     Ok((phi, q, t))
 }
 
-/// Extended radial scalars for exact per-axis η_a derivatives of the Matérn
-/// operator collocation matrices D₁ (gradient) and D₂ (Laplacian).
+/// Extended radial scalars for exact per-axis eta_a derivatives of the Matérn
+/// operator collocation matrices D1 (gradient) and D2 (full Hessian).
 ///
 /// Returns `(phi, q, t, dt_dr, d2t_dr2)` where:
 ///   - phi   = φ(r)                  (kernel value)
 ///   - q     = φ'(r)/r               (used in D₁)
-///   - t     = (φ''(r) - q) / r²     (used in D₀/D₁ per-axis chain)
-///   - dt_dr = dt/dr                 (needed for D₁ second η-derivative)
-///   - d2t_dr2 = d²t/dr²            (needed for D₂ second η-derivative)
+///   - t     = (phi''(r) - q) / r^2  (Hessian mixed-curvature scalar)
+///   - dt_dr = dt/dr                 (needed for second eta-derivatives)
+///   - d2t_dr2 = d2t/dr2             (needed for second eta-derivatives)
 ///
 /// At r = 0 (center collision), the function returns zeros for all quantities
 /// that would be multiplied by s_a (which also vanishes at collision).
@@ -6273,6 +6272,134 @@ fn matern_aniso_extended_radial_scalars(
     }
 }
 
+#[inline(always)]
+fn hessian_operator_entry(
+    q: f64,
+    t: f64,
+    h_b: f64,
+    h_c: f64,
+    w_b: f64,
+    w_c: f64,
+    axis_b: usize,
+    axis_c: usize,
+) -> f64 {
+    let diagonal = if axis_b == axis_c { w_b * q } else { 0.0 };
+    diagonal + (w_b * h_b) * (w_c * h_c) * t
+}
+
+#[inline(always)]
+fn hessian_operator_eta_entry(
+    q: f64,
+    t: f64,
+    t_r: f64,
+    r: f64,
+    s_a: f64,
+    h_b: f64,
+    h_c: f64,
+    w_b: f64,
+    w_c: f64,
+    axis_a: usize,
+    axis_b: usize,
+    axis_c: usize,
+) -> f64 {
+    let a_is_b = usize::from(axis_a == axis_b) as f64;
+    let a_is_c = usize::from(axis_a == axis_c) as f64;
+    let q_a = t * s_a;
+    let t_a = if r > 1e-14 { t_r * s_a / r } else { 0.0 };
+    let diagonal = if axis_b == axis_c {
+        w_b * (2.0 * a_is_b * q + q_a)
+    } else {
+        0.0
+    };
+    let mixed_multiplier = 2.0 * a_is_b + 2.0 * a_is_c;
+    diagonal + (w_b * h_b) * (w_c * h_c) * (mixed_multiplier * t + t_a)
+}
+
+#[inline(always)]
+fn hessian_operator_eta2_entry(
+    q: f64,
+    t: f64,
+    t_r: f64,
+    t_rr: f64,
+    r: f64,
+    s_a: f64,
+    h_b: f64,
+    h_c: f64,
+    w_b: f64,
+    w_c: f64,
+    axis_a: usize,
+    axis_b: usize,
+    axis_c: usize,
+) -> f64 {
+    let a_is_b = usize::from(axis_a == axis_b) as f64;
+    let a_is_c = usize::from(axis_a == axis_c) as f64;
+    let q_a = t * s_a;
+    let q_aa = if r > 1e-14 {
+        t_r * s_a * s_a / r + 2.0 * t * s_a
+    } else {
+        0.0
+    };
+    let t_a = if r > 1e-14 { t_r * s_a / r } else { 0.0 };
+    let t_aa = if r > 1e-14 {
+        ((t_rr * r - t_r) / (r * r * r)) * s_a * s_a + 2.0 * t_r * s_a / r
+    } else {
+        0.0
+    };
+    let diagonal = if axis_b == axis_c {
+        w_b * (4.0 * a_is_b * q + 4.0 * a_is_b * q_a + q_aa)
+    } else {
+        0.0
+    };
+    let mixed_multiplier = 2.0 * a_is_b + 2.0 * a_is_c;
+    diagonal
+        + (w_b * h_b)
+            * (w_c * h_c)
+            * (mixed_multiplier * mixed_multiplier * t + 2.0 * mixed_multiplier * t_a + t_aa)
+}
+
+#[inline(always)]
+fn hessian_operator_eta_cross_entry(
+    q: f64,
+    t: f64,
+    t_r: f64,
+    t_rr: f64,
+    r: f64,
+    s_i: f64,
+    s_j: f64,
+    h_b: f64,
+    h_c: f64,
+    w_b: f64,
+    w_c: f64,
+    axis_i: usize,
+    axis_j: usize,
+    axis_b: usize,
+    axis_c: usize,
+) -> f64 {
+    debug_assert_ne!(axis_i, axis_j);
+    let i_is_b = usize::from(axis_i == axis_b) as f64;
+    let i_is_c = usize::from(axis_i == axis_c) as f64;
+    let j_is_b = usize::from(axis_j == axis_b) as f64;
+    let j_is_c = usize::from(axis_j == axis_c) as f64;
+    let q_i = t * s_i;
+    let q_j = t * s_j;
+    let q_ij = if r > 1e-14 { t_r * s_i * s_j / r } else { 0.0 };
+    let t_i = if r > 1e-14 { t_r * s_i / r } else { 0.0 };
+    let t_j = if r > 1e-14 { t_r * s_j / r } else { 0.0 };
+    let t_ij = if r > 1e-14 {
+        ((t_rr * r - t_r) / (r * r * r)) * s_i * s_j
+    } else {
+        0.0
+    };
+    let diagonal = if axis_b == axis_c {
+        w_b * (2.0 * i_is_b * q_j + 2.0 * j_is_b * q_i + q_ij)
+    } else {
+        0.0
+    };
+    let m_i = 2.0 * i_is_b + 2.0 * i_is_c;
+    let m_j = 2.0 * j_is_b + 2.0 * j_is_c;
+    diagonal + (w_b * h_b) * (w_c * h_c) * (m_i * m_j * t + m_i * t_j + m_j * t_i + t_ij)
+}
+
 /// Build exact per-axis η_a derivatives of operator penalty matrices for
 /// anisotropic Matérn terms.
 ///
@@ -6339,8 +6466,8 @@ impl MaternCrossPenaltyContext {
         let d = self.centers.ncols();
         let mut d0_cross_raw = Array2::<f64>::zeros((p, p));
         let mut d1_cross_raw = Array2::<f64>::zeros((p * d, p));
-        let mut d2_cross_raw = Array2::<f64>::zeros((p, p));
-        let d_f64 = d as f64;
+        let mut d2_cross_raw = Array2::<f64>::zeros((p * d * d, p));
+        let metric_weights = centered_aniso_metric_weights(&self.aniso_log_scales);
 
         for k in 0..p {
             for j in 0..p {
@@ -6356,25 +6483,35 @@ impl MaternCrossPenaltyContext {
                 d0_cross_raw[[k, j]] = t * sa_sb;
                 for axis in 0..d {
                     let h_axis = ci[axis] - cj[axis];
+                    let w_axis = metric_weights[axis];
                     let row = k * d + axis;
                     d1_cross_raw[[row, j]] = if r > 1e-14 {
                         dt_dr * sa_sb / r * h_axis
+                            + if axis == axis_a { 2.0 * t * s_b * h_axis } else { 0.0 }
+                            + if axis == axis_b { 2.0 * t * s_a * h_axis } else { 0.0 }
                     } else {
                         0.0
-                    };
+                    } * w_axis;
                 }
-                d2_cross_raw[[k, j]] = if r > 1e-14 {
-                    let dw_dr = (d_f64 + 3.0) * dt_dr + d2t_dr2 * r;
-                    dw_dr * sa_sb / r
-                } else {
-                    0.0
-                };
+                for b in 0..d {
+                    let h_b = ci[b] - cj[b];
+                    let w_b = metric_weights[b];
+                    for c in 0..d {
+                        let h_c = ci[c] - cj[c];
+                        let w_c = metric_weights[c];
+                        let row = (k * d + b) * d + c;
+                        d2_cross_raw[[row, j]] = hessian_operator_eta_cross_entry(
+                            0.0, t, dt_dr, d2t_dr2, r, s_a, s_b, h_b, h_c, w_b, w_c, axis_a,
+                            axis_b, b, c,
+                        );
+                    }
+                }
             }
         }
 
         let d0_cross_proj = self.project_operator(&d0_cross_raw, p);
         let d1_cross_proj = self.project_operator(&d1_cross_raw, p * d);
-        let d2_cross_proj = self.project_operator(&d2_cross_raw, p);
+        let d2_cross_proj = self.project_operator(&d2_cross_raw, p * d * d);
 
         let s0_cross = normalize_penalty_cross_psi_derivative(
             &self.op0_s_raw,
@@ -6441,19 +6578,19 @@ fn build_matern_operator_penalty_aniso_derivatives(
     let dim = eta.len();
     assert_eq!(dim, d);
 
-    // Per-axis: build raw D₀, D₁, D₂ and their η_a first/second derivatives.
-    // D₀: p × p
-    // D₁: (p·d) × p
-    // D₂: p × p
+    // Per-axis: build raw D0, D1, and full-Hessian D2 plus their eta_a
+    // first/second derivatives.
     let mut d0_raw = Array2::<f64>::zeros((p, p));
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
-    let mut d2_raw = Array2::<f64>::zeros((p, p));
+    let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
     let mut d0_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
     let mut d1_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p * d, p))).collect();
-    let mut d2_raw_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
+    let mut d2_raw_eta: Vec<Array2<f64>> =
+        (0..dim).map(|_| Array2::zeros((p * d * d, p))).collect();
     let mut d0_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
     let mut d1_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p * d, p))).collect();
-    let mut d2_raw_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((p, p))).collect();
+    let mut d2_raw_eta2: Vec<Array2<f64>> =
+        (0..dim).map(|_| Array2::zeros((p * d * d, p))).collect();
     let num_cross = dim * (dim - 1) / 2;
     let mut cross_pairs: Vec<(usize, usize)> = Vec::with_capacity(num_cross);
     for a in 0..dim {
@@ -6461,8 +6598,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
             cross_pairs.push((a, b));
         }
     }
-
-    let d_f64 = d as f64;
+    let metric_weights = centered_aniso_metric_weights(eta);
 
     for k in 0..p {
         for j in 0..p {
@@ -6476,26 +6612,24 @@ fn build_matern_operator_penalty_aniso_derivatives(
             // --- D₀ ---
             d0_raw[[k, j]] = phi;
 
-            // --- D₂ (Laplacian) ---
-            let lap = if r < 1e-14 {
-                // At collision, φ''(0) + (d-1)·q(0).
-                // For ν=1/2 this diverges but the penalty contribution at collision
-                // is typically handled by the existing operator assembly.
-                // Use the same scalar value:
-                let (_, _, _, _, _, _, lap_c, _, _) =
-                    matern_operator_psi_triplet(r, length_scale, nu, d)?;
-                lap_c
-            } else {
-                // φ'' = q + t·r², so lap = q + t·r² + (d-1)·q = d·q + t·r²
-                q + t * r * r + (d_f64 - 1.0) * q
-            };
-            d2_raw[[k, j]] = lap;
-
             // --- D₁ (gradient) ---
             for axis in 0..d {
                 let h_b = ci[axis] - cj[axis];
+                let w_b = metric_weights[axis];
                 let row = k * d + axis;
-                d1_raw[[row, j]] = q * h_b;
+                d1_raw[[row, j]] = q * w_b * h_b;
+            }
+
+            // --- D₂ (full Hessian, row layout point × axis × axis) ---
+            for b in 0..d {
+                let h_b = ci[b] - cj[b];
+                let w_b = metric_weights[b];
+                for c in 0..d {
+                    let h_c = ci[c] - cj[c];
+                    let w_c = metric_weights[c];
+                    let row = (k * d + b) * d + c;
+                    d2_raw[[row, j]] = hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c);
+                }
             }
 
             // --- Per-axis η_a derivatives ---
@@ -6510,39 +6644,38 @@ fn build_matern_operator_penalty_aniso_derivatives(
                 // ∂D₁/∂η_a: for each axis b, ∂(q · h_b)/∂η_a = (dq/dη_a) · h_b = t · s_a · h_b
                 for b in 0..d {
                     let h_b = ci[b] - cj[b];
+                    let w_b = metric_weights[b];
                     let row = k * d + b;
-                    d1_raw_eta[a][[row, j]] = t * s_a * h_b;
-                    // ∂²D₁/∂η_a² = (dt/dr · s_a/r · s_a + 2t · s_a) · h_b
-                    //             = (dt/dr · s_a²/r + 2t · s_a) · h_b
-                    let d2q_deta2 = if r > 1e-14 {
-                        dt_dr * s_a * s_a / r + 2.0 * t * s_a
+                    d1_raw_eta[a][[row, j]] = if a == b {
+                        w_b * h_b * (t * s_a + 2.0 * q)
                     } else {
-                        // At collision s_a = 0, so the whole expression is 0.
+                        w_b * h_b * t * s_a
+                    };
+                    d1_raw_eta2[a][[row, j]] = if a == b && r > 1e-14 {
+                        w_b * h_b * (dt_dr * s_a * s_a / r + 6.0 * t * s_a + 4.0 * q)
+                    } else if a == b {
+                        0.0
+                    } else if r > 1e-14 {
+                        w_b * h_b * (dt_dr * s_a * s_a / r + 2.0 * t * s_a)
+                    } else {
                         0.0
                     };
-                    d1_raw_eta2[a][[row, j]] = d2q_deta2 * h_b;
                 }
 
-                // ∂D₂/∂η_a = [(d+2)·t + dt_dr · r] · s_a
-                let dlap_deta = if r > 1e-14 {
-                    ((d_f64 + 2.0) * t + dt_dr * r) * s_a
-                } else {
-                    0.0
-                };
-                d2_raw_eta[a][[k, j]] = dlap_deta;
-
-                // ∂²D₂/∂η_a²:
-                // Let w = (d+2)·t + dt_dr · r.
-                // ∂²D₂/∂η_a² = (dw/dr · s_a/r) · s_a + w · 2 · s_a
-                // dw/dr = (d+2)·dt_dr + d²t_dr²·r + dt_dr = (d+3)·dt_dr + d²t_dr²·r
-                let d2lap_deta2 = if r > 1e-14 {
-                    let w = (d_f64 + 2.0) * t + dt_dr * r;
-                    let dw_dr = (d_f64 + 3.0) * dt_dr + d2t_dr2 * r;
-                    dw_dr * s_a * s_a / r + 2.0 * w * s_a
-                } else {
-                    0.0
-                };
-                d2_raw_eta2[a][[k, j]] = d2lap_deta2;
+                for b in 0..d {
+                    let h_b = ci[b] - cj[b];
+                    let w_b = metric_weights[b];
+                    for c in 0..d {
+                        let h_c = ci[c] - cj[c];
+                        let w_c = metric_weights[c];
+                        let row = (k * d + b) * d + c;
+                        d2_raw_eta[a][[row, j]] =
+                            hessian_operator_eta_entry(q, t, dt_dr, r, s_a, h_b, h_c, w_b, w_c, a, b, c);
+                        d2_raw_eta2[a][[row, j]] = hessian_operator_eta2_entry(
+                            q, t, dt_dr, d2t_dr2, r, s_a, h_b, h_c, w_b, w_c, a, b, c,
+                        );
+                    }
+                }
             }
         }
     }
@@ -6575,7 +6708,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
 
     let d0 = pad(d0_kernel, p, true);
     let d1 = pad(d1_kernel, p * d, false);
-    let d2 = pad(d2_kernel, p, false);
+    let d2 = pad(d2_kernel, p * d * d, false);
 
     // Project and pad all per-axis operator derivative matrices upfront,
     // so they remain available for cross-term computation.
@@ -6589,7 +6722,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
         .collect();
     let d2_eta_all: Vec<Array2<f64>> = d2_raw_eta
         .into_iter()
-        .map(|m| pad(project(m), p, false))
+        .map(|m| pad(project(m), p * d * d, false))
         .collect();
     let d0_eta2_all: Vec<Array2<f64>> = d0_raw_eta2
         .into_iter()
@@ -6601,7 +6734,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
         .collect();
     let d2_eta2_all: Vec<Array2<f64>> = d2_raw_eta2
         .into_iter()
-        .map(|m| pad(project(m), p, false))
+        .map(|m| pad(project(m), p * d * d, false))
         .collect();
 
     // Build raw Gram penalties (axis-independent) and their per-axis
@@ -6975,6 +7108,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
     identifiability_transform: Option<&Array2<f64>>,
+    operator_penalties: &DuchonOperatorPenaltySpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<
     (
@@ -7008,7 +7142,13 @@ fn build_duchon_operator_penalty_aniso_derivatives(
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    validate_duchon_collocation_orders(length_scale, p_order, s_order, d)?;
+    validate_duchon_collocation_orders(
+        length_scale,
+        p_order,
+        s_order,
+        d,
+        duchon_max_active_operator_derivative_order(operator_penalties),
+    )?;
     let coeffs = length_scale
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let pure_block_order = pure_duchon_block_order(p_order, s_order);
@@ -7885,6 +8025,7 @@ pub fn build_duchon_collocation_operator_matrices(
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
+    max_operator_derivative_order: usize,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let mut workspace = BasisWorkspace::default();
     build_duchon_collocation_operator_matriceswithworkspace(
@@ -7895,6 +8036,7 @@ pub fn build_duchon_collocation_operator_matrices(
         nullspace_order,
         aniso_log_scales,
         identifiability_transform,
+        max_operator_derivative_order,
         &mut workspace,
     )
 }
@@ -7907,6 +8049,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
+    max_operator_derivative_order: usize,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
@@ -7914,7 +8057,13 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     let s_order = power;
     let p_colloc = centers.nrows();
     let dim = centers.ncols();
-    validate_duchon_collocation_orders(length_scale, p_order, s_order, dim)?;
+    validate_duchon_collocation_orders(
+        length_scale,
+        p_order,
+        s_order,
+        dim,
+        max_operator_derivative_order,
+    )?;
     if let Some(eta) = aniso_log_scales {
         if eta.len() != dim {
             return Err(BasisError::DimensionMismatch(format!(
@@ -10634,7 +10783,13 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
-    validate_duchon_collocation_orders(Some(length_scale), p_order, s_order, centers.ncols())?;
+    validate_duchon_collocation_orders(
+        Some(length_scale),
+        p_order,
+        s_order,
+        centers.ncols(),
+        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+    )?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
@@ -11544,7 +11699,13 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         .unwrap_or(p_padded);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
-    validate_duchon_collocation_orders(None, p_order, s_order, dim)?;
+    validate_duchon_collocation_orders(
+        None,
+        p_order,
+        s_order,
+        dim,
+        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+    )?;
     let block_order = pure_duchon_block_order(p_order, s_order);
     let mut design_result = build_aniso_design_psi_derivatives_shared(
         data,
@@ -11578,6 +11739,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         effective_nullspace_order,
         raw_eta,
         identifiability_transform.as_ref(),
+        &spec.operator_penalties,
         &mut workspace,
     )?;
     let (penalties_first, penalties_second_diag, penalties_cross_pairs, penalties_cross_provider) =
@@ -11639,6 +11801,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         effective_nullspace_order,
         eta,
         identifiability_transform.as_ref(),
+        &spec.operator_penalties,
         &mut workspace,
     )?;
 
@@ -13201,7 +13364,13 @@ pub fn build_duchon_basiswithworkspace(
     let effective_nullspace_order =
         duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    validate_duchon_collocation_orders(spec.length_scale, p_order, spec.power, data.ncols())?;
+    validate_duchon_collocation_orders(
+        spec.length_scale,
+        p_order,
+        spec.power,
+        data.ncols(),
+        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+    )?;
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
@@ -13343,6 +13512,7 @@ pub fn build_duchon_basiswithworkspace(
         effective_nullspace_order,
         aniso.as_deref(),
         identifiability_transform.as_ref().map(|z| z.view()),
+        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
     // Duchon radial basis with triple operator regularization. These are
