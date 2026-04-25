@@ -2084,8 +2084,26 @@ pub fn should_use_implicit_operators_with_policy(
 
 /// Backwards-compatible wrapper around [`should_use_implicit_operators_with_policy`]
 /// that uses the default library [`crate::resource::ResourcePolicy`].
+//
+// TODO(resource-policy-migration): four real call sites
+//   * `src/solver/reml/hyper.rs:~1286` — invoked from
+//     `EvaluationCtx::compute_directional_derivatives`; the `ReshapedReml` /
+//     `EvaluationCtx` chain does not currently carry a `ResourcePolicy`.
+//   * `src/solver/reml/mod.rs:~117` — inside
+//     `exact_tau_tau_hessian_policy_with_firth`, a free function that takes
+//     only `(n_obs, p_coeff, hyper_dirs)` and is itself called from many
+//     places without policy in scope.
+//   * `src/terms/basis.rs:~4182` (`build_aniso_design_psi_derivatives_shared`)
+//     and `~4336` (`build_scalar_design_psi_derivatives_shared`) — both are
+//     deep helpers reached via 5+ levels of `build_*_design_psi_derivatives`
+//     wrappers; none of those intermediates take a `BasisWorkspace` or
+//     `ResourcePolicy` today.
+// Properly threading the policy requires either (a) plumbing
+// `&ResourcePolicy` through `EvaluationCtx` and the `psi_derivatives`
+// builder chain, or (b) attaching the policy to the upstream model spec so
+// the helpers can read it. Tracked as a follow-up; the default-library
+// fallback is preserved here until that lands.
 pub fn should_use_implicit_operators(n: usize, p: usize, d: usize) -> bool {
-    // TODO(resource-policy-migration): thread policy through callers
     should_use_implicit_operators_with_policy(
         n,
         p,
