@@ -328,17 +328,6 @@ fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
         let d2_engine = FunctionEngine::new(d2_std, d2_ad, ForwardAD::new());
         let (_, jac2) = d2_engine.derivative(&[epsilon]);
 
-        if (eta, epsilon, log_delta) == (-1.2, -0.4, -0.3) {
-            println!(
-                "debug_sas_eps_d1 eta={eta} eps={epsilon} ld={log_delta} manual={:.16e} fd={:.16e} num_dual={:.16e} autodiff={:.16e} ad_trait={:.16e}",
-                out.djet_depsilon.d1,
-                fd_d1,
-                d1_nd,
-                d1_autodiff,
-                jac1[(0, 0)]
-            );
-        }
-
         assert_manual_ad_band!(
             "sas_djet_depsilon",
             eta,

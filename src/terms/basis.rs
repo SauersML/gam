@@ -17424,7 +17424,6 @@ mod tests {
 
         // Verify that knots are uniformly distributed (not following data distribution)
         // Since quantile knots are disabled, these should be uniform
-        println!("Uniform knots (fallback): {:?}", knots);
 
         // Check that internal knots are uniformly spaced
         let internal_knots: Vec<f64> = knots
@@ -18437,10 +18436,6 @@ mod tests {
         // Determine the bounds for the interpolation.
         let lower_bound = value_at_0_6.min(value_at_0_7);
         let upper_bound = value_at_0_6.max(value_at_0_7);
-
-        println!("Value at x=0.60: {}", value_at_0_6);
-        println!("Value at x=0.65: {}", prediction_at_0_65);
-        println!("Value at x=0.70: {}", value_at_0_7);
 
         // ASSERT: The prediction at 0.65 must lie between the values at 0.6 and 0.7.
         // This is a robust check of the spline's interpolating behavior.
