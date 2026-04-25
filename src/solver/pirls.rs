@@ -6345,11 +6345,7 @@ pub fn e_obs_from_jets(
     let q2 = phi * (v1 * h2 + v2 * h1_sq);
     let q3 = phi * (v1 * h3 + 3.0 * v2 * h1 * h2 + v3 * h1_cu);
     let q4 = phi
-        * (v1 * h4
-            + 4.0 * v2 * h1 * h3
-            + 3.0 * v2 * h2 * h2
-            + 6.0 * v3 * h1_sq * h2
-            + v4 * h1_qu);
+        * (v1 * h4 + 4.0 * v2 * h1 * h3 + 3.0 * v2 * h2 * h2 + 6.0 * v3 * h1_sq * h2 + v4 * h1_qu);
 
     // T = h₁/Q and T', T'', T''', T'''' via Leibniz on T·Q = h₁.
     //   T'    = (h₂  − T·Q')/Q

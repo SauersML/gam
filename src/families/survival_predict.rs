@@ -29,9 +29,7 @@ use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
-use crate::inference::predict::{
-    BernoulliMarginalSlopePredictor, PredictInput, predict_gam,
-};
+use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
 use crate::linalg::matrix::DesignMatrix;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::probability::normal_cdf;
@@ -729,8 +727,7 @@ fn predict_survival_location_scale_batch(
 ) -> Result<SurvivalPredictResult, String> {
     use crate::families::scale_design::apply_scale_deviation_transform;
     use crate::families::survival_construction::{
-        build_survival_marginal_slope_baseline_offsets,
-        evaluate_survival_time_basis_row,
+        build_survival_marginal_slope_baseline_offsets, evaluate_survival_time_basis_row,
     };
     use crate::families::survival_location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
@@ -778,16 +775,15 @@ fn predict_survival_location_scale_batch(
             | InverseLink::Mixture(_)
             | InverseLink::LatentCLogLog(_)
     );
-    let (_eta_offset_entry, mut eta_offset_exit, _derivative_offset_exit) =
-        if probit_baseline {
-            build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, &baseline_cfg)?
-        } else {
-            crate::families::survival_construction::build_survival_baseline_offsets(
-                age_entry,
-                age_exit,
-                &baseline_cfg,
-            )?
-        };
+    let (_eta_offset_entry, mut eta_offset_exit, _derivative_offset_exit) = if probit_baseline {
+        build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, &baseline_cfg)?
+    } else {
+        crate::families::survival_construction::build_survival_baseline_offsets(
+            age_entry,
+            age_exit,
+            &baseline_cfg,
+        )?
+    };
     // Apply the survival-location-scale derivative guard to the exit-time eta
     // offset. The entry-time + derivative offsets aren't consumed by
     // `predict_survival_location_scale` so we skip those updates here.
