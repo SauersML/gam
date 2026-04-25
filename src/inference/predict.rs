@@ -1759,6 +1759,159 @@ impl BernoulliMarginalSlopePredictor {
             Ok(vec![grad])
         })
     }
+
+    /// Per-row `(eta, ∂eta/∂q_marginal)` under the exact IFT pull-back.
+    ///
+    /// Returns the same `eta` as `predict_plugin_response`/`predict_linear_predictor`
+    /// plus the analytic derivative of the internal probit index with respect to
+    /// the per-row marginal q (the linear predictor before the de-nested
+    /// calibration). Survival prediction multiplies the second component by the
+    /// per-row `dq/dt` to obtain the exact hazard time derivative under
+    /// score-warp / link-deviation flex blocks.
+    ///
+    /// Rigid path (no flex blocks): `∂eta/∂q = c = sqrt(1 + (s b)^2)`, recovering
+    /// the rigid-path probit-frailty composition. Flex path: `∂eta/∂q =
+    /// scale · link_c_obs · a_q` where `link_c_obs = 1 + Δ_w'(eta_base)` is the
+    /// link-deviation slope at the observed `eta_base = a + b z` and `a_q =
+    /// φ(q) / |F_a|` is the implicit-function derivative of the calibration
+    /// intercept (mirrors the bernoulli `final_eta_and_gradient_from_theta`
+    /// flex branch lines 1399-1593).
+    pub fn predict_eta_and_q_chain(
+        &self,
+        input: &PredictInput,
+    ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+        let z_raw = input.auxiliary_scalar.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction requires auxiliary z column '{}'",
+                self.z_column
+            ))
+        })?;
+        let z = self
+            .latent_z_normalization
+            .apply(z_raw, "bernoulli marginal-slope prediction")
+            .map_err(EstimationError::InvalidInput)?;
+        let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "bernoulli marginal-slope prediction requires logslope design".to_string(),
+            )
+        })?;
+        let n = z.len();
+        if input.offset.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction primary offset length mismatch: rows={n}, offset={}",
+                input.offset.len()
+            )));
+        }
+        let logslope_offset = input
+            .offset_noise
+            .as_ref()
+            .map_or_else(|| Array1::zeros(n), Clone::clone);
+        if logslope_offset.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction logslope offset length mismatch: rows={n}, offset_noise={}",
+                logslope_offset.len()
+            )));
+        }
+        let marginal_eta = input
+            .design
+            .dot(&self.beta_marginal)
+            .mapv(|v| v + self.baseline_marginal)
+            + &input.offset;
+        let logslope_eta = design_logslope
+            .dot(&self.beta_logslope)
+            .mapv(|v| v + self.baseline_logslope)
+            + &logslope_offset;
+        let scale = self.probit_frailty_scale();
+        let flex_active =
+            self.score_warp_runtime.is_some() || self.link_deviation_runtime.is_some();
+
+        // Rigid path mirrors `final_eta_and_gradient_from_theta` lines 1342-1383:
+        //   eta = c·q + s·b·z,  ∂eta/∂q = c.
+        if !flex_active {
+            let mut eta = Array1::<f64>::zeros(n);
+            let mut deta_dq = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let sb = scale * logslope_eta[i];
+                let c = (1.0 + sb * sb).sqrt();
+                eta[i] = c * marginal_eta[i] + sb * z[i];
+                deta_dq[i] = c;
+            }
+            return Ok((eta, deta_dq));
+        }
+
+        // Flex path: solve the per-row intercept, then evaluate
+        //   eta = scale · (a + b·z + b·Δ_h(z) + Δ_w(a + b·z))
+        //   ∂eta/∂q = scale · (1 + Δ_w'(a + b·z)) · ∂a/∂q,
+        //   ∂a/∂q   = φ(q) / |F_a|         (IFT, marginal_link is probit so mu1 = φ(q))
+        // Mirrors `final_eta_and_gradient_from_theta` lines 1385-1621.
+        let marginal_map = marginal_eta
+            .iter()
+            .map(|&eta_marg| {
+                bernoulli_marginal_link_map(&self.base_link, eta_marg)
+                    .map_err(EstimationError::InvalidInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut intercepts = Array1::<f64>::zeros(n);
+        let mut a_q = Array1::<f64>::zeros(n);
+        let mut warm_start_buf = Array1::<f64>::zeros(1);
+        for i in 0..n {
+            let q = marginal_eta[i];
+            let slope = logslope_eta[i];
+            let intercept = self.solve_intercept_scalar(
+                q,
+                slope,
+                self.beta_link_dev.as_ref(),
+                self.beta_score_warp.as_ref(),
+                &mut warm_start_buf,
+            )?;
+            intercepts[i] = intercept;
+            let (_, m_a_raw, _) = self.evaluate_denested_calibration(
+                intercept,
+                q,
+                slope,
+                self.beta_score_warp.as_ref(),
+                self.beta_link_dev.as_ref(),
+            )?;
+            let m_a = m_a_raw.max(1e-12);
+            a_q[i] = marginal_map[i].mu1 / m_a;
+        }
+
+        let score_dev_obs = if let (Some(runtime), Some(beta)) =
+            (self.score_warp_runtime.as_ref(), self.beta_score_warp.as_ref())
+        {
+            runtime
+                .design(&z)
+                .map_err(EstimationError::InvalidInput)?
+                .dot(beta)
+        } else {
+            Array1::zeros(n)
+        };
+        let eta_base = &intercepts + &(&logslope_eta * &z);
+        let (link_dev_obs, link_c_obs) = if let (Some(runtime), Some(beta)) = (
+            self.link_deviation_runtime.as_ref(),
+            self.beta_link_dev.as_ref(),
+        ) {
+            let basis = runtime
+                .design(&eta_base)
+                .map_err(EstimationError::InvalidInput)?;
+            let dev = basis.dot(beta);
+            let d1 = runtime
+                .first_derivative_design(&eta_base)
+                .map_err(EstimationError::InvalidInput)?;
+            let mut c_obs = d1.dot(beta);
+            c_obs.mapv_inplace(|v| v + 1.0);
+            (dev, c_obs)
+        } else {
+            (Array1::zeros(n), Array1::ones(n))
+        };
+        let final_eta_internal =
+            (&eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs).mapv(|v| scale * v);
+        let mut deta_dq = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            deta_dq[i] = scale * link_c_obs[i] * a_q[i];
+        }
+        Ok((final_eta_internal, deta_dq))
+    }
 }
 
 impl PredictableModel for BernoulliMarginalSlopePredictor {

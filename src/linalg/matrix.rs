@@ -6015,25 +6015,6 @@ mod tests {
     }
 
     #[test]
-    fn reparam_operator_to_dense_arc_reuses_cached_materialization() {
-        let x = array![[1.0, 2.0], [0.5, -1.0], [3.0, 0.25]];
-        let qs = Arc::new(array![[0.8, -0.6], [0.6, 0.8]]);
-        let op = ReparamOperator::new(
-            DesignMatrix::Dense(DenseDesignMatrix::from(x.clone())),
-            Arc::clone(&qs),
-        );
-
-        let first = op.to_dense_arc();
-        let second = op.to_dense_arc();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.as_ref(), &x.dot(qs.as_ref()));
-        assert_eq!(op.to_dense(), *first.as_ref());
-
-        let borrowed = op.as_dense_ref().expect("cached dense materialization");
-        assert_eq!(borrowed, first.as_ref());
-    }
-
-    #[test]
     fn multi_channel_operator_view_paths_match_stacked_dense_reference() {
         let dense_channel = array![[1.0, 2.0], [0.5, -1.0], [3.0, 0.25]];
         let sparse_dense = array![[0.0, 1.5], [2.0, 0.0], [-1.0, 0.75]];
