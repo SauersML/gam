@@ -15654,7 +15654,6 @@ mod tests {
     use num_dual::{
         DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
     };
-    use std::time::Instant;
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
         ParameterBlockInput {
@@ -16535,23 +16534,12 @@ mod tests {
         assert!((&zls_legacy - &zls_opt).iter().all(|v| v.abs() < 1e-12));
         assert!((&wls_legacy - &wls_opt).iter().all(|v| v.abs() < 1e-12));
 
-        let t_legacy = Instant::now();
         for _ in 0..rounds {
             std::hint::black_box(legacy_eval());
         }
-        let legacy_dt = t_legacy.elapsed();
-
-        let t_opt = Instant::now();
         for _ in 0..rounds {
             std::hint::black_box(optimized_eval());
         }
-        let opt_dt = t_opt.elapsed();
-        eprintln!(
-            "gaussian hotloop legacy={:?} optimized={:?} speedup={:.3}x",
-            legacy_dt,
-            opt_dt,
-            legacy_dt.as_secs_f64() / opt_dt.as_secs_f64()
-        );
     }
 
     fn simple_matern_term_collection(
