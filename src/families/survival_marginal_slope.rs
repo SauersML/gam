@@ -14877,6 +14877,14 @@ mod tests {
                 beta: logslope_beta.clone(),
                 eta: logslope_beta.clone(),
             },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(score_runtime.basis_dim()),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(link_runtime.basis_dim()),
+            },
         ];
         let derivative_blocks = vec![
             Vec::new(),

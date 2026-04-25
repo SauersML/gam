@@ -2583,7 +2583,7 @@ mod tests {
         });
         payload.training_headers = Some(vec!["z".to_string()]);
         payload.resolved_termspec = Some(empty_termspec());
-        payload.resolved_termspec_noise = Some(empty_termspec());
+        payload.resolved_termspec_logslope = Some(empty_termspec());
         payload.formula_logslope = Some("1".to_string());
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });

@@ -693,7 +693,6 @@ impl DenseDesignMatrix {
             Self::Lazy(op) => op.row_chunk_into(rows, out),
         }
     }
-
 }
 
 impl LinearOperator for DenseDesignMatrix {
