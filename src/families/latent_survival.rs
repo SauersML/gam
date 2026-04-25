@@ -28,7 +28,7 @@ use crate::families::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from
 use crate::families::survival_location_scale::{
     TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
 };
-use crate::matrix::{DenseDesignMatrix, DesignMatrix, LinearOperator, SymmetricMatrix};
+use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
 use crate::smooth::{
@@ -2468,7 +2468,10 @@ impl CustomFamily for LatentBinaryFamily {
             let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
             ll += wi * binary.log_lik;
 
-            let mean_row = self.x_mean.row_chunk(i..i + 1);
+            let mean_row = self
+                .x_mean
+                .try_row_chunk(i..i + 1)
+                .map_err(|e| format!("LatentBinaryFamily row {i} mean row_chunk: {e}"))?;
             let mean_vec = mean_row.row(0);
             let mean_grad_scale = wi * binary.grad_scale * survival_jet.score;
             for j in 0..p_mean {

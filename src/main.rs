@@ -2280,7 +2280,10 @@ fn build_predict_input_for_model(
                 .view()
                 .into_shape_with_order((p_resp, p_cov))
                 .map_err(|e| format!("beta reshape failed: {e}"))?;
-            let cov_mat = cov_design_full.design.row_chunk(0..n);
+            let cov_mat = cov_design_full
+                .design
+                .try_row_chunk(0..n)
+                .map_err(|e| e.to_string())?;
 
             let mut derivative_grid = resp_knots
                 .iter()
@@ -2919,7 +2922,9 @@ fn saved_latent_window_local_covariances(
         )
     })?;
     rowwise_local_covariances(backend, cov_design.nrows(), 3, |rows| {
-        let mean_rows = cov_design.row_chunk(rows.clone());
+        let mean_rows = cov_design
+            .try_row_chunk(rows.clone())
+            .map_err(|e| e.to_string())?;
         let time_entry_rows = x_time_entry.slice(s![rows.clone(), ..]).to_owned();
         let time_exit_rows = x_time_exit.slice(s![rows.clone(), ..]).to_owned();
         let mut mean_grad = Array2::<f64>::zeros((mean_rows.nrows(), fit_dim));

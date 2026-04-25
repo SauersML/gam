@@ -4970,13 +4970,12 @@ impl DesignMatrix {
         match self {
             Self::Dense(matrix) => matrix.try_row_chunk(rows),
             Self::Sparse(matrix) => {
-                let csr = matrix.to_csr_arc().ok_or(MatrixMaterializationError::TooLarge {
-                    context: "DesignMatrix::try_row_chunk: failed to obtain CSR view",
-                    nrows: matrix.nrows(),
-                    ncols: matrix.ncols(),
-                    bytes: 0,
-                    limit_bytes: 0,
-                })?;
+                let csr =
+                    matrix
+                        .to_csr_arc()
+                        .ok_or(MatrixMaterializationError::MissingRowChunk {
+                            context: "DesignMatrix::try_row_chunk: failed to obtain CSR view",
+                        })?;
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();

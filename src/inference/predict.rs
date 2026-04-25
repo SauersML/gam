@@ -8,7 +8,6 @@ use crate::inference::model::{
 use crate::inference::prediction_linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows, rowwise_local_covariances,
 };
-use crate::linalg::matrix::DenseDesignOperator;
 use crate::linalg::utils::predict_gam_dimension_mismatch_message;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{

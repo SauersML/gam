@@ -1089,6 +1089,9 @@ struct SurvivalLocationScaleFamily {
     x_link_wiggle: Option<DesignMatrix>,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
+    /// Resource policy threaded into PsiDesignMap construction during
+    /// exact-Newton joint psi evaluation.
+    policy: crate::resource::ResourcePolicy,
 }
 
 #[derive(Clone, Copy)]
@@ -3796,6 +3799,7 @@ fn prepare_survival_location_scale_model(
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
         wiggle_knots: spec.linkwiggle_block.as_ref().map(|w| w.knots.clone()),
         wiggle_degree: spec.linkwiggle_block.as_ref().map(|w| w.degree),
+        policy: crate::resource::ResourcePolicy::default_library(),
     };
 
     let mut blockspecs = vec![timespec, thresholdspec, log_sigmaspec];
@@ -9854,6 +9858,7 @@ mod tests {
             x_link_wiggle: None,
             wiggle_knots: None,
             wiggle_degree: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
         }
     }
 
