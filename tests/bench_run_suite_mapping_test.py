@@ -105,6 +105,18 @@ class RunSuiteMappingTests(unittest.TestCase):
                 ]
             )
 
+    def test_flexible_gamlss_failures_are_non_blocking(self) -> None:
+        self.assertTrue(
+            _RUN_SUITE._is_non_blocking_failure(
+                {
+                    "status": "error",
+                    "scenario_name": "bone_gamair",
+                    "contender": "rust_gamlss_flexible",
+                    "error": "predict_posterior_mean failed",
+                }
+            )
+        )
+
     def test_r_gamlss_sigma_formula_rejects_constant_sigma(self) -> None:
         ds = {
             "rows": [{"y": 1.0}],
