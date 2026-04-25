@@ -77,13 +77,12 @@ use gam::survival_construction::{
     build_survival_timewiggle_derivative_design, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_baseline, evaluate_survival_time_basis_row,
-    marginal_slope_baseline_chain_rule_gradient,
-    normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient, parse_survival_baseline_config,
-    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
-    survival_likelihood_modename,
+    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
+    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
+    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config, require_structural_survival_time_basis,
+    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
+    survival_baseline_targetname, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -962,7 +961,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     progress.set_stage("fit", "building term specification");
-    let mut spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    let mut spec = build_termspec(
+        &parsed.terms,
+        &ds,
+        &col_map,
+        &mut inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
@@ -1337,8 +1342,20 @@ fn run_fit_bernoulli_marginal_slope(
 
     progress.set_stage("fit", "building marginal/logslope term specifications");
     progress.start_secondary_workflow("Marginal/Slope Terms", 2);
-    let mut marginalspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
-    let mut logslopespec = build_termspec(&parsed_logslope.terms, ds, col_map, inference_notes)?;
+    let mut marginalspec = build_termspec(
+        &parsed.terms,
+        ds,
+        col_map,
+        inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
+    let mut logslopespec = build_termspec(
+        &parsed_logslope.terms,
+        ds,
+        col_map,
+        inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut marginalspec);
         enable_scale_dimensions(&mut logslopespec);
@@ -1545,7 +1562,13 @@ fn run_fit_transformation_normal(
         "fit",
         "building transformation-normal covariate specification",
     );
-    let mut covariate_spec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    let mut covariate_spec = build_termspec(
+        &parsed.terms,
+        ds,
+        col_map,
+        inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut covariate_spec);
     }
@@ -1650,8 +1673,20 @@ fn run_fitwith_predict_noise(
     validate_auxiliary_formula_controls(&parsed_noise, "--predict-noise")?;
     progress.set_stage("fit", "building mean/noise term specifications");
     progress.start_secondary_workflow("Mean/Noise Terms", 2);
-    let mut noisespec = build_termspec(&parsed_noise.terms, ds, col_map, inference_notes)?;
-    let mut meanspec = build_termspec(&parsed.terms, ds, col_map, inference_notes)?;
+    let mut noisespec = build_termspec(
+        &parsed_noise.terms,
+        ds,
+        col_map,
+        inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
+    let mut meanspec = build_termspec(
+        &parsed.terms,
+        ds,
+        col_map,
+        inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut meanspec);
         enable_scale_dimensions(&mut noisespec);
@@ -4615,12 +4650,24 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     };
     let mut inference_notes = Vec::new();
     progress.set_stage("fit", "building survival design matrices");
-    let mut termspec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    let mut termspec = build_termspec(
+        &parsed.terms,
+        &ds,
+        &col_map,
+        &mut inference_notes,
+        &gam::resource::ResourcePolicy::default_library(),
+    )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut termspec);
     }
     let log_sigmaspec = if let Some((_, parsed_noise)) = predict_noise_formula.as_ref() {
-        let mut spec = build_termspec(&parsed_noise.terms, &ds, &col_map, &mut inference_notes)?;
+        let mut spec = build_termspec(
+            &parsed_noise.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )?;
         if args.scale_dimensions {
             enable_scale_dimensions(&mut spec);
         }
@@ -5096,8 +5143,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "survival marginal-slope",
             "--logslope-formula",
         )?;
-        let mut logslopespec =
-            build_termspec(&parsed_logslope.terms, &ds, &col_map, &mut inference_notes)?;
+        let mut logslopespec = build_termspec(
+            &parsed_logslope.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )?;
         if args.scale_dimensions {
             enable_scale_dimensions(&mut logslopespec);
         }
@@ -12925,8 +12977,14 @@ mod tests {
             ("w".to_string(), 2usize),
         ]);
         let mut inference_notes = Vec::<String>::new();
-        let spec = super::build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
-            .expect("term spec");
+        let spec = super::build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )
+        .expect("term spec");
 
         assert_eq!(spec.linear_terms.len(), 3);
         assert!(
@@ -12999,8 +13057,14 @@ mod tests {
             ("pc4".to_string(), 3usize),
         ]);
         let mut inference_notes = Vec::<String>::new();
-        let spec = super::build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
-            .expect("4-d TPS should be accepted");
+        let spec = super::build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )
+        .expect("4-d TPS should be accepted");
         assert_eq!(spec.smooth_terms.len(), 1, "should have one smooth term");
     }
 
@@ -13539,8 +13603,14 @@ mod tests {
         };
         let col_map = HashMap::from([("pc1".to_string(), 0usize), ("pc2".to_string(), 1usize)]);
         let mut inference_notes = Vec::<String>::new();
-        let spec = super::build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
-            .expect("duchon double_penalty should be accepted and ignored");
+        let spec = super::build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )
+        .expect("duchon double_penalty should be accepted and ignored");
         assert_eq!(spec.smooth_terms.len(), 1);
         assert_eq!(inference_notes.len(), 1);
         assert!(inference_notes[0].contains("ignored redundant double_penalty option"));

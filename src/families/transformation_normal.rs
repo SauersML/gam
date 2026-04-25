@@ -159,6 +159,13 @@ pub struct TransformationNormalFamily {
     response_transform: Array2<f64>,
     response_degree: usize,
     response_median: f64,
+
+    // --- Resource policy for chunked dense materialization ---
+    /// Resource policy threaded through factored weighted-cross helpers and the
+    /// `KroneckerDesign::weighted_gram` callers inside this family. Stored on
+    /// the struct because the `CustomFamily` trait surface cannot grow new
+    /// parameters per call.
+    policy: ResourcePolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +281,8 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
-        let x_val_weighted_gram = x_val_kron.weighted_gram(weights);
+        let policy = ResourcePolicy::default_library();
+        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
 
         // ----- 5. Initial log-lambdas (one per penalty, start at 0.0) -----
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
@@ -306,6 +314,7 @@ impl TransformationNormalFamily {
             response_transform: resp_transform,
             response_degree: config.response_degree,
             response_median: resp_median,
+            policy,
         })
     }
 
@@ -415,7 +424,8 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
-        let x_val_weighted_gram = x_val_kron.weighted_gram(weights);
+        let policy = ResourcePolicy::default_library();
+        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
 
         let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
 
@@ -446,6 +456,7 @@ impl TransformationNormalFamily {
             response_transform: response_transform.clone(),
             response_degree,
             response_median: resp_median,
+            policy,
         })
     }
 
@@ -683,7 +694,9 @@ impl CustomFamily for TransformationNormalFamily {
         //   -∇²ℓ = X_val^T diag(w) X_val + X_deriv^T diag(w/h'²) X_deriv
         // The first term is precomputed once as `x_val_weighted_gram`.
         let hessian = {
-            let mut xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_hp_sq);
+            let mut xtx_deriv = self
+                .x_deriv_kron
+                .weighted_gram(&weighted_inv_hp_sq, &self.policy);
             xtx_deriv += &self.x_val_weighted_gram;
             xtx_deriv
         };
@@ -824,7 +837,7 @@ impl CustomFamily for TransformationNormalFamily {
             weight[i] =
                 -2.0 * self.weights[i] * d_h_prime[i] / (h_prime[i] * h_prime[i] * h_prime[i]);
         }
-        let dd = self.x_deriv_kron.weighted_gram(&weight);
+        let dd = self.x_deriv_kron.weighted_gram(&weight, &self.policy);
         Ok(Some(dd))
     }
 
@@ -837,7 +850,9 @@ impl CustomFamily for TransformationNormalFamily {
         let h_prime = self.x_deriv_kron.forward_mul(beta);
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
-        let mut xtx_deriv = self.x_deriv_kron.weighted_gram(&weighted_inv_h_prime_sq);
+        let mut xtx_deriv = self
+            .x_deriv_kron
+            .weighted_gram(&weighted_inv_h_prime_sq, &self.policy);
         xtx_deriv += &self.x_val_weighted_gram;
         Ok(Some(xtx_deriv))
     }
@@ -870,7 +885,7 @@ impl CustomFamily for TransformationNormalFamily {
             weight[i] =
                 6.0 * self.weights[i] * d_h_prime_u[i] * d_h_prime_v[i] / (hp * hp * hp * hp);
         }
-        Ok(Some(self.x_deriv_kron.weighted_gram(&weight)))
+        Ok(Some(self.x_deriv_kron.weighted_gram(&weight, &self.policy)))
     }
 
     fn exact_newton_joint_psi_terms(
@@ -952,7 +967,7 @@ impl CustomFamily for TransformationNormalFamily {
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
             let w_cubic = ((&v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic);
+            let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic, &self.policy);
 
             sym_val + &sym_deriv + &cubic_term
         };
@@ -1079,9 +1094,9 @@ impl CustomFamily for TransformationNormalFamily {
         let hessian_psi_psi = {
             // Stay factored: keep (response_basis, covariate_factor) pairs and
             // never materialize n x (p_resp * p_cov) rowwise-Kronecker matrices.
-            // TODO(ctn-factored-migration): thread ResourcePolicy through this
-            // API rather than defaulting per call site.
-            let policy = ResourcePolicy::default_library();
+            // The resource policy is the one stored on the family so chunk
+            // sizing matches the surrounding workload.
+            let policy = &self.policy;
             let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
                 "TransformationNormalFamily exact Hessian requires dense covariate design"
                     .to_string()
@@ -1193,11 +1208,11 @@ impl CustomFamily for TransformationNormalFamily {
 
             let cubic_second =
                 ((&v_ij_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            hess += &self.x_deriv_kron.weighted_gram(&cubic_second);
+            hess += &self.x_deriv_kron.weighted_gram(&cubic_second, &self.policy);
 
             let quartic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_qu * self.weights.as_ref())
                 .mapv(|v| 6.0 * v);
-            hess += &self.x_deriv_kron.weighted_gram(&quartic);
+            hess += &self.x_deriv_kron.weighted_gram(&quartic, &self.policy);
             0.5 * (&hess + &hess.t())
         };
 
@@ -1275,11 +1290,11 @@ impl CustomFamily for TransformationNormalFamily {
         )?;
 
         let cubic_v = ((&d_v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-        hess += &self.x_deriv_kron.weighted_gram(&cubic_v);
+        hess += &self.x_deriv_kron.weighted_gram(&cubic_v, &self.policy);
 
         let quartic =
             ((&v_deriv * &d_h_prime) * &inv_h_prime_qu * self.weights.as_ref()).mapv(|v| 6.0 * v);
-        hess += &self.x_deriv_kron.weighted_gram(&quartic);
+        hess += &self.x_deriv_kron.weighted_gram(&quartic, &self.policy);
 
         Ok(Some(0.5 * (&hess + &hess.t())))
     }
@@ -1797,13 +1812,10 @@ impl KroneckerDesign {
 
     /// Compute `self^T · diag(w) · self` (weighted Gram).
     ///
-    /// Thin wrapper over `weighted_cross_with(self, self, ...)`. The policy is
-    /// defaulted here because many callers do not yet thread a `ResourcePolicy`
-    /// through; migrating them is tracked separately.
-    fn weighted_gram(&self, w: &Array1<f64>) -> Array2<f64> {
-        // TODO(ctn-factored-migration): thread a real ResourcePolicy through callers.
-        let policy = ResourcePolicy::default_library();
-        self.weighted_cross_with(w.view(), self, &policy)
+    /// Thin wrapper over `weighted_cross_with(self, self, ...)`. Callers thread
+    /// a real `ResourcePolicy` so chunk sizing matches the surrounding workload.
+    fn weighted_gram(&self, w: &Array1<f64>, policy: &ResourcePolicy) -> Array2<f64> {
+        self.weighted_cross_with(w.view(), self, policy)
             .expect("validated KroneckerDesign weighted Gram dimensions")
     }
 
@@ -1889,7 +1901,11 @@ impl LinearOperator for KroneckerDesign {
                 self.nrows()
             ));
         }
-        Ok(self.weighted_gram(weights))
+        // The `LinearOperator` trait fixes the signature, so this entry point
+        // defaults the resource policy. Internal callers in this file go
+        // through `weighted_gram` directly with their own policy.
+        let policy = ResourcePolicy::default_library();
+        Ok(self.weighted_gram(weights, &policy))
     }
 }
 
@@ -2732,7 +2748,7 @@ mod tests {
         let expected_gram = fast_atb(&weight_rows(&dense, &weights), &dense);
 
         let got_transpose = kron.transpose_mul(&v);
-        let got_gram = kron.weighted_gram(&weights);
+        let got_gram = kron.weighted_gram(&weights, &ResourcePolicy::default_library());
 
         let transpose_err = (&got_transpose - &expected_transpose)
             .iter()

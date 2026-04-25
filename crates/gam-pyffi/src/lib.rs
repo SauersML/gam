@@ -748,8 +748,32 @@ fn dataset_with_inferred_schema(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
 ) -> Result<EncodedDataset, String> {
+    let verbose = gam::solver::visualizer::data_info_enabled();
+    let n_rows = rows.len();
+    let n_cols = headers.len();
+    let t_records = std::time::Instant::now();
     let records = string_records_from_rows(&headers, rows)?;
-    encode_recordswith_inferred_schema(headers, records)
+    let records_ms = t_records.elapsed().as_secs_f64() * 1000.0;
+    if verbose || records_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] ffi_string_records | n_rows={} | n_cols={} | {:.1}ms",
+            n_rows,
+            n_cols,
+            records_ms
+        );
+    }
+    let t_encode = std::time::Instant::now();
+    let result = encode_recordswith_inferred_schema(headers, records)?;
+    let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+    if verbose || encode_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] ffi_encode_inferred | n_rows={} | n_cols={} | {:.1}ms",
+            n_rows,
+            n_cols,
+            encode_ms
+        );
+    }
+    Ok(result)
 }
 
 fn dataset_with_model_schema(
