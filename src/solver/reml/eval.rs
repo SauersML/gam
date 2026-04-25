@@ -359,7 +359,7 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        log::info!(
+        log::debug!(
             "Using adaptive cubature smoothing correction (rank={}, points={}, near_boundary={}, grad_norm={:.2e}, maxvar={:.2e})",
             rank,
             2 * rank,

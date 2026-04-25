@@ -521,7 +521,7 @@ fn rank_seeds_with_screening(
         }
     }
 
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: seed screening ranked {}/{} candidates with capped eval_cost \
          (screen_max_inner_iterations={}); rejected={}",
         ordered.len() - rejected,
@@ -725,7 +725,7 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
     } else {
         ""
     };
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}{barrier_note}{hybrid_note}",
         cap.n_params,
         cap.gradient,
@@ -2346,7 +2346,7 @@ fn run_outer(
     for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan_with_class(attempt_cap, config.solver_class);
         if attempt_idx > 0 {
-            log::info!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
+            log::debug!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
         }
         log_plan(context, attempt_cap, &the_plan);
 
@@ -2362,7 +2362,7 @@ fn run_outer(
                     "{context}: attempt {} (plan={the_plan}) exhausted without convergence",
                     attempt_idx + 1
                 );
-                log::info!("[OUTER] {message}; trying degraded fallback plan");
+                log::debug!("[OUTER] {message}; trying degraded fallback plan");
                 last_error = Some(EstimationError::RemlOptimizationFailed(message));
             }
             Err(e) => {
@@ -2422,13 +2422,13 @@ fn run_outer_with_plan(
     if should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget) {
         seeds = rank_seeds_with_screening(obj, config, context, &seeds);
     }
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
         seeds.len(),
         seed_budget,
     );
     if seed_budget < config.seed_config.seed_budget.max(1) {
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: capped requested seed budget {} -> {} for {:?} ({:?})",
             config.seed_config.seed_budget.max(1),
             seed_budget,
@@ -2437,7 +2437,7 @@ fn run_outer_with_plan(
         );
     }
     if seeds.len() > seed_budget {
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: trying up to {seed_budget}/{} generated seeds in heuristic order",
             seeds.len(),
         );
@@ -2846,7 +2846,7 @@ fn run_outer_with_plan(
         match result {
             Ok(candidate) => {
                 let candidate_converged = candidate.converged;
-                log::info!(
+                log::debug!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
                     seed_slot,
                     seed_budget,
@@ -2881,7 +2881,7 @@ fn run_outer_with_plan(
                 if requests_immediate_first_order_fallback(&e.to_string()) {
                     return Err(e);
                 }
-                log::info!(
+                log::debug!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  FAILED: {}",
                     seed_slot,
                     seed_budget,

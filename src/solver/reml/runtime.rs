@@ -2122,7 +2122,7 @@ impl<'a> RemlState<'a> {
                     &pirls_result.final_eta,
                     self.weights,
                 )?);
-                log::info!(
+                log::debug!(
                     "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
                     firth_op.x_dense.nrows(),
                     firth_op.x_dense.ncols(),
@@ -2408,7 +2408,7 @@ impl<'a> RemlState<'a> {
             );
             let pirls_elapsed = pirls_start.elapsed();
             if let Ok((ref res, ref wm)) = result {
-                log::info!(
+                log::debug!(
                     "[PIRLS-timing] iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
@@ -2525,7 +2525,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::info!(
+            log::debug!(
                 "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
                 cost_call_idx,
                 prefix.join(","),
@@ -2534,7 +2534,7 @@ impl<'a> RemlState<'a> {
         }
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
-            log::info!(
+            log::debug!(
                 "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
                 cost_call_idx,
                 eval.cost,
@@ -2548,7 +2548,7 @@ impl<'a> RemlState<'a> {
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
                 // Inner linear algebra says "too singular" — treat as barrier.
-                log::warn!(
+                log::debug!(
                     "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
                 );
                 // Diagnostics: which rho are at bounds
@@ -2565,7 +2565,7 @@ impl<'a> RemlState<'a> {
             Err(EstimationError::PerfectSeparationDetected { .. })
             | Err(EstimationError::PirlsDidNotConverge { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::warn!(
+                log::debug!(
                     "P-IRLS separation/non-convergence at current rho; returning +inf cost to retreat."
                 );
                 return Ok(f64::INFINITY);
@@ -2584,7 +2584,7 @@ impl<'a> RemlState<'a> {
             }
         };
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::info!(
+        log::debug!(
             "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?}",
             cost_call_idx,
             pirls_ms,
@@ -2594,7 +2594,7 @@ impl<'a> RemlState<'a> {
             let t_assemble = std::time::Instant::now();
             let result =
                 self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
-            log::info!(
+            log::debug!(
                 "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
                 cost_call_idx,
                 result.cost,
@@ -2663,7 +2663,7 @@ impl<'a> RemlState<'a> {
         // This ensures cost and gradient share the exact same formula.
         let t_assemble = std::time::Instant::now();
         let result = self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?;
-        log::info!(
+        log::debug!(
             "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
             cost_call_idx,
             result.cost,
@@ -3911,7 +3911,7 @@ impl<'a> RemlState<'a> {
         let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
-        log::info!(
+        log::debug!(
             "[outer-timing] evaluate_unified_with_psi_ext: PIRLS={:.1}ms  tau_build={:.1}ms  reml_eval={:.1}ms  total={:.1}ms",
             pirls_ms,
             tau_build_ms,
@@ -4000,7 +4000,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::info!(
+            log::debug!(
                 "[REML] grad-only begin | rho[..4]=[{}] | k={}",
                 prefix.join(","),
                 p.len()
@@ -4009,7 +4009,7 @@ impl<'a> RemlState<'a> {
         let rho_key = EvalCacheManager::sanitized_rhokey(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::info!(
+            log::debug!(
                 "[REML] grad-only cache hit | |g| {:.3e} | elapsed {:.1}ms",
                 gnorm,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
@@ -4029,7 +4029,7 @@ impl<'a> RemlState<'a> {
             }
         };
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::info!(
+        log::debug!(
             "[REML] grad-only pirls done | elapsed {:.1}ms | backend {:?}",
             pirls_ms,
             bundle.backend_kind()
@@ -4043,7 +4043,7 @@ impl<'a> RemlState<'a> {
             )?;
             let grad = result.gradient.unwrap();
             let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::info!(
+            log::debug!(
                 "[REML] grad-only sparse done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
                 gnorm,
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
@@ -4055,7 +4055,7 @@ impl<'a> RemlState<'a> {
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
         let grad = result.gradient.unwrap();
         let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        log::info!(
+        log::debug!(
             "[REML] grad-only dense done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
             gnorm,
             t_assemble.elapsed().as_secs_f64() * 1000.0,
@@ -4079,7 +4079,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::info!(
+            log::debug!(
                 "[REML] outer-eval begin {:?} | rho[..4]=[{}] | k={} | 2nd-order={}",
                 order,
                 prefix.join(","),
@@ -4092,7 +4092,7 @@ impl<'a> RemlState<'a> {
             let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {
                 let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                log::info!(
+                log::debug!(
                     "[REML] outer-eval cache hit | cost {:.6e} | |g| {:.3e} | elapsed {:.1}ms",
                     eval.cost,
                     gnorm,
@@ -4107,7 +4107,7 @@ impl<'a> RemlState<'a> {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::warn!(
+                log::debug!(
                     "P-IRLS flagged ill-conditioning for current rho; returning infeasible outer eval to retreat."
                 );
                 return Ok(OuterEval::infeasible(p.len()));
@@ -4115,7 +4115,7 @@ impl<'a> RemlState<'a> {
             Err(EstimationError::PerfectSeparationDetected { .. })
             | Err(EstimationError::PirlsDidNotConverge { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::warn!(
+                log::debug!(
                     "P-IRLS separation/non-convergence at current rho; returning infeasible outer eval to retreat."
                 );
                 return Ok(OuterEval::infeasible(p.len()));
@@ -4144,7 +4144,7 @@ impl<'a> RemlState<'a> {
         };
 
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::info!(
+        log::debug!(
             "[REML] outer-eval pirls done | elapsed {:.1}ms | backend {:?} | mode {:?}",
             pirls_ms,
             bundle.backend_kind(),
@@ -4178,7 +4178,7 @@ impl<'a> RemlState<'a> {
         };
         {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::info!(
+            log::debug!(
                 "[REML] outer-eval done | cost {:.6e} | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
                 eval.cost,
                 gnorm,

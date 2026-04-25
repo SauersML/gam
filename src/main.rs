@@ -1402,7 +1402,8 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    let options = blockwise_options_from_fit_args(args)?;
+    let mut options = blockwise_options_from_fit_args(args)?;
+    options.compute_covariance = true;
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
@@ -3481,9 +3482,9 @@ fn run_predict_survival(
         };
         let pred = predict_survival_location_scale(&pred_input, &saved_fit)
             .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
-        let posterior_or_uncertainty = if args.mode == PredictModeArg::PosteriorMean
-            || args.uncertainty
-        {
+        let include_survival_location_scale_intervals =
+            args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
+        let posterior_or_uncertainty = if include_survival_location_scale_intervals {
             let cov_mat = covariance_from_model(model, args.covariance_mode)?;
             Some(
                 gam::survival_location_scale::predict_survival_location_scalewith_uncertainty(
@@ -3491,7 +3492,7 @@ fn run_predict_survival(
                     &saved_fit,
                     &cov_mat,
                     args.mode == PredictModeArg::PosteriorMean,
-                    args.uncertainty,
+                    include_survival_location_scale_intervals,
                 )
                 .map_err(|e| format!("survival location-scale uncertainty predict failed: {e}"))?,
             )
@@ -3509,7 +3510,7 @@ fn run_predict_survival(
         let eta_se_default = posterior_or_uncertainty
             .as_ref()
             .map(|out| out.eta_standard_error.clone());
-        if args.uncertainty {
+        if include_survival_location_scale_intervals {
             if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
                 return Err(format!("--level must be in (0,1), got {}", args.level));
             }
@@ -3519,14 +3520,9 @@ fn run_predict_survival(
             let eta_se = eta_se_default
                 .clone()
                 .unwrap_or_else(|| out.eta_standard_error.clone());
-            // predict_survival_location_scalewith_uncertainty is called with
-            // include_response_sd = args.uncertainty just above, so under this
-            // branch (args.uncertainty == true) response_standard_error is
-            // contractually Some(_). Substituting zeros on None would silently
-            // collapse mean_lower/mean_upper to the point estimate — the caller
-            // would read zero-width bounds as a high-confidence prediction
-            // when what actually happened is the uncertainty pipeline failed
-            // to populate SDs. Fail loudly instead.
+            // This branch requests response SDs above. Substituting zeros on
+            // None would silently collapse mean_lower/mean_upper to the point
+            // estimate; fail loudly instead.
             let response_sd = out.response_standard_error.clone().ok_or_else(|| {
                 "internal error: survival location-scale response_standard_error missing under --uncertainty"
                     .to_string()
@@ -4405,7 +4401,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         validate_auxiliary_formula_controls(parsed_noise, "--predict-noise")?;
     }
 
-    let survival_link_choice = parse_link_choice(effective_args.link.as_deref(), false)?;
+    let survival_link_choice = match effective_args.link.as_deref() {
+        Some(raw)
+            if matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "loglog" | "cauchit"
+            ) =>
+        {
+            None
+        }
+        raw => parse_link_choice(raw, false)?,
+    };
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), survival_link_choice.as_ref());
     let effective_timewiggle = formula_timewiggle.clone();
@@ -5106,7 +5112,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
             opts
         };
-        let options = gam::families::custom_family::BlockwiseFitOptions::default();
+        let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
+        options.compute_covariance = true;
         let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -5167,11 +5174,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     // length-scale outer loop).
                     let mut baseline_kappa = SpatialLengthScaleOptimizationOptions::default();
                     baseline_kappa.enabled = false;
+                    let mut baseline_options = options.clone();
+                    baseline_options.compute_covariance = false;
                     let fit = match fit_model(FitRequest::SurvivalMarginalSlope(
                         SurvivalMarginalSlopeFitRequest {
                             data: ds.values.view(),
                             spec: buildspec(&prepared),
-                            options: options.clone(),
+                            options: baseline_options,
                             kappa_options: baseline_kappa,
                         },
                     )) {
@@ -5794,7 +5803,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let pirls_start = std::time::Instant::now();
     let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
         let elapsed = pirls_start.elapsed().as_secs_f64();
-        log::info!(
+        log::debug!(
             "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
             info.iteration,
             info.deviance,
@@ -5850,7 +5859,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 constrained_model,
             )
         };
-    log::info!(
+    log::debug!(
         "[PIRLS] finished: {:?} after {} iterations, deviance={:.6e}, {:.1}s total",
         summary.status,
         summary.iterations,
@@ -5870,7 +5879,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         if !rho.is_empty() {
             match surv_model.unified_lamlobjective_and_rhogradient(&beta, &state, &rho) {
                 Ok((laml_obj, laml_grad)) => {
-                    log::info!(
+                    log::debug!(
                         "[LAML] unified objective={:.6e}, |grad|={:.3e}",
                         laml_obj,
                         laml_grad.dot(&laml_grad).sqrt(),
@@ -10649,7 +10658,7 @@ mod tests {
                 let sb = slope.mapv(|value| scale * value);
                 let c = sb.mapv(|value| (1.0 + value * value).sqrt());
                 let eta = q_exit * &c + &sb * z;
-                let mean = eta.mapv(|value| normal_cdf(-value));
+                let mean = eta.mapv(normal_cdf);
                 return Ok(SavedSurvivalMarginalSlopeEtaTransport { eta, mean });
             }
 
@@ -10693,7 +10702,7 @@ mod tests {
             };
             let eta =
                 (&eta_base + &(slope * &score_dev_obs) + &link_dev_obs).mapv(|value| scale * value);
-            let mean = eta.mapv(|value| normal_cdf(-value));
+            let mean = eta.mapv(normal_cdf);
             Ok(SavedSurvivalMarginalSlopeEtaTransport { eta, mean })
         }
 
@@ -11682,13 +11691,15 @@ mod tests {
         family_state: FittedFamily,
         family: impl Into<String>,
     ) -> FittedModelPayload {
-        FittedModelPayload::new(
+        let mut payload = FittedModelPayload::new(
             MODEL_VERSION,
             formula.into(),
             model_kind,
             family_state,
             family.into(),
-        )
+        );
+        payload.data_schema = Some(DataSchema { columns: vec![] });
+        payload
     }
 
     fn intercept_only_gaussian_location_scale_model(
@@ -12926,15 +12937,15 @@ mod tests {
         let fit_result = compact_saved_multiblock_fit_result(
             vec![
                 FittedBlock {
-                    beta: Array1::zeros(0),
+                    beta: array![0.0],
                     role: BlockRole::Mean,
-                    edf: 0.0,
+                    edf: 1.0,
                     lambdas: Array1::zeros(0),
                 },
                 FittedBlock {
-                    beta: Array1::zeros(0),
+                    beta: array![0.0],
                     role: BlockRole::Scale,
-                    edf: 0.0,
+                    edf: 1.0,
                     lambdas: Array1::zeros(0),
                 },
             ],
@@ -13761,7 +13772,7 @@ mod tests {
         for i in 0..q_exit.len() {
             let c = (1.0 + slope[i] * slope[i]).sqrt();
             let expected_eta = q_exit[i] * c + slope[i] * z[i];
-            let expected_mean = super::normal_cdf(-expected_eta);
+            let expected_mean = super::normal_cdf(expected_eta);
             assert!(
                 (eta[i] - expected_eta).abs() <= 1e-10,
                 "row {i}: eta mismatch: got {}, expected {}",
@@ -13841,7 +13852,7 @@ mod tests {
         for i in 0..q_exit.len() {
             let c = (1.0 + slope[i] * slope[i]).sqrt();
             let expected_eta = q_exit[i] * c + slope[i] * z[i];
-            let expected_mean = super::normal_cdf(-expected_eta);
+            let expected_mean = super::normal_cdf(expected_eta);
             assert!((eta[i] - expected_eta).abs() <= 1e-10);
             assert!((mean[i] - expected_mean).abs() <= 1e-10);
         }
@@ -13875,7 +13886,7 @@ mod tests {
             let sb = scale * slope[i];
             let c = (1.0 + sb * sb).sqrt();
             let expected_eta = q_exit[i] * c + sb * z[i];
-            let expected_mean = super::normal_cdf(-expected_eta);
+            let expected_mean = super::normal_cdf(expected_eta);
             assert!((eta[i] - expected_eta).abs() <= 1e-10);
             assert!((mean[i] - expected_mean).abs() <= 1e-10);
         }
@@ -14175,6 +14186,7 @@ mod tests {
         ]);
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
+        payload.resolved_termspec_logslope = Some(empty_termspec());
         payload.survival_entry = Some("entry".to_string());
         payload.survival_exit = Some("exit".to_string());
         payload.survival_event = Some("event".to_string());
@@ -14313,9 +14325,11 @@ mod tests {
         )
         .expect("baseline-timewiggle build");
         let beta = Array1::from_iter((0..built.ncols).map(|j| 0.05 * (j as f64 + 1.0)));
-        let p = beta.len();
+        let mut fit_beta = Array1::<f64>::zeros(beta.len() + 1);
+        fit_beta.slice_mut(s![..beta.len()]).assign(&beta);
+        let p = fit_beta.len();
         let fit_result = core_saved_fit_result(
-            beta.clone(),
+            fit_beta,
             Array1::zeros(built.penalties.len()),
             1.0,
             Some(Array2::<f64>::eye(p)),
@@ -14352,6 +14366,20 @@ mod tests {
         payload.survival_distribution = Some("gaussian".to_string());
         payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
         payload.resolved_termspec = Some(empty_termspec());
+        payload.data_schema = Some(DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "entry".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "exit".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        });
         let model = SavedModel::from_payload(payload);
         let data = array![[10.0, 20.0], [12.0, 24.0]];
         let col_map = HashMap::from([("entry".to_string(), 0usize), ("exit".to_string(), 1usize)]);
@@ -16523,15 +16551,9 @@ mod tests {
     fn probit_location_scalewiggle_posterior_mean_matches_mc_in_largevariance_regime() {
         let beta_t = -0.4;
         let beta_ls = -1.3;
-        let beta_link_wiggle = vec![0.25, -0.1, 0.05];
-        let cov_diag = vec![0.2, 10.0, 0.4, 0.3, 0.2];
-        let cov = array![
-            [cov_diag[0], 0.0, 0.0, 0.0, 0.0],
-            [0.0, cov_diag[1], 0.0, 0.0, 0.0],
-            [0.0, 0.0, cov_diag[2], 0.0, 0.0],
-            [0.0, 0.0, 0.0, cov_diag[3], 0.0],
-            [0.0, 0.0, 0.0, 0.0, cov_diag[4]]
-        ];
+        let beta_link_wiggle = vec![0.25, 0.10, 0.05, 0.02];
+        let cov_diag = vec![0.2, 10.0, 0.4, 0.3, 0.2, 0.1];
+        let cov = Array2::from_diag(&Array1::from_vec(cov_diag.clone()));
         let model = intercept_only_binomial_location_scale_model(
             beta_t,
             beta_ls,
