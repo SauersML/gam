@@ -1334,12 +1334,6 @@ impl DesignBlock {
         }
     }
 
-    /// Legacy panicking wrapper. Migrate callers to `try_row_chunk`.
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        self.try_row_chunk(rows)
-            .expect("DesignBlock::row_chunk (legacy; migrate to try_row_chunk)")
-    }
-
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         match self {
             Self::Dense(d) => d.diag_xtw_x(weights),
@@ -1459,8 +1453,12 @@ impl BlockDesignOperator {
         let mut out = Array1::<f64>::zeros(self.n);
         for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let a_chunk = block_a.try_row_chunk(start..end).map_err(|e| e.to_string())?;
-            let b_chunk = block_b.try_row_chunk(start..end).map_err(|e| e.to_string())?;
+            let a_chunk = block_a
+                .try_row_chunk(start..end)
+                .map_err(|e| e.to_string())?;
+            let b_chunk = block_b
+                .try_row_chunk(start..end)
+                .map_err(|e| e.to_string())?;
             let a_m = fast_ab(&a_chunk, m_ab);
             for local in 0..(end - start) {
                 out[start + local] = a_m.row(local).dot(&b_chunk.row(local));
@@ -5013,7 +5011,11 @@ impl DesignMatrix {
                 if let Some(dense) = matrix.as_dense_ref() {
                     dense.row(row).dot(&beta)
                 } else {
-                    matrix.row_chunk(row..row + 1).row(0).dot(&beta)
+                    matrix
+                        .try_row_chunk(row..row + 1)
+                        .expect("DesignMatrix::dot_row_view: try_row_chunk must succeed")
+                        .row(0)
+                        .dot(&beta)
                 }
             }
             Self::Sparse(matrix) => {
