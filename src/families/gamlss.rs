@@ -9991,6 +9991,7 @@ impl BinomialLocationScaleExactNewtonJointPsiWorkspace {
                 psi_index,
                 &self.x_t,
                 &self.x_ls,
+                &self.family.policy,
             )
         })
     }
@@ -11077,6 +11078,7 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -11210,6 +11212,7 @@ impl BinomialLocationScaleFamily {
             psi_i,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -11220,6 +11223,7 @@ impl BinomialLocationScaleFamily {
             psi_j,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -11635,6 +11639,7 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -12643,6 +12648,7 @@ impl BinomialLocationScaleWiggleFamily {
                 psi_index,
                 x_t,
                 x_ls,
+                &self.policy,
             )?
             .is_none()
         {
