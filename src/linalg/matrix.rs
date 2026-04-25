@@ -522,20 +522,6 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         Ok(out)
     }
 
-    /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
-    /// `try_row_chunk(...)?` to propagate materialization errors.
-    //
-    // Remaining in-tree callers span `families/*marginal_slope.rs`,
-    // `families/scale_design.rs`, `families/latent_survival.rs`,
-    // `terms/smooth.rs`, `inference/predict.rs`, `solver/pirls.rs`, and several
-    // inherent `row_chunk` shims. Each site needs a local decision between
-    // `try_row_chunk(rows)?` and the allocation-free `row_chunk_into(rows, view)`
-    // path for hot loops.
-    fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        self.try_row_chunk(rows)
-            .expect("DenseDesignOperator::row_chunk (legacy; migrate to try_row_chunk)")
-    }
-
     /// Borrow dense storage when this operator already owns it.
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         None
@@ -1443,8 +1429,8 @@ impl BlockDesignOperator {
         let mut cross = Array2::<f64>::zeros((pi, pj));
         for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let left_chunk = left.row_chunk(start..end);
-            let right_chunk = right.row_chunk(start..end);
+            let left_chunk = left.try_row_chunk(start..end).map_err(|e| e.to_string())?;
+            let right_chunk = right.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             for local in 0..(end - start) {
                 let wi = weights[start + local].max(0.0);
                 if wi == 0.0 {
@@ -1473,8 +1459,8 @@ impl BlockDesignOperator {
         let mut out = Array1::<f64>::zeros(self.n);
         for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let a_chunk = block_a.row_chunk(start..end);
-            let b_chunk = block_b.row_chunk(start..end);
+            let a_chunk = block_a.try_row_chunk(start..end).map_err(|e| e.to_string())?;
+            let b_chunk = block_b.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let a_m = fast_ab(&a_chunk, m_ab);
             for local in 0..(end - start) {
                 out[start + local] = a_m.row(local).dot(&b_chunk.row(local));
@@ -1620,7 +1606,7 @@ impl BlockDesignOperator {
                 let mut out = Array1::<f64>::zeros(self.n);
                 for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
                     let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-                    let chunk = d.row_chunk(start..end);
+                    let chunk = d.try_row_chunk(start..end).map_err(|e| e.to_string())?;
                     for local in 0..chunk.nrows() {
                         let i = start + local;
                         if let Some(g) = re.group_ids[i] {
@@ -1638,7 +1624,7 @@ impl BlockDesignOperator {
                 let mut out = Array1::<f64>::zeros(self.n);
                 for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
                     let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-                    let chunk = d.row_chunk(start..end);
+                    let chunk = d.try_row_chunk(start..end).map_err(|e| e.to_string())?;
                     for local in 0..chunk.nrows() {
                         let i = start + local;
                         if let Some(g) = re.group_ids[i] {
@@ -1668,7 +1654,7 @@ impl BlockDesignOperator {
                 let mut out = Array1::<f64>::zeros(self.n);
                 for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
                     let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-                    let chunk = other.row_chunk(start..end);
+                    let chunk = other.try_row_chunk(start..end).map_err(|e| e.to_string())?;
                     for local in 0..(end - start) {
                         out[start + local] = chunk.row(local).dot(&m_row);
                     }
@@ -1680,7 +1666,7 @@ impl BlockDesignOperator {
                 let mut out = Array1::<f64>::zeros(self.n);
                 for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
                     let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-                    let chunk = other.row_chunk(start..end);
+                    let chunk = other.try_row_chunk(start..end).map_err(|e| e.to_string())?;
                     for local in 0..(end - start) {
                         out[start + local] = chunk.row(local).dot(&m_col);
                     }
@@ -1859,7 +1845,7 @@ impl DenseDesignOperator for BlockDesignOperator {
         for (idx, block) in self.blocks.iter().enumerate() {
             let cs = self.col_offsets[idx];
             let ce = self.col_offsets[idx + 1];
-            let block_chunk = block.row_chunk(rows.clone());
+            let block_chunk = block.try_row_chunk(rows.clone())?;
             out.slice_mut(s![.., cs..ce]).assign(&block_chunk);
         }
         Ok(())
@@ -2188,7 +2174,7 @@ impl DenseDesignOperator for MultiChannelOperator {
             let ch_local_start = global % n;
             let ch_local_end = ((ch_idx + 1) * n).min(rows.end) - ch_idx * n;
             let segment_len = ch_local_end - ch_local_start;
-            let ch_chunk = self.channels[ch_idx].row_chunk(ch_local_start..ch_local_end);
+            let ch_chunk = self.channels[ch_idx].try_row_chunk(ch_local_start..ch_local_end)?;
             out.slice_mut(s![local..local + segment_len, ..])
                 .assign(&ch_chunk);
             local += segment_len;
@@ -2621,7 +2607,7 @@ impl DenseDesignOperator for TensorProductDesignOperator {
         let mut out = Array1::<f64>::zeros(self.n);
         for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let chunk = self.row_chunk(start..end);
+            let chunk = self.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let chunk_m = fast_ab(&chunk, middle);
             for local in 0..(end - start) {
                 out[start + local] = chunk.row(local).dot(&chunk_m.row(local)).max(0.0);
@@ -2650,7 +2636,8 @@ impl DenseDesignOperator for TensorProductDesignOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.row_chunk(0..self.n)
+        self.try_row_chunk(0..self.n)
+            .expect("TensorProductDesignOperator row_chunk_into is total")
     }
 }
 
@@ -2967,7 +2954,7 @@ impl DenseDesignOperator for CoefficientTransformOperator {
                 context: "CoefficientTransformOperator::row_chunk_into shape mismatch",
             });
         }
-        let chunk = self.inner.row_chunk(rows);
+        let chunk = self.inner.try_row_chunk(rows)?;
         out.assign(&fast_ab(&chunk, &self.transform));
         Ok(())
     }
@@ -3154,7 +3141,7 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
         let mut out = Array1::<f64>::zeros(self.n);
         for start in (0..self.n).step_by(OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let chunk = self.row_chunk(start..end);
+            let chunk = self.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let chunk_m = fast_ab(&chunk, middle);
             for local in 0..(end - start) {
                 out[start + local] = chunk.row(local).dot(&chunk_m.row(local)).max(0.0);
@@ -3177,7 +3164,7 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
             });
         }
         out.fill(0.0);
-        let cov_chunk = self.cov.row_chunk(rows.clone());
+        let cov_chunk = self.cov.try_row_chunk(rows.clone())?;
         let time = self.time_basis.as_ref();
         for local in 0..chunk_rows {
             let global = rows.start + local;
@@ -3388,7 +3375,7 @@ impl DenseDesignOperator for ConditionedDesign {
                 context: "ConditionedDesign::row_chunk_into shape mismatch",
             });
         }
-        let mut chunk = self.inner.row_chunk(rows);
+        let mut chunk = self.inner.try_row_chunk(rows)?;
         for &(j, mean, scale) in &self.columns {
             chunk.column_mut(j).mapv_inplace(|v| (v - mean) / scale);
         }
@@ -4526,7 +4513,8 @@ impl DenseDesignOperator for DesignMatrix {
                 context: "DesignMatrix::row_chunk_into shape mismatch",
             });
         }
-        out.assign(&DesignMatrix::row_chunk(self, rows));
+        let chunk = DesignMatrix::try_row_chunk(self, rows)?;
+        out.assign(&chunk);
         Ok(())
     }
 
