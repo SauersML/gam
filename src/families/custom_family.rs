@@ -3885,7 +3885,13 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
     })
 }
 
-// TODO(psi-design-map-migration): callers should switch to resolve_custom_family_x_psi_map
+// TODO(psi-design-map-migration): remaining callers in `survival_location_scale.rs`
+// (lines 1911, 1952) and `gamlss.rs` (line 8653) materialize the dense matrix and
+// must move to `resolve_custom_family_x_psi_map` with an upstream `ResourcePolicy`.
+// Those files are owned by sibling agents; once they migrate, delete this adapter
+// (do not add `#[allow(dead_code)]`). The inlined `permissive_small_data()` policy
+// is a temporary back-compat scaffold — every preserved callsite should plumb a
+// real policy through and call the `_map` variant directly.
 pub(crate) fn resolve_custom_family_x_psi(
     deriv: &CustomFamilyBlockPsiDerivative,
     n: usize,
@@ -3902,7 +3908,14 @@ pub(crate) fn resolve_custom_family_x_psi(
     }
 }
 
-// TODO(psi-design-map-migration): callers should switch to resolve_custom_family_x_psi_psi_map
+// TODO(psi-design-map-migration): remaining callers in `survival_location_scale.rs`
+// (lines 2041, 2077) and `gamlss.rs` (lines 5559, 5579, 6938, 6958, 10856, 10876,
+// 12542, 12562) materialize the dense matrix and must move to
+// `resolve_custom_family_x_psi_psi_map` with an upstream `ResourcePolicy`. Those
+// files are owned by sibling agents; once they migrate, delete this adapter (do
+// not add `#[allow(dead_code)]`). The inlined `permissive_small_data()` policy is
+// a temporary back-compat scaffold — every preserved callsite should plumb a real
+// policy through and call the `_map` variant directly.
 pub(crate) fn resolve_custom_family_x_psi_psi(
     deriv_i: &CustomFamilyBlockPsiDerivative,
     deriv_j: &CustomFamilyBlockPsiDerivative,
@@ -11984,24 +11997,35 @@ mod tests {
             "info list should expose the same two psi rows"
         );
 
-        let x_cross_01 = resolve_custom_family_x_psi_psi(
+        let policy = ResourcePolicy::permissive_small_data();
+        let x_cross_01_map = resolve_custom_family_x_psi_psi_map(
             &derivs[0],
             &derivs[1],
             1,
             resolved_design.design.nrows(),
             resolved_design.design.ncols(),
+            0..resolved_design.design.nrows(),
             "psi0 cross design",
+            &policy,
         )
         .expect("resolve psi0 cross design");
-        let x_cross_10 = resolve_custom_family_x_psi_psi(
+        let x_cross_10_map = resolve_custom_family_x_psi_psi_map(
             &derivs[1],
             &derivs[0],
             0,
             resolved_design.design.nrows(),
             resolved_design.design.ncols(),
+            0..resolved_design.design.nrows(),
             "psi1 cross design",
+            &policy,
         )
         .expect("resolve psi1 cross design");
+        let x_cross_01 = x_cross_01_map
+            .row_chunk(0..resolved_design.design.nrows())
+            .expect("materialize psi0 cross design");
+        let x_cross_10 = x_cross_10_map
+            .row_chunk(0..resolved_design.design.nrows())
+            .expect("materialize psi1 cross design");
         assert_eq!(
             x_cross_01.dim(),
             (
