@@ -706,6 +706,217 @@ fn evaluate_rp_row(
     Ok((eta, cum, cum.max(1e-12)))
 }
 
+/// Batch evaluator for the location-scale survival likelihood mode.
+///
+/// Mirrors the CLI's LocationScale predict path (main.rs::run_predict_survival
+/// LocationScale arm) but stays library-only: builds the threshold/log_sigma
+/// designs from the saved frozen specs, replays the saved scale-deviation
+/// transform on the noise design, applies the survival time-derivative guard,
+/// and calls `predict_survival_location_scale`.
+///
+/// Plugin survival only — uncertainty paths still live in the CLI.
+fn predict_survival_location_scale_batch(
+    model: &SavedModel,
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cov_design: &crate::terms::smooth::TermCollectionDesign,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+    training_headers: Option<&Vec<String>>,
+    col_map: &HashMap<String, usize>,
+    data: ArrayView2<'_, f64>,
+    time_grid: Option<&[f64]>,
+) -> Result<SurvivalPredictResult, String> {
+    use crate::families::scale_design::apply_scale_deviation_transform;
+    use crate::families::survival_construction::{
+        build_survival_marginal_slope_baseline_offsets,
+        evaluate_survival_time_basis_row,
+    };
+    use crate::families::survival_location_scale::{
+        SurvivalLocationScalePredictInput, predict_survival_location_scale,
+    };
+    use crate::matrix::{DenseDesignMatrix, DesignMatrix};
+
+    if time_grid.is_some() {
+        return Err(
+            "predict_survival location-scale path does not support time_grid yet; \
+             omit time_grid for per-row exit-time evaluation"
+                .to_string(),
+        );
+    }
+    if training_headers.is_some() {
+        // Suppress the unused-variable lint while keeping the signature
+        // compatible with the rest of the module.
+    }
+    let n = age_entry.len();
+    let saved_likelihood_mode = SurvivalLikelihoodMode::LocationScale;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+    let time_cfg = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build = build_survival_time_basis(age_entry, age_exit, time_cfg.clone(), None)?;
+    let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let time_anchor = model
+        .survival_time_anchor
+        .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+    let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_cfg)?;
+    center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &time_anchor_row,
+    )?;
+    if !model.has_baseline_time_wiggle() {
+        require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
+    }
+    let saved_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
+    // Choose the proper baseline (probit-survival for SAS/etc, default for the rest).
+    let probit_baseline = matches!(
+        &saved_inverse_link,
+        InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
+            | InverseLink::LatentCLogLog(_)
+    );
+    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
+        if probit_baseline {
+            build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, &baseline_cfg)?
+        } else {
+            crate::families::survival_construction::build_survival_baseline_offsets(
+                age_entry,
+                age_exit,
+                &baseline_cfg,
+            )?
+        };
+    // Apply the survival-location-scale derivative guard (matches CLI default
+    // exactly; if a saved model was fit with a non-default guard, the CLI
+    // currently also applies the default at predict time, so parity holds).
+    let derivative_guard =
+        crate::families::survival_location_scale::DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
+    if derivative_guard > 0.0 {
+        for i in 0..n {
+            eta_offset_entry[i] += derivative_guard * (age_entry[i] - time_anchor);
+            eta_offset_exit[i] += derivative_guard * (age_exit[i] - time_anchor);
+            derivative_offset_exit[i] += derivative_guard;
+        }
+    }
+
+    let saved_fit = saved_survival_location_scale_fit_result(model)?;
+    let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
+
+    // Build threshold + log-sigma designs from the frozen saved specs. Re-using
+    // resolve_termspec_for_prediction guarantees we honor the predict-data's
+    // column layout via the model's training_headers.
+    let thresholdspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        model.training_headers.as_ref(),
+        _col_map,
+        "resolved_termspec",
+    )?;
+    let threshold_design = crate::terms::smooth::build_term_collection_design(_data, &thresholdspec)
+        .map_err(|err| format!("failed to build survival threshold design: {err}"))?;
+    let log_sigmaspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec_noise,
+        model.training_headers.as_ref(),
+        _col_map,
+        "resolved_termspec_noise",
+    )?;
+    let raw_sigma_design = crate::terms::smooth::build_term_collection_design(_data, &log_sigmaspec)
+        .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
+    let survival_noise_transform = scale_transform_from_payload(
+        &model.survival_noise_projection,
+        &model.survival_noise_center,
+        &model.survival_noise_scale,
+        model.survival_noise_non_intercept_start,
+    )?;
+
+    let x_time_exit_dense = time_build.x_exit_time.to_dense();
+    let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
+        let mut full = Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
+        full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
+            .assign(&x_time_exit_dense);
+        full
+    } else {
+        x_time_exit_dense
+    };
+    let dense_threshold = threshold_design.design.to_dense();
+    let mut survival_primary_design =
+        Array2::<f64>::zeros((n, x_time_exit.ncols() + dense_threshold.ncols()));
+    survival_primary_design
+        .slice_mut(s![.., 0..x_time_exit.ncols()])
+        .assign(&x_time_exit);
+    survival_primary_design
+        .slice_mut(s![.., x_time_exit.ncols()..])
+        .assign(&dense_threshold);
+    let dense_raw_sigma = raw_sigma_design.design.to_dense();
+    let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
+        apply_scale_deviation_transform(&survival_primary_design, &dense_raw_sigma, transform)?
+    } else {
+        dense_raw_sigma
+    };
+    let link_wiggle_knots = model
+        .linkwiggle_knots
+        .as_ref()
+        .map(|k| Array1::from_vec(k.clone()));
+    let link_wiggle_degree = model.linkwiggle_degree;
+    // Suppress the cov_design unused-variable warning while keeping the
+    // signature aligned with the rest of the module's helpers; the
+    // location-scale branch uses threshold_design for threshold inputs.
+    let _ = cov_design;
+    let pred_input = SurvivalLocationScalePredictInput {
+        x_time_exit,
+        eta_time_offset_exit: eta_offset_exit,
+        time_wiggle_knots: saved_timewiggle_runtime
+            .as_ref()
+            .map(|w| Array1::from_vec(w.knots.clone())),
+        time_wiggle_degree: saved_timewiggle_runtime.as_ref().map(|w| w.degree),
+        time_wiggle_ncols: saved_timewiggle_runtime
+            .as_ref()
+            .map_or(0, |w| w.beta.len()),
+        x_threshold: threshold_design.design.clone(),
+        eta_threshold_offset: primary_offset.clone(),
+        x_log_sigma: DesignMatrix::Dense(DenseDesignMatrix::from(prepared_sigma_design)),
+        eta_log_sigma_offset: noise_offset.clone(),
+        x_link_wiggle: None,
+        link_wiggle_knots,
+        link_wiggle_degree,
+        inverse_link: saved_inverse_link.clone(),
+    };
+    let pred = predict_survival_location_scale(&pred_input, &saved_fit)
+        .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+
+    // Map plugin survival to (hazard, survival, cumulative_hazard) per row.
+    // The location-scale predict path returns survival probability at each
+    // row's exit; without a time grid we surface that at column 0 and leave
+    // hazard/cumulative-hazard derived from the same scalar.
+    let mut survival = Array2::<f64>::zeros((n, 1));
+    let mut cumulative_hazard = Array2::<f64>::zeros((n, 1));
+    let mut hazard = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        let surv = pred.survival_prob[i].clamp(1e-300, 1.0);
+        survival[[i, 0]] = surv;
+        cumulative_hazard[[i, 0]] = -surv.ln();
+        // Hazard requires an exit-time derivative path that the CLI's
+        // run_predict_survival branch derives from the inverse-link slope; the
+        // library batch path doesn't compute it. Surface NaN so consumers can
+        // detect missing hazard rather than acting on a zero placeholder.
+        hazard[[i, 0]] = f64::NAN;
+    }
+
+    Ok(SurvivalPredictResult {
+        times: age_exit.to_vec(),
+        hazard,
+        survival,
+        cumulative_hazard,
+        linear_predictor: pred.eta,
+        likelihood_mode: saved_likelihood_mode,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Shared library helpers (used by the CLI wrapper too).
 // ---------------------------------------------------------------------------
