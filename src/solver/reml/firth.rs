@@ -2370,11 +2370,9 @@ impl FirthDenseOperator {
             dot_k_reduced: tau_kernel.dot_k_reduced.clone(),
             deta_v: beta_direction.deta.clone(),
             deta_tau_v: x_tau_v.clone(),
-            g_v_reduced: beta_direction.g_u_reduced.clone(),
             a_v_reduced: beta_direction.a_u_reduced.clone(),
             dh_v: beta_direction.dh.clone(),
             b_vvec: beta_direction.b_uvec.clone(),
-            d_beta_dot_i,
             d_beta_dot_k,
             d_beta_dot_h,
         }

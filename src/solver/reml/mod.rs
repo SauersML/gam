@@ -3665,18 +3665,11 @@ pub(crate) struct FirthTauTauPartialKernel {
 
 /// Prepared state for `D_β((H_φ)_τ|_β)[v]` (Primitive B).
 ///
-/// Carries the τ-kernel pieces (x_tau_reduced, İ, K̇, ḣ, w-chain), the
-/// β-direction reduced quantities (δη_v, I'_v, A_v, dh_v, w-chain
-/// derivatives), and the mixed β-τ pieces (D_β(İ_τ)[v], D_β(K̇_τ)[v],
-/// D_β(ḣ_τ)[v], δη_{τ,v}) so the apply step collapses to the 9-term
-/// β-τ expansion without recomputing shared reduced Grams.  Fields are
-/// filled in by 13c.
-///
-/// Allow(dead_code): scaffold until 13c populates the fields inside
-/// `d_beta_hphi_tau_partial_prepare_from_partials` and 13d wires the
-/// kernel into the `fixed_drift_deriv` closure in
-/// `build_tau_hyper_coords`.
-#[allow(dead_code)]
+/// Carries the τ-kernel pieces (x_tau_reduced, İ, K̇, ḣ), the
+/// β-direction quantities (δη_v, A_v, dh_v, b-chain), and the mixed
+/// β-τ pieces (D_β(K̇_τ)[v], D_β(ḣ_τ)[v], δη_{τ,v}) so the apply
+/// step collapses to the 9-term β-τ expansion without recomputing
+/// shared reduced Grams.
 #[derive(Clone, Default)]
 pub(crate) struct FirthTauBetaPartialKernel {
     pub(super) x_tau_reduced: Array2<f64>,
@@ -3686,11 +3679,9 @@ pub(crate) struct FirthTauBetaPartialKernel {
     pub(super) dot_k_reduced: Array2<f64>,
     pub(super) deta_v: Array1<f64>,
     pub(super) deta_tau_v: Array1<f64>,
-    pub(super) g_v_reduced: Array2<f64>,
     pub(super) a_v_reduced: Array2<f64>,
     pub(super) dh_v: Array1<f64>,
     pub(super) b_vvec: Array1<f64>,
-    pub(super) d_beta_dot_i: Array2<f64>,
     pub(super) d_beta_dot_k: Array2<f64>,
     pub(super) d_beta_dot_h: Array1<f64>,
 }
