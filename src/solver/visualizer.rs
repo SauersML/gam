@@ -108,6 +108,20 @@ pub fn reml_info_enabled() -> bool {
     })
 }
 
+/// Env-gated diagnostic: returns `true` when `GAM_LOG_DATA_INFO` is set to any
+/// non-empty value. Lowers the data-loading sub-stage threshold so CI captures
+/// timings below the default 100ms emit gate (header read, streaming parse +
+/// inference, schema finalization, Array2 assembly). Used by fuzz CI to
+/// localize timeouts that finish entirely before any solver kernel runs.
+pub fn data_info_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("GAM_LOG_DATA_INFO")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 fn install_multiprogress(mp: Option<MultiProgress>) {
     if let Ok(mut guard) = active_multiprogress().lock() {
         *guard = mp;

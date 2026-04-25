@@ -20,6 +20,7 @@ use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_usize, option_usize_any,
 };
 use crate::inference::model::ColumnKindTag;
+use crate::resource::ResourcePolicy;
 use crate::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
@@ -46,6 +47,7 @@ pub fn build_termspec(
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
     inference_notes: &mut Vec<String>,
+    policy: &ResourcePolicy,
 ) -> Result<TermCollectionSpec, String> {
     let mut linear_terms = Vec::<LinearTermSpec>::new();
     let mut random_terms = Vec::<RandomEffectTermSpec>::new();
@@ -149,7 +151,8 @@ pub fn build_termspec(
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
-                let basis = build_smooth_basis(*kind, vars, &cols, options, ds, inference_notes)?;
+                let basis =
+                    build_smooth_basis(*kind, vars, &cols, options, ds, inference_notes, policy)?;
                 smooth_terms.push(SmoothTermSpec {
                     name: label.clone(),
                     basis,
@@ -183,6 +186,7 @@ pub fn build_smooth_basis(
     options: &BTreeMap<String, String>,
     ds: &Dataset,
     inference_notes: &mut Vec<String>,
+    policy: &ResourcePolicy,
 ) -> Result<SmoothBasisSpec, String> {
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let type_opt = options
@@ -277,14 +281,13 @@ pub fn build_smooth_basis(
             })
         }
         "tps" | "thinplate" | "thin-plate" => {
-            // TODO(spatial-plan-migration): thread workspace policy through
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
                 cols.len(),
                 CenterCountRequest::Default,
                 DuchonNullspaceOrder::Linear,
                 option_bool(options, "scale_dims").unwrap_or(false),
-                &crate::resource::ResourcePolicy::default_library(),
+                policy,
             )
             .map_err(|e| e.to_string())?;
             let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
@@ -305,14 +308,13 @@ pub fn build_smooth_basis(
             })
         }
         "matern" => {
-            // TODO(spatial-plan-migration): thread workspace policy through
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
                 cols.len(),
                 CenterCountRequest::Default,
                 DuchonNullspaceOrder::Zero,
                 option_bool(options, "scale_dims").unwrap_or(false),
-                &crate::resource::ResourcePolicy::default_library(),
+                policy,
             )
             .map_err(|e| e.to_string())?;
             let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
@@ -349,14 +351,13 @@ pub fn build_smooth_basis(
                 ));
             }
             let nullspace_order = parse_duchon_order(options)?;
-            // TODO(spatial-plan-migration): thread workspace policy through
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
                 cols.len(),
                 CenterCountRequest::Default,
                 nullspace_order,
                 option_bool(options, "scale_dims").unwrap_or(false),
-                &crate::resource::ResourcePolicy::default_library(),
+                policy,
             )
             .map_err(|e| e.to_string())?;
             let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
