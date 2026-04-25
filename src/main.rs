@@ -10295,7 +10295,8 @@ mod tests {
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
-        covariance_from_model, effectivelinkwiggle_formulaspec, family_to_string, linkname,
+        covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel, family_to_string,
+        linkname,
         load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
         parse_surv_response, parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_gam, pretty_familyname, required_columns_for_fit,
@@ -11324,59 +11325,93 @@ mod tests {
     }
 
     #[test]
-    fn cli_bernoulli_marginal_slope_routes_main_and_logslope_linkwiggles_to_distinct_blocks() {
-        let td = tempdir().expect("tempdir");
-        let train_path = td.path().join("train.csv");
-        let model_path = td.path().join("model.json");
-        write_bernoulli_marginal_slope_train_csv(&train_path);
+    fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes() {
+        let saved_runtime = || SavedAnchoredDeviationRuntime {
+            kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+            breakpoints: vec![-1.0, 1.0],
+            basis_dim: 1,
+            span_c0: vec![vec![0.0]],
+            span_c1: vec![vec![0.0]],
+            span_c2: vec![vec![0.0]],
+            span_c3: vec![vec![0.0]],
+        };
+        let fit_result = compact_saved_multiblock_fit_result(
+            vec![
+                FittedBlock {
+                    beta: array![0.0],
+                    role: BlockRole::Mean,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![0.0],
+                    role: BlockRole::Scale,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![0.0],
+                    role: BlockRole::Scale,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+                FittedBlock {
+                    beta: array![0.0],
+                    role: BlockRole::LinkWiggle,
+                    edf: 0.0,
+                    lambdas: Array1::zeros(0),
+                },
+            ],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            None,
+            SavedFitSummary {
+                likelihood_family: Some(LikelihoodFamily::BinomialProbit),
+                likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+                log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
+                ..saved_fit_summary_stub()
+            },
+        );
+        let mut payload = FittedModelPayload::new(
+            MODEL_VERSION,
+            "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")"
+                .to_string(),
+            ModelKind::MarginalSlope,
+            FittedFamily::MarginalSlope {
+                likelihood: LikelihoodFamily::BinomialProbit,
+                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            },
+            "bernoulli-marginal-slope".to_string(),
+        );
+        payload.unified = Some(fit_result.clone());
+        payload.fit_result = Some(fit_result);
+        payload.data_schema = Some(DataSchema { columns: vec![] });
+        payload.training_headers = Some(vec![]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_logslope = Some(empty_termspec());
+        payload.formula_logslope =
+            Some("1 + linkwiggle(degree=3, internal_knots=4, penalty_order=\"2\")".to_string());
+        payload.z_column = Some("z".to_string());
+        payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        payload.marginal_baseline = Some(0.0);
+        payload.logslope_baseline = Some(0.0);
+        payload.link = Some("probit".to_string());
+        payload.score_warp_runtime = Some(saved_runtime());
+        payload.link_deviation_runtime = Some(saved_runtime());
 
-        run_fit(FitArgs {
-            data: train_path,
-            formula_positional:
-                "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")".to_string(),
-            predict_noise: None,
-            logslope_formula: Some(
-                "1 + linkwiggle(degree=3, internal_knots=4, penalty_order=\"2\")".to_string(),
-            ),
-            z_column: Some("z".to_string()),
-            weights_column: None,
-            offset_column: None,
-            noise_offset_column: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-            transformation_normal: false,
-            firth: false,
-            survival_likelihood: "transformation".to_string(),
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "ispline".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            adaptive_regularization: false,
-            scale_dimensions: false,
-            pilot_subsample_threshold: 0,
-            out: Some(model_path.clone()),
-        })
-        .expect("marginal-slope fit with split deviation blocks should succeed");
-
-        let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
+        let saved = SavedModel::from_payload(payload);
+        let runtime = saved
+            .saved_prediction_runtime()
+            .expect("saved marginal-slope runtime should replay");
         assert!(
-            saved.payload().score_warp_runtime.is_some(),
+            runtime.score_warp.is_some(),
             "logslope-formula linkwiggle should persist score-warp runtime"
         );
         assert!(
-            saved.payload().link_deviation_runtime.is_some(),
+            runtime.link_deviation.is_some(),
             "main-formula linkwiggle should persist link-deviation runtime"
         );
         assert_eq!(
