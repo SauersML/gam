@@ -6466,14 +6466,13 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
-        let policy = crate::resource::ResourcePolicy::default_library();
         let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
             p_psi,
             0..n,
             psi_label,
-            &policy,
+            &self.policy,
         )?;
 
         let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
@@ -6590,14 +6589,13 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
-        let policy = crate::resource::ResourcePolicy::default_library();
         let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
             p_psi,
             0..n,
             psi_label,
-            &policy,
+            &self.policy,
         )?;
 
         let block_acc = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
