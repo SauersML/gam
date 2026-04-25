@@ -158,6 +158,8 @@ fn load_delimited_inferred(
     delimiter: u8,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
+    let verbose = crate::solver::visualizer::data_info_enabled();
+    let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
@@ -176,6 +178,15 @@ fn load_delimited_inferred(
     let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
     let headers = projected_headers(&all_headers, &selected_indices);
     let p = headers.len();
+    let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+    if verbose || open_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] delim_open+headers | n_headers={} | n_proj={} | {:.1}ms",
+            all_headers.len(),
+            p,
+            open_ms
+        );
+    }
 
     // Phase 1: sample rows for schema inference, accumulate into column vecs.
     let mut col_vecs: Vec<Vec<f64>> = vec![Vec::new(); p];
@@ -189,6 +200,7 @@ fn load_delimited_inferred(
     let mut level_index: Vec<HashMap<String, usize>> = vec![HashMap::new(); p];
     let mut levels: Vec<Vec<String>> = vec![Vec::new(); p];
 
+    let t_stream = std::time::Instant::now();
     let mut record = StringRecord::new();
     while rdr
         .read_record(&mut record)
@@ -269,10 +281,21 @@ fn load_delimited_inferred(
         }
     }
 
+    let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
+    if verbose || stream_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] delim_stream+infer | n_rows={} | n_cols={} | {:.1}ms",
+            total_rows,
+            p,
+            stream_ms
+        );
+    }
+
     if total_rows == 0 {
         return Err("file has no rows".to_string());
     }
 
+    let t_schema = std::time::Instant::now();
     // Build schema from inference state.
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(p);
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
@@ -319,7 +342,21 @@ fn load_delimited_inferred(
             }
         }
     }
+    let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
+    if verbose || schema_ms > 100.0 {
+        let n_cat = column_kinds
+            .iter()
+            .filter(|k| matches!(k, ColumnKindTag::Categorical))
+            .count();
+        log::info!(
+            "[DATA-LOAD] delim_finalize_schema | n_cols={} | n_cat={} | {:.1}ms",
+            p,
+            n_cat,
+            schema_ms
+        );
+    }
 
+    let t_assemble = std::time::Instant::now();
     // Assemble into Array2 (column-major fill is cache-friendly for column vecs).
     let mut values = Array2::<f64>::zeros((total_rows, p));
     for j in 0..p {
@@ -333,6 +370,15 @@ fn load_delimited_inferred(
             }
             values[[i, j]] = v;
         }
+    }
+    let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
+    if verbose || assemble_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] delim_assemble_array2 | n_rows={} | n_cols={} | {:.1}ms",
+            total_rows,
+            p,
+            assemble_ms
+        );
     }
 
     let schema = DataSchema {
@@ -353,6 +399,8 @@ fn load_delimited_with_schema(
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
+    let verbose = crate::solver::visualizer::data_info_enabled();
+    let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
@@ -371,6 +419,15 @@ fn load_delimited_with_schema(
     let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
     let headers = projected_headers(&all_headers, &selected_indices);
     let p = headers.len();
+    let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+    if verbose || open_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] delim_schema_open+headers | n_headers={} | n_proj={} | {:.1}ms",
+            all_headers.len(),
+            p,
+            open_ms
+        );
+    }
 
     // Build per-column metadata from schema.
     let schema_byname: HashMap<&str, &SchemaColumn> = schema
@@ -428,6 +485,7 @@ fn load_delimited_with_schema(
     let mut infer_strings: Vec<Vec<(usize, String)>> = vec![Vec::new(); p]; // (row_idx, raw)
 
     let mut total_rows: usize = 0;
+    let t_stream = std::time::Instant::now();
     let mut record = StringRecord::new();
     while rdr
         .read_record(&mut record)
@@ -489,10 +547,23 @@ fn load_delimited_with_schema(
         }
     }
 
+    let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
+    if verbose || stream_ms > 100.0 {
+        let n_inf = needs_inference.iter().filter(|x| **x).count();
+        log::info!(
+            "[DATA-LOAD] delim_schema_stream | n_rows={} | n_cols={} | n_inf={} | {:.1}ms",
+            total_rows,
+            p,
+            n_inf,
+            stream_ms
+        );
+    }
+
     if total_rows == 0 {
         return Err("file has no rows".to_string());
     }
 
+    let t_finalize = std::time::Instant::now();
     // Finalize inferred columns.
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
     for j in 0..p {
@@ -519,7 +590,16 @@ fn load_delimited_with_schema(
         }
         column_kinds.push(col_meta[j].kind);
     }
+    let finalize_ms = t_finalize.elapsed().as_secs_f64() * 1000.0;
+    if verbose || finalize_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] delim_schema_finalize | n_cols={} | {:.1}ms",
+            p,
+            finalize_ms
+        );
+    }
 
+    let t_assemble = std::time::Instant::now();
     // Assemble Array2.
     let mut values = Array2::<f64>::zeros((total_rows, p));
     for j in 0..p {
@@ -533,6 +613,15 @@ fn load_delimited_with_schema(
             }
             values[[i, j]] = v;
         }
+    }
+    let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
+    if verbose || assemble_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] delim_schema_assemble | n_rows={} | n_cols={} | {:.1}ms",
+            total_rows,
+            p,
+            assemble_ms
+        );
     }
 
     let schema_out = DataSchema {
@@ -626,6 +715,8 @@ fn load_parquet_inferred(
     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
     use std::fs::File;
 
+    let verbose = crate::solver::visualizer::data_info_enabled();
+    let t_open = std::time::Instant::now();
     let file = File::open(path)
         .map_err(|e| format!("failed to open parquet '{}': {e}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -650,7 +741,17 @@ fn load_parquet_inferred(
         .build()
         .map_err(|e| format!("failed to build parquet reader: {e}"))?;
     let p = headers.len();
+    let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+    if verbose || open_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] parquet_open+meta | n_headers={} | n_proj={} | {:.1}ms",
+            all_headers.len(),
+            p,
+            open_ms
+        );
+    }
 
+    let t_batches = std::time::Instant::now();
     // Collect all batches.
     let mut col_vecs: Vec<Vec<f64>> = vec![Vec::new(); p];
     // For string columns: accumulate raw strings to build level maps.
@@ -803,10 +904,20 @@ fn load_parquet_inferred(
     }
 
     let total_rows = col_vecs[0].len();
+    let batches_ms = t_batches.elapsed().as_secs_f64() * 1000.0;
+    if verbose || batches_ms > 100.0 {
+        log::info!(
+            "[DATA-LOAD] parquet_batches_decode | n_rows={} | n_cols={} | {:.1}ms",
+            total_rows,
+            p,
+            batches_ms
+        );
+    }
     if total_rows == 0 {
         return Err("parquet file has no rows".to_string());
     }
 
+    let t_schema = std::time::Instant::now();
     // Build schema: infer kind from data.
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(p);
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);

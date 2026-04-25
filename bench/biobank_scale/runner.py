@@ -253,6 +253,12 @@ def validate_method_spec(spec: MethodSpec) -> None:
             f"method '{spec.name}' is a marginal-slope lane and must use "
             f"z_column='{PGS_CTN_Z_COLUMN}', not '{spec.z_column or 'unset'}'"
         )
+    if spec.marginal_slope and spec.spatial_basis != "duchon":
+        raise RuntimeError(
+            f"method '{spec.name}' is a marginal-slope lane and must use spatial_basis='duchon'"
+        )
+    if spec.marginal_slope and not spec.scale_dimensions:
+        raise RuntimeError(f"method '{spec.name}' must set scale_dimensions=true")
     for key, value in (
         ("mean_linkwiggle_knots", spec.mean_linkwiggle_knots),
         ("logslope_linkwiggle_knots", spec.logslope_linkwiggle_knots),
@@ -265,6 +271,15 @@ def validate_method_spec(spec: MethodSpec) -> None:
             raise RuntimeError(
                 f"unsupported disease backend '{spec.backend}' for '{spec.name}'"
             )
+        if spec.marginal_slope:
+            if spec.mean_linkwiggle_knots is None:
+                raise RuntimeError(
+                    f"disease marginal-slope method '{spec.name}' must set mean_linkwiggle_knots"
+                )
+            if spec.logslope_linkwiggle_knots is None:
+                raise RuntimeError(
+                    f"disease marginal-slope method '{spec.name}' must set logslope_linkwiggle_knots"
+                )
         if spec.survival_likelihood is not None or spec.survival_distribution is not None:
             raise RuntimeError(
                 f"disease method '{spec.name}' cannot set survival_likelihood or survival_distribution"
@@ -295,6 +310,18 @@ def validate_method_spec(spec: MethodSpec) -> None:
             if not spec.marginal_slope:
                 raise RuntimeError(
                     f"survival method '{spec.name}' must set marginal_slope=true for survival_likelihood=marginal-slope"
+                )
+            if spec.mean_linkwiggle_knots is None:
+                raise RuntimeError(
+                    f"survival marginal-slope method '{spec.name}' must set mean_linkwiggle_knots"
+                )
+            if spec.logslope_linkwiggle_knots is None:
+                raise RuntimeError(
+                    f"survival marginal-slope method '{spec.name}' must set logslope_linkwiggle_knots"
+                )
+            if spec.timewiggle_knots is None:
+                raise RuntimeError(
+                    f"survival marginal-slope method '{spec.name}' must set timewiggle_knots"
                 )
             if spec.survival_distribution is not None:
                 raise RuntimeError(
@@ -946,7 +973,9 @@ def predict_native_survival_matrix(
 ) -> tuple[np.ndarray, Path]:
     n = len(base_rows)
     if n == 0 or grid.shape[0] == 0:
-        raise RuntimeError(f"{spec.name} native survival scoring requires non-empty rows and grid")
+        raise RuntimeError(
+            f"{spec.name} native survival scoring requires non-empty rows and grid"
+        )
     stacked_rows: list[dict[str, Any]] = []
     for horizon in grid:
         stacked_rows.extend(
@@ -958,7 +987,9 @@ def predict_native_survival_matrix(
     input_path = out_dir / f"{spec.name}.native_survival_grid.csv"
     pred_path = out_dir / f"{spec.name}.native_survival_grid.pred.csv"
     if not stacked_rows:
-        raise RuntimeError(f"{spec.name} cannot write an empty native survival scoring frame")
+        raise RuntimeError(
+            f"{spec.name} cannot write an empty native survival scoring frame"
+        )
     fieldnames = [SURVIVAL_ENTRY_COLUMN] + [
         key for key in stacked_rows[0].keys() if key != SURVIVAL_ENTRY_COLUMN
     ]
@@ -1646,23 +1677,34 @@ def run_rust_marginal_slope_classification(
     }
 
 
+def rust_survival_marginal_slope_formula_parts(spec: MethodSpec, centers: int) -> tuple[str, str]:
+    if spec.spatial_basis != "duchon":
+        raise RuntimeError(
+            f"survival marginal-slope method '{spec.name}' requires spatial_basis='duchon'"
+        )
+    spatial = _biobank_duchon_pc_term(int(spec.pc_count), centers)
+    mean_terms = ["sex", "smooth(age_entry_std)", spatial]
+    if spec.timewiggle_knots is not None:
+        mean_terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
+    if spec.mean_linkwiggle_knots is not None:
+        mean_terms.append(f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})")
+    logslope_terms = ["smooth(age_entry_std)", spatial]
+    if spec.logslope_linkwiggle_knots is not None:
+        logslope_terms.append(
+            f"linkwiggle(internal_knots={int(spec.logslope_linkwiggle_knots)})"
+        )
+    fit_formula = (
+        f"Surv({SURVIVAL_ENTRY_COLUMN}, time, event) ~ " + " + ".join(mean_terms)
+    )
+    return fit_formula, " + ".join(logslope_terms)
+
+
 def rust_survival_formula_rhs(spec: MethodSpec) -> str:
     if spec.survival_likelihood == "marginal-slope":
-        centers = int(spec.centers or 24)
-        if spec.spatial_basis != "duchon":
-            raise RuntimeError(
-                f"survival marginal-slope method '{spec.name}' requires spatial_basis='duchon'"
-            )
-        terms = [
-            "sex",
-            "smooth(age_entry_std)",
-            _biobank_duchon_pc_term(int(spec.pc_count), centers),
-        ]
-        if spec.timewiggle_knots is not None:
-            terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
-        if spec.mean_linkwiggle_knots is not None:
-            terms.append(f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})")
-        return " + ".join(terms)
+        return rust_survival_marginal_slope_formula_parts(
+            spec,
+            int(spec.centers or 24),
+        )[0].split(" ~ ", 1)[1]
 
     distribution = spec.survival_distribution
     if distribution is None:
@@ -1694,20 +1736,6 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
 
 def rust_survival_formula(spec: MethodSpec) -> str:
     return f"Surv({SURVIVAL_ENTRY_COLUMN}, time, event) ~ {rust_survival_formula_rhs(spec)}"
-
-
-def rust_survival_marginal_slope_logslope_formula(spec: MethodSpec, centers: int) -> str:
-    if spec.spatial_basis != "duchon":
-        raise RuntimeError(
-            f"survival marginal-slope method '{spec.name}' requires spatial_basis='duchon'"
-        )
-    terms = [
-        "smooth(age_entry_std)",
-        _biobank_duchon_pc_term(int(spec.pc_count), centers),
-    ]
-    if spec.logslope_linkwiggle_knots is not None:
-        terms.append(f"linkwiggle(internal_knots={int(spec.logslope_linkwiggle_knots)})")
-    return " + ".join(terms)
 
 
 def survival_eval_horizon_from_rows(rows: list[dict[str, Any]]) -> float:
@@ -1864,16 +1892,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         fit_csv = ctn_train_csv
         train_metric_rows_raw = read_csv_rows(ctn_train_csv)
         prediction_rows_raw = read_csv_rows(ctn_test_csv)
-        spatial = _biobank_duchon_pc_term(int(spec.pc_count), centers)
-        mean_terms = ["sex", "smooth(age_entry_std)", spatial]
-        if spec.timewiggle_knots is not None:
-            mean_terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
-        if spec.mean_linkwiggle_knots is not None:
-            mean_terms.append(f"linkwiggle(internal_knots={int(spec.mean_linkwiggle_knots)})")
-        fit_formula = (
-            f"Surv({SURVIVAL_ENTRY_COLUMN}, time, event) ~ " + " + ".join(mean_terms)
-        )
-        logslope_formula = rust_survival_marginal_slope_logslope_formula(spec, centers)
+        fit_formula, logslope_formula = rust_survival_marginal_slope_formula_parts(spec, centers)
     else:
         fit_formula = rust_survival_formula(spec)
     prediction_preflight = preflight_survival_prediction(

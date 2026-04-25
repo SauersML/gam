@@ -990,6 +990,11 @@ pub struct FitConfig {
     pub disable_score_warp: bool,
     /// Enable Firth bias reduction for standard single-parameter families.
     pub firth: bool,
+
+    /// Optional override of the [`crate::resource::ResourcePolicy`] used when
+    /// planning spatial bases (TPS / Matern / Duchon) during term construction.
+    /// When `None`, the default-library policy is used.
+    pub resource_policy: Option<crate::resource::ResourcePolicy>,
 }
 
 impl Default for FitConfig {
@@ -1026,8 +1031,19 @@ impl Default for FitConfig {
             disable_link_dev: false,
             disable_score_warp: false,
             firth: false,
+            resource_policy: None,
         }
     }
+}
+
+/// Resolve the [`crate::resource::ResourcePolicy`] backing term construction
+/// for a given [`FitConfig`].  Returns the configured override when present,
+/// otherwise the default-library policy.
+fn resolved_resource_policy(config: &FitConfig) -> crate::resource::ResourcePolicy {
+    config
+        .resource_policy
+        .clone()
+        .unwrap_or_else(crate::resource::ResourcePolicy::default_library)
 }
 
 /// The result of materializing a formula + config against a dataset.
@@ -1167,8 +1183,9 @@ fn build_termspec_with_geometry(
     col_map: &HashMap<String, usize>,
     inference_notes: &mut Vec<String>,
     scale_dimensions: bool,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<TermCollectionSpec, String> {
-    let mut spec = build_termspec(terms, data, col_map, inference_notes)?;
+    let mut spec = build_termspec(terms, data, col_map, inference_notes, policy)?;
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
@@ -1424,12 +1441,14 @@ fn materialize_standard<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
+    let policy = resolved_resource_policy(config);
     let spec = build_termspec_with_geometry(
         &parsed.terms,
         data,
         col_map,
         &mut inference_notes,
         config.scale_dimensions,
+        &policy,
     )?;
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
@@ -1584,12 +1603,14 @@ fn materialize_bernoulli_marginal_slope<'a>(
     )?;
 
     let mut inference_notes = Vec::new();
+    let policy = resolved_resource_policy(config);
     let marginalspec = build_termspec_with_geometry(
         &parsed.terms,
         data,
         col_map,
         &mut inference_notes,
         config.scale_dimensions,
+        &policy,
     )?;
     let logslopespec = build_termspec_with_geometry(
         &parsed_logslope.terms,
@@ -1597,6 +1618,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         col_map,
         &mut inference_notes,
         config.scale_dimensions,
+        &policy,
     )?;
     let z_idx = *col_map
         .get(z_column)
@@ -1760,12 +1782,14 @@ fn materialize_survival<'a>(
         );
     }
 
+    let policy = resolved_resource_policy(config);
     let termspec = build_termspec_with_geometry(
         &parsed.terms,
         data,
         col_map,
         &mut inference_notes,
         config.scale_dimensions,
+        &policy,
     )?;
 
     let residual_dist = parse_survival_distribution(&config.survival_distribution)?;
@@ -1814,6 +1838,7 @@ fn materialize_survival<'a>(
             col_map,
             &mut inference_notes,
             config.scale_dimensions,
+            &policy,
         )?
     } else {
         TermCollectionSpec {
@@ -1879,6 +1904,7 @@ fn materialize_survival<'a>(
                     col_map,
                     &mut inference_notes,
                     config.scale_dimensions,
+                    &policy,
                 )?),
                 route_marginal_slope_deviation_blocks(
                     parsed.linkwiggle.as_ref(),
