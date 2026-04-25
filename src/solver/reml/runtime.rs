@@ -4404,6 +4404,7 @@ impl<'a> RemlState<'a> {
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }
+
 }
 
 #[cfg(test)]
@@ -4576,5 +4577,4 @@ mod tk_math_tests {
             "Tierney-Kadane analytic c/d propagation does not match Dual64 AD reference: analytic={analytic:.12e}, ad={dv_tk_ad:.12e}, rel={rel:.3e}"
         );
     }
-
 }
