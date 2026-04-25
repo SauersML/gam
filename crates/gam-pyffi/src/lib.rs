@@ -9,11 +9,11 @@ use gam::families::scale_design::{
 use gam::families::survival_construction::survival_likelihood_modename;
 use gam::families::survival_predict::apply_inverse_link_state_to_fit_result;
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
-use gam::inference::formula_dsl::parse_surv_response;
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
     encode_recordswith_schema,
 };
+use gam::inference::formula_dsl::parse_surv_response;
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
@@ -442,13 +442,7 @@ fn fit_table_impl(
                     );
                 }
             };
-            build_latent_survival_ffi_payload(
-                formula,
-                &dataset,
-                &fit_config,
-                frailty,
-                lat_result,
-            )?
+            build_latent_survival_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
         }
         FitRequest::LatentBinary(lat_request) => {
             let frailty = lat_request.frailty.clone();
@@ -462,13 +456,7 @@ fn fit_table_impl(
                     );
                 }
             };
-            build_latent_binary_ffi_payload(
-                formula,
-                &dataset,
-                &fit_config,
-                frailty,
-                lat_result,
-            )?
+            build_latent_binary_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
         }
     };
     let model = FittedModel::from_payload(payload);
@@ -749,10 +737,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     if let Some(kind) = py_config.frailty {
         let trimmed = kind.trim().to_ascii_lowercase();
         let sigma = py_config.frailty_sigma;
-        let loading_kind = py_config
-            .frailty_loading
-            .map(|raw| raw)
-            .unwrap_or(0.0);
+        let loading_kind = py_config.frailty_loading.map(|raw| raw).unwrap_or(0.0);
         let hazard_loading = if loading_kind > 0.5 {
             gam::families::lognormal_kernel::HazardLoading::LoadedVsUnloaded
         } else {
@@ -764,13 +749,15 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
                 sigma_fixed: sigma,
                 loading: hazard_loading,
             },
-            "hazard-multiplier:learnable" => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: None,
-                loading: hazard_loading,
-            },
-            "gaussian-shift" => gam::families::lognormal_kernel::FrailtySpec::GaussianShift {
-                sigma_fixed: sigma,
-            },
+            "hazard-multiplier:learnable" => {
+                gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                    sigma_fixed: None,
+                    loading: hazard_loading,
+                }
+            }
+            "gaussian-shift" => {
+                gam::families::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: sigma }
+            }
             other => {
                 return Err(format!(
                     "unknown frailty kind '{other}'; supported: 'none', 'hazard-multiplier', 'hazard-multiplier:learnable', 'gaussian-shift'"
@@ -1363,9 +1350,9 @@ fn build_survival_location_scale_ffi_payload(
     ls_result: gam::SurvivalLocationScaleFitResult,
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival_construction::{
-        build_survival_time_basis, parse_survival_baseline_config,
-        parse_survival_likelihood_mode, parse_survival_time_basis_config,
-        resolve_survival_time_anchor_value, survival_baseline_targetname,
+        build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
+        parse_survival_time_basis_config, resolve_survival_time_anchor_value,
+        survival_baseline_targetname,
     };
     use ndarray::{Array2, s};
 
@@ -1391,12 +1378,11 @@ fn build_survival_location_scale_ffi_payload(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let (t0, t1) =
-            gam::families::survival_construction::normalize_survival_time_pair(
-                dataset.values[[i, entry_idx]],
-                dataset.values[[i, exit_idx]],
-                i,
-            )?;
+        let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
+            dataset.values[[i, entry_idx]],
+            dataset.values[[i, exit_idx]],
+            i,
+        )?;
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
@@ -1423,7 +1409,10 @@ fn build_survival_location_scale_ffi_payload(
         &age_entry,
         &age_exit,
         time_cfg,
-        Some((fit_config.time_num_internal_knots, fit_config.time_smooth_lambda)),
+        Some((
+            fit_config.time_num_internal_knots,
+            fit_config.time_smooth_lambda,
+        )),
     )?;
     let resolved_time_cfg =
         gam::families::survival_construction::resolved_survival_time_basis_config_from_build(
@@ -1433,11 +1422,10 @@ fn build_survival_location_scale_ffi_payload(
             time_build.keep_cols.as_ref(),
             time_build.smooth_lambda,
         )?;
-    let time_anchor_row =
-        gam::families::survival_construction::evaluate_survival_time_basis_row(
-            time_anchor,
-            &resolved_time_cfg,
-        )?;
+    let time_anchor_row = gam::families::survival_construction::evaluate_survival_time_basis_row(
+        time_anchor,
+        &resolved_time_cfg,
+    )?;
     gam::families::survival_construction::center_survival_time_designs_at_anchor(
         &mut time_build.x_entry_time,
         &mut time_build.x_exit_time,
@@ -1481,9 +1469,7 @@ fn build_survival_location_scale_ffi_payload(
         ModelKind::Survival,
         FittedFamily::Survival {
             likelihood: LikelihoodFamily::RoystonParmar,
-            survival_likelihood: Some(
-                survival_likelihood_modename(likelihood_mode).to_string(),
-            ),
+            survival_likelihood: Some(survival_likelihood_modename(likelihood_mode).to_string()),
             survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
             frailty: gam::families::lognormal_kernel::FrailtySpec::None,
         },
@@ -1518,9 +1504,7 @@ fn build_survival_location_scale_ffi_payload(
     payload.survival_time_smooth_lambda = time_build.smooth_lambda;
     payload.survival_time_anchor = Some(time_anchor);
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.survival_likelihood = Some(
-        survival_likelihood_modename(likelihood_mode).to_string(),
-    );
+    payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
     payload.survival_beta_time = Some(ls_result.fit.fit.beta_time().to_vec());
     payload.survival_beta_threshold = Some(ls_result.fit.fit.beta_threshold().to_vec());
     payload.survival_beta_log_sigma = Some(ls_result.fit.fit.beta_log_sigma().to_vec());
@@ -1532,11 +1516,9 @@ fn build_survival_location_scale_ffi_payload(
             .map(|row| row.to_vec())
             .collect(),
     );
-    payload.survival_noise_center =
-        Some(survival_noise_transform.weighted_column_mean.to_vec());
+    payload.survival_noise_center = Some(survival_noise_transform.weighted_column_mean.to_vec());
     payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
-    payload.survival_noise_non_intercept_start =
-        Some(survival_noise_transform.non_intercept_start);
+    payload.survival_noise_non_intercept_start = Some(survival_noise_transform.non_intercept_start);
     payload.survival_distribution = Some(inverse_link_to_saved_string(&fitted_inverse_link));
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(
@@ -1615,8 +1597,9 @@ fn build_latent_window_ffi_payload(
         survival_baseline_targetname,
     };
 
-    let parsed = gam::inference::formula_dsl::parse_formula(&formula)
-        .map_err(|err| format!("failed to re-parse latent survival formula for FFI payload: {err}"))?;
+    let parsed = gam::inference::formula_dsl::parse_formula(&formula).map_err(|err| {
+        format!("failed to re-parse latent survival formula for FFI payload: {err}")
+    })?;
     let (entryname, exitname, eventname) = parse_surv_response(&parsed.response)?
         .ok_or_else(|| "latent survival/binary FFI requires Surv(...) response".to_string())?;
     let col_map: HashMap<String, usize> = dataset
@@ -1635,12 +1618,11 @@ fn build_latent_window_ffi_payload(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let (t0, t1) =
-            gam::families::survival_construction::normalize_survival_time_pair(
-                dataset.values[[i, entry_idx]],
-                dataset.values[[i, exit_idx]],
-                i,
-            )?;
+        let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
+            dataset.values[[i, entry_idx]],
+            dataset.values[[i, exit_idx]],
+            i,
+        )?;
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
@@ -1662,7 +1644,10 @@ fn build_latent_window_ffi_payload(
         &age_entry,
         &age_exit,
         time_cfg,
-        Some((fit_config.time_num_internal_knots, fit_config.time_smooth_lambda)),
+        Some((
+            fit_config.time_num_internal_knots,
+            fit_config.time_smooth_lambda,
+        )),
     )?;
 
     // For latent survival, splice the fitted latent_sd into the persisted
