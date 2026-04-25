@@ -515,7 +515,7 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     ) -> Result<(), MatrixMaterializationError>;
 
     /// Extract a dense row chunk without materializing the full matrix.
-    /// Non-panicking owned-chunk API; preferred over the legacy `row_chunk`.
+    /// Non-panicking owned-chunk API built on top of `row_chunk_into`.
     fn try_row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, MatrixMaterializationError> {
         let mut out = Array2::<f64>::zeros((rows.end - rows.start, self.ncols()));
         self.row_chunk_into(rows, out.view_mut())?;
@@ -694,10 +694,6 @@ impl DenseDesignMatrix {
         }
     }
 
-    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        self.try_row_chunk(rows)
-            .expect("DenseDesignMatrix::row_chunk (legacy; migrate to try_row_chunk)")
-    }
 }
 
 impl LinearOperator for DenseDesignMatrix {
@@ -4985,13 +4981,6 @@ impl DesignMatrix {
         }
     }
 
-    /// Legacy panicking wrapper over `try_row_chunk`. Callers should migrate to
-    /// `try_row_chunk(...)?` to propagate materialization errors.
-    pub fn row_chunk(&self, rows: Range<usize>) -> Array2<f64> {
-        self.try_row_chunk(rows)
-            .expect("DesignMatrix::row_chunk (legacy; migrate to try_row_chunk)")
-    }
-
     /// Dot a single design row against a coefficient vector without allocating
     /// a standalone row buffer when the underlying storage permits.
     pub fn dot_row(&self, row: usize, beta: &Array1<f64>) -> f64 {
@@ -5059,7 +5048,9 @@ impl DesignMatrix {
                         *dst += alpha * value;
                     }
                 } else {
-                    let chunk = matrix.row_chunk(row..row + 1);
+                    let chunk = matrix
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("DesignMatrix::axpy_row_into: {e}"))?;
                     for (dst, &value) in out.iter_mut().zip(chunk.row(0).iter()) {
                         *dst += alpha * value;
                     }
@@ -5106,7 +5097,9 @@ impl DesignMatrix {
                         *dst += alpha * value * value;
                     }
                 } else {
-                    let chunk = matrix.row_chunk(row..row + 1);
+                    let chunk = matrix
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("DesignMatrix::squared_axpy_row_into: {e}"))?;
                     for (dst, &value) in out.iter_mut().zip(chunk.row(0).iter()) {
                         *dst += alpha * value * value;
                     }
@@ -5153,13 +5146,17 @@ impl DesignMatrix {
                 let x = if let Some(lhs_dense) = lhs.as_dense_ref() {
                     lhs_dense.row(row)
                 } else {
-                    lhs_chunk = lhs.row_chunk(row..row + 1);
+                    lhs_chunk = lhs
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("crossdiag_axpy_row_into lhs: {e}"))?;
                     lhs_chunk.row(0)
                 };
                 let y = if let Some(rhs_dense) = rhs.as_dense_ref() {
                     rhs_dense.row(row)
                 } else {
-                    rhs_chunk = rhs.row_chunk(row..row + 1);
+                    rhs_chunk = rhs
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("crossdiag_axpy_row_into rhs: {e}"))?;
                     rhs_chunk.row(0)
                 };
                 for (dst, (&xi, &yi)) in out.iter_mut().zip(x.iter().zip(y.iter())) {
@@ -5218,7 +5215,9 @@ impl DesignMatrix {
                 let dense_row = if let Some(dense_ref) = dense_mat.as_dense_ref() {
                     dense_ref.row(row)
                 } else {
-                    dense_chunk = dense_mat.row_chunk(row..row + 1);
+                    dense_chunk = dense_mat
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("crossdiag_axpy_row_into dense chunk: {e}"))?;
                     dense_chunk.row(0)
                 };
                 for ptr in row_ptr[row]..row_ptr[row + 1] {
@@ -5273,7 +5272,9 @@ impl DesignMatrix {
                         }
                     }
                 } else {
-                    let chunk = matrix.row_chunk(row..row + 1);
+                    let chunk = matrix
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| format!("DesignMatrix::syr_row_into: {e}"))?;
                     let x = chunk.row(0);
                     for i in 0..x.len() {
                         let xi = x[i];
@@ -5398,9 +5399,13 @@ impl DesignMatrix {
             }
             _ => {
                 // Mixed dense/sparse: materialize both rows.
-                let x = self.row_chunk(row..row + 1);
+                let x = self
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| format!("row_outer_into_view lhs: {e}"))?;
                 let x_row = x.row(0);
-                let y = other.row_chunk(row..row + 1);
+                let y = other
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| format!("row_outer_into_view rhs: {e}"))?;
                 let y_row = y.row(0);
                 for i in 0..x_row.len() {
                     let xi = x_row[i];
@@ -6252,7 +6257,9 @@ mod tests {
             assert!((got[i] - expected[i]).abs() < 1e-12);
         }
 
-        let chunk = stacked.row_chunk(0..2);
+        let chunk = stacked
+            .try_row_chunk(0..2)
+            .expect("stacked.try_row_chunk must succeed");
         assert_eq!(chunk, array![[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]);
     }
 
