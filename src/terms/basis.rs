@@ -7247,8 +7247,20 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                         let h_c = ci[c] - cj[c];
                         let w_c = metric_weights[c];
                         let row = (k * d + b) * d + c;
-                        d2_raw[[row, col]] +=
-                            hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c) * z_jc;
+                        // At center collisions (r=0) the kernel gradient
+                        // h vanishes but `t` may be a (signed) infinity for
+                        // pure polyharmonic kernels (e.g. r³ in dim 3 has
+                        // t = 3c/r → ±∞ at r=0). Multiplying yields NaN
+                        // even though the limit `(w_b h_b)(w_c h_c)·t` is
+                        // 0. Skip the mixed Hessian term when r is at
+                        // center collision so D2_raw stays finite; only the
+                        // diagonal δ_{bc}·w_b·q survives in the limit.
+                        let entry = if r <= 1e-14 {
+                            if b == c { w_b * q } else { 0.0 }
+                        } else {
+                            hessian_operator_entry(q, t, h_b, h_c, w_b, w_c, b, c)
+                        };
+                        d2_raw[[row, col]] += entry * z_jc;
                     }
                 }
 
