@@ -1283,7 +1283,12 @@ impl<'a> RemlState<'a> {
             0
         };
         let use_implicit_requested = any_has_implicit
-            && crate::terms::basis::should_use_implicit_operators(n_obs, p_dim, implicit_n_axes);
+            && crate::terms::basis::should_use_implicit_operators_with_policy(
+                n_obs,
+                p_dim,
+                implicit_n_axes,
+                &crate::resource::ResourcePolicy::default_library(),
+            );
         let x_design_shared: Option<std::sync::Arc<DesignMatrix>> = if use_implicit_requested {
             Some(std::sync::Arc::new(
                 build_active_design_matrix(&pirls_result.x_transformed, free_basis_opt.as_ref())

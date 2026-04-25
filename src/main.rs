@@ -5146,14 +5146,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 "survival marginal-slope routes --logslope-formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
             );
         }
-        inference_notes.extend(marginal_slope_disable_flag_notes(
-            "survival marginal-slope",
-            "--logslope-formula",
-            parsed.linkwiggle.is_some(),
-            parsed_logslope.linkwiggle.is_some(),
-            false,
-            false,
-        ));
         if routed_link_dev.is_none() && routed_score_warp.is_none() {
             inference_notes.push(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),

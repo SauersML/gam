@@ -4388,6 +4388,7 @@ impl GaussianLocationScaleExactNewtonJointPsiWorkspace {
                 psi_index,
                 &self.xmu,
                 &self.x_ls,
+                &self.family.policy,
             )
         })
     }
@@ -5458,6 +5459,7 @@ impl GaussianLocationScaleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
         if block_states.len() != 2 || derivative_blocks.len() != 2 {
             return Err(format!(
@@ -5488,7 +5490,7 @@ impl GaussianLocationScaleFamily {
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleFamily mu",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
                                 format!("GaussianLocationScaleFamily mu forward_mul: {e}")
@@ -5506,7 +5508,7 @@ impl GaussianLocationScaleFamily {
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleFamily log-sigma",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
@@ -5641,6 +5643,7 @@ impl GaussianLocationScaleFamily {
             psi_index,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -5731,6 +5734,7 @@ impl GaussianLocationScaleFamily {
             psi_i,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -5741,6 +5745,7 @@ impl GaussianLocationScaleFamily {
             psi_j,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -5877,6 +5882,7 @@ impl GaussianLocationScaleFamily {
             psi_index,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -6421,6 +6427,7 @@ impl GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace {
                 psi_index,
                 &self.xmu,
                 &self.x_ls,
+                &self.family.policy,
             )
         })
     }
@@ -6840,6 +6847,7 @@ impl GaussianLocationScaleWiggleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<GaussianLocationScaleWiggleJointPsiDirection>, String> {
         if block_states.len() != 3 || derivative_blocks.len() != 3 {
             return Err(format!(
@@ -6870,7 +6878,7 @@ impl GaussianLocationScaleWiggleFamily {
                                 pmu,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily mu",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
                                 format!("GaussianLocationScaleWiggleFamily mu forward_mul: {e}")
@@ -6888,7 +6896,7 @@ impl GaussianLocationScaleWiggleFamily {
                                 p_ls,
                                 0..n,
                                 "GaussianLocationScaleWiggleFamily log-sigma",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!(
@@ -7282,6 +7290,7 @@ impl GaussianLocationScaleWiggleFamily {
             psi_index,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -7401,6 +7410,7 @@ impl GaussianLocationScaleWiggleFamily {
             psi_i,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -7411,6 +7421,7 @@ impl GaussianLocationScaleWiggleFamily {
             psi_j,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -7784,6 +7795,7 @@ impl GaussianLocationScaleWiggleFamily {
             psi_index,
             xmu,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -10096,6 +10108,7 @@ impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
                 psi_index,
                 &self.x_t,
                 &self.x_ls,
+                &self.family.policy,
             )
         })
     }
@@ -10760,6 +10773,7 @@ impl BinomialLocationScaleFamily {
         psi_index: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
         if block_states.len() != 2 || derivative_blocks.len() != 2 {
             return Err(format!(
@@ -10790,7 +10804,7 @@ impl BinomialLocationScaleFamily {
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleFamily threshold",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
                                 format!("BinomialLocationScaleFamily threshold forward_mul: {e}")
@@ -10808,7 +10822,7 @@ impl BinomialLocationScaleFamily {
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleFamily log-sigma",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!("BinomialLocationScaleFamily log-sigma forward_mul: {e}")
@@ -12454,6 +12468,7 @@ impl BinomialLocationScaleWiggleFamily {
         psi_index: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<BinomialLocationScaleWiggleJointPsiDirection>, String> {
         if block_states.len() != 3 || derivative_blocks.len() != 3 {
             return Err(format!(
@@ -12483,7 +12498,7 @@ impl BinomialLocationScaleWiggleFamily {
                                 pt,
                                 0..n,
                                 "BinomialLocationScaleWiggleFamily threshold",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
                                 format!(
@@ -12503,7 +12518,7 @@ impl BinomialLocationScaleWiggleFamily {
                                 pls,
                                 0..n,
                                 "BinomialLocationScaleWiggleFamily log-sigma",
-                                &crate::resource::ResourcePolicy::default_library(),
+                                policy,
                             )?;
                             z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
                                 format!(
@@ -12675,6 +12690,7 @@ impl BinomialLocationScaleWiggleFamily {
             psi_index,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -13096,6 +13112,7 @@ impl BinomialLocationScaleWiggleFamily {
             psi_i,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -13106,6 +13123,7 @@ impl BinomialLocationScaleWiggleFamily {
             psi_j,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
@@ -13872,6 +13890,7 @@ impl BinomialLocationScaleWiggleFamily {
             psi_index,
             x_t,
             x_ls,
+            &self.policy,
         )?
         else {
             return Ok(None);
