@@ -74,14 +74,13 @@ use gam::survival_construction::{
     build_latent_survival_baseline_offsets, build_survival_baseline_offsets,
     build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
-    center_survival_time_designs_at_anchor, evaluate_survival_baseline,
-    evaluate_survival_time_basis_row, marginal_slope_baseline_chain_rule_gradient,
-    normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient, parse_survival_baseline_config,
-    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
-    survival_likelihood_modename,
+    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
+    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
+    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
+    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
+    parse_survival_time_basis_config, require_structural_survival_time_basis,
+    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
+    survival_baseline_targetname, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -10300,8 +10299,8 @@ mod tests {
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
-        covariance_from_model, effectivelinkwiggle_formulaspec, evaluate_survival_baseline,
-        family_to_string, linkname, load_dataset_projected, parse_formula, parse_link_choice,
+        covariance_from_model, effectivelinkwiggle_formulaspec, family_to_string, linkname,
+        load_dataset_projected, parse_formula, parse_link_choice,
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_baseline_config,
         parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
         pretty_familyname, required_columns_for_fit, summarizewiggle_domain,
@@ -10342,7 +10341,7 @@ mod tests {
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
     };
-    use gam::survival_construction::SurvivalBaselineConfig;
+    use gam::survival_construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
     use gam::term_builder::{
         heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
     };
