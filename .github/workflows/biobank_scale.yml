@@ -181,14 +181,6 @@ jobs:
         shell: bash
         env:
           GAM_RUST_BINARY: ${{ github.workspace }}/target/release/gam
-          # Promote inner PIRLS / blockwise cycle emissions from `debug` to
-          # `info` so benchmark-timeout signatures can distinguish inner
-          # spin (thousands of PIRLS iter lines) from outer-assembly spin
-          # (zero PIRLS lines). See
-          # `src/solver/visualizer.rs::pirls_iter_info_enabled` for the
-          # math/context. Safe to leave on for every biobank method; the
-          # per-cycle log payload is a single line with four numbers.
-          GAM_LOG_PIRLS_INFO: "1"
         run: |
           set -euo pipefail
           mkdir -p bench/biobank_scale/results bench/biobank_scale/runs/${{ matrix.name }}

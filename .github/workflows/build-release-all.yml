@@ -18,7 +18,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  GAM_SKIP_LINT_CHECKS: "1"
 
 permissions:
   contents: write
@@ -103,7 +102,6 @@ jobs:
         env:
           # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
           RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
-          GAM_SKIP_LINT_CHECKS: "1"
           # Embed commit-addressable release tag in binary for version command
           GAM_RELEASE_TAG: "main-${{ github.sha }}"
         run: cargo +nightly build --release --target ${{ matrix.target }}
