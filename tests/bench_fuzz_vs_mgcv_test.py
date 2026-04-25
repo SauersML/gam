@@ -47,7 +47,7 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=1, power=2, double_penalty=false)",
+            "duchon(x0, x1, centers=5, order=1, power=2, length_scale=1, double_penalty=false)",
         )
         self.assertNotIn("~", noise_terms)
 

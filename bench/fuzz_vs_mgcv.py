@@ -609,13 +609,11 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
         n_smooths = max(n_smooths, 3)
         while len(smooth_kinds) < n_smooths:
             smooth_kinds.append(choice(list(SMOOTH_FN.keys())))
-        n_duchon_dims = min(max(n_duchon_dims, 2), n_smooths)
+        n_duchon_dims = 2
         duchon_order = 1
+        duchon_power = 1
         max_knots = max(3, n_obs // max(n_smooths + 1, 2) - 2)
         knots = min(knots, max_knots)
-        if duchon_order >= 1 and knots < n_duchon_dims + 1:
-            n_duchon_dims = max(2, min(n_duchon_dims, knots - 1))
-        duchon_power = _admissible_duchon_power(n_duchon_dims, duchon_order, 1)
 
     return FuzzScenario(
         seed=seed, family=family, model_type=model_type, n_obs=n_obs,
@@ -687,14 +685,6 @@ def _formula_from_terms(response, terms):
     return f"{response} ~ {_rhs_from_terms(terms)}"
 
 
-def _admissible_duchon_power(dim: int, order: int, requested_power: int) -> int:
-    """Smallest power satisfying value, gradient, and Hessian collocation."""
-    power = max(0, int(requested_power))
-    while 2 * (int(order) + power) <= int(dim) + 2:
-        power += 1
-    return power
-
-
 def _duchon_dims_for_centers(cols, sc, centers: int) -> int:
     dims = min(max(int(sc.n_duchon_dims), 2), len(cols))
     if int(sc.duchon_order) >= 1 and centers < dims + 1:
@@ -706,9 +696,8 @@ def _rust_mean_terms(cols, sc):
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
-        power = _admissible_duchon_power(dims, sc.duchon_order, sc.duchon_power)
         d_cols = cols[:dims]
-        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={power}, double_penalty={dp})"
+        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={sc.duchon_power}, length_scale=1, double_penalty={dp})"
         extra = [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols[dims:]]
         return [duchon_term] + extra
     elif sc.basis_type == "tps":
@@ -727,9 +716,8 @@ def rust_noise_terms(cols, sc):
     if sc.basis_type == "duchon" and len(cols) >= 2:
         centers = max(3, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, centers)
-        power = _admissible_duchon_power(dims, sc.duchon_order, sc.duchon_power)
         d_cols = cols[:dims]
-        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={power}, double_penalty={dp})"
+        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power}, length_scale=1, double_penalty={dp})"
     return f"s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
 
 
@@ -745,7 +733,7 @@ def mgcv_formula(cols, sc):
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
         d_cols = cols[:dims]
-        m_vals = f"c({_admissible_duchon_power(dims, sc.duchon_order, sc.duchon_power)},{sc.duchon_order})"
+        m_vals = f"c({sc.duchon_power},{sc.duchon_order})"
         k_val = sc.knots
         duchon_term = f"s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
         extra = [f"s({c}, bs='ps', k=min({sc.knots + 4}, nrow(train_df)-1))" for c in cols[dims:]]
@@ -763,7 +751,7 @@ def mgcv_sigma_formula(cols, sc):
         k_val = max(3, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, k_val)
         d_cols = cols[:dims]
-        m_vals = f"c({_admissible_duchon_power(dims, sc.duchon_order, sc.duchon_power)},{sc.duchon_order})"
+        m_vals = f"c({sc.duchon_power},{sc.duchon_order})"
         return f"~ s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
     k_val = max(3, sc.knots // 2) + (4 if sc.basis_type == "ps" else 0)
     bs = "ps" if sc.basis_type == "ps" else "tp"
