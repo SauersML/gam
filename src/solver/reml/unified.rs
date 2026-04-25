@@ -1121,6 +1121,12 @@ pub struct HyperCoord {
     /// Fixed-β Jeffreys/Firth gradient partial `(g_Φ)_i`, when the inner
     /// objective includes the exact bias-reduction term.
     pub firth_g: Option<Array1<f64>>,
+    /// Fixed-β linear predictor derivative used by the Tierney-Kadane
+    /// correction's direct c/d derivative terms.
+    pub tk_eta_fixed: Option<Array1<f64>>,
+    /// Fixed-β design derivative used by the Tierney-Kadane correction's
+    /// direct design-row derivative terms.
+    pub tk_x_fixed: Option<Array2<f64>>,
 }
 
 /// Second-order fixed-β objects for a pair of outer coordinates.
