@@ -744,10 +744,6 @@ fn predict_survival_location_scale_batch(
                 .to_string(),
         );
     }
-    if training_headers.is_some() {
-        // Suppress the unused-variable lint while keeping the signature
-        // compatible with the rest of the module.
-    }
     let n = age_entry.len();
     let saved_likelihood_mode = SurvivalLikelihoodMode::LocationScale;
     let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
@@ -782,7 +778,7 @@ fn predict_survival_location_scale_batch(
             | InverseLink::Mixture(_)
             | InverseLink::LatentCLogLog(_)
     );
-    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
+    let (_eta_offset_entry, mut eta_offset_exit, _derivative_offset_exit) =
         if probit_baseline {
             build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, &baseline_cfg)?
         } else {
@@ -792,16 +788,14 @@ fn predict_survival_location_scale_batch(
                 &baseline_cfg,
             )?
         };
-    // Apply the survival-location-scale derivative guard (matches CLI default
-    // exactly; if a saved model was fit with a non-default guard, the CLI
-    // currently also applies the default at predict time, so parity holds).
+    // Apply the survival-location-scale derivative guard to the exit-time eta
+    // offset. The entry-time + derivative offsets aren't consumed by
+    // `predict_survival_location_scale` so we skip those updates here.
     let derivative_guard =
         crate::families::survival_location_scale::DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
     if derivative_guard > 0.0 {
         for i in 0..n {
-            eta_offset_entry[i] += derivative_guard * (age_entry[i] - time_anchor);
             eta_offset_exit[i] += derivative_guard * (age_exit[i] - time_anchor);
-            derivative_offset_exit[i] += derivative_guard;
         }
     }
 
@@ -811,21 +805,16 @@ fn predict_survival_location_scale_batch(
     // Build threshold + log-sigma designs from the frozen saved specs. Re-using
     // resolve_termspec_for_prediction guarantees we honor the predict-data's
     // column layout via the model's training_headers.
-    let thresholdspec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        model.training_headers.as_ref(),
-        _col_map,
-        "resolved_termspec",
-    )?;
-    let threshold_design = crate::terms::smooth::build_term_collection_design(_data, &thresholdspec)
-        .map_err(|err| format!("failed to build survival threshold design: {err}"))?;
+    // The threshold design uses the same frozen spec as the covariate design
+    // already built for predict_survival; reuse it instead of rebuilding.
+    let threshold_design = cov_design;
     let log_sigmaspec = resolve_termspec_for_prediction(
         &model.resolved_termspec_noise,
-        model.training_headers.as_ref(),
-        _col_map,
+        training_headers,
+        col_map,
         "resolved_termspec_noise",
     )?;
-    let raw_sigma_design = crate::terms::smooth::build_term_collection_design(_data, &log_sigmaspec)
+    let raw_sigma_design = crate::terms::smooth::build_term_collection_design(data, &log_sigmaspec)
         .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
     let survival_noise_transform = scale_transform_from_payload(
         &model.survival_noise_projection,
@@ -863,10 +852,6 @@ fn predict_survival_location_scale_batch(
         .as_ref()
         .map(|k| Array1::from_vec(k.clone()));
     let link_wiggle_degree = model.linkwiggle_degree;
-    // Suppress the cov_design unused-variable warning while keeping the
-    // signature aligned with the rest of the module's helpers; the
-    // location-scale branch uses threshold_design for threshold inputs.
-    let _ = cov_design;
     let pred_input = SurvivalLocationScalePredictInput {
         x_time_exit,
         eta_time_offset_exit: eta_offset_exit,
