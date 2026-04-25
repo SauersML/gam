@@ -401,19 +401,12 @@ struct MarginalSlopePredictContext {
     /// Per-row covariate eta = `cov_design[i] · beta_marginal`. Used to
     /// pre-compute `q_exit_base`.
     cov_eta: Array1<f64>,
-    /// Per-row logslope eta = `logslope_design[i] · beta_logslope +
-    /// baseline_logslope + noise_offset[i]`. Used to compute the rigid-path
-    /// hazard scale `c = sqrt(1 + (s · b)^2)`.
-    slope_eta: Array1<f64>,
     /// Per-row latent z (raw, un-normalized — the predictor's
     /// `latent_z_normalization` is applied internally).
     z_raw: Array1<f64>,
     /// Per-row noise offset, mirroring the `pred_input.offset_noise` slice
     /// used by the CLI.
     noise_offset: Array1<f64>,
-    /// Probit frailty scale `s = 1/sqrt(1 + sigma_frailty^2)`. Used for the
-    /// rigid-path hazard derivative.
-    probit_scale: f64,
 }
 
 fn build_marginal_slope_predict_context(
@@ -472,25 +465,15 @@ fn build_marginal_slope_predict_context(
     }
     let beta_time = blocks[0].beta.clone();
     let beta_marginal = blocks[1].beta.clone();
-    let beta_logslope = blocks[2].beta.clone();
     let saved_runtime = model.saved_prediction_runtime()?;
     let saved_timewiggle = saved_runtime.baseline_time_wiggle.clone();
 
     let cov_design_dense = cov_design.to_dense();
     let logslope_design_dense = logslope_design.design.to_dense();
 
-    // Per-row precomputed accumulations. cov_eta and slope_eta are time-
-    // independent so doing them here avoids `O(n × T)` re-multiplications
-    // inside the per-cell loop.
+    // cov_eta is time-independent so doing it here avoids `O(n × T)`
+    // re-multiplications inside the per-cell loop.
     let cov_eta = cov_design.dot(&beta_marginal);
-    let baseline_logslope = model.logslope_baseline.ok_or_else(|| {
-        "saved survival marginal-slope model missing logslope_baseline".to_string()
-    })?;
-    let slope_eta = logslope_design.design.dot(&beta_logslope) + noise_offset + baseline_logslope;
-
-    let frailty = model.family_state.frailty();
-    let sigma = gaussian_frailty_sigma_from_frailty(frailty);
-    let probit_scale = ProbitFrailtyScale::new(sigma.unwrap_or(0.0)).s;
 
     Ok(MarginalSlopePredictContext {
         predictor,
@@ -500,10 +483,8 @@ fn build_marginal_slope_predict_context(
         cov_design_dense,
         logslope_design_dense,
         cov_eta,
-        slope_eta,
         z_raw,
         noise_offset: noise_offset.clone(),
-        probit_scale,
     })
 }
 
@@ -634,22 +615,15 @@ fn evaluate_marginal_slope_row(
         auxiliary_scalar: Some(Array1::from_elem(1, ctx.z_raw[row_index])),
     };
 
-    let pred = ctx
+    // Exact IFT pull-back: the predictor returns both `eta` and the analytic
+    // factor `∂eta/∂q` for this (row, t). The hazard time derivative is
+    // `(∂eta/∂q) · dq/dt` — the rigid `c·qd` is the no-flex special case.
+    let (eta_arr, deta_dq_arr) = ctx
         .predictor
-        .predict_plugin_response(&pred_input)
+        .predict_eta_and_q_chain(&pred_input)
         .map_err(|e| format!("saved survival marginal-slope predictor eta failed: {e}"))?;
-    let eta = pred.eta[0];
-
-    // Rigid-path time derivative: d(eta)/dt = c · qd, with
-    //   c = sqrt(1 + (s · b)^2),  s = 1/sqrt(1 + sigma_frailty^2),
-    //   b = slope_eta[row].
-    // In flex mode (score-warp / link-deviation active) this is the leading-order
-    // rigid approximation; the exact ∂eta/∂t additionally picks up the implicit-
-    // function pull-back (∂eta/∂a)·(∂a/∂q)·qd. Flagged for review — see the
-    // training kernel's `compute_survival_timepoint_exact` for the full IFT path.
-    let s_b = ctx.probit_scale * ctx.slope_eta[row_index];
-    let c = (1.0 + s_b * s_b).sqrt();
-    let eta_derivative = c * qd_with_wiggle;
+    let eta = eta_arr[0];
+    let eta_derivative = deta_dq_arr[0] * qd_with_wiggle;
 
     let surv = normal_cdf(-eta).clamp(1e-300, 1.0);
     let cum = -surv.ln();

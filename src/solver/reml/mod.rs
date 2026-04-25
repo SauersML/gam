@@ -1440,7 +1440,7 @@ mod tests {
         let cfg = RemlConfig::external(
             GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
             1e-10,
-            true,
+            false,
         );
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let theta = array![0.0, 0.0];
