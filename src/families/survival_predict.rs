@@ -509,14 +509,14 @@ fn build_marginal_slope_predict_context(
 
 /// Evaluate one (row, t) cell for the saved survival marginal-slope kernel.
 ///
-/// Calls the saved [`BernoulliMarginalSlopePredictor`] (built once and held in
-/// `ctx`) to obtain `eta` — this is the same code path the CLI's `gam predict`
-/// uses, so the link-deviation and score-warp blocks are replayed at predict
-/// time. The hazard time-derivative `c · qd` is the rigid-path probit-frailty
-/// correction; in flex mode (score-warp / link-deviation active) it is the
-/// leading-order rigid approximation, since the exact ∂eta/∂t requires the
-/// IFT pull-back through the per-row implicit-function intercept (see
-/// `compute_survival_timepoint_exact` in `survival_marginal_slope.rs`).
+/// Calls the saved [`BernoulliMarginalSlopePredictor`]
+/// (`predict_eta_and_q_chain`) to obtain both the linear predictor `eta` and
+/// the exact IFT-pullback factor `∂eta/∂q`. The hazard time-derivative is then
+/// `(∂eta/∂q) · qd_with_wiggle`. In rigid mode this collapses to `c · qd` (the
+/// closed-form probit-frailty composition); under score-warp / link-deviation
+/// it picks up the exact implicit-function pull-back through the per-row
+/// calibration intercept, mirroring `compute_survival_timepoint_exact` in
+/// `survival_marginal_slope.rs`.
 fn evaluate_marginal_slope_row(
     row_index: usize,
     ctx: &MarginalSlopePredictContext,
