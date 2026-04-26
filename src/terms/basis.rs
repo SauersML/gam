@@ -8934,11 +8934,6 @@ fn validate_duchon_kernel_orders(
             "Duchon hybrid length_scale must be finite and positive".to_string(),
         ));
     }
-    if length_scale.is_none() && 2 * s_order >= k_dim {
-        return Err(BasisError::InvalidInput(format!(
-            "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
-        )));
-    }
     let spectral_order = 2 * (p_order + s_order);
     if spectral_order <= k_dim {
         return Err(BasisError::InvalidInput(format!(
