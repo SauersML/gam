@@ -54,27 +54,7 @@ struct DerivativeContext {
 
 impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        if self.config.link_function() == LinkFunction::Identity {
-            return true;
-        }
-
-        let n_obs = self.x().nrows();
-        let p_coeff = self.x().ncols();
-        let enabled = super::exact_outer_hessian_problem_scale_allows(n_obs, p_coeff);
-        if !enabled
-            && !self
-                .outer_hessian_downgrade_logged
-                .swap(true, Ordering::Relaxed)
-        {
-            log::info!(
-                "[OUTER] standard REML: disabling analytic outer Hessian for large corrected model (n={}, p={}, n*p={}, n*p^2={})",
-                n_obs,
-                p_coeff,
-                n_obs.saturating_mul(p_coeff),
-                n_obs.saturating_mul(p_coeff).saturating_mul(p_coeff),
-            );
-        }
-        enabled
+        true
     }
 
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -1500,7 +1480,6 @@ impl<'a> RemlState<'a> {
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
-            outer_hessian_downgrade_logged: AtomicBool::new(false),
             screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
             kronecker_penalty_system: None,
             kronecker_factored: None,

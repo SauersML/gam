@@ -162,6 +162,39 @@ pub trait HessianOperator: Send + Sync {
         self.trace_hinv_product(a)
     }
 
+    /// diag(X · G_ε(H) · Xᵀ) — the leverage corresponding to `trace_logdet_gradient`.
+    /// `trace_logdet_gradient(Xᵀ diag(w) X) = Σᵢ wᵢ · h^G[i]`.
+    fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
+        debug_assert!(self.logdet_traces_match_hinv_kernel());
+        let n = x.nrows();
+        let p = x.ncols();
+        let xd = x.to_dense_arc();
+        let x_ref = xd.as_ref();
+
+        let block = {
+            const TARGET_CHUNK_FLOATS: usize = 1 << 16;
+            (TARGET_CHUNK_FLOATS / p.max(1)).clamp(1, n.max(1))
+        };
+
+        let mut h = Array1::<f64>::zeros(n);
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + block).min(n);
+            let rows = x_ref.slice(ndarray::s![start..end, ..]);
+            let chunk_t = rows.t().to_owned();
+            let z_chunk = self.solve_multi(&chunk_t);
+            for i in 0..(end - start) {
+                let mut acc = 0.0;
+                for j in 0..p {
+                    acc += rows[[i, j]] * z_chunk[[j, i]];
+                }
+                h[start + i] = acc;
+            }
+            start = end;
+        }
+        h
+    }
+
     /// tr(G_ε(H) B) for an operator-backed Hessian drift.
     ///
     /// Default implementation materializes `B` densely. For Cholesky-based
@@ -4412,101 +4445,51 @@ fn is_hessian_unavailable(error: &str) -> bool {
 }
 
 //   C[u]            = Xᵀ diag(c ⊙ Xu) X
-//   h_i             = (X H⁻¹ Xᵀ)_{ii}            depends only on row Xᵢ
-//   v               = Xᵀ (c ⊙ h)
+//   h^G             = diag(X G_ε(H) Xᵀ)
+//   v               = Xᵀ (c ⊙ h^G)
 //   z_c             = H⁻¹ v
-//   tr(H⁻¹ C[u])    = uᵀ v = (Hu) · z_c
+//   tr(G_ε C[u])    = uᵀ Xᵀ (c ⊙ h^G) = uᵀ v
 fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
     hop: &dyn HessianOperator,
+    leverage: &Array1<f64>,
 ) -> Result<Array1<f64>, String> {
-    let n = ing.x.nrows();
-    let p = ing.x.ncols();
-
-    let x = ing.x.to_dense_arc();
-    let x_ref = x.as_ref();
-
-    let block = {
-        const TARGET_CHUNK_FLOATS: usize = 1 << 16;
-        (TARGET_CHUNK_FLOATS / p.max(1)).clamp(1, n.max(1))
-    };
-
-    let mut v = Array1::<f64>::zeros(p);
-    let mut start = 0usize;
-    while start < n {
-        let end = (start + block).min(n);
-        let rows = x_ref.slice(ndarray::s![start..end, ..]);
-        let chunk_t = rows.t().to_owned();
-        let z_chunk = hop.solve_multi(&chunk_t);
-
-        let b = end - start;
-        let mut t_chunk = Array1::<f64>::zeros(b);
-        for i in 0..b {
-            let mut h_i = 0.0;
-            for j in 0..p {
-                h_i += rows[[i, j]] * z_chunk[[j, i]];
-            }
-            t_chunk[i] = ing.c_array[start + i] * h_i;
-        }
-
-        v += &rows.t().dot(&t_chunk);
-        start = end;
-    }
-
+    let xd = ing.x.to_dense_arc();
+    let x_ref = xd.as_ref();
+    let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
+    Zip::from(&mut weighted)
+        .and(ing.c_array)
+        .and(leverage)
+        .for_each(|w, &c, &h| *w = c * h);
+    let v = x_ref.t().dot(&weighted);
     Ok(hop.solve(&v))
 }
 
-/// Compute the fourth-derivative trace: tr(H⁻¹ Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
+/// Compute the fourth-derivative trace: tr(G_ε(H) Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
 ///
+/// Identity: tr(G_ε Xᵀ diag(w) X) = Σᵢ wᵢ · h^G[i].
 /// Returns `None` if there are no fourth-derivative (d) terms.
 fn compute_fourth_derivative_trace(
     ing: &ScalarGlmIngredients<'_>,
     v_k: &Array1<f64>,
     v_l: &Array1<f64>,
-    hop: &dyn HessianOperator,
+    leverage: &Array1<f64>,
 ) -> Result<Option<f64>, String> {
     let Some(d_array) = ing.d_array else {
         return Ok(None);
     };
-
-    let n = ing.x.nrows();
-    let p = ing.x.ncols();
-
-    let x = ing.x.to_dense_arc();
-    let x_ref = x.as_ref();
-
-    // Use operator-backed Xv products when possible.
+    let xd = ing.x.to_dense_arc();
+    let x_ref = xd.as_ref();
     let x_vk = x_ref.dot(v_k);
     let x_vl = x_ref.dot(v_l);
 
-    // weights = d ⊙ (X vₖ) ⊙ (X vₗ)
-    let mut weights = Array1::zeros(n);
-    Zip::from(&mut weights)
-        .and(d_array)
+    let mut acc = 0.0;
+    Zip::from(d_array)
         .and(&x_vk)
         .and(&x_vl)
-        .for_each(|w, &d, &xvk, &xvl| *w = d * xvk * xvl);
-
-    // Q = Xᵀ diag(weights) X — chunked accumulation for better cache behavior.
-    let mut q_mat = Array2::zeros((p, p));
-    for i in 0..n {
-        let wi = weights[i];
-        if wi.abs() > 0.0 {
-            let xi = x_ref.row(i);
-            for a in 0..p {
-                let wa = wi * xi[a];
-                for b in a..p {
-                    let val = wa * xi[b];
-                    q_mat[[a, b]] += val;
-                    if a != b {
-                        q_mat[[b, a]] += val;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(Some(hop.trace_logdet_gradient(&q_mat)))
+        .and(leverage)
+        .for_each(|&d, &xvk, &xvl, &h| acc += d * xvk * xvl * h);
+    Ok(Some(acc))
 }
 
 /// Compute the IFT second-derivative correction contribution to h2_trace.
@@ -4534,19 +4517,22 @@ fn compute_ift_correction_trace(
     effective_deriv: &dyn HessianDerivativeProvider,
     adjoint_z_c: Option<&Array1<f64>>,
     glm_ingredients: Option<&ScalarGlmIngredients<'_>>,
+    leverage: Option<&Array1<f64>>,
     subspace: Option<&PenaltySubspaceTrace>,
 ) -> Result<f64, String> {
     if !effective_deriv.has_corrections() {
         return Ok(0.0);
     }
-    // The adjoint shortcut `tr(H⁻¹ C[u]) = uᵀ z_c` is only valid for the
+    // The adjoint shortcut `tr(G_ε C[u]) = uᵀ z_c` is only valid for the
     // full-space kernel.  When the projected kernel is required, fall back
     // to materialising the correction and tracing through the subspace.
     if let (Some(z_c), None) = (adjoint_z_c, subspace) {
         let c_trace = rhs.dot(z_c);
-        let d_trace = match glm_ingredients {
-            Some(ing) => compute_fourth_derivative_trace(ing, v_i, v_j, hop)?.unwrap_or(0.0),
-            None => 0.0,
+        let d_trace = match (glm_ingredients, leverage) {
+            (Some(ing), Some(h_g)) => {
+                compute_fourth_derivative_trace(ing, v_i, v_j, h_g)?.unwrap_or(0.0)
+            }
+            _ => 0.0,
         };
         Ok(c_trace + d_trace)
     } else {
@@ -4759,18 +4745,26 @@ fn compute_outer_hessian(
 
     // ── Adjoint trick precomputation ──
     //
-    // For scalar GLMs with C[u] = Xᵀ diag(c ⊙ Xu) X, the trace
-    //   tr(H⁻¹ C[u]) = uᵀ z_c
-    // where z_c = Xᵀ (c ⊙ h) and h = diag(X H⁻¹ Xᵀ) is the hat diagonal.
+    // For scalar GLMs with C[u] = Xᵀ diag(c ⊙ Xu) X:
+    //   h^G          = diag(X G_ε(H) Xᵀ)
+    //   z_c          = H⁻¹ Xᵀ (c ⊙ h^G)
+    //   tr(G_ε C[u]) = uᵀ Xᵀ (c ⊙ h^G) = uᵀ (Hu_old) · z_c
     //
-    // This replaces O(k²) linear solves for u_kl = H⁻¹ rhs with O(k²) dot
-    // products, at the cost of ONE precomputed solve for z_c (plus computing
-    // the hat diagonal). The net saving is large when k >> 1.
+    // h^G also plugs into the fourth-derivative trace
+    //   tr(G_ε Xᵀ diag(w) X) = Σᵢ wᵢ h^G[i],
+    // collapsing per-pair O(np²) → O(n) work.
     let glm_ingredients = effective_deriv.scalar_glm_ingredients();
+    let leverage = if incl_logdet_h {
+        glm_ingredients
+            .as_ref()
+            .map(|ing| hop.xt_logdet_kernel_x_diagonal(ing.x))
+    } else {
+        None
+    };
     let adjoint_z_c = if incl_logdet_h {
-        match glm_ingredients.as_ref() {
-            Some(ing) => Some(compute_adjoint_z_c(ing, hop)?),
-            None => None,
+        match (glm_ingredients.as_ref(), leverage.as_ref()) {
+            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(ing, hop, h_g)?),
+            _ => None,
         }
     } else {
         None
@@ -5015,6 +5009,7 @@ fn compute_outer_hessian(
                 effective_deriv,
                 adjoint_z_c.as_ref(),
                 glm_ingredients.as_ref(),
+                leverage.as_ref(),
                 subspace,
             )?;
 
@@ -5112,6 +5107,7 @@ fn compute_outer_hessian(
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
+                        leverage.as_ref(),
                         subspace,
                     )?;
 
@@ -5213,6 +5209,7 @@ fn compute_outer_hessian(
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
+                        leverage.as_ref(),
                         subspace,
                     )?;
 
@@ -5449,6 +5446,7 @@ struct UnifiedOuterHessianOperator {
     incl_logdet_s: bool,
     kernel: OuterHessianDerivativeKernel,
     adjoint_z_c: Option<Array1<f64>>,
+    leverage: Option<Array1<f64>>,
     callback_second_modes: Option<Vec<Array1<f64>>>,
 }
 
@@ -5649,10 +5647,12 @@ impl UnifiedOuterHessianOperator {
             d_array: d_array.as_ref(),
             x,
         };
+        let h_g = self.leverage.as_ref().ok_or_else(|| {
+            "missing leverage cache for scalar outer Hessian operator".to_string()
+        })?;
         let c_trace = self.pair_rhs_combo_dot(idx, alpha, z_c.view());
         let d_trace =
-            compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, self.hop.as_ref())?
-                .unwrap_or(0.0);
+            compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, h_g)?.unwrap_or(0.0);
         Ok(c_trace + v_i_sign * d_trace)
     }
 
@@ -6016,21 +6016,35 @@ fn build_outer_hessian_operator(
         }
     }
 
-    let adjoint_z_c = if incl_logdet_h {
+    let leverage = if incl_logdet_h {
         match &kernel {
-            OuterHessianDerivativeKernel::ScalarGlm {
-                c_array,
-                d_array,
-                x,
-            } => Some(compute_adjoint_z_c(
+            OuterHessianDerivativeKernel::ScalarGlm { x, .. } => {
+                Some(hop.xt_logdet_kernel_x_diagonal(x))
+            }
+            OuterHessianDerivativeKernel::Callback { .. } => None,
+        }
+    } else {
+        None
+    };
+    let adjoint_z_c = if incl_logdet_h {
+        match (&kernel, leverage.as_ref()) {
+            (
+                OuterHessianDerivativeKernel::ScalarGlm {
+                    c_array,
+                    d_array,
+                    x,
+                },
+                Some(h_g),
+            ) => Some(compute_adjoint_z_c(
                 &ScalarGlmIngredients {
                     c_array,
                     d_array: d_array.as_ref(),
                     x,
                 },
                 hop.as_ref(),
+                h_g,
             )?),
-            OuterHessianDerivativeKernel::Callback { .. } => None,
+            _ => None,
         }
     } else {
         None
@@ -6068,6 +6082,7 @@ fn build_outer_hessian_operator(
         incl_logdet_s,
         kernel,
         adjoint_z_c,
+        leverage,
         callback_second_modes,
     })
 }
@@ -7481,6 +7496,15 @@ impl HessianOperator for DenseSpectralOperator {
             .sum()
     }
 
+    fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
+        // h^G_i = ‖(X G)_{i,:}‖² where G_ε = G Gᵀ and G = self.g_factor.
+        let xd = x.to_dense_arc();
+        let xg = xd.as_ref().dot(&self.g_factor);
+        xg.outer_iter()
+            .map(|r| r.iter().map(|v| v * v).sum())
+            .collect()
+    }
+
     fn trace_logdet_block_local(
         &self,
         block: &Array2<f64>,
@@ -8409,6 +8433,10 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
         self.inner.trace_logdet_gradient(a)
+    }
+
+    fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
+        self.inner.xt_logdet_kernel_x_diagonal(x)
     }
 
     fn trace_logdet_h_k(
@@ -9936,18 +9964,19 @@ mod tests {
             d_array: None,
             x: &x,
         };
-        let streamed = compute_adjoint_z_c(&ing, &hop).expect("streaming path");
-
+        // Construct h_dense = diag(X H⁻¹ Xᵀ) via solve_multi for the dense reference.
         let z_full = hop.solve_multi(&x_data.t().to_owned());
-        let mut h_diag = Array1::<f64>::zeros(n);
+        let mut h_dense = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mut acc = 0.0;
             for j in 0..p {
                 acc += x_data[[i, j]] * z_full[[j, i]];
             }
-            h_diag[i] = acc;
+            h_dense[i] = acc;
         }
-        let mut t = h_diag;
+        let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense).expect("adjoint path");
+
+        let mut t = h_dense.clone();
         Zip::from(&mut t)
             .and(&c_array)
             .for_each(|t_i, &c_i| *t_i *= c_i);
