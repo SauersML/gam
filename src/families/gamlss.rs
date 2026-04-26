@@ -18495,20 +18495,8 @@ mod tests {
         // less than 1 so κ' chain-rule contributions register at strict tolerance.
         let y = array![0.25, -0.4, 1.1, 0.05, -0.2];
         let weights = array![1.0, 0.7, 1.3, 0.9, 1.1];
-        let xmu = ndarray::arr2(&[
-            [1.0, -0.6],
-            [1.0, -0.2],
-            [1.0, 0.1],
-            [1.0, 0.4],
-            [1.0, 0.7],
-        ]);
-        let x_ls = ndarray::arr2(&[
-            [1.0, 0.5],
-            [1.0, -0.1],
-            [1.0, 0.3],
-            [1.0, -0.4],
-            [1.0, 0.2],
-        ]);
+        let xmu = ndarray::arr2(&[[1.0, -0.6], [1.0, -0.2], [1.0, 0.1], [1.0, 0.4], [1.0, 0.7]]);
+        let x_ls = ndarray::arr2(&[[1.0, 0.5], [1.0, -0.1], [1.0, 0.3], [1.0, -0.4], [1.0, 0.2]]);
         // β_ls = (−0.4, 0.05): η_ls hovers around −0.4, so σ ≈ 0.68 and κ ≈ 0.985.
         let beta_mu = array![0.35, -0.25];
         let beta_ls = array![-0.4, 0.05];
@@ -18521,8 +18509,8 @@ mod tests {
         let etamu = xmu.dot(&beta_mu);
         let eta_ls = x_ls.dot(&beta_ls);
 
-        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
-            .expect("gaussian row scalars");
+        let rows =
+            gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
         let weights0 = gaussian_joint_psi_firstweights(
             &rows,
             &Array1::zeros(y.len()),
@@ -18573,39 +18561,35 @@ mod tests {
                         } else {
                             bl[i - pmu] = x;
                         }
-                        gaussian_negloglik_logb_dense_numdual(
-                            &bm, &bl, &y, &weights, &xmu, &x_ls,
-                        )
+                        gaussian_negloglik_logb_dense_numdual(&bm, &bl, &y, &weights, &xmu, &x_ls)
                     };
                     let (_, _, d2) = second_derivative(g, beta_full[i]);
                     d2
                 } else {
-                    let f = |(a, b): (
-                        num_dual::HyperDual<f64, f64>,
-                        num_dual::HyperDual<f64, f64>,
-                    )| {
-                        let mut bm = vec![num_dual::HyperDual::from_re(0.0); pmu];
-                        let mut bl = vec![num_dual::HyperDual::from_re(0.0); p_ls];
-                        for k in 0..pmu {
-                            bm[k] = num_dual::HyperDual::from_re(beta_full[k]);
-                        }
-                        for k in 0..p_ls {
-                            bl[k] = num_dual::HyperDual::from_re(beta_full[pmu + k]);
-                        }
-                        if i < pmu {
-                            bm[i] = a;
-                        } else {
-                            bl[i - pmu] = a;
-                        }
-                        if j < pmu {
-                            bm[j] = b;
-                        } else {
-                            bl[j - pmu] = b;
-                        }
-                        gaussian_negloglik_logb_dense_numdual(
-                            &bm, &bl, &y, &weights, &xmu, &x_ls,
-                        )
-                    };
+                    let f =
+                        |(a, b): (num_dual::HyperDual<f64, f64>, num_dual::HyperDual<f64, f64>)| {
+                            let mut bm = vec![num_dual::HyperDual::from_re(0.0); pmu];
+                            let mut bl = vec![num_dual::HyperDual::from_re(0.0); p_ls];
+                            for k in 0..pmu {
+                                bm[k] = num_dual::HyperDual::from_re(beta_full[k]);
+                            }
+                            for k in 0..p_ls {
+                                bl[k] = num_dual::HyperDual::from_re(beta_full[pmu + k]);
+                            }
+                            if i < pmu {
+                                bm[i] = a;
+                            } else {
+                                bl[i - pmu] = a;
+                            }
+                            if j < pmu {
+                                bm[j] = b;
+                            } else {
+                                bl[j - pmu] = b;
+                            }
+                            gaussian_negloglik_logb_dense_numdual(
+                                &bm, &bl, &y, &weights, &xmu, &x_ls,
+                            )
+                        };
                     let (_, _, _, d2xy) =
                         second_partial_derivative(f, (beta_full[i], beta_full[j]));
                     d2xy
@@ -18647,18 +18631,14 @@ mod tests {
         let ximu = xmu.dot(&v_mu);
         let xi_ls = x_ls.dot(&v_ls);
 
-        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
-            .expect("gaussian row scalars");
+        let rows =
+            gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
         let (dhmumu, dhmu_ls, dh_ls_ls) =
             gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
         let xmu_dense = DenseOrOperator::Borrowed(&xmu);
         let xls_dense = DenseOrOperator::Borrowed(&x_ls);
         let analytic = gaussian_joint_hessian_from_designs(
-            &xmu_dense,
-            &xls_dense,
-            &dhmumu,
-            &dhmu_ls,
-            &dh_ls_ls,
+            &xmu_dense, &xls_dense, &dhmumu, &dhmu_ls, &dh_ls_ls,
         )
         .expect("gaussian joint first-directional H from designs");
 
@@ -18683,8 +18663,7 @@ mod tests {
                 bm[k] = z[k] + eps * num_dual::HyperHyperDual::from_re(v[k]);
             }
             for k in 0..p_ls {
-                bl[k] = z[pmu + k]
-                    + eps * num_dual::HyperHyperDual::from_re(v[pmu + k]);
+                bl[k] = z[pmu + k] + eps * num_dual::HyperHyperDual::from_re(v[pmu + k]);
             }
             gaussian_negloglik_logb_dense_numdual(&bm, &bl, &y, &weights, &xmu, &x_ls)
         };
@@ -18735,18 +18714,14 @@ mod tests {
         let ximuv = xmu.dot(&v_mu);
         let xi_lsv = x_ls.dot(&v_ls);
 
-        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
-            .expect("gaussian row scalars");
+        let rows =
+            gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
         let (d2hmumu, d2hmu_ls, d2h_ls_ls) =
             gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
         let xmu_dense = DenseOrOperator::Borrowed(&xmu);
         let xls_dense = DenseOrOperator::Borrowed(&x_ls);
         let analytic = gaussian_joint_hessian_from_designs(
-            &xmu_dense,
-            &xls_dense,
-            &d2hmumu,
-            &d2hmu_ls,
-            &d2h_ls_ls,
+            &xmu_dense, &xls_dense, &d2hmumu, &d2hmu_ls, &d2h_ls_ls,
         )
         .expect("gaussian joint second-directional H from designs");
 
@@ -18782,27 +18757,21 @@ mod tests {
                             + eps_u * num_dual::HyperHyperDual::from_re(u[pmu + k])
                             + num_dual::HyperHyperDual::from_re(h * v[pmu + k]);
                     }
-                    gaussian_negloglik_logb_dense_numdual(
-                        &bm, &bl, &y, &weights, &xmu, &x_ls,
-                    )
+                    gaussian_negloglik_logb_dense_numdual(&bm, &bl, &y, &weights, &xmu, &x_ls)
                 };
                 let g_minus = |z: &[num_dual::HyperHyperDual<f64, f64>]| {
                     let mut bm = vec![num_dual::HyperHyperDual::from_re(0.0); pmu];
                     let mut bl = vec![num_dual::HyperHyperDual::from_re(0.0); p_ls];
                     let eps_u = z[total];
                     for k in 0..pmu {
-                        bm[k] = z[k]
-                            + eps_u * num_dual::HyperHyperDual::from_re(u[k])
+                        bm[k] = z[k] + eps_u * num_dual::HyperHyperDual::from_re(u[k])
                             - num_dual::HyperHyperDual::from_re(h * v[k]);
                     }
                     for k in 0..p_ls {
-                        bl[k] = z[pmu + k]
-                            + eps_u * num_dual::HyperHyperDual::from_re(u[pmu + k])
+                        bl[k] = z[pmu + k] + eps_u * num_dual::HyperHyperDual::from_re(u[pmu + k])
                             - num_dual::HyperHyperDual::from_re(h * v[pmu + k]);
                     }
-                    gaussian_negloglik_logb_dense_numdual(
-                        &bm, &bl, &y, &weights, &xmu, &x_ls,
-                    )
+                    gaussian_negloglik_logb_dense_numdual(&bm, &bl, &y, &weights, &xmu, &x_ls)
                 };
                 let (_, _, _, _, _, _, _, d3_plus) =
                     third_partial_derivative_vec(g_plus, &vars_base, i, j, total);
@@ -18859,8 +18828,8 @@ mod tests {
         let zmu_psi_psi = &x_mu_psi_psi * beta_mu0;
         let z_ls_psi_psi = &x_ls_psi_psi * beta_ls0;
 
-        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
-            .expect("gaussian row scalars");
+        let rows =
+            gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
         let secondweights = gaussian_joint_psisecondweights(
             &rows,
             &zmu_psi,
