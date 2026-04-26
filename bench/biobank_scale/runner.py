@@ -147,7 +147,7 @@ def preflight_marginal_slope_biobank(
     # CTN prep peak memory model. The conditional transformation family fitted
     # before the marginal-slope stage builds a monotonicity-grid derivative
     # design whose virtual rows are the Cartesian product of training rows and
-    # the response monotonicity grid. With the OuterFactored design the two
+    # the response monotonicity grid. With the Kronecker variant the two
     # factors are kept separate, so the peak working allocation is just the
     # h'(grid) and delta-h'(grid) vectors of length n_train * n_grid each.
     # Pre-fix (row-replicated factors) the peak was n_train * n_grid * (p_resp +
@@ -206,7 +206,7 @@ def preflight_marginal_slope_biobank(
         f"Duchon tuple: order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g}",
         "Duchon smooth: lazy chunked",
         "anisotropy derivatives: implicit streaming",
-        "CTN Kronecker: factored (OuterFactored monotonicity grid)",
+        "CTN Kronecker: factored (Kronecker variant for monotonicity grid)",
         f"CTN response grid points (upper bound): {n_grid_estimate}",
         f"CTN p_resp upper bound: {p_resp_estimate}",
         f"CTN p_cov: {p_cov_ctn}",
