@@ -20,8 +20,10 @@ use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
 use crate::families::sigma_link::{
-    SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar, exp_sigma_derivs_up_to_third,
-    exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar, safe_exp,
+    LOGB_SIGMA_FLOOR, SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar,
+    exp_sigma_derivs_up_to_third, exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar,
+    logb_sigma_derivs_up_to_fourth_scalar, logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar,
+    safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::linalg::utils::solve_spd_pcg_with_info;
@@ -221,19 +223,23 @@ fn gaussian_diagonal_row_kernel(
         };
     }
 
-    let SigmaJet1 {
-        sigma: raw_sigma,
-        d1: raw_dsigma,
-    } = exp_sigma_jet1_scalar(eta_log_sigma);
-    let (sigma, d_sigma) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
-        (1e-12, 0.0)
-    } else {
-        (raw_sigma, raw_dsigma)
-    };
-    let inv_s2 = (sigma * sigma).recip().min(1e24);
+    // logb noise link σ = b + exp(η) bounds σ ≥ b > 0 by construction, so the
+    // Gaussian location-scale objective ½Σ(y−μ)²/σ² + Σlog σ is bounded below
+    // for any finite data. Its working weight 1/σ² is bounded by 1/b², so
+    // H_μμ has bounded condition number — no after-the-fact floor or cap is
+    // needed (the previous (1e-12, 1e24) clamp was a numerical bandaid for the
+    // pure-exp link's σ→0 singularity and is structurally unnecessary here).
+    let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta_log_sigma);
+    let inv_s2 = (sigma * sigma).recip();
     let residual = y - location_eta;
     let location_working_weight = floor_positiveweight(obs_weight * inv_s2, MIN_WEIGHT);
-    let dlog_sigma_deta = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
+    // dlog σ/dη = (∂σ/∂η)/σ = (σ−b)/σ = 1 − b/σ ∈ [0, 1).
+    // Use the (1 − b/σ) form so the η→+∞ tail (σ→∞ giving exp(η)/exp(η) = ∞/∞)
+    // evaluates cleanly to 1 instead of NaN; mathematically identical, but
+    // avoids feeding NaN into the IRLS info weight when overflow happens.
+    // Fisher info per obs = 2·(dσ/dη)²/σ² = 2·dlog_sigma_deta², matching the
+    // formula for the pure-exp link (where dlog_sigma_deta ≡ 1).
+    let dlog_sigma_deta = 1.0 - LOGB_SIGMA_FLOOR / sigma;
     let log_sigma_working_weight = floor_positiveweight(
         2.0 * obs_weight * dlog_sigma_deta * dlog_sigma_deta,
         MIN_WEIGHT,
@@ -1146,11 +1152,17 @@ fn gaussian_location_scalewarm_start(
             "gaussian location-scale warm start could not estimate residual scale".to_string(),
         );
     }
-    let sigma_hat = (weighted_ss / weight_sum).sqrt().max(1e-10);
+    // Warm-start σ̂ must clear the logb floor so the inverse link
+    //   η = log(σ − b)
+    // is finite. Use a relative cushion above b so the warm-start is in the
+    // smooth interior of the link domain.
+    let sigma_hat = (weighted_ss / weight_sum)
+        .sqrt()
+        .max(LOGB_SIGMA_FLOOR * 1.5);
     let beta_log_sigma = if let Some(beta) = noise_beta_hint {
         beta.clone()
     } else {
-        let eta_sigma = sigma_hat.ln();
+        let eta_sigma = (sigma_hat - LOGB_SIGMA_FLOOR).ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         solve_penalizedweighted_projection(
             &log_sigma_block.design,
@@ -4510,13 +4522,13 @@ fn gaussian_jointrow_scalars(
     let mut n = Array1::<f64>::uninit(nobs);
     let mut kappa = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let jet = crate::families::sigma_link::exp_sigma_jet1_scalar(eta_ls[i]);
+        let jet = crate::families::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]);
         let s = jet.sigma;
-        // For the exact exp sigma link, κ = (dσ/dη_ls)/σ = exp(eta_ls)/exp(eta_ls) = 1
-        // identically. Computing the ratio as `jet.d1 / s` turns the far-right tail
-        // into `inf / inf`, which poisons the exact Newton path with NaNs even though
-        // the mathematical coefficient is well defined.
-        let ki = 1.0;
+        // logb link σ = b + exp(η_ls): κ = (dσ/dη_ls)/σ = (σ−b)/σ = 1 − b/σ.
+        // Compute as (1 − b/σ) so the η→+∞ tail (where exp(η)/exp(η) would be
+        // ∞/∞ → NaN) collapses cleanly to 1; mathematically identical for finite
+        // σ, numerically robust at overflow.
+        let ki = 1.0 - LOGB_SIGMA_FLOOR / s;
         let wi = weights[i] / (s * s);
         let ri = y[i] - etamu[i];
         obs_weight[i].write(weights[i]);
@@ -5105,6 +5117,33 @@ fn exp_sigma_derivs_up_to_fourth_array(
     let mut d4 = Array1::<f64>::zeros(n);
     for i in 0..n {
         let (sigma_i, d1_i, d2_i, d3_i, d4_i) = exp_sigma_derivs_up_to_fourth_scalar(eta[i]);
+        sigma[i] = sigma_i;
+        d1[i] = d1_i;
+        d2[i] = d2_i;
+        d3[i] = d3_i;
+        d4[i] = d4_i;
+    }
+    (sigma, d1, d2, d3, d4)
+}
+
+#[inline]
+fn logb_sigma_derivs_up_to_fourth_array(
+    eta: ArrayView1<'_, f64>,
+) -> (
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+) {
+    let n = eta.len();
+    let mut sigma = Array1::<f64>::zeros(n);
+    let mut d1 = Array1::<f64>::zeros(n);
+    let mut d2 = Array1::<f64>::zeros(n);
+    let mut d3 = Array1::<f64>::zeros(n);
+    let mut d4 = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let (sigma_i, d1_i, d2_i, d3_i, d4_i) = logb_sigma_derivs_up_to_fourth_scalar(eta[i]);
         sigma[i] = sigma_i;
         d1[i] = d1_i;
         d2[i] = d2_i;
@@ -6127,9 +6166,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         if etamu.len() != n || eta_log_sigma.len() != n || self.weights.len() != n {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
-        // Use the exact exp sigma link throughout:
-        //
-        //   sigma(eta_ls) = exp(eta_ls).
+        // logb noise link: σ(η_ls) = LOGB_SIGMA_FLOOR + exp(η_ls). σ ≥ b > 0
+        // bounds the loglik below (−Σlog σ ≥ −n log b) and bounds 1/σ² by 1/b²,
+        // so the previous `inv_s2.min(1e24)` cap is structurally unnecessary.
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
         if let (Some(y_s), Some(w_s), Some(mu_s), Some(ls_s)) = (
@@ -6143,8 +6182,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 if wi == 0.0 {
                     continue;
                 }
-                let sigma_i = safe_exp(ls_s[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
+                let sigma_i = logb_sigma_from_eta_scalar(ls_s[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
                 let r = y_s[i] - mu_s[i];
                 ll += wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
             }
@@ -6154,8 +6193,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 if wi == 0.0 {
                     continue;
                 }
-                let sigma_i = safe_exp(eta_log_sigma[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
+                let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
                 let r = self.y[i] - etamu[i];
                 ll += wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
             }
@@ -6215,7 +6254,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let (sigma, d_sigma, d2_sigma, _, _) = exp_sigma_derivs_up_to_fourth_array(eta_ls.view());
+        let (sigma, d_sigma, d2_sigma, _, _) = logb_sigma_derivs_up_to_fourth_array(eta_ls.view());
         let mut dw = Array1::<f64>::zeros(n);
         match block_idx {
             Self::BLOCK_MU => {
@@ -6388,7 +6427,9 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
             ));
         }
         let mu = block_states[Self::BLOCK_MU].eta.clone();
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA].eta.mapv(safe_exp);
+        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
+            .eta
+            .mapv(logb_sigma_from_eta_scalar);
         Ok(GenerativeSpec {
             mean: mu,
             noise: NoiseModel::Gaussian { sigma },
@@ -8221,8 +8262,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
         for i in 0..self.y.len() {
-            let sigma_i = safe_exp(eta_ls[i]);
-            let inv_s2 = (sigma_i * sigma_i).recip().min(1e24);
+            let sigma_i = logb_sigma_from_eta_scalar(eta_ls[i]);
+            let inv_s2 = (sigma_i * sigma_i).recip();
             let r = self.y[i] - q[i];
             ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
         }
@@ -8473,7 +8514,9 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
             ));
         }
         let mean = &block_states[Self::BLOCK_MU].eta + &block_states[Self::BLOCK_WIGGLE].eta;
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA].eta.mapv(safe_exp);
+        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
+            .eta
+            .mapv(logb_sigma_from_eta_scalar);
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gaussian { sigma },
@@ -16486,11 +16529,17 @@ mod tests {
                 working_response,
                 working_weights,
             } => {
-                let sigma = safe_exp(eta_ls0);
-                let inv_s2 = (sigma * sigma).recip().min(1e24);
+                // logb link σ = b + e^η: at η ≫ log b the floor is dwarfed
+                // (σ ≈ e^η ~ 1e304), so dlogσ/dη = (σ−b)/σ → 1 to within
+                // f64 precision and the IRLS step matches the pure-exp Fisher
+                // step. Compute the expectation explicitly from the new link.
+                let sigma = logb_sigma_from_eta_scalar(eta_ls0);
+                let inv_s2 = (sigma * sigma).recip();
+                let dlog = (sigma - LOGB_SIGMA_FLOOR) / sigma;
                 let residual = family.y[0] - eta_mu[0];
-                let expected_score = family.weights[0] * (residual * residual * inv_s2 - 1.0);
-                let expected_info = 2.0 * family.weights[0];
+                let expected_score =
+                    family.weights[0] * (residual * residual * inv_s2 - 1.0) * dlog;
+                let expected_info = 2.0 * family.weights[0] * dlog * dlog;
                 let expected_response = eta_ls0 + expected_score / expected_info;
 
                 assert!((working_weights[0] - expected_info).abs() < 1e-12);
@@ -16588,16 +16637,8 @@ mod tests {
             for i in 0..n {
                 let w = weights[i];
                 let eta = eta_ls[i];
-                let SigmaJet1 {
-                    sigma: raw_sigma,
-                    d1: raw_dsigma,
-                } = exp_sigma_jet1_scalar(eta);
-                let (sigma, d_sigma) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
-                    (1e-12, 0.0)
-                } else {
-                    (raw_sigma, raw_dsigma)
-                };
-                let inv_s2 = (sigma * sigma).recip().min(1e24);
+                let SigmaJet1 { sigma, d1: d_sigma } = logb_sigma_jet1_scalar(eta);
+                let inv_s2 = (sigma * sigma).recip();
                 let r = y[i] - mu[i];
                 ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
                 if w == 0.0 {
@@ -16607,7 +16648,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
+                let dlogsigma_du = d_sigma / sigma;
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
@@ -16630,16 +16671,8 @@ mod tests {
             let mut wls = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let eta = eta_ls[i];
-                let SigmaJet1 {
-                    sigma: raw_sigma,
-                    d1: raw_dsigma,
-                } = exp_sigma_jet1_scalar(eta);
-                let (sigma, d_sigma) = if !raw_sigma.is_finite() || raw_sigma <= 1e-12 {
-                    (1e-12, 0.0)
-                } else {
-                    (raw_sigma, raw_dsigma)
-                };
-                let inv_s2 = (sigma * sigma).recip().min(1e24);
+                let SigmaJet1 { sigma, d1: d_sigma } = logb_sigma_jet1_scalar(eta);
+                let inv_s2 = (sigma * sigma).recip();
                 let w = weights[i];
                 let r = y[i] - mu[i];
                 ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
@@ -16650,7 +16683,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
+                let dlogsigma_du = d_sigma / sigma;
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
