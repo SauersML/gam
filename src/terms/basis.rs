@@ -7603,8 +7603,7 @@ fn duchon_kernel_radial_triplet(
                     &coeffs_local
                 }
             };
-            let jets =
-                duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs_ref)?;
+            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs_ref)?;
             (jets.phi, jets.phi_r, jets.phi_rr)
         }
     };
