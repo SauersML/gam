@@ -790,97 +790,29 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let beta = &block_states[0].beta;
 
-        // Fraction-to-boundary rule: find the largest alpha in (0, 1] such that
-        // h'(beta + alpha * delta) > 0 at every observed row and monotonicity
-        // grid row. For each row i where d_h'[i] < 0, the step that drives
-        // h'[i] to zero is alpha_i = h'[i] / (-d_h'[i]); we take the minimum
-        // and apply a 0.995 safety factor (standard in interior-point methods).
-        let mut alpha_max = 1.0_f64;
-
-        // (1) Observed-row check uses the row-wise Khatri–Rao design directly.
-        // Storage here is O(n) per vector, so materialization is fine.
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
-        let d_h_prime = self.x_deriv_kron.forward_mul(delta);
-        for i in 0..h_prime.len() {
-            let dh = d_h_prime[i];
-            if dh < -1e-14 {
-                let hit = h_prime[i] / (-dh);
-                if hit < alpha_max {
-                    alpha_max = hit;
-                }
-            }
-        }
-
-        // (2) Monotonicity-grid check is streaming: never materialize the
-        // (n_cov · n_grid) h(grid) and dh(grid) vectors. The construction-site
-        // invariant (asserts at TransformationNormalFamily::new and the
-        // warm-start variant) guarantees x_deriv_grid_kron is the Kronecker
-        // variant; we still bind the factors via match so the panic message
-        // stays explicit if that ever drifts.
-        let (response_grid, covariate) = match &self.x_deriv_grid_kron {
-            KroneckerDesign::Kronecker {
-                response_grid,
-                covariate,
-            } => (response_grid, covariate),
-            KroneckerDesign::KhatriRao { .. } => unreachable!(
-                "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) materialization (enforced at construction)"
-            ),
-        };
-        let n_cov = covariate.nrows();
-        let n_grid = response_grid.nrows();
-        let p_resp = response_grid.ncols();
-        let p_cov = covariate.ncols();
-        debug_assert_eq!(beta.len(), p_resp * p_cov);
-        debug_assert_eq!(delta.len(), p_resp * p_cov);
-
-        // Per-row response contractions:
-        //     M_β[i, a] = (C · β_matᵀ)[i, a] = Σ_b C[i, b] · β_mat[a, b]
-        //     M_δ[i, a] = (C · δ_matᵀ)[i, a]
-        // Memory: 2 · n_cov · p_resp · 8 bytes (~50 MiB at biobank scale),
-        // versus 2 · n_cov · n_grid · 8 bytes (~870 MiB) that the materialized
-        // h(grid)/dh(grid) vectors would have required — same FLOPs, ~17×
-        // smaller working set.
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .expect("beta length is p_resp * p_cov");
-        let delta_mat = delta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .expect("delta length is p_resp * p_cov");
-        let mut m_beta = Array2::<f64>::zeros((n_cov, p_resp));
-        let mut m_delta = Array2::<f64>::zeros((n_cov, p_resp));
-        for a in 0..p_resp {
-            let cb = covariate.apply(&beta_mat.row(a).to_owned());
-            let cd = covariate.apply(&delta_mat.row(a).to_owned());
-            m_beta.column_mut(a).assign(&cb);
-            m_delta.column_mut(a).assign(&cd);
-        }
-
-        // Streaming scan: for each (i, g), evaluate the length-p_resp dot
-        // products  h[i, g] = M_β.row(i) · response_grid.row(g)  and
-        // dh[i, g] = M_δ.row(i) · response_grid.row(g)  inline with the
-        // fraction-to-boundary update. The (n_cov, n_grid) output is never
-        // stored.
-        for i in 0..n_cov {
-            let m_beta_row = m_beta.row(i);
-            let m_delta_row = m_delta.row(i);
-            for g in 0..n_grid {
-                let r_row = response_grid.row(g);
-                let mut h = 0.0;
-                let mut dh = 0.0;
-                for a in 0..p_resp {
-                    h += m_beta_row[a] * r_row[a];
-                    dh += m_delta_row[a] * r_row[a];
-                }
-                if dh < -1e-14 {
-                    let hit = (h - TRANSFORMATION_MONOTONICITY_EPS) / (-dh);
-                    if hit < alpha_max {
-                        alpha_max = hit;
-                    }
-                }
-            }
-        }
+        // Fraction-to-boundary: find the largest α ∈ (0, 1] such that
+        // h'(β + α · δ) > 0 at every observed row and h'(y_g; x_i) > ε at
+        // every (covariate, response-grid) pair on the monotonicity grid.
+        //
+        // Each design owns its own streaming reduction over its virtual rows
+        // (KhatriRao: n observations; Kronecker: n_cov × n_grid pairs without
+        // materializing the dense forward image). Both return the smallest
+        // binding step ratio, or +∞ if no row binds. The grid uses the
+        // strict-feasibility margin TRANSFORMATION_MONOTONICITY_EPS; observed
+        // rows use 0.0 (the log-h' barrier in the likelihood already keeps
+        // h' away from zero on observed rows). Composing via `f64::min` is
+        // associative for non-NaN inputs, so the final α_max is bit-equivalent
+        // to a single scan over the union of binding rows.
+        let alpha_obs = self
+            .x_deriv_kron
+            .min_step_to_boundary(beta, delta, 0.0, 1e-14);
+        let alpha_grid = self.x_deriv_grid_kron.min_step_to_boundary(
+            beta,
+            delta,
+            TRANSFORMATION_MONOTONICITY_EPS,
+            1e-14,
+        );
+        let alpha_max = 1.0_f64.min(alpha_obs).min(alpha_grid);
 
         let tau = 0.995;
         let alpha_safe = tau * alpha_max;
