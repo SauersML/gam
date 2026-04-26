@@ -4525,11 +4525,12 @@ fn gaussian_jointrow_scalars(
     for i in 0..nobs {
         let jet = crate::families::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]);
         let s = jet.sigma;
-        // logb link σ = b + exp(η_ls): κ = (dσ/dη_ls)/σ = (σ−b)/σ = 1 − b/σ.
-        // Compute as (1 − b/σ) so the η→+∞ tail (where exp(η)/exp(η) would be
-        // ∞/∞ → NaN) collapses cleanly to 1; mathematically identical for finite
-        // σ, numerically robust at overflow.
-        let ki = 1.0 - LOGB_SIGMA_FLOOR / s;
+        // κ = (σ − b)/σ = exp(η)/(b + exp(η)). Use the direct exp(η)/σ form
+        // when finite — it preserves the precision of exp(η) at very negative
+        // η (where 1 − b/σ catastrophically cancels because b/σ → 1). The
+        // η → +∞ branch returns 1 cleanly without hitting ∞/∞ NaN.
+        let s_exp = jet.d1;
+        let ki = if s_exp.is_infinite() { 1.0 } else { s_exp / s };
         let kp = ki * (1.0 - ki);
         let kdp = kp * (1.0 - 2.0 * ki);
         let wi = weights[i] / (s * s);
