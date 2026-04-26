@@ -404,8 +404,10 @@ impl TransformationNormalFamily {
         let p_resp = response_val_basis.ncols();
 
         // Row-wise Kronecker product (operator form).
-        let x_val_kron = KroneckerDesign::new_khatri_rao(&response_val_basis, covariate_design.clone())?;
-        let x_deriv_kron = KroneckerDesign::new_khatri_rao(&response_deriv_basis, covariate_design.clone())?;
+        let x_val_kron =
+            KroneckerDesign::new_khatri_rao(&response_val_basis, covariate_design.clone())?;
+        let x_deriv_kron =
+            KroneckerDesign::new_khatri_rao(&response_deriv_basis, covariate_design.clone())?;
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
@@ -1848,10 +1850,7 @@ impl KroneckerDesign {
     /// Construct the outer-factored variant used by the monotonicity grid: the
     /// virtual row space is the Cartesian product `n_cov × n_grid`, and the
     /// two factors never need to share a row count.
-    fn new_kronecker(
-        response_grid: Array2<f64>,
-        covariate: DesignMatrix,
-    ) -> Result<Self, String> {
+    fn new_kronecker(response_grid: Array2<f64>, covariate: DesignMatrix) -> Result<Self, String> {
         if response_grid.ncols() == 0 {
             return Err("Kronecker response_grid has zero columns".to_string());
         }
@@ -2002,14 +2001,8 @@ impl KroneckerDesign {
                 let p_cov = covariate.ncols();
                 debug_assert_eq!(beta.len(), p_resp * p_cov);
                 debug_assert_eq!(delta.len(), p_resp * p_cov);
-                let beta_mat = beta
-                    .view()
-                    .into_shape_with_order((p_resp, p_cov))
-                    .unwrap();
-                let delta_mat = delta
-                    .view()
-                    .into_shape_with_order((p_resp, p_cov))
-                    .unwrap();
+                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                let delta_mat = delta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
                 // Project β and δ through the covariate operator once. Each
                 // takes p_resp `apply` calls — identical cost to a single
                 // `forward_mul`. Together: `n × p_resp` doubles ≈ 60 MiB at
@@ -2195,9 +2188,7 @@ impl KroneckerDesign {
                 }
                 Ok(out)
             }
-            _ => unreachable!(
-                "Kronecker cross-with case is rejected by the early return above"
-            ),
+            _ => unreachable!("Kronecker cross-with case is rejected by the early return above"),
         }
     }
 }
@@ -3391,8 +3382,7 @@ mod tests {
                     let row = i * n_grid + g;
                     for a in 0..p_resp {
                         for b in 0..p_cov {
-                            reference[[row, a * p_cov + b]] =
-                                response_grid[[g, a]] * cov[[i, b]];
+                            reference[[row, a * p_cov + b]] = response_grid[[g, a]] * cov[[i, b]];
                         }
                     }
                 }
