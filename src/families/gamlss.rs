@@ -4472,6 +4472,13 @@ struct GaussianJointRowScalars {
     /// The cross Hessian block H_{μ,ls} carries an overall κ factor and the
     /// scale-scale block H_{ls,ls} carries κ².
     kappa: Array1<f64>,
+    /// κ' = dκ/dη_ls = κ(1−κ) for the logb link. The static H_{ls,ls} block
+    /// carries a κ'·(a−n) term, so κ' threads through every dH directional
+    /// weight via the chain rule.
+    kappa_prime: Array1<f64>,
+    /// κ'' = κ(1−κ)(1−2κ); appears in d²H_{ls,ls} via the second
+    /// η-derivative of κ'·(a−n).
+    kappa_dprime: Array1<f64>,
 }
 
 struct GaussianJointPsiFirstWeights {
@@ -4521,6 +4528,8 @@ fn gaussian_jointrow_scalars(
     let mut m = Array1::<f64>::uninit(nobs);
     let mut n = Array1::<f64>::uninit(nobs);
     let mut kappa = Array1::<f64>::uninit(nobs);
+    let mut kappa_prime = Array1::<f64>::uninit(nobs);
+    let mut kappa_dprime = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
         let jet = crate::families::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]);
         let s = jet.sigma;
@@ -4529,6 +4538,8 @@ fn gaussian_jointrow_scalars(
         // ∞/∞ → NaN) collapses cleanly to 1; mathematically identical for finite
         // σ, numerically robust at overflow.
         let ki = 1.0 - LOGB_SIGMA_FLOOR / s;
+        let kp = ki * (1.0 - ki);
+        let kdp = kp * (1.0 - 2.0 * ki);
         let wi = weights[i] / (s * s);
         let ri = y[i] - etamu[i];
         obs_weight[i].write(weights[i]);
@@ -4536,6 +4547,8 @@ fn gaussian_jointrow_scalars(
         m[i].write(ri * wi);
         n[i].write(ri * ri * wi);
         kappa[i].write(ki);
+        kappa_prime[i].write(kp);
+        kappa_dprime[i].write(kdp);
     }
     // SAFETY: all elements written in the loop above.
     let obs_weight = unsafe { obs_weight.assume_init() };
@@ -4543,12 +4556,16 @@ fn gaussian_jointrow_scalars(
     let m = unsafe { m.assume_init() };
     let n = unsafe { n.assume_init() };
     let kappa = unsafe { kappa.assume_init() };
+    let kappa_prime = unsafe { kappa_prime.assume_init() };
+    let kappa_dprime = unsafe { kappa_dprime.assume_init() };
     Ok(GaussianJointRowScalars {
         obs_weight,
         w,
         m,
         n,
         kappa,
+        kappa_prime,
+        kappa_dprime,
     })
 }
 
@@ -4566,13 +4583,22 @@ fn gaussian_joint_first_directionalweights(
         let mi = scalars.m[i];
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
+        let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
+        let amn = scalars.obs_weight[i] - ni;
         let dm = dotmu[i];
-        // For the exact exp link κ = (dσ/dη_ls)/σ = 1.
-        let sde = ki * dot_eta[i];
+        let de = dot_eta[i];
+        // κ-scaled log-sigma direction.
+        let sde = ki * de;
         w_u[i].write(-2.0 * wi * sde);
-        // Cross block carries overall κ; scale-scale block carries κ².
-        c_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde));
-        d_u[i].write(ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde));
+        // + 2·κ'·m·de: dκ/dη chain-rule from σ = b + e^η.
+        c_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
+        // F_μ·dm + F_η·de with F = 2κ²n + κ'(a−n) (mirrors helper 4 dh_ls_ls).
+        d_u[i].write(
+            ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde)
+                + 2.0 * mi * kpi * dm
+                + (kdpi * amn + 6.0 * ki * kpi * ni) * de,
+        );
     }
     let w_u = unsafe { w_u.assume_init() };
     let c_u = unsafe { c_u.assume_init() };
@@ -4596,19 +4622,43 @@ fn gaussian_jointsecond_directionalweights(
         let mi = scalars.m[i];
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
+        let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
+        // κ''' = κ''(1−2κ) − 2κ'²: needed for the (a−n)·deu·dev piece of d²H_{ls,ls}/∂η².
+        let ktpi = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
+        // (κ')² + κ·κ'' − 5κ²·κ': η-η coefficient from differentiating the OLD 2κ²n part.
+        let dlsls_eta_eta_old = kpi * kpi + ki * kdpi - 5.0 * ki * ki * kpi;
+        let amn = scalars.obs_weight[i] - ni;
         let dmu = dotmu_u[i];
         let dmv = dotmuv[i];
+        let deu = dot_eta_u[i];
+        let dev = dot_etav[i];
         // κ-scaled log-sigma directions.
-        let sdeu = ki * dot_eta_u[i];
-        let sdev = ki * dot_etav[i];
-        w_uv[i].write(4.0 * wi * sdeu * sdev);
-        // Cross block carries overall κ; scale-scale block carries κ².
-        c_uv[i].write(ki * (4.0 * wi * (dmu * sdev + dmv * sdeu) + 8.0 * mi * sdeu * sdev));
+        let sdeu = ki * deu;
+        let sdev = ki * dev;
+        let de_sym = dmu * dev + dmv * deu;
+        let de_eta = deu * dev;
+        // − 2·κ'·w·deu·dev: ∂²w/∂η² = 4wκ² − 2wκ'.
+        w_uv[i].write(4.0 * wi * sdeu * sdev - 2.0 * wi * kpi * de_eta);
+        // − 2·κ'·w·sym + 2·m·(κ''−6·κ·κ')·deu·dev from d²(2mκ).
+        c_uv[i].write(
+            ki * (4.0 * wi * (dmu * sdev + dmv * sdeu) + 8.0 * mi * sdeu * sdev)
+                - 2.0 * wi * kpi * de_sym
+                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_eta,
+        );
+        // d²/du dv of corrected H_{ls,ls} = 2κ²n + κ'(a−n). The "_old" bracket
+        // covers d²(2κ²n); the extra terms cover d²(κ'(a−n)).
         d_uv[i].write(
             ki * ki
                 * (4.0 * wi * dmu * dmv
                     + 8.0 * mi * (dmu * sdev + dmv * sdeu)
-                    + 8.0 * ni * sdeu * sdev),
+                    + 8.0 * ni * sdeu * sdev)
+                - 2.0 * kpi * wi * dmu * dmv
+                - 8.0 * mi * ki * kpi * de_sym
+                + 2.0 * mi * (kdpi - 2.0 * ki * kpi) * de_sym
+                + 4.0 * ni * dlsls_eta_eta_old * de_eta
+                + (2.0 * kpi * kpi + 4.0 * ki * kdpi - 4.0 * ki * ki * kpi) * ni * de_eta
+                + ktpi * amn * de_eta,
         );
     }
     let w_uv = unsafe { w_uv.assume_init() };
@@ -4638,24 +4688,35 @@ fn gaussian_joint_psi_firstweights(
         let mi = scalars.m[i];
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
+        let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
+        let ai = scalars.obs_weight[i];
         let ma = mu_a[i];
         let ea = eta_a[i];
         // κ-scaled log-sigma direction.
         let sea = ki * ea;
         let smu = -mi;
-        let sls = ki * (scalars.obs_weight[i] - ni);
+        let sls = ki * (ai - ni);
         let wi = scalars.w[i];
         scoremu[i].write(smu);
         score_ls[i].write(sls);
         dscoremu[i].write(wi * ma + 2.0 * mi * sea);
-        dscore_ls[i].write(ki * (2.0 * mi * ma + 2.0 * ni * sea));
+        // + κ'·(a−n)·η̇ chain-rule term (∂[κ(a−n)]/∂η = κ'(a−n) + 2κ²n).
+        dscore_ls[i].write(ki * (2.0 * mi * ma + 2.0 * ni * sea) + kpi * (ai - ni) * ea);
         hmumu[i].write(wi);
-        // Cross block carries overall κ; scale-scale block carries κ².
+        // Cross block: H_{μ,ls} = 2mκ (no κ' term — derivative of −m wrt η is 2mκ).
         hmu_ls[i].write(2.0 * ki * mi);
-        h_ls_ls[i].write(2.0 * ki * ki * ni);
+        // + κ'·(a−n) term: H_{ls,ls} = κ(1−κ)(a−n) + 2κ²n.
+        h_ls_ls[i].write(2.0 * ki * ki * ni + kpi * (ai - ni));
         dhmumu[i].write(-2.0 * wi * sea);
-        dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea));
-        dh_ls_ls[i].write(ki * ki * (-4.0 * mi * ma - 4.0 * ni * sea));
+        // + 2m·κ'·η̇: ∂(2mκ)/∂η = −4mκ² + 2mκ'.
+        dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea) + 2.0 * mi * kpi * ea);
+        // + 2m·κ'·μ̇ + [κ''(a−n) + 6κκ'·n]·η̇ from differentiating κ'(a−n)+2κ²n.
+        dh_ls_ls[i].write(
+            ki * ki * (-4.0 * mi * ma - 4.0 * ni * sea)
+                + 2.0 * mi * kpi * ma
+                + (kdpi * (ai - ni) + 6.0 * ki * kpi * ni) * ea,
+        );
         objective_psirow[i].write(smu * ma + sls * ea);
     }
     unsafe {
@@ -4696,38 +4757,78 @@ fn gaussian_joint_psisecondweights(
         let mi = scalars.m[i];
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
+        let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
+        // κ''' = κ''(1−2κ) − 2κ'²: needed for the (a−n)·η_a η_b piece of d²H_{ls,ls}/∂η².
+        let ktpi = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
+        // (κ')² + κ·κ'' − 5κ²·κ': η-η coefficient inside the d²H_{ls,ls} delta from differentiating the OLD 2κ²n piece.
+        let dlsls_eta_eta_old = kpi * kpi + ki * kdpi - 5.0 * ki * ki * kpi;
+        let ai = scalars.obs_weight[i];
+        let amn = ai - ni;
         let ma = mu_a[i];
         let mb = mu_b[i];
         let mab = mu_ab[i];
+        let ea = eta_a[i];
+        let eb = eta_b[i];
+        let eab = eta_ab[i];
         // κ-scaled log-sigma directions.
-        let sea = ki * eta_a[i];
-        let seb = ki * eta_b[i];
-        let seab = ki * eta_ab[i];
+        let sea = ki * ea;
+        let seb = ki * eb;
+        let seab = ki * eab;
         let cross = ma * seb + mb * sea;
+        // Bare-η symmetric form (no κ): needed for κ' chain-rule terms.
+        let cross_eta = ma * eb + mb * ea;
         let sea_seb = sea * seb;
+        let ea_eb = ea * eb;
         let ma_mb = ma * mb;
-        // Objective psi-psi: d²NLL/d(ψ_a)d(ψ_b).
-        // Score_μ = -m, Score_ls = κ(weight - n). Hessian blocks carry κ, κ².
+        // + κ'·(a−n)·ea·eb: dκ/dη chain-rule contribution from σ = b + e^η.
         objective_psi_psirow[i].write(
             wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb - mi * mab
-                + ki * (scalars.obs_weight[i] - ni) * eta_ab[i],
+                + ki * amn * eab
+                + kpi * amn * ea_eb,
         );
-        d2scoremu[i].write(wi * mab - 2.0 * wi * cross - 4.0 * mi * sea_seb + 2.0 * mi * seab);
+        // + 2·m·κ'·ea·eb: ∂²(−m)/∂η² = −4mκ² + 2mκ'.
+        d2scoremu[i].write(
+            wi * mab - 2.0 * wi * cross - 4.0 * mi * sea_seb
+                + 2.0 * mi * seab
+                + 2.0 * mi * kpi * ea_eb,
+        );
+        // + 2·κ'·m·sym(μ_a η_b) + (κ''(a−n)+6κκ'n)·ea·eb + κ'(a−n)·eab.
         d2score_ls[i].write(
             ki * (-2.0 * wi * ma_mb - 4.0 * mi * cross - 4.0 * ni * sea_seb
                 + 2.0 * mi * mab
-                + 2.0 * ni * seab),
+                + 2.0 * ni * seab)
+                + 2.0 * mi * kpi * cross_eta
+                + (kdpi * amn + 6.0 * ki * kpi * ni) * ea_eb
+                + kpi * amn * eab,
         );
-        d2hmumu[i].write(4.0 * wi * sea_seb - 2.0 * wi * seab);
-        // Cross block carries overall κ; scale-scale block carries κ².
+        // − 2·κ'·w·ea·eb: ∂²w/∂η² = 4wκ² − 2wκ'.
+        d2hmumu[i].write(4.0 * wi * sea_seb - 2.0 * wi * seab - 2.0 * wi * kpi * ea_eb);
+        // − 2·κ'·w·sym + 2·m·(κ''−6κκ')·ea·eb + 2·m·κ'·eab from d²(2mκ).
         d2hmu_ls[i].write(
-            ki * (-2.0 * wi * mab + 4.0 * wi * cross + 8.0 * mi * sea_seb - 4.0 * mi * seab),
+            ki * (-2.0 * wi * mab + 4.0 * wi * cross + 8.0 * mi * sea_seb - 4.0 * mi * seab)
+                - 2.0 * wi * kpi * cross_eta
+                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * ea_eb
+                + 2.0 * mi * kpi * eab,
         );
+        // d²H_{ls,ls}/dψ_a dψ_b with corrected H_{ls,ls} = 2κ²n + κ'(a−n).
+        // F_μμ adds −2wκ'·ma_mb; F_μη adds 2m·(κ''−2κκ')·sym (on top of the
+        // −8mκκ' from differentiating 2κ²n); F_ηη adds (2κ'²+4κκ''−4κ²κ')n·ea_eb
+        // and κ'''(a−n)·ea_eb; F_μ adds 2mκ'·mab; F_η adds (2κκ'n + κ''(a−n))·eab.
         d2h_ls_ls[i].write(
             ki * ki
                 * (4.0 * wi * ma_mb + 8.0 * mi * cross + 8.0 * ni * sea_seb
                     - 4.0 * mi * mab
-                    - 4.0 * ni * seab),
+                    - 4.0 * ni * seab)
+                - 2.0 * kpi * wi * ma_mb
+                - 8.0 * mi * ki * kpi * cross_eta
+                + 2.0 * mi * (kdpi - 2.0 * ki * kpi) * cross_eta
+                + 4.0 * ni * dlsls_eta_eta_old * ea_eb
+                + (2.0 * kpi * kpi + 4.0 * ki * kdpi - 4.0 * ki * ki * kpi) * ni * ea_eb
+                + ktpi * amn * ea_eb
+                + 4.0 * ni * ki * kpi * eab
+                + 2.0 * mi * kpi * mab
+                + (2.0 * ki * kpi * ni + kdpi * amn) * eab,
         );
     }
     unsafe {
@@ -4763,29 +4864,62 @@ fn gaussian_joint_psi_mixed_driftweights(
         let mi = scalars.m[i];
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
+        let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
+        // κ''' = κ''(1−2κ) − 2κ'²: needed for the (a−n)·de·ea piece of d²H_{ls,ls}/∂η².
+        let ktpi = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
+        // (κ')² + κ·κ'' − 5κ²·κ': η-η coefficient from differentiating the OLD 2κ²n part.
+        let dlsls_eta_eta_old = kpi * kpi + ki * kdpi - 5.0 * ki * ki * kpi;
+        let amn = scalars.obs_weight[i] - ni;
         let dm = dotmu[i];
+        let de = dot_eta[i];
         let ma = mu_a[i];
+        let ea = eta_a[i];
         let dma = dotmu_a[i];
+        let dea = dot_eta_a[i];
         // κ-scaled log-sigma directions.
-        let sde = ki * dot_eta[i];
-        let sea = ki * eta_a[i];
-        let sdea = ki * dot_eta_a[i];
+        let sde = ki * de;
+        let sea = ki * ea;
+        let sdea = ki * dea;
         let cross = sde * ma + dm * sea;
-        // First directional derivative of Hessian blocks.
+        // Bare-η symmetric: dm·ea + ma·de (no κ, for κ' chain-rule pieces).
+        let cross_eta = dm * ea + ma * de;
+        let de_ea = de * ea;
+        // First directional derivative of Hessian blocks (== Helper A).
         dhmumu_u[i].write(-2.0 * wi * sde);
-        // Cross block carries overall κ; scale-scale block carries κ².
-        dhmu_ls_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde));
-        dh_ls_ls_u[i].write(ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde));
-        // Second directional derivative of Hessian blocks.
-        d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea);
-        d2hmu_ls[i].write(
-            ki * (-2.0 * wi * dma + 4.0 * wi * cross + 8.0 * mi * sde * sea - 4.0 * mi * sdea),
+        // + 2·κ'·m·de.
+        dhmu_ls_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
+        // F_μ·dm + F_η·de with F = 2κ²n + κ'(a−n) (mirrors helper 4 dh_ls_ls).
+        dh_ls_ls_u[i].write(
+            ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde)
+                + 2.0 * mi * kpi * dm
+                + (kdpi * amn + 6.0 * ki * kpi * ni) * de,
         );
+        // − 2·κ'·w·de·ea: ∂²w/∂η² = 4wκ² − 2wκ'.
+        d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea - 2.0 * wi * kpi * de_ea);
+        // − 2·κ'·w·(dm·ea + de·ma) + 2·m·(κ''−6κκ')·de·ea + 2·m·κ'·dea from d²(2mκ).
+        d2hmu_ls[i].write(
+            ki * (-2.0 * wi * dma + 4.0 * wi * cross + 8.0 * mi * sde * sea - 4.0 * mi * sdea)
+                - 2.0 * wi * kpi * cross_eta
+                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_ea
+                + 2.0 * mi * kpi * dea,
+        );
+        // d²/(drift × ψ) of corrected H_{ls,ls} = 2κ²n + κ'(a−n). The "_old"
+        // bracket covers d²(2κ²n); the extra κ'/κ''/κ''' terms cover d²(κ'(a−n)).
         d2h_ls_ls[i].write(
             ki * ki
                 * (4.0 * wi * dm * ma + 8.0 * mi * cross + 8.0 * ni * sde * sea
                     - 4.0 * mi * dma
-                    - 4.0 * ni * sdea),
+                    - 4.0 * ni * sdea)
+                - 2.0 * kpi * wi * dm * ma
+                - 8.0 * mi * ki * kpi * cross_eta
+                + 2.0 * mi * (kdpi - 2.0 * ki * kpi) * cross_eta
+                + 4.0 * ni * dlsls_eta_eta_old * de_ea
+                + (2.0 * kpi * kpi + 4.0 * ki * kdpi - 4.0 * ki * ki * kpi) * ni * de_ea
+                + ktpi * amn * de_ea
+                + 4.0 * ni * ki * kpi * dea
+                + 2.0 * mi * kpi * dma
+                + (2.0 * ki * kpi * ni + kdpi * amn) * dea,
         );
     }
     unsafe {
@@ -15979,6 +16113,7 @@ mod tests {
         out
     }
 
+    // Source-of-truth Gaussian logb negloglik. Analytic helpers MUST autodiff-match this.
     fn gaussian_negloglik_log_sigma_psi_numdual<D: DualNum<f64> + Copy>(
         beta_mu: D,
         beta_ls: D,
@@ -16117,7 +16252,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_joint_psi_firstweights_should_use_observation_weight_in_log_sigma_score() {
+    fn gaussian_joint_psi_firstweights_score_ls_carries_logb_chain_rule_factor() {
         let y = array![1.1];
         let etamu = array![0.3];
         let eta_ls = array![-0.2];
@@ -16125,19 +16260,21 @@ mod tests {
         let rows =
             gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
         let firstweights = gaussian_joint_psi_firstweights(&rows, &array![0.0], &array![1.0]);
-        let expected_score_ls = weights[0] - rows.n[0];
+        let sigma = crate::families::sigma_link::logb_sigma_from_eta_scalar(eta_ls[0]);
+        let kappa = 1.0 - crate::families::sigma_link::LOGB_SIGMA_FLOOR / sigma;
+        let expected = kappa * (weights[0] - rows.n[0]);
 
         assert!(
-            (firstweights.score_ls[0] - expected_score_ls).abs() <= 1e-12,
-            "For one Gaussian row, d/deta_ls [ weight * (eta_ls + 0.5 * (y-mu)^2 * exp(-2 eta_ls)) ] = weight - n_i. The helper coded {} but the implemented scalar objective differentiates to {}.",
+            (firstweights.score_ls[0] - expected).abs() <= 1e-12,
+            "Under the logb link σ = b + exp(η_ls), d/dη_ls of weight*(ln σ + 0.5(y-μ)^2/σ^2) carries the chain-rule factor κ = 1 - b/σ, so the row score must equal κ*(weight - n_i). The helper coded {} but the κ-corrected expectation is {}.",
             firstweights.score_ls[0],
-            expected_score_ls
+            expected
         );
         assert!(
-            (firstweights.objective_psirow[0] - expected_score_ls).abs() <= 1e-12,
-            "With mu_psi=0 and eta_psi=1, the exact psi objective derivative must equal weight - n_i. The helper coded {} but the scalar objective differentiates to {}.",
+            (firstweights.objective_psirow[0] - expected).abs() <= 1e-12,
+            "With mu_psi=0 and eta_psi=1, the exact psi objective derivative must equal κ*(weight - n_i) (κ = 1 - b/σ from the logb chain rule). The helper coded {} but the κ-corrected expectation is {}.",
             firstweights.objective_psirow[0],
-            expected_score_ls
+            expected
         );
     }
 
@@ -16172,7 +16309,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_joint_psisecondweights_should_use_observation_weight_in_log_sigma_eab_term() {
+    fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rule_factor() {
         let y = array![1.1];
         let etamu = array![0.3];
         let eta_ls = array![-0.2];
@@ -16188,13 +16325,15 @@ mod tests {
             &array![0.0],
             &array![1.0],
         );
-        let expected_objective_psi_psi = weights[0] - rows.n[0];
+        let sigma = crate::families::sigma_link::logb_sigma_from_eta_scalar(eta_ls[0]);
+        let kappa = 1.0 - crate::families::sigma_link::LOGB_SIGMA_FLOOR / sigma;
+        let expected = kappa * (weights[0] - rows.n[0]);
 
         assert!(
-            (secondweights.objective_psi_psirow[0] - expected_objective_psi_psi).abs() <= 1e-12,
-            "With only eta_psi_psi=1 active, the Gaussian second psi objective must contribute weight - n_i from the linear eta_ls term. The helper coded {} but the scalar objective differentiates to {}.",
+            (secondweights.objective_psi_psirow[0] - expected).abs() <= 1e-12,
+            "With only eta_psi_psi=1 active, the Gaussian second psi objective contribution from the linear η_ls term carries the logb chain-rule factor κ = 1 - b/σ, so it must equal κ*(weight - n_i). The helper coded {} but the κ-corrected expectation is {}.",
             secondweights.objective_psi_psirow[0],
-            expected_objective_psi_psi
+            expected
         );
     }
 
@@ -18278,6 +18417,488 @@ mod tests {
             "Gaussian log-sigma psi second score_ls mismatch: analytic={} autodiff={}",
             psi2_terms.score_psi_psi[1],
             score_ls_psi_psi
+        );
+    }
+
+    // Sibling oracle: μ also depends on ψ. Used by the joint psi-second-order
+    // guardrail; the original oracle leaves μ fixed in ψ.
+    fn gaussian_negloglik_log_sigma_psi_full_numdual<D: DualNum<f64> + Copy>(
+        beta_mu: D,
+        beta_ls: D,
+        psi: D,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        x_mu0: &Array1<f64>,
+        x_ls0: &Array1<f64>,
+        x_mu_psi: &Array1<f64>,
+        x_ls_psi: &Array1<f64>,
+        x_mu_psi_psi: &Array1<f64>,
+        x_ls_psi_psi: &Array1<f64>,
+    ) -> D {
+        let half = D::from(0.5);
+        let mut out = D::zero();
+        for i in 0..y.len() {
+            let x_mu = D::from(x_mu0[i])
+                + psi * D::from(x_mu_psi[i])
+                + half * psi * psi * D::from(x_mu_psi_psi[i]);
+            let eta_mu = x_mu * beta_mu;
+            let x_ls = D::from(x_ls0[i])
+                + psi * D::from(x_ls_psi[i])
+                + half * psi * psi * D::from(x_ls_psi_psi[i]);
+            let eta_ls = x_ls * beta_ls;
+            let sigma = D::from(LOGB_SIGMA_FLOOR) + eta_ls.exp();
+            let resid = D::from(y[i]) - eta_mu;
+            out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + sigma.ln());
+        }
+        out
+    }
+
+    // Oracle with multi-column designs (β vectors). Used by the joint
+    // static-Hessian guardrail and its directional derivatives.
+    fn gaussian_negloglik_logb_dense_numdual<D: DualNum<f64> + Copy>(
+        beta_mu: &[D],
+        beta_ls: &[D],
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        xmu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> D {
+        let half = D::from(0.5);
+        let n = y.len();
+        let mut out = D::zero();
+        for i in 0..n {
+            let mut eta_mu = D::zero();
+            for k in 0..beta_mu.len() {
+                eta_mu += D::from(xmu[[i, k]]) * beta_mu[k];
+            }
+            let mut eta_ls = D::zero();
+            for k in 0..beta_ls.len() {
+                eta_ls += D::from(x_ls[[i, k]]) * beta_ls[k];
+            }
+            let sigma = D::from(LOGB_SIGMA_FLOOR) + eta_ls.exp();
+            let resid = D::from(y[i]) - eta_mu;
+            out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + sigma.ln());
+        }
+        out
+    }
+
+    fn gaussian_logb_design_test_data() -> (
+        Array1<f64>,
+        Array1<f64>,
+        Array2<f64>,
+        Array2<f64>,
+        Array1<f64>,
+        Array1<f64>,
+    ) {
+        // n=5, two-column designs (intercept + smooth feature). β_ls0 chosen so
+        // that η_ls ≈ −0.4 on the central row → κ ≈ 0.985, which is noticeably
+        // less than 1 so κ' chain-rule contributions register at strict tolerance.
+        let y = array![0.25, -0.4, 1.1, 0.05, -0.2];
+        let weights = array![1.0, 0.7, 1.3, 0.9, 1.1];
+        let xmu = ndarray::arr2(&[
+            [1.0, -0.6],
+            [1.0, -0.2],
+            [1.0, 0.1],
+            [1.0, 0.4],
+            [1.0, 0.7],
+        ]);
+        let x_ls = ndarray::arr2(&[
+            [1.0, 0.5],
+            [1.0, -0.1],
+            [1.0, 0.3],
+            [1.0, -0.4],
+            [1.0, 0.2],
+        ]);
+        // β_ls = (−0.4, 0.05): η_ls hovers around −0.4, so σ ≈ 0.68 and κ ≈ 0.985.
+        let beta_mu = array![0.35, -0.25];
+        let beta_ls = array![-0.4, 0.05];
+        (y, weights, xmu, x_ls, beta_mu, beta_ls)
+    }
+
+    #[test]
+    fn gaussian_joint_static_hessian_matches_autodiff() {
+        let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
+        let etamu = xmu.dot(&beta_mu);
+        let eta_ls = x_ls.dot(&beta_ls);
+
+        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
+            .expect("gaussian row scalars");
+        let weights0 = gaussian_joint_psi_firstweights(
+            &rows,
+            &Array1::zeros(y.len()),
+            &Array1::zeros(y.len()),
+        );
+        let xmu_dense = DenseOrOperator::Borrowed(&xmu);
+        let xls_dense = DenseOrOperator::Borrowed(&x_ls);
+        let analytic = gaussian_joint_hessian_from_designs(
+            &xmu_dense,
+            &xls_dense,
+            &weights0.hmumu,
+            &weights0.hmu_ls,
+            &weights0.h_ls_ls,
+        )
+        .expect("gaussian joint static hessian from designs");
+
+        // AD ground truth: full p×p Hessian via second_partial_derivative,
+        // packing β_full = (β_μ, β_ls) and stepping (i, j) pairs.
+        let pmu = beta_mu.len();
+        let p_ls = beta_ls.len();
+        let total = pmu + p_ls;
+        let mut beta_full = vec![0.0_f64; total];
+        for k in 0..pmu {
+            beta_full[k] = beta_mu[k];
+        }
+        for k in 0..p_ls {
+            beta_full[pmu + k] = beta_ls[k];
+        }
+
+        // AD ground truth: full p×p Hessian. Diagonal (i==i) via second_derivative
+        // (1D second derivative); off-diagonal (i<j) via second_partial_derivative
+        // on a closure that injects two HyperDual variables into β.
+        let mut ad = Array2::<f64>::zeros((total, total));
+        for i in 0..total {
+            for j in i..total {
+                let val = if i == j {
+                    let g = |x: num_dual::Dual2<f64, f64>| {
+                        let mut bm = vec![num_dual::Dual2::from_re(0.0); pmu];
+                        let mut bl = vec![num_dual::Dual2::from_re(0.0); p_ls];
+                        for k in 0..pmu {
+                            bm[k] = num_dual::Dual2::from_re(beta_full[k]);
+                        }
+                        for k in 0..p_ls {
+                            bl[k] = num_dual::Dual2::from_re(beta_full[pmu + k]);
+                        }
+                        if i < pmu {
+                            bm[i] = x;
+                        } else {
+                            bl[i - pmu] = x;
+                        }
+                        gaussian_negloglik_logb_dense_numdual(
+                            &bm, &bl, &y, &weights, &xmu, &x_ls,
+                        )
+                    };
+                    let (_, _, d2) = second_derivative(g, beta_full[i]);
+                    d2
+                } else {
+                    let f = |(a, b): (
+                        num_dual::HyperDual<f64, f64>,
+                        num_dual::HyperDual<f64, f64>,
+                    )| {
+                        let mut bm = vec![num_dual::HyperDual::from_re(0.0); pmu];
+                        let mut bl = vec![num_dual::HyperDual::from_re(0.0); p_ls];
+                        for k in 0..pmu {
+                            bm[k] = num_dual::HyperDual::from_re(beta_full[k]);
+                        }
+                        for k in 0..p_ls {
+                            bl[k] = num_dual::HyperDual::from_re(beta_full[pmu + k]);
+                        }
+                        if i < pmu {
+                            bm[i] = a;
+                        } else {
+                            bl[i - pmu] = a;
+                        }
+                        if j < pmu {
+                            bm[j] = b;
+                        } else {
+                            bl[j - pmu] = b;
+                        }
+                        gaussian_negloglik_logb_dense_numdual(
+                            &bm, &bl, &y, &weights, &xmu, &x_ls,
+                        )
+                    };
+                    let (_, _, _, d2xy) =
+                        second_partial_derivative(f, (beta_full[i], beta_full[j]));
+                    d2xy
+                };
+                ad[[i, j]] = val;
+                if i != j {
+                    ad[[j, i]] = val;
+                }
+            }
+        }
+
+        for i in 0..total {
+            for j in 0..total {
+                let diff = (analytic[[i, j]] - ad[[i, j]]).abs();
+                assert!(
+                    diff <= 1e-10,
+                    "Gaussian static joint H[{i},{j}] mismatch (κ < 1 case): analytic={} ad={} diff={}",
+                    analytic[[i, j]],
+                    ad[[i, j]],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_joint_first_directional_hessian_matches_autodiff() {
+        let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
+        let etamu = xmu.dot(&beta_mu);
+        let eta_ls = x_ls.dot(&beta_ls);
+
+        let pmu = beta_mu.len();
+        let p_ls = beta_ls.len();
+        let total = pmu + p_ls;
+        // Direction v over the joint β = (β_μ, β_ls).
+        let v: Array1<f64> = Array1::from_shape_fn(total, |k| 0.13 + 0.07 * (k as f64));
+        let v_mu = v.slice(s![0..pmu]).to_owned();
+        let v_ls = v.slice(s![pmu..total]).to_owned();
+        let ximu = xmu.dot(&v_mu);
+        let xi_ls = x_ls.dot(&v_ls);
+
+        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
+            .expect("gaussian row scalars");
+        let (dhmumu, dhmu_ls, dh_ls_ls) =
+            gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
+        let xmu_dense = DenseOrOperator::Borrowed(&xmu);
+        let xls_dense = DenseOrOperator::Borrowed(&x_ls);
+        let analytic = gaussian_joint_hessian_from_designs(
+            &xmu_dense,
+            &xls_dense,
+            &dhmumu,
+            &dhmu_ls,
+            &dh_ls_ls,
+        )
+        .expect("gaussian joint first-directional H from designs");
+
+        // AD: differentiate N along (β + ε·v), evaluating ∂³N/∂β_i ∂β_j ∂ε at ε=0
+        // via third_partial_derivative_vec on the augmented vector
+        // [β_μ, β_ls, ε] of length total + 1.
+        let mut vars = vec![0.0_f64; total + 1];
+        for k in 0..pmu {
+            vars[k] = beta_mu[k];
+        }
+        for k in 0..p_ls {
+            vars[pmu + k] = beta_ls[k];
+        }
+        // vars[total] = ε = 0 by default.
+
+        let g = |z: &[num_dual::HyperHyperDual<f64, f64>]| {
+            // Reconstruct β + ε·v.
+            let mut bm = vec![num_dual::HyperHyperDual::from_re(0.0); pmu];
+            let mut bl = vec![num_dual::HyperHyperDual::from_re(0.0); p_ls];
+            let eps = z[total];
+            for k in 0..pmu {
+                bm[k] = z[k] + eps * num_dual::HyperHyperDual::from_re(v[k]);
+            }
+            for k in 0..p_ls {
+                bl[k] = z[pmu + k]
+                    + eps * num_dual::HyperHyperDual::from_re(v[pmu + k]);
+            }
+            gaussian_negloglik_logb_dense_numdual(&bm, &bl, &y, &weights, &xmu, &x_ls)
+        };
+
+        let mut ad = Array2::<f64>::zeros((total, total));
+        for i in 0..total {
+            for j in i..total {
+                let (_, _, _, _, _, _, _, d3) =
+                    third_partial_derivative_vec(&g, &vars, i, j, total);
+                ad[[i, j]] = d3;
+                if i != j {
+                    ad[[j, i]] = d3;
+                }
+            }
+        }
+
+        for i in 0..total {
+            for j in 0..total {
+                let diff = (analytic[[i, j]] - ad[[i, j]]).abs();
+                assert!(
+                    diff <= 1e-10,
+                    "Gaussian dH (first-directional) [{i},{j}] mismatch: analytic={} ad={} diff={}",
+                    analytic[[i, j]],
+                    ad[[i, j]],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_joint_second_directional_hessian_matches_autodiff() {
+        let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
+        let etamu = xmu.dot(&beta_mu);
+        let eta_ls = x_ls.dot(&beta_ls);
+
+        let pmu = beta_mu.len();
+        let p_ls = beta_ls.len();
+        let total = pmu + p_ls;
+        let u: Array1<f64> = Array1::from_shape_fn(total, |k| 0.18 - 0.05 * (k as f64));
+        let v: Array1<f64> = Array1::from_shape_fn(total, |k| -0.11 + 0.09 * (k as f64));
+        let u_mu = u.slice(s![0..pmu]).to_owned();
+        let u_ls = u.slice(s![pmu..total]).to_owned();
+        let v_mu = v.slice(s![0..pmu]).to_owned();
+        let v_ls = v.slice(s![pmu..total]).to_owned();
+        let ximu_u = xmu.dot(&u_mu);
+        let xi_ls_u = x_ls.dot(&u_ls);
+        let ximuv = xmu.dot(&v_mu);
+        let xi_lsv = x_ls.dot(&v_ls);
+
+        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
+            .expect("gaussian row scalars");
+        let (d2hmumu, d2hmu_ls, d2h_ls_ls) =
+            gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
+        let xmu_dense = DenseOrOperator::Borrowed(&xmu);
+        let xls_dense = DenseOrOperator::Borrowed(&x_ls);
+        let analytic = gaussian_joint_hessian_from_designs(
+            &xmu_dense,
+            &xls_dense,
+            &d2hmumu,
+            &d2hmu_ls,
+            &d2h_ls_ls,
+        )
+        .expect("gaussian joint second-directional H from designs");
+
+        // AD ground truth for ∂⁴N/∂β_i ∂β_j ∂ε_u ∂ε_v at (ε_u, ε_v) = (0, 0).
+        // num-dual ships native AD up to third order; the fourth order is
+        // obtained by central FD in ε_v of the AD third partial that already
+        // covers (β_i, β_j, ε_u). Augmented vector layout:
+        //   [β_μ ; β_ls ; ε_u]    of length total + 1 (ε_v lives outside AD).
+        let mut vars_base = vec![0.0_f64; total + 1];
+        for k in 0..pmu {
+            vars_base[k] = beta_mu[k];
+        }
+        for k in 0..p_ls {
+            vars_base[pmu + k] = beta_ls[k];
+        }
+        // vars_base[total] = ε_u = 0.
+
+        let h = 1e-4;
+        let mut ad = Array2::<f64>::zeros((total, total));
+        for i in 0..total {
+            for j in i..total {
+                let g_plus = |z: &[num_dual::HyperHyperDual<f64, f64>]| {
+                    let mut bm = vec![num_dual::HyperHyperDual::from_re(0.0); pmu];
+                    let mut bl = vec![num_dual::HyperHyperDual::from_re(0.0); p_ls];
+                    let eps_u = z[total];
+                    for k in 0..pmu {
+                        bm[k] = z[k]
+                            + eps_u * num_dual::HyperHyperDual::from_re(u[k])
+                            + num_dual::HyperHyperDual::from_re(h * v[k]);
+                    }
+                    for k in 0..p_ls {
+                        bl[k] = z[pmu + k]
+                            + eps_u * num_dual::HyperHyperDual::from_re(u[pmu + k])
+                            + num_dual::HyperHyperDual::from_re(h * v[pmu + k]);
+                    }
+                    gaussian_negloglik_logb_dense_numdual(
+                        &bm, &bl, &y, &weights, &xmu, &x_ls,
+                    )
+                };
+                let g_minus = |z: &[num_dual::HyperHyperDual<f64, f64>]| {
+                    let mut bm = vec![num_dual::HyperHyperDual::from_re(0.0); pmu];
+                    let mut bl = vec![num_dual::HyperHyperDual::from_re(0.0); p_ls];
+                    let eps_u = z[total];
+                    for k in 0..pmu {
+                        bm[k] = z[k]
+                            + eps_u * num_dual::HyperHyperDual::from_re(u[k])
+                            - num_dual::HyperHyperDual::from_re(h * v[k]);
+                    }
+                    for k in 0..p_ls {
+                        bl[k] = z[pmu + k]
+                            + eps_u * num_dual::HyperHyperDual::from_re(u[pmu + k])
+                            - num_dual::HyperHyperDual::from_re(h * v[pmu + k]);
+                    }
+                    gaussian_negloglik_logb_dense_numdual(
+                        &bm, &bl, &y, &weights, &xmu, &x_ls,
+                    )
+                };
+                let (_, _, _, _, _, _, _, d3_plus) =
+                    third_partial_derivative_vec(g_plus, &vars_base, i, j, total);
+                let (_, _, _, _, _, _, _, d3_minus) =
+                    third_partial_derivative_vec(g_minus, &vars_base, i, j, total);
+                let val = (d3_plus - d3_minus) / (2.0 * h);
+                ad[[i, j]] = val;
+                if i != j {
+                    ad[[j, i]] = val;
+                }
+            }
+        }
+
+        // Tolerance: the 4th-order ground truth uses one FD step on top of an
+        // AD third partial, so we relax from 1e-10 to a value compatible with
+        // the central-difference truncation (O(h²) ≈ 1e-8) and the rounding
+        // floor of the AD third partial (≈ 1e-10 / h ≈ 1e-6).
+        let tol = 5e-6;
+        for i in 0..total {
+            for j in 0..total {
+                let diff = (analytic[[i, j]] - ad[[i, j]]).abs();
+                assert!(
+                    diff <= tol,
+                    "Gaussian d2H (second-directional) [{i},{j}] mismatch: analytic={} ad={} diff={}",
+                    analytic[[i, j]],
+                    ad[[i, j]],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_joint_psi_second_order_terms_match_autodiff() {
+        // ψ-coupled scenario: both μ and η_ls depend on ψ via per-row
+        // first/second drift vectors, with non-trivial coefficients.
+        let y = array![0.25, -0.4, 1.1, 0.05, -0.2];
+        let weights = array![1.0, 0.7, 1.3, 0.9, 1.1];
+        let x_mu0 = array![1.0, -0.35, 0.6, 0.1, 0.45];
+        let x_ls0 = array![0.8, -0.25, 0.45, -0.1, 0.3];
+        let x_mu_psi = array![0.2, 0.15, -0.1, 0.05, 0.3];
+        let x_ls_psi = array![0.18, -0.12, 0.25, -0.2, 0.07];
+        let x_mu_psi_psi = array![0.04, -0.03, 0.05, 0.06, -0.02];
+        let x_ls_psi_psi = array![0.05, -0.03, 0.04, 0.07, -0.04];
+        // β_ls chosen so η_ls ≈ −0.4 (κ ≈ 0.985, noticeably less than 1).
+        let beta_mu0 = 0.35_f64;
+        let beta_ls0 = -0.4_f64;
+
+        // Per-row predictor drifts.
+        let etamu = &x_mu0 * beta_mu0;
+        let eta_ls = &x_ls0 * beta_ls0;
+        let zmu_psi = &x_mu_psi * beta_mu0;
+        let z_ls_psi = &x_ls_psi * beta_ls0;
+        let zmu_psi_psi = &x_mu_psi_psi * beta_mu0;
+        let z_ls_psi_psi = &x_ls_psi_psi * beta_ls0;
+
+        let rows = gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights)
+            .expect("gaussian row scalars");
+        let secondweights = gaussian_joint_psisecondweights(
+            &rows,
+            &zmu_psi,
+            &z_ls_psi,
+            &zmu_psi,
+            &z_ls_psi,
+            &zmu_psi_psi,
+            &z_ls_psi_psi,
+        );
+        let analytic = secondweights.objective_psi_psirow.sum();
+
+        // AD: differentiate the full ψ-dependent oracle twice in ψ at ψ=0.
+        let (_, _, ad) = second_derivative(
+            |psi| {
+                gaussian_negloglik_log_sigma_psi_full_numdual(
+                    num_dual::Dual2::from_re(beta_mu0),
+                    num_dual::Dual2::from_re(beta_ls0),
+                    psi,
+                    &y,
+                    &weights,
+                    &x_mu0,
+                    &x_ls0,
+                    &x_mu_psi,
+                    &x_ls_psi,
+                    &x_mu_psi_psi,
+                    &x_ls_psi_psi,
+                )
+            },
+            0.0,
+        );
+
+        let diff = (analytic - ad).abs();
+        assert!(
+            diff <= 1e-10,
+            "Gaussian joint ψ-ψ objective mismatch (κ < 1, μ and σ both ψ-dependent): analytic={} ad={} diff={}",
+            analytic,
+            ad,
+            diff
         );
     }
 

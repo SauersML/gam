@@ -2051,7 +2051,7 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
 /// Gaussian location-scale predictor: two blocks (mean + log-sigma).
 ///
 /// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
-/// `sigma = exp(X_noise @ beta_noise) * response_scale`.
+/// `sigma = (LOGB_SIGMA_FLOOR + exp(X_noise @ beta_noise + offset_noise)) * response_scale`.
 pub struct GaussianLocationScalePredictor {
     pub beta_mu: Array1<f64>,
     pub beta_noise: Array1<f64>,
@@ -4506,8 +4506,9 @@ mod tests {
             .predict_noise_scale(&input)
             .expect("gaussian location-scale sigma")
             .expect("sigma should be returned");
-        assert!((sigma[0] - 6.0).abs() <= 1e-12);
-        assert!((sigma[1] - 10.0).abs() <= 1e-12);
+        // σ = (LOGB_SIGMA_FLOOR + exp(η + offset)) * scale; (0.01 + 3) * 2 = 6.02.
+        assert!((sigma[0] - 6.02).abs() <= 1e-12);
+        assert!((sigma[1] - 10.02).abs() <= 1e-12);
         let out = predictor
             .predict_with_uncertainty(&input)
             .expect("gaussian location-scale uncertainty");

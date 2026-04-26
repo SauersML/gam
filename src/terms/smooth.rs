@@ -14919,10 +14919,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_joint_spatial_outer_hessian_gate_disables_large_non_gaussian_designs() {
+    fn exact_joint_spatial_outer_hessian_gate_disables_dense_non_gaussian_designs() {
         let n = 5_001usize;
         let p = 100usize;
-        let data = Array2::<f64>::zeros((n, p));
+        let data = Array2::from_shape_fn((n, p), |(i, j)| ((i + j + 1) as f64).sin());
         let spec = TermCollectionSpec {
             linear_terms: (0..p)
                 .map(|j| LinearTermSpec {
