@@ -6013,16 +6013,28 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
 fn strict_logdet_spd_with_semidefinite_option(
     matrix: &Array2<f64>,
     allow_semidefinite: bool,
+    accumulation_depth: usize,
 ) -> Result<f64, String> {
     if allow_semidefinite {
         let mut sym = matrix.clone();
         symmetrize_dense_in_place(&mut sym);
         let (evals, _) = FaerEigh::eigh(&sym, Side::Lower)
             .map_err(|e| format!("strict pseudo-laplace PSD eigendecomposition failed: {e}"))?;
+        let p = sym.nrows();
         let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-        let tol = (max_abs_eval * 1e-9).max(1e-12);
+        // Bauer-Fike: |δσ| ≤ p·‖δH‖_∞; n-term fma roundoff gives ‖δH‖_∞ ≤ ε·n·‖H‖,
+        // so σ_noise ≤ ε·n·p·‖H‖₂. Tenfold slack absorbs sign cancellations,
+        // and a 100·ε floor handles the ‖H‖→0 limit.
+        let eps = f64::EPSILON;
+        let eps_np = eps * (accumulation_depth as f64) * (p as f64);
+        let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
         if evals.iter().any(|&ev| ev < -tol) {
-            return Err("strict pseudo-laplace SPD solve failed".to_string());
+            let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
+            let below = evals.iter().filter(|&&ev| ev < -tol).count();
+            return Err(format!(
+                "strict pseudo-laplace SPD solve failed: {below} eigenvalue(s) below -tol \
+                 (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}, εnp={eps_np:.6e})"
+            ));
         }
         let logdet = evals
             .iter()
@@ -6227,7 +6239,11 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .scaled_add(curvature.rho_curvature_scale, s_lambda);
         }
         let logdet_h_scaled = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(&h_joint, allow_semidefinite)?
+            strict_logdet_spd_with_semidefinite_option(
+                &h_joint,
+                allow_semidefinite,
+                joint_observation_count(states),
+            )?
         } else {
             stable_logdet_with_ridge_policy(
                 &h_joint,
@@ -6287,7 +6303,11 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .scaled_add(1.0, s_lambda);
         }
         let logdet_h_total = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(&h_joint, allow_semidefinite)?
+            strict_logdet_spd_with_semidefinite_option(
+                &h_joint,
+                allow_semidefinite,
+                joint_observation_count(states),
+            )?
         } else {
             stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
         };
@@ -6340,7 +6360,11 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut h = xtwx;
         h += s_lambda;
         logdet_h_total += if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(&h, allow_semidefinite)?
+            strict_logdet_spd_with_semidefinite_option(
+                &h,
+                allow_semidefinite,
+                joint_observation_count(states),
+            )?
         } else {
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
         };
