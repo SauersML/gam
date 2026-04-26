@@ -8934,6 +8934,21 @@ fn validate_duchon_kernel_orders(
             "Duchon hybrid length_scale must be finite and positive".to_string(),
         ));
     }
+    // Pure-polyharmonic kernel of effective order m = p+s in R^d is
+    // r^{2m-d} (or r^{2m-d} log r when 2m-d is non-negative even integer).
+    // Wendland Thm 8.17: this kernel is CPD of order
+    //   ceil((2m-d)/2)         (d odd, non-integer exponent)
+    //   (2m-d)/2 + 1           (d even, log case)
+    // For Duchon interpolation with polynomial nullspace P_p (degree < p)
+    // to be uniquely solvable we need CPD order <= p, which both cases
+    // collapse to 2s < d (using that s, d are integers and 2s is even).
+    // The hybrid Matérn-blended kernel sidesteps this because its Matérn
+    // remainder makes it strictly PD (CPD order 0).
+    if length_scale.is_none() && 2 * s_order >= k_dim {
+        return Err(BasisError::InvalidInput(format!(
+            "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
+        )));
+    }
     let spectral_order = 2 * (p_order + s_order);
     if spectral_order <= k_dim {
         return Err(BasisError::InvalidInput(format!(
