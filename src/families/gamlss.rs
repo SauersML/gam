@@ -16530,12 +16530,12 @@ mod tests {
                 working_weights,
             } => {
                 // logb link σ = b + e^η: at η ≫ log b the floor is dwarfed
-                // (σ ≈ e^η ~ 1e304), so dlogσ/dη = (σ−b)/σ → 1 to within
+                // (σ ≈ e^η ~ 1e304), so dlogσ/dη = 1 − b/σ → 1 to within
                 // f64 precision and the IRLS step matches the pure-exp Fisher
                 // step. Compute the expectation explicitly from the new link.
                 let sigma = logb_sigma_from_eta_scalar(eta_ls0);
                 let inv_s2 = (sigma * sigma).recip();
-                let dlog = (sigma - LOGB_SIGMA_FLOOR) / sigma;
+                let dlog = 1.0 - LOGB_SIGMA_FLOOR / sigma;
                 let residual = family.y[0] - eta_mu[0];
                 let expected_score =
                     family.weights[0] * (residual * residual * inv_s2 - 1.0) * dlog;
@@ -16637,7 +16637,7 @@ mod tests {
             for i in 0..n {
                 let w = weights[i];
                 let eta = eta_ls[i];
-                let SigmaJet1 { sigma, d1: d_sigma } = logb_sigma_jet1_scalar(eta);
+                let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta);
                 let inv_s2 = (sigma * sigma).recip();
                 let r = y[i] - mu[i];
                 ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
@@ -16648,7 +16648,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = d_sigma / sigma;
+                let dlogsigma_du = 1.0 - LOGB_SIGMA_FLOOR / sigma;
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
@@ -16671,7 +16671,7 @@ mod tests {
             let mut wls = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let eta = eta_ls[i];
-                let SigmaJet1 { sigma, d1: d_sigma } = logb_sigma_jet1_scalar(eta);
+                let SigmaJet1 { sigma, d1: _ } = logb_sigma_jet1_scalar(eta);
                 let inv_s2 = (sigma * sigma).recip();
                 let w = weights[i];
                 let r = y[i] - mu[i];
@@ -16683,7 +16683,7 @@ mod tests {
                     wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
                     zmu[i] = mu[i] + r;
                 }
-                let dlogsigma_du = d_sigma / sigma;
+                let dlogsigma_du = 1.0 - LOGB_SIGMA_FLOOR / sigma;
                 let info_u =
                     floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
                 if info_u == 0.0 {
