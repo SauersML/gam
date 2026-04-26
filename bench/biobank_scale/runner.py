@@ -52,6 +52,17 @@ BIOBANK_PREFLIGHT_DEFAULT_MAX_PEAK_BYTES = int(0.80 * DEFAULT_BIOBANK_RAM_BUDGET
 BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
 BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
 BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
+# Mirrors of constants in src/families/transformation_normal.rs governing the
+# size of the monotonicity response grid built inside the CTN family. Update
+# both sides in lockstep if the Rust constants change.
+TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES = 129
+TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS = 4
+# Upper-bound estimate for the number of internal knots used by the CTN
+# response-direction basis at biobank scale. The exact count is computed
+# inside `effective_response_num_internal_knots` in the Rust code; the
+# preflight uses a conservative cap so the modelled grid size does not
+# under-report. Bumping this up is safe (only loosens the preflight check).
+CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
 BIOBANK_DUCHON16D_ORDER = 1
 BIOBANK_DUCHON16D_POWER = 8
 BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
@@ -132,8 +143,43 @@ def preflight_marginal_slope_biobank(
     linkwiggle = int(linkwiggle_knots or 0)
     scorewarp = int(scorewarp_knots or 0)
     working_bytes = n_train * (8 + d_pc + linkwiggle + scorewarp) * F64_BYTES
-    estimated_peak = dense_block_bytes + working_bytes + 384 * 1024**2
-    largest = max(dense_block_bytes, derivative_dense_bytes, working_bytes)
+
+    # CTN prep peak memory model. The conditional transformation family fitted
+    # before the marginal-slope stage builds a monotonicity-grid derivative
+    # design whose virtual rows are the Cartesian product of training rows and
+    # the response monotonicity grid. With the OuterFactored design the two
+    # factors are kept separate, so the peak working allocation is just the
+    # h'(grid) and delta-h'(grid) vectors of length n_train * n_grid each.
+    # Pre-fix (row-replicated factors) the peak was n_train * n_grid * (p_resp +
+    # p_cov) * 8 — surfaced here for reporting so the OOM regression at biobank
+    # scale stays visible if anyone removes the factored representation.
+    n_grid_estimate = (
+        TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES
+        + CTN_RESPONSE_INTERNAL_KNOTS_CAP * (TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS + 1)
+        + 4
+    )
+    p_resp_estimate = 2 + max(CTN_RESPONSE_INTERNAL_KNOTS_CAP - 2, 1)
+    p_cov_ctn = p_pc
+    ctn_prep_replicated_response_bytes = n_train * n_grid_estimate * p_resp_estimate * F64_BYTES
+    ctn_prep_replicated_covariate_bytes = n_train * n_grid_estimate * p_cov_ctn * F64_BYTES
+    ctn_prep_replicated_peak_bytes = (
+        ctn_prep_replicated_response_bytes + ctn_prep_replicated_covariate_bytes
+    )
+    ctn_prep_factored_peak_bytes = 2 * n_train * n_grid_estimate * F64_BYTES + (
+        n_grid_estimate * p_resp_estimate * F64_BYTES
+    )
+
+    estimated_peak = (
+        max(dense_block_bytes, ctn_prep_factored_peak_bytes)
+        + working_bytes
+        + 384 * 1024**2
+    )
+    largest = max(
+        dense_block_bytes,
+        derivative_dense_bytes,
+        working_bytes,
+        ctn_prep_factored_peak_bytes,
+    )
     failures: list[str] = []
     if dense_block_bytes > BIOBANK_MAX_DENSE_BLOCK_BYTES:
         failures.append(
@@ -147,6 +193,10 @@ def preflight_marginal_slope_biobank(
         failures.append(
             f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB exceeds 80% RAM budget {gibibytes(ram_budget_bytes):.1f} GiB"
         )
+    if ctn_prep_factored_peak_bytes > int(0.80 * ram_budget_bytes):
+        failures.append(
+            f"CTN prep factored peak: {gibibytes(ctn_prep_factored_peak_bytes):.1f} GiB exceeds 80% RAM budget {gibibytes(ram_budget_bytes):.1f} GiB"
+        )
     status = "FAIL" if failures else "PASS"
     lines = [
         "BIOBANK PREFLIGHT",
@@ -156,7 +206,14 @@ def preflight_marginal_slope_biobank(
         f"Duchon tuple: order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g}",
         "Duchon smooth: lazy chunked",
         "anisotropy derivatives: implicit streaming",
-        "CTN Kronecker: n/a",
+        "CTN Kronecker: factored (OuterFactored monotonicity grid)",
+        f"CTN response grid points (upper bound): {n_grid_estimate}",
+        f"CTN p_resp upper bound: {p_resp_estimate}",
+        f"CTN p_cov: {p_cov_ctn}",
+        f"CTN prep replicated response factor (avoided): {gibibytes(ctn_prep_replicated_response_bytes):.1f} GiB",
+        f"CTN prep replicated covariate factor (avoided): {gibibytes(ctn_prep_replicated_covariate_bytes):.1f} GiB",
+        f"CTN prep replicated peak (pre-fix, avoided): {gibibytes(ctn_prep_replicated_peak_bytes):.1f} GiB",
+        f"CTN prep factored peak (post-fix, modelled): {gibibytes(ctn_prep_factored_peak_bytes):.2f} GiB",
         "survival time tensor: n/a",
         f"linkwiggle knots: {linkwiggle}",
         f"scorewarp knots: {scorewarp}",
