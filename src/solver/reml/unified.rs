@@ -4430,7 +4430,7 @@ fn compute_adjoint_z_c(
 
     // Guard: the dense adjoint path effectively scales like O(n p²), so it is
     // only appropriate for small corrected models.
-    const ZC_MAX_DENSE_WORK: usize = 50_000_000;
+    const ZC_MAX_DENSE_WORK: usize = 200_000_000;
     let dense_work = n.saturating_mul(p).saturating_mul(p);
     if dense_work > ZC_MAX_DENSE_WORK {
         return Err(hessian_unavailable(format!(
@@ -4480,7 +4480,7 @@ fn compute_fourth_derivative_trace(
     let p = ing.x.ncols();
 
     // Guard: building dense p×p Q matrix is O(n p²). Refuse at biobank scale.
-    const FOURTH_DERIV_MAX_DENSE_WORK: usize = 50_000_000;
+    const FOURTH_DERIV_MAX_DENSE_WORK: usize = 200_000_000;
     let dense_work = n.saturating_mul(p).saturating_mul(p);
     if dense_work > FOURTH_DERIV_MAX_DENSE_WORK {
         return Err(hessian_unavailable(format!(
@@ -9913,7 +9913,7 @@ mod tests {
 
     #[test]
     fn test_compute_adjoint_z_c_guard_uses_quadratic_work() {
-        let n = 5_001usize;
+        let n = 20_001usize;
         let p = 100usize;
         let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             Array2::<f64>::zeros((n, p)),
@@ -9933,7 +9933,7 @@ mod tests {
 
     #[test]
     fn test_compute_fourth_derivative_trace_guard_uses_quadratic_work() {
-        let n = 5_001usize;
+        let n = 20_001usize;
         let p = 100usize;
         let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             Array2::<f64>::zeros((n, p)),
