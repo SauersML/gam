@@ -22,8 +22,7 @@ use crate::families::scale_design::{
 use crate::families::sigma_link::{
     LOGB_SIGMA_FLOOR, SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar,
     exp_sigma_derivs_up_to_third, exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar,
-    logb_sigma_derivs_up_to_fourth_scalar, logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar,
-    safe_exp,
+    logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::linalg::utils::solve_spd_pcg_with_info;
@@ -169,29 +168,22 @@ fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
 }
 
 #[inline]
-fn gaussian_log_sigma_irlsinfo_directional_derivative(
-    weight: f64,
-    sigma: f64,
-    d_sigma: f64,
-    d2_sigma: f64,
-    d_eta: f64,
-) -> f64 {
+fn gaussian_log_sigma_irlsinfo_directional_derivative(weight: f64, sigma: f64, d_eta: f64) -> f64 {
     if weight == 0.0 || d_eta == 0.0 || !sigma.is_finite() || sigma <= 0.0 {
         return 0.0;
     }
-
-    let raw_g = if d_sigma == 0.0 { 0.0 } else { d_sigma / sigma };
-    let g = raw_g.clamp(-1.0, 1.0);
+    // Logb form mirrors gaussian_jointrow_scalars: κ = 1 − b/σ ∈ [0, 1) and
+    // dκ/dη = κ(1−κ). Avoids the inf/inf NaN that the older d_sigma/sigma
+    // form produced at large η when both numerator and denominator overflow.
+    let g = 1.0 - LOGB_SIGMA_FLOOR / sigma;
+    if !g.is_finite() || !(0.0..1.0).contains(&g) {
+        return 0.0;
+    }
     let rawinfo = 2.0 * weight * g * g;
     if !rawinfo.is_finite() || rawinfo <= MIN_WEIGHT {
         return 0.0;
     }
-
-    if !(-1.0..=1.0).contains(&raw_g) || raw_g == -1.0 || raw_g == 1.0 {
-        return 0.0;
-    }
-
-    let dg_deta = d2_sigma / sigma - d_sigma * d_sigma / (sigma * sigma);
+    let dg_deta = g * (1.0 - g);
     let dw = 4.0 * weight * g * dg_deta * d_eta;
     if dw.is_finite() { dw } else { 0.0 }
 }
@@ -5260,33 +5252,6 @@ fn exp_sigma_derivs_up_to_fourth_array(
     (sigma, d1, d2, d3, d4)
 }
 
-#[inline]
-fn logb_sigma_derivs_up_to_fourth_array(
-    eta: ArrayView1<'_, f64>,
-) -> (
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-) {
-    let n = eta.len();
-    let mut sigma = Array1::<f64>::zeros(n);
-    let mut d1 = Array1::<f64>::zeros(n);
-    let mut d2 = Array1::<f64>::zeros(n);
-    let mut d3 = Array1::<f64>::zeros(n);
-    let mut d4 = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (sigma_i, d1_i, d2_i, d3_i, d4_i) = logb_sigma_derivs_up_to_fourth_scalar(eta[i]);
-        sigma[i] = sigma_i;
-        d1[i] = d1_i;
-        d2[i] = d2_i;
-        d3[i] = d3_i;
-        d4[i] = d4_i;
-    }
-    (sigma, d1, d2, d3, d4)
-}
-
 impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
@@ -6390,7 +6355,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let (sigma, d_sigma, d2_sigma, _, _) = logb_sigma_derivs_up_to_fourth_array(eta_ls.view());
+        let sigma = eta_ls.mapv(logb_sigma_from_eta_scalar);
         let mut dw = Array1::<f64>::zeros(n);
         match block_idx {
             Self::BLOCK_MU => {
@@ -6430,8 +6395,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
                     dw[i] = gaussian_log_sigma_irlsinfo_directional_derivative(
                         self.weights[i],
                         sigma[i],
-                        d_sigma[i],
-                        d2_sigma[i],
                         d_eta[i],
                     );
                 }
