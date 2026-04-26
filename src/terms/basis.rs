@@ -8561,12 +8561,19 @@ fn duchon_matern_block(
     let c = kappa.powf(k_half - n)
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
     if r <= 0.0 {
-        if nu_abs > 0.0 && nu > 0.0 {
-            // r^nu K_nu(kappa r) ~ 2^(nu-1) Γ(nu) kappa^(-nu).
+        if nu > 0.0 {
+            // r^ν K_ν(κr) → 2^(ν−1) Γ(ν) κ^(−ν) as r→0+.
             return Ok(c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu) * kappa.powf(-nu));
         }
-        // Center-collision diagonal: zero by convention for nu <= 0 Matérn blocks.
-        return Ok(0.0);
+        // ν ≤ 0: c·r^ν·K_|ν|(κr) is divergent at r=0 (logarithmically for ν=0,
+        // power-law for ν<0). The hybrid-kernel diagonal must be evaluated via
+        // duchon_hybrid_kernel_collision_value, which sums the divergent
+        // Matérn and polyharmonic blocks so the singularities cancel exactly
+        // (guaranteed by the PFD identity when 2(p+s) > d).
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon Matérn block at r=0 with ν={nu} ≤ 0 is divergent; \
+             evaluate the hybrid kernel diagonal via the collision routine"
+        )));
     }
     let z = (kappa * r).max(1e-300);
     let k_nu = bessel_k_real_half_integer_or_integer(nu_abs, z)?;
@@ -8858,12 +8865,21 @@ fn duchon_matern_block_jet4(
     let c = kappa.powf(k_half - n)
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
     if r <= 0.0 {
-        let value = if nu > 0.0 {
-            c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu) * kappa.powf(-nu)
-        } else {
-            0.0
-        };
-        return Ok((value, 0.0, 0.0, 0.0, 0.0));
+        if nu > 0.0 {
+            // r^ν K_ν(κr) → 2^(ν−1) Γ(ν) κ^(−ν) at r=0+. Radial derivatives
+            // depend on ν (smooth for ν > 1.5, divergent for smaller ν);
+            // production callers always pass r_eff > 0, so the zero
+            // placeholders are not consumed.
+            let value = c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu) * kappa.powf(-nu);
+            return Ok((value, 0.0, 0.0, 0.0, 0.0));
+        }
+        // ν ≤ 0: c·r^ν·K_|ν|(κr) is divergent at r=0. Diagonal evaluations of
+        // the hybrid kernel must go through the collision routine, where the
+        // Matérn and polyharmonic singularities cancel by the PFD identity.
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon Matérn block jet at r=0 with ν={nu} ≤ 0 is divergent; \
+             evaluate the hybrid kernel diagonal via the collision routine"
+        )));
     }
 
     duchon_matern_family_jet4(r, kappa, c, nu)
@@ -8924,16 +8940,44 @@ fn validate_duchon_kernel_orders(
             "Duchon hybrid length_scale must be finite and positive".to_string(),
         ));
     }
-    // Pure-polyharmonic kernel of effective order m = p+s in R^d is
-    // r^{2m-d} (or r^{2m-d} log r when 2m-d is non-negative even integer).
-    // Wendland Thm 8.17: this kernel is CPD of order
-    //   ceil((2m-d)/2)         (d odd, non-integer exponent)
-    //   (2m-d)/2 + 1           (d even, log case)
-    // For Duchon interpolation with polynomial nullspace P_p (degree < p)
-    // to be uniquely solvable we need CPD order <= p, which both cases
-    // collapse to 2s < d (using that s, d are integers and 2s is even).
-    // The hybrid Matérn-blended kernel sidesteps this because its Matérn
-    // remainder makes it strictly PD (CPD order 0).
+    // Two independent well-posedness conditions on (p, s, d) for pure Duchon.
+    //
+    // (1) CPD-vs-nullspace adequacy — gated below on `length_scale.is_none()`.
+    //     The pure-polyharmonic kernel of effective order m = p+s in R^d is
+    //     phi(r) = r^{2m-d}, or r^{2m-d}·log r when 2m-d is a non-negative
+    //     even integer (the "log case", reached precisely when d is even
+    //     and m >= d/2). Wendland's Theorem 8.17 / 8.18 give its
+    //     conditional-positive-definiteness order:
+    //
+    //         d odd,  exponent half-integer:  ceil((2m-d)/2) = m - (d-1)/2
+    //         d even, log case:               (2m-d)/2 + 1   = m - d/2 + 1
+    //
+    //     Duchon interpolation with polynomial nullspace P_p (polynomials
+    //     of degree < p) is uniquely solvable iff the kernel's CPD order
+    //     does not exceed p. Substituting m = p + s:
+    //
+    //         d odd:  s <= (d-1)/2     <=>  2s <= d - 1
+    //         d even: s <= d/2 - 1     <=>  2s <= d - 2
+    //
+    //     Both branches collapse to `2s < d` once we use that s and d are
+    //     integers and 2s is therefore even (so `2s = d - 1` is impossible
+    //     for even d, and `2s <= d - 2` is just `2s < d`).
+    //
+    //     Counter-example admitted if this guard is dropped: d=2, p=1, s=1
+    //     passes the spectral check (2(1+1)=4 > 2) and builds the TPS
+    //     kernel c·r²·log r against a constants-only nullspace P_1; the
+    //     interpolation form is not PD on lambda perp P_1 and the fitted
+    //     penalty is meaningless.
+    //
+    //     The hybrid (Matérn-blended) Duchon kernel sidesteps this entirely:
+    //     the Matérn remainder is strictly positive definite (CPD order 0),
+    //     so any P_p suffices — hence the `length_scale.is_none()` gate.
+    //
+    // (2) Spectral kernel-existence — universal, gated below on the sum.
+    //     The pointwise kernel comes from the inverse Fourier of
+    //     1/|xi|^{2(p+s)}, which is a finite distribution at the origin
+    //     iff `2(p+s) > d`. Below that threshold the radial kernel value
+    //     diverges and there is nothing to evaluate.
     if length_scale.is_none() && 2 * s_order >= k_dim {
         return Err(BasisError::InvalidInput(format!(
             "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
@@ -8955,7 +8999,21 @@ fn validate_duchon_collocation_orders(
     k_dim: usize,
     max_operator_derivative_order: usize,
 ) -> Result<(), BasisError> {
+    // Kernel-level conditions (existence + CPD/nullspace adequacy) come first;
+    // the operator-level conditions below build on a pointwise-valid kernel.
     validate_duchon_kernel_orders(length_scale, p_order, s_order, k_dim)?;
+    // The spectral_order > k_dim + k checks below are C^k-at-origin
+    // conditions: for the polyharmonic kernel r^{2(p+s)-d} (or the log
+    // variant) to admit k-th radial derivatives in the distributional sense
+    // — and therefore for k-th-order derivative *collocation* of the
+    // kernel against centers to produce a finite operator — we need its
+    // exponent to clear the next k orders of differentiation at the
+    // origin. Equivalently: 2(p+s) - d > k.
+    //
+    // Note these are independent of the CPD/nullspace check. The penalty
+    // matrices ultimately built from these collocation operators are of
+    // the form S = D_k^T D_k and are PSD by construction; the discipline
+    // here is purely about *existence* of D_k itself.
     let spectral_order = 2 * (p_order + s_order);
     if max_operator_derivative_order >= 1 && spectral_order <= k_dim + 1 {
         return Err(BasisError::InvalidInput(format!(
