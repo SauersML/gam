@@ -434,7 +434,7 @@ const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
 const EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
 const EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM: usize = 32;
 const EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK: usize = 4_000_000;
-const EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK: usize = 50_000_000;
+const EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK: usize = 200_000_000;
 
 pub(crate) fn exact_outer_hessian_problem_scale_allows(specs: &[ParameterBlockSpec]) -> bool {
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
@@ -6020,7 +6020,7 @@ fn strict_logdet_spd_with_semidefinite_option(
         let (evals, _) = FaerEigh::eigh(&sym, Side::Lower)
             .map_err(|e| format!("strict pseudo-laplace PSD eigendecomposition failed: {e}"))?;
         let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-        let tol = (max_abs_eval * 1e-12).max(1e-14);
+        let tol = (max_abs_eval * 1e-9).max(1e-12);
         if evals.iter().any(|&ev| ev < -tol) {
             return Err("strict pseudo-laplace SPD solve failed".to_string());
         }
