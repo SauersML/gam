@@ -360,8 +360,12 @@ pub fn build_smooth_basis(
             let (nullspace_order, power) = match parse_duchon_power_policy(options)? {
                 DuchonPowerPolicy::Explicit(power) => (requested_nullspace_order, power),
                 DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
-                    let resolved =
-                        resolve_duchon_orders(cols.len(), requested_nullspace_order, 2, length_scale);
+                    let resolved = resolve_duchon_orders(
+                        cols.len(),
+                        requested_nullspace_order,
+                        2,
+                        length_scale,
+                    );
                     if resolved.0 != requested_nullspace_order {
                         inference_notes.push(format!(
                             "Note: pure Duchon CPD against polynomial nullspace requires order ≥ {:?} \

@@ -2085,9 +2085,8 @@ impl GaussianLocationScalePredictor {
             eta_noise += offset_noise;
         }
         let scale = self.response_scale;
-        Ok(eta_noise.mapv(|eta| {
-            crate::families::sigma_link::logb_sigma_from_eta_scalar(eta) * scale
-        }))
+        Ok(eta_noise
+            .mapv(|eta| crate::families::sigma_link::logb_sigma_from_eta_scalar(eta) * scale))
     }
 
     fn eta_standard_error(

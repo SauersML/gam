@@ -1887,7 +1887,9 @@ pub fn resolve_duchon_orders(
         }
         nullspace = duchon_next_nullspace_order(nullspace);
     }
-    unreachable!("resolve_duchon_orders did not converge for dim={dim}, max_op={max_operator_derivative_order}, pure={pure}")
+    unreachable!(
+        "resolve_duchon_orders did not converge for dim={dim}, max_op={max_operator_derivative_order}, pure={pure}"
+    )
 }
 
 #[inline]

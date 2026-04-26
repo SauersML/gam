@@ -13549,7 +13549,12 @@ mod tests {
 
     #[test]
     fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
-        let model = intercept_only_gaussian_location_scale_model(-3.0, (0.25f64).ln(), 8.0);
+        // logb noise link σ_scaled = LOGB_SIGMA_FLOOR + exp(η_ls). For
+        // η_ls = log(0.25) the scaled σ is 0.01 + 0.25 = 0.26, then scaled to
+        // response units gives 0.26 * 8 = 2.08. Pick the input so the expected
+        // response σ exits as 2.0 exactly: η_ls = log(2.0/8 − LOGB_SIGMA_FLOOR)
+        // = log(0.24).
+        let model = intercept_only_gaussian_location_scale_model(-3.0, (0.24f64).ln(), 8.0);
         let data = ndarray::Array2::<f64>::zeros((2, 0));
         let headers = vec![];
         let col_map = HashMap::new();
@@ -13568,7 +13573,7 @@ mod tests {
         assert_eq!(spec.mean.to_vec(), vec![-3.0, -3.0]);
         match spec.noise {
             gam::generative::NoiseModel::Gaussian { sigma } => {
-                assert_eq!(sigma.to_vec(), vec![2.0, 2.0]);
+                assert!(sigma.iter().all(|&v| (v - 2.0).abs() < 1e-12));
             }
             _ => panic!("expected Gaussian noise model"),
         }
