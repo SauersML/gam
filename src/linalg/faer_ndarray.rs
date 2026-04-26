@@ -450,6 +450,10 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     }
 
     // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
+    // Compute Xᵀ·diag(W)·X as Xᵀ·(W·X) to preserve sign on W; the prior
+    // sqrt(max(0, w))-then-Gram form clipped negative weights to zero, which
+    // corrupted observed-Hessian assembly when any block had n > a (e.g. heavy
+    // residuals under the logb σ link).
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 131_072;
@@ -458,29 +462,31 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         .min(n);
 
     let mut result = Array2::<f64>::zeros((p, p).f());
-    let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
     let mut out_view = array2_to_matmut(&mut result);
 
     for start in (0..n).step_by(chunk_rows) {
         let rows = (n - start).min(chunk_rows);
         {
             let x_slice = x.slice(s![start..start + rows, ..]);
-            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+            let mut chunk = wx_chunk.slice_mut(s![0..rows, ..]);
             for local in 0..rows {
-                let sqrtw = w[start + local].max(0.0).sqrt();
+                let wi = w[start + local];
                 for col in 0..p {
-                    chunk[[local, col]] = x_slice[[local, col]] * sqrtw;
+                    chunk[[local, col]] = x_slice[[local, col]] * wi;
                 }
             }
         }
-        let chunk_slice = weighted_chunk.slice(s![0..rows, ..]);
-        let chunk_view = FaerArrayView::new(&chunk_slice);
+        let x_slice = x.slice(s![start..start + rows, ..]);
+        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+        let x_view = FaerArrayView::new(&x_slice);
+        let wx_view = FaerArrayView::new(&wx_slice);
         let par = matmul_parallelism(p, p, rows);
         matmul(
             out_view.as_mut(),
             Accum::Add,
-            chunk_view.as_ref().transpose(),
-            chunk_view.as_ref(),
+            x_view.as_ref().transpose(),
+            wx_view.as_ref(),
             1.0,
             par,
         );
