@@ -15998,9 +15998,13 @@ mod tests {
                 + psi * D::from(x_ls_psi[i])
                 + half * psi * psi * D::from(x_ls_psi_psi[i]);
             let eta_ls = x_ls * beta_ls;
-            let sigma = eta_ls.exp();
+            // Mirror the production logb noise link σ = LOGB_SIGMA_FLOOR + exp(η_ls)
+            // (see `GaussianLocationScaleFamily::loglik`); using the bare-exp link
+            // here would diverge from the family's σ at the same η and break the
+            // psi-derivative identities that this reference negloglik certifies.
+            let sigma = D::from(LOGB_SIGMA_FLOOR) + eta_ls.exp();
             let resid = D::from(y[i]) - eta_mu;
-            out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + eta_ls);
+            out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + sigma.ln());
         }
         out
     }
