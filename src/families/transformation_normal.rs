@@ -3323,6 +3323,122 @@ mod tests {
             );
         }
     }
+
+    /// Sweep over a representative cross-section of (n_cov, n_grid, p_resp,
+    /// p_cov) shapes — including degenerate p_resp=1 / p_cov=1 cases and
+    /// asymmetric n_cov / n_grid ratios — to confirm the factored Kronecker
+    /// identities hold across the parameter space, not just at one point. All
+    /// inputs are deterministic (a Numerical-Recipes LCG over a fixed seed)
+    /// so the test is reproducible without an RNG dependency.
+    #[test]
+    fn kronecker_variant_matches_materialized_form_across_shapes() {
+        fn lcg_sequence(seed: u64, len: usize) -> Vec<f64> {
+            let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = (state >> 11) as f64 / (1u64 << 53) as f64;
+                out.push(2.0 * u - 1.0);
+            }
+            out
+        }
+        fn make_array2(seed: u64, rows: usize, cols: usize) -> Array2<f64> {
+            Array2::from_shape_vec((rows, cols), lcg_sequence(seed, rows * cols))
+                .expect("dimensions match")
+        }
+        fn make_array1(seed: u64, len: usize) -> Array1<f64> {
+            Array1::from_vec(lcg_sequence(seed, len))
+        }
+
+        // Shapes: (n_cov, n_grid, p_resp, p_cov). Includes the structural edge
+        // cases p_resp=1 and p_cov=1 (the elementwise definition collapses to
+        // an outer product), n_cov=1 and n_grid=1, an asymmetric grid-heavy
+        // case, and a moderate generic shape.
+        let shapes: &[(usize, usize, usize, usize)] = &[
+            (1, 5, 3, 4),
+            (5, 1, 3, 4),
+            (5, 7, 1, 4),
+            (5, 7, 3, 1),
+            (3, 11, 2, 5),
+            (10, 4, 4, 3),
+            (8, 13, 2, 4),
+            (4, 4, 4, 4),
+        ];
+
+        for (idx, &(n_cov, n_grid, p_resp, p_cov)) in shapes.iter().enumerate() {
+            let seed = 0xA17B_C0DE_u64.wrapping_add(idx as u64);
+            let response_grid = make_array2(seed ^ 0x1, n_grid, p_resp);
+            let cov = make_array2(seed ^ 0x2, n_cov, p_cov);
+            let beta = make_array1(seed ^ 0x3, p_resp * p_cov);
+            let v = make_array1(seed ^ 0x4, n_cov * n_grid);
+
+            let design = KroneckerDesign::new_kronecker(
+                response_grid.clone(),
+                DesignMatrix::Dense(DenseDesignMatrix::from(cov.clone())),
+            )
+            .expect("Kronecker variant construction");
+
+            // Materialize the reference matrix from the elementwise definition
+            // X[(i, g), (a, b)] = R[g, a] · C[i, b] with row-flatten covariate-
+            // major and column-flatten response-major.
+            let p_total = p_resp * p_cov;
+            let n_virtual = n_cov * n_grid;
+            let mut reference = Array2::<f64>::zeros((n_virtual, p_total));
+            for i in 0..n_cov {
+                for g in 0..n_grid {
+                    let row = i * n_grid + g;
+                    for a in 0..p_resp {
+                        for b in 0..p_cov {
+                            reference[[row, a * p_cov + b]] =
+                                response_grid[[g, a]] * cov[[i, b]];
+                        }
+                    }
+                }
+            }
+
+            // forward_mul: factored vs. materialized.
+            let got_forward = design.forward_mul(&beta);
+            let expected_forward = reference.dot(&beta);
+            for k in 0..n_virtual {
+                let diff = (got_forward[k] - expected_forward[k]).abs();
+                assert!(
+                    diff < 1e-12,
+                    "shape {:?} #{idx}: forward_mul mismatch at virtual row {k} (diff={diff:e})",
+                    (n_cov, n_grid, p_resp, p_cov),
+                );
+            }
+
+            // transpose_mul: factored vs. materialized.
+            let got_transpose = design.transpose_mul(&v);
+            let expected_transpose = reference.t().dot(&v);
+            for k in 0..p_total {
+                let diff = (got_transpose[k] - expected_transpose[k]).abs();
+                assert!(
+                    diff < 1e-12,
+                    "shape {:?} #{idx}: transpose_mul mismatch at col {k} (diff={diff:e})",
+                    (n_cov, n_grid, p_resp, p_cov),
+                );
+            }
+
+            // Adjoint identity: ⟨v, X β⟩ = ⟨Xᵀ v, β⟩. If both forms match the
+            // same reference this is implied, but checking it directly catches
+            // a class of off-by-one transpose bugs that would happen to flip
+            // both forms consistently.
+            let lhs: f64 = v.iter().zip(got_forward.iter()).map(|(a, b)| a * b).sum();
+            let rhs: f64 = got_transpose
+                .iter()
+                .zip(beta.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            assert!(
+                (lhs - rhs).abs() < 1e-10,
+                "shape {:?} #{idx}: adjoint identity ⟨v, Xβ⟩ ≠ ⟨Xᵀv, β⟩ (lhs={lhs}, rhs={rhs})",
+                (n_cov, n_grid, p_resp, p_cov),
+            );
+        }
+    }
 }
 
 impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
