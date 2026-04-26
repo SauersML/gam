@@ -2820,14 +2820,17 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         let mut xtwx = Array2::<f64>::zeros((p, p));
         for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let mut chunk = self.row_chunk_combined(start..end);
-            // Apply sqrt(w) to each row.
+            let chunk = self.row_chunk_combined(start..end);
+            // Build W·chunk with signed weights and accumulate Xᵀ·(W·X). The
+            // prior sqrt(max(0, w))-then-Gram path clipped negative weights to
+            // zero, corrupting observed-Hessian assembly when any block had a
+            // negative diagonal entry (e.g. n > a under the logb σ link).
+            let mut wchunk = chunk.clone();
             for local in 0..(end - start) {
-                let w = weights[start + local].max(0.0).sqrt();
-                chunk.row_mut(local).mapv_inplace(|v| v * w);
+                let wi = weights[start + local];
+                wchunk.row_mut(local).mapv_inplace(|v| v * wi);
             }
-            // Accumulate chunk^T chunk.
-            let ata = fast_ab(&chunk.t().to_owned(), &chunk);
+            let ata = fast_ab(&chunk.t().to_owned(), &wchunk);
             xtwx += &ata;
         }
         Ok(xtwx)
@@ -4782,9 +4785,13 @@ impl EmbeddedColumnBlock<'_> {
 
 /// Streaming chunked BLAS computation of X^T * diag(W) * X.
 ///
-/// Processes rows in cache-friendly chunks, scaling each chunk by sqrt(w)
-/// and accumulating via BLAS matmul.  Peak intermediate allocation is
-/// chunk_size × p × 8 bytes (~8 MB) instead of n × p × 8 bytes.
+/// Processes rows in cache-friendly chunks, scaling each row of X by w
+/// and accumulating Xᵀ·(W·X) via BLAS matmul. Peak intermediate allocation
+/// is chunk_size × p × 8 bytes (~8 MB) instead of n × p × 8 bytes.
+///
+/// Uses signed weights directly; the prior sqrt(max(0, w))-then-Gram form
+/// clipped negative weights to zero and corrupted observed-Hessian assembly
+/// whenever the diagonal block had any negative entries.
 fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Array2<f64>) {
     let n = x.nrows();
     let p = x.ncols();
@@ -4793,36 +4800,36 @@ fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Ar
     }
 
     // Target ~8MB working set per chunk (matches faer_ndarray streaming path).
-    // Previous 2MB / MAX_ROWS=2048 was 64x smaller than needed and caused
-    // excessive loop overhead on large n.
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 131_072;
     let chunk_rows = (TARGET_BYTES / (p * 8)).max(MIN_ROWS).min(MAX_ROWS).min(n);
 
     let par = faer::get_global_parallelism();
-    let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
     let mut out_view = array2_to_matmut(out);
 
     for start in (0..n).step_by(chunk_rows) {
         let rows = (n - start).min(chunk_rows);
         {
-            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+            let mut chunk = wx_chunk.slice_mut(s![0..rows, ..]);
             for local in 0..rows {
                 let src = start + local;
-                let sqrtw = weights[src].max(0.0).sqrt();
+                let wi = weights[src];
                 for col in 0..p {
-                    chunk[[local, col]] = x[[src, col]] * sqrtw;
+                    chunk[[local, col]] = x[[src, col]] * wi;
                 }
             }
         }
-        let chunk_slice = weighted_chunk.slice(s![0..rows, ..]);
-        let chunk_view = FaerArrayView::new(&chunk_slice);
+        let x_slice = x.slice(s![start..start + rows, ..]);
+        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+        let x_view = FaerArrayView::new(&x_slice);
+        let wx_view = FaerArrayView::new(&wx_slice);
         matmul(
             out_view.as_mut(),
             Accum::Add,
-            chunk_view.as_ref().transpose(),
-            chunk_view.as_ref(),
+            x_view.as_ref().transpose(),
+            wx_view.as_ref(),
             1.0,
             par,
         );
