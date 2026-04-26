@@ -868,6 +868,16 @@ fn schema_check(
     rows: &[Vec<String>],
 ) -> Result<SchemaCheckPayload, String> {
     let schema = model.require_data_schema()?;
+    // The response column is part of the training schema but plays no role in
+    // prediction — it is the target, not an input. Strict-extras validation
+    // (which catches typos like passing `z` to a model trained on `x`) must
+    // therefore exempt it on both sides: it is neither *required* in the
+    // prediction frame nor *forbidden* from being there. Filtering only one
+    // side breaks the symmetric pattern users rely on (`fit(df, ...);
+    // predict(df)` where `df` carries the response throughout).
+    //
+    // Surv(...)-style formulas have no scalar response column —
+    // `response_column_name` returns None and both filters become no-ops.
     let response_column = response_column_name(model.payload().formula.as_str());
     let expected_names = schema
         .columns
