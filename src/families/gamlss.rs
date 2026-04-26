@@ -5551,9 +5551,11 @@ impl GaussianLocationScaleFamily {
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        // Cross block carries overall κ; scale-scale block carries κ².
+        // H_{μ,ls} = 2κm. H_{ls,ls} = 2κ²n + κ'(a−n): the κ'(a−n) piece is
+        // ∂[κ(a−n)]/∂η, lost if κ is treated as constant under the logb link.
         let cross = 2.0 * &rows.kappa * &rows.m;
-        let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.n;
+        let amn = &rows.obs_weight - &rows.n;
+        let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &rows.w, &cross, &scale,
         )?))
@@ -7278,9 +7280,12 @@ impl GaussianLocationScaleWiggleFamily {
         }
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
-        // Cross blocks involving η_ls carry overall κ; scale-scale carries κ².
+        // Cross blocks involving η_ls carry overall κ; scale-scale block is
+        // 2κ²n + κ'(a−n) under the logb link (the κ'(a−n) piece is lost if κ
+        // is treated as constant under ∂/∂η_ls).
         let coeff_ml = (2.0 * &rows.kappa * &rows.m) * &geom.dq_dq0;
-        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n;
+        let amn = &rows.obs_weight - &rows.n;
+        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml, x_ls)?;
         let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
