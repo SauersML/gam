@@ -4407,10 +4407,6 @@ pub fn reml_laml_evaluate(
 
 const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 
-fn hessian_unavailable(message: impl Into<String>) -> String {
-    format!("{} {}", HESSIAN_UNAVAILABLE_PREFIX, message.into())
-}
-
 fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
 }
