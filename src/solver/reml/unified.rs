@@ -4405,10 +4405,6 @@ pub fn reml_laml_evaluate(
     })
 }
 
-/// Precompute the adjoint trace vector z_c = H⁻¹ Xᵀ (c ⊙ h) from raw GLM ingredients.
-///
-/// When available, tr(H⁻¹ C[u]) for C[u] = Xᵀ diag(c ⊙ Xu) X simplifies to uᵀ z_c,
-/// replacing an O(p²) solve with an O(p) dot product.
 const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 
 fn hessian_unavailable(message: impl Into<String>) -> String {
@@ -4419,6 +4415,11 @@ fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
 }
 
+//   C[u]            = Xᵀ diag(c ⊙ Xu) X
+//   h_i             = (X H⁻¹ Xᵀ)_{ii}            depends only on row Xᵢ
+//   v               = Xᵀ (c ⊙ h)
+//   z_c             = H⁻¹ v
+//   tr(H⁻¹ C[u])    = uᵀ v = (Hu) · z_c
 fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
     hop: &dyn HessianOperator,
@@ -4426,48 +4427,37 @@ fn compute_adjoint_z_c(
     let n = ing.x.nrows();
     let p = ing.x.ncols();
 
-    // Guard: the dominant resource here is the dense `Z = H⁻¹ Xᵀ` matrix,
-    // which carries `n * p` f64 entries (the `solve_multi` output and the
-    // transposed `Xᵀ` input both have that shape).  FLOP-wise the call is
-    // `O(n p²)` but those FLOPs are vectorised dense triangular solves that
-    // cost a few hundred ms even at biobank scale; the real failure mode is
-    // allocating the `n × p`-element float buffer.  Cap the buffer at
-    // 200M f64 ≈ 1.6 GiB so very wide+tall designs (e.g. n=320 000, p≥625)
-    // fall back to the gradient-only path before they OOM.
-    const ZC_MAX_DENSE_FLOATS: usize = 200_000_000;
-    let dense_floats = n.saturating_mul(p);
-    if dense_floats > ZC_MAX_DENSE_FLOATS {
-        return Err(hessian_unavailable(format!(
-            "adjoint GLM trace dense Z=H⁻¹Xᵀ has {dense_floats} entries (n={n}, p={p}); exceeds {ZC_MAX_DENSE_FLOATS}-entry buffer cap"
-        )));
-    }
-
     let x = ing.x.to_dense_arc();
     let x_ref = x.as_ref();
 
-    // Z = H⁻¹ Xᵀ  (p × n)
-    let x_t = x_ref.t().to_owned();
-    let z = hop.solve_multi(&x_t);
+    let block = {
+        const TARGET_CHUNK_FLOATS: usize = 1 << 16;
+        (TARGET_CHUNK_FLOATS / p.max(1)).clamp(1, n.max(1))
+    };
 
-    // Hat diagonal: h_i = Σ_j X_{i,j} * Z_{j,i}
-    let mut h_diag = Array1::zeros(n);
-    for i in 0..n {
-        let mut hi = 0.0;
-        for j in 0..p {
-            hi += x_ref[[i, j]] * z[[j, i]];
+    let mut v = Array1::<f64>::zeros(p);
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + block).min(n);
+        let rows = x_ref.slice(ndarray::s![start..end, ..]);
+        let chunk_t = rows.t().to_owned();
+        let z_chunk = hop.solve_multi(&chunk_t);
+
+        let b = end - start;
+        let mut t_chunk = Array1::<f64>::zeros(b);
+        for i in 0..b {
+            let mut h_i = 0.0;
+            for j in 0..p {
+                h_i += rows[[i, j]] * z_chunk[[j, i]];
+            }
+            t_chunk[i] = ing.c_array[start + i] * h_i;
         }
-        h_diag[i] = hi;
+
+        v += &rows.t().dot(&t_chunk);
+        start = end;
     }
 
-    // t = c ⊙ h
-    let mut t = h_diag;
-    Zip::from(&mut t)
-        .and(ing.c_array)
-        .for_each(|t_i, &c_i| *t_i *= c_i);
-
-    // z_c = H⁻¹ Xᵀ t
-    let x_t_t = x_ref.t().dot(&t);
-    Ok(hop.solve(&x_t_t))
+    Ok(hop.solve(&v))
 }
 
 /// Compute the fourth-derivative trace: tr(H⁻¹ Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
@@ -4485,15 +4475,6 @@ fn compute_fourth_derivative_trace(
 
     let n = ing.x.nrows();
     let p = ing.x.ncols();
-
-    // Guard: building dense p×p Q matrix is O(n p²). Refuse at biobank scale.
-    const FOURTH_DERIV_MAX_DENSE_WORK: usize = 200_000_000;
-    let dense_work = n.saturating_mul(p).saturating_mul(p);
-    if dense_work > FOURTH_DERIV_MAX_DENSE_WORK {
-        return Err(hessian_unavailable(format!(
-            "fourth-derivative GLM trace would require dense O(n*p^2) work (n={n}, p={p}, n*p^2={dense_work})"
-        )));
-    }
 
     let x = ing.x.to_dense_arc();
     let x_ref = x.as_ref();
@@ -9919,59 +9900,67 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_adjoint_z_c_guard_uses_dense_floats() {
-        // Memory cap is 200M f64 entries (Z = H⁻¹Xᵀ has n*p entries).  Pick
-        // shapes that trip n*p > 200M without forcing the test to allocate
-        // the corresponding 1.6 GiB design matrix: the guard runs before
-        // `to_dense_arc()` and only consults `nrows()/ncols()`, so an empty
-        // sparse design with the right reported shape is enough.
-        let n = 250_001usize;
-        let p = 1_000usize;
-        let sparse = faer::sparse::SparseColMat::<usize, f64>::try_new_from_triplets(n, p, &[])
-            .expect("empty sparse design should build");
-        let x = DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse));
-        let c_array = Array1::ones(n);
+    fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
+        // streaming and dense paths differ only by reordering the sum that builds v;
+        // with n=64, p=8 the gap is bounded by O(εn) ≈ 1e-14.
+        let n = 64usize;
+        let p = 8usize;
+        let mut rng = Xoshiro256SS::from_seed(0x5EED_C0FFEE_u64);
+        let unit = |rng: &mut Xoshiro256SS| {
+            let bits = rng.next_u64() >> 11;
+            (bits as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+        };
+
+        let mut x_data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x_data[[i, j]] = unit(&mut rng);
+            }
+        }
+        let mut c_array = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            c_array[i] = unit(&mut rng);
+        }
+
+        let mut m = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                m[[i, j]] = unit(&mut rng);
+            }
+        }
+        let mut h = m.t().dot(&m);
+        for i in 0..p {
+            h[[i, i]] += p as f64;
+        }
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_data.clone()));
         let ing = ScalarGlmIngredients {
             c_array: &c_array,
             d_array: None,
             x: &x,
         };
-        // A 1×1 operator is enough — the guard fires before any solve.
-        let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(1)).unwrap();
+        let streamed = compute_adjoint_z_c(&ing, &hop).expect("streaming path");
 
-        let err = compute_adjoint_z_c(&ing, &hop)
-            .expect_err("oversized adjoint trace should make the Hessian unavailable");
-        assert!(is_hessian_unavailable(&err));
-        assert!(
-            err.contains("entries"),
-            "guard message should describe the buffer-entry cap, got: {err}"
-        );
-    }
+        let z_full = hop.solve_multi(&x_data.t().to_owned());
+        let mut h_diag = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut acc = 0.0;
+            for j in 0..p {
+                acc += x_data[[i, j]] * z_full[[j, i]];
+            }
+            h_diag[i] = acc;
+        }
+        let mut t = h_diag;
+        Zip::from(&mut t)
+            .and(&c_array)
+            .for_each(|t_i, &c_i| *t_i *= c_i);
+        let v = x_data.t().dot(&t);
+        let reference = hop.solve(&v);
 
-    #[test]
-    fn test_compute_fourth_derivative_trace_guard_uses_quadratic_work() {
-        let n = 20_001usize;
-        let p = 100usize;
-        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::<f64>::zeros((n, p)),
-        ));
-        let c_array = Array1::ones(n);
-        let d_array = Array1::ones(n);
-        let ing = ScalarGlmIngredients {
-            c_array: &c_array,
-            d_array: Some(&d_array),
-            x: &x,
-        };
-        let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(p)).unwrap();
-
-        let err = compute_fourth_derivative_trace(
-            &ing,
-            &Array1::<f64>::zeros(p),
-            &Array1::<f64>::zeros(p),
-            &hop,
-        )
-        .expect_err("oversized fourth-derivative trace should make the Hessian unavailable");
-        assert!(is_hessian_unavailable(&err));
+        for k in 0..p {
+            assert_relative_eq!(streamed[k], reference[k], epsilon = 1e-12, max_relative = 1e-12);
+        }
     }
 
     #[test]

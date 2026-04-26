@@ -50,6 +50,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::UnifiedFitResult;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, s};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -786,19 +787,18 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
-        let d_h_prime = self.x_deriv_kron.forward_mul(delta);
-        let h_prime_grid = self.x_deriv_grid_kron.forward_mul(beta);
-        let d_h_prime_grid = self.x_deriv_grid_kron.forward_mul(delta);
 
         // Fraction-to-boundary rule: find the largest alpha in (0, 1] such that
         // h'(beta + alpha * delta) > 0 at every observed row and monotonicity
-        // grid row.
-        //
-        // For each i where d_h'[i] < 0, the step that drives h'[i] to zero is
-        // alpha_i = h'[i] / (-d_h'[i]).  We take the minimum and apply a 0.995
-        // safety factor (standard in interior-point methods).
+        // grid row. For each row i where d_h'[i] < 0, the step that drives
+        // h'[i] to zero is alpha_i = h'[i] / (-d_h'[i]); we take the minimum
+        // and apply a 0.995 safety factor (standard in interior-point methods).
         let mut alpha_max = 1.0_f64;
+
+        // (1) Observed-row check uses the row-wise Khatri–Rao design directly.
+        // Storage here is O(n) per vector, so materialization is fine.
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let d_h_prime = self.x_deriv_kron.forward_mul(delta);
         for i in 0..h_prime.len() {
             let dh = d_h_prime[i];
             if dh < -1e-14 {
@@ -808,15 +808,78 @@ impl CustomFamily for TransformationNormalFamily {
                 }
             }
         }
-        for i in 0..h_prime_grid.len() {
-            let dh = d_h_prime_grid[i];
-            if dh < -1e-14 {
-                let hit = (h_prime_grid[i] - TRANSFORMATION_MONOTONICITY_EPS) / (-dh);
-                if hit < alpha_max {
-                    alpha_max = hit;
+
+        // (2) Monotonicity-grid check is streaming: never materialize the
+        // (n_cov · n_grid) h(grid) and dh(grid) vectors. The construction-site
+        // invariant (asserts at TransformationNormalFamily::new and the
+        // warm-start variant) guarantees x_deriv_grid_kron is the Kronecker
+        // variant; we still bind the factors via match so the panic message
+        // stays explicit if that ever drifts.
+        let (response_grid, covariate) = match &self.x_deriv_grid_kron {
+            KroneckerDesign::Kronecker {
+                response_grid,
+                covariate,
+            } => (response_grid, covariate),
+            KroneckerDesign::KhatriRao { .. } => unreachable!(
+                "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) materialization (enforced at construction)"
+            ),
+        };
+        let n_cov = covariate.nrows();
+        let n_grid = response_grid.nrows();
+        let p_resp = response_grid.ncols();
+        let p_cov = covariate.ncols();
+        debug_assert_eq!(beta.len(), p_resp * p_cov);
+        debug_assert_eq!(delta.len(), p_resp * p_cov);
+
+        // Per-row response contractions:
+        //     M_β[i, a] = (C · β_matᵀ)[i, a] = Σ_b C[i, b] · β_mat[a, b]
+        //     M_δ[i, a] = (C · δ_matᵀ)[i, a]
+        // Memory: 2 · n_cov · p_resp · 8 bytes (~50 MiB at biobank scale),
+        // versus 2 · n_cov · n_grid · 8 bytes (~870 MiB) that the materialized
+        // h(grid)/dh(grid) vectors would have required — same FLOPs, ~17×
+        // smaller working set.
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .expect("beta length is p_resp * p_cov");
+        let delta_mat = delta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .expect("delta length is p_resp * p_cov");
+        let mut m_beta = Array2::<f64>::zeros((n_cov, p_resp));
+        let mut m_delta = Array2::<f64>::zeros((n_cov, p_resp));
+        for a in 0..p_resp {
+            let cb = covariate.apply(&beta_mat.row(a).to_owned());
+            let cd = covariate.apply(&delta_mat.row(a).to_owned());
+            m_beta.column_mut(a).assign(&cb);
+            m_delta.column_mut(a).assign(&cd);
+        }
+
+        // Streaming scan: for each (i, g), evaluate the length-p_resp dot
+        // products  h[i, g] = M_β.row(i) · response_grid.row(g)  and
+        // dh[i, g] = M_δ.row(i) · response_grid.row(g)  inline with the
+        // fraction-to-boundary update. The (n_cov, n_grid) output is never
+        // stored.
+        for i in 0..n_cov {
+            let m_beta_row = m_beta.row(i);
+            let m_delta_row = m_delta.row(i);
+            for g in 0..n_grid {
+                let r_row = response_grid.row(g);
+                let mut h = 0.0;
+                let mut dh = 0.0;
+                for a in 0..p_resp {
+                    h += m_beta_row[a] * r_row[a];
+                    dh += m_delta_row[a] * r_row[a];
+                }
+                if dh < -1e-14 {
+                    let hit = (h - TRANSFORMATION_MONOTONICITY_EPS) / (-dh);
+                    if hit < alpha_max {
+                        alpha_max = hit;
+                    }
                 }
             }
         }
+
         let tau = 0.995;
         let alpha_safe = tau * alpha_max;
         if alpha_safe < 1.0 {
@@ -1879,6 +1942,123 @@ impl KroneckerDesign {
                 result_2d
                     .into_shape_with_order((n_cov * n_grid,))
                     .expect("row-major Array2 flattens to Array1 of length n_cov*n_grid")
+            }
+        }
+    }
+
+    /// Streaming fraction-to-boundary reduction.
+    ///
+    /// Returns the smallest positive α for which there exists a virtual row
+    /// `r` with `(self · δ)[r] < -dh_eps` and
+    /// `(self · β)[r] + α · (self · δ)[r] = slack`, i.e.
+    ///
+    /// ```text
+    ///     α = ((self · β)[r] - slack) / (-(self · δ)[r])
+    /// ```
+    ///
+    /// minimized over all such `r`. Returns `f64::INFINITY` if no row violates
+    /// the descent threshold.
+    ///
+    /// For the `Kronecker` variant the reduction streams over the
+    /// `n_cov × n_grid` virtual rows from the factored representation: only an
+    /// `n_cov × p_resp` projection (`C = X · β_matᵀ`, `D = X · δ_matᵀ`) and a
+    /// per-thread `chunk_rows × n_grid` scratch buffer are held in memory, so
+    /// the dense `n_cov · n_grid · 8 B` forward image is never materialized.
+    ///
+    /// The reduction is `f64::min`, which is associative for non-NaN inputs,
+    /// so the parallel and serial reductions are bit-equivalent.
+    fn min_step_to_boundary(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+        slack: f64,
+        dh_eps: f64,
+    ) -> f64 {
+        match self {
+            KroneckerDesign::KhatriRao { .. } => {
+                // n observation rows: a single forward_mul pair fits in cache,
+                // and the tight serial scan dominates.
+                let h = self.forward_mul(beta);
+                let dh = self.forward_mul(delta);
+                let mut alpha = f64::INFINITY;
+                for i in 0..h.len() {
+                    let dval = dh[i];
+                    if dval < -dh_eps {
+                        let hit = (h[i] - slack) / (-dval);
+                        if hit < alpha {
+                            alpha = hit;
+                        }
+                    }
+                }
+                alpha
+            }
+            KroneckerDesign::Kronecker {
+                response_grid,
+                covariate,
+            } => {
+                let n = covariate.nrows();
+                let n_grid = response_grid.nrows();
+                let p_resp = response_grid.ncols();
+                let p_cov = covariate.ncols();
+                debug_assert_eq!(beta.len(), p_resp * p_cov);
+                debug_assert_eq!(delta.len(), p_resp * p_cov);
+                let beta_mat = beta
+                    .view()
+                    .into_shape_with_order((p_resp, p_cov))
+                    .unwrap();
+                let delta_mat = delta
+                    .view()
+                    .into_shape_with_order((p_resp, p_cov))
+                    .unwrap();
+                // Project β and δ through the covariate operator once. Each
+                // takes p_resp `apply` calls — identical cost to a single
+                // `forward_mul`. Together: `n × p_resp` doubles ≈ 60 MiB at
+                // biobank scale, vs the `2 · n × n_grid ≈ 3 GiB` the prior
+                // pair of `forward_mul` outputs held simultaneously.
+                let mut c = Array2::<f64>::zeros((n, p_resp));
+                let mut d = Array2::<f64>::zeros((n, p_resp));
+                for a in 0..p_resp {
+                    let beta_row = beta_mat.row(a).to_owned();
+                    let delta_row = delta_mat.row(a).to_owned();
+                    c.column_mut(a).assign(&covariate.apply(&beta_row));
+                    d.column_mut(a).assign(&covariate.apply(&delta_row));
+                }
+                // Stream the (i, g) reduction in row chunks. For each chunk:
+                //   H_chunk  = C[chunk] · Rᵀ      (m × n_grid)
+                //   dH_chunk = D[chunk] · Rᵀ      (m × n_grid)
+                // and reduce the fraction-to-boundary minimum locally before
+                // dropping the buffers. Per chunk: 2 · m · n_grid · 8 B
+                // ≈ 9 MiB at m = 1024 and biobank-scale n_grid.
+                const CHUNK_ROWS: usize = 1024;
+                let n_chunks = n.div_ceil(CHUNK_ROWS);
+                let r_t = response_grid.t();
+                (0..n_chunks)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * CHUNK_ROWS;
+                        let end = (start + CHUNK_ROWS).min(n);
+                        let m = end - start;
+                        let c_chunk = c.slice(s![start..end, ..]);
+                        let d_chunk = d.slice(s![start..end, ..]);
+                        let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
+                        let mut dh_chunk = Array2::<f64>::zeros((m, n_grid));
+                        fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
+                        fast_ab_into(&d_chunk, &r_t, &mut dh_chunk);
+                        let mut local = f64::INFINITY;
+                        for i_local in 0..m {
+                            for g in 0..n_grid {
+                                let dval = dh_chunk[[i_local, g]];
+                                if dval < -dh_eps {
+                                    let hit = (h_chunk[[i_local, g]] - slack) / (-dval);
+                                    if hit < local {
+                                        local = hit;
+                                    }
+                                }
+                            }
+                        }
+                        local
+                    })
+                    .reduce(|| f64::INFINITY, f64::min)
             }
         }
     }
