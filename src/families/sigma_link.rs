@@ -445,4 +445,105 @@ mod tests {
             assert_eq!(d4, sigma);
         }
     }
+
+    #[test]
+    fn logb_sigma_floor_bounds_below_for_arbitrarily_negative_eta() {
+        for &eta in &[-1000.0, -100.0, -50.0, -10.0] {
+            let sigma = logb_sigma_from_eta_scalar(eta);
+            assert!(sigma >= LOGB_SIGMA_FLOOR);
+            assert!(sigma.is_finite());
+            let inv_s2 = (sigma * sigma).recip();
+            assert!(inv_s2 <= LOGB_SIGMA_FLOOR.powi(-2) + 1e-12);
+        }
+    }
+
+    #[test]
+    fn logb_sigma_recovers_exp_link_in_upper_regime() {
+        for &eta in &[3.0, 5.0, 10.0] {
+            let logb = logb_sigma_from_eta_scalar(eta);
+            let pure_exp = exp_sigma_from_eta_scalar(eta);
+            let rel_err = (logb - pure_exp).abs() / pure_exp;
+            assert!(rel_err < 1e-2);
+        }
+    }
+
+    #[test]
+    fn logb_sigma_jet_d1_through_d4_match_pure_exp_eta() {
+        for &eta in &[-3.0_f64, 0.0, 2.0] {
+            let s = eta.exp();
+            let jet1 = logb_sigma_jet1_scalar(eta);
+            let jet3 = logb_sigma_jet3_scalar(eta);
+            let jet4 = logb_sigma_jet4_scalar(eta);
+            assert!((jet1.sigma - (LOGB_SIGMA_FLOOR + s)).abs() < 1e-12);
+            assert!((jet1.d1 - s).abs() < 1e-12);
+            assert!((jet3.sigma - (LOGB_SIGMA_FLOOR + s)).abs() < 1e-12);
+            assert!((jet3.d1 - s).abs() < 1e-12);
+            assert!((jet3.d2 - s).abs() < 1e-12);
+            assert!((jet3.d3 - s).abs() < 1e-12);
+            assert!((jet4.d4 - s).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn logb_sigma_derivatives_match_finite_difference() {
+        let h = 1e-5;
+        let h3 = 2e-3;
+        let points = [-6.0, -3.5, -1.2, 0.0, 0.8, 2.1, 6.0];
+        for &eta in &points {
+            let (s, d1, d2, d3) = logb_sigma_derivs_up_to_third_scalar(eta);
+            let s_plus = logb_sigma_from_eta_scalar(eta + h);
+            let s_minus = logb_sigma_from_eta_scalar(eta - h);
+            let d1fd = (s_plus - s_minus) / (2.0 * h);
+            let d2fd = (s_plus - 2.0 * s + s_minus) / (h * h);
+            let d2_at = |x: f64| {
+                let xp = logb_sigma_from_eta_scalar(x + h3);
+                let xc = logb_sigma_from_eta_scalar(x);
+                let xm = logb_sigma_from_eta_scalar(x - h3);
+                (xp - 2.0 * xc + xm) / (h3 * h3)
+            };
+            let d3fd = (d2_at(eta + h3) - d2_at(eta - h3)) / (2.0 * h3);
+            let d1_scale = d1.abs().max(d1fd.abs()).max(1.0);
+            let d2_scale = d2.abs().max(d2fd.abs()).max(1.0);
+            let d3_scale = d3.abs().max(d3fd.abs()).max(1.0);
+            assert!((d1 - d1fd).abs() < 1e-8 * d1_scale);
+            assert!((d2 - d2fd).abs() < 1e-5 * d2_scale);
+            assert!((d3 - d3fd).abs() < 5e-4 * d3_scale);
+        }
+    }
+
+    #[test]
+    fn logb_sigma_inverse_round_trip() {
+        for &sigma in &[
+            LOGB_SIGMA_FLOOR + 1e-3,
+            LOGB_SIGMA_FLOOR + 0.5,
+            1.0,
+            10.0,
+            1e6,
+        ] {
+            let eta = logb_sigma_eta_for_sigma_scalar(sigma);
+            let recovered = logb_sigma_from_eta_scalar(eta);
+            let scale = sigma.abs().max(1.0);
+            assert!((recovered - sigma).abs() < 1e-10 * scale);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "sigma must exceed LOGB_SIGMA_FLOOR")]
+    fn logb_sigma_inverse_rejects_sigma_at_floor() {
+        logb_sigma_eta_for_sigma_scalar(LOGB_SIGMA_FLOOR);
+    }
+
+    #[test]
+    fn logb_sigma_vectorized_matches_scalar() {
+        let eta = Array1::from_vec(vec![-701.0, -4.2, -1.4, -0.2, 0.4, 1.9, 3.1, 701.0]);
+        let (s, d1, d2, d3, d4) = logb_sigma_derivs_up_to_fourth(eta.view());
+        for i in 0..eta.len() {
+            let (ss, d1s, d2s, d3s, d4s) = logb_sigma_derivs_up_to_fourth_scalar(eta[i]);
+            assert!((s[i] - ss).abs() < 1e-12);
+            assert!((d1[i] - d1s).abs() < 1e-12);
+            assert!((d2[i] - d2s).abs() < 1e-12);
+            assert!((d3[i] - d3s).abs() < 1e-12);
+            assert!((d4[i] - d4s).abs() < 1e-12);
+        }
+    }
 }
