@@ -22,10 +22,6 @@ mod runtime;
 mod trace;
 pub(crate) mod unified;
 
-const EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
-const EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM: usize = 32;
-const EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK: usize = 4_000_000;
-const EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK: usize = 200_000_000;
 const EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const FIRTH_MAX_OBSERVATIONS: usize = 20_000;
 const FIRTH_MAX_COEFFICIENTS: usize = 256;
@@ -75,15 +71,6 @@ impl TauTauHessianPolicy {
             || self.hessian_plan.total_bytes() > self.budget_bytes
             || self.firth_pair_terms_unavailable
     }
-}
-
-pub(crate) fn exact_outer_hessian_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
-    let linear_work = n_obs.saturating_mul(p_coeff);
-    let quadratic_work = linear_work.saturating_mul(p_coeff);
-    !((n_obs >= EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD
-        && p_coeff >= EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM)
-        || linear_work > EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK
-        || quadratic_work > EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK)
 }
 
 pub(crate) fn exact_tau_tau_hessian_policy(
@@ -781,70 +768,6 @@ mod tests {
             cancellation.abs() < 1e-10,
             "stationarity cancellation failed: | -ell_beta^T B + beta^T S B | = {:.3e}",
             cancellation.abs()
-        );
-    }
-
-    #[test]
-    fn large_non_gaussian_models_disable_analytic_outer_hessian() {
-        let n = 5_001usize;
-        let p = 100usize;
-        let y = Array1::<f64>::zeros(n);
-        let w = Array1::<f64>::ones(n);
-        let x = Array2::<f64>::zeros((n, p));
-        let s0 = Array2::<f64>::eye(p);
-        let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
-            1e-6,
-            false,
-        );
-        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-
-        assert!(!state.analytic_outer_hessian_enabled());
-    }
-
-    #[test]
-    fn downgraded_second_order_request_reuses_cached_first_order_outer_eval() {
-        let n = 5_001usize;
-        let p = 100usize;
-        let y = Array1::<f64>::zeros(n);
-        let w = Array1::<f64>::ones(n);
-        let x = Array2::<f64>::zeros((n, p));
-        let s0 = Array2::<f64>::eye(p);
-        let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
-            1e-6,
-            false,
-        );
-        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let rho = array![0.0];
-        let expected = OuterEval {
-            cost: 7.5,
-            gradient: array![1.25],
-            hessian: HessianResult::Unavailable,
-        };
-
-        let rho_key = EvalCacheManager::sanitized_rhokey(&rho);
-        state.cache_manager.store_outer_eval(&rho_key, &expected);
-        state
-            .cache_manager
-            .current_eval_bundle
-            .write()
-            .unwrap()
-            .take();
-        assert!(
-            state.cache_manager.cached_eval_bundle(&rho_key).is_none(),
-            "test precondition: force the second request to rely on outer-eval cache only"
-        );
-
-        let cached_eval = state
-            .compute_outer_eval_with_order(&rho, OuterEvalOrder::ValueGradientHessian)
-            .expect("cached downgraded outer eval");
-        assert_eq!(cached_eval.cost, expected.cost);
-        assert_eq!(cached_eval.gradient, expected.gradient);
-        assert!(matches!(cached_eval.hessian, HessianResult::Unavailable));
-        assert!(
-            state.cache_manager.cached_eval_bundle(&rho_key).is_none(),
-            "downgraded second-order request should return from cached first-order outer eval"
         );
     }
 
@@ -3541,7 +3464,6 @@ pub(crate) struct RemlState<'a> {
     arena: RemlArena,
     pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
-    outer_hessian_downgrade_logged: AtomicBool,
     pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
 
     /// When set, the penalties have Kronecker (tensor-product) structure and

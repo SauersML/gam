@@ -431,26 +431,6 @@ impl ExactOuterDerivativeOrder {
 /// first-order when a caller insists on materializing it. This gate is keyed
 /// to the actual outer dimension K, not the inner coefficient dimension p.
 const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
-const EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
-const EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM: usize = 32;
-const EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK: usize = 4_000_000;
-const EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK: usize = 200_000_000;
-
-pub(crate) fn exact_outer_hessian_problem_scale_allows(specs: &[ParameterBlockSpec]) -> bool {
-    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let max_n: usize = specs
-        .iter()
-        .map(|spec| spec.design.nrows())
-        .max()
-        .unwrap_or(0);
-    let linear_work = max_n.saturating_mul(total_p);
-    let quadratic_work = linear_work.saturating_mul(total_p);
-
-    !((max_n >= EXACT_OUTER_HESSIAN_LARGE_N_THRESHOLD
-        && total_p >= EXACT_OUTER_HESSIAN_LARGE_N_MIN_DIM)
-        || linear_work > EXACT_OUTER_HESSIAN_MAX_LINEAR_WORK
-        || quadratic_work > EXACT_OUTER_HESSIAN_MAX_QUADRATIC_WORK)
-}
 
 /// Shared cost-aware gate for second-order exact outer derivatives.
 ///

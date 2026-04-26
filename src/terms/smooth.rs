@@ -6097,9 +6097,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
     let analytic_outer_hessian_available =
         crate::custom_family::joint_exact_analytic_outer_hessian_available()
-            && crate::custom_family::exact_outer_hessian_problem_scale_allows(
-                std::slice::from_ref(&blockspec),
-            )
             && base_family
                 .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
                 .has_hessian()
@@ -9311,12 +9308,7 @@ fn exact_joint_spatial_outer_hessian_available(
     design: &TermCollectionDesign,
 ) -> bool {
     let sparse_design = design.design.as_sparse().is_some();
-    family.link_function() == crate::types::LinkFunction::Identity
-        || (sparse_design
-            && crate::estimate::reml::exact_outer_hessian_problem_scale_allows(
-                design.design.nrows(),
-                design.design.ncols(),
-            ))
+    family.link_function() == crate::types::LinkFunction::Identity || sparse_design
 }
 
 fn spatial_tau_tau_hessian_policy(
