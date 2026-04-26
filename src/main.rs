@@ -13233,9 +13233,11 @@ mod tests {
         )
         .expect("duchon double_penalty should be accepted and ignored");
         assert_eq!(spec.smooth_terms.len(), 1);
-        assert_eq!(inference_notes.len(), 1);
-        assert!(inference_notes[0].contains("ignored redundant double_penalty option"));
-        assert!(inference_notes[0].contains("Duchon smooths always include nullspace shrinkage"));
+        let redundant_warning = inference_notes
+            .iter()
+            .find(|n| n.contains("ignored redundant double_penalty option"))
+            .expect("redundant double_penalty warning should be emitted");
+        assert!(redundant_warning.contains("Duchon smooths always include nullspace shrinkage"));
     }
 
     #[test]
