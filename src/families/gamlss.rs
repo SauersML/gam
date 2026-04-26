@@ -115,10 +115,9 @@ fn dense_block_or_operator<'a>(
 
     let dense_bytes = 8usize.saturating_mul(n).saturating_mul(p);
     if dense_bytes <= budget_bytes {
-        if let Ok(arc) = design.try_to_dense_with_policy(
-            &policy.material_policy(),
-            "gamlss dense_block_or_operator",
-        ) {
+        if let Ok(arc) = design
+            .try_to_dense_with_policy(&policy.material_policy(), "gamlss dense_block_or_operator")
+        {
             return DenseOrOperator::Owned(arc.as_ref().clone());
         }
     }

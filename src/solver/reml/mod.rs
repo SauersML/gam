@@ -2316,7 +2316,6 @@ mod tests {
              analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
         );
     }
-
 }
 
 #[derive(Clone, Copy, Debug)]
