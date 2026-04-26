@@ -4404,9 +4404,19 @@ impl<'a> RemlState<'a> {
 mod tk_math_tests {
     use super::*;
     use crate::faer_ndarray::FaerCholesky;
+    use crate::mixture_link::{
+        beta_logistic_inverse_link_jet, beta_logistic_inverse_link_pdffourth_derivative,
+        beta_logistic_inverse_link_pdfthird_derivative, inverse_link_jet_for_inverse_link,
+        inverse_link_pdffourth_derivative_for_inverse_link,
+        inverse_link_pdfthird_derivative_for_inverse_link, mixture_inverse_link_jet,
+        sas_inverse_link_jet, sas_inverse_link_pdffourth_derivative,
+        sas_inverse_link_pdfthird_derivative, state_fromspec,
+    };
+    use crate::pirls::{VarianceJet, e_obs_from_jets};
+    use crate::types::{LinkComponent, MixtureLinkSpec};
     use faer::Side;
     use ndarray::array;
-    use num_dual::{Dual64, DualNum};
+    use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
 
     fn solve_vec(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
         h.cholesky(Side::Lower).expect("chol(H)").solvevec(rhs)
@@ -4569,5 +4579,353 @@ mod tk_math_tests {
             rel < 1.0e-12,
             "Tierney-Kadane analytic c/d propagation does not match Dual64 AD reference: analytic={analytic:.12e}, ad={dv_tk_ad:.12e}, rel={rel:.3e}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    //  Analytic e_i = ∂³W_obs/∂η³ vs. Dual3 AD across non-Logit links.
+    //
+    //  These tests verify the general observed-Hessian path that
+    //  `RemlState::hessian_cde_arrays` invokes for every non-canonical link
+    //  (Probit, CLogLog, SAS, BetaLogistic, Mixture).  The reference is
+    //  `num_dual::third_derivative`, which evaluates W_obs(η₀+δ) in
+    //  third-order dual arithmetic and extracts ∂³W_obs/∂δ³ at δ=0
+    //  symbolically – no finite differences anywhere.
+    //
+    //  The trick is that Dual3 only carries (re, v1, v2, v3) so any
+    //  Taylor truncation of μ to order δ³ is propagated *exactly* through
+    //  Dual3 arithmetic.  We therefore parametrise μ(δ), μ'(δ), μ''(δ)
+    //  as length-(4..6) Taylor polynomials whose coefficients come from
+    //  the *independently derived* closed-form helpers in
+    //  `mixture_link.rs` (μ⁽ᵏ⁾(η₀) for k ∈ 0..5).  This makes the test
+    //  link-agnostic: the same AD machinery validates the polynomial
+    //  formula in `pirls::e_obs_from_jets` for every link.
+    // ---------------------------------------------------------------------
+
+    /// Build a Dual3 polynomial in δ representing
+    ///   μ(η₀ + δ) ≈ Σ_{k=0..5} μ⁽ᵏ⁾(η₀)·δᵏ/k!
+    /// truncated at δ³ – Dual3's arithmetic discards higher-order terms
+    /// anyway, so the propagated (re, v1, v2, v3) match the analytic
+    /// values μ⁽⁰⁾..μ⁽³⁾(η₀) exactly.
+    fn taylor_mu_dual3(delta: Dual3_64, h0: f64, h1: f64, h2: f64, h3: f64) -> Dual3_64 {
+        let inv2 = 0.5_f64;
+        let inv6 = 1.0_f64 / 6.0_f64;
+        let d2 = delta * delta;
+        let d3 = d2 * delta;
+        Dual3_64::from_re(h0) + delta * h1 + d2 * (h2 * inv2) + d3 * (h3 * inv6)
+    }
+
+    /// Same Taylor expansion as [`taylor_mu_dual3`] but starting one order
+    /// later in the η-jet, so that the resulting Dual3 represents
+    ///   ∂μ/∂η at η₀+δ ≈ Σ_{k=0..4} μ⁽ᵏ⁺¹⁾(η₀)·δᵏ/k!
+    /// (used as the closed-form `h1(δ)` carrier inside W_obs).
+    fn taylor_mu_eta_dual3(delta: Dual3_64, h1: f64, h2: f64, h3: f64, h4: f64) -> Dual3_64 {
+        let inv2 = 0.5_f64;
+        let inv6 = 1.0_f64 / 6.0_f64;
+        let d2 = delta * delta;
+        let d3 = d2 * delta;
+        Dual3_64::from_re(h1) + delta * h2 + d2 * (h3 * inv2) + d3 * (h4 * inv6)
+    }
+
+    /// Closed-form `h2(δ)` carrier (= ∂²μ/∂η² at η₀+δ) as a Dual3 Taylor
+    /// polynomial – picks up `h5` in its δ³ coefficient.
+    fn taylor_mu_etaeta_dual3(delta: Dual3_64, h2: f64, h3: f64, h4: f64, h5: f64) -> Dual3_64 {
+        let inv2 = 0.5_f64;
+        let inv6 = 1.0_f64 / 6.0_f64;
+        let d2 = delta * delta;
+        let d3 = d2 * delta;
+        Dual3_64::from_re(h2) + delta * h3 + d2 * (h4 * inv2) + d3 * (h5 * inv6)
+    }
+
+    /// Closed-form W_obs for a binomial likelihood with arbitrary link:
+    ///   W_obs(η) = h₁²/(φV) − (y−μ)·(h₂·V − h₁²·V_μ)/(φV²)
+    /// where V(μ)=μ(1−μ) and V_μ(μ)=1−2μ.  Built entirely from the three
+    /// Taylor carriers (mu, mu_eta, mu_etaeta) using only num_dual ops.
+    fn binomial_w_obs_dual3(
+        mu: Dual3_64,
+        mu_eta: Dual3_64,
+        mu_etaeta: Dual3_64,
+        y: f64,
+        phi: f64,
+    ) -> Dual3_64 {
+        let one = Dual3_64::from_re(1.0);
+        let two = Dual3_64::from_re(2.0);
+        let v = mu * (one - mu);
+        let v_mu = one - two * mu;
+        let h1sq = mu_eta * mu_eta;
+        // φ enters as a constant scalar — fold it into the existing
+        // Dual3 multiplications via `Mul<F>` instead of allocating a new
+        // Dual3 carrier (mathematically identical, just lighter).
+        let phi_v = v * phi;
+        let fisher = h1sq / phi_v;
+        let resid = Dual3_64::from_re(y) - mu;
+        let t_prime = (mu_etaeta * v - h1sq * v_mu) / (phi_v * v);
+        fisher - resid * t_prime
+    }
+
+    /// Drive `pirls::e_obs_from_jets` and Dual3 AD for the same scalar
+    /// fixture and assert the analytic 3rd-η-derivative of W_obs matches
+    /// the AD reference to floating-point tolerance.
+    fn assert_e_obs_matches_dual3_ad(
+        link_label: &str,
+        eta0: f64,
+        y: f64,
+        h0: f64,
+        h1: f64,
+        h2: f64,
+        h3: f64,
+        h4: f64,
+        h5: f64,
+        phi: f64,
+        tol: f64,
+    ) {
+        let v = h0 * (1.0 - h0);
+        let vj = VarianceJet::bernoulli(h0);
+        assert!(
+            v.is_finite() && v > 0.0,
+            "fixture {link_label} (eta={eta0}) has degenerate V(μ)={v}; pick a non-saturated point"
+        );
+        let analytic = e_obs_from_jets(y, h0, h1, h2, h3, h4, h5, vj, phi, 1.0);
+
+        let (_, _, _, d3_w) = third_derivative(
+            |delta| {
+                let mu = taylor_mu_dual3(delta, h0, h1, h2, h3);
+                let mu_eta = taylor_mu_eta_dual3(delta, h1, h2, h3, h4);
+                let mu_etaeta = taylor_mu_etaeta_dual3(delta, h2, h3, h4, h5);
+                binomial_w_obs_dual3(mu, mu_eta, mu_etaeta, y, phi)
+            },
+            0.0_f64,
+        );
+
+        let scale = analytic.abs().max(d3_w.abs()).max(1.0e-12);
+        let rel = (analytic - d3_w).abs() / scale;
+        assert!(
+            rel < tol,
+            "{link_label}: analytic e_obs ({analytic:.12e}) does not match Dual3 AD ({d3_w:.12e}) at eta={eta0}, y={y}; rel={rel:.3e}"
+        );
+    }
+
+    /// Probit + Bernoulli: closed-form e_obs (via `pirls::e_obs_from_jets`)
+    /// matches the Dual3-AD third η-derivative of W_obs at every fixture
+    /// point.  This is the production link for biobank-scale GAMLSS
+    /// marginal-slope inference, so we cover both shoulders and the
+    /// origin to exercise the (η³,η²,η) polynomial structure of the
+    /// Probit jets.
+    #[test]
+    fn e_obs_from_jets_matches_dual3_ad_probit_bernoulli() {
+        let etas = [-1.4_f64, -0.4, 0.0, 0.6, 1.3];
+        let ys = [0.0_f64, 1.0];
+        let probit = InverseLink::Standard(LinkFunction::Probit);
+        for &eta in &etas {
+            let jet = inverse_link_jet_for_inverse_link(&probit, eta).expect("probit jet");
+            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&probit, eta)
+                .expect("probit h4");
+            let h5 = inverse_link_pdffourth_derivative_for_inverse_link(&probit, eta)
+                .expect("probit h5");
+            for &y in &ys {
+                assert_e_obs_matches_dual3_ad(
+                    "probit", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0, 1.0e-9,
+                );
+            }
+        }
+    }
+
+    /// CLogLog + Bernoulli: same AD vs analytic check.  CLogLog is the
+    /// canonical hazard-link for survival models so its W_obs has a
+    /// non-trivial residual term that exercises the full (h₁..h₅,
+    /// V₀..V₂) polynomial composition inside `e_obs_from_jets`.
+    #[test]
+    fn e_obs_from_jets_matches_dual3_ad_cloglog_bernoulli() {
+        let etas = [-1.6_f64, -0.5, 0.0, 0.4, 1.2];
+        let ys = [0.0_f64, 1.0];
+        let cloglog = InverseLink::Standard(LinkFunction::CLogLog);
+        for &eta in &etas {
+            let jet = inverse_link_jet_for_inverse_link(&cloglog, eta).expect("cloglog jet");
+            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&cloglog, eta)
+                .expect("cloglog h4");
+            let h5 = inverse_link_pdffourth_derivative_for_inverse_link(&cloglog, eta)
+                .expect("cloglog h5");
+            for &y in &ys {
+                assert_e_obs_matches_dual3_ad(
+                    "cloglog", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0, 1.0e-9,
+                );
+            }
+        }
+    }
+
+    /// Logit + Bernoulli (canonical fast-path consistency check):
+    /// `hessian_cde_arrays` ships canonical Logit through a dedicated
+    /// fast path that returns `pw·μ⁽⁴⁾(η)` (since W = h₁ for the
+    /// canonical pairing).  Independently, the *general* observed-Hessian
+    /// path in `pirls::e_obs_from_jets` must produce the identical value
+    /// when evaluated on the same Logit jets, otherwise the two paths
+    /// would disagree on outer-gradient propagation.  We additionally
+    /// sanity-check both quantities against Dual3 AD.
+    #[test]
+    fn e_obs_from_jets_matches_dual3_ad_logit_bernoulli_canonical_consistency() {
+        let etas = [-1.7_f64, -0.6, 0.0, 0.5, 1.4];
+        let ys = [0.0_f64, 1.0];
+        let logit = InverseLink::Standard(LinkFunction::Logit);
+        for &eta in &etas {
+            let jet = inverse_link_jet_for_inverse_link(&logit, eta).expect("logit jet");
+            let h4 =
+                inverse_link_pdfthird_derivative_for_inverse_link(&logit, eta).expect("logit h4");
+            let h5 = inverse_link_pdffourth_derivative_for_inverse_link(&logit, eta)
+                .expect("logit h5");
+
+            // The (y−μ) residual term in the general formula must drop
+            // out when y is replaced by μ; pick y = μ to isolate
+            // W_F = h₁²/V = h₁ on the Logit canonical pairing and confirm
+            // that path returns h⁽⁴⁾, which is exactly the value the
+            // canonical fast-path stores in `e_array`.
+            let canonical_fast_path = h4; // W = h₁ ⇒ ∂³W/∂η³ = h⁽⁴⁾.
+            let general_at_y_eq_mu = e_obs_from_jets(
+                jet.mu,
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                h4,
+                h5,
+                VarianceJet::bernoulli(jet.mu),
+                1.0,
+                1.0,
+            );
+            let rel_fast = (general_at_y_eq_mu - canonical_fast_path).abs()
+                / canonical_fast_path.abs().max(1.0e-12);
+            assert!(
+                rel_fast < 1.0e-10,
+                "Logit canonical fast path ({canonical_fast_path:.12e}) does not match general e_obs at y=μ ({general_at_y_eq_mu:.12e}) at eta={eta}; rel={rel_fast:.3e}"
+            );
+
+            for &y in &ys {
+                assert_e_obs_matches_dual3_ad(
+                    "logit", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0, 1.0e-9,
+                );
+            }
+        }
+    }
+
+    /// SAS + Bernoulli: validate `e_obs_from_jets` against Dual3 AD using
+    /// the closed-form SAS jets `(μ, h₁..h₃)` from `sas_inverse_link_jet`
+    /// plus the analytic `h₄, h₅` helpers.  Two SAS shape parameters are
+    /// covered to exercise both the symmetric (ε≈0) and skewed regimes.
+    #[test]
+    fn e_obs_from_jets_matches_dual3_ad_sas_bernoulli() {
+        let etas = [-1.1_f64, -0.3, 0.0, 0.5, 1.0];
+        let ys = [0.0_f64, 1.0];
+        let configs = [(-0.25_f64, 0.35_f64), (0.4_f64, -0.2_f64)];
+        for &(epsilon, log_delta) in &configs {
+            let state = SasLinkState::new(epsilon, log_delta).expect("sas state");
+            let link = InverseLink::Sas(state);
+            for &eta in &etas {
+                let jet = sas_inverse_link_jet(eta, state.epsilon, state.log_delta);
+                let h4 = sas_inverse_link_pdfthird_derivative(eta, state.epsilon, state.log_delta);
+                let h5 = sas_inverse_link_pdffourth_derivative(eta, state.epsilon, state.log_delta);
+                // Cross-check the Result-returning dispatch path used by
+                // `hessian_cde_arrays` against the direct closed-form
+                // helpers — both must return the same h₄, h₅.
+                let h4_dispatch = inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+                    .expect("sas h4 via dispatch");
+                let h5_dispatch = inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
+                    .expect("sas h5 via dispatch");
+                assert!(
+                    (h4 - h4_dispatch).abs() <= 1.0e-12 * h4.abs().max(1.0),
+                    "sas h4 dispatch mismatch at eta={eta}, eps={epsilon}, log_delta={log_delta}: direct={h4} dispatch={h4_dispatch}"
+                );
+                assert!(
+                    (h5 - h5_dispatch).abs() <= 1.0e-12 * h5.abs().max(1.0),
+                    "sas h5 dispatch mismatch at eta={eta}, eps={epsilon}, log_delta={log_delta}: direct={h5} dispatch={h5_dispatch}"
+                );
+                for &y in &ys {
+                    assert_e_obs_matches_dual3_ad(
+                        "sas", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0, 1.0e-9,
+                    );
+                }
+            }
+        }
+    }
+
+    /// BetaLogistic + Bernoulli: the third production-grade flexible link
+    /// shipped by the GAMLSS marginal-slope family.  Same Dual3 AD test
+    /// against `e_obs_from_jets`, exercised at two (delta, ε) shape pairs.
+    #[test]
+    fn e_obs_from_jets_matches_dual3_ad_beta_logistic_bernoulli() {
+        let etas = [-1.0_f64, -0.25, 0.0, 0.4, 0.9];
+        let ys = [0.0_f64, 1.0];
+        let configs = [(0.18_f64, -0.22_f64), (-0.3_f64, 0.4_f64)];
+        for &(epsilon, log_delta) in &configs {
+            let delta = log_delta.exp();
+            let state = SasLinkState {
+                epsilon,
+                log_delta,
+                delta,
+            };
+            let link = InverseLink::BetaLogistic(state);
+            for &eta in &etas {
+                let jet = beta_logistic_inverse_link_jet(eta, state.log_delta, state.epsilon);
+                let h4 = beta_logistic_inverse_link_pdfthird_derivative(
+                    eta,
+                    state.log_delta,
+                    state.epsilon,
+                );
+                let h5 = beta_logistic_inverse_link_pdffourth_derivative(
+                    eta,
+                    state.log_delta,
+                    state.epsilon,
+                );
+                let h4_dispatch = inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+                    .expect("beta-logistic h4 dispatch");
+                let h5_dispatch = inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
+                    .expect("beta-logistic h5 dispatch");
+                assert!(
+                    (h4 - h4_dispatch).abs() <= 1.0e-12 * h4.abs().max(1.0),
+                    "beta-logistic h4 dispatch mismatch at eta={eta}: direct={h4} dispatch={h4_dispatch}"
+                );
+                assert!(
+                    (h5 - h5_dispatch).abs() <= 1.0e-12 * h5.abs().max(1.0),
+                    "beta-logistic h5 dispatch mismatch at eta={eta}: direct={h5} dispatch={h5_dispatch}"
+                );
+                for &y in &ys {
+                    assert_e_obs_matches_dual3_ad(
+                        "beta-logistic", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0,
+                        1.0e-9,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Mixture-of-links + Bernoulli: μ is a convex combination of standard
+    /// component inverse links, so every η-derivative is the matching
+    /// convex combination of the per-component derivatives.  We cover a
+    /// 4-component Probit/Logit/CLogLog/Cauchit mixture to exercise the
+    /// dispatch path inside `inverse_link_pdf{third,fourth}_derivative_for_inverse_link`.
+    #[test]
+    fn e_obs_from_jets_matches_dual3_ad_mixture_bernoulli() {
+        let spec = MixtureLinkSpec {
+            components: vec![
+                LinkComponent::Probit,
+                LinkComponent::Logit,
+                LinkComponent::CLogLog,
+                LinkComponent::Cauchit,
+            ],
+            initial_rho: Array1::from_vec(vec![0.35, -0.45, 0.2]),
+        };
+        let state = state_fromspec(&spec).expect("mixture state");
+        let link = InverseLink::Mixture(state.clone());
+        let etas = [-1.2_f64, -0.4, 0.0, 0.5, 1.1];
+        let ys = [0.0_f64, 1.0];
+        for &eta in &etas {
+            let jet = mixture_inverse_link_jet(&state, eta);
+            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+                .expect("mixture h4 dispatch");
+            let h5 = inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
+                .expect("mixture h5 dispatch");
+            for &y in &ys {
+                assert_e_obs_matches_dual3_ad(
+                    "mixture", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0, 1.0e-9,
+                );
+            }
+        }
     }
 }
