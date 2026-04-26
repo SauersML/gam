@@ -129,7 +129,7 @@ pub struct TransformationNormalFamily {
     /// Derivative design operator on the monotonicity grid: the virtual row
     /// space is the Cartesian product of all training covariate rows with a
     /// bounded response grid (knots, support quantiles, interval guard points,
-    /// tail guards). Stored as the `KroneckerDesign::OuterFactored` variant —
+    /// tail guards). Stored as the `KroneckerDesign::Kronecker` variant —
     /// the (n_grid × p_resp) response-direction factor and the unmodified
     /// covariate design are kept separate, so the n_cov*n_grid × p_total
     /// row-replicated form is never materialized. Only `forward_mul` is
@@ -254,8 +254,8 @@ impl TransformationNormalFamily {
         let p_resp = resp_val.ncols();
 
         // ----- 2. Row-wise Kronecker product (operator form) -----
-        let x_val_kron = KroneckerDesign::new(&resp_val, covariate_design.clone())?;
-        let x_deriv_kron = KroneckerDesign::new(&resp_deriv, covariate_design.clone())?;
+        let x_val_kron = KroneckerDesign::new_khatri_rao(&resp_val, covariate_design.clone())?;
+        let x_deriv_kron = KroneckerDesign::new_khatri_rao(&resp_deriv, covariate_design.clone())?;
         let x_deriv_grid_kron = build_monotonicity_derivative_grid_kron(
             response,
             &resp_knots,
@@ -268,12 +268,12 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
         // Hard invariant (release+debug): the monotonicity grid design must
-        // remain OuterFactored. Switching it to the row-wise Factored variant
-        // re-introduces the n_cov*n_grid row replication and OOMs at biobank
-        // scale. Cost is one match per family construction.
+        // remain the Kronecker variant. Switching it to the row-wise KhatriRao
+        // variant re-introduces the n_cov*n_grid row replication and OOMs at
+        // biobank scale. Cost is one match per family construction.
         assert!(
-            matches!(x_deriv_grid_kron, KroneckerDesign::OuterFactored { .. }),
-            "x_deriv_grid_kron must be OuterFactored — Factored re-introduces O(n_cov*n_grid*p_total) materialization",
+            matches!(x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
+            "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) row-replicated materialization",
         );
 
         // ----- 3. Warm start -----
@@ -403,8 +403,8 @@ impl TransformationNormalFamily {
         let p_resp = response_val_basis.ncols();
 
         // Row-wise Kronecker product (operator form).
-        let x_val_kron = KroneckerDesign::new(&response_val_basis, covariate_design.clone())?;
-        let x_deriv_kron = KroneckerDesign::new(&response_deriv_basis, covariate_design.clone())?;
+        let x_val_kron = KroneckerDesign::new_khatri_rao(&response_val_basis, covariate_design.clone())?;
+        let x_deriv_kron = KroneckerDesign::new_khatri_rao(&response_deriv_basis, covariate_design.clone())?;
         let p_total = p_resp * p_cov;
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
@@ -422,8 +422,8 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
         // Hard invariant — see TransformationNormalFamily::new for rationale.
         assert!(
-            matches!(x_deriv_grid_kron, KroneckerDesign::OuterFactored { .. }),
-            "x_deriv_grid_kron must be OuterFactored — Factored re-introduces O(n_cov*n_grid*p_total) materialization",
+            matches!(x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
+            "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) row-replicated materialization",
         );
         let initial_beta = compute_warm_start(
             &response_approx,
@@ -1564,7 +1564,7 @@ fn build_monotonicity_derivative_grid_kron(
     // Build the operator factored: the small (n_grid × p_resp) response-side
     // factor and the unmodified covariate design. The implied virtual row
     // space is n_cov × n_grid — never materialized.
-    KroneckerDesign::new_outer_factored(response_deriv_grid, covariate_design.clone())
+    KroneckerDesign::new_kronecker(response_deriv_grid, covariate_design.clone())
 }
 
 fn effective_response_num_internal_knots(
@@ -1688,44 +1688,51 @@ fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: u
 // Kronecker-aware operator for biobank-scale tensor products
 // ---------------------------------------------------------------------------
 
-/// A lazy representation of the row-wise Kronecker product `A ⊙ B`
-/// (face-splitting product / Khatri–Rao row-wise product).
+/// Discriminated union over two factored representations of a Kronecker-shaped
+/// design. Both variants compute `forward_mul` and `transpose_mul` from the
+/// natural factor pair without ever materializing the full matrix.
 ///
-/// The response basis is kept as a dense left factor and the covariate side is
-/// kept in its native `DesignMatrix` representation. Products are evaluated in
-/// factored form:
+/// `KhatriRao` is the row-wise Kronecker (face-splitting / Khatri–Rao) product
+/// `A ⊙ B`: both factors share `n` rows, and each output row is the elementwise
+/// Kronecker of the corresponding factor rows. Used for designs whose virtual
+/// rows already correspond one-to-one with covariate rows (value and
+/// derivative designs at observation points).
 ///
-///   forward_mul(β):  reshape β → (p_a, p_b), then result[i] = Σ_j A[i,j] * (B[i,:] · β[j,:])
-///   transpose_mul(v): result[j, k] = Σ_i v[i] * A[i,j] * B[i,k]
-///
-/// Storage: O(n·p_a + storage(B)) vs O(n·p_a·p_b) for the materialized form.
-///
-/// `OuterFactored` covers the monotonicity-grid design, where the virtual row
-/// space is the Cartesian product of `n_cov` covariate rows and `n_grid`
-/// response grid points (yielding `n_cov * n_grid` virtual rows). Row
-/// `(i, g)` mapped to flat index `i*n_grid + g` evaluates to
-/// `response_grid[g, :] ⊗ covariate[i, :]`. Columns use response-major
-/// ordering `a*p_cov + b`, identical to the row-wise `Factored` variant.
-/// Storage: O(n_grid·p_resp + storage(covariate)) vs the
-/// O(n_cov·n_grid·(p_resp + p_cov)) row-replicated form.
+/// `Kronecker` is the full tensor product. The virtual row space is the
+/// Cartesian product `n_cov × n_grid`; the two factors do not share a row
+/// count and are never replicated. Used for the monotonicity grid, where each
+/// covariate row is paired with every response grid point.
 #[derive(Clone)]
 enum KroneckerDesign {
-    Factored {
+    /// Row-wise Khatri–Rao product `A ⊙ B`.
+    ///
+    /// Element-wise definition (with `n` shared rows, `p_a` and `p_b` columns):
+    /// ```text
+    ///     (A ⊙ B)[i, a*p_b + b]  =  A[i, a] · B[i, b]
+    /// ```
+    /// Forward identity (used by `forward_mul`):
+    /// ```text
+    ///     ((A ⊙ B) β)[i] = Σ_{a,b} A[i,a] · B[i,b] · β_mat[a,b]
+    ///                    = Σ_a A[i,a] · (B · β_mat[a, :])[i]
+    /// ```
+    /// where `β_mat[a, b] = β[a*p_b + b]` (row-major reshape into `p_a × p_b`).
+    ///
+    /// Storage: `O(n·p_a + storage(B))`. The dense `n × (p_a · p_b)`
+    /// materialization is never built.
+    KhatriRao {
         left: Array2<f64>,   // n × p_a
         right: DesignMatrix, // n × p_b
     },
-    /// Operator for a virtual design matrix `X` whose rows are the Cartesian
-    /// product of `n_cov` covariate rows and `n_grid` response-grid points,
-    /// with row index `i*n_grid + g` (covariate-major) and column index
-    /// `a*p_cov + b` (response-major). Defined elementwise as
+    /// Full Kronecker product `R ⊗ C` with covariate-major row flattening.
     ///
+    /// The virtual row space is the Cartesian product `n_cov × n_grid` with row
+    /// index `i*n_grid + g` (covariate-major); columns use the same response-
+    /// major ordering `a*p_cov + b` as `KhatriRao`. Defined elementwise:
     /// ```text
     ///     X[(i, g), (a, b)]  =  R[g, a] · C[i, b]
     /// ```
-    ///
     /// where `R = response_grid` (n_grid × p_resp) and `C = covariate`
-    /// (n_cov × p_cov). The two factors are kept separate; `X` is never
-    /// materialized.
+    /// (n_cov × p_cov).
     ///
     /// Forward identity (used by `forward_mul`):
     /// ```text
@@ -1734,9 +1741,8 @@ enum KroneckerDesign {
     ///       = Σ_a R[g,a] · (C · β_matᵀ)[i, a]
     ///       = ((C · β_matᵀ) · Rᵀ)[i, g]
     /// ```
-    /// where `β_mat[a, b] = β[a*p_cov + b]` (row-major reshape into
-    /// `p_resp × p_cov`, matching the rest of the file's response-major
-    /// flattening).
+    /// with `β_mat[a, b] = β[a*p_cov + b]` (row-major reshape into
+    /// `p_resp × p_cov`).
     ///
     /// Transpose identity (used by `transpose_mul`):
     /// ```text
@@ -1746,12 +1752,12 @@ enum KroneckerDesign {
     ///       = (Cᵀ · (V · R)[:, a])[b]
     /// ```
     ///
-    /// In exact arithmetic this is a strict reassociation of the materialized
-    /// `Σ_{a,b}` sum; in IEEE-754 the factored and replicated forms agree to
-    /// within the BLAS-accumulation rounding floor (~1e-15). Storage:
-    /// `O(n_grid · p_resp + storage(C))` instead of the row-replicated
+    /// In exact arithmetic these identities are a strict reassociation of the
+    /// materialized `Σ_{a,b}` sum; in IEEE-754 the factored and replicated
+    /// forms agree to within the BLAS-accumulation rounding floor (~1e-15).
+    /// Storage: `O(n_grid · p_resp + storage(C))` instead of the row-replicated
     /// `O(n_cov · n_grid · (p_resp + p_cov))`.
-    OuterFactored {
+    Kronecker {
         /// (n_grid × p_resp) — small response-direction derivative basis on
         /// the monotonicity grid. Independent of covariate rows.
         response_grid: Array2<f64>,
@@ -1761,7 +1767,7 @@ enum KroneckerDesign {
 }
 
 impl KroneckerDesign {
-    fn new(left: &Array2<f64>, right: DesignMatrix) -> Result<Self, String> {
+    fn new_khatri_rao(left: &Array2<f64>, right: DesignMatrix) -> Result<Self, String> {
         if left.nrows() != right.nrows() {
             return Err(format!(
                 "KroneckerDesign row mismatch: left={}, right={}",
@@ -1770,7 +1776,7 @@ impl KroneckerDesign {
             ));
         }
         assert_rowwise_kronecker_dimensions(left.nrows(), left.ncols(), right.ncols(), "CTN");
-        Ok(KroneckerDesign::Factored {
+        Ok(KroneckerDesign::KhatriRao {
             left: left.clone(),
             right,
         })
@@ -1779,17 +1785,17 @@ impl KroneckerDesign {
     /// Construct the outer-factored variant used by the monotonicity grid: the
     /// virtual row space is the Cartesian product `n_cov × n_grid`, and the
     /// two factors never need to share a row count.
-    fn new_outer_factored(
+    fn new_kronecker(
         response_grid: Array2<f64>,
         covariate: DesignMatrix,
     ) -> Result<Self, String> {
         if response_grid.ncols() == 0 {
-            return Err("OuterFactored response_grid has zero columns".to_string());
+            return Err("Kronecker response_grid has zero columns".to_string());
         }
         if covariate.ncols() == 0 {
-            return Err("OuterFactored covariate has zero columns".to_string());
+            return Err("Kronecker covariate has zero columns".to_string());
         }
-        Ok(KroneckerDesign::OuterFactored {
+        Ok(KroneckerDesign::Kronecker {
             response_grid,
             covariate,
         })
@@ -1797,8 +1803,8 @@ impl KroneckerDesign {
 
     fn nrows(&self) -> usize {
         match self {
-            KroneckerDesign::Factored { left, .. } => left.nrows(),
-            KroneckerDesign::OuterFactored {
+            KroneckerDesign::KhatriRao { left, .. } => left.nrows(),
+            KroneckerDesign::Kronecker {
                 response_grid,
                 covariate,
             } => covariate.nrows() * response_grid.nrows(),
@@ -1807,8 +1813,8 @@ impl KroneckerDesign {
 
     fn ncols(&self) -> usize {
         match self {
-            KroneckerDesign::Factored { left, right } => left.ncols() * right.ncols(),
-            KroneckerDesign::OuterFactored {
+            KroneckerDesign::KhatriRao { left, right } => left.ncols() * right.ncols(),
+            KroneckerDesign::Kronecker {
                 response_grid,
                 covariate,
             } => response_grid.ncols() * covariate.ncols(),
@@ -1819,7 +1825,7 @@ impl KroneckerDesign {
     /// Returns an n-vector.
     fn forward_mul(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
-            KroneckerDesign::Factored { left, right } => {
+            KroneckerDesign::KhatriRao { left, right } => {
                 let pa = left.ncols();
                 let pb = right.ncols();
                 let n = left.nrows();
@@ -1845,7 +1851,7 @@ impl KroneckerDesign {
                 }
                 result
             }
-            KroneckerDesign::OuterFactored {
+            KroneckerDesign::Kronecker {
                 response_grid,
                 covariate,
             } => {
@@ -1881,7 +1887,7 @@ impl KroneckerDesign {
     /// Returns a (p_a * p_b)-vector.
     fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
         match self {
-            KroneckerDesign::Factored { left, right } => {
+            KroneckerDesign::KhatriRao { left, right } => {
                 let n = left.nrows();
                 let pa = left.ncols();
                 let pb = right.ncols();
@@ -1907,7 +1913,7 @@ impl KroneckerDesign {
                 }
                 out
             }
-            KroneckerDesign::OuterFactored {
+            KroneckerDesign::Kronecker {
                 response_grid,
                 covariate,
             } => {
@@ -1952,11 +1958,11 @@ impl KroneckerDesign {
         other: &KroneckerDesign,
         policy: &ResourcePolicy,
     ) -> Result<Array2<f64>, String> {
-        if matches!(self, KroneckerDesign::OuterFactored { .. })
-            || matches!(other, KroneckerDesign::OuterFactored { .. })
+        if matches!(self, KroneckerDesign::Kronecker { .. })
+            || matches!(other, KroneckerDesign::Kronecker { .. })
         {
             return Err(
-                "KroneckerDesign::weighted_cross_with is not supported for the OuterFactored \
+                "KroneckerDesign::weighted_cross_with is not supported for the Kronecker \
                  monotonicity-grid variant: the virtual row space (n_cov × n_grid) does not \
                  align with weights of the underlying observations, and no caller in the \
                  transformation-normal family computes a weighted Gram on this design."
@@ -1965,8 +1971,8 @@ impl KroneckerDesign {
         }
         match (self, other) {
             (
-                KroneckerDesign::Factored { left: a, right: b },
-                KroneckerDesign::Factored { left: c, right: d },
+                KroneckerDesign::KhatriRao { left: a, right: b },
+                KroneckerDesign::KhatriRao { left: c, right: d },
             ) => {
                 // If both covariate sides are dense, stay fully factored.
                 if let (Some(b_dense), Some(d_dense)) = (b.as_dense_ref(), d.as_dense_ref()) {
@@ -2009,9 +2015,9 @@ impl KroneckerDesign {
                 }
                 Ok(out)
             }
-            _ => {
-                unreachable!("OuterFactored cross-with case is rejected by the early return above")
-            }
+            _ => unreachable!(
+                "Kronecker cross-with case is rejected by the early return above"
+            ),
         }
     }
 }
@@ -2066,7 +2072,7 @@ impl DenseDesignOperator for KroneckerDesign {
             });
         }
         match self {
-            KroneckerDesign::Factored { left, right } => {
+            KroneckerDesign::KhatriRao { left, right } => {
                 assert_rowwise_kronecker_dimensions(
                     rows.end.saturating_sub(rows.start),
                     left.ncols(),
@@ -2077,9 +2083,9 @@ impl DenseDesignOperator for KroneckerDesign {
                 let right_chunk = right.try_row_chunk(rows)?;
                 out.assign(&rowwise_kronecker(&left_chunk, &right_chunk));
             }
-            KroneckerDesign::OuterFactored { .. } => {
+            KroneckerDesign::Kronecker { .. } => {
                 panic!(
-                    "KroneckerDesign::row_chunk_into is not supported on the OuterFactored \
+                    "KroneckerDesign::row_chunk_into is not supported on the Kronecker \
                      monotonicity-grid design: it would materialize the n_cov*n_grid × p_total \
                      row-replicated form (the very allocation this variant exists to avoid). \
                      Use forward_mul / transpose_mul instead."
@@ -2091,14 +2097,14 @@ impl DenseDesignOperator for KroneckerDesign {
 
     fn to_dense(&self) -> Array2<f64> {
         match self {
-            KroneckerDesign::Factored { left, right } => {
+            KroneckerDesign::KhatriRao { left, right } => {
                 assert_no_rowwise_kronecker_materialization(
                     left.nrows(),
                     left.ncols(),
                     right.ncols(),
                 );
             }
-            KroneckerDesign::OuterFactored {
+            KroneckerDesign::Kronecker {
                 response_grid,
                 covariate,
             } => {
@@ -2895,7 +2901,7 @@ mod tests {
         ];
         let weights = array![0.7, 1.4, 0.9, 1.2];
         let v = array![0.6, -0.3, 0.5, 0.8];
-        let kron = KroneckerDesign::new(
+        let kron = KroneckerDesign::new_khatri_rao(
             &left,
             DesignMatrix::Dense(DenseDesignMatrix::from(right.clone())),
         )
@@ -3075,7 +3081,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_factored_kronecker_design_matches_materialized_form() {
+    fn kronecker_variant_matches_materialized_form() {
         // Tiny inputs: n_cov=4 covariate rows, n_grid=3 monotonicity-grid points,
         // p_resp=2 response-direction columns, p_cov=2 covariate columns.
         let response_grid = array![[1.0, 0.5], [0.7, -0.1], [-0.3, 0.9]];
@@ -3087,11 +3093,11 @@ mod tests {
         let p_total = p_resp * p_cov;
         let n_virtual = n_cov * n_grid;
 
-        let design = KroneckerDesign::new_outer_factored(
+        let design = KroneckerDesign::new_kronecker(
             response_grid.clone(),
             DesignMatrix::Dense(DenseDesignMatrix::from(cov.clone())),
         )
-        .expect("OuterFactored construction");
+        .expect("Kronecker variant construction");
         assert_eq!(design.nrows(), n_virtual);
         assert_eq!(design.ncols(), p_total);
 
