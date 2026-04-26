@@ -18730,6 +18730,14 @@ mod tests {
                 );
             }
         }
+        // Symmetry guardrail: floating-point skew must be at the noise floor.
+        let skew = (&analytic - &analytic.t())
+            .mapv(f64::abs)
+            .fold(0.0_f64, |acc, &v| acc.max(v));
+        assert!(
+            skew <= 1e-12,
+            "Gaussian static joint Hessian skew exceeds noise floor: {skew}"
+        );
     }
 
     #[test]
@@ -18809,6 +18817,13 @@ mod tests {
                 );
             }
         }
+        let skew = (&analytic - &analytic.t())
+            .mapv(f64::abs)
+            .fold(0.0_f64, |acc, &v| acc.max(v));
+        assert!(
+            skew <= 1e-12,
+            "Gaussian first-directional dH skew exceeds noise floor: {skew}"
+        );
     }
 
     #[test]
@@ -18919,6 +18934,13 @@ mod tests {
                 );
             }
         }
+        let skew = (&analytic - &analytic.t())
+            .mapv(f64::abs)
+            .fold(0.0_f64, |acc, &v| acc.max(v));
+        assert!(
+            skew <= 1e-10,
+            "Gaussian second-directional d2H skew exceeds noise floor: {skew}"
+        );
     }
 
     #[test]
