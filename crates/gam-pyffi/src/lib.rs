@@ -875,7 +875,11 @@ fn schema_check(
         .filter(|column| response_column.as_deref() != Some(column.name.as_str()))
         .map(|column| column.name.clone())
         .collect::<BTreeSet<_>>();
-    let present_names = headers.iter().cloned().collect::<BTreeSet<_>>();
+    let present_names = headers
+        .iter()
+        .filter(|name| response_column.as_deref() != Some(name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut issues = Vec::<SchemaIssue>::new();
 
     for missing in expected_names.difference(&present_names) {
