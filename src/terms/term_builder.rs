@@ -13,7 +13,7 @@ use crate::basis::{
     DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
     MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
-    minimum_duchon_power_for_operator_penalties, plan_spatial_basis,
+    plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
@@ -350,7 +350,31 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
-            let nullspace_order = parse_duchon_order(options)?;
+            let requested_nullspace_order = parse_duchon_order(options)?;
+            let length_scale = option_f64(options, "length_scale");
+            // Resolve `(nullspace_order, power)` against the joint constraints
+            // (operator collocation + pure-mode CPD). Explicit power keeps the
+            // user's nullspace as-is (validator will reject inconsistent combos);
+            // the policy path may auto-escalate the nullspace order in pure mode
+            // when CPD requires a richer polynomial absorption space.
+            let (nullspace_order, power) = match parse_duchon_power_policy(options)? {
+                DuchonPowerPolicy::Explicit(power) => (requested_nullspace_order, power),
+                DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
+                    let resolved =
+                        resolve_duchon_orders(cols.len(), requested_nullspace_order, 2, length_scale);
+                    if resolved.0 != requested_nullspace_order {
+                        inference_notes.push(format!(
+                            "Note: pure Duchon CPD against polynomial nullspace requires order ≥ {:?} \
+                             at dimension {} (Wendland 8.17, 2s < d); auto-escalated from {:?}. \
+                             Specify length_scale=... to use hybrid Duchon and bypass this constraint.",
+                            resolved.0,
+                            cols.len(),
+                            requested_nullspace_order,
+                        ));
+                    }
+                    resolved
+                }
+            };
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
                 cols.len(),
@@ -366,13 +390,6 @@ pub fn build_smooth_basis(
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
-            let power = match parse_duchon_power_policy(options)? {
-                DuchonPowerPolicy::Explicit(power) => power,
-                DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
-                    minimum_duchon_power_for_operator_penalties(cols.len(), nullspace_order, 2)
-                }
-            };
-            let length_scale = option_f64(options, "length_scale");
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
             } else {
