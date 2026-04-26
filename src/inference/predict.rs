@@ -2061,8 +2061,13 @@ pub struct GaussianLocationScalePredictor {
 }
 
 impl GaussianLocationScalePredictor {
-    /// Compute sigma = exp(eta_noise + offset_noise) * response_scale for each observation.
-    /// Clamps the linear predictor to [-500, 500] to prevent overflow/underflow in exp().
+    /// Compute σ = (LOGB_SIGMA_FLOOR + exp(η_noise + offset_noise)) · response_scale.
+    /// The logb link bounds σ ≥ LOGB_SIGMA_FLOOR · response_scale > 0 in
+    /// response units, matching the fit-time parameterization in
+    /// `gaussian_diagonal_row_kernel`. The previous `clamp(-500, 500)` on η
+    /// was a defensive guard against `exp` underflow with the pure-exp link;
+    /// it is unnecessary here because the floor keeps σ representable for any
+    /// finite η.
     fn compute_sigma(
         &self,
         design_noise: &DesignMatrix,
@@ -2079,7 +2084,10 @@ impl GaussianLocationScalePredictor {
             }
             eta_noise += offset_noise;
         }
-        Ok(eta_noise.mapv(|eta| eta.clamp(-500.0, 500.0).exp() * self.response_scale))
+        let scale = self.response_scale;
+        Ok(eta_noise.mapv(|eta| {
+            crate::families::sigma_link::logb_sigma_from_eta_scalar(eta) * scale
+        }))
     }
 
     fn eta_standard_error(
