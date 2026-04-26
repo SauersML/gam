@@ -9959,7 +9959,12 @@ mod tests {
         let reference = hop.solve(&v);
 
         for k in 0..p {
-            assert_relative_eq!(streamed[k], reference[k], epsilon = 1e-12, max_relative = 1e-12);
+            assert_relative_eq!(
+                streamed[k],
+                reference[k],
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
         }
     }
 
