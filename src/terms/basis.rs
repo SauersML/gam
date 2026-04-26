@@ -1839,6 +1839,66 @@ pub fn minimum_duchon_power_for_operator_penalties(
     s
 }
 
+/// Resolve a fully admissible Duchon `(nullspace_order, power)` pair.
+///
+/// Three constraints fold into one resolution:
+///   (a) operator collocation up to `max_op`:        `2(p + s) > d + max_op`
+///   (b) pure-mode CPD vs polynomial nullspace P_p:  `2s < d`
+///       (Wendland Thm 8.17: pure polyharmonic kernel of order m = p+s in
+///        R^d is CPD of order `m − ⌊d/2⌋ + 1[d even, log] / m − (d−1)/2
+///        [d odd]`, and Duchon interpolation against P_p is well-posed iff
+///        CPD order ≤ p, which collapses to `2s < d` since 2s, d are
+///        integers and 2s is even.)
+///   (a) implies the kernel-existence condition `2(p + s) > d`.
+///   (b) is dropped when `length_scale` is `Some` (hybrid Matérn-blended
+///       kernel is strictly PD, CPD order 0).
+///
+/// Strategy: at the requested `nullspace_order`, take the smallest `s`
+/// satisfying (a). If that `s` violates (b) in pure mode, escalate the
+/// nullspace order by one and retry. Termination: at `p ≥ ⌈(d+max_op)/2⌉ + 1`
+/// the operator constraint (a) admits `s = 0`, and `0 < d` satisfies (b)
+/// for any `d ≥ 1`, so escalation always converges.
+///
+/// The returned nullspace order is monotone in the request: it never
+/// decreases the user's requested order — only strengthens it when pure-mode
+/// CPD requires a richer polynomial absorption space.
+pub fn resolve_duchon_orders(
+    dim: usize,
+    requested_nullspace_order: DuchonNullspaceOrder,
+    max_operator_derivative_order: usize,
+    length_scale: Option<f64>,
+) -> (DuchonNullspaceOrder, usize) {
+    assert!(dim >= 1, "Duchon basis requires dim >= 1");
+    let pure = length_scale.is_none();
+    let mut nullspace = requested_nullspace_order;
+    // Bounded loop: escalation terminates by the argument above.
+    for _ in 0..=(dim + max_operator_derivative_order + 1) {
+        let p = duchon_p_from_nullspace_order(nullspace);
+        // Smallest s with 2(p + s) > d + max_op:
+        //   2p > d + max_op            ⇒ s = 0
+        //   else s = ⌈(d + max_op + 1 − 2p) / 2⌉ = (d + max_op + 2 − 2p) / 2
+        let s_op = if 2 * p > dim + max_operator_derivative_order {
+            0
+        } else {
+            (dim + max_operator_derivative_order + 2 - 2 * p) / 2
+        };
+        if !pure || 2 * s_op < dim {
+            return (nullspace, s_op);
+        }
+        nullspace = duchon_next_nullspace_order(nullspace);
+    }
+    unreachable!("resolve_duchon_orders did not converge for dim={dim}, max_op={max_operator_derivative_order}, pure={pure}")
+}
+
+#[inline]
+fn duchon_next_nullspace_order(order: DuchonNullspaceOrder) -> DuchonNullspaceOrder {
+    match order {
+        DuchonNullspaceOrder::Zero => DuchonNullspaceOrder::Linear,
+        DuchonNullspaceOrder::Linear => DuchonNullspaceOrder::Degree(2),
+        DuchonNullspaceOrder::Degree(k) => DuchonNullspaceOrder::Degree(k + 1),
+    }
+}
+
 /// Returns the maximum derivative order required by the *active* operator
 /// penalties: 2 if stiffness is Active, else 1 if tension is Active, else 0.
 /// Mass-only (or no active operator) penalties only require kernel validity
