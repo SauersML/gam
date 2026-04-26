@@ -7332,7 +7332,7 @@ impl GaussianLocationScaleWiggleFamily {
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
         let xi = xmu.dot(&umu);
         let zeta = x_ls.dot(&u_ls);
-        // For the exact exp link κ = 1.
+        // logb κ-scaled η_ls direction; κ' = dκ/dη_ls = κ(1−κ).
         let szeta = &rows.kappa * &zeta;
         let phi = geom.basis.dot(&uw);
         let mut q_u = &geom.dq_dq0 * &xi;
@@ -7346,18 +7346,27 @@ impl GaussianLocationScaleWiggleFamily {
         let dw_u = -2.0 * &rows.w * &szeta;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
         let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
+        let amn = &rows.obs_weight - &rows.n;
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
             - &(&dm_u * &geom.d2q_dq02)
             - &(&rows.m * &g2_u);
-        // Cross blocks involving η_ls carry overall κ; scale-scale carries κ².
-        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u);
-        let coeff_ll_u = 2.0 * &rows.kappa * &rows.kappa * &dn_u;
+        // Static blocks: H_{μ,ls} = 2κm·dq_dq0; H_{ls,ls} = 2κ²n + κ'(a−n).
+        // Differentiating along α = (xi, zeta, phi) carries dκ/dη_ls = κ' on
+        // every term that originally read just κ. The η_w direction has no
+        // direct η_ls dependence so does not contribute κ' factors directly,
+        // but does enter dn_u via q_u as a μ-chain — already captured.
+        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
+            + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
+        let coeff_ll_u = 2.0 * &rows.kappa * &rows.kappa * &dn_u
+            + 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.n)
+            + &rows.kappa_dprime * &(&zeta * &amn)
+            - &rows.kappa_prime * &dn_u;
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let c_u = -&dm_u;
-        // ls-wiggle cross block carries one κ from the η_ls chain.
-        let l_u = 2.0 * &rows.kappa * &dm_u;
+        // ls-wiggle cross block: l = 2κm; differentiating gains 2κ'·m·zeta.
+        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&rows.m * &zeta);
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_u)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml_u, x_ls)?;
@@ -7448,20 +7457,28 @@ impl GaussianLocationScaleWiggleFamily {
         let basis1_v = scale_matrix_rows(&geom.basis_d2, &xi_v)?;
         let basis1_uv = scale_matrix_rows(&geom.basis_d3, &(&xi_u * &xi_v))?;
 
-        // For the exact exp link κ = 1.
+        // logb κ-scaled η_ls directions; κ' = κ(1−κ), κ'' = κ(1−κ)(1−2κ).
         let szeta_u = &rows.kappa * &zeta_u;
         let szeta_v = &rows.kappa * &zeta_v;
+        let zeta_u_zeta_v = &zeta_u * &zeta_v;
         let dw_u = -2.0 * &rows.w * &szeta_u;
         let dw_v = -2.0 * &rows.w * &szeta_v;
-        let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v);
+        // ∂²w/∂u∂v: differentiating −2wκζ_u along v gains a −2w·κ'·ζ_v·ζ_u
+        // term that the κ-as-constant code dropped.
+        let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v)
+            - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta_u);
         let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &szeta_v);
+        // ∂²m/∂u∂v: same structural κ' correction as dw_uv (the −2mκζ_u term
+        // gains −2m·κ'·ζ_v·ζ_u when differentiated along η_ls).
         let dm_uv = &(2.0 * &rows.w * &(&q_u * &szeta_v + &q_v * &szeta_u)) - &(&rows.w * &q_uv)
-            + &(4.0 * &rows.m * &(&szeta_u * &szeta_v));
+            + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
+            - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
         let dn_uv = &(2.0 * &rows.w * &(&q_u * &q_v))
             + &(4.0 * &rows.m * &(&q_u * &szeta_v + &q_v * &szeta_u))
             - &(2.0 * &rows.m * &q_uv)
-            + &(4.0 * &rows.n * &(&szeta_u * &szeta_v));
+            + &(4.0 * &rows.n * &(&szeta_u * &szeta_v))
+            - 2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v;
 
         let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &dw_u * &geom.dq_dq0 * &s1_v)
