@@ -210,7 +210,7 @@ mod tests {
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
     use crate::pirls::PirlsCoordinateFrame;
-    use crate::solver::outer_strategy::{HessianResult, OuterEval, OuterEvalOrder};
+    use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::GlmLikelihoodSpec;
     use faer::Side;
