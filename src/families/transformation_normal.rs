@@ -22,7 +22,9 @@
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
 };
-use crate::faer_ndarray::{default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_nullspace_basis};
+use crate::faer_ndarray::{
+    default_rrqr_rank_alpha, fast_ab, fast_ab_into, fast_atb, rrqr_nullspace_basis,
+};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiSecondOrderTerms,
@@ -265,6 +267,14 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
+        // Hard invariant (release+debug): the monotonicity grid design must
+        // remain OuterFactored. Switching it to the row-wise Factored variant
+        // re-introduces the n_cov*n_grid row replication and OOMs at biobank
+        // scale. Cost is one match per family construction.
+        assert!(
+            matches!(x_deriv_grid_kron, KroneckerDesign::OuterFactored { .. }),
+            "x_deriv_grid_kron must be OuterFactored — Factored re-introduces O(n_cov*n_grid*p_total) materialization",
+        );
 
         // ----- 3. Warm start -----
         let initial_beta = compute_warm_start(
@@ -410,6 +420,11 @@ impl TransformationNormalFamily {
             &covariate_design,
         )?;
         debug_assert_eq!(x_deriv_grid_kron.ncols(), p_total);
+        // Hard invariant — see TransformationNormalFamily::new for rationale.
+        assert!(
+            matches!(x_deriv_grid_kron, KroneckerDesign::OuterFactored { .. }),
+            "x_deriv_grid_kron must be OuterFactored — Factored re-introduces O(n_cov*n_grid*p_total) materialization",
+        );
         let initial_beta = compute_warm_start(
             &response_approx,
             weights,
@@ -1699,6 +1714,43 @@ enum KroneckerDesign {
         left: Array2<f64>,   // n × p_a
         right: DesignMatrix, // n × p_b
     },
+    /// Operator for a virtual design matrix `X` whose rows are the Cartesian
+    /// product of `n_cov` covariate rows and `n_grid` response-grid points,
+    /// with row index `i*n_grid + g` (covariate-major) and column index
+    /// `a*p_cov + b` (response-major). Defined elementwise as
+    ///
+    /// ```text
+    ///     X[(i, g), (a, b)]  =  R[g, a] · C[i, b]
+    /// ```
+    ///
+    /// where `R = response_grid` (n_grid × p_resp) and `C = covariate`
+    /// (n_cov × p_cov). The two factors are kept separate; `X` is never
+    /// materialized.
+    ///
+    /// Forward identity (used by `forward_mul`):
+    /// ```text
+    ///     (X β)[i*n_grid + g]
+    ///       = Σ_{a,b} R[g,a] · C[i,b] · β_mat[a,b]
+    ///       = Σ_a R[g,a] · (C · β_matᵀ)[i, a]
+    ///       = ((C · β_matᵀ) · Rᵀ)[i, g]
+    /// ```
+    /// where `β_mat[a, b] = β[a*p_cov + b]` (row-major reshape into
+    /// `p_resp × p_cov`, matching the rest of the file's response-major
+    /// flattening).
+    ///
+    /// Transpose identity (used by `transpose_mul`):
+    /// ```text
+    ///     (Xᵀ v)[(a, b)]
+    ///       = Σ_{i,g} v[i*n_grid+g] · R[g,a] · C[i,b]
+    ///       = Σ_i C[i,b] · (V · R)[i, a]            with V[i,g] = v[i*n_grid+g]
+    ///       = (Cᵀ · (V · R)[:, a])[b]
+    /// ```
+    ///
+    /// In exact arithmetic this is a strict reassociation of the materialized
+    /// `Σ_{a,b}` sum; in IEEE-754 the factored and replicated forms agree to
+    /// within the BLAS-accumulation rounding floor (~1e-15). Storage:
+    /// `O(n_grid · p_resp + storage(C))` instead of the row-replicated
+    /// `O(n_cov · n_grid · (p_resp + p_cov))`.
     OuterFactored {
         /// (n_grid × p_resp) — small response-direction derivative basis on
         /// the monotonicity grid. Independent of covariate rows.
@@ -1803,24 +1855,24 @@ impl KroneckerDesign {
                 let p_cov = covariate.ncols();
                 debug_assert_eq!(beta.len(), p_resp * p_cov);
                 let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
-                // inner[i, a] = covariate.apply(beta[a, :])[i] — shape (n_cov × p_resp).
+                // inner[i, a] = covariate.apply(beta_mat[a, :])[i] — shape (n_cov × p_resp).
                 let mut inner = Array2::<f64>::zeros((n_cov, p_resp));
                 for a in 0..p_resp {
                     let cov_part = covariate.apply(&beta_mat.row(a).to_owned());
                     inner.column_mut(a).assign(&cov_part);
                 }
-                // outer = inner · response_grid^T  →  (n_cov × n_grid).
-                let outer = fast_ab(&inner, &response_grid.t().to_owned());
-                // Flatten covariate-major: out[i*n_grid + g] = outer[i, g].
-                let mut result = Array1::<f64>::zeros(n_cov * n_grid);
-                for i in 0..n_cov {
-                    let row_i = outer.row(i);
-                    let start = i * n_grid;
-                    for g in 0..n_grid {
-                        result[start + g] = row_i[g];
-                    }
-                }
-                result
+                // result_2d = inner · response_grid^T  →  (n_cov × n_grid),
+                // written directly into the row-major buffer that the returned
+                // Array1 will own. Default Array2 layout is row-major C-order,
+                // so flattening yields result[i*n_grid + g] = result_2d[i, g] —
+                // exactly the covariate-major virtual-row layout.
+                // response_grid.t() is a zero-copy transposed view; faer accepts
+                // any positive-strided layout, so no temporary copy is made.
+                let mut result_2d = Array2::<f64>::zeros((n_cov, n_grid));
+                fast_ab_into(&inner, &response_grid.t(), &mut result_2d);
+                result_2d
+                    .into_shape_with_order((n_cov * n_grid,))
+                    .expect("row-major Array2 flattens to Array1 of length n_cov*n_grid")
             }
         }
     }
@@ -1864,10 +1916,13 @@ impl KroneckerDesign {
                 let p_resp = response_grid.ncols();
                 let p_cov = covariate.ncols();
                 debug_assert_eq!(v.len(), n_cov * n_grid);
-                // V is (n_cov × n_grid), covariate-major flattening of v.
+                // v reshaped as V (n_cov × n_grid) row-major view — matches the
+                // covariate-major flattening v[i*n_grid + g] = V[i, g]. Faer
+                // accepts the zero-copy view, so V is never duplicated.
                 let v_mat = v.view().into_shape_with_order((n_cov, n_grid)).unwrap();
                 // tmp = V · response_grid  →  (n_cov × p_resp).
-                let tmp = fast_ab(&v_mat.to_owned(), response_grid);
+                let mut tmp = Array2::<f64>::zeros((n_cov, p_resp));
+                fast_ab_into(&v_mat, response_grid, &mut tmp);
                 // For each a, out[a*p_cov..(a+1)*p_cov] = covariate^T · tmp[:, a].
                 let mut out = Array1::<f64>::zeros(p_resp * p_cov);
                 for a in 0..p_resp {
@@ -3017,6 +3072,70 @@ mod tests {
         let beta_minus = &state.beta - &(dir_v * h);
         let fd = (eval_dh(&beta_plus) - eval_dh(&beta_minus)) / (2.0 * h);
         assert_matrix_derivativefd(&fd, &analytic, 2e-4, "transformation normal joint d2H");
+    }
+
+    #[test]
+    fn outer_factored_kronecker_design_matches_materialized_form() {
+        // Tiny inputs: n_cov=4 covariate rows, n_grid=3 monotonicity-grid points,
+        // p_resp=2 response-direction columns, p_cov=2 covariate columns.
+        let response_grid = array![[1.0, 0.5], [0.7, -0.1], [-0.3, 0.9]];
+        let cov = array![[0.20, 1.10], [-0.40, 0.80], [0.55, -0.25], [0.10, 0.65]];
+        let n_cov = cov.nrows();
+        let n_grid = response_grid.nrows();
+        let p_resp = response_grid.ncols();
+        let p_cov = cov.ncols();
+        let p_total = p_resp * p_cov;
+        let n_virtual = n_cov * n_grid;
+
+        let design = KroneckerDesign::new_outer_factored(
+            response_grid.clone(),
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov.clone())),
+        )
+        .expect("OuterFactored construction");
+        assert_eq!(design.nrows(), n_virtual);
+        assert_eq!(design.ncols(), p_total);
+
+        // Materialize the reference: virtual row (i, g) has design row equal
+        // to response_grid[g, :] ⊗ cov[i, :] (response-major flattening).
+        let mut reference = Array2::<f64>::zeros((n_virtual, p_total));
+        for i in 0..n_cov {
+            for g in 0..n_grid {
+                let row = i * n_grid + g;
+                for a in 0..p_resp {
+                    for b in 0..p_cov {
+                        reference[[row, a * p_cov + b]] = response_grid[[g, a]] * cov[[i, b]];
+                    }
+                }
+            }
+        }
+
+        // forward_mul: choose a deterministic non-trivial beta and compare.
+        let beta = Array1::from_vec((0..p_total).map(|k| 0.3 + 0.17 * k as f64).collect());
+        let got_forward = design.forward_mul(&beta);
+        let expected_forward = reference.dot(&beta);
+        assert_eq!(got_forward.len(), n_virtual);
+        for i in 0..n_virtual {
+            assert!(
+                (got_forward[i] - expected_forward[i]).abs() < 1e-12,
+                "forward_mul mismatch at row {i}: got={}, expected={}",
+                got_forward[i],
+                expected_forward[i]
+            );
+        }
+
+        // transpose_mul: virtual-row vector v, compare against reference^T · v.
+        let v = Array1::from_vec((0..n_virtual).map(|k| -0.25 + 0.31 * k as f64).collect());
+        let got_transpose = design.transpose_mul(&v);
+        let expected_transpose = reference.t().dot(&v);
+        assert_eq!(got_transpose.len(), p_total);
+        for k in 0..p_total {
+            assert!(
+                (got_transpose[k] - expected_transpose[k]).abs() < 1e-12,
+                "transpose_mul mismatch at col {k}: got={}, expected={}",
+                got_transpose[k],
+                expected_transpose[k]
+            );
+        }
     }
 }
 
