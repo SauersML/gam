@@ -4717,8 +4717,8 @@ mod tk_math_tests {
         let probit = InverseLink::Standard(LinkFunction::Probit);
         for &eta in &etas {
             let jet = inverse_link_jet_for_inverse_link(&probit, eta).expect("probit jet");
-            let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&probit, eta)
-                .expect("probit h4");
+            let h4 =
+                inverse_link_pdfthird_derivative_for_inverse_link(&probit, eta).expect("probit h4");
             let h5 = inverse_link_pdffourth_derivative_for_inverse_link(&probit, eta)
                 .expect("probit h5");
             for &y in &ys {
@@ -4769,8 +4769,8 @@ mod tk_math_tests {
             let jet = inverse_link_jet_for_inverse_link(&logit, eta).expect("logit jet");
             let h4 =
                 inverse_link_pdfthird_derivative_for_inverse_link(&logit, eta).expect("logit h4");
-            let h5 = inverse_link_pdffourth_derivative_for_inverse_link(&logit, eta)
-                .expect("logit h5");
+            let h5 =
+                inverse_link_pdffourth_derivative_for_inverse_link(&logit, eta).expect("logit h5");
 
             // The (y−μ) residual term in the general formula must drop
             // out when y is replaced by μ; pick y = μ to isolate
@@ -4887,7 +4887,16 @@ mod tk_math_tests {
                 );
                 for &y in &ys {
                     assert_e_obs_matches_dual3_ad(
-                        "beta-logistic", eta, y, jet.mu, jet.d1, jet.d2, jet.d3, h4, h5, 1.0,
+                        "beta-logistic",
+                        eta,
+                        y,
+                        jet.mu,
+                        jet.d1,
+                        jet.d2,
+                        jet.d3,
+                        h4,
+                        h5,
+                        1.0,
                         1.0e-9,
                     );
                 }

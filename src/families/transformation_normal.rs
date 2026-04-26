@@ -2009,9 +2009,9 @@ impl KroneckerDesign {
                 }
                 Ok(out)
             }
-            _ => unreachable!(
-                "OuterFactored cross-with case is rejected by the early return above"
-            ),
+            _ => {
+                unreachable!("OuterFactored cross-with case is rejected by the early return above")
+            }
         }
     }
 }
