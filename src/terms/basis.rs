@@ -7574,56 +7574,47 @@ fn duchon_kernel_radial_triplet(
     k_dim: usize,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<(f64, f64, f64), BasisError> {
-    // Public Duchon (phi, phi_r, phi_rr) triplet.
+    // Public Duchon (φ, φ_r, φ_rr) triplet.
     //
-    // Pure Duchon keeps its direct polyharmonic path. Hybrid Duchon now
-    // delegates to `duchon_radial_jets(...)` so every public radial derivative
-    // shares the exact same differentiable family as q/lap/t and the operator
-    // penalty code paths.
-    let value = duchon_matern_kernel_general_from_distance(
-        r,
-        length_scale,
-        p_order,
-        s_order,
-        k_dim,
-        coeffs,
-    )?;
-    if !value.is_finite() {
-        return Err(BasisError::InvalidInput(format!(
-            "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale:?}, p={p_order}, s={s_order}, dim={k_dim}"
-        )));
-    }
+    // The Duchon spectral kernel is F(ρ) = 1 / [ρ^(2p)·(κ²+ρ²)^s]. The pure
+    // case (κ=0) is the κ→0 limit and collapses to a single polyharmonic of
+    // order m = p+s — value and both radial derivatives all come from one
+    // normalization in `polyharmonic_block_jet4`. The hybrid case (κ>0) is the
+    // partial-fraction sum; we route it through `duchon_radial_jets` so the
+    // public triplet shares the same Taylor / collision tiering used by the
+    // operator scalars (q, lap, t) in the penalty code.
+    let triplet = match length_scale {
+        None => {
+            let m = pure_duchon_block_order(p_order, s_order);
+            polyharmonic_kernel_triplet(r, m, k_dim)?
+        }
+        Some(length_scale) => {
+            if !length_scale.is_finite() || length_scale <= 0.0 {
+                return Err(BasisError::InvalidInput(
+                    "Duchon hybrid length_scale must be finite and positive".to_string(),
+                ));
+            }
+            let kappa = 1.0 / length_scale.max(1e-300);
+            let coeffs_local;
+            let coeffs_ref = match coeffs {
+                Some(c) => c,
+                None => {
+                    coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+                    &coeffs_local
+                }
+            };
+            let jets =
+                duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs_ref)?;
+            (jets.phi, jets.phi_r, jets.phi_rr)
+        }
+    };
 
-    let Some(length_scale) = length_scale else {
-        let block_order = pure_duchon_block_order(p_order, s_order);
-        let (_, mut first, second) = polyharmonic_kernel_triplet(r, block_order, k_dim)?;
-        if r == 0.0 {
-            first = 0.0;
-        }
-        if !first.is_finite() || !second.is_finite() {
-            return Err(BasisError::InvalidInput(format!(
-                "non-finite pure Duchon radial derivatives at r={r}, order={block_order}, dim={k_dim}"
-            )));
-        }
-        return Ok((value, first, second));
-    };
-    let kappa = 1.0 / length_scale.max(1e-300);
-    let coeffs_local;
-    let coeffs_ref = if let Some(c) = coeffs {
-        c
-    } else {
-        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-        &coeffs_local
-    };
-    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs_ref)?;
-    let first = jets.phi_r;
-    let second = jets.phi_rr;
-    if !first.is_finite() || !second.is_finite() {
+    if !triplet.0.is_finite() || !triplet.1.is_finite() || !triplet.2.is_finite() {
         return Err(BasisError::InvalidInput(format!(
-            "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale:?}, p={p_order}, s={s_order}, dim={k_dim}"
+            "non-finite Duchon radial triplet at r={r}, length_scale={length_scale:?}, p={p_order}, s={s_order}, dim={k_dim}"
         )));
     }
-    Ok((value, first, second))
+    Ok(triplet)
 }
 
 fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {

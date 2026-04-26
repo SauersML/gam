@@ -4423,20 +4423,27 @@ fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
     hop: &dyn HessianOperator,
 ) -> Result<Array1<f64>, String> {
-    let x = ing.x.to_dense_arc();
-    let x_ref = x.as_ref();
-    let n = x_ref.nrows();
-    let p = x_ref.ncols();
+    let n = ing.x.nrows();
+    let p = ing.x.ncols();
 
-    // Guard: the dense adjoint path effectively scales like O(n p²), so it is
-    // only appropriate for small corrected models.
-    const ZC_MAX_DENSE_WORK: usize = 200_000_000;
-    let dense_work = n.saturating_mul(p).saturating_mul(p);
-    if dense_work > ZC_MAX_DENSE_WORK {
+    // Guard: the dominant resource here is the dense `Z = H⁻¹ Xᵀ` matrix,
+    // which carries `n * p` f64 entries (the `solve_multi` output and the
+    // transposed `Xᵀ` input both have that shape).  FLOP-wise the call is
+    // `O(n p²)` but those FLOPs are vectorised dense triangular solves that
+    // cost a few hundred ms even at biobank scale; the real failure mode is
+    // allocating the `n × p`-element float buffer.  Cap the buffer at
+    // 200M f64 ≈ 1.6 GiB so very wide+tall designs (e.g. n=320 000, p≥625)
+    // fall back to the gradient-only path before they OOM.
+    const ZC_MAX_DENSE_FLOATS: usize = 200_000_000;
+    let dense_floats = n.saturating_mul(p);
+    if dense_floats > ZC_MAX_DENSE_FLOATS {
         return Err(hessian_unavailable(format!(
-            "adjoint GLM trace would require dense O(n*p^2) work (n={n}, p={p}, n*p^2={dense_work})"
+            "adjoint GLM trace dense Z=H⁻¹Xᵀ has {dense_floats} entries (n={n}, p={p}); exceeds {ZC_MAX_DENSE_FLOATS}-entry buffer cap"
         )));
     }
+
+    let x = ing.x.to_dense_arc();
+    let x_ref = x.as_ref();
 
     // Z = H⁻¹ Xᵀ  (p × n)
     let x_t = x_ref.t().to_owned();
@@ -9912,23 +9919,33 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_adjoint_z_c_guard_uses_quadratic_work() {
-        let n = 20_001usize;
-        let p = 100usize;
-        let x = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::<f64>::zeros((n, p)),
-        ));
+    fn test_compute_adjoint_z_c_guard_uses_dense_floats() {
+        // Memory cap is 200M f64 entries (Z = H⁻¹Xᵀ has n*p entries).  Pick
+        // shapes that trip n*p > 200M without forcing the test to allocate
+        // the corresponding 1.6 GiB design matrix: the guard runs before
+        // `to_dense_arc()` and only consults `nrows()/ncols()`, so an empty
+        // sparse design with the right reported shape is enough.
+        let n = 250_001usize;
+        let p = 1_000usize;
+        let sparse = faer::sparse::SparseColMat::<usize, f64>::try_new_from_triplets(n, p, &[])
+            .expect("empty sparse design should build");
+        let x = DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse));
         let c_array = Array1::ones(n);
         let ing = ScalarGlmIngredients {
             c_array: &c_array,
             d_array: None,
             x: &x,
         };
-        let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(p)).unwrap();
+        // A 1×1 operator is enough — the guard fires before any solve.
+        let hop = DenseSpectralOperator::from_symmetric(&Array2::<f64>::eye(1)).unwrap();
 
         let err = compute_adjoint_z_c(&ing, &hop)
             .expect_err("oversized adjoint trace should make the Hessian unavailable");
         assert!(is_hessian_unavailable(&err));
+        assert!(
+            err.contains("entries"),
+            "guard message should describe the buffer-entry cap, got: {err}"
+        );
     }
 
     #[test]
