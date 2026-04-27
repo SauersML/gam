@@ -3478,7 +3478,38 @@ where
                             if projected_grad <= near_stationary_tol {
                                 status = PirlsStatus::StalledAtValidMinimum;
                             } else {
-                                status = PirlsStatus::MaxIterationsReached;
+                                // Surface what actually exhausted: damping reached its
+                                // ceiling, retry counter exhausted, or lambda went non-
+                                // finite. The collapsed status hides that distinction;
+                                // this debug log restores it.
+                                let ceiling =
+                                    !loop_lambda.is_finite() || loop_lambda > LM_MAX_LAMBDA;
+                                let attempts_used = attempts >= lm_max_attempts;
+                                let max_abs_eta_now = state
+                                    .eta
+                                    .iter()
+                                    .copied()
+                                    .map(f64::abs)
+                                    .fold(0.0_f64, f64::max);
+                                log::debug!(
+                                    "[PIRLS] LM step search exhausted at iter={}: \
+                                     attempts={}/{} lambda={:.3e} (ceiling={}) \
+                                     projected_grad={:.3e} (near_stationary_tol={:.3e}) \
+                                     current_pen={:.6e} predicted_reduction={:.3e} \
+                                     max|eta|={:.1} attempts_exhausted={}",
+                                    iter,
+                                    attempts,
+                                    lm_max_attempts,
+                                    loop_lambda,
+                                    ceiling,
+                                    projected_grad,
+                                    near_stationary_tol,
+                                    current_penalized,
+                                    predicted_reduction,
+                                    max_abs_eta_now,
+                                    attempts_used,
+                                );
+                                status = PirlsStatus::LmStepSearchExhausted;
                             }
                             // Preserve the structural ridge from the model state.
                             final_state = Some(state.clone());
@@ -3539,7 +3570,7 @@ where
         options.coefficient_lower_bounds.as_ref(),
         options.linear_constraints.as_ref(),
     );
-    if matches!(status, PirlsStatus::MaxIterationsReached) {
+    if status.is_failed_max_iterations() {
         if final_projected_grad < options.convergence_tolerance {
             status = PirlsStatus::StalledAtValidMinimum;
         } else if final_projected_grad <= near_stationary_tol
@@ -3625,8 +3656,30 @@ pub enum PirlsStatus {
     StalledAtValidMinimum,
     /// Reached maximum iterations without converging.
     MaxIterationsReached,
+    /// Levenberg-Marquardt step search exhausted its retry budget (damping λ
+    /// reached its ceiling, attempts counter expired, or λ went non-finite)
+    /// before the projected gradient entered the near-stationary band. Distinct
+    /// from `MaxIterationsReached`, which means the outer iteration counter
+    /// itself ran out — that exhaustion is a "looped 100×, made progress each
+    /// time but never converged" signal, while this one is a "no acceptable
+    /// step direction even after damping" signal pointing at curvature trouble
+    /// or saturated likelihoods.
+    LmStepSearchExhausted,
     /// Fitting process became unstable, likely due to perfect separation.
     Unstable,
+}
+
+impl PirlsStatus {
+    /// Whether the inner loop concluded without producing a usable mode.
+    /// Both the iteration-cap and LM-exhausted exits should be treated the
+    /// same by callers that just want to know "did we get a valid solution?".
+    #[inline]
+    pub fn is_failed_max_iterations(self) -> bool {
+        matches!(
+            self,
+            PirlsStatus::MaxIterationsReached | PirlsStatus::LmStepSearchExhausted
+        )
+    }
 }
 
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
@@ -4689,7 +4742,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     }
 
     let mut status = working_summary.status.clone();
-    if matches!(status, PirlsStatus::MaxIterationsReached) {
+    if status.is_failed_max_iterations() {
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
@@ -4705,7 +4758,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             working_summary.status = status.clone();
         }
     }
-    if matches!(status, PirlsStatus::MaxIterationsReached) && firth_active {
+    if status.is_failed_max_iterations() && firth_active {
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
@@ -8484,10 +8537,17 @@ mod root_cause_tests {
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
                 .expect("plateaued accepted step should still return a final state");
 
+        // The plateau triggers the LM step search to exhaust its retry budget
+        // (each candidate step is rejected as a noise-scale move) while the
+        // projected gradient 5e-5 sits well above the near-stationary band
+        // (= 1e-5). That maps exactly to LmStepSearchExhausted: distinct from
+        // MaxIterationsReached (which would mean the outer iteration counter
+        // ran out without the LM block ever exhausting), and definitely not
+        // Converged/StalledAtValidMinimum.
         assert_eq!(
             result.status,
-            PirlsStatus::MaxIterationsReached,
-            "projected gradient 5e-5 is well above the near-stationary band and must not be promoted to Converged/Stalled"
+            PirlsStatus::LmStepSearchExhausted,
+            "projected gradient 5e-5 is well above the near-stationary band and must hit the LM-exhaust exit, not be promoted to Converged/Stalled or fall through to a default MaxIterationsReached"
         );
     }
 
@@ -8512,10 +8572,16 @@ mod root_cause_tests {
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
                 .expect("noise-scale rejected step should still preserve the current state");
 
+        // Same exit path as the plateau test: noise-scale rejection drives the
+        // LM block to exhaustion with projected_grad 2e-5 above the
+        // near-stationary band (= 1e-5), so the exact status is
+        // LmStepSearchExhausted — keep the assertion strict so a future
+        // regression that silently promotes to Converged/Stalled OR falls back
+        // to the generic MaxIterationsReached default fails immediately.
         assert_eq!(
             result.status,
-            PirlsStatus::MaxIterationsReached,
-            "projected gradient 2e-5 exceeds the near-stationary band and must not be accepted after a noise-scale rejection"
+            PirlsStatus::LmStepSearchExhausted,
+            "projected gradient 2e-5 exceeds the near-stationary band and must hit the LM-exhaust exit, not be accepted after a noise-scale rejection or fall through to MaxIterationsReached"
         );
     }
 

@@ -510,7 +510,16 @@ const LAML_RIDGE: f64 = 1e-8;
 pub(crate) const DP_FLOOR: f64 = 1e-12;
 /// Width of the smooth transition region for the deviance floor.
 const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
-const MAX_PIRLS_CACHE_ENTRIES: usize = 128;
+/// Total byte budget for the in-memory P-IRLS warm-start cache.
+///
+/// The cache used to be a fixed 128-entry LRU, which silently scaled into
+/// gigabytes once `n` reached biobank size: each compacted `PirlsResult`
+/// retains six `n`-length f64 vectors plus two `p×p` Hessians, so a single
+/// entry at `n=320 000, p≈100` is ≈15 MiB and 128 of them is ≈1.9 GiB. A
+/// byte budget keeps the warm-start benefit (revisiting recent ρ values
+/// during outer line search) while bounding worst-case memory regardless of
+/// problem dimensions.
+pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 // Unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
 // Additional headroom reduces frequent contact with the hard box constraints.
 pub(crate) const RHO_BOUND: f64 = 30.0;

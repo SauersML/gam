@@ -3837,7 +3837,23 @@ pub fn fit_transformation_normal(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
+    log::info!(
+        "[transformation-normal] starting baseline custom-family fit before exact joint optimization \
+         (rho_dim={}, log_kappa_dim={})",
+        n_penalties,
+        kappa0.len(),
+    );
+    let baseline_start = std::time::Instant::now();
     let baseline_fit = fit_custom_family(&probe_family, &probe_blocks, &options).ok();
+    log::info!(
+        "[transformation-normal] baseline fit {} in {:.2}s",
+        if baseline_fit.is_some() {
+            "succeeded"
+        } else {
+            "failed (continuing with default rho seed)"
+        },
+        baseline_start.elapsed().as_secs_f64(),
+    );
     if let Some(fit) = baseline_fit.as_ref() {
         if fit.log_lambdas.len() == n_penalties {
             rho0 = fit.log_lambdas.clone();
@@ -3909,42 +3925,51 @@ pub fn fit_transformation_normal(
         RefCell::new(None);
     let spatial_terms_for_cache = spatial_terms.clone();
 
-    let ensure_exact_geometry =
-        |spec: &TermCollectionSpec, design: &TermCollectionDesign| -> Result<(), String> {
-            let key = transformation_spatial_geometry_key(spec, &spatial_terms_for_cache);
-            let needs_rebuild = exact_geometry_cache
-                .borrow()
-                .as_ref()
-                .map(|cached| cached.key != key)
-                .unwrap_or(true);
-            if !needs_rebuild {
-                return Ok(());
-            }
+    let ensure_exact_geometry = |spec: &TermCollectionSpec,
+                                 design: &TermCollectionDesign|
+     -> Result<(), String> {
+        let key = transformation_spatial_geometry_key(spec, &spatial_terms_for_cache);
+        let needs_rebuild = exact_geometry_cache
+            .borrow()
+            .as_ref()
+            .map(|cached| cached.key != key)
+            .unwrap_or(true);
+        if !needs_rebuild {
+            return Ok(());
+        }
 
-            let family = make_family(design)?;
-            let cov_psi_derivs = build_block_spatial_psi_derivatives(covariate_data, spec, design)?
-                .ok_or_else(|| {
-                    "missing covariate spatial psi derivatives for transformation model".to_string()
-                })?;
-            let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
+        let geom_start = std::time::Instant::now();
+        let family = make_family(design)?;
+        let cov_psi_derivs = build_block_spatial_psi_derivatives(covariate_data, spec, design)?
+            .ok_or_else(|| {
+                "missing covariate spatial psi derivatives for transformation model".to_string()
+            })?;
+        let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
 
-            log::trace!(
-                "[transformation-normal] rebuilt exact geometry cache for {} spatial terms",
-                spatial_terms_for_cache.len(),
-            );
+        log::debug!(
+            "[transformation-normal] rebuilt exact geometry cache for {} spatial terms in {:.3}s",
+            spatial_terms_for_cache.len(),
+            geom_start.elapsed().as_secs_f64(),
+        );
 
-            // The exact-inner warm start embeds geometry-dependent state.
-            // Reuse it across rho updates, but drop it when the spatial basis changes.
-            exact_warm_start.replace(None);
-            exact_geometry_cache.replace(Some(TransformationExactGeometryCache {
-                key,
-                base_block_spec: family.block_spec(),
-                family,
-                derivative_blocks: vec![tensor_derivs],
-            }));
-            Ok(())
-        };
+        // The exact-inner warm start embeds geometry-dependent state.
+        // Reuse it across rho updates, but drop it when the spatial basis changes.
+        exact_warm_start.replace(None);
+        exact_geometry_cache.replace(Some(TransformationExactGeometryCache {
+            key,
+            base_block_spec: family.block_spec(),
+            family,
+            derivative_blocks: vec![tensor_derivs],
+        }));
+        Ok(())
+    };
 
+    log::info!(
+        "[transformation-normal] entering exact joint outer optimization \
+         (analytic_gradient={}, analytic_hessian={})",
+        analytic_gradient,
+        analytic_hessian,
+    );
     let solved = optimize_spatial_length_scale_exact_joint(
         covariate_data,
         &block_specs_slice,
@@ -3956,7 +3981,12 @@ pub fn fit_transformation_normal(
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
         // EFS Wood-Fasiolo PSD invariant fails — disable fixed-point so the
-        // planner goes straight to analytic-gradient BFGS.
+        // planner cannot pick EFS / Hybrid-EFS. With fixed-point ruled out
+        // and analytic gradient + Hessian declared, the planner then chooses
+        // ARC by default and BFGS only when TauTauHessianPolicy reports
+        // prefer_gradient_only (e.g. multi-dimensional Duchon, dense tau
+        // cache exceeding budget) — which IS the typical biobank-scale CTN
+        // configuration with --scale-dimensions and ≥4 PCs.
         true,
         // fit_fn
         |_, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {

@@ -47,7 +47,58 @@ ROUTINE_SURVIVAL_HORIZONS = (1.0, 2.0, 5.0, 10.0)
 SURVIVAL_ENTRY_COLUMN = "__entry"
 F64_BYTES = 8
 F32_BYTES = 4
-DEFAULT_BIOBANK_RAM_BUDGET_BYTES = 64 * 1024**3
+
+
+def _detect_host_memory_bytes() -> int:
+    """Effective memory available to this process.
+
+    Consults cgroup v2, then cgroup v1, then /proc/meminfo MemTotal. The
+    smallest finite limit wins so a 16 GiB GitHub-hosted runner is reported
+    as 16 GiB even if its parent system would otherwise look larger; this
+    is the value the OS-level OOM killer will actually enforce. Falls back
+    to a 64 GiB hardcoded value only if all detection paths are unavailable
+    (e.g. macOS), so the preflight stays usable on developer workstations
+    while it stops false-PASSing on small CI runners.
+    """
+    fallback = 64 * 1024**3
+    candidates: list[int] = []
+
+    # cgroup v2 unified hierarchy. "max" means "no limit".
+    try:
+        raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        if raw and raw != "max":
+            value = int(raw)
+            if 0 < value < (1 << 60):
+                candidates.append(value)
+    except (OSError, ValueError):
+        pass
+
+    # cgroup v1. The kernel reports a near-MAX_INT sentinel when unlimited.
+    try:
+        raw = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text().strip()
+        if raw:
+            value = int(raw)
+            if 0 < value < (1 << 60):
+                candidates.append(value)
+    except (OSError, ValueError):
+        pass
+
+    # /proc/meminfo MemTotal as the floor of physical RAM.
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                kib = int(line.split()[1])
+                candidates.append(kib * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    if not candidates:
+        return fallback
+    return min(candidates)
+
+
+DEFAULT_BIOBANK_RAM_BUDGET_BYTES = _detect_host_memory_bytes()
 BIOBANK_PREFLIGHT_DEFAULT_MAX_PEAK_BYTES = int(0.80 * DEFAULT_BIOBANK_RAM_BUDGET_BYTES)
 BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
 BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
