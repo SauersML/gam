@@ -475,7 +475,7 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
         }
-        .with_max_iterations(100)
+        .with_max_iterations(300)
     }
 
     pub(crate) fn with_max_iterations(mut self, max_iterations: usize) -> Self {
