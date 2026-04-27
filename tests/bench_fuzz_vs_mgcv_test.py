@@ -1,8 +1,10 @@
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,20 +65,50 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         )
 
     def test_select_scenarios_applies_cost_cap_before_sorting(self) -> None:
-        scenarios, skipped = _FUZZ.select_scenarios([56, 83, 84, 130], max_scenario_cost=75_000)
+        # Use a wide seed sweep so we're guaranteed to land at least one
+        # scenario above and one below the cost cap regardless of how the
+        # scenario generator's random distributions evolve.
+        seeds = list(range(1, 60))
+        cap = 75_000.0
+        scenarios, skipped = _FUZZ.select_scenarios(seeds, max_scenario_cost=cap)
 
-        self.assertEqual([sc.seed for sc in scenarios], [83])
-        self.assertEqual([sc.seed for sc, _ in skipped], [56, 84, 130])
-        self.assertGreater(skipped[0][1], 75_000)
+        # Every retained scenario is at or below cap; every skipped scenario
+        # is strictly above cap.
+        for sc in scenarios:
+            self.assertLessEqual(_FUZZ.estimate_scenario_cost(sc), cap)
+        for sc, cost in skipped:
+            self.assertGreater(cost, cap)
+        # And the harness is producing some of each (otherwise the cap is
+        # not actually doing any work in this seed range, which would be
+        # a regression).
+        self.assertGreater(len(scenarios), 0)
+        self.assertGreater(len(skipped), 0)
 
     def test_duchon_extra_terms_raise_estimated_cost(self) -> None:
-        low_dim = _FUZZ.generate_scenario(121)
-        high_dim = _FUZZ.generate_scenario(84)
-
-        self.assertEqual(low_dim.basis_type, "duchon")
-        self.assertEqual(high_dim.basis_type, "duchon")
-        self.assertGreater(_FUZZ.estimate_scenario_cost(high_dim), 75_000)
-        self.assertLess(_FUZZ.estimate_scenario_cost(low_dim), 75_000)
+        # Build two synthetic Duchon scenarios at known sizes — one small
+        # and cheap, one large and over-cap — instead of relying on the
+        # random scenario generator producing specific shapes for fixed
+        # seeds (which is fragile under generator changes).
+        small = SimpleNamespace(
+            seed=0, family="gaussian", model_type="gam",
+            n_obs=200, n_smooths=3, knots=8, double_penalty=False,
+            noise_sd=1.0, noise_kind="gaussian", smooth_kinds=["sine"],
+            x_distribution="uniform", basis_type="duchon",
+            collinear_strength=0.0, signal_structure="additive",
+            sigma_kind="constant", duchon_order=0, duchon_power=2,
+            n_duchon_dims=2,
+        )
+        large = SimpleNamespace(
+            seed=0, family="gaussian", model_type="gam",
+            n_obs=5000, n_smooths=10, knots=20, double_penalty=True,
+            noise_sd=1.0, noise_kind="gaussian", smooth_kinds=["sine"],
+            x_distribution="uniform", basis_type="duchon",
+            collinear_strength=0.0, signal_structure="additive",
+            sigma_kind="constant", duchon_order=0, duchon_power=2,
+            n_duchon_dims=2,
+        )
+        self.assertGreater(_FUZZ.estimate_scenario_cost(large), 75_000)
+        self.assertLess(_FUZZ.estimate_scenario_cost(small), 75_000)
 
 
 def _trial(*, family="gaussian", model_type="gam", basis="ps",
@@ -193,6 +225,20 @@ class FuzzCiGateTests(unittest.TestCase):
         self.assertTrue(gates["failed"])
         gate_names = [gf["gate"] for gf in gates["gate_failures"]]
         self.assertIn("coverage", gate_names)
+
+    def test_depth_env_var_controls_default_n_trials(self) -> None:
+        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "lean"}, clear=False):
+            self.assertEqual(_FUZZ._default_n_trials(), 100)
+        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "default"}, clear=False):
+            self.assertEqual(_FUZZ._default_n_trials(), 200)
+        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "deep"}, clear=False):
+            self.assertEqual(_FUZZ._default_n_trials(), 500)
+        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "heavy"}, clear=False):
+            self.assertEqual(_FUZZ._default_n_trials(), 1000)
+        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "BOGUS"}, clear=False):
+            # Unknown depth tokens fall back to the safe default rather than
+            # crashing — CI shouldn't bomb on a typo.
+            self.assertEqual(_FUZZ._default_n_trials(), 200)
 
     def test_baseline_regression_fires(self) -> None:
         # Baseline says gaussian/gam/ps cohort had median gap +0.02; current
