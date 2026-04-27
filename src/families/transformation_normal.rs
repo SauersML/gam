@@ -4946,6 +4946,189 @@ mod tests {
             );
         }
     }
+
+    /// When most virtual rows are far from the slack boundary the active-set
+    /// certificate accepts and the cached fast path must produce the same
+    /// `α` the full-grid scan would. Bit-equivalence is the contract — any
+    /// drift is a correctness bug, not a numerical-precision issue, since
+    /// both paths reduce identical sums by the associative `f64::min`.
+    #[test]
+    fn ctn_active_set_certificate_matches_full_grid_when_bound_passes() {
+        // n=64, p_resp=8, p_cov=4, n_grid=16. Build smooth, well-separated
+        // factors so most (i, g) pairs have generous feasibility margin.
+        let n = 64usize;
+        let p_resp = 8usize;
+        let p_cov = 4usize;
+        let n_grid = 16usize;
+        let mut covariate = Array2::<f64>::zeros((n, p_cov));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            covariate[[i, 0]] = 1.0;
+            covariate[[i, 1]] = 0.20 + 0.05 * t;
+            covariate[[i, 2]] = -0.10 + 0.04 * (t * t - 0.5);
+            covariate[[i, 3]] = 0.08 * (t - 0.5);
+        }
+        let mut response_grid = Array2::<f64>::zeros((n_grid, p_resp));
+        for g in 0..n_grid {
+            let s = g as f64 / (n_grid as f64 - 1.0);
+            response_grid[[g, 0]] = 1.0;
+            for a in 1..p_resp {
+                response_grid[[g, a]] = 0.05 * (a as f64) * (s - 0.5);
+            }
+        }
+        let design = KroneckerDesign::new_kronecker(
+            response_grid.clone(),
+            DesignMatrix::Dense(DenseDesignMatrix::from(covariate)),
+        )
+        .expect("Kronecker design");
+
+        // β has dominant value on the (a=0, b=0) entry so h ≈ 1.0 on every
+        // virtual row, well above slack. δ has small negative leading entry
+        // to push some virtual rows toward the boundary, but |Δ| stays small
+        // enough that L · α_A is comfortably below m_inactive.
+        let mut beta = Array1::<f64>::zeros(p_resp * p_cov);
+        beta[0] = 1.0;
+        let mut delta = Array1::<f64>::zeros(p_resp * p_cov);
+        delta[0] = -1.0e-2;
+
+        let slack = 1e-3;
+        let dh_eps = 1e-14;
+
+        // Reference: full-grid reduction via the un-cached entry point.
+        let alpha_full = design.min_step_to_boundary(&beta, &delta, slack, dh_eps);
+
+        let c = design
+            .project_kronecker_factor(&beta)
+            .expect("Kronecker variant projects β");
+        let d = design
+            .project_kronecker_factor(&delta)
+            .expect("Kronecker variant projects δ");
+        let mut cache = KroneckerActiveSetCache::new();
+        // First call refreshes the cache (cache.cached_for_version != c_version
+        // ⇒ cache miss); the answer matches full-grid by construction.
+        let alpha_first = design.min_step_to_boundary_with_active_set(
+            c.view(),
+            d.view(),
+            &delta,
+            slack,
+            dh_eps,
+            &mut cache,
+        );
+        assert_eq!(
+            alpha_first, alpha_full,
+            "first active-set call must full-scan and match the un-cached path"
+        );
+        // Cache must now be marked fresh and hold a finite inactive bound.
+        assert_eq!(cache.cached_for_version, cache.c_version);
+        assert!(
+            cache.min_inactive_margin.is_finite(),
+            "fixture must produce at least one inactive pair so m_inactive is finite"
+        );
+        // Second call: same β-projection ⇒ certificate path. Must be exactly
+        // bit-equal to the full-grid reduction.
+        let alpha_certified = design.min_step_to_boundary_with_active_set(
+            c.view(),
+            d.view(),
+            &delta,
+            slack,
+            dh_eps,
+            &mut cache,
+        );
+        assert_eq!(
+            alpha_certified, alpha_full,
+            "active-set certificate fast path must be bit-equivalent to the full-grid scan"
+        );
+    }
+
+    /// When the certificate's Lipschitz bound is too loose to certify (an
+    /// inactive pair is near-binding), the implementation must fall back to a
+    /// full grid scan and return the correct `α`. We refresh the cache, then
+    /// shrink `m_inactive` to drive the certificate into its fail branch and
+    /// confirm the fallback recovers the exact full-grid answer.
+    #[test]
+    fn ctn_active_set_falls_back_to_full_grid_when_bound_fails() {
+        // p_resp=2, p_cov=1, n=3, n_grid=2 ⇒ 6 virtual pairs. Response grid
+        // r_g = e_a (axis-aligned) so h_{i,g} = c[i, g] and d_{i,g} = d[i, g];
+        // diagonal indexing makes the fixture readable.
+        let n = 3usize;
+        let p_resp = 2usize;
+        let response_grid = array![[1.0, 0.0], [0.0, 1.0]];
+        let mut cov_arr = Array2::<f64>::zeros((n, 1));
+        cov_arr[[0, 0]] = 1.0;
+        cov_arr[[1, 0]] = 1.0;
+        cov_arr[[2, 0]] = 1.0;
+        let design = KroneckerDesign::new_kronecker(
+            response_grid.clone(),
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov_arr)),
+        )
+        .expect("Kronecker design");
+
+        // c shape (n × p_resp). Pair (0, 0) is the binder (h = slack + 1e-12)
+        // with strongly negative d so α_A is tiny and finite. Pair (1, 1) is
+        // the near-inactive: h_{1,1} = slack + 1e-3 — sits just outside τ but
+        // small enough that the conservative L bound can exceed m_inactive.
+        // Remaining pairs sit far above slack.
+        let slack = 1e-3;
+        let dh_eps = 1e-14;
+        let mut c = Array2::<f64>::zeros((n, p_resp));
+        c[[0, 0]] = slack + 1e-12;
+        c[[0, 1]] = 5.0;
+        c[[1, 0]] = 5.0;
+        c[[1, 1]] = slack + 1e-3;
+        c[[2, 0]] = 5.0;
+        c[[2, 1]] = 5.0;
+        // Only the binder has nonzero d, so the full-grid α equals (h-slack)/(-d).
+        let mut d = Array2::<f64>::zeros((n, p_resp));
+        d[[0, 0]] = -1.0;
+        let delta = Array1::<f64>::from(vec![1.0, 0.0]);
+        let alpha_ref = (c[[0, 0]] - slack) / (-d[[0, 0]]);
+
+        let mut cache = KroneckerActiveSetCache::new();
+        // First call: cache miss ⇒ full-grid scan, populates cache.
+        let alpha_first = design.min_step_to_boundary_with_active_set(
+            c.view(),
+            d.view(),
+            &delta,
+            slack,
+            dh_eps,
+            &mut cache,
+        );
+        assert_eq!(alpha_first, alpha_ref);
+        // The near-inactive pair (1,1) has h - slack = 1e-3, well outside τ
+        // (≈1e-6) but the smallest among inactive pairs, so it drives
+        // cache.min_inactive_margin to ~1e-3.
+        assert!(
+            cache.min_inactive_margin <= 1e-3 + 1e-12,
+            "near-inactive pair must drive m_inactive ≤ 1e-3, got {}",
+            cache.min_inactive_margin
+        );
+        // For this fixture max ||r_g|| = 1, max ||c_i|| = 1, ‖ΔB‖_F = 1 ⇒
+        // L = 1. With α_A = 1e-12 the certificate margin (1e-3) trivially
+        // exceeds α_A · L, so it would actually accept here. Drive the
+        // fail-bound branch by mutating m_inactive directly — this mirrors
+        // the production case where ‖ΔB‖_F is large enough that L overshoots
+        // the truth and the conservative bound is too tight.
+        cache.min_inactive_margin = 0.0;
+        let alpha_after = design.min_step_to_boundary_with_active_set(
+            c.view(),
+            d.view(),
+            &delta,
+            slack,
+            dh_eps,
+            &mut cache,
+        );
+        // Bound-failure branch must fall back to a full grid scan and return
+        // the correct α. The full scan also refreshes the cache, restoring
+        // `min_inactive_margin` to its true value.
+        assert_eq!(
+            alpha_after, alpha_ref,
+            "fallback path must return the full-grid α when the certificate bound fails"
+        );
+        assert!(
+            cache.min_inactive_margin > 0.0,
+            "fallback must rerun the refresh and restore m_inactive"
+        );
+    }
 }
 
 impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
@@ -5591,7 +5774,8 @@ pub fn fit_transformation_normal(
             Ok((geometry.family.clone(), fit))
         },
         // exact_fn
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+            use crate::solver::estimate::reml::unified::EvalMode;
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let cache_ref = exact_geometry_cache.borrow();
             let geometry = cache_ref
@@ -5608,18 +5792,14 @@ pub fn fit_transformation_normal(
                 &rho,
                 &geometry.derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
-                if need_hessian {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
-                } else {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
-                },
+                eval_mode,
             )
             .map_err(|e| format!("transformation exact_fn: {e}"))?;
 
             if !eval.objective.is_finite() {
                 log::warn!(
-                    "transformation exact joint returned non-finite objective: need_hessian={} rho={:?} gradient_len={}",
-                    need_hessian,
+                    "transformation exact joint returned non-finite objective: eval_mode={:?} rho={:?} gradient_len={}",
+                    eval_mode,
                     rho,
                     eval.gradient.len(),
                 );
@@ -5627,7 +5807,7 @@ pub fn fit_transformation_normal(
 
             exact_warm_start.replace(Some(eval.warm_start));
 
-            if need_hessian && !eval.outer_hessian.is_analytic() {
+            if matches!(eval_mode, EvalMode::ValueGradientHessian) && !eval.outer_hessian.is_analytic() {
                 return Err(
                     "transformation exact joint objective did not return an outer Hessian"
                         .to_string(),
