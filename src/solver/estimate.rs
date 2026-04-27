@@ -504,15 +504,6 @@ impl RemlConfig {
         self
     }
 
-    /// Override the inner P-IRLS tolerance independently of the outer REML
-    /// tolerance. The provided value is used directly (no flooring) so that
-    /// callers who genuinely want a tight inner certificate can request one.
-    #[allow(dead_code)]
-    pub(crate) fn with_pirls_tolerance(mut self, pirls_tol: f64) -> Self {
-        self.pirls_convergence_tolerance = pirls_tol;
-        self
-    }
-
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
