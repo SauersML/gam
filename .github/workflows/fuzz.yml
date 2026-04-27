@@ -80,7 +80,7 @@ jobs:
             --top 30 \
             --rust-timeout 60 \
             --r-timeout 60 \
-            --max-scenario-cost 75000 \
+            --max-scenario-cost 200000 \
             --max-total-seconds 3300 \
             2>&1 | tee fuzz_output.txt
 
