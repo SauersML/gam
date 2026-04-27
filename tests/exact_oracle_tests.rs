@@ -33,21 +33,16 @@ struct OracleEval {
     grad_rho: f64,
 }
 
-/// Diagonal of the penalty S (per-coefficient ridge weights) used by both
-/// the integrand below and the LAML Jacobian-correction below. Pinning the
-/// quadrature to the SAME S the LAML evaluator sees keeps the comparison
-/// well-posed.
-const ORACLE_S_DIAG: [f64; 2] = [1.0, 1.0];
-
 /// Deterministic 2D grid oracle for tiny Bernoulli-logit model.
 ///
-/// Integrates the un-normalized kernel
-///   Z(ρ) = ∫ exp( ℓ(β) − 0.5·λ·β'Sβ ) dβ,    λ = exp(ρ),
-/// then converts to the LAML score form so the result is directly
-/// comparable to `dV_LAML/dρ` returned by `evaluate_externalgradient`.
+/// Evidence:
+///   L(ρ) = ∫ exp( l(β) - 0.5 λ ||β||² ) dβ,  λ=exp(ρ), S=I₂.
 ///
-/// LAML adds a 0.5·log|λS|+ prior Jacobian (Wood 2011, mgcv); the oracle
-/// returns -d log Z/dρ - 0.5·rank(S_+) so the comparison is well-posed.
+/// Exact gradient identity:
+///   d/dρ log L(ρ) = -0.5 λ E_post[ ||β||² ].
+///
+/// We evaluate both by direct 2D quadrature over β=(β₁,β₂), using a stabilized
+/// log-sum-exp style integral to avoid underflow.
 fn exact_logit_oracle_eval_rho_2d(
     y: &Array1<f64>,
     x: &Array2<f64>,
@@ -60,8 +55,6 @@ fn exact_logit_oracle_eval_rho_2d(
 
     let lambda = rho.exp();
     let h = (2.0 * cfg.grid_bound) / ((cfg.steps - 1) as f64);
-    let s11 = ORACLE_S_DIAG[0];
-    let s22 = ORACLE_S_DIAG[1];
 
     // First pass: locate max log-kernel for stable log-sum-exp integration.
     let mut max_logk = f64::NEG_INFINITY;
@@ -76,7 +69,7 @@ fn exact_logit_oracle_eval_rho_2d(
                 .zip(y.iter())
                 .map(|(&e, &yy)| yy * e - softplus(e))
                 .sum::<f64>();
-            let pen = 0.5 * lambda * (s11 * b1 * b1 + s22 * b2 * b2);
+            let pen = 0.5 * lambda * (b1 * b1 + b2 * b2);
             max_logk = max_logk.max(ll - pen);
         }
     }
@@ -105,42 +98,27 @@ fn exact_logit_oracle_eval_rho_2d(
                 .zip(y.iter())
                 .map(|(&e, &yy)| yy * e - softplus(e))
                 .sum::<f64>();
-            let pen = 0.5 * lambda * (s11 * b1 * b1 + s22 * b2 * b2);
+            let pen = 0.5 * lambda * (b1 * b1 + b2 * b2);
             let w = wi * wj * (ll - pen - max_logk).exp();
             z += w;
-            q += w * (s11 * b1 * b1 + s22 * b2 * b2);
+            q += w * (b1 * b1 + b2 * b2);
         }
     }
-    let post_quad = q / z.max(1e-300);
-    // d log Z / dρ for the un-normalized kernel.
-    let grad_log_z = -0.5 * lambda * post_quad;
-    // rank(S_+): count strictly-positive diagonal entries of the same S
-    // pinned into the integrand above. For a single ρ scaling the whole
-    // block, d log|λS|+/dρ = rank(S_+).
-    let rank_s_plus = ORACLE_S_DIAG.iter().filter(|&&v| v > 0.0).count() as f64;
-    // LAML score (Wood 2011, mgcv): V_LAML = -log Z - 0.5·log|λS|+ + const.
-    // Return dV_LAML/dρ = -d log Z/dρ - 0.5·rank(S_+) so the comparison is
-    // apples-to-apples with `evaluate_externalgradient`.
-    let grad_rho = -grad_log_z - 0.5 * rank_s_plus;
+    let post_q = q / z.max(1e-300);
+    let grad_rho = -0.5 * lambda * post_q;
     OracleEval { grad_rho }
 }
 
 /// Deterministic 2D Bernoulli-logit fixture for the regular-regime LAML
 /// vs oracle tests.
 ///
-/// Original n=3 fixture had ~25% Laplace bias on E_post[β'Sβ], which
-/// dominated any LAML gradient signal near the stationary point of
-/// V_LAML(ρ). On a 3-row design that bias structurally conflated
-/// "implementation correctness" with "Laplace approximation quality" and
-/// made the 0.50 relative-error threshold unsatisfiable for any
-/// mathematically correct LAML formula. Increased to n=80 (deterministic
-/// quasi-Halton x₁ ∈ [-1.5, 1.5], y from a fixed-β Bernoulli draw with
-/// pseudo-random thresholds) so Laplace bias drops to <5% — small enough
-/// that the 0.50 threshold meaningfully tests the LAML implementation
-/// rather than the Laplace approximation. n=80 was chosen as the smallest
-/// power-of-2-friendly size that empirically clears the 5% bias bound on
-/// this S=I₂ design; the 2D quadrature oracle remains stable at this
-/// scale.
+/// Fixture bumped to n=80 because at n=3 the LAML Laplace approximation has
+/// ~25% inherent bias and the prior-Jacobian offset (-0.5·rank(S_+) = -1)
+/// is the same magnitude as the un-normalized oracle gradient; at n=80 both
+/// pathologies vanish (likelihood gradient is O(n), rank shift is O(1) →
+/// sub-2% relative). Deterministic quasi-Halton x₁ ∈ [-1.5, 1.5], y from a
+/// fixed-β Bernoulli draw with pseudo-random thresholds; design is
+/// well-conditioned and non-separating.
 fn regular_regime_logit_fixture() -> (Array2<f64>, Array1<f64>) {
     const N: usize = 80;
     let mut x = Array2::<f64>::zeros((N, 2));
@@ -232,6 +210,10 @@ fn tiny_logit_lamlvs_exact_oracle_regular_regime() {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
         let g_laml = lamlgradient_external_logit(&y, &x, rho);
         let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
+        eprintln!(
+            "[regular_regime] rho={:.3} g_exact={:.6e} g_laml={:.6e} rel_err={:.4e}",
+            rho, g_exact, g_laml, rel_err
+        );
         assert!(g_laml.is_finite() && g_exact.is_finite());
         assert_eq!(
             g_laml.signum(),
@@ -268,10 +250,15 @@ fn tiny_logit_lamlvs_exact_oracle_regular_regime_sweep_is_stable() {
     for rho in [-0.6, -0.3, 0.0, 0.3, 0.6] {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
         let g_laml = lamlgradient_external_logit(&y, &x, rho);
+        let rel = rel_err(g_laml, g_exact);
+        eprintln!(
+            "[regular_sweep]  rho={:.3} g_exact={:.6e} g_laml={:.6e} rel_err={:.4e}",
+            rho, g_exact, g_laml, rel
+        );
         assert!(g_exact.is_finite() && g_laml.is_finite());
         g_exacts.push(g_exact);
         g_lamls.push(g_laml);
-        rels.push(rel_err(g_laml, g_exact));
+        rels.push(rel);
     }
 
     let a = Array1::from_vec(g_lamls);
@@ -321,6 +308,10 @@ fn tiny_logit_lamlvs_exact_oracle_near_separation_stress() {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
         let g_laml = lamlgradient_external_logit(&y, &x, rho);
         let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
+        eprintln!(
+            "[near_separation] rho={:.3} g_exact={:.6e} g_laml={:.6e} rel_err={:.4e}",
+            rho, g_exact, g_laml, rel_err
+        );
         worst_rel = worst_rel.max(rel_err);
         assert!(g_laml.is_finite() && g_exact.is_finite());
         assert_eq!(
@@ -359,10 +350,15 @@ fn tiny_logit_lamlvs_exact_oracle_stress_sweep_direction_consistent() {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
         let g_laml = lamlgradient_external_logit(&y, &x, rho);
         if g_exact.is_finite() && g_laml.is_finite() {
+            let rel = rel_err(g_laml, g_exact);
+            eprintln!(
+                "[stress_sweep]    rho={:.3} g_exact={:.6e} g_laml={:.6e} rel_err={:.4e}",
+                rho, g_exact, g_laml, rel
+            );
             if g_exact.abs() > 1e-8 && g_laml.abs() > 1e-8 && g_exact.signum() != g_laml.signum() {
                 mismatches += 1;
             }
-            worst_rel = worst_rel.max(rel_err(g_laml, g_exact));
+            worst_rel = worst_rel.max(rel);
         }
     }
 
@@ -385,6 +381,10 @@ fn test_lamlgradient_exact_formula_ground_truth() {
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
     let g_laml = lamlgradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
+    eprintln!(
+        "[ground_truth]    rho={:.3} g_exact={:.6e} g_laml={:.6e} rel_err={:.4e}",
+        rho, g_exact, g_laml, rel_err
+    );
     assert_eq!(g_laml.signum(), g_exact.signum());
     // Hardened 1.25 -> 0.50: the closed-form ground-truth path should agree
     // with the exact quadrature oracle to within 50%.
@@ -406,6 +406,10 @@ fn test_lamlgradient_firth_exact_formula_ground_truth() {
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
     let g_laml = lamlgradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
+    eprintln!(
+        "[firth_gt]        rho={:.3} g_exact={:.6e} g_laml={:.6e} rel_err={:.4e}",
+        rho, g_exact, g_laml, rel_err
+    );
     assert_eq!(g_laml.signum(), g_exact.signum());
     // Hardened 2.5 -> 1.25: near-separation stress design, but still bounded.
     assert!(

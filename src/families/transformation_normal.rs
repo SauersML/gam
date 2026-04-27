@@ -41,7 +41,9 @@ use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::resource::{MatrixMaterializationError, ResourcePolicy};
+use crate::resource::{
+    MatrixMaterializationError, ResourcePolicy, ctn_monotonicity_pass_ops,
+};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -2384,6 +2386,60 @@ fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: u
 /// count and are never replicated. Used for the monotonicity grid, where each
 /// covariate row is paired with every response grid point.
 #[derive(Clone)]
+/// Active-set certificate cache for the cached `min_step_to_boundary` path on
+/// the `Kronecker` variant. See `min_step_to_boundary_with_active_set` for the
+/// math and validity proof. Caller is responsible for bumping `c_version`
+/// whenever the underlying β projection changes; the certificate is otherwise
+/// invariant in δ (the refresh recomputes the inactive bound from `c` only).
+#[derive(Clone, Debug)]
+struct KroneckerActiveSetCache {
+    /// Pairs `(i, g)` whose `h_{i,g} - slack ≤ τ`. Empty before first refresh.
+    active_pairs: Vec<(usize, usize)>,
+    /// `min h_{i,g}` over inactive `(i,g)` (the smallest non-active feasibility
+    /// margin); `+∞` when every pair is active or the cache is unrefreshed.
+    min_inactive_margin: f64,
+    /// `max_g ||r_g||₂`, response_grid invariant.
+    max_response_norm: Option<f64>,
+    /// `max_i ||X_cov[i,:]||₂`, covariate-design invariant (per family).
+    max_covariate_norm: Option<f64>,
+    /// Caller-managed monotone version stamp on the current `c` projection.
+    c_version: u64,
+    /// `c_version` value at the most recent refresh; equals `c_version` ⇒ fresh.
+    cached_for_version: u64,
+    /// Sentinel `(n, n_grid, p_resp, slack, dh_eps)` at refresh time, used to
+    /// invalidate the cache if any of these change between calls.
+    n: usize,
+    n_grid: usize,
+    p_resp: usize,
+    slack: f64,
+    dh_eps: f64,
+}
+
+impl KroneckerActiveSetCache {
+    fn new() -> Self {
+        Self {
+            active_pairs: Vec::new(),
+            min_inactive_margin: f64::INFINITY,
+            max_response_norm: None,
+            max_covariate_norm: None,
+            c_version: 0,
+            cached_for_version: u64::MAX, // distinct from c_version=0 ⇒ stale
+            n: 0,
+            n_grid: 0,
+            p_resp: 0,
+            slack: f64::NAN,
+            dh_eps: f64::NAN,
+        }
+    }
+
+    /// Mark the active-set certificate as stale because `c` (β projection)
+    /// has changed. Bumps the monotone version stamp; the next call to
+    /// `min_step_to_boundary_with_active_set` will full-scan to refresh.
+    fn invalidate_for_new_beta(&mut self) {
+        self.c_version = self.c_version.wrapping_add(1);
+    }
+}
+
 enum KroneckerDesign {
     /// Row-wise Khatri–Rao product `A ⊙ B`.
     ///
@@ -2760,6 +2816,253 @@ impl KroneckerDesign {
                 Self::min_step_kronecker_reduce(response_grid, c, d, slack, dh_eps)
             }
         }
+    }
+
+    /// Maximum row L2-norm of the response-grid factor (`max_g ||r_g||₂`).
+    ///
+    /// Returns `None` for the `KhatriRao` variant — it has no separate response
+    /// factor to summarize.
+    fn max_response_norm(&self) -> Option<f64> {
+        match self {
+            KroneckerDesign::KhatriRao { .. } => None,
+            KroneckerDesign::Kronecker { response_grid, .. } => {
+                let mut m = 0.0_f64;
+                for g in 0..response_grid.nrows() {
+                    let row = response_grid.row(g);
+                    let s2: f64 = row.iter().map(|v| v * v).sum();
+                    m = m.max(s2.sqrt());
+                }
+                Some(m)
+            }
+        }
+    }
+
+    /// Maximum row L2-norm of the covariate factor (`max_i ||X_cov[i,:]||₂`).
+    ///
+    /// Streamed via `try_row_chunk` so sparse / operator-backed covariates
+    /// stay chunkable. Returns `None` for the `KhatriRao` variant.
+    fn max_covariate_norm(&self) -> Option<f64> {
+        match self {
+            KroneckerDesign::KhatriRao { .. } => None,
+            KroneckerDesign::Kronecker { covariate, .. } => {
+                let n = covariate.nrows();
+                if n == 0 {
+                    return Some(0.0);
+                }
+                let p = covariate.ncols();
+                if let Some(dense) = covariate.as_dense_ref() {
+                    let mut m = 0.0_f64;
+                    for i in 0..n {
+                        let row = dense.row(i);
+                        let s2: f64 = row.iter().map(|v| v * v).sum();
+                        m = m.max(s2.sqrt());
+                    }
+                    return Some(m);
+                }
+                let chunk_rows = crate::resource::rows_for_target_bytes(
+                    8 * 1024 * 1024,
+                    p.max(1),
+                )
+                .max(1);
+                let mut m = 0.0_f64;
+                let mut start = 0usize;
+                while start < n {
+                    let end = (start + chunk_rows).min(n);
+                    let chunk = covariate
+                        .try_row_chunk(start..end)
+                        .expect("covariate.try_row_chunk for max-row-norm precompute");
+                    for i in 0..(end - start) {
+                        let row = chunk.row(i);
+                        let s2: f64 = row.iter().map(|v| v * v).sum();
+                        m = m.max(s2.sqrt());
+                    }
+                    start = end;
+                }
+                Some(m)
+            }
+        }
+    }
+
+    /// Cached `min_step_to_boundary` for the `Kronecker` variant with an
+    /// active-set certificate fast path.
+    ///
+    /// Bit-equivalent to `min_step_to_boundary(β, δ, slack, dh_eps)` whenever
+    /// the certificate accepts; otherwise refreshes the certificate by running
+    /// a full grid scan and returns the same `α` the un-cached path would.
+    /// Math (proof of correctness):
+    ///   For each `(i, g)`: `h_{i,g} = r_g · c_i^T`, `d_{i,g} = r_g · d_i^T`.
+    ///   Lipschitz bound `|d_{i,g}| ≤ ||r_g||₂ · ||ΔB||_F · ||X_cov[i,:]||₂`.
+    ///   Let `L = max_g ||r_g||₂ · max_i ||X_cov[i,:]||₂ · ||ΔB||_F`.
+    ///   `α_A` = min over active `(i,g)` with `d_{i,g}<-dh_eps` of
+    ///     `(h_{i,g} - slack)/(-d_{i,g})`. If `m_inactive - α_A · L > slack`
+    ///   then no inactive constraint can bind before `α_A`, so `α_A` is exact.
+    fn min_step_to_boundary_with_active_set(
+        &self,
+        c: ndarray::ArrayView2<'_, f64>,
+        d: ndarray::ArrayView2<'_, f64>,
+        delta: &Array1<f64>,
+        slack: f64,
+        dh_eps: f64,
+        cache: &mut KroneckerActiveSetCache,
+    ) -> f64 {
+        let response_grid = match self {
+            KroneckerDesign::KhatriRao { .. } => panic!(
+                "min_step_to_boundary_with_active_set is only defined for the \
+                 Kronecker variant; KhatriRao callers should use the un-cached \
+                 streaming path"
+            ),
+            KroneckerDesign::Kronecker { response_grid, .. } => response_grid,
+        };
+        let n = c.nrows();
+        let n_grid = response_grid.nrows();
+        let p_resp = response_grid.ncols();
+        debug_assert_eq!(c.ncols(), p_resp);
+        debug_assert_eq!(d.nrows(), n);
+        debug_assert_eq!(d.ncols(), p_resp);
+
+        // ||ΔB||_F: from the row-major (p_resp × p_cov) reshape of `delta`.
+        let p_cov = delta.len() / p_resp.max(1);
+        debug_assert_eq!(delta.len(), p_resp * p_cov);
+        let delta_fro: f64 = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+        // Initialize / refresh the row-norm caches if missing.
+        if cache.max_response_norm.is_none() {
+            cache.max_response_norm = self.max_response_norm();
+        }
+        if cache.max_covariate_norm.is_none() {
+            cache.max_covariate_norm = self.max_covariate_norm();
+        }
+        let max_response = cache.max_response_norm.unwrap_or(f64::INFINITY);
+        let max_covariate = cache.max_covariate_norm.unwrap_or(f64::INFINITY);
+        let lipschitz = max_response * max_covariate * delta_fro;
+
+        // If the cache is stale (β changed), or its dimensions disagree with
+        // the current projection shape, refresh by a full grid scan.
+        let cache_fresh = cache.cached_for_version == cache.c_version
+            && cache.n == n
+            && cache.n_grid == n_grid
+            && cache.p_resp == p_resp
+            && (cache.slack - slack).abs() <= f64::EPSILON
+            && (cache.dh_eps - dh_eps).abs() <= f64::EPSILON;
+
+        if cache_fresh {
+            // Active-set fast path: scan only the cached active set with the
+            // fresh `d` projection. Compute α_A.
+            let mut alpha_active = f64::INFINITY;
+            for &(i, g) in &cache.active_pairs {
+                let r_g = response_grid.row(g);
+                let mut hv = 0.0_f64;
+                let mut dv = 0.0_f64;
+                for a in 0..p_resp {
+                    hv += r_g[a] * c[[i, a]];
+                    dv += r_g[a] * d[[i, a]];
+                }
+                if dv < -dh_eps {
+                    let hit = (hv - slack) / (-dv);
+                    if hit < alpha_active {
+                        alpha_active = hit;
+                    }
+                }
+            }
+            // Certificate: m_inactive - α_A · L > slack ⇒ no inactive can bind
+            // before α_A. The cached `min_inactive_margin = min h_{i,g}` over
+            // (i,g) ∉ A is invariant in β (computed at refresh); compare
+            // against `slack + α_A · L`.
+            let alpha_for_bound = if alpha_active.is_finite() {
+                alpha_active
+            } else {
+                f64::INFINITY
+            };
+            let bound_ok = if alpha_for_bound.is_infinite() {
+                // No active binding: certificate accepts iff every inactive
+                // pair has m_inactive > slack (which is true by construction
+                // — they were classified as inactive). But if active set is
+                // empty, we still need to check no constraint binds at all,
+                // which is the case iff `lipschitz` does not destabilize:
+                // any α we return must respect all inactive (i,g) too, so
+                // we treat the certificate as failing here and refresh.
+                cache.active_pairs.is_empty()
+                    && cache.min_inactive_margin > slack
+                    && lipschitz == 0.0
+            } else {
+                cache.min_inactive_margin - alpha_active * lipschitz > slack
+            };
+            if bound_ok {
+                return alpha_active;
+            }
+        }
+
+        // Cache stale or certificate failed: full grid scan refreshes both
+        // the answer AND the active set.
+        let alpha_full = Self::min_step_kronecker_reduce(response_grid, c, d, slack, dh_eps);
+        Self::refresh_active_set_cache(
+            response_grid,
+            c,
+            slack,
+            dh_eps,
+            n,
+            n_grid,
+            p_resp,
+            cache,
+        );
+        alpha_full
+    }
+
+    /// Recompute the active-set cache from the current `c` projection.
+    /// `active_pairs` collects (i, g) with `h_{i,g} - slack ≤ τ`; the
+    /// `min_inactive_margin` is the smallest `h_{i,g} - slack` over inactive
+    /// pairs (= the tightest non-active constraint).
+    fn refresh_active_set_cache(
+        response_grid: &Array2<f64>,
+        c: ndarray::ArrayView2<'_, f64>,
+        slack: f64,
+        dh_eps: f64,
+        n: usize,
+        n_grid: usize,
+        p_resp: usize,
+        cache: &mut KroneckerActiveSetCache,
+    ) {
+        // Compute H = c · response_gridᵀ in chunked passes; classify rows.
+        const CHUNK_ROWS: usize = 1024;
+        // Active-set tolerance: small relative-to-slack with an additive
+        // floor. The certificate is valid for any τ ≥ 0; this scale keeps
+        // the active set typically ≤ 0.1% of pairs at biobank scale.
+        let scale = c.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1.0);
+        let tau = (slack.abs() * 1e-3 + 1e-12).max(dh_eps * scale);
+
+        let r_t = response_grid.t();
+        let mut active_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut min_inactive = f64::INFINITY;
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + CHUNK_ROWS).min(n);
+            let m = end - start;
+            let c_chunk = c.slice(s![start..end, ..]);
+            let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
+            fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
+            for i_local in 0..m {
+                let i = start + i_local;
+                for g in 0..n_grid {
+                    let h = h_chunk[[i_local, g]];
+                    let margin = h - slack;
+                    if margin <= tau {
+                        active_pairs.push((i, g));
+                    } else if margin < min_inactive {
+                        min_inactive = margin;
+                    }
+                }
+            }
+            start = end;
+        }
+
+        cache.active_pairs = active_pairs;
+        cache.min_inactive_margin = min_inactive;
+        cache.n = n;
+        cache.n_grid = n_grid;
+        cache.p_resp = p_resp;
+        cache.slack = slack;
+        cache.dh_eps = dh_eps;
+        cache.cached_for_version = cache.c_version;
     }
 
     /// Compute `self^T · v` where v is an n-vector.
