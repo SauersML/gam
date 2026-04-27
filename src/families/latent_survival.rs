@@ -17,7 +17,6 @@ use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, fit_custom_family,
-    slice_joint_into_block_working_sets,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::lognormal_kernel::{
@@ -1861,6 +1860,167 @@ impl LatentSurvivalFamily {
         Ok((ll, gradient))
     }
 
+    /// Block-diagonal-only pullback: writes only time-time, mean-mean, and
+    /// log_sigma-log_sigma rowwise contributions into per-block targets.
+    /// Used by `evaluate()` to populate per-block working sets without ever
+    /// materializing the cross blocks the inner solver does not consume.
+    fn add_pullback_primary_block_diagonals(
+        &self,
+        row: usize,
+        primary_hessian: &Array2<f64>,
+        time_target: &mut Array2<f64>,
+        mean_target: &mut Array2<f64>,
+        log_sigma_target: Option<&mut Array2<f64>>,
+    ) {
+        let h = primary_hessian;
+        // Time block: 3 squared rows + 3 symmetric crosses.
+        dense_outer_accumulate(
+            time_target,
+            h[[
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+            ]],
+            self.x_time_entry.row(row),
+        );
+        dense_outer_accumulate(
+            time_target,
+            h[[
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+            ]],
+            self.x_time_exit.row(row),
+        );
+        dense_outer_accumulate(
+            time_target,
+            h[[
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+            ]],
+            self.x_time_derivative_exit.row(row),
+        );
+        for (a, b, lhs, rhs) in [
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                &self.x_time_entry,
+                &self.x_time_exit,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                &self.x_time_entry,
+                &self.x_time_derivative_exit,
+            ),
+            (
+                LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+                LATENT_SURVIVAL_PRIMARY_QDOT_EXIT,
+                &self.x_time_exit,
+                &self.x_time_derivative_exit,
+            ),
+        ] {
+            let weight = h[[a, b]];
+            if weight == 0.0 {
+                continue;
+            }
+            dense_symmetric_cross_accumulate(time_target, weight, lhs.row(row), rhs.row(row));
+        }
+        // Mean block.
+        let mean_weight = h[[LATENT_SURVIVAL_PRIMARY_MU, LATENT_SURVIVAL_PRIMARY_MU]];
+        self.x_mean
+            .syr_row_into_view(row, mean_weight, mean_target.view_mut())
+            .expect("latent survival mean block-diagonal pullback dimension mismatch");
+        // Log-σ block (scalar).
+        if let Some(target) = log_sigma_target {
+            target[[0, 0]] += h[[
+                LATENT_SURVIVAL_PRIMARY_LOG_SIGMA,
+                LATENT_SURVIVAL_PRIMARY_LOG_SIGMA,
+            ]];
+        }
+    }
+
+    /// Block-diagonal evaluator used by `evaluate()`. Returns the per-row
+    /// log-likelihood, the joint gradient (sliced into block gradients by
+    /// the caller), and the three per-block diagonal Hessians without ever
+    /// materializing the full joint matrix.
+    fn evaluate_exact_newton_block_diagonals(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<
+        (
+            f64,
+            Array1<f64>,
+            Array2<f64>,
+            Array2<f64>,
+            Option<Array2<f64>>,
+        ),
+        String,
+    > {
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let slices = self.joint_slices();
+        let include_log_sigma = slices.log_sigma.is_some();
+        let mut ll = 0.0;
+        let mut gradient = Array1::<f64>::zeros(slices.total);
+        let p_time = slices.time.len();
+        let p_mean = slices.mean.len();
+        let mut hess_time = Array2::<f64>::zeros((p_time, p_time));
+        let mut hess_mean = Array2::<f64>::zeros((p_mean, p_mean));
+        let mut hess_log_sigma = if include_log_sigma {
+            Some(Array2::<f64>::zeros((1, 1)))
+        } else {
+            None
+        };
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let event_type = if self.event_target[row_idx] >= 1 {
+                LatentSurvivalEventType::ExactEvent
+            } else {
+                LatentSurvivalEventType::RightCensored
+            };
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                event_type,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                qdot_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_hazard_exit[row_idx],
+            )?;
+            let (row_ll, primary_gradient, primary_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    mu[row_idx],
+                    sigma,
+                    include_log_sigma,
+                )?;
+            ll += wi * row_ll;
+            self.add_pullback_primary_gradient(
+                &mut gradient,
+                row_idx,
+                &slices,
+                &primary_gradient,
+                wi,
+            );
+            self.add_pullback_primary_block_diagonals(
+                row_idx,
+                &(wi * primary_hessian),
+                &mut hess_time,
+                &mut hess_mean,
+                hess_log_sigma.as_mut(),
+            );
+        }
+        Ok((ll, gradient, hess_time, hess_mean, hess_log_sigma))
+    }
+
     fn evaluate_exact_newton_joint_dense(
         &self,
         block_states: &[ParameterBlockState],
@@ -2324,20 +2484,32 @@ impl CustomFamily for LatentSurvivalFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        let (ll, joint_gradient, joint_hessian) =
-            self.evaluate_exact_newton_joint_dense(block_states)?;
+        let (ll, joint_gradient, hess_time, hess_mean, hess_log_sigma) =
+            self.evaluate_exact_newton_block_diagonals(block_states)?;
         let block_ranges = self.joint_block_ranges();
-        let block_gradients = block_ranges
-            .iter()
-            .map(|range| joint_gradient.slice(s![range.clone()]).to_owned())
-            .collect();
+        let mut blockworking_sets = vec![
+            BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient
+                    .slice(s![block_ranges[0].clone()])
+                    .to_owned(),
+                hessian: SymmetricMatrix::Dense(hess_time),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient
+                    .slice(s![block_ranges[1].clone()])
+                    .to_owned(),
+                hessian: SymmetricMatrix::Dense(hess_mean),
+            },
+        ];
+        if let (Some(range), Some(hessian)) = (block_ranges.get(2).cloned(), hess_log_sigma) {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient.slice(s![range]).to_owned(),
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: slice_joint_into_block_working_sets(
-                block_gradients,
-                &joint_hessian,
-                &block_ranges,
-            ),
+            blockworking_sets,
         })
     }
 
