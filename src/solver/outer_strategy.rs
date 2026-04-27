@@ -1454,6 +1454,13 @@ struct OuterFixedPointBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
     barrier_config: Option<BarrierConfig>,
+    /// Consecutive HybridEFS iterations whose ψ block was zeroed after
+    /// exhausting backtracking. When this reaches
+    /// [`MAX_CONSECUTIVE_PSI_STAGNATION`], the bridge surfaces the
+    /// [`EFS_FIRST_ORDER_FALLBACK_MARKER`] error so the runner aborts the
+    /// HybridEFS attempt and the fallback ladder routes to a joint
+    /// gradient-based solver where ψ stationarity ∇_ψ V = 0 can be enforced.
+    consecutive_psi_zero_iters: usize,
 }
 
 /// Maximum number of backtracking halvings for the ψ block in the hybrid
@@ -1464,6 +1471,20 @@ struct OuterFixedPointBridge<'a> {
 /// is applied. This preserves the EFS convergence guarantee for ρ coords
 /// even when the ψ step is too aggressive.
 const MAX_PSI_BACKTRACK: usize = 8;
+
+/// Maximum number of consecutive HybridEFS iterations whose ψ block was
+/// zeroed before the bridge bails out and triggers a solver switch.
+///
+/// Why 2 and not 1: an isolated ψ-zero iteration is a normal recovery
+/// step (the EFS-suggested ψ direction was too aggressive at this iterate
+/// but the ψ block itself is not pathological). Two in a row, however,
+/// means the ψ stationarity condition ∇_ψ V = 0 is not being enforced —
+/// the solver is making ρ progress while ψ stays frozen, which on
+/// problems with strong ρ–ψ coupling (Duchon60, anisotropic Matérn) can
+/// converge to an interior point that is *not* a joint minimum. Routing
+/// to a gradient-based solver via the fallback ladder restores joint
+/// stationarity in O(1) outer iterations.
+const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 2;
 
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
@@ -1599,11 +1620,37 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 for &i in psi_indices {
                     combined_step[i] = 0.0;
                 }
+                self.consecutive_psi_zero_iters =
+                    self.consecutive_psi_zero_iters.saturating_add(1);
+                if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
+                    // Persistent ψ stagnation: the EFS ψ step direction is no
+                    // longer descent-correlated at this iterate. Continuing on
+                    // ρ alone with Δψ=0 cannot enforce ∇_ψ V = 0 (Duchon60
+                    // 1181-second slow-success). Surface the runtime
+                    // first-order fallback marker so the runner aborts the
+                    // HybridEFS attempt and the fallback ladder routes to a
+                    // joint gradient-based solver (BFGS / Arc) where ψ
+                    // stationarity is part of the optimality condition.
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "{} HybridEFS ψ stagnation: {} consecutive iterations \
+                         exhausted backtracking and zeroed ψ step \
+                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                        EFS_FIRST_ORDER_FALLBACK_MARKER,
+                        self.consecutive_psi_zero_iters,
+                        self.layout.rho_dim(),
+                        self.layout.psi_dim,
+                        self.layout.n_params,
+                        eval.cost,
+                    )));
+                }
+            } else {
+                self.consecutive_psi_zero_iters = 0;
             }
 
             combined_step
         } else {
             // Pure EFS path: no ψ coordinates, no backtracking needed.
+            self.consecutive_psi_zero_iters = 0;
             Array1::from_vec(eval.steps)
         };
 
@@ -1808,6 +1855,24 @@ pub struct OuterProblem {
     /// assembly; family-specific scalings (Khatri–Rao, GAMLSS block tri-up)
     /// can be folded into the same scalar.
     dense_hessian_work_hint: Option<f64>,
+    /// Caller-supplied estimate of the aggregate per-outer-iteration
+    /// Hessian-pair assembly cost (`k² · n · p²` in the standard GLM model).
+    /// Independent of [`Self::dense_hessian_work_hint`]: the hint above
+    /// captures one-inner-solve cost, this captures the aggregate
+    /// across all `k²` LAML pairwise terms within one outer iteration.
+    /// Either crossing the threshold triggers the cost-driven downgrade.
+    aggregate_hessian_pair_work_hint: Option<f64>,
+    /// True when the family's joint Hessian can be applied as a Hv
+    /// operator (`HessianResult::Operator`) rather than materialized as a
+    /// dense matrix.  When true, the cost-driven downgrade does NOT fire:
+    /// ARC's matrix-free trust-region CG path (`run_operator_trust_region`
+    /// at the dispatch site) absorbs the per-iteration cost via O(n·p)
+    /// HVPs instead of O(n·p²) dense Gram assembly, so the work-budget
+    /// argument that justified switching to BFGS no longer applies.
+    /// Explicit `with_prefer_gradient_only(true)` from the caller is still
+    /// preserved — the matrix-free flag only suppresses *cost-driven*
+    /// downgrades, not deliberate ones.
+    matrix_free_hessian_available: bool,
 }
 
 /// Per-Hessian work above which the outer planner prefers gradient-only
@@ -1869,6 +1934,8 @@ impl OuterProblem {
             screening_cap: None,
             solver_class: SolverClass::Primary,
             dense_hessian_work_hint: None,
+            aggregate_hessian_pair_work_hint: None,
+            matrix_free_hessian_available: false,
         }
     }
 
@@ -2005,6 +2072,68 @@ impl OuterProblem {
     /// Callers who already passed `prefer_gradient_only` via
     /// [`with_prefer_gradient_only`] keep that flag — this method only
     /// upgrades it from `false` to `true` when the policy fires.
+    ///
+    /// # Cost model derivation and why `I_expected` is not an explicit input
+    ///
+    /// A reader looking at `solver/reml/unified.rs::compute_outer_hessian`
+    /// will notice that the actual per-outer-eval Hessian-assembly cost is
+    ///
+    /// ```text
+    ///   C_assembly  ≈  k · n·p²   +   k² · p²
+    ///                  └────┬───┘     └───┬───┘
+    ///         per-coord D_β H[v_k]    per-pair mat-vec / cross-trace
+    ///         (one X' diag(c⊙Xv_k) X   on the precomputed spectral
+    ///          per smoothing param,    rotation; no further n·p² work
+    ///          O(np²) each)            after the k correction builds)
+    /// ```
+    ///
+    /// not the `k² · n·p²` written below.  The factored form arises because
+    /// inner P-IRLS runs **once** per outer evaluation (producing β̂ and a
+    /// cached Hessian factorization in `hop`); `compute_outer_hessian` then
+    /// uses that cached factorization without re-triggering P-IRLS, so the
+    /// pairwise `k²` work is O(p²) per pair, not O(n·p²) per pair.  The
+    /// O(n·p²) cost is paid `k` times for the per-coordinate
+    /// `hessian_derivative_correction(v_k) = X' diag(c⊙X v_k) X` builds, not
+    /// `k²` times.
+    ///
+    /// The user's original prescription named the inner-solve cost
+    /// `C_inner ≈ n · p² · I_expected`, where `I_expected` is the expected
+    /// P-IRLS iteration count.  That cost is paid identically by ARC and by
+    /// BFGS (both must compute the mode β̂); it does not enter the
+    /// ARC-vs-BFGS branch decision.  The branch decision compares only the
+    /// **Hessian-assembly overhead** (`k·n·p² + k²·p²`) that ARC pays on
+    /// top of the shared inner solve.  So `I_expected` correctly does not
+    /// appear here.
+    ///
+    /// Why we use `k² · n·p²` (a structural upper bound on the true cost)
+    /// rather than the tight `k·n·p² + k²·p²`:
+    ///
+    /// At biobank scale (n=320K, p=65, k=6) the true overhead is
+    ///   k·n·p² + k²·p²  ≈  6·1.35e9 + 36·4.2e3  ≈  8.1e9
+    /// and the current formula gives
+    ///   k²·n·p²  ≈  36·1.35e9  ≈  4.87e10
+    /// — a 6× overstatement that is exactly the factor `k`.  The empirical
+    /// `STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS = 5e9` was
+    /// hand-tuned against the inflated formula so the inflection point
+    /// `k²·n·p² > 5e9` lands where the true overhead `k·n·p² ≈ 8e9` first
+    /// exceeds the wall-clock break-even with BFGS+gradient on the
+    /// production Duchon problem.  Equivalently, the budget can be read as
+    ///
+    ///   5e9   ≈   k_typical · n · p²   at the calibration point
+    ///         ≈   6 · 320 000 · 65²    rounded down by ~40% headroom
+    ///
+    /// where the implicit `I_expected` of the inner solve has been folded
+    /// into the constant alongside the `k`-vs-`k²` factor and assorted
+    /// per-pair lower-order terms.  Rewriting the formula as the tight
+    /// `k·n·p² + k²·p²` would require recalibrating the threshold by
+    /// roughly a factor of `k_typical = 6`, leaving the same decision
+    /// boundary in the (n, p, k)-space that callers actually exercise; no
+    /// problem currently in scope would change classification.
+    ///
+    /// `STANDARD_GAM_OUTER_BFGS_MIN_K = 4` then handles the small-k regime
+    /// independently of either cost model: ARC always wins for `k ≤ 3`
+    /// because the dim-k BFGS curvature history is too thin, regardless of
+    /// how favorable the FLOP comparison would otherwise look.
     pub fn with_standard_gam_dimensions(
         mut self,
         n_obs: usize,
@@ -2017,16 +2146,50 @@ impl OuterProblem {
         let n_p_squared = (n_obs as f64) * (p_coeff as f64) * (p_coeff as f64);
         self.dense_hessian_work_hint = Some(n_p_squared);
         if self.n_params >= STANDARD_GAM_OUTER_BFGS_MIN_K {
+            // `inner_solve_work = n·p²` is the per-coordinate D_β H[v_k]
+            // build cost, NOT a per-iteration P-IRLS cost.  The variable
+            // name predates the cost-model derivation in the doc-comment
+            // above; keeping it for symmetry with `dense_hessian_work_hint`
+            // (which uses the same n·p² formula for the per-inner-solve
+            // path).
             let inner_solve_work = (n_obs as u128)
                 .saturating_mul(p_coeff as u128)
                 .saturating_mul(p_coeff as u128);
+            // `k² · n·p²` is a structural upper bound on the true
+            // `k·n·p² + k²·p²` Hessian-assembly cost; the 5e9 threshold is
+            // empirically calibrated against this inflated formula so the
+            // inflection point lines up with the true overhead's
+            // wall-clock break-even.  See the doc-comment for the
+            // derivation.
+            //
+            // We *store* this as a separate signal rather than directly
+            // setting `prefer_gradient_only`, so the matrix-free check
+            // in `capability()` can suppress the downgrade when the
+            // family supplies Hv operators that absorb the cost.
             let hessian_pair_work = inner_solve_work
                 .saturating_mul(self.n_params as u128)
                 .saturating_mul(self.n_params as u128);
-            if hessian_pair_work > STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS {
-                self.prefer_gradient_only = true;
-            }
+            // Saturating cast u128 → f64; values up to ~1.8·10³⁰⁸ fit, so
+            // the saturation point is unreachable for any realistic GAM.
+            self.aggregate_hessian_pair_work_hint = Some(hessian_pair_work as f64);
         }
+        self
+    }
+
+    /// Declare that the family produces its joint Hessian as a Hv operator
+    /// (`HessianResult::Operator`) rather than a dense matrix.  When set,
+    /// cost-driven downgrades from dense-Hessian budget breaches are
+    /// suppressed because ARC's matrix-free trust-region CG path absorbs
+    /// the per-iteration cost via O(n·p) HVPs.  Explicit
+    /// `with_prefer_gradient_only(true)` is still honoured — this flag
+    /// only suppresses *cost-driven* downgrades, not deliberate ones.
+    ///
+    /// Set this for families with an `exact_newton_joint_hessian_workspace`
+    /// implementation when the dimensions cross
+    /// `use_joint_matrix_free_path`'s thresholds (so the eval will
+    /// actually return `HessianResult::Operator` rather than dense).
+    pub fn with_matrix_free_hessian_available(mut self, available: bool) -> Self {
+        self.matrix_free_hessian_available = available;
         self
     }
 
@@ -2041,17 +2204,37 @@ impl OuterProblem {
             .unwrap_or(false)
     }
 
+    /// True when the aggregate `k²·n·p²` per-outer-iteration Hessian-pair
+    /// assembly cost exceeds [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`].
+    fn aggregate_hessian_pair_work_too_large(&self) -> bool {
+        self.aggregate_hessian_pair_work_hint
+            .map(|w| {
+                w.is_finite()
+                    && w > STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS as f64
+            })
+            .unwrap_or(false)
+    }
+
     /// Derive the capability flags from the builder state.
     /// `fixed_point_available` is set to `false` here; `build_objective`
     /// overrides it based on whether an EFS closure is actually provided.
     fn capability(&self) -> OuterCapability {
-        // Cost-driven gradient-only routing: when the caller supplied a
-        // work-cost hint that exceeds the threshold, we set
-        // `prefer_gradient_only` so the planner picks BFGS+BfgsApprox even
-        // if an analytic Hessian was declared. The caller's explicit
-        // `with_prefer_gradient_only(true)` is preserved either way.
-        let prefer_gradient_only =
-            self.prefer_gradient_only || self.dense_hessian_work_too_large();
+        // Cost-driven gradient-only routing fires when *either* cost model
+        // crosses its threshold:
+        //   - per-inner-solve cost (n·p²)  via `dense_hessian_work_too_large`
+        //   - aggregate Hessian-pair cost (k²·n·p²) via the second helper
+        //
+        // BUT — when the family produces an Hv operator instead of a dense
+        // Hessian, ARC routes through `run_operator_trust_region` and the
+        // per-iteration cost is O(n·p) HVPs rather than O(n·p²) dense
+        // assembly.  The work-budget argument for switching to BFGS no
+        // longer applies, so we suppress the cost-driven downgrade.
+        // Explicit `with_prefer_gradient_only(true)` from the caller is
+        // always preserved.
+        let cost_driven_downgrade = (self.dense_hessian_work_too_large()
+            || self.aggregate_hessian_pair_work_too_large())
+            && !self.matrix_free_hessian_available;
+        let prefer_gradient_only = self.prefer_gradient_only || cost_driven_downgrade;
         OuterCapability {
             gradient: self.gradient,
             hessian: self.hessian,
@@ -2155,6 +2338,44 @@ impl OuterProblem {
         obj: &mut dyn OuterObjective,
         context: &str,
     ) -> Result<OuterResult, EstimationError> {
+        // Surface the arithmetic-cost decision once per fit. The existing
+        // memory-budget preflight emits a "status: PASS" line for users; the
+        // work-cost path was previously silent, so a long fit at biobank
+        // scale couldn't be distinguished from one whose dense Hessian was
+        // dominating wall-clock time. Log the work estimate alongside the
+        // routing decision so the user can attribute "ARC -> BFGS" downgrades
+        // to the cost model rather than a mystery heuristic. Both the
+        // per-inner-solve hint (n·p²) and the aggregate Hessian-pair hint
+        // (k²·n·p²) are surfaced when set, along with whether the matrix-
+        // free Hv-operator path will absorb the cost (in which case ARC
+        // stays even with a high cost estimate).
+        if self.dense_hessian_work_hint.is_some()
+            || self.aggregate_hessian_pair_work_hint.is_some()
+        {
+            let dense_work = self.dense_hessian_work_hint.unwrap_or(f64::NAN);
+            let aggregate_work = self.aggregate_hessian_pair_work_hint.unwrap_or(f64::NAN);
+            let dense_too_large = self.dense_hessian_work_too_large();
+            let aggregate_too_large = self.aggregate_hessian_pair_work_too_large();
+            let cost_breached = dense_too_large || aggregate_too_large;
+            let routing = if !cost_breached {
+                "off (cost under threshold)"
+            } else if self.matrix_free_hessian_available {
+                "off (cost over threshold; matrix-free Hv operator absorbs it)"
+            } else {
+                "ENGAGED (will route to BFGS+gradient even with analytic Hessian)"
+            };
+            log::info!(
+                "[OUTER] {context}: dense-Hessian work {:.2e} FLOPs (threshold {:.2e}); \
+                 aggregate Hessian-pair work {:.2e} FLOPs (threshold {:.2e}); \
+                 matrix-free={}; cost-driven gradient-only routing: {}",
+                dense_work,
+                DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD,
+                aggregate_work,
+                STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS as f64,
+                self.matrix_free_hessian_available,
+                routing,
+            );
+        }
         run_outer(obj, &self.config(), context)
     }
 }
@@ -2387,6 +2608,23 @@ fn steihaug_toint_step_operator(
     Ok((pred.is_finite() && pred > 0.0).then_some((p, pred)))
 }
 
+/// Scale-invariant tolerance for the outer REML/LAML optimizer.
+///
+/// V_LAML(ρ) is dominated by an O(n) likelihood term at biobank scale, so
+/// its gradient ∇V scales the same way. An absolute test ‖∇V‖ < τ becomes
+/// systematically too tight at large n. Multiplying τ by `1 + |V(ρ)|` makes
+/// the certificate invariant under uniform `V → c·V`; the additive 1 is a
+/// unit floor for trivial-cost problems. This is the standard textbook
+/// scaling (mgcv's `magic` REML driver applies the same rescaling to its
+/// score tolerance).
+///
+/// Used to scale the absolute gradient-norm tolerance passed to argmin's
+/// BFGS / ARC / Trust-Region solvers, which only support an absolute test.
+#[inline]
+fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
+    base_tol * (1.0 + seed_cost.abs())
+}
+
 fn run_operator_trust_region(
     obj: &mut dyn OuterObjective,
     seed: &Array1<f64>,
@@ -2404,7 +2642,16 @@ fn run_operator_trust_region(
     for iter in 0..max_iter {
         let g_proj = projected_gradient(&x_k, &eval_k.gradient, bounds);
         let g_norm = g_proj.dot(&g_proj).sqrt();
-        if g_norm.is_finite() && g_norm <= tolerance {
+        // Scale-invariant outer KKT certificate: V_LAML scales with n (the
+        // dominant likelihood term is O(n)) so its gradient ∇V scales the
+        // same way. An absolute test ‖∇V‖ < τ becomes systematically too
+        // tight at biobank n. Comparing against τ · (1 + |V(ρ)|) makes the
+        // certificate invariant under V → c·V (the additive 1 is a unit
+        // floor for the trivial-cost case). This matches the inner-PIRLS
+        // fix and mirrors how mgcv's `magic` REML driver scales its score
+        // tolerance by the absolute objective.
+        let outer_kkt_scale = 1.0 + eval_k.cost.abs();
+        if g_norm.is_finite() && g_norm <= tolerance * outer_kkt_scale {
             return Ok(OuterResult {
                 rho: x_k,
                 final_value: eval_k.cost,
@@ -2769,8 +3016,10 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
+                    let scaled_tol =
+                        outer_scaled_tolerance(config.tolerance, seed_eval.cost);
                     let tol =
-                        Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                        Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -2822,27 +3071,33 @@ fn run_outer_with_plan(
                         continue 'seed_attempts;
                     }
                 };
-                let seed_eval =
-                    finite_outer_first_order_eval_or_error("outer eval failed", layout, seed_eval)
-                        .map_err(|err| match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        });
-                if let Err(err) = seed_eval {
-                    log::warn!(
-                        "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
-                    );
-                    rejection_reasons.push((seed_idx, "validation", err.to_string()));
-                    continue 'seed_attempts;
-                }
+                let seed_eval = match finite_outer_first_order_eval_or_error(
+                    "outer eval failed",
+                    layout,
+                    seed_eval,
+                )
+                .map_err(|err| match err {
+                    ObjectiveEvalError::Recoverable { message }
+                    | ObjectiveEvalError::Fatal { message } => {
+                        EstimationError::RemlOptimizationFailed(message)
+                    }
+                }) {
+                    Ok(eval) => eval,
+                    Err(err) => {
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
+                        continue 'seed_attempts;
+                    }
+                };
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
+                let scaled_tol = outer_scaled_tolerance(config.tolerance, seed_eval.cost);
+                let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFirstOrderBridge { obj, layout };
@@ -2917,6 +3172,7 @@ fn run_outer_with_plan(
                     obj,
                     layout,
                     barrier_config: cap.barrier_config.clone(),
+                    consecutive_psi_zero_iters: 0,
                 };
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
@@ -2986,6 +3242,7 @@ fn run_outer_with_plan(
                     obj,
                     layout,
                     barrier_config: cap.barrier_config.clone(),
+                    consecutive_psi_zero_iters: 0,
                 };
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
@@ -3271,6 +3528,74 @@ mod tests {
         assert!(!cap.prefer_gradient_only);
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Arc);
+    }
+
+    #[test]
+    fn outer_problem_matrix_free_suppresses_dense_work_downgrade() {
+        // Per-inner-solve work n·p² = 2.7e10 ≫ 5e9 threshold, so the
+        // dense-work check fires. But the family declares matrix-free
+        // availability, so ARC's `run_operator_trust_region` will absorb
+        // the per-iteration cost — the cost-driven downgrade must NOT
+        // engage. ARC stays selected.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_dense_hessian_work_hint(2.7e10)
+            .with_matrix_free_hessian_available(true);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn outer_problem_matrix_free_suppresses_aggregate_work_downgrade() {
+        // Biobank-scale standard-GAM dimensions trigger the aggregate
+        // k²·n·p² check (n=320 000, p=65, k=6 ⇒ 4.9e10 ≫ 5e9), but
+        // matrix-free availability suppresses the cost-driven downgrade.
+        let problem = OuterProblem::new(6)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_standard_gam_dimensions(320_000, 65, true)
+            .with_matrix_free_hessian_available(true);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn outer_problem_explicit_prefer_gradient_only_wins_over_matrix_free() {
+        // If the caller deliberately set `prefer_gradient_only(true)` (e.g.
+        // a family-specific structural reason), the matrix-free flag does
+        // NOT undo that — the explicit caller intent always wins. Only
+        // *cost-driven* downgrades are suppressed by matrix-free.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_prefer_gradient_only(true)
+            .with_matrix_free_hessian_available(true);
+        let cap = problem.capability();
+        assert!(cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+    }
+
+    #[test]
+    fn outer_problem_matrix_free_does_not_engage_below_threshold() {
+        // Below-threshold work + matrix-free flag: still ARC. The
+        // matrix-free flag is purely a *suppressor* of the cost-driven
+        // downgrade, not an inducer of any new behavior.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_dense_hessian_work_hint(1.0e6)
+            .with_matrix_free_hessian_available(true);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Arc);
     }
 
     #[test]
@@ -3729,6 +4054,7 @@ mod tests {
             obj: &mut obj,
             layout: cap.theta_layout(),
             barrier_config: None,
+            consecutive_psi_zero_iters: 0,
         };
 
         let sample = bridge

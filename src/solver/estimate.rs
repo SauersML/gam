@@ -1540,6 +1540,96 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.reml_state
             .compute_efs_steps_with_psi_ext(&rho, &hyper_dirs)
     }
+
+    /// Reset the inner surface for a value-only evaluation. This is the
+    /// hyper-dir-free counterpart of [`prepare_eval_state`]: it accepts the
+    /// fact that the spatial design has been re-realized at the current κ
+    /// (the caller guarantees this via the realizer cache), so no directional
+    /// hyper-derivatives are required to produce a correct cost. Skipping
+    /// the hyper_dir validation and the per-direction conditioning loop is
+    /// what makes line-search probes cheap in the iso/aniso joint paths.
+    fn prepare_eval_state_cost_only(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        warm_start_beta: Option<ArrayView1<'_, f64>>,
+        context: &str,
+    ) -> Result<(), EstimationError> {
+        let p = x.ncols();
+        let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
+        validate_penalty_specs(&specs, p, context)?;
+        let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
+            &specs,
+            nullspace_dims,
+            p,
+            context,
+        )?;
+
+        let x_fit = self.conditioning.apply_to_design(x);
+        let fit_linear_constraints = self
+            .conditioning
+            .transform_linear_constraints_to_internal(linear_constraints);
+
+        // Cost-only paths do not introduce design drift via hyper_dirs, so
+        // the directional-hyper-support check is unnecessary here.
+        self.reml_state.reset_surface(
+            x_fit,
+            Arc::new(canonical),
+            p,
+            active_nullspace_dims,
+            None,
+            fit_linear_constraints,
+            self.kronecker_penalty_system.clone(),
+            self.kronecker_factored.clone(),
+        )?;
+        self.reml_state
+            .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
+        self.reml_state.setwarm_start_original_beta(warm_start_beta);
+        Ok(())
+    }
+
+    /// Cost-only evaluation at the current κ-realized design. Used by the
+    /// joint [ρ, ψ] BFGS line-search cost callback so probes pay neither the
+    /// `try_build_spatial_log_kappa_hyper_dirs` cost nor the gradient assembly
+    /// cost. The gradient callback continues to use [`evaluate_with_order`].
+    ///
+    /// Contract: the caller MUST have already realized the design at the κ
+    /// implied by `theta`'s ψ tail (typically via the
+    /// `SingleBlockExactJointDesignCache::ensure_theta` path). The penalty
+    /// gradients w.r.t. ρ are independent of κ for the spatial single-block
+    /// path, so `compute_cost(rho)` evaluates the joint REML/LAML cost
+    /// correctly at the full theta.
+    pub(crate) fn evaluate_cost_only(
+        &mut self,
+        x: &DesignMatrix,
+        s_list: &[BlockwisePenalty],
+        nullspace_dims: &[usize],
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
+        warm_start_beta: Option<ArrayView1<'_, f64>>,
+        context: &str,
+    ) -> Result<f64, EstimationError> {
+        if rho_dim > theta.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "rho_dim {} exceeds theta dimension {}",
+                rho_dim,
+                theta.len()
+            )));
+        }
+        self.prepare_eval_state_cost_only(
+            x,
+            s_list,
+            nullspace_dims,
+            linear_constraints,
+            warm_start_beta,
+            context,
+        )?;
+        let rho = theta.slice(s![..rho_dim]).to_owned();
+        self.reml_state.compute_cost(&rho)
+    }
 }
 
 // canonicalize_active_penalties removed — replaced by
@@ -1754,7 +1844,18 @@ where
         // place and the sparse path's iteration-count advantage holds.
         let n_obs = reml_state.x().nrows();
         let p_total = reml_state.x().ncols();
-        let dense_design = matches!(reml_state.x(), DesignMatrix::Dense(_));
+        // The planner gates dense-Hessian work cost on `dense_design`, but the
+        // input `DesignMatrix` enum is not authoritative: the runtime REML
+        // geometry decision in `select_reml_geometry` may route a sparse
+        // design to the dense-spectral backend (firth, dense linear
+        // constraints, or per-ρ penalized-Hessian density above 0.10).  Read
+        // the actual runtime backend kind at a representative ρ (the neutral
+        // ρ=0 baseline that seeding.rs always includes) so that biobank-scale
+        // Matern fits (n=320 000, p=101, sparse design, dense per-ρ
+        // selection) get gated to BFGS+gradient instead of ARC + analytic
+        // Hessian, which OOMs at 14.56 GiB RSS.
+        let probe_rho = Array1::<f64>::zeros(k);
+        let dense_design = reml_state.runtime_geometry_is_dense(&probe_rho);
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {

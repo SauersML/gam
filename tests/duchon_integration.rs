@@ -369,9 +369,14 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
         .sum::<f64>()
         / (n as f64);
 
+    // Hardened 0.80 -> 0.55 (45% improvement over mean-only). Aniso Duchon
+    // on 2D Gaussian data should produce a substantial MSE reduction; the
+    // previous 0.80 bound permitted near-trivial fits.
     assert!(
-        mse_model < 0.80 * mse_baseline,
-        "aniso Duchon Gaussian fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
+        mse_model < 0.55 * mse_baseline,
+        "aniso Duchon Gaussian fit must beat mean-only baseline by ≥45%: \
+         mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e} (ratio={ratio:.3})",
+        ratio = mse_model / mse_baseline,
     );
 }
 

@@ -131,9 +131,15 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
         .sum::<f64>()
         / (n as f64);
 
+    // Hardened from 0.90 (10% improvement) to 0.60 (40% improvement). A
+    // useful Matérn fit on smooth simulated data should reduce MSE far
+    // below the mean-only baseline; the 0.90 bound previously allowed a
+    // model that learned almost nothing.
     assert!(
-        mse_model < 0.90 * mse_baseline,
-        "Matérn integration fit should improve over the mean baseline: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
+        mse_model < 0.60 * mse_baseline,
+        "Matérn integration fit should beat mean-only baseline by ≥40%: \
+         mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e} (ratio={ratio:.3})",
+        ratio = mse_model / mse_baseline,
     );
 }
 
@@ -238,9 +244,12 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         .sum::<f64>()
         / (n as f64);
 
+    // Hardened 0.90 -> 0.60 (matching the non-adaptive variant above).
     assert!(
-        mse_model < 0.90 * mse_baseline,
-        "exact adaptive Matérn integration fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
+        mse_model < 0.60 * mse_baseline,
+        "exact adaptive Matérn fit should beat mean-only baseline by ≥40%: \
+         mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e} (ratio={ratio:.3})",
+        ratio = mse_model / mse_baseline,
     );
 }
 

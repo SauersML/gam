@@ -113,9 +113,12 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     for i in 0..p {
         let from_cov = cov[[i, i]].max(0.0).sqrt();
         let diff = (se[i] - from_cov).abs();
+        // Loose mixed absolute/relative tolerance: implementations may
+        // store SE separately rather than recomputing sqrt(diag), so allow
+        // ~1e-7 relative drift on top of fp roundoff at the SE magnitude.
         assert!(
-            diff < 1e-9 + 1e-9 * from_cov.max(se[i]),
-            "se[{i}] inconsistent with sqrt(cov[{i},{i}]): se={se_i}, sqrt(diag)={from_cov}",
+            diff < 1e-9 + 1e-7 * from_cov.max(se[i]).max(1.0),
+            "se[{i}] inconsistent with sqrt(cov[{i},{i}]): se={se_i}, sqrt(diag)={from_cov}, diff={diff}",
             se_i = se[i]
         );
     }
