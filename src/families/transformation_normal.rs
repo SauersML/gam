@@ -28,11 +28,12 @@ use crate::faer_ndarray::{
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
-    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
+    FamilyEvaluation, MaterializablePsiDerivativeOperator, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -812,6 +813,64 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(ll)
     }
 
+    /// Log-likelihood + flat joint gradient without building the dense Hessian.
+    ///
+    /// The default trait implementation returns `None`, so the joint-Newton
+    /// inner solver falls back to `evaluate()` to obtain the gradient — and
+    /// that side-effects a full `Θ(n p²)` `weighted_gram` Hessian build at
+    /// every inner iteration. CTN's gradient is structurally
+    ///
+    ///   `∇ℓ = -X_val^T (w·h) + X_deriv^T (w/h')`,
+    ///
+    /// which is two `transpose_mul`s through the existing Khatri-Rao operators
+    /// and one `Θ(n)` row reduction — `Θ(n p)` total. At biobank scale that is
+    /// ~10⁷ FLOPs per call versus ~3·10¹⁰ for the full `evaluate`, so wiring
+    /// this override is the gating condition for routing CTN's inner solve
+    /// through the matrix-free joint-Newton path without paying the dense H
+    /// tax on every gradient refresh.
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        if block_states.len() != 1 {
+            return Err(format!(
+                "TransformationNormalFamily expects 1 block, got {}",
+                block_states.len()
+            ));
+        }
+        let beta = &block_states[0].beta;
+        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let n = h.len();
+        let min_h_prime = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
+        if min_h_prime <= 0.0 {
+            return Err(format!(
+                "TransformationNormalFamily: h' has non-positive values (min = {min_h_prime:.6e}). \
+                 Monotonicity constraint may be violated."
+            ));
+        }
+        // Fused single-pass O(n) reduction: log-likelihood + per-row weighted
+        // vectors needed for the two transpose_muls below.
+        let mut log_likelihood = 0.0;
+        let mut weighted_h = Array1::<f64>::zeros(n);
+        let mut weighted_inv_hp = Array1::<f64>::zeros(n);
+        let weights = self.weights.as_ref();
+        for i in 0..n {
+            let wi = weights[i];
+            let hi = h[i];
+            let hpi = h_prime[i];
+            log_likelihood += wi * (-0.5 * hi * hi + hpi.ln());
+            weighted_h[i] = wi * hi;
+            weighted_inv_hp[i] = wi / hpi;
+        }
+        let mut gradient = self.x_deriv_kron.transpose_mul(&weighted_inv_hp);
+        gradient -= &self.x_val_kron.transpose_mul(&weighted_h);
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood,
+            gradient,
+        }))
+    }
+
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         // The Hessian depends on β through 1/h'² where h' = X_deriv · β.
         true
@@ -888,15 +947,38 @@ impl CustomFamily for TransformationNormalFamily {
         // h' away from zero on observed rows). Composing via `f64::min` is
         // associative for non-NaN inputs, so the final α_max is bit-equivalent
         // to a single scan over the union of binding rows.
+        //
+        // Observation-row reduction stays on the un-cached path because the
+        // KhatriRao variant streams over `n` observation rows directly via
+        // `forward_mul`; there is no factored projection to reuse there.
         let alpha_obs = self
             .x_deriv_kron
             .min_step_to_boundary(beta, delta, 0.0, 1e-14);
-        let alpha_grid = self.x_deriv_grid_kron.min_step_to_boundary(
-            beta,
-            delta,
-            TRANSFORMATION_MONOTONICITY_EPS,
-            1e-14,
-        );
+        // Monotonicity-grid reduction: the `Kronecker` variant lets us project
+        // β and δ through the covariate factor once per call and route the
+        // chunked (i, g) reduction through the cached entry point. The
+        // `KhatriRao` branch of `project_kronecker_factor` returns `None`, so
+        // we transparently fall back to the un-cached path for any future
+        // configuration that swaps the grid design out of the Kronecker form.
+        let alpha_grid = match (
+            self.x_deriv_grid_kron.project_kronecker_factor(beta),
+            self.x_deriv_grid_kron.project_kronecker_factor(delta),
+        ) {
+            (Some(c_beta), Some(d_delta)) => self
+                .x_deriv_grid_kron
+                .min_step_to_boundary_with_projections(
+                    c_beta.view(),
+                    d_delta.view(),
+                    TRANSFORMATION_MONOTONICITY_EPS,
+                    1e-14,
+                ),
+            _ => self.x_deriv_grid_kron.min_step_to_boundary(
+                beta,
+                delta,
+                TRANSFORMATION_MONOTONICITY_EPS,
+                1e-14,
+            ),
+        };
         let alpha_max = 1.0_f64.min(alpha_obs).min(alpha_grid);
 
         let tau = 0.995;
@@ -1422,18 +1504,15 @@ impl CustomFamily for TransformationNormalFamily {
         // non-positive value is an upstream invariant break worth surfacing
         // loudly.
         let mut weighted_inv_hp_sq = Array1::<f64>::zeros(h_prime.len());
-        ndarray::Zip::indexed(&mut weighted_inv_hp_sq)
-            .and(self.weights.view())
-            .and(&h_prime)
-            .try_for_each(|i, slot, &w, &hp| -> Result<(), String> {
-                if !hp.is_finite() || hp <= 0.0 {
-                    return Err(format!(
-                        "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
-                    ));
-                }
-                *slot = w / (hp * hp);
-                Ok(())
-            })?;
+        for i in 0..h_prime.len() {
+            let hp = h_prime[i];
+            if !hp.is_finite() || hp <= 0.0 {
+                return Err(format!(
+                    "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
+                ));
+            }
+            weighted_inv_hp_sq[i] = self.weights[i] / (hp * hp);
+        }
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
             h_prime,
@@ -1442,6 +1521,23 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
         ))
+    }
+
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        // CTN's joint Hessian is always supplied as a matrix-free Hv
+        // operator: `exact_newton_joint_hessian_workspace` above unconditionally
+        // returns a `TransformationNormalJointHessianWorkspace` for any single
+        // block (the `block_states.len() != 1` guard surfaces a panic, never a
+        // `None`), so the unified outer evaluator will see
+        // `JointHessianSource::Operator` rather than a dense matrix as soon as
+        // `use_joint_matrix_free_path` fires on `(p, n)`. Returning `true` here
+        // tells the outer planner to suppress the cost-driven
+        // `prefer_gradient_only` downgrade — ARC's `run_operator_trust_region`
+        // path will absorb the per-iteration cost via O(n·p) HVPs.
+        true
     }
 }
 
@@ -2483,7 +2579,6 @@ impl KroneckerDesign {
                 covariate,
             } => {
                 let n = covariate.nrows();
-                let n_grid = response_grid.nrows();
                 let p_resp = response_grid.ncols();
                 let p_cov = covariate.ncols();
                 debug_assert_eq!(beta.len(), p_resp * p_cov);
@@ -2503,42 +2598,133 @@ impl KroneckerDesign {
                     c.column_mut(a).assign(&covariate.apply(&beta_row));
                     d.column_mut(a).assign(&covariate.apply(&delta_row));
                 }
-                // Stream the (i, g) reduction in row chunks. For each chunk:
-                //   H_chunk  = C[chunk] · Rᵀ      (m × n_grid)
-                //   dH_chunk = D[chunk] · Rᵀ      (m × n_grid)
-                // and reduce the fraction-to-boundary minimum locally before
-                // dropping the buffers. Per chunk: 2 · m · n_grid · 8 B
-                // ≈ 9 MiB at m = 1024 and biobank-scale n_grid.
-                const CHUNK_ROWS: usize = 1024;
-                let n_chunks = n.div_ceil(CHUNK_ROWS);
-                let r_t = response_grid.t();
-                (0..n_chunks)
-                    .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * CHUNK_ROWS;
-                        let end = (start + CHUNK_ROWS).min(n);
-                        let m = end - start;
-                        let c_chunk = c.slice(s![start..end, ..]);
-                        let d_chunk = d.slice(s![start..end, ..]);
-                        let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
-                        let mut dh_chunk = Array2::<f64>::zeros((m, n_grid));
-                        fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
-                        fast_ab_into(&d_chunk, &r_t, &mut dh_chunk);
-                        let mut local = f64::INFINITY;
-                        for i_local in 0..m {
-                            for g in 0..n_grid {
-                                let dval = dh_chunk[[i_local, g]];
-                                if dval < -dh_eps {
-                                    let hit = (h_chunk[[i_local, g]] - slack) / (-dval);
-                                    if hit < local {
-                                        local = hit;
-                                    }
-                                }
+                Self::min_step_kronecker_reduce(response_grid, c.view(), d.view(), slack, dh_eps)
+            }
+        }
+    }
+
+    /// Streaming reduction over the `n_cov × n_grid` virtual rows from
+    /// pre-computed `C = X · β_matᵀ` and `D = X · δ_matᵀ` projections.
+    ///
+    /// Splitting this out lets the inner-Newton outer loop cache `C` across
+    /// successive `min_step_to_boundary` calls when only `β` (or only `δ`)
+    /// has changed: a single `apply` pass per fresh column is enough to
+    /// refresh the projection, instead of re-projecting both factors from
+    /// scratch each time. The reduction itself is identical to the inline
+    /// path in `min_step_to_boundary`, so the cached and un-cached paths
+    /// agree to BLAS-rounding.
+    ///
+    /// `c` and `d` must each be `(n_cov × p_resp)` and share the column
+    /// ordering with `response_grid` (`p_resp` columns). The active
+    /// monotonicity certification at accepted iterates can call this
+    /// directly with the freshly-projected pair so the full grid is scanned
+    /// exactly once per accepted step.
+    fn min_step_kronecker_reduce(
+        response_grid: &Array2<f64>,
+        c: ndarray::ArrayView2<'_, f64>,
+        d: ndarray::ArrayView2<'_, f64>,
+        slack: f64,
+        dh_eps: f64,
+    ) -> f64 {
+        let n = c.nrows();
+        let n_grid = response_grid.nrows();
+        let p_resp = response_grid.ncols();
+        debug_assert_eq!(c.ncols(), p_resp);
+        debug_assert_eq!(d.nrows(), n);
+        debug_assert_eq!(d.ncols(), p_resp);
+        // Stream the (i, g) reduction in row chunks. For each chunk:
+        //   H_chunk  = C[chunk] · Rᵀ      (m × n_grid)
+        //   dH_chunk = D[chunk] · Rᵀ      (m × n_grid)
+        // and reduce the fraction-to-boundary minimum locally before
+        // dropping the buffers. Per chunk: 2 · m · n_grid · 8 B
+        // ≈ 9 MiB at m = 1024 and biobank-scale n_grid.
+        const CHUNK_ROWS: usize = 1024;
+        let n_chunks = n.div_ceil(CHUNK_ROWS);
+        let r_t = response_grid.t();
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK_ROWS;
+                let end = (start + CHUNK_ROWS).min(n);
+                let m = end - start;
+                let c_chunk = c.slice(s![start..end, ..]);
+                let d_chunk = d.slice(s![start..end, ..]);
+                let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
+                let mut dh_chunk = Array2::<f64>::zeros((m, n_grid));
+                fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
+                fast_ab_into(&d_chunk, &r_t, &mut dh_chunk);
+                let mut local = f64::INFINITY;
+                for i_local in 0..m {
+                    for g in 0..n_grid {
+                        let dval = dh_chunk[[i_local, g]];
+                        if dval < -dh_eps {
+                            let hit = (h_chunk[[i_local, g]] - slack) / (-dval);
+                            if hit < local {
+                                local = hit;
                             }
                         }
-                        local
-                    })
-                    .reduce(|| f64::INFINITY, f64::min)
+                    }
+                }
+                local
+            })
+            .reduce(|| f64::INFINITY, f64::min)
+    }
+
+    /// Project a `(p_resp × p_cov)` row-major coefficient vector through the
+    /// covariate factor of the `Kronecker` variant. Returns the
+    /// `(n_cov × p_resp)` matrix `X · β_matᵀ`.
+    ///
+    /// Used by the cached `min_step_to_boundary` path: callers pass the
+    /// freshly-projected `C` and `D` so the projection cost is paid once per
+    /// fresh `β` / `δ` rather than once per outer iteration. Returns `None`
+    /// for the `KhatriRao` variant since that branch streams over `n`
+    /// observation rows directly and benefits no caching.
+    fn project_kronecker_factor(&self, beta: &Array1<f64>) -> Option<Array2<f64>> {
+        match self {
+            KroneckerDesign::KhatriRao { .. } => None,
+            KroneckerDesign::Kronecker {
+                response_grid,
+                covariate,
+            } => {
+                let n = covariate.nrows();
+                let p_resp = response_grid.ncols();
+                let p_cov = covariate.ncols();
+                debug_assert_eq!(beta.len(), p_resp * p_cov);
+                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                let mut out = Array2::<f64>::zeros((n, p_resp));
+                for a in 0..p_resp {
+                    let row_a = beta_mat.row(a).to_owned();
+                    out.column_mut(a).assign(&covariate.apply(&row_a));
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// Cached `min_step_to_boundary` for the `Kronecker` variant.
+    ///
+    /// Bit-equivalent to `min_step_to_boundary(β, δ, slack, dh_eps)` when
+    /// `c = X · β_matᵀ` and `d = X · δ_matᵀ`, but reuses the projections
+    /// supplied by the caller so a line-search probe that only changes one
+    /// of `(β, δ)` need refresh just one factor with a single `apply` pass.
+    /// Panics if invoked on a `KhatriRao` design — those callers should keep
+    /// using the un-cached entry point since their `forward_mul` already
+    /// streams over the `n` observation rows.
+    fn min_step_to_boundary_with_projections(
+        &self,
+        c: ndarray::ArrayView2<'_, f64>,
+        d: ndarray::ArrayView2<'_, f64>,
+        slack: f64,
+        dh_eps: f64,
+    ) -> f64 {
+        match self {
+            KroneckerDesign::KhatriRao { .. } => panic!(
+                "min_step_to_boundary_with_projections is only defined for the \
+                 Kronecker variant; KhatriRao callers should use the un-cached \
+                 streaming path"
+            ),
+            KroneckerDesign::Kronecker { response_grid, .. } => {
+                Self::min_step_kronecker_reduce(response_grid, c, d, slack, dh_eps)
             }
         }
     }
@@ -3496,6 +3682,151 @@ mod tests {
     }
 
     #[test]
+    fn max_feasible_step_size_uses_cached_kronecker_reduction() {
+        // End-to-end equivalence check for the production line-search caller.
+        // `max_feasible_step_size` projects β and δ through the covariate factor
+        // once and routes the monotonicity-grid reduction through
+        // `min_step_to_boundary_with_projections`; this test confirms the
+        // wired path matches the un-cached baseline exactly on a small CTN
+        // configuration (toy family with a `Kronecker` grid design).
+        let psi = array![0.15, -0.10];
+        let (family, _, state, _) = toy_family_and_derivatives(&psi);
+        // Sanity: the toy fixture really uses the Kronecker grid variant the
+        // cached path was built for; if anything ever rewires this design to
+        // KhatriRao the production caller must keep working via fallback, so
+        // the assertion documents the precondition rather than gating it.
+        assert!(
+            matches!(
+                family.x_deriv_grid_kron,
+                KroneckerDesign::Kronecker { .. }
+            ),
+            "toy family must keep the Kronecker grid variant for cached-path coverage"
+        );
+        // δ direction with a negative leading h' contribution so the grid
+        // reduction binds above ε rather than returning +∞ (which would still
+        // be bit-equivalent but would not exercise the streaming reduction).
+        let delta = array![-0.20, 0.05, -0.10, 0.05];
+
+        // Production path (cached internally).
+        let block_states = vec![state.clone()];
+        let alpha_prod = family
+            .max_feasible_step_size(&block_states, 0, &delta)
+            .expect("toy max_feasible_step_size returns Ok");
+
+        // Hand-rolled un-cached baseline that mirrors the pre-wiring
+        // implementation: both designs use `min_step_to_boundary` directly,
+        // with no projection caching. If the cached and un-cached reductions
+        // ever diverge (e.g. a chunk-size change), this test fails before the
+        // production line search silently picks up the regression.
+        let beta = &block_states[0].beta;
+        let alpha_obs_uncached = family
+            .x_deriv_kron
+            .min_step_to_boundary(beta, &delta, 0.0, 1e-14);
+        let alpha_grid_uncached = family.x_deriv_grid_kron.min_step_to_boundary(
+            beta,
+            &delta,
+            TRANSFORMATION_MONOTONICITY_EPS,
+            1e-14,
+        );
+        let alpha_max_uncached = 1.0_f64.min(alpha_obs_uncached).min(alpha_grid_uncached);
+        let tau = 0.995;
+        let alpha_safe_uncached = tau * alpha_max_uncached;
+        let expected = if alpha_safe_uncached < 1.0 {
+            Some(alpha_safe_uncached)
+        } else {
+            None
+        };
+
+        assert_eq!(
+            alpha_prod, expected,
+            "wired max_feasible_step_size must match the un-cached baseline bit-for-bit \
+             (cached α = {alpha_prod:?}, un-cached α = {expected:?})"
+        );
+    }
+
+    #[test]
+    fn kronecker_min_step_to_boundary_cached_matches_uncached() {
+        // Small CTN-like Kronecker design: covariate factor with n_cov=6 rows,
+        // p_cov=3 columns and a response monotonicity grid with n_grid=5 rows,
+        // p_resp=4 columns. The values are chosen so several virtual rows hit
+        // the descent threshold for a non-trivial reduction.
+        let covariate = DesignMatrix::Dense(DenseDesignMatrix::from(array![
+            [1.0, 0.40, -0.10],
+            [1.0, 0.55, 0.05],
+            [1.0, -0.20, 0.30],
+            [1.0, 0.10, -0.40],
+            [1.0, 0.70, 0.15],
+            [1.0, -0.35, 0.25],
+        ]));
+        let response_grid = array![
+            [1.0, 0.10, -0.05, 0.20],
+            [1.0, 0.30, 0.20, -0.10],
+            [1.0, -0.15, 0.40, 0.05],
+            [1.0, 0.45, -0.20, 0.30],
+            [1.0, -0.30, 0.05, 0.40],
+        ];
+        let design = KroneckerDesign::new_kronecker(response_grid.clone(), covariate.clone())
+            .expect("toy Kronecker design");
+        // β positive on the leading response coordinate so h'(grid) starts
+        // safely above the slack threshold; δ has a negative leading entry to
+        // drive at least one virtual row toward the boundary. Layout follows
+        // the row-major `(p_resp × p_cov)` reshape used by `forward_mul`.
+        let beta = array![
+            0.80, 0.10, -0.05, // a = 0
+            0.20, 0.05, 0.20, // a = 1
+            0.00, -0.10, 0.10, // a = 2
+            -0.05, 0.15, 0.00, // a = 3
+        ];
+        let delta = array![
+            -0.40, 0.05, 0.10, // a = 0
+            -0.15, -0.10, -0.05, // a = 1
+            0.05, 0.00, 0.05, // a = 2
+            0.00, -0.10, 0.05, // a = 3
+        ];
+        let slack = 1e-3;
+        let dh_eps = 1e-14;
+
+        let alpha_uncached = design.min_step_to_boundary(&beta, &delta, slack, dh_eps);
+        assert!(
+            alpha_uncached.is_finite() && alpha_uncached > 0.0,
+            "un-cached α must be a finite positive bound for this fixture: {alpha_uncached}"
+        );
+
+        // Cached path: project β and δ once via the helper, hand the (n × p_resp)
+        // factors to the cached entry point.
+        let c = design
+            .project_kronecker_factor(&beta)
+            .expect("Kronecker variant projects β");
+        let d = design
+            .project_kronecker_factor(&delta)
+            .expect("Kronecker variant projects δ");
+        let alpha_cached =
+            design.min_step_to_boundary_with_projections(c.view(), d.view(), slack, dh_eps);
+        assert_eq!(
+            alpha_cached, alpha_uncached,
+            "cached min_step_to_boundary_with_projections must be bit-equivalent to the un-cached path"
+        );
+
+        // Reusing C across a fresh δ′ (the line-search reuse pattern) must
+        // still match the un-cached call with that δ′.
+        let delta_prime = &delta * 0.5;
+        let d_prime = design
+            .project_kronecker_factor(&delta_prime)
+            .expect("Kronecker variant projects δ′");
+        let alpha_cached_prime = design.min_step_to_boundary_with_projections(
+            c.view(),
+            d_prime.view(),
+            slack,
+            dh_eps,
+        );
+        let alpha_uncached_prime = design.min_step_to_boundary(&beta, &delta_prime, slack, dh_eps);
+        assert_eq!(
+            alpha_cached_prime, alpha_uncached_prime,
+            "cached path with reused C and refreshed D must equal the un-cached path"
+        );
+    }
+
+    #[test]
     fn warm_start_absorbs_offset_into_affine_seed() {
         let response = array![2.0, 5.0];
         let response_val_basis = array![[1.0, 2.0], [1.0, 5.0]];
@@ -3799,6 +4130,79 @@ mod tests {
     }
 
     #[test]
+    fn ctn_coefficient_hessian_cost_uses_dense_for_small_problems() {
+        // Toy family: n=4, p_resp=2, p_cov=2 → p_total=4. The matrix-free
+        // gate `use_joint_matrix_free_path(4, 4)` returns false (well below
+        // every threshold), so the override must report the dense Khatri–Rao
+        // gram cost n·(p_resp·p_cov)² = 4·16 = 64.
+        let psi = array![0.15, -0.10];
+        let (family, _, _, _) = toy_family_and_derivatives(&psi);
+        let n = family.response_val_basis.nrows() as u64;
+        let p_resp = family.response_val_basis.ncols() as u64;
+        let p_cov = family.covariate_design.ncols() as u64;
+        assert!(!crate::custom_family::use_joint_matrix_free_path(
+            (p_resp * p_cov) as usize,
+            n as usize,
+        ));
+        let p_total = p_resp * p_cov;
+        let expected_dense = n * p_total * p_total;
+        assert_eq!(family.coefficient_hessian_cost(&[]), expected_dense);
+    }
+
+    #[test]
+    fn ctn_coefficient_hessian_cost_switches_to_matvec_when_matrix_free_active() {
+        // p_resp=2, p_cov=256 → p_total=512 ≥ JOINT_MATRIX_FREE_MIN_DIM, so
+        // matrix-free is ALWAYS active for any n. The override must report the
+        // per-Hv matvec cost n·(p_resp + p_cov), not the dense p² gram.
+        // n=8 keeps the test allocation small (~16 KB for covariate_design).
+        let n = 8usize;
+        let p_cov = 256usize;
+        let mut response_val_basis = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            response_val_basis[[i, 0]] = 1.0;
+            response_val_basis[[i, 1]] = i as f64;
+        }
+        let mut response_deriv_basis = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            response_deriv_basis[[i, 1]] = 1.0;
+        }
+        let weights = Array1::from_elem(n, 1.0);
+        let offset = Array1::zeros(n);
+        let cov_design = Array2::<f64>::zeros((n, p_cov));
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            response_val_basis,
+            response_deriv_basis,
+            vec![],
+            Array1::zeros(0),
+            1,
+            Array2::zeros((0, 0)),
+            &weights,
+            &offset,
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
+            vec![],
+            &TransformationNormalConfig {
+                double_penalty: false,
+                ..TransformationNormalConfig::default()
+            },
+            None,
+        )
+        .expect("matrix-free-eligible CTN family");
+        let p_resp = family.response_val_basis.ncols() as u64;
+        let actual_p_cov = family.covariate_design.ncols() as u64;
+        let p_total = p_resp * actual_p_cov;
+        assert!(crate::custom_family::use_joint_matrix_free_path(
+            p_total as usize,
+            n,
+        ));
+        let expected_matvec = (n as u64) * (p_resp + actual_p_cov);
+        assert_eq!(family.coefficient_hessian_cost(&[]), expected_matvec);
+        // Sanity: the matrix-free cost is dramatically smaller than the dense
+        // would have been (the whole point of branching).
+        let dense_cost = (n as u64) * p_total * p_total;
+        assert!(expected_matvec < dense_cost / 100);
+    }
+
+    #[test]
     fn ctn_joint_hessian_workspace_dh_operator_matches_dense() {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
@@ -3890,6 +4294,52 @@ mod tests {
                     got[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ctn_exact_newton_joint_gradient_evaluation_matches_evaluate() {
+        // The joint-Newton inner solver prefers
+        // `exact_newton_joint_gradient_evaluation` over `evaluate()` to refresh
+        // the gradient between cycles. Lock in that the override returns
+        // exactly the same log-likelihood and flat gradient that the dense
+        // path produces (up to floating-point summation order).
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+
+        let eval = family
+            .evaluate(std::slice::from_ref(&state))
+            .expect("evaluate must succeed on the toy fixture");
+        let want_ll = eval.log_likelihood;
+        let want_grad = match &eval.blockworking_sets[0] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient.clone(),
+            _ => panic!("CTN must report an ExactNewton block working set"),
+        };
+        assert_eq!(want_grad.len(), p);
+
+        let gradient_eval = family
+            .exact_newton_joint_gradient_evaluation(
+                std::slice::from_ref(&state),
+                &[spec.clone()],
+            )
+            .expect("gradient-only call")
+            .expect("gradient-only result must be present");
+        assert!(
+            (want_ll - gradient_eval.log_likelihood).abs() <= 1e-12 * want_ll.abs().max(1.0) + 1e-12,
+            "log-likelihood mismatch: evaluate={:.6e}, gradient-only={:.6e}",
+            want_ll,
+            gradient_eval.log_likelihood,
+        );
+        assert_eq!(gradient_eval.gradient.len(), p);
+        for i in 0..p {
+            let tol = 1e-12 * want_grad[i].abs().max(1.0) + 1e-12;
+            assert!(
+                (want_grad[i] - gradient_eval.gradient[i]).abs() <= tol,
+                "gradient mismatch at {i}: evaluate={:.6e}, gradient-only={:.6e}",
+                want_grad[i],
+                gradient_eval.gradient[i],
+            );
         }
     }
 

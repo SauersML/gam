@@ -5931,27 +5931,26 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     initial_theta[at + 2] = eps_c_init.max(adaptive_opts.min_epsilon).ln();
 
     let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
+    let zero_psi_op: std::sync::Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator> =
+        std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
+            baseline.design.design.nrows(),
+            baseline.design.design.ncols(),
+        ));
     let derivative_blocks = vec![
         hyperspecs
             .iter()
             .enumerate()
             .map(|(_, _)| CustomFamilyBlockPsiDerivative {
                 penalty_index: None,
-                x_psi: Array2::<f64>::zeros((
-                    baseline.design.design.nrows(),
-                    baseline.design.design.ncols(),
-                )),
-                s_psi: Array2::<f64>::zeros((
-                    baseline.design.design.ncols(),
-                    baseline.design.design.ncols(),
-                )),
+                x_psi: Array2::<f64>::zeros((0, 0)),
+                s_psi: Array2::<f64>::zeros((0, 0)),
                 s_psi_components: None,
                 s_psi_penalty_components: None,
                 x_psi_psi: None,
                 s_psi_psi: None,
                 s_psi_psi_components: None,
                 s_psi_psi_penalty_components: None,
-                implicit_operator: None,
+                implicit_operator: Some(std::sync::Arc::clone(&zero_psi_op)),
                 implicit_axis: 0,
                 implicit_group_id: None,
             })
@@ -6011,23 +6010,40 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let rho_dim = retained_penalties.len();
     let operator_slots_end = rho_dim + runtime_caches.len() * 3;
     const EPSILON_LOG_WINDOW: f64 = 6.0;
-    // Operator-λ lower bound is tighter than the standard rho lower bound:
-    // exp(-10) ≈ 4.5e-5 still permits a very weak penalty but prevents the
-    // adaptive overlay from collapsing to the box floor and producing a
-    // near-interpolation when the overlay's surrogate is weakly identified.
-    const OPERATOR_LAMBDA_LOG_LOWER: f64 = -10.0;
+    // Operator-λ box is anchored to the baseline REML log-lambda with a
+    // symmetric window. The previous absolute floor of exp(-10) ≈ 4.5e-5
+    // was scale-blind: at small n with k_basis comparable to n, that floor
+    // still admits near-interpolation because S_mass = D0'D0 = K_CC² has
+    // tiny eigenvalues on weakly-identified directions in the kernel block,
+    // and a constant log-λ floor doesn't track the n-dependent noise floor
+    // of J. Anchoring on baseline_log_lambda inherits the baseline REML's
+    // own scale calibration: at n=300K production scale the baseline is
+    // already in the right neighbourhood, and at small-n fuzz the baseline
+    // is too. The overlay is then allowed to refine within a ±WINDOW
+    // band around it (~exp(±6) ≈ 400× either way), which is wide enough
+    // for genuine adaptive refinement and tight enough that the overlay
+    // cannot blow through the baseline's well-posed regime into the
+    // L_tilde-unbounded interpolation regime that produces R²=−19995.
+    // The absolute -10 floor is retained as a backstop against pathological
+    // baselines whose own log-lambda is already far into the unstable
+    // regime.
+    const OPERATOR_LAMBDA_LOG_WINDOW: f64 = 6.0;
+    const OPERATOR_LAMBDA_LOG_LOWER_FLOOR: f64 = -10.0;
+    const OPERATOR_LAMBDA_LOG_UPPER_CAP: f64 = 30.0;
     let eps_lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
         if idx < rho_dim {
             -30.0_f64
         } else if idx < operator_slots_end {
-            OPERATOR_LAMBDA_LOG_LOWER
+            (initial_theta[idx] - OPERATOR_LAMBDA_LOG_WINDOW).max(OPERATOR_LAMBDA_LOG_LOWER_FLOOR)
         } else {
             (initial_theta[idx] - EPSILON_LOG_WINDOW).max(adaptive_opts.min_epsilon.max(1e-12).ln())
         }
     }));
     let eps_upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
-        if idx < operator_slots_end {
+        if idx < rho_dim {
             30.0_f64
+        } else if idx < operator_slots_end {
+            (initial_theta[idx] + OPERATOR_LAMBDA_LOG_WINDOW).min(OPERATOR_LAMBDA_LOG_UPPER_CAP)
         } else {
             initial_theta[idx] + EPSILON_LOG_WINDOW
         }
@@ -6136,13 +6152,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     // burning the full job budget on directionally wrong updates. Disable the
     // fallback so the optimizer commits to its principled plan.
     // Cost-aware downgrade: in addition to the existing dense-design heuristic
-    // above, feed the planner a FLOP estimate of one dense exact-joint
-    // Hessian assembly so the work-cost threshold can divert to gradient-only
-    // optimization when n·p² is large enough for a single Newton iteration to
-    // dominate wall-clock time, regardless of the sparse/dense routing.
-    let dense_hessian_work = (baseline.design.design.nrows() as f64)
-        * (baseline.design.design.ncols() as f64)
-        * (baseline.design.design.ncols() as f64);
+    // above, hand the planner the standard-GAM problem dimensions so both the
+    // per-inner-solve (n·p²) and per-outer-eval (k²·n·p²) cost models can
+    // divert to gradient-only optimization when a single Newton iteration or
+    // the LAML pairwise Hessian assembly would dominate wall-clock time.
+    let n_obs_baseline = baseline.design.design.nrows();
+    let p_baseline = baseline.design.design.ncols();
+    let dense_baseline = baseline.design.design.as_sparse().is_none();
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -6151,8 +6167,15 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Derivative::Unavailable
         })
         .with_prefer_gradient_only(prefer_gradient_only)
-        .with_dense_hessian_work_hint(dense_hessian_work)
-        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
+        .with_standard_gam_dimensions(n_obs_baseline, p_baseline, dense_baseline)
+        // Re-enable the automatic fallback ladder for the spatial-adaptive
+        // custom-family path. The original disable was for the geo-bench
+        // fallback bug; the ψ-stagnation guard in OuterFixedPointBridge
+        // (`MAX_CONSECUTIVE_PSI_STAGNATION`) now surfaces the
+        // first-order-fallback marker when ψ stationarity cannot be
+        // enforced, so the ladder routes correctly to BFGS instead of
+        // grinding HybridEFS on the Charbonnier surface.
+        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Automatic)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(options.max_iter)
@@ -9326,6 +9349,30 @@ fn evaluate_joint_reml_efs_at_theta(
     )
 }
 
+/// Cost-only evaluation at the current κ-realized design. Skips the expensive
+/// `try_build_spatial_log_kappa_hyper_dirs` build that the gradient/Hessian
+/// path requires. Used by the iso/aniso joint optimizers for BFGS line-search
+/// probes — the gradient callback continues to use the
+/// `evaluate_joint_reml_outer_eval_at_theta` (with hyper_dirs) path.
+fn evaluate_joint_reml_cost_at_theta(
+    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    design: &TermCollectionDesign,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+) -> Result<f64, EstimationError> {
+    evaluator.evaluate_cost_only(
+        &design.design,
+        &design.penalties,
+        &design.nullspace_dims,
+        design.linear_constraints.clone(),
+        theta,
+        rho_dim,
+        warm_start_beta,
+        "evaluate_joint_reml_cost_at_theta",
+    )
+}
+
 fn exact_joint_spatial_outer_hessian_available(
     family: LikelihoodFamily,
     design: &TermCollectionDesign,
@@ -10280,6 +10327,10 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         self.last_eval = Some(eval);
     }
 
+    fn store_cost(&mut self, cost: f64) {
+        self.last_cost = Some(cost);
+    }
+
     fn spec(&self) -> &TermCollectionSpec {
         self.realizer.spec()
     }
@@ -10642,14 +10693,32 @@ fn try_exact_joint_spatial_aniso_optimization(
             )
         }
 
-        /// Cost-only evaluation — uses the same evaluator as eval_full to ensure
-        /// the line search and gradient see the same objective function.
+        /// Cost-only evaluation. BFGS line-search probes route through the
+        /// evaluator's true value-only path so they neither construct
+        /// `try_build_spatial_log_kappa_hyper_dirs` nor assemble a gradient
+        /// that the line search will discard.
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
             }
-            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient, false) {
-                Ok((cost, _, _)) => cost,
+            if self.cache.ensure_theta(theta).is_err() {
+                return f64::INFINITY;
+            }
+            let design = self.cache.design().clone();
+            match self.evaluator.evaluate_cost_only(
+                &design.design,
+                &design.penalties,
+                &design.nullspace_dims,
+                design.linear_constraints.clone(),
+                theta,
+                self.rho_dim,
+                None,
+                "spatial-aniso-joint cost-only",
+            ) {
+                Ok(cost) => {
+                    self.cache.store_cost(cost);
+                    cost
+                }
                 Err(_) => f64::INFINITY,
             }
         }
@@ -10804,7 +10873,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     lower: &Array1<f64>,
     upper: &Array1<f64>,
     rho_dim: usize,
-    _: &SpatialLengthScaleOptimizationOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<Array1<f64>, EstimationError> {
     assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
     assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
@@ -10934,14 +11003,36 @@ fn try_exact_joint_spatial_isotropic_optimization(
             )
         }
 
-        /// Cost-only evaluation — uses the same evaluator as eval_full to ensure
-        /// the line search and gradient see the same objective function.
+        /// Cost-only evaluation. BFGS line-search probes only need the cost,
+        /// not the gradient or Hessian. The previous implementation called
+        /// `eval_full(.., ValueAndGradient, ..)`, which built the full
+        /// `try_build_spatial_log_kappa_hyper_dirs` set and then assembled a
+        /// gradient that was thrown away — turning every probe into a full
+        /// `(V, ∇V)` evaluation. Here we route through the evaluator's true
+        /// value-only path (`evaluate_cost_only`), which skips both the
+        /// hyper-direction construction and the gradient assembly.
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
             }
-            match self.eval_full(theta, OuterEvalOrder::ValueAndGradient, false) {
-                Ok((cost, _, _)) => cost,
+            if self.cache.ensure_theta(theta).is_err() {
+                return f64::INFINITY;
+            }
+            let design = self.cache.design().clone();
+            match self.evaluator.evaluate_cost_only(
+                &design.design,
+                &design.penalties,
+                &design.nullspace_dims,
+                design.linear_constraints.clone(),
+                theta,
+                self.rho_dim,
+                None,
+                "spatial-iso-joint cost-only",
+            ) {
+                Ok(cost) => {
+                    self.cache.store_cost(cost);
+                    cost
+                }
                 Err(_) => f64::INFINITY,
             }
         }
@@ -11003,8 +11094,8 @@ fn try_exact_joint_spatial_isotropic_optimization(
         // for single-block families with β-independent joint H_L.
         false,
         seed_risk_profile_for_likelihood_family(family),
-        1e-6,
-        50,
+        kappa_options.rel_tol.max(1e-6),
+        kappa_options.max_outer_iter.max(1),
     );
 
     let eval_outer = |ctx: &mut &mut IsoJointContext<'_>,
@@ -12326,7 +12417,16 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_hessian(hessian)
         .with_prefer_gradient_only(prefer_gradient_only)
         .with_disable_fixed_point(disable_fixed_point)
-        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
+        // Re-enable the automatic fallback ladder for exact joint spatial
+        // problems. It was previously `Disabled` to suppress a geo-bench
+        // fallback bug where HybridEFS ψ stagnation degraded silently to
+        // BfgsApprox on a Charbonnier surface. With the ψ-stagnation guard
+        // in OuterFixedPointBridge (`MAX_CONSECUTIVE_PSI_STAGNATION`) the
+        // bridge now surfaces `EFS_FIRST_ORDER_FALLBACK_MARKER` when ψ
+        // stationarity cannot be enforced, so the ladder routes correctly
+        // to a joint gradient-based solver instead of grinding HybridEFS
+        // for thousands of iterations.
+        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Automatic)
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
@@ -12808,8 +12908,20 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 resolvedspec = pilot_result.resolvedspec;
             }
             Err(err) => {
+                // The full-data path that follows is no longer the OOM
+                // hazard it used to be: at biobank scale the runtime REML
+                // backend probe in `optimize_external_design...` reads the
+                // actual selected geometry (not the input `DesignMatrix`
+                // enum), so when the per-ρ density check forces dense the
+                // outer planner downgrades ARC + analytic Hessian to
+                // BFGS + analytic gradient.  Routing through full-data
+                // dense exact-Hessian REML is therefore no longer the
+                // automatic outcome of this branch (P1/P3b fix).
                 log::warn!(
-                    "[spatial-kappa] pilot anisotropy optimization failed; proceeding with direct full-data optimization from the current geometry: {err}"
+                    "[spatial-kappa] pilot anisotropy optimization failed (seed-failure stats: \
+                     1 pilot fault); proceeding with direct full-data optimization from the \
+                     current geometry — outer planner will route through gradient-only BFGS \
+                     when the runtime backend selects dense at full data: {err}"
                 );
             }
         }
@@ -18058,27 +18170,27 @@ mod tests {
         )
         .expect("initial epsilons");
         let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
+        let zero_psi_op: std::sync::Arc<
+            dyn crate::custom_family::CustomFamilyPsiDerivativeOperator,
+        > = std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
+            baseline.design.design.nrows(),
+            baseline.design.design.ncols(),
+        ));
         let derivative_blocks = vec![
             hyperspecs
                 .iter()
                 .enumerate()
                 .map(|(_, _)| CustomFamilyBlockPsiDerivative {
                     penalty_index: None,
-                    x_psi: Array2::<f64>::zeros((
-                        baseline.design.design.nrows(),
-                        baseline.design.design.ncols(),
-                    )),
-                    s_psi: Array2::<f64>::zeros((
-                        baseline.design.design.ncols(),
-                        baseline.design.design.ncols(),
-                    )),
+                    x_psi: Array2::<f64>::zeros((0, 0)),
+                    s_psi: Array2::<f64>::zeros((0, 0)),
                     s_psi_components: None,
                     s_psi_penalty_components: None,
                     x_psi_psi: None,
                     s_psi_psi: None,
                     s_psi_psi_components: None,
                     s_psi_psi_penalty_components: None,
-                    implicit_operator: None,
+                    implicit_operator: Some(std::sync::Arc::clone(&zero_psi_op)),
                     implicit_axis: 0,
                     implicit_group_id: None,
                 })
@@ -18266,27 +18378,27 @@ mod tests {
             compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
                 .expect("initial epsilons");
         let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
+        let zero_psi_op: std::sync::Arc<
+            dyn crate::custom_family::CustomFamilyPsiDerivativeOperator,
+        > = std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
+            baseline.design.design.nrows(),
+            baseline.design.design.ncols(),
+        ));
         let derivative_blocks = vec![
             hyperspecs
                 .iter()
                 .enumerate()
                 .map(|(_, _)| CustomFamilyBlockPsiDerivative {
                     penalty_index: None,
-                    x_psi: Array2::<f64>::zeros((
-                        baseline.design.design.nrows(),
-                        baseline.design.design.ncols(),
-                    )),
-                    s_psi: Array2::<f64>::zeros((
-                        baseline.design.design.ncols(),
-                        baseline.design.design.ncols(),
-                    )),
+                    x_psi: Array2::<f64>::zeros((0, 0)),
+                    s_psi: Array2::<f64>::zeros((0, 0)),
                     s_psi_components: None,
                     s_psi_penalty_components: None,
                     x_psi_psi: None,
                     s_psi_psi: None,
                     s_psi_psi_components: None,
                     s_psi_psi_penalty_components: None,
-                    implicit_operator: None,
+                    implicit_operator: Some(std::sync::Arc::clone(&zero_psi_op)),
                     implicit_axis: 0,
                     implicit_group_id: None,
                 })

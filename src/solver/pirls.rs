@@ -3826,14 +3826,22 @@ where
                         // Newton-decrement acceptance (Boyd & Vandenberghe §9.5.1):
                         // at the pre-step iterate the squared decrement is
                         //     λ_N²(β) = gᵀ H⁻¹ g  =  −g · d_N,
-                        // where d_N = −H⁻¹g is the pure Newton step. The
-                        // direction we just solved is d = −(H + λ_lm·I)⁻¹g,
-                        // so −lin = −g·d = gᵀ(H + λ_lm·I)⁻¹g approximates
-                        // λ_N² with relative error of order κ(H)·λ_lm/λ_min.
-                        // Restricting acceptance to `loop_lambda ≤ 1.0` keeps
-                        // that error bounded for any well-posed PIRLS problem
-                        // (the unpenalized Hessian has eigenvalues O(n) for
-                        // standardized designs, so λ_min ≫ 1 at biobank n).
+                        // where d_N = −H⁻¹g is the pure Newton step.
+                        //
+                        // The direction we just solved is d = −(H + λ_lm·I)⁻¹g,
+                        // so −lin = gᵀ(H + λ_lm·I)⁻¹g UNDER-estimates λ_N².
+                        // From the resolvent identity
+                        //     H⁻¹ = (H + λ_lm·I)⁻¹ + λ_lm·H⁻¹·(H + λ_lm·I)⁻¹,
+                        // applied between gᵀ and g and bounded by ‖H⁻¹‖₂ ≤
+                        // 1/λ_min(H), we get the *exact* upper bound
+                        //     λ_N² ≤ (−lin) · (1 + λ_lm/λ_min(H)).
+                        // PIRLS's `ensure_positive_definite_with_ridge` step
+                        // guarantees λ_min(H) ≥ `ridge_used` after the ridge
+                        // is folded in (with a 1e-12 absolute floor for the
+                        // ridge-free case). Multiplying −lin by that
+                        // correction makes the test a *provably* faithful
+                        // upper bound on the true Newton decrement, removing
+                        // the prior heuristic gate `loop_lambda ≤ 1.0`.
                         //
                         // The scale-invariant criterion
                         //     λ_N² / (1 + |F(β)|) ≤ τ²
@@ -3846,14 +3854,15 @@ where
                         // tests, only certifies convergence in problems where
                         // ‖g‖ is intrinsically large (very ill-conditioned
                         // designs) but H⁻¹g is already tiny.
-                        const NEWTON_DECREMENT_LM_GUARD: f64 = 1.0;
                         let f_scale = 1.0 + current_penalized.abs();
-                        let newton_decrement_sq = (-lin).max(0.0);
+                        let lambda_floor = final_state_ref.ridge_used.max(1.0e-12);
+                        let nd_correction = 1.0 + loop_lambda / lambda_floor;
+                        let newton_decrement_sq_upper =
+                            (-lin).max(0.0) * nd_correction;
                         let nd_threshold = options.convergence_tolerance
                             * options.convergence_tolerance
                             * f_scale;
-                        let nd_pass = loop_lambda <= NEWTON_DECREMENT_LM_GUARD
-                            && newton_decrement_sq <= nd_threshold;
+                        let nd_pass = newton_decrement_sq_upper <= nd_threshold;
 
                         // Strict KKT: scale-invariant under EITHER the
                         // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
@@ -3937,8 +3946,25 @@ where
                         let near_stationary_pass =
                             state.near_stationary_kkt(projected_grad, options.convergence_tolerance);
 
-                        // Near stationarity: the screening rejected all candidates, but the
-                        // gradient is tiny. Treat this as converged rather than escalating damping.
+                        // Note: this acceptance is intentionally NOT routed through
+                        // `pirls_soft_acceptance`. That helper plateau-checks the
+                        // *realized* deviance change of an accepted step, but here
+                        // the LM step search rejected every candidate — there is no
+                        // accepted step and no deviance change to measure. The
+                        // semantic substitute is the *predicted* reduction from the
+                        // last attempted candidate: if the model itself says no
+                        // further descent is available (|Δpred| at the noise floor)
+                        // and the gradient is already inside the near-stationary
+                        // band, the iterate certifies as a valid minimum. Reusing
+                        // `pirls_soft_acceptance` with `deviance_change = 0.0`
+                        // would silently widen acceptance — the helper's
+                        // `|Δdev| < scaled_dev_tol` predicate becomes vacuously
+                        // true at zero, and its `BoundarySaturation` /
+                        // `RelativeBandPlateau` arms would start firing on
+                        // gradient/eta criteria that this branch does not currently
+                        // accept. Likewise the streak counter only governs the
+                        // step-accepted path; this branch terminates the loop
+                        // directly and must not interact with it.
                         if near_stationary_pass
                             && predicted_reduction.abs() <= reduction_noise_floor
                         {
@@ -9021,6 +9047,40 @@ mod root_cause_tests {
         assert!(!state.near_stationary_kkt(2.0e-3, tol));
         // Strict KKT at the same point should be ~10× tighter.
         assert!(!state.certifies_kkt(9.9e-4, tol));
+    }
+
+    /// The Newton-decrement upper bound `(−lin)·(1 + λ_lm/λ_min)` is
+    /// derived from the resolvent identity and is a *provable* upper bound
+    /// on `gᵀH⁻¹g` whenever `λ_min(H) ≥ ridge_floor`. Verify the algebraic
+    /// inequality on a 2×2 worked example so the formula is locked in.
+    #[test]
+    fn newton_decrement_correction_upper_bounds_true_decrement() {
+        // H = diag(2, 0.5).  λ_min = 0.5.  λ_lm = 0.25.
+        let lambda_min = 0.5_f64;
+        let lambda_lm = 0.25_f64;
+        let g = ndarray::array![1.0_f64, 1.0];
+        // True Newton decrement²: gᵀ H⁻¹ g = 1/2 + 1/0.5 = 0.5 + 2.0 = 2.5
+        let true_decrement_sq = g[0].powi(2) / 2.0 + g[1].powi(2) / 0.5;
+        // Damped: gᵀ (H+λI)⁻¹ g = 1/(2+0.25) + 1/(0.5+0.25) = 1/2.25 + 1/0.75
+        let damped_decrement_sq = g[0].powi(2) / (2.0 + lambda_lm)
+            + g[1].powi(2) / (0.5 + lambda_lm);
+        // Correction factor: 1 + λ_lm / λ_min = 1 + 0.25/0.5 = 1.5
+        let correction = 1.0 + lambda_lm / lambda_min;
+        let upper_bound = damped_decrement_sq * correction;
+        assert!(
+            upper_bound >= true_decrement_sq,
+            "(1 + λ_lm/λ_min)·damped must upper-bound true decrement: \
+             upper={:.6}  true={:.6}",
+            upper_bound,
+            true_decrement_sq,
+        );
+        // And the bound should be tight enough to be useful (within 2× of true).
+        assert!(
+            upper_bound <= 2.0 * true_decrement_sq,
+            "correction should not be wildly loose: upper={:.6}  true={:.6}",
+            upper_bound,
+            true_decrement_sq,
+        );
     }
 
     /// Hypothesis 3: LM gain-ratio fallback should accept when both predicted

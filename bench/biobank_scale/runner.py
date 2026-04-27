@@ -103,6 +103,29 @@ BIOBANK_PREFLIGHT_DEFAULT_MAX_PEAK_BYTES = int(0.80 * DEFAULT_BIOBANK_RAM_BUDGET
 BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
 BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
 BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
+
+
+def _detect_runtime_op_budget() -> int:
+    """Conservative per-process FLOP budget gating CTN biobank runs.
+
+    The numbers below model the dominant cost inside
+    `KroneckerDesign::min_step_to_boundary` plus the surrounding inner-Newton
+    line search. The hardcoded `1×10¹²` figure corresponds to roughly half a
+    minute of dense f64 BLAS on a typical CI runner; runs whose modelled work
+    exceeds this budget have repeatedly hit the bench's 2400 s timeout, so the
+    preflight refuses to start them rather than letting them stall the queue.
+    Bumping this is safe (only loosens the check); lowering it triggers an
+    earlier bail-out for pathological dimensions.
+    """
+    return 1_000_000_000_000
+
+
+DEFAULT_BIOBANK_OP_BUDGET = _detect_runtime_op_budget()
+# Conservative aggregate BFGS / line-search / outer-iter scan factor used to
+# convert the per-monotonicity-pass FLOP count into a total runtime estimate.
+# 50 inner iters x 5 line-search probes x 200 outer iters ≈ 5×10⁴ evaluations
+# matches observed timeout traces from the marginal-slope biobank suite.
+BIOBANK_CTN_AGGREGATE_EVALUATIONS = 50_000
 # Mirrors of constants in src/families/transformation_normal.rs governing the
 # size of the monotonicity response grid built inside the CTN family. Update
 # both sides in lockstep if the Rust constants change.
@@ -185,6 +208,7 @@ def preflight_marginal_slope_biobank(
     linkwiggle_knots: int | None = None,
     scorewarp_knots: int | None = None,
     ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
+    op_budget: int = DEFAULT_BIOBANK_OP_BUDGET,
 ) -> BiobankPreflightReport:
     if n_train <= 0 or d_pc <= 0 or centers <= 0:
         raise RuntimeError("biobank preflight dimensions must be positive")
@@ -248,6 +272,23 @@ def preflight_marginal_slope_biobank(
         failures.append(
             f"CTN prep factored peak: {gibibytes(ctn_prep_factored_peak_bytes):.1f} GiB exceeds 80% RAM budget {gibibytes(ram_budget_bytes):.1f} GiB"
         )
+    # Compute-side gating. Per monotonicity pass the dominant cost inside
+    # `KroneckerDesign::min_step_to_boundary` is the (β, δ) projection onto the
+    # covariate factor (`2·n·p_resp·p_cov`) plus the chunked product against
+    # the response grid (`2·n·n_grid·p_resp`). Multiplying by the aggregate
+    # BFGS / line-search / outer-iter evaluation count gives a defensible upper
+    # bound on the per-process work. Runs whose modelled FLOP count exceeds the
+    # runtime budget have repeatedly hit the 2400 s timeout, so the preflight
+    # rejects them up-front rather than letting them stall the queue.
+    ops_mono_pass = (
+        2 * n_train * n_grid_estimate * p_resp_estimate
+        + 2 * n_train * p_resp_estimate * p_cov_ctn
+    )
+    total_estimated_ops = ops_mono_pass * BIOBANK_CTN_AGGREGATE_EVALUATIONS
+    if total_estimated_ops > op_budget:
+        failures.append(
+            f"estimated CTN compute: {total_estimated_ops:.2e} mul-add exceeds runtime op budget {op_budget:.2e}"
+        )
     status = "FAIL" if failures else "PASS"
     lines = [
         "BIOBANK PREFLIGHT",
@@ -273,6 +314,10 @@ def preflight_marginal_slope_biobank(
         f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB",
         f"RAM budget: {gibibytes(ram_budget_bytes):.0f} GiB",
         f"largest single allocation planned: {gibibytes(largest):.1f} GiB",
+        f"ops per monotonicity pass: {ops_mono_pass:.2e} mul-add",
+        f"aggregate evaluations modelled: {BIOBANK_CTN_AGGREGATE_EVALUATIONS:,}",
+        f"total estimated ops: {total_estimated_ops:.2e} mul-add",
+        f"runtime op budget: {op_budget:.2e} mul-add",
         _preflight_status_line(status),
     ]
     lines.extend(f"reason: {failure}" for failure in failures)
