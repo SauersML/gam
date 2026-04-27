@@ -1,6 +1,9 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
-use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
+use crate::pirls::{
+    LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState,
+    array1_l2_norm,
+};
 use crate::types::{Coefficients, LinearPredictor};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
@@ -1254,11 +1257,11 @@ impl WorkingModelSurvival {
         // Norm of the unpenalized score, captured before adding the penalty
         // and ridge contributions, for the scale-invariant convergence
         // certificate (||score||_2 + ||S*beta||_2 (+ ridge*||beta||_2)).
-        let score_norm = grad.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let score_norm = array1_l2_norm(&grad);
 
         let penaltygrad = self.penalties.gradient(beta);
         let penalty_dev = self.penalties.deviance(beta);
-        let penaltygrad_norm = penaltygrad.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let penaltygrad_norm = array1_l2_norm(&penaltygrad);
 
         let mut totalgrad = grad;
         totalgrad += &penaltygrad;
@@ -1274,8 +1277,7 @@ impl WorkingModelSurvival {
         //   grad += ridge * beta,  Hess += ridge * I
         // which correspond to 0.5 * ridge * ||beta||^2.
         let ridge_penalty = 0.5 * ridge_used * beta.dot(beta);
-        let ridge_grad_norm =
-            ridge_used * beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let ridge_grad_norm = ridge_used * array1_l2_norm(beta);
 
         let log_likelihood = -nll;
         let deviance = 2.0 * nll;

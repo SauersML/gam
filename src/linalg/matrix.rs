@@ -60,6 +60,63 @@ pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
     Ok(())
 }
 
+/// Per-fit estimate of inner P-IRLS iterations used in the compute-budget
+/// preflight. Five iterations is an empirical median across well-conditioned
+/// biobank-scale fits and intentionally on the optimistic side: the gate is
+/// meant to reject configurations that would blow the budget even *under*
+/// favorable convergence.
+pub const POLICY_INNER_ITER_ESTIMATE: u64 = 5;
+
+/// Default outer iteration estimate for the compute-budget preflight when
+/// the caller has no better signal. Conservative for second-order outer
+/// optimizers (BFGS / unified Newton); first-order callers may pass a
+/// larger value.
+pub const POLICY_DEFAULT_OUTER_ITER_ESTIMATE: usize = 20;
+
+/// Compute-budget companion to
+/// [`panic_or_error_if_biobank_mode_and_to_dense_called_with_policy`].
+///
+/// The byte gate alone permits configurations that fit in memory but whose
+/// `n·p² × outer_iters × inner_iter_estimate` arithmetic still exceeds the
+/// wall-clock ceiling — these silently hit the eventual timeout with no
+/// useful diagnostic. This preflight estimates the per-fit FLOP count on the
+/// dense materialization path and refuses to proceed past
+/// `policy.max_compute_budget_flops`, redirecting callers to
+/// (a) operator-backed designs and
+/// (b) matrix-free Hessian workspaces (where the family exposes one).
+///
+/// Skip this check when the caller has already routed to a matrix-free
+/// workspace path: the FLOP estimate models dense `n·p²` Hessian assembly
+/// and does not apply when the per-evaluation work is the much cheaper
+/// matrix-free `Hv` apply.
+pub fn panic_or_error_if_biobank_mode_compute_budget_exceeded(
+    context: &str,
+    n: usize,
+    p: usize,
+    estimated_outer_iters: usize,
+    policy: &ResourcePolicy,
+) -> Result<(), String> {
+    let assembly_flops = (n as u64)
+        .saturating_mul(p as u64)
+        .saturating_mul(p as u64);
+    let total_flops = assembly_flops
+        .saturating_mul(estimated_outer_iters as u64)
+        .saturating_mul(POLICY_INNER_ITER_ESTIMATE);
+    if total_flops > policy.max_compute_budget_flops {
+        let inner_iter_estimate = POLICY_INNER_ITER_ESTIMATE;
+        return Err(format!(
+            "{context}: estimated compute budget {:.3e} FLOPs exceeds ceiling {:.3e} \
+             at n={n}, p={p}, outer_iters≈{estimated_outer_iters}, \
+             inner_iters≈{inner_iter_estimate} per outer step — \
+             switch to an operator-backed design (avoids the n·p² assembly), \
+             or implement a matrix-free Hessian workspace for this family",
+            total_flops as f64,
+            policy.max_compute_budget_flops as f64,
+        ));
+    }
+    Ok(())
+}
+
 fn weighted_crossprod_dense(
     left: &Array2<f64>,
     weights: &Array1<f64>,
@@ -687,11 +744,19 @@ impl DenseDesignMatrix {
         match self {
             Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
             Self::Lazy(op) => {
+                let policy = ResourcePolicy::default_library();
                 panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
                     context,
                     op.nrows(),
                     op.ncols(),
-                    &ResourcePolicy::default_library(),
+                    &policy,
+                )?;
+                panic_or_error_if_biobank_mode_compute_budget_exceeded(
+                    context,
+                    op.nrows(),
+                    op.ncols(),
+                    POLICY_DEFAULT_OUTER_ITER_ESTIMATE,
+                    &policy,
                 )?;
                 Ok(op.to_dense_arc())
             }
