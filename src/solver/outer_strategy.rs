@@ -662,13 +662,6 @@ pub enum FallbackPolicy {
     Automatic,
     /// No retries; use only the primary plan.
     Disabled,
-    /// Same fallback ladder as `Automatic`, but the caller requires that no
-    /// fallback ever introduces finite-difference gradients or any
-    /// transformation that changes the objective surface. Behaviorally
-    /// identical to `Automatic` today (the ladder only downgrades the
-    /// Hessian and disables fixed-point), but documents intent and gates
-    /// future ladder additions.
-    AnalyticGradientOnly,
 }
 
 impl std::fmt::Display for OuterPlan {
@@ -882,30 +875,7 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
         }
         attempts.push(grad_cap);
     }
-    debug_assert!(
-        attempts.iter().all(|c| c.gradient == Derivative::Analytic),
-        "automatic fallback ladder produced a non-analytic-gradient attempt"
-    );
     attempts
-}
-
-/// Analytic-gradient-only fallback ladder.
-///
-/// Behaviorally identical to [`automatic_fallback_attempts`] today — the
-/// ladder is already strictly analytic-gradient — but the explicit wrapper
-/// gates future ladder additions: any new attempt that does not preserve an
-/// analytic gradient is filtered out here, so an `AnalyticGradientOnly`
-/// caller can never silently receive an FD-gradient retry.
-fn analytic_gradient_only_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
-    let attempts = automatic_fallback_attempts(cap);
-    debug_assert!(
-        attempts.iter().all(|c| c.gradient == Derivative::Analytic),
-        "analytic-gradient-only fallback ladder produced a non-analytic-gradient attempt"
-    );
-    attempts
-        .into_iter()
-        .filter(|c| c.gradient == Derivative::Analytic)
-        .collect()
 }
 
 /// Result of one outer objective evaluation.
@@ -2821,11 +2791,7 @@ fn run_outer(
     // surfaced to the caller.
     let fallback_attempts = match (config.fallback_policy, config.solver_class) {
         (FallbackPolicy::Automatic, SolverClass::Primary) => automatic_fallback_attempts(&cap),
-        (FallbackPolicy::AnalyticGradientOnly, SolverClass::Primary) => {
-            analytic_gradient_only_fallback_attempts(&cap)
-        }
         (FallbackPolicy::Automatic, SolverClass::AuxiliaryGradientFree)
-        | (FallbackPolicy::AnalyticGradientOnly, SolverClass::AuxiliaryGradientFree)
         | (FallbackPolicy::Disabled, _) => Vec::new(),
     };
     let mut attempts: Vec<OuterCapability> = Vec::with_capacity(1 + fallback_attempts.len());
@@ -5350,60 +5316,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn analytic_gradient_only_ladder_never_produces_unavailable_gradient() {
-        // ARC primary (analytic gradient + analytic Hessian): the cascade
-        // downgrades the Hessian and must keep the gradient analytic.
-        let arc_cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Analytic,
-            n_params: 4,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        let attempts = analytic_gradient_only_fallback_attempts(&arc_cap);
-        assert!(
-            !attempts.is_empty(),
-            "ARC primary must yield at least one analytic-gradient fallback",
-        );
-        for c in &attempts {
-            assert_eq!(c.gradient, Derivative::Analytic);
-        }
-
-        // EFS primary (analytic gradient, fixed-point available): the cascade
-        // disables fixed-point first, then optionally downgrades the Hessian.
-        let efs_cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
-            n_params: 4,
-            psi_dim: 1,
-            fixed_point_available: true,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: false,
-        };
-        for c in &analytic_gradient_only_fallback_attempts(&efs_cap) {
-            assert_eq!(c.gradient, Derivative::Analytic);
-        }
-
-        // BFGS-only primary (no Hessian to downgrade, no fixed-point): the
-        // ladder may legitimately be empty, but if it ever populates it
-        // must remain analytic-gradient.
-        let bfgs_cap = OuterCapability {
-            gradient: Derivative::Analytic,
-            hessian: Derivative::Unavailable,
-            n_params: 4,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: true,
-            disable_fixed_point: false,
-        };
-        for c in &analytic_gradient_only_fallback_attempts(&bfgs_cap) {
-            assert_eq!(c.gradient, Derivative::Analytic);
-        }
-    }
 }

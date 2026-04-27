@@ -16284,6 +16284,53 @@ mod tests {
         assert!(op.as_materializable().is_none());
     }
 
+    /// At biobank scale (n=320 000, p=101) a dense `Array2::zeros((n, p))`
+    /// for an unused ψ-derivative slot consumes ≈ 0.24 GiB; the spatial-
+    /// adaptive baseline used to allocate one per ψ coordinate (≈ 1.4 GiB
+    /// of guaranteed-zero memory at six coords). Replacing the dense zero
+    /// matrix with a `(0, 0)` shape sentinel — without an implicit
+    /// operator — must still resolve to `PsiDesignMap::Zero` so callers
+    /// see exact-zero semantics with O(1) memory.
+    #[test]
+    fn spatial_adaptive_zero_xpsi_uses_zero_map_without_dense_allocation() {
+        let n = 320_000usize;
+        let p = 101usize;
+        let deriv = CustomFamilyBlockPsiDerivative {
+            penalty_index: None,
+            x_psi: Array2::<f64>::zeros((0, 0)),
+            s_psi: Array2::<f64>::zeros((0, 0)),
+            s_psi_components: None,
+            s_psi_penalty_components: None,
+            x_psi_psi: None,
+            s_psi_psi: None,
+            s_psi_psi_components: None,
+            s_psi_psi_penalty_components: None,
+            implicit_operator: None,
+            implicit_axis: 0,
+            implicit_group_id: None,
+        };
+        let policy = ResourcePolicy::default_library();
+        let map = resolve_custom_family_x_psi_map(
+            &deriv,
+            n,
+            p,
+            0..n,
+            "spatial-adaptive zero sentinel",
+            &policy,
+        )
+        .expect("resolve x_psi map for (0, 0)-sentinel deriv");
+        match map {
+            PsiDesignMap::Zero { nrows, ncols } => {
+                assert_eq!(nrows, n);
+                assert_eq!(ncols, p);
+            }
+            other => panic!(
+                "(0, 0) x_psi sentinel must resolve to PsiDesignMap::Zero, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
     #[test]
     fn zero_psi_derivative_operator_resolves_to_zero_design_map() {
         let n = 12usize;
