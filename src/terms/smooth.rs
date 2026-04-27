@@ -6013,16 +6013,24 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
 
     let rho_dim = retained_penalties.len();
+    let operator_slots_end = rho_dim + runtime_caches.len() * 3;
     const EPSILON_LOG_WINDOW: f64 = 6.0;
+    // Operator-λ lower bound is tighter than the standard rho lower bound:
+    // exp(-10) ≈ 4.5e-5 still permits a very weak penalty but prevents the
+    // adaptive overlay from collapsing to the box floor and producing a
+    // near-interpolation when the overlay's surrogate is weakly identified.
+    const OPERATOR_LAMBDA_LOG_LOWER: f64 = -10.0;
     let eps_lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
-        if idx < rho_dim + runtime_caches.len() * 3 {
+        if idx < rho_dim {
             -30.0_f64
+        } else if idx < operator_slots_end {
+            OPERATOR_LAMBDA_LOG_LOWER
         } else {
             (initial_theta[idx] - EPSILON_LOG_WINDOW).max(adaptive_opts.min_epsilon.max(1e-12).ln())
         }
     }));
     let eps_upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
-        if idx < rho_dim + runtime_caches.len() * 3 {
+        if idx < operator_slots_end {
             30.0_f64
         } else {
             initial_theta[idx] + EPSILON_LOG_WINDOW
