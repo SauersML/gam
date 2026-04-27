@@ -2315,16 +2315,12 @@ impl CustomFamily for LatentSurvivalFamily {
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // `evaluate_exact_newton_joint_dense` builds a fully dense joint
-        // Hessian over (Σ p_b)² across the time, mean, and optional log-σ
-        // blocks via per-row pullback of the latent-survival primary kernel.
-        // Honest assembly cost is `n · (Σ p_b)²`; the block-diagonal default
-        // would understate the dense cross-block fill.
-        let n = self.event_target.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        // Hessian over (Σ p_b)² across time, mean, and optional log-σ blocks
+        // via per-row pullback of the latent-survival primary kernel.
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(
+            self.event_target.len() as u64,
+            specs,
+        )
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
