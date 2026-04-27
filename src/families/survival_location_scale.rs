@@ -9630,7 +9630,8 @@ pub(crate) fn fit_survival_location_scale_terms(
             wiggle_beta_hint.replace(fit.beta_link_wiggle());
             Ok(fit)
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+            use crate::solver::estimate::reml::unified::EvalMode;
             if !analytic_joint_gradient_available {
                 return Err(
                     "analytic spatial psi derivatives are unavailable for survival exact two-block path"
@@ -9658,6 +9659,16 @@ pub(crate) fn fit_survival_location_scale_terms(
             if prepared.family.x_link_wiggle.is_some() {
                 derivative_blocks.push(Vec::new());
             }
+            // If the caller asked for a Hessian but the family can't provide
+            // an analytic one, downgrade the request to ValueAndGradient.
+            // ValueOnly stays ValueOnly so cost-only line-search probes skip
+            // gradient assembly entirely.
+            let effective_mode = match eval_mode {
+                EvalMode::ValueGradientHessian if !analytic_joint_hessian_available => {
+                    EvalMode::ValueAndGradient
+                }
+                other => other,
+            };
             let eval = evaluate_custom_family_joint_hyper(
                 &prepared.family,
                 &prepared.blockspecs,
@@ -9665,11 +9676,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
-                if need_hessian && analytic_joint_hessian_available {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
-                } else {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
-                },
+                effective_mode,
             )
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start));

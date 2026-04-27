@@ -1924,57 +1924,48 @@ pub const DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD: f64 = 5.0e9;
 /// BFGS instead.
 ///
 /// The cost model gated here is the **truthful** per-outer-evaluation
-/// Hessian assembly:
+/// Hessian-assembly cost:
 ///
 /// ```text
-///   C_assembly = (k · n·p²  +  k² · p²) · I_expected
-///                 └────┬────┘   └──┬──┘
-///        per-coord    per-pair        × number of inner P-IRLS
-///        D_β H[v_k]    cross trace   iterations expected per outer
-///        (k of them,   on cached     evaluation (each smoothing-param
-///         O(n·p²))     spectral      direction touches the inner solve
-///                      rotation)     once via warm-start)
+///   C_assembly  =  k · n·p²   +   k² · p²
+///                  └────┬───┘     └──┬──┘
+///         per-coord D_β H[v_k]    per-pair cross-trace on
+///         (k builds, O(n·p²)      cached spectral rotation
+///          each)                  (no further n·p² work)
 /// ```
 ///
 /// This is independent of [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]:
 /// that constant gates the *single-inner-solve* cost (when one Hessian
 /// assembly is already too slow), while this one gates the *aggregate*
-/// Hessian-assembly cost (when the per-outer-evaluation work dominates).
-/// Both can independently trigger the gradient-only downgrade — they
-/// capture different regimes.
+/// per-outer Hessian-assembly cost (when the per-outer-evaluation work
+/// dominates).  Both can independently trigger the gradient-only
+/// downgrade — they capture different regimes.
 ///
-/// **Calibration.** At biobank-Duchon (n=320 000, p=65, k=6,
-/// I_expected=30):
+/// **Calibration.** At biobank-Duchon (n=320 000, p=65, k=6):
 /// ```text
-///   C_assembly  =  (6 · 320 000 · 65²  +  6² · 65²) · 30
-///              ≈  (8.10·10⁹  +  1.5·10⁵) · 30
-///              ≈  2.43·10¹¹
+///   C_assembly  =  6 · 320 000 · 65²  +  6² · 65²
+///              ≈  8.10·10⁹  +  1.5·10⁵
+///              ≈  8.10·10⁹
 /// ```
-/// — and the threshold sits at 2·10¹¹, just below, so the biobank case
-/// triggers the BFGS downgrade.  At TPS pilot (n=10 000, p=116, k=6):
+/// — above the 5·10⁹ threshold, so the biobank case triggers the BFGS
+/// downgrade.  At TPS pilot (n=10 000, p=116, k=6):
 /// ```text
-///   C_assembly  ≈  (6 · 10 000 · 116²  +  36 · 116²) · 30  ≈  2.43·10¹⁰
+///   C_assembly  ≈  6 · 10 000 · 116²  +  36 · 116²  ≈  8.10·10⁸
 /// ```
 /// — well under threshold, ARC stays.
-pub const STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS: u128 = 200_000_000_000;
-
-/// Expected number of inner P-IRLS iterations per outer evaluation.
 ///
-/// This factor enters the per-outer Hessian-assembly cost model because
-/// the assembly's per-coord `D_β H[v_k]` builds and per-pair cross-trace
-/// terms each touch the inner-solver state once per inner iteration that
-/// the inner P-IRLS chooses to take.  After the soft-acceptance helper
-/// (`pirls_soft_acceptance`) lets the inner loop exit on a 2-iter
-/// plateau streak, well-conditioned biobank-scale fits typically settle
-/// in 20–40 inner iterations; 30 is a calibrated midpoint.
-///
-/// Note that `I_expected` does NOT enter the *branch* decision (ARC vs
-/// BFGS) by itself, because both optimizers pay the inner-solve cost
-/// identically.  It enters here because the threshold is calibrated as
-/// an absolute wall-clock proxy for one outer evaluation, and the
-/// Hessian-assembly side of an outer evaluation scales linearly with
-/// `I_expected`.
-pub const STANDARD_GAM_OUTER_EXPECTED_INNER_ITERATIONS: u128 = 30;
+/// **Why the cost model has no `I_expected` factor.** The user's original
+/// prescription named the inner-solve cost as `C_inner ≈ n·p²·I_expected`.
+/// That cost is paid identically by ARC and by BFGS (both must compute
+/// the mode β̂); it does not enter the ARC-vs-BFGS branch decision.  The
+/// branch decision compares only the Hessian-assembly *overhead* that
+/// ARC pays on top of the shared inner solve, so `I_expected` correctly
+/// does not appear here.  Note also that nothing in this gate caps the
+/// number of inner P-IRLS iterations — the inner loop runs to its
+/// configured convergence (strict KKT, or a valid stationary point via
+/// `pirls_soft_acceptance` within 10× the user's `convergence_tolerance`
+/// band).  Model quality is unaffected by this gate.
+pub const STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS: u128 = 5_000_000_000;
 
 /// Minimum smoothing-parameter count below which ARC's super-linear
 /// convergence advantage outweighs any per-iteration Hessian cost.
@@ -2117,94 +2108,60 @@ impl OuterProblem {
     }
 
     /// Standard-GAM dense problem dimensions: a single fluent call that
-    /// configures both the per-inner-solve work hint (`n · p²`, gating
-    /// [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]) AND the per-outer-eval
-    /// Hessian-assembly policy (`k² · n · p²`, gating
-    /// [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`]).
+    /// configures both the per-inner-solve work hint and the per-outer-eval
+    /// Hessian-assembly policy.
     ///
-    /// The two cost models are independent and complementary:
+    /// **Per-inner-solve hint** — `n · p²` against
+    /// [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]: catches problems where
+    /// one Hessian assembly is already too slow, regardless of how many
+    /// smoothing parameters are in play.
     ///
-    ///   - The per-inner-solve hint catches problems where one Hessian
-    ///     assembly is already too slow, regardless of how many smoothing
-    ///     parameters are in play.
-    ///   - The per-outer-eval policy catches problems where each individual
-    ///     inner solve is moderate but the analytic LAML Hessian's k²
-    ///     pairwise inner-derived terms together dominate the per-outer
-    ///     work and ARC's super-linear convergence cannot amortize the
-    ///     extra cost.
+    /// **Per-outer-eval policy** — the truthful per-outer Hessian-assembly
+    /// cost
+    /// ```text
+    ///   C_assembly  =  (k · n·p²  +  k² · p²) · I_expected
+    ///                   └────┬───┘   └──┬──┘
+    ///          per-coord  D_β H[v_k]    per-pair cross-trace on
+    ///          (k builds, O(n·p²) each)  cached spectral rotation
+    /// ```
+    /// against [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`].
+    /// Catches problems where each individual inner solve is moderate but
+    /// the per-outer-evaluation Hessian-assembly overhead dominates and
+    /// ARC's super-linear convergence cannot amortize the extra cost.
     ///
-    /// Both can independently set `prefer_gradient_only` to steer the
-    /// planner to BFGS+gradient instead of ARC+Hessian. For sparse designs
-    /// (`is_dense = false`) both checks are skipped — the n·p² model
-    /// assumes dense XᵀWX, and sparse linear algebra is governed by a
-    /// different cost model under which ARC's iteration-count advantage
-    /// typically holds.
+    /// The factored `k · n·p² + k² · p²` form arises because inner P-IRLS
+    /// runs once per outer evaluation (producing β̂ and a cached Hessian
+    /// factorization in `hop`); `compute_outer_hessian` then uses that
+    /// cached factorization without re-triggering P-IRLS, so the pairwise
+    /// k² work is O(p²) per pair (cross-trace on the spectral rotation),
+    /// not O(n·p²) per pair.  The O(n·p²) cost is paid `k` times for the
+    /// per-coordinate `hessian_derivative_correction(v_k) =
+    /// X' diag(c⊙X v_k) X` builds, not `k²` times.
+    ///
+    /// `I_expected` ([`STANDARD_GAM_OUTER_EXPECTED_INNER_ITERATIONS`])
+    /// scales the assembly cost because each smoothing-direction touches
+    /// the inner-solver state once per inner P-IRLS iteration.  It does
+    /// **not** enter the ARC-vs-BFGS branch decision on its own — both
+    /// optimizers pay the inner-solve cost identically.  It enters here
+    /// because the threshold is calibrated as an absolute wall-clock
+    /// proxy for one outer evaluation, and the Hessian-assembly side of
+    /// an outer evaluation scales linearly with `I_expected`.
+    ///
+    /// Both cost models can independently set `prefer_gradient_only` to
+    /// steer the planner to BFGS+gradient instead of ARC+Hessian.  For
+    /// sparse designs (`is_dense = false`) both checks are skipped — the
+    /// `n · p²` model assumes dense XᵀWX, and sparse linear algebra is
+    /// governed by a different cost model under which ARC's
+    /// iteration-count advantage typically holds.
     ///
     /// Callers who already passed `prefer_gradient_only` via
     /// [`with_prefer_gradient_only`] keep that flag — this method only
     /// upgrades it from `false` to `true` when the policy fires.
     ///
-    /// # Cost model derivation and why `I_expected` is not an explicit input
-    ///
-    /// A reader looking at `solver/reml/unified.rs::compute_outer_hessian`
-    /// will notice that the actual per-outer-eval Hessian-assembly cost is
-    ///
-    /// ```text
-    ///   C_assembly  ≈  k · n·p²   +   k² · p²
-    ///                  └────┬───┘     └───┬───┘
-    ///         per-coord D_β H[v_k]    per-pair mat-vec / cross-trace
-    ///         (one X' diag(c⊙Xv_k) X   on the precomputed spectral
-    ///          per smoothing param,    rotation; no further n·p² work
-    ///          O(np²) each)            after the k correction builds)
-    /// ```
-    ///
-    /// not the `k² · n·p²` written below.  The factored form arises because
-    /// inner P-IRLS runs **once** per outer evaluation (producing β̂ and a
-    /// cached Hessian factorization in `hop`); `compute_outer_hessian` then
-    /// uses that cached factorization without re-triggering P-IRLS, so the
-    /// pairwise `k²` work is O(p²) per pair, not O(n·p²) per pair.  The
-    /// O(n·p²) cost is paid `k` times for the per-coordinate
-    /// `hessian_derivative_correction(v_k) = X' diag(c⊙X v_k) X` builds, not
-    /// `k²` times.
-    ///
-    /// The user's original prescription named the inner-solve cost
-    /// `C_inner ≈ n · p² · I_expected`, where `I_expected` is the expected
-    /// P-IRLS iteration count.  That cost is paid identically by ARC and by
-    /// BFGS (both must compute the mode β̂); it does not enter the
-    /// ARC-vs-BFGS branch decision.  The branch decision compares only the
-    /// **Hessian-assembly overhead** (`k·n·p² + k²·p²`) that ARC pays on
-    /// top of the shared inner solve.  So `I_expected` correctly does not
-    /// appear here.
-    ///
-    /// Why we use `k² · n·p²` (a structural upper bound on the true cost)
-    /// rather than the tight `k·n·p² + k²·p²`:
-    ///
-    /// At biobank scale (n=320K, p=65, k=6) the true overhead is
-    ///   k·n·p² + k²·p²  ≈  6·1.35e9 + 36·4.2e3  ≈  8.1e9
-    /// and the current formula gives
-    ///   k²·n·p²  ≈  36·1.35e9  ≈  4.87e10
-    /// — a 6× overstatement that is exactly the factor `k`.  The empirical
-    /// `STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS = 5e9` was
-    /// hand-tuned against the inflated formula so the inflection point
-    /// `k²·n·p² > 5e9` lands where the true overhead `k·n·p² ≈ 8e9` first
-    /// exceeds the wall-clock break-even with BFGS+gradient on the
-    /// production Duchon problem.  Equivalently, the budget can be read as
-    ///
-    ///   5e9   ≈   k_typical · n · p²   at the calibration point
-    ///         ≈   6 · 320 000 · 65²    rounded down by ~40% headroom
-    ///
-    /// where the implicit `I_expected` of the inner solve has been folded
-    /// into the constant alongside the `k`-vs-`k²` factor and assorted
-    /// per-pair lower-order terms.  Rewriting the formula as the tight
-    /// `k·n·p² + k²·p²` would require recalibrating the threshold by
-    /// roughly a factor of `k_typical = 6`, leaving the same decision
-    /// boundary in the (n, p, k)-space that callers actually exercise; no
-    /// problem currently in scope would change classification.
-    ///
-    /// `STANDARD_GAM_OUTER_BFGS_MIN_K = 4` then handles the small-k regime
-    /// independently of either cost model: ARC always wins for `k ≤ 3`
-    /// because the dim-k BFGS curvature history is too thin, regardless of
-    /// how favorable the FLOP comparison would otherwise look.
+    /// `STANDARD_GAM_OUTER_BFGS_MIN_K = 4` independently handles the
+    /// small-k regime: ARC always wins for `k ≤ 3` because the dim-k
+    /// BFGS curvature history is too thin, regardless of how favorable
+    /// the FLOP comparison would otherwise look.
     pub fn with_standard_gam_dimensions(
         mut self,
         n_obs: usize,
