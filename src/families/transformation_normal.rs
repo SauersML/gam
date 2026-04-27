@@ -54,7 +54,7 @@ use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -179,9 +179,11 @@ pub struct TransformationNormalFamily {
 
     // --- Active-set certificate for the monotonicity-grid line search ---
     /// Cached `(active_pairs, m_inactive, ||r_g||, ||X_cov_i||)` summary for
-    /// `KroneckerDesign::min_step_to_boundary_with_active_set`. RefCell so the
-    /// `&self` `max_feasible_step_size` callsite can mutate it.
-    active_set_cache: RefCell<KroneckerActiveSetCache>,
+    /// `KroneckerDesign::min_step_to_boundary_with_active_set`. `Mutex` so
+    /// the `&self` `max_feasible_step_size` callsite can mutate it while the
+    /// surrounding family stays `Send + Sync` (required by
+    /// `ExactNewtonJointHessianWorkspace: Send + Sync`).
+    active_set_cache: Mutex<KroneckerActiveSetCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +341,7 @@ impl TransformationNormalFamily {
             response_degree: config.response_degree,
             response_median: resp_median,
             policy,
-            active_set_cache: RefCell::new(KroneckerActiveSetCache::new()),
+            active_set_cache: Mutex::new(KroneckerActiveSetCache::new()),
         })
     }
 
@@ -489,7 +491,7 @@ impl TransformationNormalFamily {
             response_degree,
             response_median: resp_median,
             policy,
-            active_set_cache: RefCell::new(KroneckerActiveSetCache::new()),
+            active_set_cache: Mutex::new(KroneckerActiveSetCache::new()),
         })
     }
 
@@ -1010,7 +1012,10 @@ impl CustomFamily for TransformationNormalFamily {
                 // Bit-equivalent to `min_step_to_boundary_with_projections`
                 // when the certificate accepts; otherwise refreshes via a
                 // full grid scan and returns the same `α`.
-                let mut cache = self.active_set_cache.borrow_mut();
+                let mut cache = self
+                    .active_set_cache
+                    .lock()
+                    .expect("active-set cache mutex poisoned");
                 self.x_deriv_grid_kron.min_step_to_boundary_with_active_set(
                     c_beta.view(),
                     d_delta.view(),

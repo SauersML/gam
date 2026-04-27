@@ -2119,10 +2119,11 @@ impl OuterProblem {
     /// **Per-outer-eval policy** — the truthful per-outer Hessian-assembly
     /// cost
     /// ```text
-    ///   C_assembly  =  (k · n·p²  +  k² · p²) · I_expected
-    ///                   └────┬───┘   └──┬──┘
-    ///          per-coord  D_β H[v_k]    per-pair cross-trace on
-    ///          (k builds, O(n·p²) each)  cached spectral rotation
+    ///   C_assembly  =  k · n·p²   +   k² · p²
+    ///                  └────┬───┘     └──┬──┘
+    ///          per-coord D_β H[v_k]    per-pair cross-trace on
+    ///          (k builds, O(n·p²)      cached spectral rotation
+    ///           each)
     /// ```
     /// against [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`].
     /// Catches problems where each individual inner solve is moderate but
@@ -2133,19 +2134,18 @@ impl OuterProblem {
     /// runs once per outer evaluation (producing β̂ and a cached Hessian
     /// factorization in `hop`); `compute_outer_hessian` then uses that
     /// cached factorization without re-triggering P-IRLS, so the pairwise
-    /// k² work is O(p²) per pair (cross-trace on the spectral rotation),
-    /// not O(n·p²) per pair.  The O(n·p²) cost is paid `k` times for the
-    /// per-coordinate `hessian_derivative_correction(v_k) =
-    /// X' diag(c⊙X v_k) X` builds, not `k²` times.
+    /// `k²` work is O(p²) per pair (cross-trace on the spectral
+    /// rotation), not O(n·p²) per pair.  The O(n·p²) cost is paid `k`
+    /// times for the per-coordinate `hessian_derivative_correction(v_k)
+    /// = X' diag(c⊙X v_k) X` builds, not `k²` times.
     ///
-    /// `I_expected` ([`STANDARD_GAM_OUTER_EXPECTED_INNER_ITERATIONS`])
-    /// scales the assembly cost because each smoothing-direction touches
-    /// the inner-solver state once per inner P-IRLS iteration.  It does
-    /// **not** enter the ARC-vs-BFGS branch decision on its own — both
-    /// optimizers pay the inner-solve cost identically.  It enters here
-    /// because the threshold is calibrated as an absolute wall-clock
-    /// proxy for one outer evaluation, and the Hessian-assembly side of
-    /// an outer evaluation scales linearly with `I_expected`.
+    /// **Nothing in this gate caps inner P-IRLS iterations.** The inner
+    /// loop runs to its configured convergence (strict KKT, or a valid
+    /// stationary point via `pirls_soft_acceptance` within 10× the
+    /// user's `convergence_tolerance` band).  This method only changes
+    /// *which outer optimizer* is selected (ARC vs BFGS), and only based
+    /// on the Hessian-assembly overhead that ARC pays on top of the
+    /// shared inner solve.  Model quality is unaffected.
     ///
     /// Both cost models can independently set `prefer_gradient_only` to
     /// steer the planner to BFGS+gradient instead of ARC+Hessian.  For
@@ -2158,8 +2158,8 @@ impl OuterProblem {
     /// [`with_prefer_gradient_only`] keep that flag — this method only
     /// upgrades it from `false` to `true` when the policy fires.
     ///
-    /// `STANDARD_GAM_OUTER_BFGS_MIN_K = 4` independently handles the
-    /// small-k regime: ARC always wins for `k ≤ 3` because the dim-k
+    /// [`STANDARD_GAM_OUTER_BFGS_MIN_K`] independently handles the
+    /// small-k regime: ARC always wins for `k ≤ 3` because the dim-`k`
     /// BFGS curvature history is too thin, regardless of how favorable
     /// the FLOP comparison would otherwise look.
     pub fn with_standard_gam_dimensions(
@@ -2176,29 +2176,26 @@ impl OuterProblem {
         if self.n_params >= STANDARD_GAM_OUTER_BFGS_MIN_K {
             // Truthful per-outer-evaluation Hessian-assembly cost:
             //
-            //   C_assembly  =  (k · n·p²  +  k² · p²) · I_expected
+            //   C_assembly  =  k · n·p²  +  k² · p²
             //
             // — the `k · n·p²` per-coord `D_β H[v_k]` builds and the
             // `k² · p²` per-pair cross-trace terms on the cached spectral
-            // rotation, each repeated `I_expected` times because the
-            // inner P-IRLS state touches each smoothing-direction once
-            // per inner iteration.
+            // rotation.  Inner P-IRLS runs once per outer evaluation
+            // producing a cached Hessian factorization, so the pairwise
+            // k² work is O(p²) per pair, not O(n·p²).
             //
             // We *store* this as a separate signal rather than directly
-            // setting `prefer_gradient_only`, so the matrix-free check
-            // in `capability()` can suppress the downgrade when the
-            // family supplies Hv operators that absorb the per-iteration
-            // cost.
+            // setting `prefer_gradient_only`, so the matrix-free check in
+            // `capability()` can suppress the downgrade when the family
+            // supplies Hv operators that absorb the per-evaluation cost.
             let n = n_obs as u128;
             let p = p_coeff as u128;
             let k = self.n_params as u128;
             let p_squared = p.saturating_mul(p);
             let n_p_squared = n.saturating_mul(p_squared);
             let per_coord_builds = k.saturating_mul(n_p_squared); // k · n·p²
-            let per_pair_traces = k.saturating_mul(k).saturating_mul(p_squared); // k²·p²
-            let assembly_per_eval = per_coord_builds.saturating_add(per_pair_traces);
-            let hessian_assembly_work =
-                assembly_per_eval.saturating_mul(STANDARD_GAM_OUTER_EXPECTED_INNER_ITERATIONS);
+            let per_pair_traces = k.saturating_mul(k).saturating_mul(p_squared); // k² · p²
+            let hessian_assembly_work = per_coord_builds.saturating_add(per_pair_traces);
             // Saturating cast u128 → f64; values up to ~1.8·10³⁰⁸ fit, so
             // the saturation point is unreachable for any realistic GAM.
             self.aggregate_hessian_pair_work_hint = Some(hessian_assembly_work as f64);
@@ -2234,8 +2231,9 @@ impl OuterProblem {
             .unwrap_or(false)
     }
 
-    /// True when the aggregate `k²·n·p²` per-outer-iteration Hessian-pair
-    /// assembly cost exceeds [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`].
+    /// True when the truthful per-outer Hessian-assembly cost
+    /// (`k · n·p² + k² · p²`) exceeds
+    /// [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`].
     fn aggregate_hessian_pair_work_too_large(&self) -> bool {
         self.aggregate_hessian_pair_work_hint
             .map(|w| {
@@ -3693,10 +3691,14 @@ mod tests {
 
     #[test]
     fn standard_gam_dimensions_biobank_duchon_triggers_gradient_only() {
-        // Biobank-scale dense Duchon: n=320K, p=65, k=6 → k²·n·p² ≈ 4.9e10
-        // > 5e9 budget. The aggregate Hessian-assembly policy must steer
-        // the planner to gradient-only, even though the per-inner-solve
-        // hint (n·p² ≈ 1.35e9) is below its own 5e9 threshold.
+        // Biobank-scale dense Duchon: n=320K, p=65, k=6.
+        // Truthful Hessian-assembly cost: k·n·p² + k²·p²
+        //   = 6 · 320 000 · 65²  +  6² · 65²
+        //   ≈ 8.10·10⁹ + 1.5·10⁵
+        //   ≈ 8.10·10⁹     > 5·10⁹ threshold
+        // So the aggregate-assembly policy steers the planner to gradient-only,
+        // even though the per-inner-solve hint (n·p² ≈ 1.35·10⁹) sits below
+        // its own 5·10⁹ threshold.
         let problem = OuterProblem::new(6)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Analytic)
@@ -3708,10 +3710,10 @@ mod tests {
 
     #[test]
     fn standard_gam_dimensions_per_inner_solve_hint_alone_triggers_gradient_only() {
-        // n=20K, p=600, k=2 → n·p² = 7.2e9 > 5e9 (existing per-inner-solve
-        // threshold) but k²·n·p² = 2.88e10 — same order. The per-inner-solve
-        // hint is what fires here because k=2 is below the BFGS-min-k cutoff,
-        // so the aggregate-assembly policy short-circuits.
+        // n=20K, p=600, k=2.  k=2 is below BFGS-min-k (4), so the
+        // aggregate-assembly policy short-circuits.  But the per-inner-solve
+        // hint (n·p² = 7.2·10⁹ > 5·10⁹) fires independently and gets us to
+        // gradient-only — the two cost models capture different regimes.
         let problem = OuterProblem::new(2)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Analytic)
@@ -3723,8 +3725,10 @@ mod tests {
 
     #[test]
     fn standard_gam_dimensions_small_problem_keeps_arc() {
-        // Small dense problem: n=1000, p=10, k=4 → both hints below
-        // threshold, so ARC stays selected.
+        // Small dense problem: n=1000, p=10, k=4.
+        // Aggregate cost: 4·1 000·100 + 16·100 = 4.0·10⁵ + 1.6·10³ ≈ 4·10⁵
+        //   ≪ 5·10⁹ threshold.
+        // Per-inner-solve cost: n·p² = 10⁵ ≪ 5·10⁹.  Both checks pass; ARC stays.
         let problem = OuterProblem::new(4)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Analytic)
@@ -3736,10 +3740,10 @@ mod tests {
 
     #[test]
     fn standard_gam_dimensions_low_k_keeps_arc_at_biobank_scale() {
-        // For k ≤ 3 the BFGS curvature history is too thin to win. The
-        // aggregate-assembly policy must short-circuit on k regardless of
-        // n·p². The per-inner-solve hint also stays below threshold here
-        // (n·p² = 1.35e9 < 5e9), so neither check fires.
+        // n=320K, p=65, k=3.  k=3 < BFGS-min-k (4), so the aggregate
+        // policy short-circuits regardless of how big the assembly cost
+        // would otherwise be.  Per-inner-solve hint also stays below
+        // threshold (n·p² ≈ 1.35·10⁹ < 5·10⁹), so neither check fires.
         let problem = OuterProblem::new(3)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Analytic)

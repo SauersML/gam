@@ -13935,13 +13935,23 @@ pub fn fit_survival_marginal_slope_terms(
             }
             Ok(fit)
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], need_hessian| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+            use crate::solver::estimate::reml::unified::EvalMode;
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
+            // Downgrade Hessian request to gradient-only when the family
+            // can't supply an analytic Hessian; preserve ValueOnly so the
+            // line-search probes truly skip gradient assembly.
+            let effective_mode = match eval_mode {
+                EvalMode::ValueGradientHessian if !analytic_joint_hessian_available => {
+                    EvalMode::ValueAndGradient
+                }
+                other => other,
+            };
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
@@ -13949,14 +13959,12 @@ pub fn fit_survival_marginal_slope_terms(
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
-                if need_hessian && analytic_joint_hessian_available {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
-                } else {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
-                },
+                effective_mode,
             )?;
             exact_warm_start.replace(Some(eval.warm_start));
-            if need_hessian && analytic_joint_hessian_available && !eval.outer_hessian.is_analytic()
+            if matches!(eval_mode, EvalMode::ValueGradientHessian)
+                && analytic_joint_hessian_available
+                && !eval.outer_hessian.is_analytic()
             {
                 return Err(
                     "exact survival marginal-slope joint objective did not return an outer Hessian"
