@@ -4,7 +4,7 @@ The ``synthetic_biobank`` fixture provides a compact biobank-like DataFrame
 with PCs, a raw PGS, a binary disease outcome, and left-truncated survival
 columns. It is the single source of truth for the three pipeline smoke
 tests in ``tests/test_python_api.py`` and for the demo in
-``python/examples/pgs_calibration_pipeline.py`` (which imports it through
+``examples/pgs_calibration_pipeline.py`` (which imports it through
 ``load_biobank_sample``).
 
 The column schema is intentionally the same schema the CLI-based

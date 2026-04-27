@@ -36,6 +36,26 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Predict whether the runtime REML geometry will end up routing through
+    /// the dense-spectral backend at `rho`.  Returns `true` when
+    /// `select_reml_geometry(rho)` selects `DenseSpectral`.
+    ///
+    /// Used by the outer planner to decide whether to apply dense-Hessian
+    /// work-cost gates: the planner historically read `dense_design` from
+    /// the `DesignMatrix` enum, which is wrong when the design is sparse
+    /// but the runtime densifies for routing reasons (firth, constraints,
+    /// or per-ρ penalized-Hessian density above 0.10).  At biobank scale
+    /// (n=320 000, p=101, sparse Matern), the original `DesignMatrix` is
+    /// `Sparse`, but the per-ρ density check above pushes the runtime to
+    /// dense — and without dense gates, the planner picks ARC + analytic
+    /// Hessian and OOMs.
+    pub(crate) fn runtime_geometry_is_dense(&self, rho: &Array1<f64>) -> bool {
+        matches!(
+            self.select_reml_geometry(rho).geometry,
+            RemlGeometry::DenseSpectral
+        )
+    }
+
     pub(super) fn select_reml_geometry(&self, rho: &Array1<f64>) -> SparseRemlDecision {
         let p = self.p;
         let has_dense_constraints =
@@ -86,9 +106,6 @@ impl<'a> RemlState<'a> {
             // consistent option.
             return dense_backend("firth_bias_reduction_active", None, None);
         }
-        if p < 256 {
-            return dense_backend("p_below_threshold", None, None);
-        }
         if has_dense_constraints {
             return dense_backend("constraints_present", None, None);
         }
@@ -98,6 +115,18 @@ impl<'a> RemlState<'a> {
         let Some(blocks) = self.sparse_penalty_blocks.as_ref() else {
             return dense_backend("penalty_blocks_not_separable", None, None);
         };
+        // Small-problem dense fast-path: the previous heuristic densified
+        // unconditionally on `p < 256`, which is wrong when `n` is large
+        // (a sparse 320k×101 design has the dense Gram path consume
+        // O(n p²) bytes per assembled block — exact-Hessian REML can
+        // accumulate many such blocks and OOM).  Restrict the early-out
+        // to truly small problems: `p < 256` AND `n·p` small enough
+        // that one dense `n×p` block is in the few-tens-of-MB range.
+        const SMALL_NP_DENSE_BUDGET: usize = 4_000_000;
+        let n_obs = self.y.len();
+        if p < 256 && n_obs.saturating_mul(p) < SMALL_NP_DENSE_BUDGET {
+            return dense_backend("p_below_threshold_and_small", None, None);
+        }
 
         let lambdas = rho.mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));

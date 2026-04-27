@@ -6552,6 +6552,21 @@ impl CustomFamily for GaussianLocationScaleFamily {
         )?;
         Ok(Some(Arc::new(workspace)))
     }
+
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        // The Gaussian location-scale workspace is returned by
+        // `exact_newton_joint_hessian_workspace` whenever
+        // `exact_joint_dense_block_designs` succeeds, which itself depends on
+        // both block designs being present.  Mirror that condition so the
+        // outer planner can suppress the cost-driven `prefer_gradient_only`
+        // downgrade exactly when the eval will actually return
+        // `HessianResult::Operator` and ARC's matrix-free path will absorb
+        // the per-iteration assembly cost via O(n·p) HVPs.
+        self.exact_joint_supported()
+    }
 }
 
 impl CustomFamilyGenerative for GaussianLocationScaleFamily {
@@ -8989,6 +9004,19 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             x_ls.into_owned(),
         )?;
         Ok(Some(Arc::new(workspace)))
+    }
+
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        // Same gating as the workspace impl above: matrix-free fires when
+        // `exact_joint_dense_block_designs` is satisfiable, which requires
+        // both location and scale block designs to be present.  The wiggle
+        // block is folded into the operator via the per-row pieces — its
+        // presence is implied by reaching the wiggle family in the first
+        // place — so the predicate matches the non-wiggle case.
+        self.exact_joint_supported()
     }
 }
 
@@ -13021,6 +13049,20 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )?;
         Ok(Some(Arc::new(workspace)))
     }
+
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        // Mirror the workspace gating: matrix-free path fires whenever
+        // `exact_joint_dense_block_designs` returns the threshold + log-σ
+        // designs, which is the same condition `exact_joint_supported`
+        // checks. When this returns `true` the unified outer evaluator
+        // produces `JointHessianSource::Operator` and ARC routes through
+        // the matrix-free trust-region CG path; the `OuterProblem`
+        // cost-driven downgrade should then stay off.
+        self.exact_joint_supported()
+    }
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
@@ -16713,6 +16755,20 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         )?;
         Ok(Some(Arc::new(workspace)))
     }
+
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        // Same gating as the workspace impl: matrix-free path is available
+        // when both threshold and log-σ block designs are present (the
+        // wiggle block is folded into the per-row pieces inside
+        // `BinomialLocationScaleWiggleHessianWorkspace`). When this returns
+        // `true` the outer planner should suppress the cost-driven
+        // gradient-only downgrade — ARC's `run_operator_trust_region`
+        // route absorbs the per-iteration cost via O(n·p) HVPs.
+        self.exact_joint_supported()
+    }
 }
 
 /// Matrix-free joint-Hessian operator for the 3-block binomial
@@ -17309,6 +17365,607 @@ mod tests {
             expected > crate::custom_family::default_coefficient_hessian_cost(&specs),
             "joint-coupled cost must exceed block-diagonal default by the cross-block fill"
         );
+    }
+
+    /// Helper: build a small Gaussian location-scale family + state + specs
+    /// for matrix-free joint-Hessian validation.
+    fn gls_workspace_fixture() -> (
+        GaussianLocationScaleFamily,
+        Vec<ParameterBlockState>,
+        Vec<ParameterBlockSpec>,
+    ) {
+        let n = 7usize;
+        let p_mu = 3usize;
+        let p_ls = 2usize;
+        let xmu = Array2::from_shape_fn((n, p_mu), |(i, j)| {
+            ((i as f64) * 0.13 + (j as f64) * 0.31).sin()
+        });
+        let xls = Array2::from_shape_fn((n, p_ls), |(i, j)| {
+            ((i as f64) * 0.21 + (j as f64) * 0.47).cos()
+        });
+        let beta_mu = array![0.10, -0.20, 0.30];
+        let beta_ls = array![0.40, -0.10];
+        let eta_mu = xmu.dot(&beta_mu);
+        let eta_ls = xls.dot(&beta_ls);
+        let y = Array1::from_shape_fn(n, |i| 0.5 + 0.1 * (i as f64).cos());
+        let weights = Array1::from_elem(n, 1.0);
+        let mu_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xmu.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let family = GaussianLocationScaleFamily {
+            y,
+            weights,
+            mu_design: Some(mu_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cached_row_scalars: std::sync::RwLock::new(None),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_mu,
+                eta: eta_mu,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "mu".to_string(),
+                design: mu_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: log_sigma_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        (family, states, specs)
+    }
+
+    /// Helper: build a small Binomial location-scale family + state + specs
+    /// for matrix-free joint-Hessian validation. Probit is the production link.
+    fn bls_workspace_fixture() -> (
+        BinomialLocationScaleFamily,
+        Vec<ParameterBlockState>,
+        Vec<ParameterBlockSpec>,
+    ) {
+        let n = 8usize;
+        let pt = 3usize;
+        let pls = 2usize;
+        let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+            ((i as f64) * 0.17 + (j as f64) * 0.29).sin()
+        });
+        let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+            ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.5
+        });
+        let beta_t = array![0.20, -0.10, 0.05];
+        let beta_ls = array![0.30, -0.15];
+        let eta_t = xt.dot(&beta_t);
+        let eta_ls = xls.dot(&beta_ls);
+        let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let family = BinomialLocationScaleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t,
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
+                design: threshold_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: log_sigma_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        (family, states, specs)
+    }
+
+    #[test]
+    fn gaussian_location_scale_workspace_matvec_matches_dense() {
+        // Patch 7 mirror of the CTN matrix-free reference test: the matrix-
+        // free `Hv` and `diag(H)` operators must reconstruct the dense joint
+        // Hessian element-wise. This pins the cross-block coefficient
+        // (`coeff_ml` in GaussianLocationScaleHessianWorkspace) against any
+        // future regression of the t↔ℓ coupling.
+        let (family, states, specs) = gls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let dense = family
+            .exact_newton_joint_hessian(&states)
+            .expect("dense joint Hessian build")
+            .expect("dense joint Hessian present");
+        assert_eq!(dense.nrows(), p);
+        assert_eq!(dense.ncols(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let diag_op = workspace
+            .hessian_diagonal()
+            .expect("diagonal call")
+            .expect("diagonal present");
+        assert_eq!(diag_op.len(), p);
+        for i in 0..p {
+            let want = dense[[i, i]];
+            let got = diag_op[i];
+            assert!(
+                (want - got).abs() <= 1e-10 * want.abs().max(1.0) + 1e-10,
+                "GLS diagonal mismatch at {i}: dense={want:.6e}, workspace={got:.6e}"
+            );
+        }
+
+        let directions = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0, 0.0]),
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31]),
+        ];
+        for (k, v) in directions.iter().enumerate() {
+            assert_eq!(v.len(), p);
+            let want = dense.dot(v);
+            let got = workspace
+                .hessian_matvec(v)
+                .expect("matvec call")
+                .expect("matvec present");
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-10 * want[i].abs().max(1.0) + 1e-10;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "GLS matvec[{k}, {i}] mismatch: dense={:.6e}, workspace={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_workspace_dh_operator_matches_dense() {
+        let (family, states, specs) = gls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        assert_eq!(d_beta.len(), p);
+
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &d_beta)
+            .expect("dense dH build")
+            .expect("dense dH present");
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH operator call")
+            .expect("dH operator present");
+
+        let probes = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            assert_eq!(w.len(), p);
+            let want = dense_dh.dot(w);
+            let got = dh_op.mul_vec(w);
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "GLS dH op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_workspace_matvec_matches_dense() {
+        // Probit + logb-sigma is the production-pipeline link combination, so
+        // the cross-block coefficient `coeff_tl` must agree with the dense
+        // assembly to within tight tolerance on randomly sampled directions.
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let dense = family
+            .exact_newton_joint_hessian(&states)
+            .expect("dense joint Hessian build")
+            .expect("dense joint Hessian present");
+        assert_eq!(dense.nrows(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let diag_op = workspace
+            .hessian_diagonal()
+            .expect("diagonal call")
+            .expect("diagonal present");
+        assert_eq!(diag_op.len(), p);
+        for i in 0..p {
+            let want = dense[[i, i]];
+            let got = diag_op[i];
+            assert!(
+                (want - got).abs() <= 1e-10 * want.abs().max(1.0) + 1e-10,
+                "BLS diagonal mismatch at {i}: dense={want:.6e}, workspace={got:.6e}"
+            );
+        }
+
+        let directions = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0, 0.0]),
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31]),
+        ];
+        for (k, v) in directions.iter().enumerate() {
+            assert_eq!(v.len(), p);
+            let want = dense.dot(v);
+            let got = workspace
+                .hessian_matvec(v)
+                .expect("matvec call")
+                .expect("matvec present");
+            for i in 0..p {
+                let tol = 1e-10 * want[i].abs().max(1.0) + 1e-10;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "BLS matvec[{k}, {i}] mismatch: dense={:.6e}, workspace={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_workspace_dh_operator_matches_dense() {
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        assert_eq!(d_beta.len(), p);
+
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &d_beta)
+            .expect("dense dH build")
+            .expect("dense dH present");
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH operator call")
+            .expect("dH operator present");
+
+        let probes = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            assert_eq!(w.len(), p);
+            let want = dense_dh.dot(w);
+            let got = dh_op.mul_vec(w);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "BLS dH op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_wiggle_workspace_matvec_matches_dense() {
+        // Probit + linkwiggle is the production-pipeline supervised link.
+        // This is the load-bearing cross-block test: it pins the b/d wiggle
+        // coefficients (`coeff_tw_b/d`, `coeff_lw_b/d`, `coeffww`) and the
+        // t↔ℓ block against the dense assembly used by
+        // `exact_newton_joint_hessian` for the wiggle variant.
+        let n = 10usize;
+        let pt = 3usize;
+        let pls = 2usize;
+        let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+            ((i as f64) * 0.17 + (j as f64) * 0.29).sin() * 0.4
+        });
+        let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+            ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.3
+        });
+        let beta_t = array![0.20, -0.10, 0.05];
+        let beta_ls = array![0.30, -0.15];
+        let eta_t = xt.dot(&beta_t);
+        let eta_ls = xls.dot(&beta_ls);
+
+        // Build a tiny wiggle basis through the existing seed helper.
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
+            Some(d) => d.clone(),
+            None => panic!("wiggle design must be dense for this test fixture"),
+        };
+        let pw = wiggle_design_dense.ncols();
+        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
+        let eta_w = wiggle_design_dense.dot(&beta_w);
+
+        let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let family = BinomialLocationScaleWiggleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t,
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: eta_w,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
+                design: threshold_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: log_sigma_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: wiggle_block.design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+
+        let p = pt + pls + pw;
+        let dense = family
+            .exact_newton_joint_hessian(&states)
+            .expect("dense joint Hessian build")
+            .expect("dense joint Hessian present");
+        assert_eq!(dense.nrows(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let directions = vec![
+            // Axis-aligned probes per block:
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == pt { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == pt + pls { 1.0 } else { 0.0 }),
+            // Mixed direction across all three blocks:
+            Array1::from_shape_fn(p, |i| 0.1 * ((i + 1) as f64).cos()),
+        ];
+        for (k, v) in directions.iter().enumerate() {
+            let want = dense.dot(v);
+            let got = workspace
+                .hessian_matvec(v)
+                .expect("matvec call")
+                .expect("matvec present");
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "BLSW matvec[{k}, {i}] mismatch: dense={:.6e}, workspace={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_wiggle_workspace_matvec_matches_dense() {
+        let n = 10usize;
+        let p_mu = 3usize;
+        let p_ls = 2usize;
+        let xmu = Array2::from_shape_fn((n, p_mu), |(i, j)| {
+            ((i as f64) * 0.13 + (j as f64) * 0.31).sin() * 0.4
+        });
+        let xls = Array2::from_shape_fn((n, p_ls), |(i, j)| {
+            ((i as f64) * 0.21 + (j as f64) * 0.47).cos() * 0.3
+        });
+        let beta_mu = array![0.10, -0.20, 0.30];
+        let beta_ls = array![0.40, -0.10];
+        let eta_mu = xmu.dot(&beta_mu);
+        let eta_ls = xls.dot(&beta_ls);
+
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
+            Some(d) => d.clone(),
+            None => panic!("wiggle design must be dense for this test fixture"),
+        };
+        let pw = wiggle_design_dense.ncols();
+        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).sin());
+        let eta_w = wiggle_design_dense.dot(&beta_w);
+
+        let y = Array1::from_shape_fn(n, |i| 0.5 + 0.1 * (i as f64).cos());
+        let weights = Array1::from_elem(n, 1.0);
+        let mu_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xmu.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let family = GaussianLocationScaleWiggleFamily {
+            y,
+            weights,
+            mu_design: Some(mu_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cached_row_scalars: std::sync::RwLock::new(None),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_mu,
+                eta: eta_mu,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: eta_w,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "mu".to_string(),
+                design: mu_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: log_sigma_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: wiggle_block.design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+
+        let p = p_mu + p_ls + pw;
+        let dense = family
+            .exact_newton_joint_hessian(&states)
+            .expect("dense joint Hessian build")
+            .expect("dense joint Hessian present");
+        assert_eq!(dense.nrows(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let directions = vec![
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == p_mu { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == p_mu + p_ls { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| 0.1 * ((i + 1) as f64).sin()),
+        ];
+        for (k, v) in directions.iter().enumerate() {
+            let want = dense.dot(v);
+            let got = workspace
+                .hessian_matvec(v)
+                .expect("matvec call")
+                .expect("matvec present");
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "GLSW matvec[{k}, {i}] mismatch: dense={:.6e}, workspace={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
     }
 
     #[test]

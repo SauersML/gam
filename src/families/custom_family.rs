@@ -413,6 +413,47 @@ const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
 /// cheap-outer path even though K²=484 alone is small.
 const DEFAULT_EXACT_OUTER_MAX_COMBINED_COST: u64 = 1_000_000_000;
 
+/// Total floating-point budget for one full first-order outer optimization
+/// (BFGS / L-BFGS) on the custom-family path, in flop-equivalent units.
+///
+/// The gate downstream of [`cost_gated_outer_order`] turns this into a hard
+/// cap on the BFGS outer iteration count: once the per-evaluation
+/// coefficient-space gradient cost is known, the cap is
+///
+///   `max_iter ≤ FIRST_ORDER_TOTAL_BUDGET_FLOPS / (probes_per_step · gradient_cost)`.
+///
+/// `probes_per_step` is the conservative average number of additional
+/// value-only line-search probes per iteration. With warm-cached inner
+/// solutions a value-only probe is roughly one Newton step from the warm
+/// start, much cheaper than a fresh evaluate; we set the multiplier to
+/// `FIRST_ORDER_LINE_SEARCH_MULTIPLIER` to account for it.
+///
+/// At biobank scale (K=15, n=320 000, p_total=64) the joint-coupled
+/// gradient cost is ≈ 1.31·10⁹, so the cap evaluates to
+/// `2·10¹¹ / (3 · 1.31·10⁹) ≈ 50` iterations — enough to converge on a
+/// well-conditioned surrogate REML surface but not so much that a pathological
+/// search burns 2400 s wall-clock before the runner returns.
+pub const DEFAULT_FIRST_ORDER_TOTAL_BUDGET_FLOPS: u128 = 200_000_000_000;
+
+/// Multiplier covering value-only line-search probes per BFGS iteration.
+///
+/// Each outer step issues one value+gradient evaluation plus, on average,
+/// ~2 value-only line-search probes before Strong-Wolfe accepts. Value-only
+/// evaluations on the custom-family path use the warm-cached inner solution
+/// (`fit_custom_family`'s `cost_fn` callback rebuilds from the prior warm
+/// state in 1–2 Newton steps instead of restarting from cold), so the
+/// per-probe cost is roughly half of a fresh value+gradient evaluation. The
+/// effective multiplier is therefore ≈ 1·full + 2·½ = 2 full evaluations
+/// per outer step; we use 3 conservatively to leave headroom for harder
+/// line searches at biobank scale.
+const FIRST_ORDER_LINE_SEARCH_MULTIPLIER: u128 = 3;
+
+/// Hard floor on the first-order outer iteration cap regardless of the
+/// per-evaluation cost: small problems should always get at least this many
+/// iterations to converge; large problems may have their cap reduced down
+/// to this number but never below it.
+const FIRST_ORDER_OUTER_MIN_MAX_ITER: usize = 30;
+
 /// Shared cost-aware gate for second-order exact outer derivatives.
 ///
 /// The outer Hessian returned by `compute_outer_hessian` has shape
@@ -476,6 +517,55 @@ pub fn joint_coupled_coefficient_hessian_cost(n: u64, specs: &[ParameterBlockSpe
         .map(|s| s.design.ncols() as u64)
         .fold(0u64, |acc, p| acc.saturating_add(p));
     n.saturating_mul(p_total.saturating_mul(p_total))
+}
+
+/// Default coefficient-space gradient cost: half the Hessian cost.
+///
+/// The first-order analytic gradient in the unified evaluator runs the same
+/// inner Newton solve as the second-order path but skips the `K`-fold
+/// pairwise Hessian assembly (`B_{j,k}` blocks) and the `K`-fold inner
+/// derivative solves; what remains is the inner solve plus a single
+/// gradient-only sweep through the data. Empirically this is roughly half
+/// the per-evaluation arithmetic of forming the dense Hessian, hence the
+/// `/2` default. Families whose gradient assembly differs structurally
+/// (e.g. matrix-free Hv operators with no dense Hessian assembly to halve)
+/// should override [`CustomFamily::coefficient_gradient_cost`] explicitly.
+pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
+    default_coefficient_hessian_cost(specs) / 2
+}
+
+/// First-order outer max-iter cap derived from a global FLOP budget.
+///
+/// The cap ensures the BFGS / L-BFGS outer optimization cannot spend more
+/// than [`DEFAULT_FIRST_ORDER_TOTAL_BUDGET_FLOPS`] in coefficient-space work
+/// across all gradient and value-only line-search evaluations. The
+/// per-iteration cost is approximated as
+/// `FIRST_ORDER_LINE_SEARCH_MULTIPLIER · gradient_cost`.
+///
+/// Returns `requested_max_iter` if either the budget is not exceeded or the
+/// gradient cost is zero (degenerate / unspecified). Always returns at least
+/// [`FIRST_ORDER_OUTER_MIN_MAX_ITER`] so a problem cannot be capped down to
+/// trivially-few iterations.
+pub fn cost_gated_first_order_max_iter(
+    requested_max_iter: usize,
+    gradient_cost: u64,
+) -> usize {
+    if gradient_cost == 0 {
+        return requested_max_iter;
+    }
+    let per_iter = FIRST_ORDER_LINE_SEARCH_MULTIPLIER.saturating_mul(gradient_cost as u128);
+    if per_iter == 0 {
+        return requested_max_iter;
+    }
+    let allowed = DEFAULT_FIRST_ORDER_TOTAL_BUDGET_FLOPS / per_iter;
+    let allowed = if allowed > usize::MAX as u128 {
+        usize::MAX
+    } else {
+        allowed as usize
+    };
+    requested_max_iter
+        .min(allowed)
+        .max(FIRST_ORDER_OUTER_MIN_MAX_ITER)
 }
 
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
@@ -588,6 +678,27 @@ pub trait CustomFamily {
     ///   build that the unified evaluator skips.
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         default_coefficient_hessian_cost(specs)
+    }
+
+    /// Per-evaluation arithmetic cost of one analytic-gradient outer
+    /// evaluation, in flop-equivalent units. Used by
+    /// [`cost_gated_first_order_max_iter`] to bound the BFGS / L-BFGS
+    /// outer iteration count when [`cost_gated_outer_order`] has already
+    /// downgraded the family to first-order — without this gate the
+    /// first-order path can run for `outer_max_iter=200` iterations × ~10⁹
+    /// flops per gradient evaluation × O(line-search probes), which is the
+    /// 2400 s GAMLSS Duchon60 timeout that motivates the gate.
+    ///
+    /// The default returns `coefficient_hessian_cost / 2` (see
+    /// [`default_coefficient_gradient_cost`]). Families whose gradient
+    /// assembly differs structurally should override; in particular,
+    /// joint-coupled families that override `coefficient_hessian_cost` to
+    /// `joint_coupled_coefficient_hessian_cost(n, specs)` automatically
+    /// inherit the corresponding gradient cost via this default — no
+    /// per-family override is required for the GAMLSS / marginal-slope /
+    /// joint-latent path.
+    fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        self.coefficient_hessian_cost(specs) / 2
     }
 
     /// Declares how much exact outer calculus this family wants to expose for
@@ -839,6 +950,29 @@ pub trait CustomFamily {
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         Ok(None)
+    }
+
+    /// Static query: does this family supply a matrix-free joint Hessian
+    /// operator (`HessianResult::Operator` via
+    /// `exact_newton_joint_hessian_workspace`) for the given specs?
+    ///
+    /// The default returns `false`.  Families that override
+    /// `exact_newton_joint_hessian_workspace` to return `Some(workspace)`
+    /// at evaluation time should also override this to return `true` so
+    /// that the outer planner — which decides between ARC and BFGS *before*
+    /// any evaluation occurs — knows the matrix-free Hv path is available.
+    ///
+    /// Used by `OuterProblem::with_matrix_free_hessian_available` at the
+    /// REML/LAML outer construction sites: when the dimensions cross
+    /// `use_joint_matrix_free_path`'s thresholds *and* this returns `true`,
+    /// the eval will return `HessianResult::Operator`, ARC will route to
+    /// `run_operator_trust_region`, and the work-cost downgrade should be
+    /// suppressed (BFGS is no longer faster per outer iteration).
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        false
     }
 
     /// Optional spec-aware exact joint Hessian.
@@ -2098,6 +2232,132 @@ impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperat
             self.total_p,
         )
         .materialize())
+    }
+}
+
+/// Non-allocating zero operator for `\partial X / \partial \psi` derivative
+/// blocks whose ψ coordinate does not move the design matrix at all (e.g.
+/// the spatial-adaptive overlay's mass / tension / stiffness / ε
+/// hyperparameters, which act through the penalty stack alone).
+///
+/// All matvec/transpose_mul methods return zero vectors of the correct
+/// length, all row-chunk methods return chunk-sized zero matrices. The
+/// operator never allocates an `(n, p)` dense buffer, which saves ~1.45 GiB
+/// at the biobank-scale spatial-adaptive overlay (n ≈ 320 000, p ≈ 101,
+/// six hyperparameters).
+pub(crate) struct ZeroPsiDerivativeOperator {
+    n: usize,
+    p: usize,
+}
+
+impl ZeroPsiDerivativeOperator {
+    pub(crate) fn new(n: usize, p: usize) -> Self {
+        Self { n, p }
+    }
+}
+
+impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn n_data(&self) -> usize {
+        self.n
+    }
+
+    fn p_out(&self) -> usize {
+        self.p
+    }
+
+    fn transpose_mul(
+        &self,
+        _axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_eq!(v.len(), self.n);
+        Ok(Array1::<f64>::zeros(self.p))
+    }
+
+    fn forward_mul(
+        &self,
+        _axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_eq!(u.len(), self.p);
+        Ok(Array1::<f64>::zeros(self.n))
+    }
+
+    fn transpose_mul_second_diag(
+        &self,
+        _axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_eq!(v.len(), self.n);
+        Ok(Array1::<f64>::zeros(self.p))
+    }
+
+    fn transpose_mul_second_cross(
+        &self,
+        _axis_d: usize,
+        _axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_eq!(v.len(), self.n);
+        Ok(Array1::<f64>::zeros(self.p))
+    }
+
+    fn forward_mul_second_diag(
+        &self,
+        _axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_eq!(u.len(), self.p);
+        Ok(Array1::<f64>::zeros(self.n))
+    }
+
+    fn forward_mul_second_cross(
+        &self,
+        _axis_d: usize,
+        _axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_eq!(u.len(), self.p);
+        Ok(Array1::<f64>::zeros(self.n))
+    }
+
+    fn row_chunk_first(
+        &self,
+        _axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
+    }
+
+    fn row_vector_first_into(
+        &self,
+        _axis: usize,
+        _row: usize,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), crate::terms::basis::BasisError> {
+        out.fill(0.0);
+        Ok(())
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        _axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        _axis_d: usize,
+        _axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 }
 
@@ -5082,7 +5342,27 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             // exact-Newton block updates on nonconvex blocks such as survival
             // `log_sigma`.
             let delta = if use_exact_newton_strict_spd(ctx.family) {
-                strict_solve_spd(&lhs_dense, &rhs_step)?
+                // Strict-mode Newton step uses the LM δ-ridge continuation:
+                // a single near-zero eigenvalue from numerical noise in
+                // H_β should not bounce the entire seed evaluation. The
+                // bare strict_solve_spd contract is preserved (still used
+                // by other paths and the existing test
+                // `pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash`);
+                // here we pay an O(p³) extra Cholesky attempt when needed
+                // to keep adaptive optimization moving.
+                let (step, lm_stats) =
+                    strict_solve_spd_with_lm_continuation(&lhs_dense, &rhs_step)?;
+                if lm_stats.escalations > 0 {
+                    log::debug!(
+                        "[strict-spd-lm] block={} ({}): δ-ridge continuation succeeded \
+                         after {} escalation(s) at δ={:.3e}",
+                        ctx.block_idx,
+                        ctx.spec.name,
+                        lm_stats.escalations,
+                        lm_stats.delta_used,
+                    );
+                }
+                step
             } else {
                 solve_spd_systemwith_policy(
                     &lhs_dense,
@@ -6035,6 +6315,78 @@ fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f6
         .cholesky(Side::Lower)
         .map_err(|_| "strict pseudo-laplace SPD solve failed".to_string())?;
     Ok(chol.solvevec(rhs))
+}
+
+/// Statistics about a Levenberg-Marquardt-style δ-ridge SPD continuation.
+/// Recorded by `strict_solve_spd_with_lm_continuation` and surfaced for
+/// diagnostics — a recurring need for nontrivial ridges signals fragile
+/// curvature that the controller may need to escalate.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StrictSpdLmStats {
+    /// δ value finally used (0.0 means the bare strict solve succeeded).
+    pub(crate) delta_used: f64,
+    /// Number of escalations performed before Cholesky succeeded.
+    pub(crate) escalations: usize,
+}
+
+/// Strict-mode SPD solve with internal Levenberg-Marquardt δ-ridge
+/// continuation: solves `(H + δI) x = b` with δ escalated geometrically
+/// until the Cholesky succeeds.  The bare `strict_solve_spd` is unchanged —
+/// callers that need strict semantics keep them.  Callers that want
+/// fail-soft Newton on a fragile geometry (e.g. spatial-adaptive seed
+/// evaluation) use this wrapper to avoid bouncing the entire seed on a
+/// numerically-indefinite block.
+///
+/// Schedule: δ₀ = max(ε · ‖H‖₁ / p, 1e-12); growth ×10 per step; capped
+/// at MAX_ESCALATIONS escalations.  The cap prevents runaway curvature
+/// from producing arbitrary ridges; if the cap is hit, the bare strict
+/// error propagates so the caller can route to a different optimization
+/// path (e.g. sparse/gradient-only standard REML at full data).
+pub(crate) fn strict_solve_spd_with_lm_continuation(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+) -> Result<(Array1<f64>, StrictSpdLmStats), String> {
+    const MAX_ESCALATIONS: usize = 16;
+    const RIDGE_GROWTH: f64 = 10.0;
+
+    if let Ok(solution) = strict_solve_spd(matrix, rhs) {
+        return Ok((solution, StrictSpdLmStats::default()));
+    }
+
+    let p = matrix.nrows();
+    if p == 0 {
+        return Ok((Array1::<f64>::zeros(0), StrictSpdLmStats::default()));
+    }
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
+    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
+
+    let mut delta = delta0;
+    for escalation in 1..=MAX_ESCALATIONS {
+        let mut ridged = sym.clone();
+        for i in 0..p {
+            ridged[[i, i]] += delta;
+        }
+        match ridged.cholesky(Side::Lower) {
+            Ok(chol) => {
+                return Ok((
+                    chol.solvevec(rhs),
+                    StrictSpdLmStats {
+                        delta_used: delta,
+                        escalations: escalation,
+                    },
+                ));
+            }
+            Err(_) => {
+                delta *= RIDGE_GROWTH;
+            }
+        }
+    }
+    Err(format!(
+        "strict pseudo-laplace SPD solve failed even with LM δ-ridge continuation \
+         (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e})"
+    ))
 }
 
 fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
@@ -11348,16 +11700,29 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // gradient BFGS instead of paying for a doomed EFS attempt first.
     let multi_block_beta_dependent =
         specs.len() > 1 && family.exact_newton_joint_hessian_beta_dependent();
-    // Custom family outer plans never degrade to BFGS + Hessian approximation
-    // in production. The automatic fallback ladder's remaining step is
-    // `downgrade_hessian`, which converts Analytic → Unavailable → BFGS +
-    // BfgsApprox, and the EFS → BFGS-with-analytic-gradient retry also uses
-    // BfgsApprox for its Hessian. Both are hostile to the RidgedQuadraticReml
-    // surrogate surface (directionally wrong rank-2 updates, documented Strong
-    // Wolfe iter-0 failures) and were the direct cause of the 45-minute hangs
-    // on binomial-logit + P-spline benchmarks. If the primary Arc + Analytic
-    // plan fails, surface the non-convergence as an error rather than masking
-    // it with a weaker method.
+    // Re-enable the automatic fallback policy (P4 / task #9). Earlier the
+    // custom-family path used `FallbackPolicy::Disabled` to keep the cascade
+    // from converting `Analytic` Hessian → `Unavailable` → BFGS+BfgsApprox,
+    // because that downgrade was hostile to the RidgedQuadraticReml surrogate
+    // surface (directionally wrong rank-2 updates, Strong-Wolfe iter-0
+    // failures) and produced the 45-minute hangs on binomial-logit +
+    // P-spline benchmarks. The current pipeline is different in three ways
+    // that make the disable unnecessary:
+    //   1. `cost_gated_outer_order` already routes large `K² · n · p²`
+    //      problems to first-order BFGS *before* a fallback would be
+    //      considered, so the cascade no longer downgrades a working
+    //      Analytic-Hessian plan onto an unsuitable surface.
+    //   2. The first-order work gate added below caps `outer_max_iter` so a
+    //      degraded BFGS retry cannot spin forever even if the line search
+    //      misbehaves.
+    //   3. With the gate, the legitimate use of fallback — recovering from a
+    //      seed that triggers an indefinite Hessian or a non-finite Newton
+    //      direction in ARC — becomes valuable: the cascade lets the runner
+    //      retry with the BFGS-approx geometry instead of failing the whole
+    //      fit on a single bad seed.
+    // If the primary plan still fails after the cascade, the runner surfaces
+    // the `RemlOptimizationFailed` error so the user sees the underlying
+    // non-convergence rather than a silent partial result.
     // Standard-GAM dense problem dimensions for the custom-family joint
     // outer. The joint coefficient dimension sums per-block designs; the
     // per-row outer-product cost is (Σ p_b)² weighted by the sample count.
@@ -11374,17 +11739,55 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .map(|s| s.design.nrows())
         .unwrap_or(0);
     let all_blocks_dense = specs.iter().all(|s| s.design.as_sparse().is_none());
+    // First-order work gate (P6 / task #9): the BFGS / L-BFGS path can be
+    // selected by either `cost_gated_outer_order` (family declares
+    // `Unavailable` Hessian) or `OuterProblem::with_standard_gam_dimensions`
+    // (cost-driven `prefer_gradient_only` downgrades a declared analytic
+    // Hessian to BfgsApprox). In either case each gradient evaluation still
+    // costs ≈ `coefficient_gradient_cost` flops in the inner coefficient
+    // space, and the unrestricted BFGS runner can burn
+    // `outer_max_iter · line_search_probes` of those evaluations (≈2400 s
+    // on `rust_gamlss_additive_duchon60`: K=15, n=320 000, p_total ≥ 64).
+    // The gate translates a global FLOP budget into a hard cap on the
+    // outer iteration count so total first-order work stays bounded; see
+    // `cost_gated_first_order_max_iter` for the budget model. The cap
+    // floors at `FIRST_ORDER_OUTER_MIN_MAX_ITER` so small problems never
+    // lose iterations they need to converge. Apply the cap unconditionally:
+    // when ARC is selected the cap is immaterial (ARC converges in O(20)
+    // outer iterations, well below the floor on this surface), and when
+    // the cascade later degrades to BFGS via the automatic fallback ladder,
+    // the same `max_iter` is reused and would otherwise spin.
+    let outer_first_order_max_iter = cost_gated_first_order_max_iter(
+        options.outer_max_iter,
+        family.coefficient_gradient_cost(specs),
+    );
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
-        .with_fallback_policy(FallbackPolicy::Disabled)
+        .with_fallback_policy(FallbackPolicy::Automatic)
         .with_tolerance(options.outer_tol)
-        .with_max_iter(options.outer_max_iter)
+        .with_max_iter(outer_first_order_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())
-        .with_standard_gam_dimensions(n_obs_joint, total_p_joint, all_blocks_dense);
+        .with_standard_gam_dimensions(n_obs_joint, total_p_joint, all_blocks_dense)
+        // Matrix-free awareness: when the family supplies a Hv-operator
+        // joint Hessian (`exact_newton_joint_hessian_workspace` returns
+        // Some) AND the unified evaluator's dimension predicate fires, the
+        // eval returns `JointHessianSource::Operator` and ARC routes
+        // through `run_operator_trust_region`. The per-iteration cost the
+        // dense-work threshold guards against has been replaced by O(n·p)
+        // HVPs, so suppress the cost-driven `prefer_gradient_only`
+        // downgrade. Without this signal CTN and the four GAMLSS
+        // location-scale variants used to be sent to BFGS+gradient at
+        // biobank scale even though their matrix-free workspaces would
+        // have absorbed the cost while preserving ARC's super-linear
+        // convergence.
+        .with_matrix_free_hessian_available(
+            family.supports_matrix_free_joint_hessian(specs)
+                && use_joint_matrix_free_path(total_p_joint, n_obs_joint),
+        );
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
@@ -11773,6 +12176,97 @@ mod tests {
             cost_gated_outer_order(&specs, cost),
             ExactOuterDerivativeOrder::First
         );
+    }
+
+    #[test]
+    fn cost_gated_first_order_max_iter_caps_biobank_scale_gamlss_below_request() {
+        // GAMLSS Duchon60 scenario from task #9: K=15 outer parameters,
+        // n=320_000 observations, p_t + p_ℓ = 64 fully-coupled coefficients.
+        // The joint-coupled coefficient gradient cost (≈ Hessian/2) is
+        // 320_000 · 64² / 2 ≈ 6.55·10⁸. With the line-search multiplier of
+        // 3 and the 200 GFLOP first-order budget, the gate caps the BFGS
+        // outer iteration count well below 200, so a pathological line
+        // search cannot burn 2400 s like plain BFGS at outer_max_iter=200
+        // did before this gate landed.
+        let n: u64 = 320_000;
+        let p_total: u64 = 64;
+        let gradient_cost = n * p_total * p_total / 2;
+        let capped = cost_gated_first_order_max_iter(200, gradient_cost);
+        assert!(
+            capped < 200,
+            "biobank-scale GAMLSS first-order outer must cap below requested 200 iters, \
+             got {capped}"
+        );
+        assert!(
+            capped >= FIRST_ORDER_OUTER_MIN_MAX_ITER,
+            "first-order cap must never go below {FIRST_ORDER_OUTER_MIN_MAX_ITER}, got {capped}"
+        );
+    }
+
+    #[test]
+    fn cost_gated_first_order_max_iter_preserves_request_for_small_problems() {
+        // Small custom-family fits (n=1000, p_total=20) have per-eval gradient
+        // cost 1000·400/2 = 2·10⁵ flops; 200 iters × 3 probes × 2·10⁵ =
+        // 1.2·10⁸ flops, well under the 200 GFLOP budget. The cap must not
+        // steal iterations from problems where the global budget is not the
+        // binding constraint.
+        let gradient_cost: u64 = 1_000 * 20 * 20 / 2;
+        let capped = cost_gated_first_order_max_iter(200, gradient_cost);
+        assert_eq!(
+            capped, 200,
+            "small-scale custom family must keep its requested iteration budget"
+        );
+    }
+
+    #[test]
+    fn cost_gated_first_order_max_iter_floors_at_min_max_iter() {
+        // Pathological-cost regime: gradient_cost overflows the budget by
+        // multiple orders of magnitude. The cap must still return at least
+        // FIRST_ORDER_OUTER_MIN_MAX_ITER so the BFGS runner has enough
+        // iterations to make any meaningful progress.
+        let gradient_cost: u64 = 10_000_000_000_000; // 10 TFLOPs / eval
+        let capped = cost_gated_first_order_max_iter(200, gradient_cost);
+        assert_eq!(
+            capped, FIRST_ORDER_OUTER_MIN_MAX_ITER,
+            "first-order cap must floor at {FIRST_ORDER_OUTER_MIN_MAX_ITER}"
+        );
+    }
+
+    #[test]
+    fn cost_gated_first_order_max_iter_is_inert_for_zero_cost() {
+        // Defensive: a family that returns 0 from `coefficient_gradient_cost`
+        // (degenerate or unspecified) must keep its requested iteration budget
+        // — the gate must not interpret unknown cost as "huge cost".
+        let capped = cost_gated_first_order_max_iter(200, 0);
+        assert_eq!(capped, 200);
+    }
+
+    #[test]
+    fn default_coefficient_gradient_cost_is_half_of_hessian_cost() {
+        // The gradient-only sweep through the inner Newton solve does
+        // roughly half the per-evaluation arithmetic of the full Hessian
+        // assembly path (skips K-fold pairwise B_{j,k} blocks and K-fold
+        // inner derivative solves). The default trait method preserves
+        // this 2× ratio; families that override `coefficient_hessian_cost`
+        // (e.g. GAMLSS via `joint_coupled_coefficient_hessian_cost`)
+        // automatically inherit a consistent gradient-cost scaling without
+        // a per-family override.
+        let mk_spec = |n: usize, p: usize| ParameterBlockSpec {
+            name: "test".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                n, p,
+            )))),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
+        let h_cost = default_coefficient_hessian_cost(&specs);
+        let g_cost = default_coefficient_gradient_cost(&specs);
+        assert_eq!(h_cost, 500 * 100 + 500 * 196);
+        assert_eq!(g_cost, h_cost / 2);
     }
 
     #[test]
@@ -15533,5 +16027,115 @@ mod tests {
         let inf_interior =
             projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1));
         assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn zero_psi_derivative_operator_acts_as_zero_map() {
+        let n = 17usize;
+        let p = 5usize;
+        let op = ZeroPsiDerivativeOperator::new(n, p);
+
+        assert_eq!(op.n_data(), n);
+        assert_eq!(op.p_out(), p);
+
+        let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
+        let v = Array1::from_iter((0..n).map(|k| 1.0 - 0.5 * k as f64));
+
+        let fwd = op.forward_mul(0, &u.view()).expect("forward_mul");
+        assert_eq!(fwd.len(), n);
+        assert!(fwd.iter().all(|x| *x == 0.0));
+
+        let trn = op.transpose_mul(0, &v.view()).expect("transpose_mul");
+        assert_eq!(trn.len(), p);
+        assert!(trn.iter().all(|x| *x == 0.0));
+
+        let fwd2 = op
+            .forward_mul_second_diag(0, &u.view())
+            .expect("forward_mul_second_diag");
+        assert_eq!(fwd2.len(), n);
+        assert!(fwd2.iter().all(|x| *x == 0.0));
+
+        let trn2 = op
+            .transpose_mul_second_diag(0, &v.view())
+            .expect("transpose_mul_second_diag");
+        assert_eq!(trn2.len(), p);
+        assert!(trn2.iter().all(|x| *x == 0.0));
+
+        let fwd_cross = op
+            .forward_mul_second_cross(0, 1, &u.view())
+            .expect("forward_mul_second_cross");
+        assert_eq!(fwd_cross.len(), n);
+        assert!(fwd_cross.iter().all(|x| *x == 0.0));
+
+        let trn_cross = op
+            .transpose_mul_second_cross(0, 1, &v.view())
+            .expect("transpose_mul_second_cross");
+        assert_eq!(trn_cross.len(), p);
+        assert!(trn_cross.iter().all(|x| *x == 0.0));
+
+        let chunk = op.row_chunk_first(0, 3..7).expect("row_chunk_first");
+        assert_eq!(chunk.dim(), (4, p));
+        assert!(chunk.iter().all(|x| *x == 0.0));
+
+        let chunk_diag = op
+            .row_chunk_second_diag(0, 0..n)
+            .expect("row_chunk_second_diag");
+        assert_eq!(chunk_diag.dim(), (n, p));
+        assert!(chunk_diag.iter().all(|x| *x == 0.0));
+
+        let chunk_cross = op
+            .row_chunk_second_cross(0, 1, 1..3)
+            .expect("row_chunk_second_cross");
+        assert_eq!(chunk_cross.dim(), (2, p));
+        assert!(chunk_cross.iter().all(|x| *x == 0.0));
+
+        let mut row = Array1::from_elem(p, 9.5);
+        op.row_vector_first_into(0, 4, row.view_mut())
+            .expect("row_vector_first_into");
+        assert!(row.iter().all(|x| *x == 0.0));
+
+        // The operator must not advertise dense materialization — production
+        // hot paths rely on this to avoid forming an (n, p) buffer.
+        assert!(op.as_materializable().is_none());
+    }
+
+    #[test]
+    fn zero_psi_derivative_operator_resolves_to_zero_design_map() {
+        let n = 12usize;
+        let p = 4usize;
+        let zero_op: Arc<dyn CustomFamilyPsiDerivativeOperator> =
+            Arc::new(ZeroPsiDerivativeOperator::new(n, p));
+        let deriv = CustomFamilyBlockPsiDerivative {
+            penalty_index: None,
+            x_psi: Array2::<f64>::zeros((0, 0)),
+            s_psi: Array2::<f64>::zeros((0, 0)),
+            s_psi_components: None,
+            s_psi_penalty_components: None,
+            x_psi_psi: None,
+            s_psi_psi: None,
+            s_psi_psi_components: None,
+            s_psi_psi_penalty_components: None,
+            implicit_operator: Some(Arc::clone(&zero_op)),
+            implicit_axis: 0,
+            implicit_group_id: None,
+        };
+        let policy = ResourcePolicy::default_library();
+        let map = resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "zero", &policy)
+            .expect("resolve x_psi map");
+        let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
+        let fwd = map.forward_mul(u.view()).expect("forward_mul map");
+        assert_eq!(fwd.len(), n);
+        assert!(fwd.iter().all(|x| *x == 0.0));
+
+        let chunk = map.row_chunk(2..5).expect("row_chunk map");
+        assert_eq!(chunk.dim(), (3, p));
+        assert!(chunk.iter().all(|x| *x == 0.0));
+
+        let map_second =
+            resolve_custom_family_x_psi_psi_map(&deriv, &deriv, 0, n, p, 0..n, "zero", &policy)
+                .expect("resolve x_psi_psi map");
+        let fwd_second = map_second.forward_mul(u.view()).expect("forward_mul second");
+        assert_eq!(fwd_second.len(), n);
+        assert!(fwd_second.iter().all(|x| *x == 0.0));
     }
 }
