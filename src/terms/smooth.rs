@@ -12934,7 +12934,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 // outer planner downgrades ARC + analytic Hessian to
                 // BFGS + analytic gradient.  Routing through full-data
                 // dense exact-Hessian REML is therefore no longer the
-                // automatic outcome of this branch (P1/P3b fix).
+                // automatic outcome of this branch.
                 log::warn!(
                     "[spatial-kappa] pilot anisotropy optimization failed (seed-failure stats: \
                      1 pilot fault); proceeding with direct full-data optimization from the \
