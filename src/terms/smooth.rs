@@ -15051,14 +15051,17 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, need_hessian| {
+            |theta, specs, designs, eval_mode| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),
-                    if need_hessian {
+                    if matches!(
+                        eval_mode,
+                        crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    ) {
                         crate::solver::outer_strategy::HessianResult::Analytic(Array2::zeros((
                             theta_dim, theta_dim,
                         )))
@@ -15315,14 +15318,17 @@ mod tests {
                 assert_eq!(designs.len(), 2);
                 Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
             },
-            |theta, specs, designs, need_hessian| {
+            |theta, specs, designs, eval_mode| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),
-                    if need_hessian {
+                    if matches!(
+                        eval_mode,
+                        crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    ) {
                         crate::solver::outer_strategy::HessianResult::Analytic(Array2::zeros((
                             theta_dim, theta_dim,
                         )))
@@ -17196,14 +17202,17 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, need_hessian| {
+            |theta, specs, designs, eval_mode| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
                 Ok((
                     0.0,
                     Array1::zeros(theta_dim),
-                    if need_hessian {
+                    if matches!(
+                        eval_mode,
+                        crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    ) {
                         crate::solver::outer_strategy::HessianResult::Analytic(Array2::zeros((
                             theta_dim, theta_dim,
                         )))
