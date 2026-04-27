@@ -178,6 +178,12 @@ pub struct TransformationNormalFamily {
     /// the struct because the `CustomFamily` trait surface cannot grow new
     /// parameters per call.
     policy: ResourcePolicy,
+
+    // --- Active-set certificate for the monotonicity-grid line search ---
+    /// Cached `(active_pairs, m_inactive, ||r_g||, ||X_cov_i||)` summary for
+    /// `KroneckerDesign::min_step_to_boundary_with_active_set`. RefCell so the
+    /// `&self` `max_feasible_step_size` callsite can mutate it.
+    active_set_cache: RefCell<KroneckerActiveSetCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +341,7 @@ impl TransformationNormalFamily {
             response_degree: config.response_degree,
             response_median: resp_median,
             policy,
+            active_set_cache: RefCell::new(KroneckerActiveSetCache::new()),
         })
     }
 
@@ -484,6 +491,7 @@ impl TransformationNormalFamily {
             response_degree,
             response_median: resp_median,
             policy,
+            active_set_cache: RefCell::new(KroneckerActiveSetCache::new()),
         })
     }
 
@@ -999,14 +1007,21 @@ impl CustomFamily for TransformationNormalFamily {
             self.x_deriv_grid_kron.project_kronecker_factor(beta),
             self.x_deriv_grid_kron.project_kronecker_factor(delta),
         ) {
-            (Some(c_beta), Some(d_delta)) => self
-                .x_deriv_grid_kron
-                .min_step_to_boundary_with_projections(
+            (Some(c_beta), Some(d_delta)) => {
+                // Active-set fast path with full-grid certificate fallback.
+                // Bit-equivalent to `min_step_to_boundary_with_projections`
+                // when the certificate accepts; otherwise refreshes via a
+                // full grid scan and returns the same `α`.
+                let mut cache = self.active_set_cache.borrow_mut();
+                self.x_deriv_grid_kron.min_step_to_boundary_with_active_set(
                     c_beta.view(),
                     d_delta.view(),
+                    delta,
                     TRANSFORMATION_MONOTONICITY_EPS,
                     1e-14,
-                ),
+                    &mut cache,
+                )
+            }
             _ => self.x_deriv_grid_kron.min_step_to_boundary(
                 beta,
                 delta,
@@ -2406,6 +2421,11 @@ struct KroneckerActiveSetCache {
     c_version: u64,
     /// `c_version` value at the most recent refresh; equals `c_version` ⇒ fresh.
     cached_for_version: u64,
+    /// Triplet fingerprint of the `c` projection at the most recent refresh.
+    /// Used to detect β changes implicitly without a hash over the full
+    /// `(n × p_resp)` matrix: corner samples `c[0,0]`, `c[mid,mid]`,
+    /// `c[n-1,p_resp-1]`. If any differ, the cache is treated as stale.
+    c_fingerprint: [f64; 3],
     /// Sentinel `(n, n_grid, p_resp, slack, dh_eps)` at refresh time, used to
     /// invalidate the cache if any of these change between calls.
     n: usize,
@@ -2424,12 +2444,28 @@ impl KroneckerActiveSetCache {
             max_covariate_norm: None,
             c_version: 0,
             cached_for_version: u64::MAX, // distinct from c_version=0 ⇒ stale
+            c_fingerprint: [f64::NAN; 3],
             n: 0,
             n_grid: 0,
             p_resp: 0,
             slack: f64::NAN,
             dh_eps: f64::NAN,
         }
+    }
+
+    fn fingerprint_of(c: ndarray::ArrayView2<'_, f64>) -> [f64; 3] {
+        let n = c.nrows();
+        let p = c.ncols();
+        if n == 0 || p == 0 {
+            return [0.0; 3];
+        }
+        let mid_i = n / 2;
+        let mid_j = p / 2;
+        [
+            c[[0, 0]],
+            c[[mid_i, mid_j]],
+            c[[n - 1, p - 1]],
+        ]
     }
 
     /// Mark the active-set certificate as stale because `c` (β projection)
@@ -2937,13 +2973,18 @@ impl KroneckerDesign {
         let lipschitz = max_response * max_covariate * delta_fro;
 
         // If the cache is stale (β changed), or its dimensions disagree with
-        // the current projection shape, refresh by a full grid scan.
+        // the current projection shape, refresh by a full grid scan. We
+        // fingerprint `c` by three corner samples — when the caller has
+        // accepted a Newton step, β (and therefore `c`) changes and at least
+        // one of those samples will differ.
+        let fp = KroneckerActiveSetCache::fingerprint_of(c);
         let cache_fresh = cache.cached_for_version == cache.c_version
             && cache.n == n
             && cache.n_grid == n_grid
             && cache.p_resp == p_resp
             && (cache.slack - slack).abs() <= f64::EPSILON
-            && (cache.dh_eps - dh_eps).abs() <= f64::EPSILON;
+            && (cache.dh_eps - dh_eps).abs() <= f64::EPSILON
+            && cache.c_fingerprint == fp;
 
         if cache_fresh {
             // Active-set fast path: scan only the cached active set with the
@@ -3062,6 +3103,7 @@ impl KroneckerDesign {
         cache.p_resp = p_resp;
         cache.slack = slack;
         cache.dh_eps = dh_eps;
+        cache.c_fingerprint = KroneckerActiveSetCache::fingerprint_of(c);
         cache.cached_for_version = cache.c_version;
     }
 

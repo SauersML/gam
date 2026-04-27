@@ -33,16 +33,21 @@ struct OracleEval {
     grad_rho: f64,
 }
 
-/// Deterministic 2D grid oracle for tiny Bernoulli-logit model.
+/// Diagonal of the penalty S used by both the integrand and the LAML
+/// Jacobian-correction below; pinned to the same S = I₂ that the LAML
+/// evaluator sees through `BlockwisePenalty::new(0..2, Array2::eye(2))`.
+const ORACLE_S_DIAG: [f64; 2] = [1.0, 1.0];
+
+/// Deterministic 2D grid oracle for Bernoulli-logit model.
 ///
-/// Evidence:
-///   L(ρ) = ∫ exp( l(β) - 0.5 λ ||β||² ) dβ,  λ=exp(ρ), S=I₂.
-///
-/// Exact gradient identity:
-///   d/dρ log L(ρ) = -0.5 λ E_post[ ||β||² ].
-///
-/// We evaluate both by direct 2D quadrature over β=(β₁,β₂), using a stabilized
-/// log-sum-exp style integral to avoid underflow.
+/// Integrates the un-normalized kernel
+///   Z(ρ) = ∫ exp( ℓ(β) - 0.5·λ·β'Sβ ) dβ,  λ = exp(ρ),
+/// then converts to the LAML score form. mgcv-style LAML adds a Bayesian
+/// prior Jacobian 0.5·log|λS|+ to the un-normalized log-evidence (Wood
+/// 2011); the oracle returns
+///   dV_LAML/dρ = -d log Z/dρ - 0.5·rank(S_+)
+/// so the comparison is well-posed against `evaluate_externalgradient`,
+/// which returns `dV_LAML/dρ` directly.
 fn exact_logit_oracle_eval_rho_2d(
     y: &Array1<f64>,
     x: &Array2<f64>,
@@ -55,6 +60,8 @@ fn exact_logit_oracle_eval_rho_2d(
 
     let lambda = rho.exp();
     let h = (2.0 * cfg.grid_bound) / ((cfg.steps - 1) as f64);
+    let s11 = ORACLE_S_DIAG[0];
+    let s22 = ORACLE_S_DIAG[1];
 
     // First pass: locate max log-kernel for stable log-sum-exp integration.
     let mut max_logk = f64::NEG_INFINITY;
@@ -69,7 +76,7 @@ fn exact_logit_oracle_eval_rho_2d(
                 .zip(y.iter())
                 .map(|(&e, &yy)| yy * e - softplus(e))
                 .sum::<f64>();
-            let pen = 0.5 * lambda * (b1 * b1 + b2 * b2);
+            let pen = 0.5 * lambda * (s11 * b1 * b1 + s22 * b2 * b2);
             max_logk = max_logk.max(ll - pen);
         }
     }
@@ -98,14 +105,21 @@ fn exact_logit_oracle_eval_rho_2d(
                 .zip(y.iter())
                 .map(|(&e, &yy)| yy * e - softplus(e))
                 .sum::<f64>();
-            let pen = 0.5 * lambda * (b1 * b1 + b2 * b2);
+            let pen = 0.5 * lambda * (s11 * b1 * b1 + s22 * b2 * b2);
             let w = wi * wj * (ll - pen - max_logk).exp();
             z += w;
-            q += w * (b1 * b1 + b2 * b2);
+            q += w * (s11 * b1 * b1 + s22 * b2 * b2);
         }
     }
-    let post_q = q / z.max(1e-300);
-    let grad_rho = -0.5 * lambda * post_q;
+    let post_quad = q / z.max(1e-300);
+    // d log Z/dρ from the un-normalized kernel quadrature.
+    let grad_log_z = -0.5 * lambda * post_quad;
+    // rank(S_+): count strictly-positive diagonal entries of the same S
+    // pinned into the integrand; for a single ρ scaling the whole block,
+    // d log|λS|+/dρ = rank(S_+).
+    let rank_s_plus = ORACLE_S_DIAG.iter().filter(|&&v| v > 0.0).count() as f64;
+    // dV_LAML/dρ = -d log Z/dρ - 0.5·rank(S_+).
+    let grad_rho = -grad_log_z - 0.5 * rank_s_plus;
     OracleEval { grad_rho }
 }
 

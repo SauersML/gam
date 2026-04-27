@@ -586,6 +586,45 @@ pub struct ExactNewtonJointGradientEvaluation {
     pub gradient: Array1<f64>,
 }
 
+/// Batched per-θ_j contributions to the analytic outer gradient.
+///
+/// Used by [`CustomFamily::batched_outer_gradient_terms`] to amortize the
+/// joint-Hessian factorization across all K hyperparameters: instead of
+/// computing each `tr(H⁻¹ · Ḣ_j)` independently (K independent solves), the
+/// family factors `H` once, computes per-row leverages `L_i = Z_i H⁻¹ Z_iᵀ`,
+/// and accumulates all K traces in a single streaming pass.
+///
+/// All three vectors have length equal to the total number of outer
+/// hyperparameters (K = `rho.len() + Σ derivative_blocks[b].len()`), in the
+/// same coordinate order as the unified evaluator's gradient: ρ-coords first,
+/// ψ-coords appended.
+///
+/// # Assembly formula
+///
+/// The caller assembles the outer gradient as
+///
+/// ```text
+///   grad[j] = objective_theta[j]
+///           + 0.5 * trace_h_inv_hdot[j]
+///           - 0.5 * trace_s_pinv_sdot[j]
+/// ```
+///
+/// matching the three-term convention in [`outer_gradient_entry`] (penalty +
+/// trace − det).
+pub struct BatchedOuterGradientTerms {
+    /// Explicit ∂J/∂θ_j contributions evaluated at the converged β̂ holding
+    /// β fixed (i.e. the part that does NOT flow through H or S):
+    ///
+    /// * For ρ-coords: `½ β̂ᵀ A_k β̂` (penalty quadratic).
+    /// * For ψ-coords: `V_i^explicit + g_i^explicit · β̂` style contributions.
+    pub objective_theta: Array1<f64>,
+    /// `tr(H⁻¹ · ∂H/∂θ_j)` for each j, with H = -∇²log L + S the full
+    /// penalized Hessian at the mode.
+    pub trace_h_inv_hdot: Array1<f64>,
+    /// `tr(S⁺ · ∂S/∂θ_j)` for each j (penalty pseudo-logdet first derivative).
+    pub trace_s_pinv_sdot: Array1<f64>,
+}
+
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
     /// Evaluate log-likelihood and per-block working quantities at current block predictors.
@@ -949,6 +988,44 @@ pub trait CustomFamily {
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        Ok(None)
+    }
+
+    /// Optional batched analytic-gradient hook.
+    ///
+    /// Returns the K per-θ_j gradient contributions ([`BatchedOuterGradientTerms`])
+    /// in one amortized pass when the family can factor its joint Hessian
+    /// once and stream row-block leverages instead of computing each
+    /// `tr(H⁻¹ · ∂H/∂θ_j)` independently.
+    ///
+    /// # Cost amortization
+    ///
+    /// Generic per-θ_j path: `O(K · n · p²)` (K independent dense traces).
+    /// Batched path: `O(n · p²)` (single factor + leverage stream)
+    ///                 + `O(K · n · m²)` (per-row block-diagonal accumulators
+    ///                   with `m` = per-row predictor dimension; m = 2 for
+    ///                   GAMLSS location-scale, 1 for scalar GLMs).
+    ///
+    /// At biobank scale with K ≈ 15, p ≈ 64, m = 2 the batched path is
+    /// ≈ K·p²/(p² + K·m²) ≈ 15× cheaper.
+    ///
+    /// # Default
+    ///
+    /// Returns `Ok(None)`. The unified outer gradient evaluator falls back
+    /// to its generic per-coordinate path. Families with row-coupled
+    /// likelihoods (GAMLSS location-scale, marginal-slope) should override.
+    ///
+    /// Implementations may return `Ok(None)` for ψ-coordinates whose
+    /// design-drift is too involved for a batched leverage form, letting
+    /// the generic path handle those cases.
+    fn batched_outer_gradient_terms(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _rho: &Array1<f64>,
+        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         Ok(None)
     }
 
