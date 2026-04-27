@@ -10387,6 +10387,107 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
 
     // ── ρ-only path (psi_dim == 0): route through unified evaluator ──
     //
+    // Batched fast-path: if the family overrides `batched_outer_gradient_terms`
+    // and we are in `ValueAndGradient` mode, factor H once at the family level
+    // and amortize all K trace computations in a single streaming pass.
+    // The cost is still computed via the unified `ValueOnly` path; only the
+    // gradient assembly is replaced. See `BatchedOuterGradientTerms`.
+    if eval_mode == EvalMode::ValueAndGradient {
+        let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
+        let synced_states_for_batch = synchronized_states_from_flat_beta(
+            family,
+            specs,
+            &inner.block_states,
+            &beta_flat_for_batch,
+        )?;
+        let workspace_for_batch = family
+            .exact_newton_joint_hessian_workspace(&synced_states_for_batch, specs)
+            .ok()
+            .flatten();
+        let derivative_blocks_for_batch =
+            vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
+        if let Ok(Some(batch)) = family.batched_outer_gradient_terms(
+            &synced_states_for_batch,
+            specs,
+            &derivative_blocks_for_batch,
+            rho_current,
+            workspace_for_batch.clone(),
+        ) {
+            // Sanity check: batched output must match (rho_dim + psi_dim).
+            let expected = rho_dim + psi_dim;
+            if batch.objective_theta.len() == expected
+                && batch.trace_h_inv_hdot.len() == expected
+                && batch.trace_s_pinv_sdot.len() == expected
+            {
+                if let Some(joint_bundle_value_only) =
+                    build_joint_hessian_closures(family, &inner.block_states, specs, total)?
+                {
+                    let JointHessianBundle {
+                        source: h_joint_unpen,
+                        beta_flat,
+                        compute_dh,
+                        compute_d2h,
+                        rho_curvature_scale,
+                        hessian_logdet_correction,
+                    } = joint_bundle_value_only;
+                    let value_only = joint_outer_evaluate(
+                        &inner,
+                        specs,
+                        &per_block,
+                        rho_current,
+                        &beta_flat,
+                        h_joint_unpen,
+                        &ranges,
+                        total,
+                        ridge,
+                        moderidge,
+                        extra_logdet_ridge,
+                        rho_curvature_scale,
+                        hessian_logdet_correction,
+                        include_logdet_h,
+                        include_logdet_s,
+                        strict_spd,
+                        EvalMode::ValueOnly,
+                        options,
+                        family.pseudo_logdet_mode(),
+                        compute_dh.as_ref(),
+                        compute_d2h.as_ref(),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    // Assemble the gradient via the universal three-term formula:
+                    //   grad[k] = obj_θ[k] + 0.5 * tr(H⁻¹ Ḣ_k) - 0.5 * tr(S⁺ Ṡ_k).
+                    // This matches `outer_gradient_entry` for fixed-dispersion
+                    // families. Profiled-Gaussian families (which scale the
+                    // penalty term by dp_cgrad / profiled_scale) currently fall
+                    // back to the generic path because they should not opt in
+                    // to this hook.
+                    let mut gradient = Array1::<f64>::zeros(expected);
+                    for j in 0..expected {
+                        let trace_term = if include_logdet_h {
+                            0.5 * batch.trace_h_inv_hdot[j]
+                        } else {
+                            0.0
+                        };
+                        let det_term = if include_logdet_s {
+                            0.5 * batch.trace_s_pinv_sdot[j]
+                        } else {
+                            0.0
+                        };
+                        gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+                    }
+                    return Ok(OuterObjectiveEvalResult {
+                        objective: value_only.objective,
+                        gradient,
+                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        warm_start: value_only.warm_start,
+                    });
+                }
+            }
+        }
+    }
+
     // Try build_joint_hessian_closures which handles both exact Newton and
     // surrogate Hessian sources, then call joint_outer_evaluate with no
     // extended coordinates.

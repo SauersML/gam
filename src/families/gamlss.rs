@@ -3,17 +3,17 @@ use crate::basis::{
     create_difference_penalty_matrix, create_ispline_derivative_dense,
 };
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
-    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, PsiDesignMap, build_block_spatial_psi_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi_map,
-    resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc,
-    weighted_crossprod_psi_maps,
+    BatchedOuterGradientTerms, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
+    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
+    CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
+    CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
+    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
+    shared_dense_arc, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
@@ -1922,7 +1922,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 |theta,
                  specs: &[TermCollectionSpec],
                  designs: &[TermCollectionDesign],
-                 need_hessian| {
+                 eval_mode| {
+                    use crate::solver::estimate::reml::unified::EvalMode;
                     if !analytic_joint_derivatives_available {
                         return Err(
                             "analytic spatial psi derivatives are unavailable for this exact two-block path"
@@ -1963,14 +1964,12 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &rho,
                         &psiderivative_blocks,
                         warm_start.as_ref(),
-                        if need_hessian {
-                            crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
-                        } else {
-                            crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
-                        },
+                        eval_mode,
                     )?;
                     *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
-                    if need_hessian && !eval.outer_hessian.is_analytic() {
+                    if matches!(eval_mode, EvalMode::ValueGradientHessian)
+                        && !eval.outer_hessian.is_analytic()
+                    {
                         return Err(
                             "exact two-block spatial objective requires a full joint [rho, psi] hessian"
                                 .to_string(),

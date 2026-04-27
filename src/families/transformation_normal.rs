@@ -179,11 +179,15 @@ pub struct TransformationNormalFamily {
 
     // --- Active-set certificate for the monotonicity-grid line search ---
     /// Cached `(active_pairs, m_inactive, ||r_g||, ||X_cov_i||)` summary for
-    /// `KroneckerDesign::min_step_to_boundary_with_active_set`. `Mutex` so
-    /// the `&self` `max_feasible_step_size` callsite can mutate it while the
-    /// surrounding family stays `Send + Sync` (required by
-    /// `ExactNewtonJointHessianWorkspace: Send + Sync`).
-    active_set_cache: Mutex<KroneckerActiveSetCache>,
+    /// `KroneckerDesign::min_step_to_boundary_with_active_set`. `Arc<Mutex<…>>`
+    /// so the `&self` `max_feasible_step_size` callsite can mutate it while
+    /// the surrounding family stays `Send + Sync + Clone` (required by
+    /// `ExactNewtonJointHessianWorkspace: Send + Sync` and the `#[derive(Clone)]`
+    /// on `TransformationNormalFamily`). The cache is purely a line-search
+    /// optimization, so sharing it across cloned families is safe and matches
+    /// the prior `RefCell` semantics (single-threaded interior mutability)
+    /// while satisfying the trait bound.
+    active_set_cache: Arc<Mutex<KroneckerActiveSetCache>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +345,7 @@ impl TransformationNormalFamily {
             response_degree: config.response_degree,
             response_median: resp_median,
             policy,
-            active_set_cache: Mutex::new(KroneckerActiveSetCache::new()),
+            active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
         })
     }
 
@@ -491,7 +495,7 @@ impl TransformationNormalFamily {
             response_degree,
             response_median: resp_median,
             policy,
-            active_set_cache: Mutex::new(KroneckerActiveSetCache::new()),
+            active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
         })
     }
 
