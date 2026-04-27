@@ -787,8 +787,7 @@ impl WorkingState {
     ///     scaling (so the natural scale is dominated by a single component).
     #[inline]
     pub fn certifies_kkt(&self, g_norm: f64, tol: f64) -> bool {
-        g_norm < tol * self.kkt_dimension_scale()
-            || self.relative_gradient_norm(g_norm) < tol
+        g_norm < tol * self.kkt_dimension_scale() || self.relative_gradient_norm(g_norm) < tol
     }
 
     /// Near-stationary band (10× the strict KKT tolerance) under EITHER
@@ -2114,9 +2113,10 @@ impl SparseXtWxCache {
     fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
         // For X^T X where X is CSC: X^T is a SparseRowMat, which we need to
         // convert to CSC format for the matmul API.
-        let x_t_csc = x.as_ref().transpose().to_col_major().map_err(|_| {
-            EstimationError::InvalidInput("failed to transpose to CSC".to_string())
-        })?;
+        let x_t_csc =
+            x.as_ref().transpose().to_col_major().map_err(|_| {
+                EstimationError::InvalidInput("failed to transpose to CSC".to_string())
+            })?;
         let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(x_t_csc.symbolic(), x.symbolic())
             .map_err(|_| {
                 EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
@@ -2576,22 +2576,14 @@ fn pirls_soft_acceptance(
     max_abs_eta: f64,
     tol: f64,
 ) -> Option<PirlsSoftAccept> {
-    let objective_scale = state
-        .deviance
-        .abs()
-        .max(state.penalty_term.abs())
-        .max(1.0);
+    let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
     let scaled_dev_tol = tol * objective_scale;
 
-    if state.near_stationary_kkt(projected_grad, tol)
-        && deviance_change.abs() < scaled_dev_tol
-    {
+    if state.near_stationary_kkt(projected_grad, tol) && deviance_change.abs() < scaled_dev_tol {
         return Some(PirlsSoftAccept::NearStationaryPlateau);
     }
 
-    if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12)
-        && deviance_change.abs() < scaled_dev_tol
-    {
+    if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12) && deviance_change.abs() < scaled_dev_tol {
         return Some(PirlsSoftAccept::BoundarySaturation);
     }
 
@@ -3849,9 +3841,8 @@ where
                         const NEWTON_DECREMENT_LM_GUARD: f64 = 1.0;
                         let f_scale = 1.0 + current_penalized.abs();
                         let newton_decrement_sq = (-lin).max(0.0);
-                        let nd_threshold = options.convergence_tolerance
-                            * options.convergence_tolerance
-                            * f_scale;
+                        let nd_threshold =
+                            options.convergence_tolerance * options.convergence_tolerance * f_scale;
                         let nd_pass = loop_lambda <= NEWTON_DECREMENT_LM_GUARD
                             && newton_decrement_sq <= nd_threshold;
 
@@ -3934,8 +3925,8 @@ where
                         );
                         let projected_grad = stategrad_norm;
                         let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
-                        let near_stationary_pass =
-                            state.near_stationary_kkt(projected_grad, options.convergence_tolerance);
+                        let near_stationary_pass = state
+                            .near_stationary_kkt(projected_grad, options.convergence_tolerance);
 
                         // Near stationarity: the screening rejected all candidates, but the
                         // gradient is tiny. Treat this as converged rather than escalating damping.
@@ -5273,8 +5264,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let dev_scale = summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
-        let progress_stopped = summary.last_deviance_change.abs() <= dev_tol
-            || summary.last_step_size <= step_floor;
+        let progress_stopped =
+            summary.last_deviance_change.abs() <= dev_tol || summary.last_step_size <= step_floor;
         let near_stationary = summary
             .state
             .near_stationary_kkt(summary.lastgradient_norm, options.convergence_tolerance);

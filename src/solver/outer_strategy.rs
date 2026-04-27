@@ -2050,8 +2050,7 @@ impl OuterProblem {
         // `prefer_gradient_only` so the planner picks BFGS+BfgsApprox even
         // if an analytic Hessian was declared. The caller's explicit
         // `with_prefer_gradient_only(true)` is preserved either way.
-        let prefer_gradient_only =
-            self.prefer_gradient_only || self.dense_hessian_work_too_large();
+        let prefer_gradient_only = self.prefer_gradient_only || self.dense_hessian_work_too_large();
         OuterCapability {
             gradient: self.gradient,
             hessian: self.hessian,
