@@ -9349,30 +9349,6 @@ fn evaluate_joint_reml_efs_at_theta(
     )
 }
 
-/// Cost-only evaluation at the current κ-realized design. Skips the expensive
-/// `try_build_spatial_log_kappa_hyper_dirs` build that the gradient/Hessian
-/// path requires. Used by the iso/aniso joint optimizers for BFGS line-search
-/// probes — the gradient callback continues to use the
-/// `evaluate_joint_reml_outer_eval_at_theta` (with hyper_dirs) path.
-fn evaluate_joint_reml_cost_at_theta(
-    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
-    design: &TermCollectionDesign,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-) -> Result<f64, EstimationError> {
-    evaluator.evaluate_cost_only(
-        &design.design,
-        &design.penalties,
-        &design.nullspace_dims,
-        design.linear_constraints.clone(),
-        theta,
-        rho_dim,
-        warm_start_beta,
-        "evaluate_joint_reml_cost_at_theta",
-    )
-}
-
 fn exact_joint_spatial_outer_hessian_available(
     family: LikelihoodFamily,
     design: &TermCollectionDesign,
