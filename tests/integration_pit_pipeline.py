@@ -92,7 +92,13 @@ def read_csv(path):
 
 
 def merge_z_into_study(study_csv, pred_csv, out_csv):
-    """Read predict output (eta column = PIT z), merge as 'z' into study data."""
+    """Read predict output (eta column = PIT z), merge as 'z' into study data.
+
+    The merged z scores should be approximately N(0, 1) under conditional
+    Gaussianization on the PC manifold. We assert this here so a regression
+    that produced biased or improperly scaled z-scores would be flagged
+    immediately rather than silently propagating through downstream fits.
+    """
     study = read_csv(study_csv)
     preds = read_csv(pred_csv)
     if len(preds) != len(study):
@@ -103,9 +109,49 @@ def merge_z_into_study(study_csv, pred_csv, out_csv):
         s["z"] = p["eta"]
     write_csv(study, out_csv)
     zs = [float(p["eta"]) for p in preds]
-    z_mean = sum(zs) / len(zs)
-    z_sd = (sum((z - z_mean) ** 2 for z in zs) / len(zs)) ** 0.5
-    print(f"  PIT z: n={len(zs)}, mean={z_mean:.4f}, sd={z_sd:.4f}, range=[{min(zs):.3f}, {max(zs):.3f}]")
+    n = len(zs)
+    z_mean = sum(zs) / n
+    z_sd = (sum((z - z_mean) ** 2 for z in zs) / n) ** 0.5
+    print(f"  PIT z: n={n}, mean={z_mean:.4f}, sd={z_sd:.4f}, range=[{min(zs):.3f}, {max(zs):.3f}]")
+
+    # Numeric contracts on the PIT z-scores. Failures raise so the pipeline
+    # script returns non-zero — silent drift toward a bias of 0.5 or
+    # collapse to a near-constant z would otherwise flow into fits 2 and 4
+    # and corrupt downstream metrics.
+    if not all(_finite(z) for z in zs):
+        raise RuntimeError(
+            f"PIT z column contained non-finite values; first non-finite: "
+            f"{[(i, zs[i]) for i in range(n) if not _finite(zs[i])][:3]}"
+        )
+    # Mean should be near 0 and standard deviation should be near 1. The
+    # tolerance is loose because the test datasets are small (~40 rows),
+    # but a runaway bias or near-constant prediction would still fail.
+    if abs(z_mean) > 0.5:
+        raise RuntimeError(
+            f"PIT z mean {z_mean:.4f} drifted too far from zero; expected |mean| < 0.5"
+        )
+    if not (0.5 < z_sd < 1.8):
+        raise RuntimeError(
+            f"PIT z sd {z_sd:.4f} outside expected (0.5, 1.8); expected ≈ 1.0"
+        )
+
+    # Spread sanity: at least 60% of z values should sit within ±2.5 of zero
+    # (true under N(0,1) for >98%, but small-sample noise + tail outliers
+    # justify a permissive band).
+    inliers = sum(1 for z in zs if abs(z) < 2.5)
+    if inliers < 0.6 * n:
+        raise RuntimeError(
+            f"only {inliers}/{n} PIT z values lie within ±2.5; distribution does "
+            "not look like N(0,1)"
+        )
+
+
+def _finite(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return f == f and f not in (float("inf"), float("-inf"))
 
 
 def run(args, label, timeout=300):

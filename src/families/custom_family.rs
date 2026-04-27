@@ -591,25 +591,28 @@ pub trait CustomFamily {
     /// [`cost_gated_outer_order`] to decide whether the family can afford the
     /// exact outer Hessian path: the combined work is `K² · this`.
     ///
-    /// The default returns `Σ_b n_b · p_b²`, which is the honest assembly cost
-    /// only when the joint Hessian is **block-diagonal** — i.e. the inner
-    /// solver assembles each block's `X_b' W_b X_b` independently, with no
-    /// cross-block coupling per row. Families whose row likelihood couples all
-    /// blocks (every row contributes a rank-`m` outer-product update to the
-    /// full joint Hessian over `Σ p_b` coefficients) **must** override to
-    /// `n · (Σ p_b)²`, otherwise the default undercounts the cross-block
-    /// outer-product terms `2·Σ_{a<b} n·p_a·p_b`.
+    /// The default returns `Σ_b n_b · p_b²` via [`default_coefficient_hessian_cost`],
+    /// which is the honest assembly cost only when the joint Hessian is
+    /// **block-diagonal** — i.e. the inner solver assembles each block's
+    /// `X_b' W_b X_b` independently, with no cross-block coupling per row.
+    /// Families whose row likelihood couples all blocks (every row contributes
+    /// a rank-`m` outer-product update to the full joint Hessian over
+    /// `Σ p_b` coefficients) **must** override and delegate to
+    /// [`joint_coupled_coefficient_hessian_cost`] (or the equivalent factored
+    /// form for tensor designs), otherwise the default undercounts the
+    /// cross-block outer-product terms `2·Σ_{a<b} n·p_a·p_b`.
     ///
     /// Concretely:
     ///
     /// * **Block-diagonal** (default OK): `LatentBinaryFamily` collects
     ///   separate `hess_time` and `hess_mean` per row, never forming an
     ///   off-diagonal contribution.
-    /// * **Joint-coupled** (must override): GAMLSS location-scale, GAMLSS
-    ///   wiggle variants, marginal-slope families (Bernoulli, Survival),
-    ///   `LatentSurvivalFamily`, `SurvivalLocationScaleFamily` — every row
-    ///   contributes to the full `(Σ p_b)²` joint Hessian via Jacobian
-    ///   pullback of a multi-dimensional primary kernel.
+    /// * **Joint-coupled** (override via [`joint_coupled_coefficient_hessian_cost`]):
+    ///   GAMLSS location-scale, GAMLSS wiggle variants, marginal-slope families
+    ///   (Bernoulli, Survival), `LatentSurvivalFamily`,
+    ///   `SurvivalLocationScaleFamily` — every row contributes to the full
+    ///   `(Σ p_b)²` joint Hessian via Jacobian pullback of a multi-dimensional
+    ///   primary kernel.
     /// * **Single-block** (default OK): tensor designs whose `design.ncols()`
     ///   already equals `p_total` (e.g. CTN's Khatri–Rao `n × (p_resp·p_cov)`);
     ///   `n · p²` reduces correctly to `n · p_resp² · p_cov²`.
@@ -10690,7 +10693,11 @@ fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
         .unwrap_or(0)
 }
 
-fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool {
+/// Whether the unified evaluator will pick the matrix-free joint Hessian path
+/// for a problem of size `(total_p, total_n)`. Exposed at crate scope so
+/// families with matrix-free operators can branch their `coefficient_hessian_cost`
+/// estimate on the same predicate the evaluator will use at fit time.
+pub(crate) fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool {
     total_p >= JOINT_MATRIX_FREE_MIN_DIM
         || (total_n >= JOINT_MATRIX_FREE_MIN_ROWS
             && total_p >= JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N)
@@ -11705,6 +11712,65 @@ mod tests {
 
     #[derive(Clone)]
     struct OneBlockIdentityFamily;
+
+    #[test]
+    fn joint_coupled_coefficient_hessian_cost_matches_n_times_p_total_squared() {
+        // Three blocks p_b = (12, 20, 8), n=200. Joint-coupled cost is
+        // n·(Σp_b)² = 200·40² = 320_000. Block-diagonal default with the
+        // same designs would give n·Σp_b² = 200·(144+400+64) = 121_600.
+        // The cross-block fill 2·n·(p_t·p_m + p_t·p_l + p_m·p_l) =
+        // 2·200·(240+96+160) = 198_400 accounts for the difference.
+        let mk_spec = |p: usize| ParameterBlockSpec {
+            name: "test".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                200, p,
+            )))),
+            offset: Array1::zeros(200),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
+        assert_eq!(
+            joint_coupled_coefficient_hessian_cost(200, &specs),
+            200 * 40 * 40
+        );
+        assert_eq!(default_coefficient_hessian_cost(&specs), 200 * (144 + 400 + 64));
+        assert!(
+            joint_coupled_coefficient_hessian_cost(200, &specs)
+                > default_coefficient_hessian_cost(&specs)
+        );
+    }
+
+    #[test]
+    fn joint_coupled_coefficient_hessian_cost_at_biobank_scale_routes_to_first_order() {
+        // Production CTN-on-PC scenario: K=22 (ρ_dim=6 + log-κ_dim=16),
+        // p_total=300, n≈4·10⁵. The helper returns n·p² ≈ 3.6·10¹⁰; combined
+        // with K²=484 the gate sees 1.7·10¹³ ≫ 1·10⁹ → First. This is the
+        // exact scenario the inner-cost gate exists to catch — K²=484 alone
+        // would slip past any element-only cap.
+        let mk_spec = |p: usize| ParameterBlockSpec {
+            name: "ctn".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, p,
+            )))),
+            offset: Array1::zeros(1),
+            penalties: (0..22)
+                .map(|_| PenaltyMatrix::Dense(Array2::zeros((1, 1))))
+                .collect(),
+            nullspace_dims: vec![0; 22],
+            initial_log_lambdas: Array1::zeros(22),
+            initial_beta: None,
+        };
+        let specs = vec![mk_spec(300)];
+        let cost = joint_coupled_coefficient_hessian_cost(400_000, &specs);
+        assert_eq!(cost, 400_000u64 * 300 * 300);
+        assert_eq!(
+            cost_gated_outer_order(&specs, cost),
+            ExactOuterDerivativeOrder::First
+        );
+    }
 
     #[test]
     fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {

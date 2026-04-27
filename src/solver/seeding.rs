@@ -14,7 +14,17 @@ pub struct SeedConfig {
     pub max_seeds: usize,
     /// Maximum number of seed starts to run in heuristic order.
     pub seed_budget: usize,
-    /// Screening-only inner-iteration cap used while ranking candidate seeds.
+    /// Initial inner-iteration cap used while ranking candidate seeds. The
+    /// outer screening loop runs each seed's P-IRLS at this cap to obtain
+    /// an approximate cost; partial fits whose objective, β, gradient
+    /// natural scale, and gradient norm are all finite are accepted and
+    /// scored as `C_approx + ½·r_g²` (where r_g is the dimensionless
+    /// relative gradient residual). Only seeds whose partial state is
+    /// genuinely non-finite are rejected. The cascade in
+    /// `rank_seeds_with_screening` escalates the cap geometrically (×4,
+    /// ×16, then uncapped) only if every seed at the initial cap is
+    /// non-finite — a rare pathological case after the
+    /// partial-fit-acceptance change.
     pub screen_max_inner_iterations: usize,
     pub risk_profile: SeedRiskProfile,
     /// Number of trailing dimensions that are auxiliary parameters (e.g. SAS
