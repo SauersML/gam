@@ -79,5 +79,141 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertLess(_FUZZ.estimate_scenario_cost(low_dim), 75_000)
 
 
+def _trial(*, family="gaussian", model_type="gam", basis="ps",
+           gap=None, rust_metric=None, mgcv_metric=None,
+           rust=None, mgcv=None, seed=0):
+    primary_metric = "r2" if family == "gaussian" else "auc"
+    rv = rust_metric if rust_metric is not None else (None if gap is None else 0.5)
+    mv = mgcv_metric if mgcv_metric is not None else (None if gap is None else (rv + gap if rv is not None else None))
+    rust_dict = {primary_metric: rv}
+    if rust:
+        rust_dict.update(rust)
+    mgcv_dict = {primary_metric: mv}
+    if mgcv:
+        mgcv_dict.update(mgcv)
+    scenario = {
+        "seed": seed,
+        "family": family,
+        "model_type": model_type,
+        "basis_type": basis,
+        "n_obs": 200,
+        "n_smooths": 2,
+        "knots": 8,
+    }
+    fr = _FUZZ.FuzzResult(scenario=scenario, rust=rust_dict, mgcv=mgcv_dict)
+    fr.compute_gap()
+    return fr
+
+
+class FuzzCiGateTests(unittest.TestCase):
+    def test_clean_run_passes(self) -> None:
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
+            for i in range(100)
+        ]
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        self.assertFalse(gates["failed"], gates)
+
+    def test_per_trial_huge_gap_fails(self) -> None:
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
+            for i in range(100)
+        ]
+        # Inject one massive regression — gap = 0.74 like the real run.
+        results[7] = _trial(rust_metric=0.05, mgcv_metric=0.79, seed=7)
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        self.assertTrue(gates["failed"])
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertIn("per_trial_gap", gate_names)
+
+    def test_cohort_median_failure_fires(self) -> None:
+        # gaussian/gam/duchon cohort with median gap +0.25 like the real run.
+        results = []
+        for i in range(20):
+            results.append(_trial(
+                family="gaussian", model_type="gam", basis="duchon",
+                rust_metric=0.50, mgcv_metric=0.75, seed=1000 + i,
+            ))
+        # Plus a clean cohort to make sure we only flag the bad one.
+        for i in range(20):
+            results.append(_trial(
+                family="gaussian", model_type="gam", basis="ps",
+                rust_metric=0.80, mgcv_metric=0.81, seed=2000 + i,
+            ))
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=40)
+        self.assertTrue(gates["failed"])
+        cohort_failures = [
+            gf for gf in gates["gate_failures"]
+            if gf["gate"] == "cohort_median"
+        ]
+        self.assertEqual(len(cohort_failures), 1)
+        offenders = cohort_failures[0]["offenders"]
+        self.assertEqual(len(offenders), 1)
+        self.assertEqual(
+            offenders[0]["cohort"], ("gaussian", "gam", "duchon")
+        )
+
+    def test_cohort_net_wins_failure_fires(self) -> None:
+        # 10 mgcv wins, 0 rust wins → net = 10 > 5 in this cohort.
+        results = []
+        for i in range(10):
+            # gap = +0.06 — too small for per-trial fail, big enough for win.
+            results.append(_trial(
+                family="binomial", model_type="gam", basis="tps",
+                rust_metric=0.60, mgcv_metric=0.66, seed=3000 + i,
+            ))
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=10)
+        self.assertTrue(gates["failed"])
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertIn("cohort_net_wins", gate_names)
+
+    def test_rust_nan_inf_failure_fires(self) -> None:
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
+            for i in range(100)
+        ]
+        # Trial 5 — rust returned NaN R² where mgcv was finite.
+        results[5] = _trial(
+            rust_metric=float("nan"), mgcv_metric=0.55, seed=5,
+        )
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        self.assertTrue(gates["failed"])
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertIn("rust_nan_inf", gate_names)
+
+    def test_coverage_failure_fires_when_too_many_skipped(self) -> None:
+        # 50 valid trials out of 100 requested ⇒ below the 80% floor.
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
+            for i in range(50)
+        ]
+        gates = _FUZZ.compute_ci_gates(
+            results, requested_trials=100, skipped_count=50,
+        )
+        self.assertTrue(gates["failed"])
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertIn("coverage", gate_names)
+
+    def test_baseline_regression_fires(self) -> None:
+        # Baseline says gaussian/gam/ps cohort had median gap +0.02; current
+        # run has +0.10 — delta 0.08 > threshold 0.05 ⇒ fail.
+        results = []
+        for i in range(20):
+            results.append(_trial(
+                family="gaussian", model_type="gam", basis="ps",
+                rust_metric=0.70, mgcv_metric=0.80, seed=4000 + i,
+            ))
+        baseline = {
+            "threshold": 0.05,
+            "cohorts": {"gaussian/gam/ps": 0.02},
+        }
+        gates = _FUZZ.compute_ci_gates(
+            results, requested_trials=20, baseline=baseline,
+        )
+        self.assertTrue(gates["failed"])
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertIn("baseline_regression", gate_names)
+
+
 if __name__ == "__main__":
     unittest.main()
