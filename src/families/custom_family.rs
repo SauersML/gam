@@ -497,6 +497,23 @@ pub fn default_coefficient_hessian_cost(specs: &[ParameterBlockSpec]) -> u64 {
         .fold(0u64, |acc, c| acc.saturating_add(c))
 }
 
+/// Joint-coupled coefficient-space Hessian cost: `n · (Σ_b p_b)²`. The honest
+/// per-evaluation work for any family whose row likelihood couples every block
+/// (every observation contributes a rank-`m` outer-product update to the full
+/// joint Hessian over `Σ p_b` coefficients), as opposed to the block-diagonal
+/// `default_coefficient_hessian_cost` which assumes each `X_b' W_b X_b` is
+/// assembled independently.
+///
+/// Used by all GAMLSS, marginal-slope, and joint-latent families. CTN does
+/// not delegate here — it uses its Khatri–Rao factor dimensions internally.
+pub fn joint_coupled_coefficient_hessian_cost(n: u64, specs: &[ParameterBlockSpec]) -> u64 {
+    let p_total: u64 = specs
+        .iter()
+        .map(|s| s.design.ncols() as u64)
+        .fold(0u64, |acc, p| acc.saturating_add(p));
+    n.saturating_mul(p_total.saturating_mul(p_total))
+}
+
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
