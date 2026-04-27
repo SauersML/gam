@@ -1,6 +1,9 @@
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{FaerCholesky, fast_atb};
-use crate::linalg::utils::{StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd};
+use crate::linalg::utils::{
+    StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd,
+    stochastic_lanczos_logdet_spd_operator,
+};
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
 };
@@ -428,29 +431,70 @@ impl ExactOuterDerivativeOrder {
 }
 
 /// Maximum dense outer-Hessian size (f64 elements) before downgrading to
-/// first-order when a caller insists on materializing it. This gate is keyed
-/// to the actual outer dimension K, not the inner coefficient dimension p.
+/// first-order when a caller insists on materializing it. Keyed to the outer
+/// hyperparameter dimension K alone — once this is exceeded, the K×K Hessian
+/// is itself too large to assemble or factor regardless of inner cost.
 const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
+
+/// Maximum combined work `K² · coefficient_hessian_cost` allowed on the
+/// exact-second-order outer path. Each outer-Hessian element requires inner
+/// solves whose dominant arithmetic scales like the coefficient-space Hessian
+/// cost (`n·p²` for dense families, larger for tensor families). When the
+/// combined cost exceeds this budget the family is downgraded to first-order
+/// derivatives so the outer optimizer uses BFGS / L-BFGS instead of trying to
+/// materialize an exact outer Hessian whose per-evaluation cost is prohibitive.
+///
+/// At biobank scale (K≈22, n≈4·10⁵, p≈300) the combined cost is
+/// 484·4·10⁵·9·10⁴ ≈ 1.7·10¹³, so the gate correctly routes such fits to the
+/// cheap-outer path even though K²=484 alone is small.
+const DEFAULT_EXACT_OUTER_MAX_COMBINED_COST: u64 = 1_000_000_000;
 
 /// Shared cost-aware gate for second-order exact outer derivatives.
 ///
 /// The outer Hessian returned by `compute_outer_hessian` has shape
-/// (K+ext_dim) × (K+ext_dim) where K = total number of smoothing parameters.
-/// Inner coefficient dimension p and sample count n enter only through block-
-/// local H⁻¹ solves that are already performed for the gradient, so the only
-/// meaningful affordability proxy for the second-order path is the size of the
-/// dense K×K outer Hessian. Inner n·p or n·p² proxies do not correspond to any
-/// allocation in the Hessian assembly and would incorrectly block affordable
-/// problems (e.g. K=8, n=50000, p=80 → outer Hessian is 64 f64s, but an n·p²
-/// gate would disable it).
-pub fn cost_gated_outer_order(specs: &[ParameterBlockSpec]) -> ExactOuterDerivativeOrder {
+/// (K+ext_dim) × (K+ext_dim) where K = total number of smoothing parameters,
+/// but the work to *compute* each element scales with `coefficient_cost` —
+/// the per-Hessian-evaluation cost in the inner coefficient space, supplied
+/// by the family via [`CustomFamily::coefficient_hessian_cost`]. The gate
+/// therefore considers two thresholds:
+///
+/// 1. `K² > DEFAULT_EXACT_OUTER_MAX_ELEMENTS` — the dense K×K outer Hessian
+///    itself is too large to allocate or factor.
+/// 2. `K² · coefficient_cost > DEFAULT_EXACT_OUTER_MAX_COMBINED_COST` — the
+///    inner work per outer Hessian evaluation is prohibitive even when the
+///    K×K matrix is small, e.g. biobank-scale fits where K²=484 looks fine
+///    but n·p²≈10¹⁰ makes each outer-Hessian evaluation untenable.
+///
+/// Either condition routes the family to first-order BFGS/L-BFGS.
+pub fn cost_gated_outer_order(
+    specs: &[ParameterBlockSpec],
+    coefficient_cost: u64,
+) -> ExactOuterDerivativeOrder {
     let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
     let outer_elements = k.saturating_mul(k);
     if outer_elements > DEFAULT_EXACT_OUTER_MAX_ELEMENTS {
+        return ExactOuterDerivativeOrder::First;
+    }
+    let combined = outer_elements.saturating_mul(coefficient_cost);
+    if combined > DEFAULT_EXACT_OUTER_MAX_COMBINED_COST {
         ExactOuterDerivativeOrder::First
     } else {
         ExactOuterDerivativeOrder::Second
     }
+}
+
+/// Default coefficient-space Hessian cost: `Σ_b n_b · p_b²`, summed across
+/// blocks. Represents the work to assemble or apply the dense block-diagonal
+/// inner Hessian once.
+pub fn default_coefficient_hessian_cost(specs: &[ParameterBlockSpec]) -> u64 {
+    specs
+        .iter()
+        .map(|s| {
+            let n = s.design.nrows() as u64;
+            let p = s.design.ncols() as u64;
+            n.saturating_mul(p.saturating_mul(p))
+        })
+        .fold(0u64, |acc, c| acc.saturating_add(c))
 }
 
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
@@ -525,17 +569,40 @@ pub trait CustomFamily {
         self.exact_newton_outerobjective() != ExactNewtonOuterObjective::RidgedQuadraticReml
     }
 
+    /// Per-evaluation arithmetic cost of forming or applying the inner
+    /// coefficient-space Hessian once, in flop-equivalent units. Used by
+    /// [`cost_gated_outer_order`] to decide whether the family can afford the
+    /// exact outer Hessian path: the combined work is `K² · this`.
+    ///
+    /// The default sums `n_b · p_b²` over blocks (dense rank-1 update form).
+    /// Tensor-product families with structured designs should override:
+    ///
+    /// * Khatri–Rao response × covariate (`X = R ⊙ C`, p = p_resp · p_cov):
+    ///   `n · p_resp² · p_cov²`, since the dense p² Hessian can never be the
+    ///   work-model proxy for these — it would understate by p_resp factor.
+    /// * GAMLSS two-block joint (mean p_t, scale p_ℓ, fully coupled rows):
+    ///   `n · (p_t + p_ℓ)²` because off-diagonal blocks are full rank-1 cross
+    ///   contributions per row.
+    ///
+    /// Families that expose a matrix-free Hessian operator may return the
+    /// per-`Hv` work instead so the gate prefers the operator path.
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        default_coefficient_hessian_cost(specs)
+    }
+
     /// Declares how much exact outer calculus this family wants to expose for
     /// the current realized problem size.
     ///
-    /// The default uses [`cost_gated_outer_order`], keyed to the actual outer
-    /// hyperparameter dimension rather than the inner coefficient dimension.
+    /// The default uses [`cost_gated_outer_order`], combining outer K² with
+    /// the per-evaluation inner coefficient cost so biobank-scale fits with
+    /// small K but large n·p² are routed to first-order BFGS/L-BFGS instead
+    /// of attempting to materialize an unaffordable outer Hessian.
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        cost_gated_outer_order(specs)
+        cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
     }
 
     /// Family-specific outer seeding policy.
@@ -6251,19 +6318,36 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             None
         };
-    if let Some(JointHessianSource::Operator { apply, diagonal }) = exact_joint_source {
-        let mut h = materialize_joint_hessian_source(
-            &JointHessianSource::Operator { apply, diagonal },
-            total,
-            "joint exact-newton Hessian materialization in logdet terms",
-        )?;
-        for (b, s_lambda) in s_lambdas.iter().enumerate() {
-            let (start, end) = ranges[b];
-            h.slice_mut(ndarray::s![start..end, start..end])
-                .scaled_add(1.0, s_lambda);
-        }
+    if let Some(JointHessianSource::Operator { apply, diagonal: _ }) = exact_joint_source {
+        // Matrix-free logdet of H + S_λ via deterministic stochastic Lanczos.
+        // The matvec composes the family's matrix-free Hessian operator with a
+        // ridge-stabilized block-diagonal penalty add, so the dense (total ×
+        // total) Hessian is never materialized.
+        let ridge_floor = options.ridge_floor.max(0.0);
+        let ranges_vec: Vec<(usize, usize)> = ranges.to_vec();
+        let s_lambdas_owned: Vec<Array2<f64>> = s_lambdas.clone();
+        let apply_h = Arc::clone(&apply);
+        let apply_op = move |v: &Array1<f64>| -> Array1<f64> {
+            let mut out = match apply_h(v) {
+                Ok(out) => out,
+                Err(error) => {
+                    log::warn!(
+                        "joint exact-newton operator matvec failed during SLQ logdet: {error}"
+                    );
+                    Array1::<f64>::zeros(total)
+                }
+            };
+            let penalty =
+                apply_joint_block_penalty(&ranges_vec, &s_lambdas_owned, v, ridge_floor);
+            out += &penalty;
+            out
+        };
+        let (probes, steps) = default_slq_parameters(total);
         let logdet_h_total =
-            stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
+            stochastic_lanczos_logdet_spd_operator(total, apply_op, probes, steps, 0xC75_5C75_5C75)
+                .map_err(|e| {
+                    format!("matrix-free SLQ logdet for joint Hessian + S_lambda: {e}")
+                })?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
     // Fallback: try the non-rescaled symmetrized path (for families that
