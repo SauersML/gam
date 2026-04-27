@@ -47,9 +47,11 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
 
+        # length_scale was dropped in commit 35e62344 to align rust pure
+        # scale-free Duchon with mgcv bs='ds' (mgcv has no hybrid-mode analog).
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=1, power=2, length_scale=1, double_penalty=false)",
+            "duchon(x0, x1, centers=5, order=1, power=2, double_penalty=false)",
         )
         self.assertNotIn("~", noise_terms)
 
@@ -139,8 +141,11 @@ def _trial(*, family="gaussian", model_type="gam", basis="ps",
 
 class FuzzCiGateTests(unittest.TestCase):
     def test_clean_run_passes(self) -> None:
+        # True-tie metrics (gap=0) so all 100 trials land inside the
+        # ±0.01 deadband regardless of FP-arithmetic noise; tests that
+        # a green run does NOT fire any gate.
         results = [
-            _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
+            _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i)
             for i in range(100)
         ]
         gates = _FUZZ.compute_ci_gates(results, requested_trials=100)

@@ -2461,8 +2461,7 @@ impl RadialScalarKind {
                 // so q and t are multiplied by zero and never observed; we
                 // still need a finite phi (= 0 for the standard TPS kernels).
                 if r < 1e-14 {
-                    let (phi, _, _) =
-                        thin_plate_kernel_triplet_from_scaled_distance(0.0, *dim)?;
+                    let (phi, _, _) = thin_plate_kernel_triplet_from_scaled_distance(0.0, *dim)?;
                     return Ok((phi, 0.0, 0.0));
                 }
                 let scaled_r = r / *length_scale;
