@@ -11937,17 +11937,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
-        // Custom families always supply an analytic gradient (`cap_gradient`
-        // upstream is unconditionally `Analytic`). The
-        // `AnalyticGradientOnly` policy gates future ladder additions to
-        // never introduce a finite-difference gradient or any transformation
-        // that changes the objective surface — keeping the intended model
-        // and its analytic gradient even when the primary plan fails.
-        // Behaviorally identical to `Automatic` today (the existing ladder
-        // only downgrades the Hessian and disables fixed-point), so this is
-        // a documentation-of-intent gate, not a behavior change at this
-        // commit.
-        .with_fallback_policy(FallbackPolicy::AnalyticGradientOnly)
+        .with_fallback_policy(FallbackPolicy::Automatic)
         .with_tolerance(options.outer_tol)
         .with_max_iter(outer_first_order_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
