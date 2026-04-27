@@ -2511,6 +2511,26 @@ impl RadialScalarKind {
             RadialScalarKind::Duchon { .. } | RadialScalarKind::PureDuchon { .. }
         )
     }
+
+    /// Whether the radial-kind enforces a hard guard against accidental
+    /// dense `(n × p)` ψ-derivative materialization. Duchon-family terms
+    /// always do (they are streaming-only at any scale). ThinPlate joins
+    /// the guard list because the new scalar-streaming routing makes it
+    /// genuine to rely on the implicit operator at biobank scale, and a
+    /// downstream consumer that sneaks in a `materialize_dense()` call
+    /// would silently re-introduce the same `n × p` allocation we wired
+    /// streaming to avoid. The guard panics only when the resource
+    /// policy says the materialization would exceed budget — small `n`
+    /// problems still get the dense fast path.
+    #[inline]
+    fn enforces_dense_materialization_budget(&self) -> bool {
+        matches!(
+            self,
+            RadialScalarKind::Duchon { .. }
+                | RadialScalarKind::PureDuchon { .. }
+                | RadialScalarKind::ThinPlate { .. }
+        )
+    }
 }
 
 /// Data stored for streaming (on-the-fly) recomputation of radial jet scalars.
@@ -2834,6 +2854,35 @@ impl ImplicitDesignPsiDerivative {
                 RadialScalarKind::Duchon { .. } | RadialScalarKind::PureDuchon { .. }
             )
         }) || self.psi_scale_share != 0.0
+    }
+
+    /// Whether this operator is wired up by a basis whose biobank-scale path
+    /// is supposed to stay implicit, so a dense `(n × p)` materialization
+    /// here is a regression rather than a normal compute path. Duchon-family
+    /// terms qualify because they are streaming-only at any scale; ThinPlate
+    /// qualifies because the new scalar-streaming routing relies on the
+    /// implicit operator above the policy threshold and a sneaky
+    /// `materialize_dense()` would silently re-introduce the n × p
+    /// allocation we just removed. The flag is consulted by the
+    /// materialize_first / materialize_second_diag / materialize_second_cross
+    /// guards to fire `assert_no_dense_derivative_materialization` for these
+    /// kinds whenever the resource policy says the materialization would
+    /// exceed budget. Small-n problems still pass the assertion and get the
+    /// dense fast path.
+    pub(crate) fn enforces_dense_materialization_budget(&self) -> bool {
+        if self
+            .streaming
+            .as_ref()
+            .is_some_and(|state| state.radial_kind.enforces_dense_materialization_budget())
+        {
+            return true;
+        }
+        // The materialized-mode path keeps no `radial_kind` to inspect, but
+        // a non-zero psi_scale_share is the unambiguous Duchon-family
+        // signature there (Matern uses 0, ThinPlate uses 0). Materialized
+        // ThinPlate / Matern terms are in the dense fast path and the
+        // guard does not need to fire for them.
+        self.psi_scale_share != 0.0
     }
 
     /// Output dimension: total basis columns in the final space.
@@ -3731,7 +3780,7 @@ impl ImplicitDesignPsiDerivative {
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(axis < self.n_axes());
-        if self.is_duchon_family() {
+        if self.enforces_dense_materialization_budget() {
             assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
         }
         if self.axis_combinations.is_some() {
@@ -3788,7 +3837,7 @@ impl ImplicitDesignPsiDerivative {
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(axis < self.n_axes());
-        if self.is_duchon_family() {
+        if self.enforces_dense_materialization_budget() {
             assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
         }
         if self.axis_combinations.is_some() {
@@ -3867,7 +3916,7 @@ impl ImplicitDesignPsiDerivative {
         assert!(axis_d < self.n_axes());
         assert!(axis_e < self.n_axes());
         assert_ne!(axis_d, axis_e);
-        if self.is_duchon_family() {
+        if self.enforces_dense_materialization_budget() {
             assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
         }
         if self.axis_combinations.is_some() {
