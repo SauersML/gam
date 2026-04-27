@@ -6,16 +6,18 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
-    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
-    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
+    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, PsiDesignMap, build_block_spatial_psi_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi_map,
+    resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc,
+    slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
+use crate::matrix::SymmetricMatrix;
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
@@ -6164,6 +6166,19 @@ impl CustomFamily for GaussianLocationScaleFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Two fully-coupled blocks (mean p_t, log-σ p_ℓ): the joint Hessian
+        // has size (p_t + p_ℓ)² and each of the n rows contributes a full
+        // outer-product to all four blocks, so honest per-evaluation work is
+        // n · (p_t + p_ℓ)² rather than the block-diagonal sum n · (p_t² + p_ℓ²).
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -8414,6 +8429,18 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Three fully-coupled blocks (mean p_t, log-σ p_ℓ, link-wiggle p_w):
+        // every cross-block in the joint Hessian is dense, so per-evaluation
+        // work is n · (p_t + p_ℓ + p_w)².
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
@@ -9121,6 +9148,17 @@ impl BinomialMeanWiggleFamily {
 impl CustomFamily for BinomialMeanWiggleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
+    }
+
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Mean and link-wiggle blocks couple through the binomial weight,
+        // giving a dense joint Hessian of size (p_μ + p_w)² per row.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
     }
 
     fn block_linear_constraints(
@@ -10780,6 +10818,74 @@ impl BinomialLocationScaleFamily {
         )
     }
 
+    /// Compute the rowwise joint curvature coefficients (D_tt, D_tl, D_ll)
+    /// shared by the dense joint Hessian path and the matrix-free workspace.
+    fn exact_newton_joint_hessian_row_coefficients(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q = core.q0[i];
+            let r = 1.0 / core.sigma[i];
+            // κ = (dσ/dη_ls)/σ = 1 for the exact exp link.
+            let kappa = core.dsigma_deta[i] / core.sigma[i];
+            let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
+                self.y[i],
+                self.weights[i],
+                q,
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+                &self.link_kind,
+            );
+            coeff_tt[i] = m2 * r * r;
+            coeff_tl[i] = kappa * r * (m1 + q * m2);
+            coeff_ll[i] = kappa * kappa * q * (m1 + q * m2);
+        }
+        Ok((coeff_tt, coeff_tl, coeff_ll))
+    }
+
+    /// Exact diagonal-block-only Hessians (h_tt, h_ll) used by `evaluate()`
+    /// to populate per-block working sets without ever materializing the
+    /// dense p×p joint matrix.
+    fn exact_newton_block_diagonal_hessians_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let (coeff_tt, _coeff_tl, coeff_ll) =
+            self.exact_newton_joint_hessian_row_coefficients(block_states)?;
+        let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
+        let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        Ok((h_tt, h_ll))
+    }
+
     fn exact_newton_joint_hessian_from_designs(
         &self,
         block_states: &[ParameterBlockState],
@@ -10842,51 +10948,10 @@ impl BinomialLocationScaleFamily {
         //
         // The off-diagonal block is generally nonzero. That is exactly the
         // coupling term the broken blockwise outer-gradient path was dropping.
-        if block_states.len() != 2 {
-            return Err(format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
-        }
-
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            None,
-            &self.link_kind,
-        )?;
+        let (coeff_tt, coeff_tl, coeff_ll) =
+            self.exact_newton_joint_hessian_row_coefficients(block_states)?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            // κ = (dσ/dη_ls)/σ = 1 for the exact exp link.
-            let kappa = core.dsigma_deta[i] / core.sigma[i];
-            let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            coeff_tt[i] = m2 * r * r;
-            coeff_tl[i] = kappa * r * (m1 + q * m2);
-            coeff_ll[i] = kappa * kappa * q * (m1 + q * m2);
-        }
 
         let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
         let h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
@@ -12256,6 +12321,17 @@ impl CustomFamily for BinomialLocationScaleFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Two fully-coupled blocks (threshold p_t, log-σ p_ℓ): joint Hessian
+        // size (p_t + p_ℓ)² per row.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -12316,20 +12392,27 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
         let grad_ls = log_sigma_design.transpose_vector_multiply(&grad_eta_ls);
 
-        // Block Hessians are principal diagonal blocks of the joint Hessian
-        // (single source of truth — no separate blockwise Hessian derivation).
-        let joint = self
-            .exact_newton_joint_hessian(block_states)?
-            .ok_or("BinomialLocationScaleFamily: joint hessian unavailable")?;
-        let pt = block_states[Self::BLOCK_T].beta.len();
-        let pls = block_states[Self::BLOCK_LOG_SIGMA].beta.len();
+        // Per-block Hessians without ever materializing the full p×p joint
+        // matrix — the off-diagonal cross block is unused for IRLS-style block
+        // working sets and would cost O(p_t * p_ls * n) to form. The diagonal
+        // blocks are computed from the same row coefficients as the joint.
+        let (x_t, x_ls) = self.exact_joint_dense_block_designs(None)?.ok_or(
+            "BinomialLocationScaleFamily: joint block designs unavailable",
+        )?;
+        let (h_tt, h_ll) =
+            self.exact_newton_block_diagonal_hessians_from_designs(block_states, &x_t, &x_ls)?;
         Ok(FamilyEvaluation {
             log_likelihood: core.log_likelihood,
-            blockworking_sets: slice_joint_into_block_working_sets(
-                vec![grad_t, grad_ls],
-                &joint,
-                &[0..pt, pt..pt + pls],
-            ),
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_t,
+                    hessian: SymmetricMatrix::Dense(h_tt),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_ls,
+                    hessian: SymmetricMatrix::Dense(h_ll),
+                },
+            ],
         })
     }
 
@@ -12568,6 +12651,24 @@ impl CustomFamily for BinomialLocationScaleFamily {
             d_betav_flat,
         )
     }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let workspace = BinomialLocationScaleHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            x_t.into_owned(),
+            x_ls.into_owned(),
+        )?;
+        Ok(Some(Arc::new(workspace)))
+    }
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
@@ -12598,6 +12699,139 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
             mean,
             noise: NoiseModel::Bernoulli,
         })
+    }
+}
+
+/// Matrix-free joint-Hessian operator for the two-block binomial
+/// location-scale family.
+///
+/// The dense joint Hessian is `H = [[X_t^T D_tt X_t, X_t^T D_tl X_ls],
+///                                  [X_ls^T D_tl X_t, X_ls^T D_ll X_ls]]`
+/// where `D_tt`, `D_tl`, `D_ll` are diagonal weight vectors derived from the
+/// rowwise scalar-composition Hessian. For a flattened direction
+/// `v = (v_t, v_ls)`, `H v` is computed as
+///
+///   u_t = X_t v_t,  u_ls = X_ls v_ls,
+///   r_t = D_tt .* u_t + D_tl .* u_ls,
+///   r_ls = D_tl .* u_t + D_ll .* u_ls,
+///   H v = (X_t^T r_t, X_ls^T r_ls).
+///
+/// Cost is Θ(n (p_t + p_ls)) per matvec versus Θ(n (p_t + p_ls)^2) to form
+/// the dense matrix. The directional-derivative paths still use the dense
+/// `from_designs` helpers — the unified evaluator wraps any returned dense
+/// matrix in a HyperOperator when no native operator form exists.
+struct BinomialLocationScaleHessianWorkspace {
+    family: BinomialLocationScaleFamily,
+    block_states: Vec<ParameterBlockState>,
+    x_t: Array2<f64>,
+    x_ls: Array2<f64>,
+    coeff_tt: Array1<f64>,
+    coeff_tl: Array1<f64>,
+    coeff_ll: Array1<f64>,
+}
+
+impl BinomialLocationScaleHessianWorkspace {
+    fn new(
+        family: BinomialLocationScaleFamily,
+        block_states: Vec<ParameterBlockState>,
+        _specs: Vec<ParameterBlockSpec>,
+        x_t: Array2<f64>,
+        x_ls: Array2<f64>,
+    ) -> Result<Self, String> {
+        let (coeff_tt, coeff_tl, coeff_ll) =
+            family.exact_newton_joint_hessian_row_coefficients(&block_states)?;
+        Ok(Self {
+            family,
+            block_states,
+            x_t,
+            x_ls,
+            coeff_tt,
+            coeff_tl,
+            coeff_ll,
+        })
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace {
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        let pt = self.x_t.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pt + pls;
+        if v.len() != total {
+            return Err(format!(
+                "BinomialLocationScale matvec dimension mismatch: got {}, expected {}",
+                v.len(),
+                total
+            ));
+        }
+        // u_t = X_t v_t, u_ls = X_ls v_ls
+        let u_t = self.x_t.dot(&v.slice(s![0..pt]));
+        let u_ls = self.x_ls.dot(&v.slice(s![pt..total]));
+        // r_t = D_tt .* u_t + D_tl .* u_ls; r_ls = D_tl .* u_t + D_ll .* u_ls
+        let r_t = &self.coeff_tt * &u_t + &self.coeff_tl * &u_ls;
+        let r_ls = &self.coeff_tl * &u_t + &self.coeff_ll * &u_ls;
+        // (X_t^T r_t, X_ls^T r_ls)
+        let out_t = self.x_t.t().dot(&r_t);
+        let out_ls = self.x_ls.t().dot(&r_ls);
+        let mut out = Array1::<f64>::zeros(total);
+        out.slice_mut(s![0..pt]).assign(&out_t);
+        out.slice_mut(s![pt..total]).assign(&out_ls);
+        Ok(Some(out))
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        let pt = self.x_t.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pt + pls;
+        let mut diag = Array1::<f64>::zeros(total);
+        // diag(X_t^T D_tt X_t)[j] = sum_i D_tt[i] * X_t[i,j]^2
+        for j in 0..pt {
+            let col = self.x_t.column(j);
+            let mut acc = 0.0;
+            for i in 0..self.coeff_tt.len() {
+                let v = col[i];
+                acc += self.coeff_tt[i] * v * v;
+            }
+            diag[j] = acc;
+        }
+        for j in 0..pls {
+            let col = self.x_ls.column(j);
+            let mut acc = 0.0;
+            for i in 0..self.coeff_ll.len() {
+                let v = col[i];
+                acc += self.coeff_ll[i] * v * v;
+            }
+            diag[pt + j] = acc;
+        }
+        Ok(Some(diag))
+    }
+
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_from_designs(
+                &self.block_states,
+                &self.x_t,
+                &self.x_ls,
+                d_beta_flat,
+            )
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+                &self.block_states,
+                &self.x_t,
+                &self.x_ls,
+                d_beta_u_flat,
+                d_beta_v_flat,
+            )
     }
 }
 
@@ -14951,6 +15185,17 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// predictor, which changes with all three coefficient blocks.
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
+    }
+
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Three fully-coupled blocks (threshold p_t, log-σ p_ℓ, link-wiggle
+        // p_w): joint Hessian size (p_t + p_ℓ + p_w)² per row.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
     }
 
     /// The wiggle family carries a structural null-space direction: the

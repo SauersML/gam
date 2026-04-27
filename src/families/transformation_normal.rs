@@ -27,7 +27,8 @@ use crate::faer_ndarray::{
 };
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointPsiSecondOrderTerms,
+    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
     MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
@@ -49,6 +50,7 @@ use crate::smooth::{
     sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
+use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
@@ -760,12 +762,24 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, _specs: &[ParameterBlockSpec]) -> u64 {
+        // Khatri–Rao tensor design: the coefficient block is
+        // X = R ⊙ C with rows length p_resp · p_cov. The exact dense Hessian
+        // therefore costs n · (p_resp·p_cov)² flops to assemble, which is the
+        // honest work model for routing — n·p² with p = p_resp·p_cov.
+        let n = self.response_val_basis.nrows() as u64;
+        let p_resp = self.response_val_basis.ncols() as u64;
+        let p_cov = self.covariate_design.ncols() as u64;
+        let p_total = p_resp.saturating_mul(p_cov);
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        crate::custom_family::cost_gated_outer_order(specs)
+        crate::custom_family::cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
     }
 
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
@@ -1316,6 +1330,402 @@ impl CustomFamily for TransformationNormalFamily {
         hess += &self.x_deriv_kron.weighted_gram(&quartic, &self.policy);
 
         Ok(Some(0.5 * (&hess + &hess.t())))
+    }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        if block_states.len() != 1 {
+            return Err(format!(
+                "TransformationNormalFamily expects 1 block, got {}",
+                block_states.len()
+            ));
+        }
+        let beta = &block_states[0].beta;
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        for (i, value) in h_prime.iter().enumerate() {
+            if !value.is_finite() || *value <= 0.0 {
+                return Err(format!(
+                    "TransformationNormalFamily Hessian workspace: h'[{i}] = {value} is not strictly positive"
+                ));
+            }
+        }
+        let weighted_inv_hp_sq: Array1<f64> = self
+            .weights
+            .iter()
+            .zip(h_prime.iter())
+            .map(|(&w, &hp)| w / (hp * hp))
+            .collect();
+        let workspace = TransformationNormalJointHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            h_prime,
+            weighted_inv_hp_sq,
+        )?;
+        Ok(Some(
+            Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Matrix-free joint Hessian workspace (Khatri-Rao operator-only)
+// ---------------------------------------------------------------------------
+
+/// Per-evaluation workspace for the CTN joint Hessian.
+///
+/// Caches the row-space quantities needed to apply
+///   H = X_val^T diag(w) X_val + X_deriv^T diag(w / h'^2) X_deriv
+/// without materializing X_val, X_deriv, or H itself. All matvecs go through
+/// the Khatri-Rao operator primitives on `KroneckerDesign`, which run in
+/// `O(n * p_resp * p_cov) = O(n * p)` per call. This avoids both the
+/// `O(n * p^2)` cost of the dense weighted Gram and the `O(p^2)` storage of
+/// the materialized joint Hessian.
+struct TransformationNormalJointHessianWorkspace {
+    family: TransformationNormalFamily,
+    block_states: Vec<ParameterBlockState>,
+    /// h'_i = X_deriv · β at the current iterate. Cached so the matrix-free
+    /// directional-derivative operators can reuse it without rerunning
+    /// `forward_mul(beta)`.
+    h_prime: Array1<f64>,
+    /// Row weights w / h'^2 for the X_deriv^T diag(·) X_deriv summand.
+    weighted_inv_hp_sq: Array1<f64>,
+}
+
+impl TransformationNormalJointHessianWorkspace {
+    fn new(
+        family: TransformationNormalFamily,
+        block_states: Vec<ParameterBlockState>,
+        h_prime: Array1<f64>,
+        weighted_inv_hp_sq: Array1<f64>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            family,
+            block_states,
+            h_prime,
+            weighted_inv_hp_sq,
+        })
+    }
+
+    fn p_total(&self) -> usize {
+        self.family.x_val_kron.ncols()
+    }
+
+    fn apply_hessian(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.p_total() {
+            return Err(format!(
+                "CTN joint Hessian matvec: input length {} != p_total {}",
+                v.len(),
+                self.p_total()
+            ));
+        }
+        // Term 1: X_val^T diag(w) X_val · v.
+        let val_image = self.family.x_val_kron.forward_mul(v);
+        let weighted_val: Array1<f64> = val_image
+            .iter()
+            .zip(self.family.weights.iter())
+            .map(|(&u, &w)| u * w)
+            .collect();
+        let mut out = self.family.x_val_kron.transpose_mul(&weighted_val);
+
+        // Term 2: X_deriv^T diag(w / h'^2) X_deriv · v.
+        let deriv_image = self.family.x_deriv_kron.forward_mul(v);
+        let weighted_deriv: Array1<f64> = deriv_image
+            .iter()
+            .zip(self.weighted_inv_hp_sq.iter())
+            .map(|(&u, &w)| u * w)
+            .collect();
+        out += &self.family.x_deriv_kron.transpose_mul(&weighted_deriv);
+        Ok(out)
+    }
+
+    /// Diagonal of the unpenalized joint Hessian for Khatri-Rao designs.
+    ///
+    /// For X = A ⊙ B the diagonal of `X^T diag(w) X` is
+    ///   `H_(a,b),(a,b) = Σ_i w_i A_{i,a}^2 B_{i,b}^2`
+    /// which is computed in O(n * p_resp * p_cov) without materializing X
+    /// or its squared columns.
+    fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
+        let resp_val = &self.family.response_val_basis;
+        let resp_deriv = &self.family.response_deriv_basis;
+        let cov_dense = self
+            .family
+            .covariate_design
+            .as_dense_ref()
+            .ok_or_else(|| {
+                "CTN joint Hessian diagonal requires dense covariate design".to_string()
+            })?;
+        let p_resp = resp_val.ncols();
+        let p_cov = cov_dense.ncols();
+        let n = resp_val.nrows();
+        let total = p_resp * p_cov;
+        let weights = self.family.weights.as_ref();
+
+        // Pre-square the covariate design once.
+        let mut cov_sq = cov_dense.clone();
+        cov_sq.mapv_inplace(|v| v * v);
+
+        let mut diag = Array1::<f64>::zeros(total);
+        let mut tilde_w = Array1::<f64>::zeros(n);
+        for a in 0..p_resp {
+            // Term 1 contribution: tilde_w[i] = w_i * A_{i,a}^2
+            for i in 0..n {
+                let aval = resp_val[[i, a]];
+                tilde_w[i] = weights[i] * aval * aval;
+            }
+            for b in 0..p_cov {
+                let mut acc = 0.0;
+                for i in 0..n {
+                    acc += tilde_w[i] * cov_sq[[i, b]];
+                }
+                diag[a * p_cov + b] += acc;
+            }
+            // Term 2 contribution: tilde_w[i] = (w_i / h'^2) * D_{i,a}^2
+            for i in 0..n {
+                let dval = resp_deriv[[i, a]];
+                tilde_w[i] = self.weighted_inv_hp_sq[i] * dval * dval;
+            }
+            for b in 0..p_cov {
+                let mut acc = 0.0;
+                for i in 0..n {
+                    acc += tilde_w[i] * cov_sq[[i, b]];
+                }
+                diag[a * p_cov + b] += acc;
+            }
+        }
+        Ok(diag)
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorkspace {
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(self.apply_hessian(v)?))
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(self.compute_diagonal()?))
+    }
+
+    fn directional_derivative(
+        &self,
+        _d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // Dense form is reached only when a caller forces materialization via
+        // `into_operator().to_dense()`. Returning `None` keeps consumers on the
+        // operator path supplied below; legacy callers that explicitly need a
+        // p×p matrix fall through to `family.exact_newton_joint_hessian_directional_derivative_with_specs`
+        // (the dense `weighted_gram` route) at the call site, so behavior is
+        // preserved without forcing a dense build here.
+        Ok(None)
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let p_total = self.p_total();
+        if d_beta_flat.len() != p_total {
+            return Err(format!(
+                "CTN directional_derivative_operator length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                p_total
+            ));
+        }
+        let d_h_prime = self.family.x_deriv_kron.forward_mul(d_beta_flat);
+        let op = TransformationNormalDhMatrixFreeOperator::new(
+            self.family.clone(),
+            self.h_prime.clone(),
+            d_h_prime,
+        );
+        Ok(Some(Arc::new(op) as Arc<dyn HyperOperator>))
+    }
+
+    fn second_directional_derivative(
+        &self,
+        _u: &Array1<f64>,
+        _v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        let p_total = self.p_total();
+        if d_beta_u.len() != p_total || d_beta_v.len() != p_total {
+            return Err(format!(
+                "CTN second_directional_derivative_operator length mismatch: u={}, v={}, expected {}",
+                d_beta_u.len(),
+                d_beta_v.len(),
+                p_total
+            ));
+        }
+        let d_h_prime_u = self.family.x_deriv_kron.forward_mul(d_beta_u);
+        let d_h_prime_v = self.family.x_deriv_kron.forward_mul(d_beta_v);
+        let op = TransformationNormalD2hMatrixFreeOperator::new(
+            self.family.clone(),
+            self.h_prime.clone(),
+            d_h_prime_u,
+            d_h_prime_v,
+        );
+        Ok(Some(Arc::new(op) as Arc<dyn HyperOperator>))
+    }
+}
+
+/// Matrix-free directional derivative of the CTN joint Hessian.
+///
+/// Encodes
+///   `dH[v_dir] = -2 X_derivᵀ diag(w · (X_deriv v_dir) / h'³) X_deriv`
+/// by caching the per-row weight kernel
+///   `c_i = -2 w_i (X_deriv v_dir)_i / h'_i³`
+/// at construction time. Each `mul_vec(w)` call costs `Θ(n (p_resp + p_cov))`
+/// via the same Khatri-Rao primitives the joint Hessian matvec uses, so the
+/// O(p²) dense `weighted_gram` build is never performed and stochastic
+/// trace estimators (`MatrixFreeSpdOperator::trace_logdet_operator`) consume
+/// the operator directly without materialization.
+struct TransformationNormalDhMatrixFreeOperator {
+    family: TransformationNormalFamily,
+    weight_kernel: Array1<f64>,
+}
+
+impl TransformationNormalDhMatrixFreeOperator {
+    fn new(
+        family: TransformationNormalFamily,
+        h_prime: Array1<f64>,
+        d_h_prime: Array1<f64>,
+    ) -> Self {
+        let n = h_prime.len();
+        debug_assert_eq!(d_h_prime.len(), n);
+        let weights = family.weights.as_ref();
+        let mut weight_kernel = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let hp = h_prime[i];
+            weight_kernel[i] = -2.0 * weights[i] * d_h_prime[i] / (hp * hp * hp);
+        }
+        Self {
+            family,
+            weight_kernel,
+        }
+    }
+
+    fn p_total(&self) -> usize {
+        self.family.x_deriv_kron.ncols()
+    }
+
+    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        let image = self.family.x_deriv_kron.forward_mul(v);
+        let n = image.len();
+        let mut weighted = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            weighted[i] = self.weight_kernel[i] * image[i];
+        }
+        self.family.x_deriv_kron.transpose_mul(&weighted)
+    }
+}
+
+impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p_total());
+        self.apply(v)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        // Legacy fallback for consumers that go through
+        // `DriftDerivResult::into_operator().to_dense()`. The hot trace/logdet
+        // path applies `mul_vec` directly and never reaches this branch.
+        let p = self.p_total();
+        let mut out = Array2::<f64>::zeros((p, p));
+        let mut basis = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            basis[j] = 1.0;
+            let col = self.apply(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+/// Matrix-free second directional derivative of the CTN joint Hessian.
+///
+/// Encodes
+///   `d²H[u, v] = 6 X_derivᵀ diag(w (X_deriv u)(X_deriv v) / h'⁴) X_deriv`
+/// with the same factored apply pattern as `TransformationNormalDhMatrixFreeOperator`.
+/// Used by the unified evaluator's second-order trace identities and second
+/// directional drift evaluations on the outer Hessian.
+struct TransformationNormalD2hMatrixFreeOperator {
+    family: TransformationNormalFamily,
+    weight_kernel: Array1<f64>,
+}
+
+impl TransformationNormalD2hMatrixFreeOperator {
+    fn new(
+        family: TransformationNormalFamily,
+        h_prime: Array1<f64>,
+        d_h_prime_u: Array1<f64>,
+        d_h_prime_v: Array1<f64>,
+    ) -> Self {
+        let n = h_prime.len();
+        debug_assert_eq!(d_h_prime_u.len(), n);
+        debug_assert_eq!(d_h_prime_v.len(), n);
+        let weights = family.weights.as_ref();
+        let mut weight_kernel = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let hp = h_prime[i];
+            let hp2 = hp * hp;
+            let hp4 = hp2 * hp2;
+            weight_kernel[i] = 6.0 * weights[i] * d_h_prime_u[i] * d_h_prime_v[i] / hp4;
+        }
+        Self {
+            family,
+            weight_kernel,
+        }
+    }
+
+    fn p_total(&self) -> usize {
+        self.family.x_deriv_kron.ncols()
+    }
+
+    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        let image = self.family.x_deriv_kron.forward_mul(v);
+        let n = image.len();
+        let mut weighted = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            weighted[i] = self.weight_kernel[i] * image[i];
+        }
+        self.family.x_deriv_kron.transpose_mul(&weighted)
+    }
+}
+
+impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p_total());
+        self.apply(v)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.p_total();
+        let mut out = Array2::<f64>::zeros((p, p));
+        let mut basis = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            basis[j] = 1.0;
+            let col = self.apply(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
     }
 }
 

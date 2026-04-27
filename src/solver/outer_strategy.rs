@@ -1755,7 +1755,33 @@ pub struct OuterProblem {
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     solver_class: SolverClass,
+    /// Caller-supplied estimate of the floating-point work required to
+    /// assemble one dense exact joint Hessian, in FLOPs.  When `Some(work)`
+    /// and `work` exceeds [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`], the
+    /// planner downgrades `(Analytic, Analytic)` to BFGS+gradient even
+    /// though an analytic Hessian is declared.  This is the arithmetic-cost
+    /// counterpart to the memory-budget preflight: a "memory-PASS" plan
+    /// whose per-iteration work would dominate wall-clock time should be
+    /// routed away from the dense-Hessian path automatically.
+    ///
+    /// Typical formula: `work ≈ n · p²` for standard GLM curvature
+    /// assembly; family-specific scalings (Khatri–Rao, GAMLSS block tri-up)
+    /// can be folded into the same scalar.
+    dense_hessian_work_hint: Option<f64>,
 }
+
+/// Per-Hessian work above which the outer planner prefers gradient-only
+/// optimization even when an analytic Hessian is available.
+///
+/// At biobank scale the outer Newton step performs O(20) iterations, each
+/// of which assembles a dense exact joint Hessian.  Once a single assembly
+/// exceeds ~5 GFLOPs, the second-order step's superior local convergence
+/// no longer compensates for the per-evaluation cost vs. L-BFGS, which
+/// only needs O(n·p) gradient work per step.  The threshold is intentionally
+/// generous: we keep ARC active for the common biobank regime (n=3·10⁵,
+/// p≈100 → 3·10⁹ FLOPs ≪ threshold) and only divert when the dense path
+/// would dominate wall-clock time.
+pub const DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD: f64 = 5.0e9;
 
 impl OuterProblem {
     pub fn new(n_params: usize) -> Self {
@@ -1777,6 +1803,7 @@ impl OuterProblem {
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             solver_class: SolverClass::Primary,
+            dense_hessian_work_hint: None,
         }
     }
 
@@ -1869,14 +1896,49 @@ impl OuterProblem {
         self
     }
 
+    /// Hint at the floating-point work cost of one dense exact Hessian
+    /// assembly, in FLOPs.  Use `n · p²` for standard GLM curvature, or a
+    /// family-specific equivalent.  When the supplied work exceeds
+    /// [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`], the planner routes the
+    /// outer optimization through L-BFGS + analytic gradient instead of
+    /// ARC + analytic Hessian, even though both derivatives are declared.
+    ///
+    /// This is the arithmetic counterpart of the existing memory-budget
+    /// preflight: a plan that fits in RAM but assembles a multi-second
+    /// Hessian per outer iteration should be steered to gradient-only
+    /// optimization automatically, not silently burn wall-clock time on
+    /// dense second-order work.
+    pub fn with_dense_hessian_work_hint(mut self, work_flops: f64) -> Self {
+        self.dense_hessian_work_hint = Some(work_flops);
+        self
+    }
+
+    /// True when the caller has supplied a dense-Hessian work estimate that
+    /// exceeds the downgrade threshold.  Used by `capability()` to upgrade
+    /// the `prefer_gradient_only` flag — callers can still set the flag
+    /// directly via `with_prefer_gradient_only(true)`; the work hint only
+    /// adds a *cost-driven* path to the same flag.
+    fn dense_hessian_work_too_large(&self) -> bool {
+        self.dense_hessian_work_hint
+            .map(|w| w.is_finite() && w > DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD)
+            .unwrap_or(false)
+    }
+
     /// Derive the capability flags from the builder state.
     /// `fixed_point_available` is set to `false` here; `build_objective`
     /// overrides it based on whether an EFS closure is actually provided.
     fn capability(&self) -> OuterCapability {
+        // Cost-driven gradient-only routing: when the caller supplied a
+        // work-cost hint that exceeds the threshold, we set
+        // `prefer_gradient_only` so the planner picks BFGS+BfgsApprox even
+        // if an analytic Hessian was declared. The caller's explicit
+        // `with_prefer_gradient_only(true)` is preserved either way.
+        let prefer_gradient_only =
+            self.prefer_gradient_only || self.dense_hessian_work_too_large();
         OuterCapability {
             gradient: self.gradient,
             hessian: self.hessian,
-            prefer_gradient_only: self.prefer_gradient_only,
+            prefer_gradient_only,
             disable_fixed_point: self.disable_fixed_point,
             n_params: self.n_params,
             psi_dim: self.psi_dim,

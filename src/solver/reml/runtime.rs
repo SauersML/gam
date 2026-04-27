@@ -21,6 +21,44 @@ fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
     mode != super::unified::EvalMode::ValueOnly
 }
 
+/// Apply the screening residual penalty to a cost.
+///
+/// Under multi-start seed screening (a ranking pass over candidate ρ
+/// vectors), the inner P-IRLS is intentionally capped at a few iterations.
+/// Partial modes that do not certify stationarity are accepted for ranking
+/// in `execute_pirls_if_needed`; this helper turns the partial cost into a
+/// finite ranking score
+///
+///     C_screen(s) = C_approx(s) + ½ · ‖∇L_p(β_partial)‖² ,
+///
+/// which is monotone in the inner residual norm. Seeds whose partial mode
+/// is close to its inner optimum (small ‖∇‖) rank ahead of seeds whose
+/// partial mode is far from optimal. The penalty vanishes at the true
+/// inner mode (‖∇‖ → 0), so converged screening fits incur no penalty.
+///
+/// Outside of screening, partial fits never reach this helper:
+/// `execute_pirls_if_needed` surfaces `MaxIterationsReached` and
+/// `LmStepSearchExhausted` as `EstimationError::PirlsDidNotConverge`, so
+/// production REML evaluations always operate on certified inner modes
+/// and this helper is a strict no-op for them.
+#[inline]
+fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
+    if !cost.is_finite() {
+        return cost;
+    }
+    match pr.status {
+        pirls::PirlsStatus::MaxIterationsReached | pirls::PirlsStatus::LmStepSearchExhausted => {
+            let r_g = pr.lastgradient_norm;
+            if r_g.is_finite() {
+                cost + 0.5 * r_g * r_g
+            } else {
+                f64::INFINITY
+            }
+        }
+        _ => cost,
+    }
+}
+
 struct TkCorrectionTerms {
     value: f64,
     gradient: Option<Array1<f64>>,
@@ -2016,6 +2054,18 @@ impl<'a> RemlState<'a> {
         self.warm_start_beta.write().unwrap().take();
     }
 
+    /// Returns true when the outer optimizer has installed a seed-screening
+    /// inner-iteration cap (a multi-start ranking pass). While active, the
+    /// inner P-IRLS budget is intentionally tiny, partial-fit results are
+    /// surfaced as `Ok` for cost ranking instead of being rejected, the
+    /// screening residual penalty is applied to the cost, and KKT-style
+    /// constraint certification is skipped (the actual fit at full inner
+    /// budget will certify it).
+    #[inline]
+    pub(super) fn screening_active(&self) -> bool {
+        self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0
+    }
+
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
@@ -2420,7 +2470,14 @@ impl<'a> RemlState<'a> {
 
         let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
         let pirls_result = Arc::new(pirls_result);
-        self.enforce_constraint_kkt(pirls_result.as_ref())?;
+        // Under seed screening the inner solver is intentionally given a tiny
+        // iteration budget, so KKT stationarity will not be satisfied at the
+        // partial mode. Skip the certificate so the seed can still be ranked
+        // by an approximate cost; the actual fit (full inner budget) will
+        // certify KKT later.
+        if !in_screening {
+            self.enforce_constraint_kkt(pirls_result.as_ref())?;
+        }
 
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
@@ -2450,6 +2507,29 @@ impl<'a> RemlState<'a> {
                     pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
                     _ => "max iterations reached",
                 };
+                // Seed screening's purpose is to rank candidate seeds by an
+                // approximate cost. Requiring full KKT-style convergence under
+                // a 3-iteration cap would discard all informative seeds, so
+                // when the partial state is finite we surface the result as
+                // Ok and let downstream cost computation derive a finite
+                // approximate score. The result is not cached and the warm
+                // start is not updated (status is not Converged/Stalled, so
+                // the existing branches above do not run).
+                if in_screening
+                    && pirls_result.deviance.is_finite()
+                    && pirls_result
+                        .beta_transformed
+                        .0
+                        .iter()
+                        .all(|v| v.is_finite())
+                {
+                    log::debug!(
+                        "[seed-screen] partial-fit accepted for ranking: {kind} (gradient norm {:.3e}, iter {})",
+                        pirls_result.lastgradient_norm,
+                        pirls_result.iteration
+                    );
+                    return Ok(pirls_result);
+                }
                 if in_screening {
                     log::debug!(
                         "[seed-screen] P-IRLS rejected: {kind} (gradient norm {:.3e}, iter {})",
@@ -2595,14 +2675,15 @@ impl<'a> RemlState<'a> {
             let t_assemble = std::time::Instant::now();
             let result =
                 self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+            let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
             log::debug!(
                 "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
                 cost_call_idx,
-                result.cost,
+                cost,
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
-            return Ok(result.cost);
+            return Ok(cost);
         }
         {
             // Validation and diagnostics (before delegating to unified evaluator).
@@ -2664,14 +2745,15 @@ impl<'a> RemlState<'a> {
         // This ensures cost and gradient share the exact same formula.
         let t_assemble = std::time::Instant::now();
         let result = self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?;
+        let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
         log::debug!(
             "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
             cost_call_idx,
-            result.cost,
+            cost,
             t_assemble.elapsed().as_secs_f64() * 1000.0,
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
-        Ok(result.cost)
+        Ok(cost)
     }
 
     ///
