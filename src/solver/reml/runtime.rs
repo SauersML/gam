@@ -2381,12 +2381,14 @@ impl<'a> RemlState<'a> {
 
         // Detect whether we are running under outer-loop seed screening. While
         // screening is active the planner caps inner iterations to a small
-        // value (~3) and trial seeds are EXPECTED to fail certification — those
-        // are not user-visible errors, just rejected candidates whose costs are
-        // ranked. We thread this flag down so the warn/error sites below can
-        // demote screening-mode failures to debug.
+        // value (~3); trial seeds are NOT expected to certify a stationary
+        // mode under that cap. Partial fits with finite β and deviance are
+        // surfaced as Ok so the caller can rank them by an approximate cost
+        // (`screening_residual_penalty`); only non-finite states are rejected.
+        // We thread this flag down so the warn/error sites below also demote
+        // screening-mode rejections from error- to debug-level diagnostics.
         let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
-        let in_screening = screening_cap > 0;
+        let in_screening = self.screening_active();
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs
