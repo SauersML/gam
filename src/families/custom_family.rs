@@ -6486,6 +6486,69 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
     Ok(2.0 * chol.diag().mapv(f64::ln).sum())
 }
 
+/// Strict-mode logdet with the same Levenberg-Marquardt δ-ridge continuation
+/// schedule as [`strict_solve_spd_with_lm_continuation`]: when the bare
+/// Cholesky on `H` rejects, we factor `H + δI` with δ escalated geometrically
+/// until success.  Returns `log|H + δI|` and the δ used.
+///
+/// The mathematical content is the regularized pseudo-Laplace logdet,
+/// `log|H + δI|`, not the bare `log|H|` — but this is precisely the quantity
+/// the controller needs at indefinite seeds to make a step decision.  Without
+/// continuation, every seed where H_β has a marginally-non-positive eigenvalue
+/// is rejected, the spatial-adaptive pilot loses its entire seed budget, and
+/// the controller fall-opens into a full-data path that was never gated for
+/// it (the Matern adaptive seed-failure → 14.56 GiB OOM in the recovery
+/// branch).  The δ that finally factors is recorded in `StrictSpdLmStats`
+/// so the outer controller can detect a recurring need for nontrivial ridges
+/// and react (e.g. tighten step length, fall through to a sparse path, or
+/// surface a structural diagnostic to the user).
+pub(crate) fn strict_logdet_spd_with_lm_continuation(
+    matrix: &Array2<f64>,
+) -> Result<(f64, StrictSpdLmStats), String> {
+    const MAX_ESCALATIONS: usize = 16;
+    const RIDGE_GROWTH: f64 = 10.0;
+
+    if let Ok(logdet) = strict_logdet_spd(matrix) {
+        return Ok((logdet, StrictSpdLmStats::default()));
+    }
+
+    let p = matrix.nrows();
+    if p == 0 {
+        return Ok((0.0, StrictSpdLmStats::default()));
+    }
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
+    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
+
+    let mut delta = delta0;
+    for escalation in 1..=MAX_ESCALATIONS {
+        let mut ridged = sym.clone();
+        for i in 0..p {
+            ridged[[i, i]] += delta;
+        }
+        match ridged.cholesky(Side::Lower) {
+            Ok(chol) => {
+                let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
+                return Ok((
+                    logdet,
+                    StrictSpdLmStats {
+                        delta_used: delta,
+                        escalations: escalation,
+                    },
+                ));
+            }
+            Err(_) => {
+                delta *= RIDGE_GROWTH;
+            }
+        }
+    }
+    Err(format!(
+        "strict pseudo-laplace SPD logdet failed even with LM δ-ridge continuation \
+         (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e})"
+    ))
+}
+
 fn strict_logdet_spd_with_semidefinite_option(
     matrix: &Array2<f64>,
     allow_semidefinite: bool,

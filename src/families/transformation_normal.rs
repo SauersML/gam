@@ -2460,12 +2460,6 @@ impl KroneckerActiveSetCache {
         ]
     }
 
-    /// Mark the active-set certificate as stale because `c` (β projection)
-    /// has changed. Bumps the monotone version stamp; the next call to
-    /// `min_step_to_boundary_with_active_set` will full-scan to refresh.
-    fn invalidate_for_new_beta(&mut self) {
-        self.c_version = self.c_version.wrapping_add(1);
-    }
 }
 
 /// Discriminated union over two factored representations of a Kronecker-shaped
