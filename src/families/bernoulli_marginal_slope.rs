@@ -10074,8 +10074,9 @@ mod tests {
         use ndarray::Array2;
 
         // Small problem (K=4, n=10, p=8): combined cost ≪ threshold → Second.
-        let small_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((10, 8))));
+        let small_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::zeros((10, 8)),
+        ));
         let small_specs: Vec<ParameterBlockSpec> = (0..2)
             .map(|i| ParameterBlockSpec {
                 name: format!("block_{i}"),
@@ -10098,9 +10099,9 @@ mod tests {
         // Biobank-shape problem (K²≈400 looks fine, but n·p² ≈ 1.25e9 makes
         // the combined K²·n·p² ≈ 5e11 prohibitive). Patch 4 routes this to
         // first-order BFGS instead of attempting an exact outer Hessian.
-        let big_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
-            (5_000, 500),
-        )));
+        let big_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::zeros((5_000, 500)),
+        ));
         let big_specs: Vec<ParameterBlockSpec> = (0..2)
             .map(|i| ParameterBlockSpec {
                 name: format!("block_{i}"),
@@ -10164,10 +10165,12 @@ mod tests {
         let n = 1000usize;
         let p_marg = 20usize;
         let p_log = 8usize;
-        let marg_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((n, p_marg))));
-        let log_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((n, p_log))));
+        let marg_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::zeros((n, p_marg)),
+        ));
+        let log_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::zeros((n, p_log)),
+        ));
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(Array1::zeros(n)),
             weights: Arc::new(Array1::from_elem(n, 1.0)),
@@ -10209,7 +10212,10 @@ mod tests {
         let expected_joint = (n as u64) * p_total * p_total;
         let expected_block_diag = (n as u64) * ((p_marg * p_marg + p_log * p_log) as u64);
         assert_eq!(family.coefficient_hessian_cost(&specs), expected_joint);
-        assert_eq!(default_coefficient_hessian_cost(&specs), expected_block_diag);
+        assert_eq!(
+            default_coefficient_hessian_cost(&specs),
+            expected_block_diag
+        );
         assert!(family.coefficient_hessian_cost(&specs) > default_coefficient_hessian_cost(&specs));
     }
 
