@@ -3,7 +3,7 @@ use crate::basis::{
     create_difference_penalty_matrix, create_ispline_derivative_dense,
 };
 use crate::custom_family::{
-    BatchedOuterGradientTerms, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
