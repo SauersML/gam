@@ -3590,6 +3590,161 @@ mod tests {
     }
 
     #[test]
+    fn ctn_joint_hessian_workspace_matvec_matches_dense() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+
+        let dense = family
+            .exact_newton_joint_hessian(std::slice::from_ref(&state))
+            .expect("dense joint Hessian build")
+            .expect("dense joint Hessian present");
+        assert_eq!(dense.nrows(), p);
+        assert_eq!(dense.ncols(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
+            .expect("workspace build")
+            .expect("workspace present");
+
+        // Diagonal must agree element-wise (matrix-free pre-square path vs. dense gram).
+        let diag_op = workspace
+            .hessian_diagonal()
+            .expect("diagonal call")
+            .expect("diagonal present");
+        assert_eq!(diag_op.len(), p);
+        for i in 0..p {
+            let want = dense[[i, i]];
+            let got = diag_op[i];
+            assert!(
+                (want - got).abs() <= 1e-12 * want.abs().max(1.0) + 1e-12,
+                "diagonal mismatch at {i}: dense={want:.6e}, workspace={got:.6e}"
+            );
+        }
+
+        // Hessian-vector product must agree with dense H · v across a few
+        // randomly chosen directions (deterministic seed for stability).
+        let directions = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.3, -0.7, 0.5, -0.2]),
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05]),
+        ];
+        for (k, v) in directions.iter().enumerate() {
+            assert_eq!(v.len(), p);
+            let want = dense.dot(v);
+            let got = workspace
+                .hessian_matvec(v)
+                .expect("matvec call")
+                .expect("matvec present");
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "matvec[{k}, {i}] mismatch: dense={:.6e}, workspace={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctn_joint_hessian_workspace_dh_operator_matches_dense() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+        let d_beta = array![0.07, -0.04, 0.21, 0.08];
+        assert_eq!(d_beta.len(), p);
+
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative(
+                std::slice::from_ref(&state),
+                &d_beta,
+            )
+            .expect("dense dH build")
+            .expect("dense dH present");
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH operator call")
+            .expect("dH operator present");
+
+        let probes = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.3, -0.7, 0.5, -0.2]),
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05]),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            assert_eq!(w.len(), p);
+            let want = dense_dh.dot(w);
+            let got = dh_op.mul_vec(w);
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "dH op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctn_joint_hessian_workspace_d2h_operator_matches_dense() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+        let dir_u = array![0.02, -0.01, 0.03, 0.015];
+        let dir_v = array![-0.01, 0.02, 0.01, -0.025];
+
+        let dense_d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                std::slice::from_ref(&state),
+                &dir_u,
+                &dir_v,
+            )
+            .expect("dense d2H build")
+            .expect("dense d2H present");
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
+            .expect("workspace build")
+            .expect("workspace present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&dir_u, &dir_v)
+            .expect("d2H operator call")
+            .expect("d2H operator present");
+
+        let probes = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.3, -0.7, 0.5, -0.2]),
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05]),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            assert_eq!(w.len(), p);
+            let want = dense_d2h.dot(w);
+            let got = d2h_op.mul_vec(w);
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "d2H op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn kronecker_variant_matches_materialized_form() {
         // Tiny inputs: n_cov=4 covariate rows, n_grid=3 monotonicity-grid points,
         // p_resp=2 response-direction columns, p_cov=2 covariate columns.
