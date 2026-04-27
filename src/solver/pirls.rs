@@ -8537,17 +8537,18 @@ mod root_cause_tests {
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
                 .expect("plateaued accepted step should still return a final state");
 
-        // The plateau triggers the LM step search to exhaust its retry budget
-        // (each candidate step is rejected as a noise-scale move) while the
-        // projected gradient 5e-5 sits well above the near-stationary band
-        // (= 1e-5). That maps exactly to LmStepSearchExhausted: distinct from
-        // MaxIterationsReached (which would mean the outer iteration counter
-        // ran out without the LM block ever exhausting), and definitely not
-        // Converged/StalledAtValidMinimum.
+        // The plateau case ACCEPTS the candidate step (it's a noise-scale
+        // improvement of 1.25e-9 in deviance), so the LM block does not
+        // exhaust. The outer iteration counter (max_iterations=1) runs out
+        // first, so the default-initialized MaxIterationsReached stands.
+        // Distinct from the rejection test below, which exhausts LM retries
+        // before iter completes. What both tests guard against is the
+        // gradient 5e-5 (above the 1e-5 near-stationary band) being silently
+        // promoted to Converged or StalledAtValidMinimum.
         assert_eq!(
             result.status,
-            PirlsStatus::LmStepSearchExhausted,
-            "projected gradient 5e-5 is well above the near-stationary band and must hit the LM-exhaust exit, not be promoted to Converged/Stalled or fall through to a default MaxIterationsReached"
+            PirlsStatus::MaxIterationsReached,
+            "projected gradient 5e-5 is well above the near-stationary band and must not be promoted to Converged/Stalled — the candidate step is accepted but the outer iteration counter must run out as MaxIterationsReached, not be silently re-classified"
         );
     }
 

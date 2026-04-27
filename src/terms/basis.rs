@@ -14327,28 +14327,28 @@ fn active_thin_plate_penalty_derivatives(
         .collect()
 }
 
-/// Which orders of psi-derivative the ThinPlate builders should materialize.
-///
-/// At biobank scale the design-side derivative arrays are dense `n × p`
-/// (hundreds of MiB at n≈3×10⁵) and one of the two top-level callers always
-/// discards a full half. Letting the caller request only what it needs keeps
-/// the inner kernel loop in single-pass form for the `Both` path while
-/// dropping the unused allocation entirely on the `First` / `Second` paths.
+/// Which order of psi-derivative the ThinPlate penalty builder should
+/// materialize. The penalty matrices are k × k (typically tens of KiB),
+/// not n × p, so the cost of producing the unrequested half is small;
+/// what matters is that the two top-level callers (first-derivative
+/// builder and second-derivative builder) each only consume one side and
+/// can skip the unused half cleanly. (The design-side equivalent now
+/// goes through the shared scalar streaming path and does not need this
+/// enum.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThinPlateDerivativeOrder {
     First,
     Second,
-    Both,
 }
 
 impl ThinPlateDerivativeOrder {
     #[inline]
     fn wants_first(self) -> bool {
-        matches!(self, Self::First | Self::Both)
+        matches!(self, Self::First)
     }
     #[inline]
     fn wants_second(self) -> bool {
-        matches!(self, Self::Second | Self::Both)
+        matches!(self, Self::Second)
     }
 }
 
