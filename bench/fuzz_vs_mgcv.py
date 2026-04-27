@@ -639,15 +639,34 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
         while len(smooth_kinds) < n_smooths:
             smooth_kinds.append(choice(list(SMOOTH_FN.keys())))
         n_duchon_dims = 2
-        # Pure scale-free Duchon, polyharmonic order m = p + s = 3 in d = 2.
-        # Rust (order=Zero, power=2) ⇒ p=1, s=2 maps to mgcv m=c(1, 2): both
-        # sides build the same polyharmonic kernel against a constants-only
-        # null space. `length_scale=1` (hybrid Duchon-Matérn) has no mgcv
-        # equivalent and is therefore not used in the comparison.
-        duchon_order = 0
-        duchon_power = 2
-        max_knots = max(3, n_obs // max(n_smooths + 1, 2) - 2)
-        knots = min(knots, max_knots)
+        # Pure scale-free Duchon at d = 2 with rust's triple-operator
+        # collocation penalty has only one admissible configuration:
+        # (nullspace order = Degree(2), power = 0). Rust's
+        # `resolve_duchon_orders` enforces both the kernel-existence /
+        # triple-collocation constraint `2(p + s) > d + 2` and the pure-
+        # mode CPD constraint `2s < d`; in d = 2 these jointly force
+        # `s = 0` and `p ≥ 3`, i.e. order = Degree(2). The previous
+        # (order=Zero, power=2) pairing has p+s=3 but `2s=4 ≥ d=2`, so
+        # rust hard-rejects it ("pure Duchon requires power < dimension/2
+        # for nullspace degree < 1"). order=Degree(2) is encoded as int 2
+        # in the rust formula DSL and as mgcv `m1 = 3` (mgcv m1 =
+        # null-space polynomial order; null space spans polynomials of
+        # total degree ≤ m1 − 1). The mgcv pair is therefore m=c(3, 0).
+        # mgcv accepts m[2]=0 with an "s value reduced" warning, then
+        # builds the same polyharmonic kernel against a cubic null space.
+        duchon_order = 2
+        duchon_power = 0
+        # The cubic polynomial null space at d = 2 has C(2 + 2, 2) = 6
+        # monomials. Rust requires `centers >= 6` (else
+        # `duchon_effective_nullspace_order` silently auto-degrades to
+        # order=Zero). mgcv `s(..., bs='ds', m=c(3,0), k=...)` requires
+        # `k >= 8` (mgcv adds a 2-column safety margin for the kernel
+        # block; lower values trigger an internal "basis dimension reset"
+        # warning that leaves the fit in a state where `predict()` then
+        # crashes with "'qr' and 'y' must have the same number of rows").
+        min_duchon_centers = 8
+        max_knots = max(min_duchon_centers, n_obs // max(n_smooths + 1, 2) - 2)
+        knots = min(max(knots, min_duchon_centers), max_knots)
 
     return FuzzScenario(
         seed=seed, family=family, model_type=model_type, n_obs=n_obs,
@@ -665,15 +684,22 @@ def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
         return
     sc.basis_type = basis_filter
     if basis_filter == "duchon":
-        if sc.n_smooths < 2:
-            sc.n_smooths = 2
-            sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
-        # Match the duchon branch in generate_scenario so a basis-filtered
-        # scenario uses the same pure scale-free configuration that
-        # rust ↔ mgcv can compare apples-to-apples.
+        # Mirror the full duchon branch in generate_scenario: same
+        # configuration (Degree(2), 0), same n_smooths floor, and the same
+        # `min_duchon_centers` clamp on `knots`. Without these, a forced
+        # duchon scenario can be built with too few centers to span the
+        # cubic null space, causing rust to silently auto-degrade to
+        # order=Zero and desync from mgcv.
+        if sc.n_smooths < 3:
+            sc.n_smooths = 3
+            while len(sc.smooth_kinds) < 3:
+                sc.smooth_kinds.append(sc.smooth_kinds[-1] if sc.smooth_kinds else "linear")
         sc.n_duchon_dims = 2
-        sc.duchon_order = 0
-        sc.duchon_power = 2
+        sc.duchon_order = 2
+        sc.duchon_power = 0
+        min_duchon_centers = 8
+        max_knots = max(min_duchon_centers, sc.n_obs // max(sc.n_smooths + 1, 2) - 2)
+        sc.knots = min(max(sc.knots, min_duchon_centers), max_knots)
 
 
 def select_scenarios(
@@ -758,8 +784,15 @@ def _formula_from_terms(response, terms):
 
 def _duchon_dims_for_centers(cols, sc, centers: int) -> int:
     dims = min(max(int(sc.n_duchon_dims), 2), len(cols))
-    if int(sc.duchon_order) >= 1 and centers < dims + 1:
-        dims = max(2, min(dims, centers - 1))
+    order = int(sc.duchon_order)
+    if order >= 1:
+        # Polynomial null space at order = k in `dims` dimensions has
+        # C(dims + k, k) monomials. Rust auto-degrades to order=Zero when
+        # centers can't span the nullspace, which would silently desync
+        # rust ↔ mgcv; clamp dims so that polynomial-block ≤ centers.
+        while dims >= 2 and math.comb(dims + order, order) > centers:
+            dims -= 1
+        dims = max(2, dims)
     return dims
 
 
@@ -785,7 +818,14 @@ def rust_noise_terms(cols, sc):
     """Noise terms for GAMLSS; --predict-noise expects only the RHS."""
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon" and len(cols) >= 2:
-        centers = max(3, sc.knots // 2)
+        # The noise term uses fewer centers than the mean term but must
+        # still satisfy: (a) polynomial-block-size centers (rust auto-
+        # degrade) and (b) mgcv's k floor (else mgcv silently resets and
+        # predict() crashes). For the hardcoded order=2 / d=2 case the
+        # joint floor is 8 (=poly_block + 2).
+        poly_block = math.comb(2 + int(sc.duchon_order), int(sc.duchon_order))
+        min_centers = poly_block + 2
+        centers = max(min_centers, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, centers)
         d_cols = cols[:dims]
         return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
@@ -825,7 +865,10 @@ def mgcv_formula(cols, sc):
 
 def mgcv_sigma_formula(cols, sc):
     if sc.basis_type == "duchon" and len(cols) >= 2:
-        k_val = max(3, sc.knots // 2)
+        # Mirror rust_noise_terms: poly-block + 2 floor satisfies both rust
+        # (no auto-degrade) and mgcv (no "basis dimension reset" warning).
+        poly_block = math.comb(2 + int(sc.duchon_order), int(sc.duchon_order))
+        k_val = max(poly_block + 2, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, k_val)
         d_cols = cols[:dims]
         # mgcv `m=c(m1, m2)` for bs='ds' uses m1 = null-space order (so the
