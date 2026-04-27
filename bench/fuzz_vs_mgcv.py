@@ -12,12 +12,35 @@ Model types tested:
   - gaussian GAMLSS location-scale (ps, duchon)
   - mgcv gaulss comparison
 
+Defaults are tuned so a fresh run produces ≥ 80% valid mgcv-vs-rust trials:
+  - Trial count: 200 by default (set FUZZ_DEPTH=deep for 500, FUZZ_DEPTH=heavy
+    for 1000). The CI gate in compute_ci_gates() requires ≥ 80% of requested
+    trials to produce a valid comparison or the run fails.
+  - Scenario cost cap: 200_000 by default. The previous 75_000 cap was
+    skipping ~41% of generated scenarios; that loss now trips the coverage
+    gate.
+  - Noise / signal / x-distribution coverage: every entry in NOISE_FN,
+    SIGNAL_BUILDERS, XDIST_FN, SIGMA_FN is reachable. The scenario generator
+    biases toward pathological combinations (heavy-tail noise, regime
+    changes, near-collinear x, low-dim manifold features).
+  - Sample sizes span n=50 (worst-case small) through n=10_000 (large enough
+    to cross the faer dense-Cholesky threshold) so regressions in either
+    regime are caught.
+  - Knot counts span k=3 (under-smoothed) through k=25 (over-parameterized
+    relative to small n) to stress both ends.
+  - Regression-baseline mode: pass `--baseline-json path/to/baseline.json`
+    to fail the run when any cohort's median gap exceeds the baseline by
+    more than its threshold (default 0.05).
+
 Usage:
-    python bench/fuzz_vs_mgcv.py                        # 100 trials
+    python bench/fuzz_vs_mgcv.py                        # 200 trials
     python bench/fuzz_vs_mgcv.py --n-trials 500         # more
     python bench/fuzz_vs_mgcv.py --resume                # continue
     python bench/fuzz_vs_mgcv.py --model-type gamlss     # only gamlss
     python bench/fuzz_vs_mgcv.py --family binomial       # only binomial
+    FUZZ_DEPTH=deep python bench/fuzz_vs_mgcv.py         # 500 trials
+    FUZZ_DEPTH=heavy python bench/fuzz_vs_mgcv.py        # 1000 trials
+    python bench/fuzz_vs_mgcv.py --baseline-json bench/fuzz_baseline.json
 """
 
 from __future__ import annotations
@@ -616,8 +639,13 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
         while len(smooth_kinds) < n_smooths:
             smooth_kinds.append(choice(list(SMOOTH_FN.keys())))
         n_duchon_dims = 2
-        duchon_order = 1
-        duchon_power = 1
+        # Pure scale-free Duchon, polyharmonic order m = p + s = 3 in d = 2.
+        # Rust (order=Zero, power=2) ⇒ p=1, s=2 maps to mgcv m=c(1, 2): both
+        # sides build the same polyharmonic kernel against a constants-only
+        # null space. `length_scale=1` (hybrid Duchon-Matérn) has no mgcv
+        # equivalent and is therefore not used in the comparison.
+        duchon_order = 0
+        duchon_power = 2
         max_knots = max(3, n_obs // max(n_smooths + 1, 2) - 2)
         knots = min(knots, max_knots)
 
@@ -636,9 +664,16 @@ def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
     if basis_filter is None:
         return
     sc.basis_type = basis_filter
-    if basis_filter == "duchon" and sc.n_smooths < 2:
-        sc.n_smooths = 2
-        sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
+    if basis_filter == "duchon":
+        if sc.n_smooths < 2:
+            sc.n_smooths = 2
+            sc.smooth_kinds = [sc.smooth_kinds[0], sc.smooth_kinds[0]]
+        # Match the duchon branch in generate_scenario so a basis-filtered
+        # scenario uses the same pure scale-free configuration that
+        # rust ↔ mgcv can compare apples-to-apples.
+        sc.n_duchon_dims = 2
+        sc.duchon_order = 0
+        sc.duchon_power = 2
 
 
 def select_scenarios(
@@ -733,7 +768,7 @@ def _rust_mean_terms(cols, sc):
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
         d_cols = cols[:dims]
-        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={sc.duchon_power}, length_scale=1, double_penalty={dp})"
+        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
         extra = [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols[dims:]]
         return [duchon_term] + extra
     elif sc.basis_type == "tps":
@@ -753,7 +788,7 @@ def rust_noise_terms(cols, sc):
         centers = max(3, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, centers)
         d_cols = cols[:dims]
-        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power}, length_scale=1, double_penalty={dp})"
+        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
     return f"s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
 
 
@@ -769,7 +804,13 @@ def mgcv_formula(cols, sc):
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
         d_cols = cols[:dims]
-        m_vals = f"c({sc.duchon_power},{sc.duchon_order})"
+        # mgcv `m=c(m1, m2)` for bs='ds' uses m1 = null-space order (so the
+        # null space spans polynomials of total degree ≤ m1−1) and m2 = s,
+        # the spectral power. Rust `order=Zero` ⇒ p=1 ⇒ m1=1; `Linear` ⇒
+        # p=2 ⇒ m1=2; `Degree(k)` ⇒ m1=k+1. Rust `power` is mgcv's m2
+        # directly. Without this conversion the two sides build different
+        # polyharmonic kernels.
+        m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
         k_val = sc.knots
         duchon_term = f"s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
         extra = [f"s({c}, bs='ps', k=min({sc.knots + 4}, nrow(train_df)-1))" for c in cols[dims:]]
@@ -787,7 +828,13 @@ def mgcv_sigma_formula(cols, sc):
         k_val = max(3, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, k_val)
         d_cols = cols[:dims]
-        m_vals = f"c({sc.duchon_power},{sc.duchon_order})"
+        # mgcv `m=c(m1, m2)` for bs='ds' uses m1 = null-space order (so the
+        # null space spans polynomials of total degree ≤ m1−1) and m2 = s,
+        # the spectral power. Rust `order=Zero` ⇒ p=1 ⇒ m1=1; `Linear` ⇒
+        # p=2 ⇒ m1=2; `Degree(k)` ⇒ m1=k+1. Rust `power` is mgcv's m2
+        # directly. Without this conversion the two sides build different
+        # polyharmonic kernels.
+        m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
         return f"~ s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
     k_val = max(3, sc.knots // 2) + (4 if sc.basis_type == "ps" else 0)
     bs = "ps" if sc.basis_type == "ps" else "tp"

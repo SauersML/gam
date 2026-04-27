@@ -255,7 +255,11 @@ jobs:
       - bootstrap-runtime
     if: ${{ needs.prepare.outputs.parallel_count != '0' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # GH ceiling is a safety net only — the bench command is wrapped in
+    # GNU `timeout` set a few minutes shorter so a timeout produces a
+    # workflow `failure` (not `cancelled`). See "running benchmark shard"
+    # below.
+    timeout-minutes: 47
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -374,10 +378,29 @@ jobs:
           Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
           mkdir -p bench/results-shards
           echo "running benchmark shard..."
-          python3 bench/run_suite.py \
-            --scenarios bench/scenarios.json \
-            --scenario-name "${{ matrix.scenario }}" \
-            --out "bench/results-shards/${{ matrix.scenario }}.json"
+          # Wrap the bench command in GNU timeout so an over-budget shard
+          # FAILS (exit 124 / 137) rather than being cancelled by the GH
+          # job-level timeout-minutes ceiling. We set the GNU timeout
+          # several minutes shorter than that ceiling so the shard exits
+          # cleanly before GH would auto-cancel; the explicit `exit 1`
+          # below ensures the conclusion is `failure`, not `cancelled`.
+          BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-42m}"
+          set +e
+          timeout --signal=TERM --kill-after=30s "${BENCH_SHARD_TIMEOUT}" \
+            python3 bench/run_suite.py \
+              --scenarios bench/scenarios.json \
+              --scenario-name "${{ matrix.scenario }}" \
+              --out "bench/results-shards/${{ matrix.scenario }}.json"
+          rc=$?
+          set -e
+          if [ "${rc}" -ne 0 ]; then
+            if [ "${rc}" = "124" ] || [ "${rc}" = "137" ]; then
+              echo "::error title=Benchmark shard timeout::Scenario ${{ matrix.scenario }} exceeded ${BENCH_SHARD_TIMEOUT} wall budget (exit ${rc}); failing the job rather than being cancelled by the GH job-level ceiling."
+            else
+              echo "::error title=Benchmark shard error::Scenario ${{ matrix.scenario }} failed with exit ${rc}."
+            fi
+            exit 1
+          fi
           echo "shard output:"
           ls -l "bench/results-shards/${{ matrix.scenario }}.json"
 
@@ -397,7 +420,11 @@ jobs:
       - bootstrap-runtime
     if: ${{ needs.prepare.outputs.serial_count != '0' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # GH ceiling is a safety net only — the bench command is wrapped in
+    # GNU `timeout` set a few minutes shorter so a timeout produces a
+    # workflow `failure` (not `cancelled`). See "running benchmark shard"
+    # below.
+    timeout-minutes: 47
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -516,10 +543,29 @@ jobs:
           Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
           mkdir -p bench/results-shards
           echo "running benchmark shard..."
-          python3 bench/run_suite.py \
-            --scenarios bench/scenarios.json \
-            --scenario-name "${{ matrix.scenario }}" \
-            --out "bench/results-shards/${{ matrix.scenario }}.json"
+          # Wrap the bench command in GNU timeout so an over-budget shard
+          # FAILS (exit 124 / 137) rather than being cancelled by the GH
+          # job-level timeout-minutes ceiling. We set the GNU timeout
+          # several minutes shorter than that ceiling so the shard exits
+          # cleanly before GH would auto-cancel; the explicit `exit 1`
+          # below ensures the conclusion is `failure`, not `cancelled`.
+          BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-42m}"
+          set +e
+          timeout --signal=TERM --kill-after=30s "${BENCH_SHARD_TIMEOUT}" \
+            python3 bench/run_suite.py \
+              --scenarios bench/scenarios.json \
+              --scenario-name "${{ matrix.scenario }}" \
+              --out "bench/results-shards/${{ matrix.scenario }}.json"
+          rc=$?
+          set -e
+          if [ "${rc}" -ne 0 ]; then
+            if [ "${rc}" = "124" ] || [ "${rc}" = "137" ]; then
+              echo "::error title=Benchmark shard timeout::Scenario ${{ matrix.scenario }} exceeded ${BENCH_SHARD_TIMEOUT} wall budget (exit ${rc}); failing the job rather than being cancelled by the GH job-level ceiling."
+            else
+              echo "::error title=Benchmark shard error::Scenario ${{ matrix.scenario }} failed with exit ${rc}."
+            fi
+            exit 1
+          fi
           echo "shard output:"
           ls -l "bench/results-shards/${{ matrix.scenario }}.json"
 
