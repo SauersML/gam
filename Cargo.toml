@@ -61,3 +61,7 @@ ad_trait = "0.2.2"
 [[bin]]
 name = "gam"
 path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
