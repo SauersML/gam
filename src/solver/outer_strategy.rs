@@ -480,64 +480,78 @@ fn rank_seeds_with_screening(
         return seeds.to_vec();
     };
 
-    let cap_value = config.seed_config.screen_max_inner_iterations.max(1);
-    let previous_cap = screening_cap.swap(cap_value, Ordering::Relaxed);
+    let initial_cap = config.seed_config.screen_max_inner_iterations.max(1);
+    let previous_cap = screening_cap.swap(initial_cap, Ordering::Relaxed);
+
+    // Cascade caps: initial → 4× → 16× → uncapped (0).
+    //
+    // The original two-stage protocol (initial cap → fully uncapped on
+    // every seed) has a degenerate worst case: when every seed under the
+    // shallow cap collapses to a non-finite cost, we re-evaluate every
+    // seed at the *full* inner budget. At biobank scale (n ≈ 3 × 10⁵, p
+    // dense) one full P-IRLS solve is hundreds of n·p² operations, so
+    // ranking N seeds costs N × full_pirls_work just to pick a starting
+    // point. The cascade replaces that all-or-nothing jump with a
+    // geometric escalation that exits the moment any seed produces a
+    // finite cost — typically at an intermediate cap that costs a small
+    // multiple of the initial cap rather than the entire inner budget.
+    //
+    // Worst-case work is bounded by (initial × 1) + (initial × 4) +
+    // (initial × 16) + max_inner ≈ 21 × initial + max_inner per seed,
+    // which is a small overhead on top of the original uncapped fallback
+    // and is paid only when every cap stage produces no finite signal.
+    let cascade_caps = [initial_cap, initial_cap * 4, initial_cap * 16, 0usize];
+
     let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
     let mut rejected = 0usize;
+    let mut final_cap_used = initial_cap;
+    let mut stages_consumed = 0usize;
 
-    for (idx, seed) in seeds.iter().enumerate() {
-        obj.reset();
-        match obj.eval_cost(seed) {
-            Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
-            Ok(_) | Err(_) => rejected += 1,
-        }
-    }
-
-    // First-pass screening collapsed every seed to non-finite. That happens
-    // when the inner solver cannot certify a usable mode within the screening
-    // iteration cap, often because the cap is too shallow for the family or
-    // the problem is mildly ill-conditioned at every seed. Rather than commit
-    // to heuristic ordering and let the actual fit pick a poor first start,
-    // do a second pass with the cap disabled. If even one seed becomes finite
-    // under the full inner budget, we get a real ranking; if all still fail
-    // we fall back to heuristic order with the failure surfaced.
-    if ranked.is_empty() {
-        screening_cap.store(0, Ordering::Relaxed);
-        log::debug!(
-            "[OUTER] {context}: seed screening produced no finite cheap costs; \
-             retrying with screening cap disabled"
-        );
-        let mut second_rejected = 0usize;
+    for (stage, &cap) in cascade_caps.iter().enumerate() {
+        screening_cap.store(cap, Ordering::Relaxed);
+        ranked.clear();
+        rejected = 0;
         for (idx, seed) in seeds.iter().enumerate() {
             obj.reset();
             match obj.eval_cost(seed) {
                 Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
-                Ok(_) | Err(_) => second_rejected += 1,
+                Ok(_) | Err(_) => rejected += 1,
             }
         }
-        if ranked.is_empty() {
-            log::info!(
-                "[OUTER] {context}: no finite seed cost even with full inner budget \
-                 ({} seeds, {} rejected); keeping heuristic order",
-                seeds.len(),
-                second_rejected,
-            );
-            screening_cap.store(previous_cap, Ordering::Relaxed);
-            obj.reset();
-            return seeds.to_vec();
+        final_cap_used = cap;
+        stages_consumed = stage + 1;
+        if !ranked.is_empty() {
+            if stage > 0 {
+                log::info!(
+                    "[OUTER] {context}: seed screening cap escalated from {} to {} \
+                     (initial cap was too shallow for this problem; {}/{} seeds ranked)",
+                    initial_cap,
+                    if cap == 0 {
+                        "uncapped".to_string()
+                    } else {
+                        cap.to_string()
+                    },
+                    ranked.len(),
+                    seeds.len(),
+                );
+            }
+            break;
         }
-        log::info!(
-            "[OUTER] {context}: full-budget retry ranked {}/{} seeds; the screening cap \
-             ({}) was too shallow for this problem",
-            ranked.len(),
-            seeds.len(),
-            cap_value,
-        );
-        rejected = second_rejected;
     }
 
     screening_cap.store(previous_cap, Ordering::Relaxed);
     obj.reset();
+
+    if ranked.is_empty() {
+        log::info!(
+            "[OUTER] {context}: no finite seed cost even with full inner budget \
+             ({} seeds, {} rejected, {} cascade stages tried); keeping heuristic order",
+            seeds.len(),
+            rejected,
+            stages_consumed,
+        );
+        return seeds.to_vec();
+    }
 
     ranked.sort_by(|(idx_a, cost_a), (idx_b, cost_b)| {
         cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
@@ -556,11 +570,17 @@ fn rank_seeds_with_screening(
     }
 
     log::debug!(
-        "[OUTER] {context}: seed screening ranked {}/{} candidates with capped eval_cost \
-         (screen_max_inner_iterations={}); rejected={}",
+        "[OUTER] {context}: seed screening ranked {}/{} candidates at cap={} \
+         (initial cap={}, stages used={}); rejected={}",
         ordered.len() - rejected,
         seeds.len(),
-        cap_value,
+        if final_cap_used == 0 {
+            "uncapped".to_string()
+        } else {
+            final_cap_used.to_string()
+        },
+        initial_cap,
+        stages_consumed,
         rejected,
     );
 
@@ -4230,6 +4250,91 @@ mod tests {
             "screening should move the lowest-cost seed to the front before full startup eval",
         );
         assert_eq!(screening_cap.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rank_seeds_cascade_escalates_when_initial_cap_collapses_all() {
+        // When every seed's cost is non-finite at the initial screening cap
+        // we must NOT jump straight to a fully uncapped re-evaluation on
+        // every seed (the original two-stage protocol). Instead the cap
+        // should escalate geometrically (initial → 4× → 16× → uncapped),
+        // exiting the moment any cap stage produces a finite cost. This
+        // test forces a cost function that returns non-finite for cap < 12
+        // and finite for cap ≥ 12, then asserts the cascade exits at the
+        // 4× stage with a meaningful ranking — never reaching the uncapped
+        // pass.
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 1;
+        seed_config.screen_max_inner_iterations = 3;
+        let screening_cap = Arc::new(AtomicUsize::new(0));
+        let initial_seed = array![5.0];
+        let valid_seed = crate::seeding::generate_rho_candidates(1, None, &seed_config)
+            .first()
+            .expect("seed generator should yield at least one candidate")
+            .clone();
+        let max_cap_seen = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_seed_config(seed_config)
+            .with_screening_cap(Arc::clone(&screening_cap))
+            .with_initial_rho(initial_seed.clone())
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            {
+                let screening_cap = Arc::clone(&screening_cap);
+                let max_cap_seen = Arc::clone(&max_cap_seen);
+                let valid_seed = valid_seed.clone();
+                move |_: &mut (), theta: &Array1<f64>| {
+                    let cap = screening_cap.load(Ordering::Relaxed);
+                    max_cap_seen.fetch_max(cap, Ordering::Relaxed);
+                    // Mimic an inner solver that needs ≥ 12 iterations of
+                    // budget to certify a finite cost; below that it returns
+                    // a non-finite "could not converge" signal.
+                    if cap > 0 && cap < 12 {
+                        return Ok(f64::NAN);
+                    }
+                    if theta == &valid_seed {
+                        Ok(0.0)
+                    } else {
+                        Ok(1000.0)
+                    }
+                }
+            },
+            {
+                let valid_seed = valid_seed.clone();
+                move |_: &mut (), theta: &Array1<f64>| {
+                    if theta == &valid_seed {
+                        Ok(OuterEval {
+                            cost: 0.0,
+                            gradient: array![0.0],
+                            hessian: HessianResult::Analytic(array![[1.0]]),
+                        })
+                    } else {
+                        Ok(OuterEval::infeasible(theta.len()))
+                    }
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let _ = problem
+            .run(&mut obj, "cascade should escalate")
+            .expect("cascade should reach a finite cost at the 4× cap stage");
+        // The cascade is [3, 12, 48, 0]; the 4× stage (cap=12) is the first
+        // stage that produces a finite cost, so the cascade must exit there
+        // and never escalate to 48 or to the uncapped (0) stage.
+        let max_cap = max_cap_seen.load(Ordering::Relaxed);
+        assert_eq!(
+            max_cap, 12,
+            "cascade should stop at the 4× cap stage; observed max cap = {max_cap}"
+        );
+        assert_eq!(
+            screening_cap.load(Ordering::Relaxed),
+            0,
+            "screening cap must be restored to its previous value after cascade"
+        );
     }
 
     #[test]

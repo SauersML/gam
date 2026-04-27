@@ -746,10 +746,59 @@ impl WorkingState {
     pub fn relative_gradient_norm(&self, g_norm: f64) -> f64 {
         g_norm / (1.0 + self.gradient_natural_scale)
     }
+
+    /// Dimension-based scale `√n · max(1, √p)` for the structural KKT bound.
+    ///
+    /// Under standardized columns, the score `Xᵀ(μ − y)` has components of
+    /// order O(√n), so the absolute test ‖g‖ < τ becomes systematically too
+    /// tight at large n. Multiplying τ by this scale restores the advertised
+    /// per-observation meaning.
+    #[inline]
+    fn kkt_dimension_scale(&self) -> f64 {
+        let n = self.eta.len().max(1) as f64;
+        let p = (self.gradient.len() as f64).max(1.0);
+        n.sqrt() * p.sqrt()
+    }
+
+    /// Strict KKT acceptance: `g_norm` certifies stationarity under EITHER
+    /// scale-invariant criterion (dimension-based or data-driven natural-scale).
+    ///
+    /// Both certificates are invariant under uniform rescaling of the objective
+    /// `F → c·F` (in the limit where the natural scale dominates the additive
+    /// `1` floor). Acceptance under either is sufficient because:
+    ///   - the natural-scale bound is tighter when the data are well-scaled
+    ///     (it tracks actual gradient component magnitudes);
+    ///   - the dimension bound is tighter when the design matrix has unusual
+    ///     scaling (so the natural scale is dominated by a single component).
+    #[inline]
+    pub fn certifies_kkt(&self, g_norm: f64, tol: f64) -> bool {
+        g_norm < tol * self.kkt_dimension_scale()
+            || self.relative_gradient_norm(g_norm) < tol
+    }
+
+    /// Near-stationary band (10× the strict KKT tolerance) under EITHER
+    /// scale-invariant criterion. Used as a "good-enough" plateau check that
+    /// classifies a fit as `StalledAtValidMinimum` rather than as a hard
+    /// non-convergence.
+    #[inline]
+    pub fn near_stationary_kkt(&self, g_norm: f64, tol: f64) -> bool {
+        let near_tol = tol.max(1e-6) * 10.0;
+        g_norm <= near_tol * self.kkt_dimension_scale()
+            || self.relative_gradient_norm(g_norm) <= near_tol
+    }
 }
 
+/// Numerically stable Euclidean norm of an `Array1<f64>`.
+///
+/// Used to assemble the penalized-gradient natural scale at every
+/// `WorkingState` construction site (main GAM, identity-link short circuit,
+/// survival, test mocks). Centralizing here avoids drift between sites and
+/// makes the convergence certificate's denominator a single source of truth.
+///
+/// One pass, no allocation, O(p). At p≈10⁴ the cost is ≪ the O(np²) PIRLS
+/// inner work, so this is free in any setting where it matters.
 #[inline]
-fn array1_l2_norm(v: &Array1<f64>) -> f64 {
+pub(crate) fn array1_l2_norm(v: &Array1<f64>) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
@@ -3256,23 +3305,15 @@ where
     let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
     let lambda_factor = 10.0;
     let lm_max_attempts = options.max_step_halving.max(1);
-    // Scale-invariant KKT certificate: the absolute test ‖g‖ < τ is not scale
-    // invariant — F and cF share an optimum but ‖∇(cF)‖ = c‖∇F‖, so the same
-    // τ classifies one as converged and the other as not. ‖g‖₂ also grows as
-    // O(√n) for standardized columns (the score is a sum of n contributions),
-    // so an absolute τ becomes systematically too tight at large n. We compare
-    // the projected gradient against a problem-size–normalized tolerance
-    //   ‖g‖ ≤ τ · √n · max(1, √p)
-    // so τ retains its advertised meaning at biobank scale.
-    let p_dim = beta.as_ref().len();
-    let kkt_scale_for = |n: usize| -> f64 {
-        let n_root = (n.max(1) as f64).sqrt();
-        let p_root = (p_dim as f64).sqrt().max(1.0);
-        n_root * p_root
-    };
-    let near_stationary_tol_for = |n: usize| -> f64 {
-        options.convergence_tolerance.max(1e-6) * 10.0 * kkt_scale_for(n)
-    };
+    // Convergence is decided by `WorkingState::certifies_kkt` /
+    // `WorkingState::near_stationary_kkt`, which combine a dimension-based
+    // bound  ‖g‖ < τ · √n · max(1, √p)  with a data-driven natural-scale
+    // bound  ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ  and accept under either.
+    // Both certificates are scale-invariant under F → c·F (the additive 1
+    // is a NaN-safe floor; for non-trivial fits the natural scale dominates
+    // it within one PIRLS iteration). The absolute test ‖g‖ < τ that this
+    // replaces was systematically too tight at biobank n because ‖g‖₂ grows
+    // as O(√n) for standardized columns.
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -3627,83 +3668,109 @@ where
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
                         // redefine the objective's stabilization ridge.
-                        let n_eff_for_kkt = accepted_state.eta.len();
-                        // Capture the data-driven natural scale before moving
-                        // accepted_state into final_state.  The natural scale
-                        // is ||X'(weighted_residual)||_2 + ||S*beta||_2
-                        // (+ ridge*||beta||_2), which gives the scale-invariant
-                        // certificate ||g||_2 / (1 + scale) ≤ τ.  This is
-                        // strictly tighter than the dimension-only kkt_scale
-                        // bound when the data are well-scaled and strictly
-                        // looser when the columns of X are not standardized,
-                        // so we accept under either bound.
-                        let natural_scale = accepted_state.gradient_natural_scale;
                         final_state = Some(accepted_state);
+                        let final_state_ref = final_state
+                            .as_ref()
+                            .expect("final_state set immediately above");
+
                         let deviance_scale = current_penalized
                             .abs()
                             .max(candidate_penalized.abs())
                             .max(1.0);
-                        // Scale-invariant projected-gradient KKT tolerance.
-                        let grad_tol_dim =
-                            options.convergence_tolerance * kkt_scale_for(n_eff_for_kkt);
-                        let relative_grad = convergence_grad_norm / (1.0 + natural_scale);
                         let dev_tol = options.convergence_tolerance * deviance_scale;
-                        let near_stationary_tol = near_stationary_tol_for(n_eff_for_kkt);
-                        let near_stationary_relative =
-                            options.convergence_tolerance.max(1e-6) * 10.0;
 
-                        // Newton-decrement acceptance.  At the pre-step iterate
-                        // the squared decrement is λ_N² = gᵀH⁻¹g, and the
-                        // direction we just solved is d ≈ -H_reg⁻¹g, so
-                        //     lin = g·d ≈ -gᵀH_reg⁻¹g  ⇒  λ_N² ≈ −lin.
-                        // The damped Hessian H_reg = H + λ_lm·I differs from H
-                        // by O(λ_lm), which is small near a minimum (`lambda`
-                        // begins at 1e-6 and only grows on rejected steps).
+                        // Newton-decrement acceptance (Boyd & Vandenberghe §9.5.1):
+                        // at the pre-step iterate the squared decrement is
+                        //     λ_N²(β) = gᵀ H⁻¹ g  =  −g · d_N,
+                        // where d_N = −H⁻¹g is the pure Newton step. The
+                        // direction we just solved is d = −(H + λ_lm·I)⁻¹g,
+                        // so −lin = −g·d = gᵀ(H + λ_lm·I)⁻¹g approximates
+                        // λ_N² with relative error of order κ(H)·λ_lm/λ_min.
+                        // Restricting acceptance to `loop_lambda ≤ 1.0` keeps
+                        // that error bounded for any well-posed PIRLS problem
+                        // (the unpenalized Hessian has eigenvalues O(n) for
+                        // standardized designs, so λ_min ≫ 1 at biobank n).
+                        //
                         // The scale-invariant criterion
                         //     λ_N² / (1 + |F(β)|) ≤ τ²
                         // is the textbook Newton stopping rule: ½λ_N² is the
-                        // predicted decrease in F from this iterate, so when it
-                        // falls below the objective's natural rounding scale the
-                        // step is below floating-point noise and further inner
-                        // iterations cannot improve the certificate. This is an
-                        // *additional* acceptance — it never weakens the
-                        // gradient-norm tests, only certifies convergence in
-                        // problems where ‖g‖ is intrinsically large (e.g. very
-                        // ill-conditioned designs) but H⁻¹g is already tiny.
-                        let f_scale = 1.0 + current_penalized.abs().max(1.0);
+                        // model's predicted decrease in F from this iterate,
+                        // so when it falls below the objective's natural
+                        // rounding scale, further inner iterations cannot
+                        // improve the certificate. This is an *additional*
+                        // acceptance — it never weakens the gradient-norm
+                        // tests, only certifies convergence in problems where
+                        // ‖g‖ is intrinsically large (very ill-conditioned
+                        // designs) but H⁻¹g is already tiny.
+                        const NEWTON_DECREMENT_LM_GUARD: f64 = 1.0;
+                        let f_scale = 1.0 + current_penalized.abs();
                         let newton_decrement_sq = (-lin).max(0.0);
                         let nd_threshold = options.convergence_tolerance
                             * options.convergence_tolerance
                             * f_scale;
-                        let nd_pass = newton_decrement_sq <= nd_threshold;
+                        let nd_pass = loop_lambda <= NEWTON_DECREMENT_LM_GUARD
+                            && newton_decrement_sq <= nd_threshold;
 
-                        let kkt_pass = convergence_grad_norm < grad_tol_dim
-                            || relative_grad < options.convergence_tolerance
+                        // Strict KKT: scale-invariant under EITHER the
+                        // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
+                        // data-driven natural-scale bound
+                        //     ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ.
+                        // Newton decrement is an independent additional
+                        // acceptance for ill-conditioned problems where ‖g‖
+                        // is intrinsically large but H⁻¹g is already tiny.
+                        let kkt_pass = final_state_ref
+                            .certifies_kkt(convergence_grad_norm, options.convergence_tolerance)
                             || nd_pass;
 
                         if kkt_pass {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
-                        if deviance_change.abs() < dev_tol
-                            && deviance_change >= 0.0
-                            && kkt_pass
-                        {
-                            status = PirlsStatus::Converged;
-                            break 'pirls_loop;
-                        }
-                        // Early exit: the objective has plateaued and the
-                        // projected gradient is already inside the same
-                        // near-stationary band we allow for stalled minima.
-                        // Do not mark this as exact convergence unless the
-                        // strict KKT tolerance has actually been met.
+                        // Plateau within the near-stationary band: neither
+                        // the strict KKT nor the strict deviance test passed,
+                        // but both are inside their 10× guard bands and the
+                        // deviance is non-decreasing. This is a usable but
+                        // non-strict minimum.
                         if deviance_change.abs() < dev_tol * 0.01
                             && deviance_change >= 0.0
-                            && (convergence_grad_norm <= near_stationary_tol
-                                || relative_grad <= near_stationary_relative)
+                            && final_state_ref.near_stationary_kkt(
+                                convergence_grad_norm,
+                                options.convergence_tolerance,
+                            )
                         {
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
+                        }
+
+                        // Two-iteration relative-band plateau, mirroring the
+                        // post-loop rescue. Without this in-loop check, a
+                        // fit meeting the rescue's three conditions at
+                        // iteration k still grinds through (max_iter − k)
+                        // further iterations only to be accepted post-loop
+                        // with the same condition. At biobank scale that is
+                        // hundreds of n·p² inner iterations of wasted work.
+                        // Two consecutive iterations rule out a single noisy
+                        // step faking convergence.
+                        let objective_scale_for_relative = final_state_ref
+                            .deviance
+                            .abs()
+                            .max(final_state_ref.penalty_term.abs())
+                            .max(1.0);
+                        let scaled_dev_tol_relative =
+                            options.convergence_tolerance * objective_scale_for_relative;
+                        let relative_band_grad_bound = options.convergence_tolerance.max(1e-6)
+                            * objective_scale_for_relative;
+                        if convergence_grad_norm <= relative_band_grad_bound
+                            && deviance_change.abs() < scaled_dev_tol_relative * 0.1
+                            && deviance_change >= 0.0
+                        {
+                            relative_band_plateau_streak += 1;
+                            if relative_band_plateau_streak >= 2 {
+                                status = PirlsStatus::StalledAtValidMinimum;
+                                break 'pirls_loop;
+                            }
+                        } else {
+                            relative_band_plateau_streak = 0;
                         }
 
                         break; // Break inner lambda loop, continue outer pirls loop
@@ -3733,12 +3800,8 @@ where
                         );
                         let projected_grad = stategrad_norm;
                         let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
-                        let near_stationary_tol = near_stationary_tol_for(state.eta.len());
-                        let relative_grad = state.relative_gradient_norm(projected_grad);
-                        let near_stationary_relative =
-                            options.convergence_tolerance.max(1e-6) * 10.0;
-                        let near_stationary_pass = projected_grad <= near_stationary_tol
-                            || relative_grad <= near_stationary_relative;
+                        let near_stationary_pass =
+                            state.near_stationary_kkt(projected_grad, options.convergence_tolerance);
 
                         // Near stationarity: the screening rejected all candidates, but the
                         // gradient is tiny. Treat this as converged rather than escalating damping.
@@ -3776,10 +3839,11 @@ where
                                     .copied()
                                     .map(f64::abs)
                                     .fold(0.0_f64, f64::max);
+                                let relative_grad = state.relative_gradient_norm(projected_grad);
                                 log::debug!(
                                     "[PIRLS] LM step search exhausted at iter={}: \
                                      attempts={}/{} lambda={:.3e} (ceiling={}) \
-                                     projected_grad={:.3e} (near_stationary_tol={:.3e}) \
+                                     projected_grad={:.3e} (relative={:.3e}) \
                                      current_pen={:.6e} predicted_reduction={:.3e} \
                                      max|eta|={:.1} attempts_exhausted={}",
                                     iter,
@@ -3788,7 +3852,7 @@ where
                                     loop_lambda,
                                     ceiling,
                                     projected_grad,
-                                    near_stationary_tol,
+                                    relative_grad,
                                     current_penalized,
                                     predicted_reduction,
                                     max_abs_eta_now,
@@ -3858,22 +3922,16 @@ where
     if status.is_failed_max_iterations() {
         let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
         let scaled_dev_tol = options.convergence_tolerance * objective_scale;
-        let final_kkt_scale = kkt_scale_for(state.eta.len());
-        let final_near_stationary_tol = near_stationary_tol_for(state.eta.len());
-        let final_relative_grad = state.relative_gradient_norm(final_projected_grad);
-        let final_near_stationary_relative =
-            options.convergence_tolerance.max(1e-6) * 10.0;
-        if final_projected_grad < options.convergence_tolerance * final_kkt_scale
-            || final_relative_grad < options.convergence_tolerance
-        {
+        let tol = options.convergence_tolerance;
+
+        if state.certifies_kkt(final_projected_grad, tol) {
+            // Strict KKT met after the loop bailed; reclassify as a valid
+            // (if non-strictly-converged) minimum.
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if (final_projected_grad <= final_near_stationary_tol
-            || final_relative_grad <= final_near_stationary_relative)
+        } else if state.near_stationary_kkt(final_projected_grad, tol)
             && last_deviance_change.abs() < scaled_dev_tol
         {
-            // The objective has plateaued and the projected gradient is
-            // already inside the near-stationary band, so accept this as a
-            // stalled but usable minimum.
+            // Plateaued objective + near-stationary projected gradient.
             status = PirlsStatus::StalledAtValidMinimum;
         } else if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12)
             && last_deviance_change.abs() < scaled_dev_tol
@@ -3882,24 +3940,16 @@ where
             // is the same saturated boundary class as separated binomial fits:
             // extra Newton work only re-tries the clipped boundary.
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if final_projected_grad <= options.convergence_tolerance.max(1e-6) * objective_scale
+        } else if final_projected_grad <= tol.max(1e-6) * objective_scale
             && last_deviance_change.abs() < scaled_dev_tol * 0.1
             && last_deviance_change >= 0.0
         {
-            // Per-observation / per-likelihood-scale convergence: at large n,
-            // ‖g‖ scales with n (since the score is a sum of n contributions)
-            // and the absolute KKT test ‖g‖ < tol becomes systematically too
-            // tight even when the fit is functionally converged. Accept here
-            // when ‖g‖ is small *relative* to the objective magnitude AND the
-            // deviance has plateaued more strictly than the absolute scaled
-            // tolerance (×0.1 floor) AND deviance change is non-negative
-            // (genuine plateau, not still climbing). All three together rule
-            // out a not-yet-converged fit being silently classified as
-            // stalled-but-valid: the strict band already failed, the eta cap
-            // is not active, and we have an unusually tight plateau plus a
-            // gradient in the relative band. This is the path that the user's
-            // analysis flagged for biobank-scale GLMs where ‖g‖=1.27e-2 at
-            // n≈3e5 is functionally converged but trips the absolute test.
+            // Objective-scale relative band: a third independent rescue that
+            // accepts ‖g‖ small *relative to |F(β)|*. The strict KKT band has
+            // already failed, the eta cap is not active, and we additionally
+            // require a tighter (×0.1) deviance plateau plus monotone
+            // non-decreasing change to rule out a not-yet-converged fit being
+            // silently classified as stalled-but-valid.
             status = PirlsStatus::StalledAtValidMinimum;
         }
     }
@@ -4093,6 +4143,13 @@ pub struct PirlsResult {
     pub iteration: usize,
     pub max_abs_eta: f64,
     pub lastgradient_norm: f64,
+    /// Natural scale of the penalized gradient at the accepted PIRLS state,
+    /// equal to ‖Xᵀ(weighted residual)‖₂ + ‖Sβ‖₂ (+ ridge·‖β‖₂ when active).
+    /// Mirrors `WorkingState::gradient_natural_scale` so that callers reading
+    /// `PirlsResult` directly (e.g. seed-screening cost augmentation) can form
+    /// the scale-invariant residual r_g = ‖g‖ / (1 + this) without rebuilding
+    /// the score and penalty norms.
+    pub gradient_natural_scale: f64,
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
     pub hessian_curvature: HessianCurvatureKind,
@@ -4117,6 +4174,16 @@ impl PirlsResult {
     #[inline]
     pub fn jeffreys_logdet(&self) -> Option<f64> {
         self.firth.jeffreys_logdet()
+    }
+
+    /// Scale-invariant relative gradient residual at the accepted PIRLS state.
+    ///
+    /// Returns ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖). Numerator is
+    /// `lastgradient_norm`; denominator is `1 + gradient_natural_scale`.
+    /// This is the "r_g" used by seed-screening cost augmentation.
+    #[inline]
+    pub fn relative_gradient_norm(&self) -> f64 {
+        self.lastgradient_norm / (1.0 + self.gradient_natural_scale)
     }
 
     pub(crate) fn compact_for_reml_cache(&self) -> Self {
@@ -4147,6 +4214,7 @@ impl PirlsResult {
             iteration: self.iteration,
             max_abs_eta: self.max_abs_eta,
             lastgradient_norm: self.lastgradient_norm,
+            gradient_natural_scale: self.gradient_natural_scale,
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
@@ -4230,6 +4298,7 @@ impl PirlsResult {
             iteration: self.iteration,
             max_abs_eta: self.max_abs_eta,
             lastgradient_norm: self.lastgradient_norm,
+            gradient_natural_scale: self.gradient_natural_scale,
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
@@ -4299,6 +4368,7 @@ fn assemble_pirls_result(
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
         lastgradient_norm: working_summary.lastgradient_norm,
+        gradient_natural_scale: working_summary.state.gradient_natural_scale,
         last_deviance_change: working_summary.last_deviance_change,
         last_step_halving: working_summary.last_step_halving,
         hessian_curvature: working_summary.state.hessian_curvature,
@@ -4857,7 +4927,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             ridge_grad_norm = ridge_used * array1_l2_norm(beta_transformed.as_ref());
         }
 
-        let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let gradient_norm = array1_l2_norm(&gradient);
         let max_abs_eta = finalmu.iter().copied().map(f64::abs).fold(0.0, f64::max);
         let log_likelihood =
             calculate_loglikelihood_omitting_constants(y, &finalmu, likelihood, priorweights);
@@ -4930,6 +5000,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             iteration: 1,
             max_abs_eta,
             lastgradient_norm: gradient_norm,
+            gradient_natural_scale: score_norm + s_beta_norm + ridge_grad_norm,
             last_deviance_change: 0.0,
             last_step_halving: 0,
             hessian_curvature: HessianCurvatureKind::Fisher,
@@ -5061,51 +5132,37 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         edf = (p - r).max(0.0);
     }
 
+    // Outer rescue: a fit that hit max-iterations may still be a usable
+    // minimum if progress has effectively stopped (deviance plateaued or
+    // step size collapsed to the floor) AND the projected gradient is in
+    // the near-stationary band under the scale-invariant certificate.
+    // Same logic for non-Firth and Firth paths; firth_active just gates
+    // the second pass.
+    let stalled_at_valid_minimum = |summary: &WorkingModelPirlsResult| -> bool {
+        let dev_scale = summary.state.deviance.abs().max(1.0);
+        let dev_tol = options.convergence_tolerance * dev_scale;
+        let step_floor = options.min_step_size * 2.0;
+        let progress_stopped = summary.last_deviance_change.abs() <= dev_tol
+            || summary.last_step_size <= step_floor;
+        let near_stationary = summary
+            .state
+            .near_stationary_kkt(summary.lastgradient_norm, options.convergence_tolerance);
+        progress_stopped && near_stationary
+    };
+
     let mut status = working_summary.status.clone();
-    if status.is_failed_max_iterations() {
-        let dev_scale = working_summary.state.deviance.abs().max(1.0);
-        let dev_tol = options.convergence_tolerance * dev_scale;
-        let step_floor = options.min_step_size * 2.0;
-        // Near-stationarity in the dual sense: either the absolute residual
-        // is tiny, or its scale-invariant counterpart ‖g‖ / (1 + ‖score‖ +
-        // ‖S β‖) is. The latter is required at biobank n where the absolute
-        // test is systematically too tight.
-        let absolute_tol = options.convergence_tolerance.max(1e-6) * 10.0;
-        let relative_grad = working_summary
-            .state
-            .relative_gradient_norm(working_summary.lastgradient_norm);
-        let grad_ok =
-            working_summary.lastgradient_norm <= absolute_tol || relative_grad <= absolute_tol;
-        if (working_summary.last_deviance_change.abs() <= dev_tol
-            || working_summary.last_step_size <= step_floor)
-            && grad_ok
-        {
-            // Treat as a stalled but usable minimum when progress has effectively stopped.
-            // Require near-stationarity to keep envelope diagnostics meaningful.
-            status = PirlsStatus::StalledAtValidMinimum;
-            working_summary.status = status.clone();
-        }
+    if status.is_failed_max_iterations() && stalled_at_valid_minimum(&working_summary) {
+        status = PirlsStatus::StalledAtValidMinimum;
+        working_summary.status = status.clone();
     }
-    if status.is_failed_max_iterations() && firth_active {
-        let dev_scale = working_summary.state.deviance.abs().max(1.0);
-        let dev_tol = options.convergence_tolerance * dev_scale;
-        let step_floor = options.min_step_size * 2.0;
-        let absolute_tol = options.convergence_tolerance.max(1e-6) * 10.0;
-        let relative_grad = working_summary
-            .state
-            .relative_gradient_norm(working_summary.lastgradient_norm);
-        let grad_ok =
-            working_summary.lastgradient_norm <= absolute_tol || relative_grad <= absolute_tol;
-        if (working_summary.last_deviance_change.abs() <= dev_tol
-            || working_summary.last_step_size <= step_floor)
-            && grad_ok
-        {
-            // Firth-adjusted fits can stall; accept when the objective stops changing
-            // or steps have shrunk to the minimum scale.
-            // Keep the same near-stationarity guard as the non-Firth path.
-            status = PirlsStatus::StalledAtValidMinimum;
-            working_summary.status = status.clone();
-        }
+    if status.is_failed_max_iterations()
+        && firth_active
+        && stalled_at_valid_minimum(&working_summary)
+    {
+        // Firth-adjusted fits can stall; accept under the same dual-criterion
+        // near-stationary band.
+        status = PirlsStatus::StalledAtValidMinimum;
+        working_summary.status = status.clone();
     }
     let has_penalty = penalty_active.rank() > 0;
     let firth_active = options.firth_bias_reduction;

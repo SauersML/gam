@@ -574,18 +574,34 @@ pub trait CustomFamily {
     /// [`cost_gated_outer_order`] to decide whether the family can afford the
     /// exact outer Hessian path: the combined work is `K² · this`.
     ///
-    /// The default sums `n_b · p_b²` over blocks (dense rank-1 update form).
-    /// Tensor-product families with structured designs should override:
+    /// The default returns `Σ_b n_b · p_b²`, which is the honest assembly cost
+    /// only when the joint Hessian is **block-diagonal** — i.e. the inner
+    /// solver assembles each block's `X_b' W_b X_b` independently, with no
+    /// cross-block coupling per row. Families whose row likelihood couples all
+    /// blocks (every row contributes a rank-`m` outer-product update to the
+    /// full joint Hessian over `Σ p_b` coefficients) **must** override to
+    /// `n · (Σ p_b)²`, otherwise the default undercounts the cross-block
+    /// outer-product terms `2·Σ_{a<b} n·p_a·p_b`.
     ///
-    /// * Khatri–Rao response × covariate (`X = R ⊙ C`, p = p_resp · p_cov):
-    ///   `n · p_resp² · p_cov²`, since the dense p² Hessian can never be the
-    ///   work-model proxy for these — it would understate by p_resp factor.
-    /// * GAMLSS two-block joint (mean p_t, scale p_ℓ, fully coupled rows):
-    ///   `n · (p_t + p_ℓ)²` because off-diagonal blocks are full rank-1 cross
-    ///   contributions per row.
+    /// Concretely:
     ///
-    /// Families that expose a matrix-free Hessian operator may return the
-    /// per-`Hv` work instead so the gate prefers the operator path.
+    /// * **Block-diagonal** (default OK): `LatentBinaryFamily` collects
+    ///   separate `hess_time` and `hess_mean` per row, never forming an
+    ///   off-diagonal contribution.
+    /// * **Joint-coupled** (must override): GAMLSS location-scale, GAMLSS
+    ///   wiggle variants, marginal-slope families (Bernoulli, Survival),
+    ///   `LatentSurvivalFamily`, `SurvivalLocationScaleFamily` — every row
+    ///   contributes to the full `(Σ p_b)²` joint Hessian via Jacobian
+    ///   pullback of a multi-dimensional primary kernel.
+    /// * **Single-block** (default OK): tensor designs whose `design.ncols()`
+    ///   already equals `p_total` (e.g. CTN's Khatri–Rao `n × (p_resp·p_cov)`);
+    ///   `n · p²` reduces correctly to `n · p_resp² · p_cov²`.
+    /// * **Matrix-free Hessian operator**: families that expose
+    ///   [`Self::exact_newton_joint_hessian_workspace`] with operator-form
+    ///   directional derivatives (CTN at biobank scale) may instead return
+    ///   the per-`Hv` matvec cost (e.g. `n·(p_resp + p_cov)` for Khatri–Rao)
+    ///   so the gate reflects the operator path rather than the dense
+    ///   build that the unified evaluator skips.
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         default_coefficient_hessian_cost(specs)
     }
@@ -11336,6 +11352,22 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // on binomial-logit + P-spline benchmarks. If the primary Arc + Analytic
     // plan fails, surface the non-convergence as an error rather than masking
     // it with a weaker method.
+    // FLOP estimate of one dense exact joint Hessian assembly. For the
+    // custom-family path the joint coefficient dimension sums per-block
+    // designs; the per-row outer-product cost is (Σ p_b)² weighted by the
+    // sample count. When this exceeds DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD,
+    // OuterProblem::capability() promotes prefer_gradient_only and the
+    // planner routes the outer to BFGS+gradient even though the family
+    // declares an analytic Hessian. This is the cost-aware counterpart to
+    // the existing `multi_block_beta_dependent` EFS opt-out: both let the
+    // planner skip a path it would otherwise have committed to.
+    let total_p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let n_obs_joint = specs
+        .first()
+        .map(|s| s.design.nrows())
+        .unwrap_or(0);
+    let dense_hessian_work =
+        (n_obs_joint as f64) * (total_p_joint as f64) * (total_p_joint as f64);
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
@@ -11345,7 +11377,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_max_iter(options.outer_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
-        .with_initial_rho(rho0.clone());
+        .with_initial_rho(rho0.clone())
+        .with_dense_hessian_work_hint(dense_hessian_work);
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,

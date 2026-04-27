@@ -29,12 +29,17 @@ fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
 /// in `execute_pirls_if_needed`; this helper turns the partial cost into a
 /// finite ranking score
 ///
-///     C_screen(s) = C_approx(s) + ½ · ‖∇L_p(β_partial)‖² ,
+///     C_screen(s) = C_approx(s) + ½ · r_g(s)² ,
 ///
-/// which is monotone in the inner residual norm. Seeds whose partial mode
-/// is close to its inner optimum (small ‖∇‖) rank ahead of seeds whose
-/// partial mode is far from optimal. The penalty vanishes at the true
-/// inner mode (‖∇‖ → 0), so converged screening fits incur no penalty.
+/// where r_g = ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖) is the scale-invariant
+/// relative gradient residual. Using r_g rather than the absolute ‖g‖ keeps
+/// the penalty meaningful at biobank n: the absolute score grows as O(√n),
+/// so an absolute residual term would swamp the actual REML cost differences
+/// across seeds and reduce the screen to a √n-scaled tie-break. r_g is
+/// dimensionless and bounded above by 1 for any well-defined PIRLS state, so
+/// the penalty stays comparable to the cost differences that actually
+/// distinguish good seeds from bad. The penalty vanishes at the true inner
+/// mode (r_g → 0), so converged screening fits incur no penalty.
 ///
 /// Outside of screening, partial fits never reach this helper:
 /// `execute_pirls_if_needed` surfaces `MaxIterationsReached` and
@@ -48,7 +53,7 @@ fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     }
     match pr.status {
         pirls::PirlsStatus::MaxIterationsReached | pirls::PirlsStatus::LmStepSearchExhausted => {
-            let r_g = pr.lastgradient_norm;
+            let r_g = pr.relative_gradient_norm();
             if r_g.is_finite() {
                 cost + 0.5 * r_g * r_g
             } else {
@@ -2512,22 +2517,33 @@ impl<'a> RemlState<'a> {
                 // Seed screening's purpose is to rank candidate seeds by an
                 // approximate cost. Requiring full KKT-style convergence under
                 // a 3-iteration cap would discard all informative seeds, so
-                // when the partial state is finite we surface the result as
-                // Ok and let downstream cost computation derive a finite
-                // approximate score. The result is not cached and the warm
-                // start is not updated (status is not Converged/Stalled, so
-                // the existing branches above do not run).
+                // when the partial state is finite (objective, β, Hessian,
+                // residual all finite — Hessian finiteness is implied by
+                // `gradient_natural_scale.is_finite()`, which is the L2 norm
+                // of Sβ + ridge·β) we surface the result as Ok and let
+                // downstream cost computation derive a finite approximate
+                // score. The result is not cached and the warm start is not
+                // updated (status is not Converged/Stalled, so the existing
+                // branches above do not run).
+                let finite_objective = pirls_result.deviance.is_finite()
+                    && pirls_result.stable_penalty_term.is_finite();
+                let finite_beta = pirls_result
+                    .beta_transformed
+                    .0
+                    .iter()
+                    .all(|v| v.is_finite());
+                let finite_hessian_proxy = pirls_result.gradient_natural_scale.is_finite();
+                let finite_residual = pirls_result.lastgradient_norm.is_finite();
                 if in_screening
-                    && pirls_result.deviance.is_finite()
-                    && pirls_result
-                        .beta_transformed
-                        .0
-                        .iter()
-                        .all(|v| v.is_finite())
+                    && finite_objective
+                    && finite_beta
+                    && finite_hessian_proxy
+                    && finite_residual
                 {
                     log::debug!(
-                        "[seed-screen] partial-fit accepted for ranking: {kind} (gradient norm {:.3e}, iter {})",
+                        "[seed-screen] partial-fit accepted for ranking: {kind} (|g| {:.3e}, r_g {:.3e}, iter {})",
                         pirls_result.lastgradient_norm,
+                        pirls_result.relative_gradient_norm(),
                         pirls_result.iteration
                     );
                     return Ok(pirls_result);

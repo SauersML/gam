@@ -7407,6 +7407,20 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Marginal-slope rows couple every block (marginal, log-slope, optional
+        // score-warp / link-deviation) through the same row kernel: each row
+        // adds a rank-`m` outer-product to the full joint Hessian over
+        // `Σ p_b` coefficients, so the honest assembly cost is `n · (Σ p_b)²`,
+        // not the block-diagonal `Σ n · p_b²` default.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],

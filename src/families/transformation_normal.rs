@@ -1359,7 +1359,7 @@ impl CustomFamily for TransformationNormalFamily {
             .map(|(&w, &hp)| w / (hp * hp))
             .collect();
         let workspace = TransformationNormalJointHessianWorkspace::new(
-            self.clone(),
+            Arc::new(self.clone()),
             h_prime,
             weighted_inv_hp_sq,
         )?;
@@ -1383,24 +1383,28 @@ impl CustomFamily for TransformationNormalFamily {
 /// `O(n * p^2)` cost of the dense weighted Gram and the `O(p^2)` storage of
 /// the materialized joint Hessian.
 struct TransformationNormalJointHessianWorkspace {
-    family: TransformationNormalFamily,
+    /// Shared family handle. Cloning the workspace's family for each downstream
+    /// matrix-free operator (dH, d²H per psi coord and per pair) would copy
+    /// the full row-space Kronecker designs (~hundreds of MiB at biobank
+    /// scale) per call. Arc-sharing makes operator construction O(1).
+    family: Arc<TransformationNormalFamily>,
     /// h'_i = X_deriv · β at the current iterate. Cached so the matrix-free
     /// directional-derivative operators can reuse it without rerunning
     /// `forward_mul(beta)`.
-    h_prime: Array1<f64>,
+    h_prime: Arc<Array1<f64>>,
     /// Row weights w / h'^2 for the X_deriv^T diag(·) X_deriv summand.
     weighted_inv_hp_sq: Array1<f64>,
 }
 
 impl TransformationNormalJointHessianWorkspace {
     fn new(
-        family: TransformationNormalFamily,
+        family: Arc<TransformationNormalFamily>,
         h_prime: Array1<f64>,
         weighted_inv_hp_sq: Array1<f64>,
     ) -> Result<Self, String> {
         Ok(Self {
             family,
-            h_prime,
+            h_prime: Arc::new(h_prime),
             weighted_inv_hp_sq,
         })
     }
@@ -1531,8 +1535,8 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         }
         let d_h_prime = self.family.x_deriv_kron.forward_mul(d_beta_flat);
         let op = TransformationNormalDhMatrixFreeOperator::new(
-            self.family.clone(),
-            self.h_prime.clone(),
+            Arc::clone(&self.family),
+            Arc::clone(&self.h_prime),
             d_h_prime,
         );
         Ok(Some(Arc::new(op) as Arc<dyn HyperOperator>))
@@ -1563,8 +1567,8 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         let d_h_prime_u = self.family.x_deriv_kron.forward_mul(d_beta_u);
         let d_h_prime_v = self.family.x_deriv_kron.forward_mul(d_beta_v);
         let op = TransformationNormalD2hMatrixFreeOperator::new(
-            self.family.clone(),
-            self.h_prime.clone(),
+            Arc::clone(&self.family),
+            Arc::clone(&self.h_prime),
             d_h_prime_u,
             d_h_prime_v,
         );
@@ -1584,14 +1588,14 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
 /// trace estimators (`MatrixFreeSpdOperator::trace_logdet_operator`) consume
 /// the operator directly without materialization.
 struct TransformationNormalDhMatrixFreeOperator {
-    family: TransformationNormalFamily,
+    family: Arc<TransformationNormalFamily>,
     weight_kernel: Array1<f64>,
 }
 
 impl TransformationNormalDhMatrixFreeOperator {
     fn new(
-        family: TransformationNormalFamily,
-        h_prime: Array1<f64>,
+        family: Arc<TransformationNormalFamily>,
+        h_prime: Arc<Array1<f64>>,
         d_h_prime: Array1<f64>,
     ) -> Self {
         let n = h_prime.len();
@@ -1658,14 +1662,14 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 /// Used by the unified evaluator's second-order trace identities and second
 /// directional drift evaluations on the outer Hessian.
 struct TransformationNormalD2hMatrixFreeOperator {
-    family: TransformationNormalFamily,
+    family: Arc<TransformationNormalFamily>,
     weight_kernel: Array1<f64>,
 }
 
 impl TransformationNormalD2hMatrixFreeOperator {
     fn new(
-        family: TransformationNormalFamily,
-        h_prime: Array1<f64>,
+        family: Arc<TransformationNormalFamily>,
+        h_prime: Arc<Array1<f64>>,
         d_h_prime_u: Array1<f64>,
         d_h_prime_v: Array1<f64>,
     ) -> Self {
