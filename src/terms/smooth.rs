@@ -12353,6 +12353,21 @@ impl<'d> ExactJointDesignCache<'d> {
         self.last_eval = Some(eval);
     }
 
+    /// Cache a cost-only result. Called after `ensure_theta(theta)` for
+    /// line-search probes that pay only for the cost evaluation. We
+    /// intentionally do not populate `last_eval` because no gradient was
+    /// computed; the next outer evaluation at this θ will recompute
+    /// (V, ∇V) via `evaluate_with_order` if the optimizer asks for it.
+    fn store_cost_only(&mut self, theta: &Array1<f64>, cost: f64) {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_cost = Some(cost);
+        }
+    }
+
     fn specs(&self) -> Vec<&TermCollectionSpec> {
         self.realizers.iter().map(|r| r.spec()).collect()
     }
@@ -12455,7 +12470,7 @@ where
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
-        bool,
+        crate::solver::estimate::reml::unified::EvalMode,
     ) -> Result<
         (
             f64,
@@ -12665,7 +12680,12 @@ where
             let designs = collect_designs(&ctx.cache);
             let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
-            match (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, need_hessian) {
+            let eval_mode = if need_hessian {
+                crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+            } else {
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+            };
+            match (&mut *exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode) {
                 Ok((cost, grad, hess)) => {
                     ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
                     ctx.track_best(theta, cost);
@@ -12707,14 +12727,25 @@ where
                 }
                 let specs = collect_specs(&ctx.cache);
                 let designs = collect_designs(&ctx.cache);
+                // Cost-only line-search probe: pass `ValueOnly` so the closure
+                // skips gradient and Hessian assembly. This is the principled
+                // fix for the N-block joint optimization V+G-per-probe waste —
+                // gradient construction (≈ 6.5·10⁹ FLOPs per CTN step at
+                // n=320 000, n_grid=293, p_resp=32, p_cov=23) is now paid only
+                // when the outer evaluator actually requests it.
                 match (&mut *exact_fn_cell.borrow_mut())(
                     theta,
                     &specs,
                     &designs,
-                    false, // cost-only: skip outer Hessian
+                    crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
                 ) {
-                    Ok((cost, grad, hess)) => {
-                        ctx.cache.store_eval((cost, grad, hess));
+                    Ok((cost, _grad, _hess)) => {
+                        // Don't `store_eval`: that path is only valid when the
+                        // closure produced a real gradient. The next outer-eval
+                        // call will recompute (V, ∇V) at this θ if needed; the
+                        // memoized_cost path covers the common case where the
+                        // line search returns to an accepted iterate.
+                        ctx.cache.store_cost_only(theta, cost);
                         ctx.track_best(theta, cost);
                         Ok(cost)
                     }

@@ -1919,21 +1919,62 @@ pub struct OuterProblem {
 pub const DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD: f64 = 5.0e9;
 
 /// Per-outer-evaluation FLOP budget above which the analytic LAML outer
-/// Hessian's pairwise inner-solve assembly (`k² · n · p²`) is judged too
-/// expensive for ARC's super-linear convergence to amortize, and the
-/// planner switches to gradient-only BFGS instead.
+/// Hessian's assembly cost is judged too expensive for ARC's super-linear
+/// convergence to amortize, and the planner switches to gradient-only
+/// BFGS instead.
 ///
-/// This is independent of [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]: that
-/// constant gates the *single-inner-solve* cost (when one Hessian assembly
-/// is already too slow), while this one gates the *aggregate Hessian
-/// assembly* cost (when k² inner-derived pairwise terms together dominate
-/// the per-outer-iteration work). Both can independently trigger the
-/// gradient-only downgrade — they capture different regimes.
+/// The cost model gated here is the **truthful** per-outer-evaluation
+/// Hessian assembly:
 ///
-/// The same 5 × 10⁹ inflection-point empirical value applies: below it,
-/// ARC's fewer outer iterations more than pay for the Hessian assembly;
-/// above it, BFGS's amortized curvature catches up.
-pub const STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS: u128 = 5_000_000_000;
+/// ```text
+///   C_assembly = (k · n·p²  +  k² · p²) · I_expected
+///                 └────┬────┘   └──┬──┘
+///        per-coord    per-pair        × number of inner P-IRLS
+///        D_β H[v_k]    cross trace   iterations expected per outer
+///        (k of them,   on cached     evaluation (each smoothing-param
+///         O(n·p²))     spectral      direction touches the inner solve
+///                      rotation)     once via warm-start)
+/// ```
+///
+/// This is independent of [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]:
+/// that constant gates the *single-inner-solve* cost (when one Hessian
+/// assembly is already too slow), while this one gates the *aggregate*
+/// Hessian-assembly cost (when the per-outer-evaluation work dominates).
+/// Both can independently trigger the gradient-only downgrade — they
+/// capture different regimes.
+///
+/// **Calibration.** At biobank-Duchon (n=320 000, p=65, k=6,
+/// I_expected=30):
+/// ```text
+///   C_assembly  =  (6 · 320 000 · 65²  +  6² · 65²) · 30
+///              ≈  (8.10·10⁹  +  1.5·10⁵) · 30
+///              ≈  2.43·10¹¹
+/// ```
+/// — and the threshold sits at 2·10¹¹, just below, so the biobank case
+/// triggers the BFGS downgrade.  At TPS pilot (n=10 000, p=116, k=6):
+/// ```text
+///   C_assembly  ≈  (6 · 10 000 · 116²  +  36 · 116²) · 30  ≈  2.43·10¹⁰
+/// ```
+/// — well under threshold, ARC stays.
+pub const STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS: u128 = 200_000_000_000;
+
+/// Expected number of inner P-IRLS iterations per outer evaluation.
+///
+/// This factor enters the per-outer Hessian-assembly cost model because
+/// the assembly's per-coord `D_β H[v_k]` builds and per-pair cross-trace
+/// terms each touch the inner-solver state once per inner iteration that
+/// the inner P-IRLS chooses to take.  After the soft-acceptance helper
+/// (`pirls_soft_acceptance`) lets the inner loop exit on a 2-iter
+/// plateau streak, well-conditioned biobank-scale fits typically settle
+/// in 20–40 inner iterations; 30 is a calibrated midpoint.
+///
+/// Note that `I_expected` does NOT enter the *branch* decision (ARC vs
+/// BFGS) by itself, because both optimizers pay the inner-solve cost
+/// identically.  It enters here because the threshold is calibrated as
+/// an absolute wall-clock proxy for one outer evaluation, and the
+/// Hessian-assembly side of an outer evaluation scales linearly with
+/// `I_expected`.
+pub const STANDARD_GAM_OUTER_EXPECTED_INNER_ITERATIONS: u128 = 30;
 
 /// Minimum smoothing-parameter count below which ARC's super-linear
 /// convergence advantage outweighs any per-iteration Hessian cost.
@@ -2176,32 +2217,34 @@ impl OuterProblem {
         let n_p_squared = (n_obs as f64) * (p_coeff as f64) * (p_coeff as f64);
         self.dense_hessian_work_hint = Some(n_p_squared);
         if self.n_params >= STANDARD_GAM_OUTER_BFGS_MIN_K {
-            // `inner_solve_work = n·p²` is the per-coordinate D_β H[v_k]
-            // build cost, NOT a per-iteration P-IRLS cost.  The variable
-            // name predates the cost-model derivation in the doc-comment
-            // above; keeping it for symmetry with `dense_hessian_work_hint`
-            // (which uses the same n·p² formula for the per-inner-solve
-            // path).
-            let inner_solve_work = (n_obs as u128)
-                .saturating_mul(p_coeff as u128)
-                .saturating_mul(p_coeff as u128);
-            // `k² · n·p²` is a structural upper bound on the true
-            // `k·n·p² + k²·p²` Hessian-assembly cost; the 5e9 threshold is
-            // empirically calibrated against this inflated formula so the
-            // inflection point lines up with the true overhead's
-            // wall-clock break-even.  See the doc-comment for the
-            // derivation.
+            // Truthful per-outer-evaluation Hessian-assembly cost:
+            //
+            //   C_assembly  =  (k · n·p²  +  k² · p²) · I_expected
+            //
+            // — the `k · n·p²` per-coord `D_β H[v_k]` builds and the
+            // `k² · p²` per-pair cross-trace terms on the cached spectral
+            // rotation, each repeated `I_expected` times because the
+            // inner P-IRLS state touches each smoothing-direction once
+            // per inner iteration.
             //
             // We *store* this as a separate signal rather than directly
             // setting `prefer_gradient_only`, so the matrix-free check
             // in `capability()` can suppress the downgrade when the
-            // family supplies Hv operators that absorb the cost.
-            let hessian_pair_work = inner_solve_work
-                .saturating_mul(self.n_params as u128)
-                .saturating_mul(self.n_params as u128);
+            // family supplies Hv operators that absorb the per-iteration
+            // cost.
+            let n = n_obs as u128;
+            let p = p_coeff as u128;
+            let k = self.n_params as u128;
+            let p_squared = p.saturating_mul(p);
+            let n_p_squared = n.saturating_mul(p_squared);
+            let per_coord_builds = k.saturating_mul(n_p_squared); // k · n·p²
+            let per_pair_traces = k.saturating_mul(k).saturating_mul(p_squared); // k²·p²
+            let assembly_per_eval = per_coord_builds.saturating_add(per_pair_traces);
+            let hessian_assembly_work =
+                assembly_per_eval.saturating_mul(STANDARD_GAM_OUTER_EXPECTED_INNER_ITERATIONS);
             // Saturating cast u128 → f64; values up to ~1.8·10³⁰⁸ fit, so
             // the saturation point is unreachable for any realistic GAM.
-            self.aggregate_hessian_pair_work_hint = Some(hessian_pair_work as f64);
+            self.aggregate_hessian_pair_work_hint = Some(hessian_assembly_work as f64);
         }
         self
     }

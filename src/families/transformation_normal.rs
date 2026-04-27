@@ -41,9 +41,7 @@ use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::resource::{
-    MatrixMaterializationError, ResourcePolicy, ctn_monotonicity_pass_ops,
-};
+use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -2386,21 +2384,6 @@ fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: u
 // Kronecker-aware operator for biobank-scale tensor products
 // ---------------------------------------------------------------------------
 
-/// Discriminated union over two factored representations of a Kronecker-shaped
-/// design. Both variants compute `forward_mul` and `transpose_mul` from the
-/// natural factor pair without ever materializing the full matrix.
-///
-/// `KhatriRao` is the row-wise Kronecker (face-splitting / Khatri–Rao) product
-/// `A ⊙ B`: both factors share `n` rows, and each output row is the elementwise
-/// Kronecker of the corresponding factor rows. Used for designs whose virtual
-/// rows already correspond one-to-one with covariate rows (value and
-/// derivative designs at observation points).
-///
-/// `Kronecker` is the full tensor product. The virtual row space is the
-/// Cartesian product `n_cov × n_grid`; the two factors do not share a row
-/// count and are never replicated. Used for the monotonicity grid, where each
-/// covariate row is paired with every response grid point.
-#[derive(Clone)]
 /// Active-set certificate cache for the cached `min_step_to_boundary` path on
 /// the `Kronecker` variant. See `min_step_to_boundary_with_active_set` for the
 /// math and validity proof. Caller is responsible for bumping `c_version`
@@ -2476,6 +2459,21 @@ impl KroneckerActiveSetCache {
     }
 }
 
+/// Discriminated union over two factored representations of a Kronecker-shaped
+/// design. Both variants compute `forward_mul` and `transpose_mul` from the
+/// natural factor pair without ever materializing the full matrix.
+///
+/// `KhatriRao` is the row-wise Kronecker (face-splitting / Khatri–Rao) product
+/// `A ⊙ B`: both factors share `n` rows, and each output row is the elementwise
+/// Kronecker of the corresponding factor rows. Used for designs whose virtual
+/// rows already correspond one-to-one with covariate rows (value and
+/// derivative designs at observation points).
+///
+/// `Kronecker` is the full tensor product. The virtual row space is the
+/// Cartesian product `n_cov × n_grid`; the two factors do not share a row
+/// count and are never replicated. Used for the monotonicity grid, where each
+/// covariate row is paired with every response grid point.
+#[derive(Clone)]
 enum KroneckerDesign {
     /// Row-wise Khatri–Rao product `A ⊙ B`.
     ///
@@ -3006,28 +3004,20 @@ impl KroneckerDesign {
                 }
             }
             // Certificate: m_inactive - α_A · L > slack ⇒ no inactive can bind
-            // before α_A. The cached `min_inactive_margin = min h_{i,g}` over
-            // (i,g) ∉ A is invariant in β (computed at refresh); compare
-            // against `slack + α_A · L`.
+            // at any α ≤ α_A. The cached `min_inactive_margin = min (h_{i,g}
+            // - slack)` over (i,g) ∉ A was computed in `refresh_active_set_cache`
+            // already net of `slack`, so the strict-feasibility comparison
+            // collapses to `m_inactive > α_A · L` (the comment-form expansion
+            // would double-count slack). When α_A = +∞ (no active pair binds),
+            // we still need to certify no inactive pair binds within the
+            // caller's eventual `α_max ≤ 1.0` step (downstream callsite caps
+            // at min(1.0, ...)), so the bound becomes `m_inactive > 1.0 · L`.
             let alpha_for_bound = if alpha_active.is_finite() {
                 alpha_active
             } else {
-                f64::INFINITY
+                1.0
             };
-            let bound_ok = if alpha_for_bound.is_infinite() {
-                // No active binding: certificate accepts iff every inactive
-                // pair has m_inactive > slack (which is true by construction
-                // — they were classified as inactive). But if active set is
-                // empty, we still need to check no constraint binds at all,
-                // which is the case iff `lipschitz` does not destabilize:
-                // any α we return must respect all inactive (i,g) too, so
-                // we treat the certificate as failing here and refresh.
-                cache.active_pairs.is_empty()
-                    && cache.min_inactive_margin > slack
-                    && lipschitz == 0.0
-            } else {
-                cache.min_inactive_margin - alpha_active * lipschitz > slack
-            };
+            let bound_ok = cache.min_inactive_margin > alpha_for_bound * lipschitz;
             if bound_ok {
                 return alpha_active;
             }
