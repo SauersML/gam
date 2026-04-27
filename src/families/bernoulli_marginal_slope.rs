@@ -7412,7 +7412,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        cost_gated_outer_order(specs)
+        cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
@@ -10062,19 +10062,44 @@ mod tests {
     }
 
     #[test]
-    fn cost_gated_outer_order_ignores_inner_coefficient_dimension() {
-        use crate::custom_family::cost_gated_outer_order;
+    fn cost_gated_outer_order_combines_outer_and_inner_work() {
+        use crate::custom_family::{cost_gated_outer_order, default_coefficient_hessian_cost};
         use crate::matrix::DesignMatrix;
         use ndarray::Array2;
 
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-            10, 500,
-        ))));
-        let specs: Vec<ParameterBlockSpec> = (0..2)
+        // Small problem (K=4, n=10, p=8): combined cost ≪ threshold → Second.
+        let small_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((10, 8))));
+        let small_specs: Vec<ParameterBlockSpec> = (0..2)
             .map(|i| ParameterBlockSpec {
                 name: format!("block_{i}"),
-                design: design.clone(),
+                design: small_design.clone(),
                 offset: ndarray::Array1::zeros(10),
+                penalties: (0..2)
+                    .map(|_| crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((8, 8))))
+                    .collect(),
+                nullspace_dims: vec![0; 2],
+                initial_log_lambdas: ndarray::Array1::zeros(2),
+                initial_beta: None,
+            })
+            .collect();
+        let small_cost = default_coefficient_hessian_cost(&small_specs);
+        assert_eq!(
+            cost_gated_outer_order(&small_specs, small_cost),
+            ExactOuterDerivativeOrder::Second
+        );
+
+        // Biobank-shape problem (K²≈400 looks fine, but n·p² ≈ 1.25e9 makes
+        // the combined K²·n·p² ≈ 5e11 prohibitive). Patch 4 routes this to
+        // first-order BFGS instead of attempting an exact outer Hessian.
+        let big_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (5_000, 500),
+        )));
+        let big_specs: Vec<ParameterBlockSpec> = (0..2)
+            .map(|i| ParameterBlockSpec {
+                name: format!("block_{i}"),
+                design: big_design.clone(),
+                offset: ndarray::Array1::zeros(5_000),
                 penalties: (0..10)
                     .map(|_| crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((500, 500))))
                     .collect(),
@@ -10083,9 +10108,10 @@ mod tests {
                 initial_beta: None,
             })
             .collect();
+        let big_cost = default_coefficient_hessian_cost(&big_specs);
         assert_eq!(
-            cost_gated_outer_order(&specs),
-            ExactOuterDerivativeOrder::Second
+            cost_gated_outer_order(&big_specs, big_cost),
+            ExactOuterDerivativeOrder::First
         );
     }
 
