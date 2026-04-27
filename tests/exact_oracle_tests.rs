@@ -225,8 +225,7 @@ fn rel_err(a: f64, b: f64) -> f64 {
 
 #[test]
 fn tiny_logit_lamlvs_exact_oracle_regular_regime() {
-    let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
-    let y = array![0.0, 1.0, 1.0];
+    let (x, y) = regular_regime_logit_fixture();
     let cfg = OracleConfig::default();
 
     for rho in [-0.4, 0.0, 0.4] {
@@ -260,8 +259,7 @@ fn tiny_logit_lamlvs_exact_oracle_regular_regime() {
 
 #[test]
 fn tiny_logit_lamlvs_exact_oracle_regular_regime_sweep_is_stable() {
-    let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
-    let y = array![0.0, 1.0, 1.0];
+    let (x, y) = regular_regime_logit_fixture();
     let cfg = OracleConfig::default();
 
     let mut g_exacts = Vec::new();
@@ -381,8 +379,7 @@ fn tiny_logit_lamlvs_exact_oracle_stress_sweep_direction_consistent() {
 
 #[test]
 fn test_lamlgradient_exact_formula_ground_truth() {
-    let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
-    let y = array![0.0, 1.0, 1.0];
+    let (x, y) = regular_regime_logit_fixture();
     let cfg = OracleConfig::default();
     let rho = 0.0;
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
