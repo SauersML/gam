@@ -3430,6 +3430,52 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// `outer_scaled_tolerance` reduces to the base tolerance for trivial
+    /// cost and scales as `τ · (1 + |V|)` for biobank-scale cost. This is
+    /// the textbook relative-tolerance form mgcv's `magic` REML driver
+    /// applies to its score tolerance.
+    #[test]
+    fn outer_scaled_tolerance_matches_textbook_form() {
+        // Trivial-cost case: scale factor is 1, so test reduces to absolute.
+        let trivial = outer_scaled_tolerance(1e-6, 0.0);
+        assert!((trivial - 1e-6).abs() < 1e-18);
+
+        // Small cost case: 1 + |V| = 1.5, still close to absolute.
+        let small = outer_scaled_tolerance(1e-6, 0.5);
+        assert!((small - 1.5e-6).abs() < 1e-18);
+
+        // Biobank-scale cost: V_LAML ≈ -1.6e5 for binomial logit at
+        // n=320 000. The relative test ‖∇V‖/|V| ≤ τ becomes
+        // ‖∇V‖ ≤ 1e-6 · (1 + 1.6e5) ≈ 0.16, vs the absolute 1e-6
+        // that would never fire at biobank scale.
+        let biobank = outer_scaled_tolerance(1e-6, -1.6e5);
+        let expected = 1e-6 * (1.0 + 1.6e5);
+        assert!((biobank - expected).abs() < 1e-12);
+        assert!(
+            biobank > 0.1,
+            "biobank tolerance must be substantially larger than the absolute 1e-6: got {biobank:.6e}"
+        );
+    }
+
+    /// Scale invariance: under uniform `V → c·V` the relative test
+    /// ‖∇V‖ ≤ τ · (1 + |V|) is invariant in the limit |V| ≫ 1. At
+    /// biobank scale this is exact within rounding.
+    #[test]
+    fn outer_scaled_tolerance_is_scale_invariant_at_large_cost() {
+        let base_tol = 1e-7;
+        let v_base: f64 = 1.0e6;
+        let v_scaled: f64 = v_base * 1000.0;
+
+        // Scale ratio must be the same for both magnitudes.
+        let ratio_base = outer_scaled_tolerance(base_tol, v_base) / (1.0 + v_base);
+        let ratio_scaled =
+            outer_scaled_tolerance(base_tol, v_scaled) / (1.0 + v_scaled);
+        assert!(
+            (ratio_base - ratio_scaled).abs() < 1e-15,
+            "scale ratio must be invariant: base={ratio_base:.3e}  scaled={ratio_scaled:.3e}"
+        );
+    }
+
     struct FailingSeedMaterializationOperator {
         dim: usize,
     }
