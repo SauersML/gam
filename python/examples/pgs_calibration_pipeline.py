@@ -144,7 +144,9 @@ def stage2_survival(df: pd.DataFrame) -> Any:
 def evaluate(model: Any, df: pd.DataFrame, kind: str) -> dict[str, float]:
     """Return AUC for binary, C-index for survival, and z-moments for calibration."""
     if kind == "binary":
-        probs = np.asarray(model.predict(df, return_type="dict")["mean"], float)
+        # bernoulli marginal-slope returns the probability array directly
+        # (see _model.predict docstring); no return_type indirection.
+        probs = np.asarray(model.predict(df), dtype=float)
         return {"auc": _auc(df["disease"].to_numpy(), probs)}
     if kind == "survival":
         pred = model.predict(df)
