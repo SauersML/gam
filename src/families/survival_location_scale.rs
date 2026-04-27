@@ -1,6 +1,6 @@
 use crate::basis::BasisOptions;
 use crate::custom_family::{
-    BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
     CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointPsiDirectCache,
@@ -10,8 +10,7 @@ use crate::custom_family::{
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
-    shared_dense_arc, slice_joint_into_block_working_sets, weighted_crossprod_psi_maps,
-    wrap_spatial_implicit_psi_operator,
+    shared_dense_arc, weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
@@ -26,7 +25,7 @@ use crate::families::scale_design::{
 };
 use crate::matrix::{
     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
-    EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator,
+    EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
 };
 use crate::mixture_link::{
     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
@@ -5784,6 +5783,125 @@ fn lift_conditional_covariance(
 }
 
 impl SurvivalLocationScaleFamily {
+    /// Block-diagonal-only assembly: returns the four (or three, when no
+    /// link-wiggle is configured) principal diagonal blocks of the joint
+    /// Hessian without ever materializing the cross blocks. Used by
+    /// `evaluate()` so the inner solver gets per-block working sets at
+    /// Θ(n · Σ p_b²) instead of Θ(n · (Σ p_b)²) — for biobank scale
+    /// (n ≈ 3·10⁵, Σ p_b ≈ 200) this avoids ~12·10⁹ scalar multiplies and
+    /// the corresponding p² dense allocation per evaluate.
+    fn assemble_block_diagonal_hessians_from_quantities(
+        &self,
+        q: &SurvivalJointQuantities,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit = &*x_threshold_exit_cow;
+        let x_threshold_entry_cow = self
+            .x_threshold_entry
+            .as_ref()
+            .map(DesignMatrix::as_dense_cow);
+        let x_threshold_entry = x_threshold_entry_cow
+            .as_ref()
+            .map_or(x_threshold_exit, |c| &**c);
+        let x_threshold_deriv_cow = self
+            .x_threshold_deriv
+            .as_ref()
+            .map(DesignMatrix::as_dense_cow);
+        let x_threshold_deriv = x_threshold_deriv_cow.as_ref().map(|c| &**c);
+        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit = &*x_log_sigma_exit_cow;
+        let x_log_sigma_entry_cow = self
+            .x_log_sigma_entry
+            .as_ref()
+            .map(DesignMatrix::as_dense_cow);
+        let x_log_sigma_entry = x_log_sigma_entry_cow
+            .as_ref()
+            .map_or(x_log_sigma_exit, |c| &**c);
+        let x_log_sigma_deriv_cow = self
+            .x_log_sigma_deriv
+            .as_ref()
+            .map(DesignMatrix::as_dense_cow);
+        let x_log_sigma_deriv = x_log_sigma_deriv_cow.as_ref().map(|c| &**c);
+
+        // Time-time block (mirrors line 5846-5849 in the joint assembly).
+        let h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.h_time_h0))
+            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.h_time_h1))
+            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &q.h_time_d);
+
+        // Threshold-threshold block.
+        let h_tt = if let Some(x_t_deriv) = x_threshold_deriv {
+            let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+                + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+                + &q.d1_qdot1 * &q.d2qdot_tt);
+            let h_entry =
+                -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
+            let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
+            let h_exit_deriv =
+                -(&q.d2_qdot1 * &(&q.dqdot_t * &q.dqdot_td) + &q.d1_qdot1 * &q.d2qdot_ttd);
+            let mut h_tt = weighted_crossprod_dense(x_threshold_exit, &h_exit, x_threshold_exit)?
+                + weighted_crossprod_dense(x_threshold_entry, &h_entry, x_threshold_entry)?
+                + weighted_crossprod_dense(x_t_deriv, &h_deriv, x_t_deriv)?;
+            let cross = weighted_crossprod_dense(x_threshold_exit, &h_exit_deriv, x_t_deriv)?;
+            h_tt += &cross;
+            h_tt += &cross.t().to_owned();
+            h_tt
+        } else {
+            let h_t = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+                + &q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+                + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+                + &q.d1_qdot1 * &q.d2qdot_tt);
+            weighted_crossprod_dense(&x_threshold_exit, &h_t, &x_threshold_exit)?
+        };
+
+        // Log-sigma–log-sigma block.
+        let h_ll = if let Some(x_ls_deriv) = x_log_sigma_deriv {
+            let dq_ls_entry = q.dq_ls_entry.as_ref().unwrap();
+            let d2q_ls_entry = q.d2q_ls_entry.as_ref().unwrap();
+            let h_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+                + &(&q.d1_q1 * &q.d2q_ls)
+                + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+                + &(&q.d1_qdot1 * &q.d2qdot_ls));
+            let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v))
+                + &(&q.d1_q0 * d2q_ls_entry));
+            let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
+            let h_exit_deriv =
+                -(&q.d2_qdot1 * &(&q.dqdot_ls * &q.dqdot_lsd) + &q.d1_qdot1 * &q.d2qdot_lslsd);
+            let mut h_ll = weighted_crossprod_dense(x_log_sigma_exit, &h_exit, x_log_sigma_exit)?
+                + weighted_crossprod_dense(x_log_sigma_entry, &h_entry, x_log_sigma_entry)?
+                + weighted_crossprod_dense(x_ls_deriv, &h_deriv, x_ls_deriv)?;
+            let cross = weighted_crossprod_dense(x_log_sigma_exit, &h_exit_deriv, x_ls_deriv)?;
+            h_ll += &cross;
+            h_ll += &cross.t().to_owned();
+            h_ll
+        } else {
+            let h_ls = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+                + &(&q.d1_q1 * &q.d2q_ls)
+                + &q.d2_q0 * &q.dq_ls_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+                + &(&q.d1_q0 * q.d2q_ls_entry.as_ref().unwrap())
+                + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+                + &(&q.d1_qdot1 * &q.d2qdot_ls));
+            weighted_crossprod_dense(&x_log_sigma_exit, &h_ls, &x_log_sigma_exit)?
+        };
+
+        let mut blocks = vec![h_time, h_tt, h_ll];
+
+        // Optional link-wiggle block.
+        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
+            dynamic.wiggle_basis_exit.as_ref(),
+            dynamic.wiggle_basis_entry.as_ref(),
+            dynamic.wiggle_qdot_basis_exit.as_ref(),
+        ) {
+            let hww = weighted_crossprod_dense(xw_exit, &(-&q.d2_q1), xw_exit)?
+                + weighted_crossprod_dense(xw_entry, &(-&q.d2_q0), xw_entry)?
+                + weighted_crossprod_dense(xw_qdot, &(-&q.d2_qdot1), xw_qdot)?;
+            blocks.push(hww);
+        }
+
+        Ok(blocks)
+    }
+
     fn assemble_joint_hessian_from_quantities(
         &self,
         q: &SurvivalJointQuantities,
@@ -7729,22 +7847,30 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             block_gradients.push(gradw);
         }
 
-        // Block Hessians are principal diagonal blocks of the joint Hessian
-        // (single source of truth — no separate blockwise Hessian derivation).
-        let joint = self
-            .exact_newton_joint_hessian(block_states)?
-            .ok_or("SurvivalLocationScaleFamily: joint hessian unavailable")?;
-        let offsets = self.joint_block_offsets();
-        let block_ranges: Vec<std::ops::Range<usize>> = (0..block_gradients.len())
-            .map(|k| offsets[k]..offsets[k + 1])
+        // Block-diagonal direct path — assemble only the principal blocks
+        // the inner solver consumes. The cross blocks (h_ht, h_hl, h_hw,
+        // h_tl, h_tw, h_lw) are not required by per-block working sets, so
+        // we never materialize them. See `assemble_block_diagonal_hessians_from_quantities`.
+        let q = self.collect_joint_quantities(block_states)?;
+        let block_hessians = self.assemble_block_diagonal_hessians_from_quantities(&q, block_states)?;
+        if block_hessians.len() != block_gradients.len() {
+            return Err(format!(
+                "SurvivalLocationScaleFamily evaluate block count mismatch: gradients={}, hessians={}",
+                block_gradients.len(),
+                block_hessians.len()
+            ));
+        }
+        let blockworking_sets = block_gradients
+            .into_iter()
+            .zip(block_hessians.into_iter())
+            .map(|(gradient, hessian)| BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            })
             .collect();
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: slice_joint_into_block_working_sets(
-                block_gradients,
-                &joint,
-                &block_ranges,
-            ),
+            blockworking_sets,
         })
     }
 
@@ -9887,6 +10013,42 @@ mod tests {
             wiggle_degree: None,
             policy: crate::resource::ResourcePolicy::default_library(),
         }
+    }
+
+    #[test]
+    fn survival_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
+        // SurvivalLocationScale couples time, threshold, log-σ, and optional
+        // wiggle blocks per row. The override pulls n from `self.n` and
+        // forwards specs to the shared joint-coupled helper.
+        let family = survival_exact_newton_test_family();
+        let n = family.n as u64;
+        let p_time = 5usize;
+        let p_threshold = 3usize;
+        let p_log_sigma = 2usize;
+        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
+                family.n, p,
+            )))),
+            offset: Array1::zeros(family.n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let specs = vec![
+            mk_spec("time", p_time),
+            mk_spec("threshold", p_threshold),
+            mk_spec("log_sigma", p_log_sigma),
+        ];
+        let p_total = (p_time + p_threshold + p_log_sigma) as u64;
+        let expected = crate::custom_family::joint_coupled_coefficient_hessian_cost(n, &specs);
+        assert_eq!(family.coefficient_hessian_cost(&specs), expected);
+        assert_eq!(expected, n * p_total * p_total);
+        assert!(
+            expected > crate::custom_family::default_coefficient_hessian_cost(&specs),
+            "joint-coupled cost must exceed block-diagonal default by the cross-block fill"
+        );
     }
 
     #[test]

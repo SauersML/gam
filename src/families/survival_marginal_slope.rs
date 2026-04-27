@@ -6,7 +6,6 @@ use crate::custom_family::{
     PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
-    slice_joint_into_block_working_sets,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::families::bernoulli_marginal_slope::{
@@ -8497,6 +8496,44 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Block-diagonal-only pullback: writes only the principal time-time,
+    /// marginal-marginal, and logslope-logslope rowwise contributions into
+    /// per-block targets. Used by `evaluate()` to populate per-block working
+    /// sets without ever materializing the cross blocks.
+    fn add_pullback_block_diagonals(
+        &self,
+        row: usize,
+        primary_hessian: &Array2<f64>,
+        time_target: &mut Array2<f64>,
+        marginal_target: &mut Array2<f64>,
+        logslope_target: &mut Array2<f64>,
+    ) {
+        let h = primary_hessian;
+        let time_designs = [
+            &self.design_entry,
+            &self.design_exit,
+            &self.design_derivative_exit,
+        ];
+        for a in 0..3 {
+            for b in 0..3 {
+                let alpha = h[[a, b]];
+                if alpha == 0.0 {
+                    continue;
+                }
+                time_designs[a]
+                    .row_outer_into_view(row, time_designs[b], alpha, time_target.view_mut())
+                    .expect("time block row_outer_into dimension mismatch");
+            }
+        }
+        let alpha_mm = h[[0, 0]] + h[[0, 1]] + h[[1, 0]] + h[[1, 1]];
+        self.marginal_design
+            .syr_row_into_view(row, alpha_mm, marginal_target.view_mut())
+            .expect("marginal syr_row_into dimension mismatch");
+        self.logslope_design
+            .syr_row_into_view(row, h[[3, 3]], logslope_target.view_mut())
+            .expect("logslope syr_row_into dimension mismatch");
+    }
+
     fn row_primary_direction_from_flat_dynamic(
         &self,
         row: usize,
@@ -12246,38 +12283,67 @@ impl SurvivalMarginalSlopeFamily {
         let nll_grad = row_kernel_gradient(&kern, &cache);
         let joint_gradient = -nll_grad;
 
-        // Joint Hessian (NLL Hessian = negative Hessian of log-likelihood,
-        // which is exactly what BlockWorkingSet::ExactNewton.hessian stores).
-        let joint_hessian = row_kernel_hessian_dense(&kern, &cache);
-
-        // Slice principal diagonal blocks — block Hessians are views of the
-        // joint Hessian, never independently derived.
+        // Block-diagonal Hessians only — the inner solver consumes per-block
+        // working sets, so we accumulate the principal time-time, m-m, and
+        // g-g blocks directly instead of building the full joint Hessian and
+        // slicing.  Cost falls from Θ(n·(p_t+p_m+p_g)²) to
+        // Θ(n·(p_t²+p_m²+p_g²)).
         let slices = block_slices(self, block_states);
-        let mut block_gradients = vec![
-            joint_gradient.slice(s![slices.time.clone()]).to_owned(),
-            joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
-            joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
-        ];
-        let mut block_ranges = vec![
-            slices.time.clone(),
-            slices.marginal.clone(),
-            slices.logslope.clone(),
-        ];
-        if let Some(range) = slices.score_warp.clone() {
-            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
-            block_ranges.push(range);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let mut hess_time = Array2::<f64>::zeros((p_t, p_t));
+        let mut hess_marginal = Array2::<f64>::zeros((p_m, p_m));
+        let mut hess_logslope = Array2::<f64>::zeros((p_g, p_g));
+        for row in 0..cache.n {
+            let h = &cache.hessians[row];
+            let mut h_arr = Array2::<f64>::zeros((4, 4));
+            for a in 0..4 {
+                for b in 0..4 {
+                    h_arr[[a, b]] = h[a][b];
+                }
+            }
+            self.add_pullback_block_diagonals(
+                row,
+                &h_arr,
+                &mut hess_time,
+                &mut hess_marginal,
+                &mut hess_logslope,
+            );
         }
-        if let Some(range) = slices.link_dev.clone() {
-            block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
-            block_ranges.push(range);
+
+        let mut blockworking_sets = vec![
+            BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient.slice(s![slices.time.clone()]).to_owned(),
+                hessian: SymmetricMatrix::Dense(hess_time),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
+                hessian: SymmetricMatrix::Dense(hess_marginal),
+            },
+            BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
+                hessian: SymmetricMatrix::Dense(hess_logslope),
+            },
+        ];
+        if let Some(range) = slices.score_warp.as_ref() {
+            // The 4-D row kernel does not span score_warp / link_dev primary
+            // dimensions, so these blocks contribute zero gradient/Hessian
+            // here — exactly what the joint-then-slice path produced.
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient.slice(s![range.clone()]).to_owned(),
+                hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+            });
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient: joint_gradient.slice(s![range.clone()]).to_owned(),
+                hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+            });
         }
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            blockworking_sets: slice_joint_into_block_working_sets(
-                block_gradients,
-                &joint_hessian,
-                &block_ranges,
-            ),
+            blockworking_sets,
         })
     }
 

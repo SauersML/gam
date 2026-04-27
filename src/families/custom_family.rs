@@ -369,42 +369,6 @@ pub enum BlockWorkingSet {
     },
 }
 
-/// Slice a joint Hessian's principal diagonal blocks and pair them with
-/// pre-computed per-block gradients to form `ExactNewton` working sets.
-///
-/// `block_gradients[k]` is the gradient for block k.
-/// `block_ranges[k]` gives the coefficient index range for block k in
-/// the flat joint parameter vector.
-/// The Hessian for each block is the principal diagonal block
-/// `joint_hessian[range, range]`.
-///
-/// This is the single authoritative way to derive block Hessians: they are
-/// always views of the joint Hessian, never independently computed.
-pub fn slice_joint_into_block_working_sets(
-    block_gradients: Vec<Array1<f64>>,
-    joint_hessian: &Array2<f64>,
-    block_ranges: &[std::ops::Range<usize>],
-) -> Vec<BlockWorkingSet> {
-    assert_eq!(
-        block_gradients.len(),
-        block_ranges.len(),
-        "slice_joint_into_block_working_sets: gradient/range count mismatch"
-    );
-    block_gradients
-        .into_iter()
-        .zip(block_ranges.iter())
-        .map(|(gradient, range)| {
-            let hessian = joint_hessian
-                .slice(s![range.clone(), range.clone()])
-                .to_owned();
-            BlockWorkingSet::ExactNewton {
-                gradient,
-                hessian: SymmetricMatrix::Dense(hessian),
-            }
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactNewtonOuterObjective {
     RidgedQuadraticReml,
@@ -6536,24 +6500,42 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
-    let has_joint_exacthessian = if use_joint_matrix_free_path(total_joint_p, total_joint_n) {
-        let workspace = family.exact_newton_joint_hessian_workspace(&states, specs)?;
-        match workspace.as_ref() {
-            Some(workspace) => {
-                exact_newton_joint_hessian_source_from_workspace(
+    // Track workspace-source availability separately so we only route
+    // single-block families to the joint-Newton path when the matrix-free
+    // operator is actually wired. Single-block families with only the dense
+    // `exact_newton_joint_hessian` would pay a full `Θ(n p²)` Gram build per
+    // joint-Newton cycle, which is strictly worse than the blockwise dense
+    // Cholesky path — keep them on blockwise.
+    let (has_joint_exacthessian, has_workspace_source) =
+        if use_joint_matrix_free_path(total_joint_p, total_joint_n) {
+            let workspace = family.exact_newton_joint_hessian_workspace(&states, specs)?;
+            if let Some(workspace) = workspace.as_ref() {
+                if exact_newton_joint_hessian_source_from_workspace(
                     workspace,
                     total_joint_p,
                     "joint exact-newton operator mismatch during inner availability probe",
                 )?
                 .is_some()
-                    || family.exact_newton_joint_hessian(&states)?.is_some()
+                {
+                    (true, true)
+                } else {
+                    (family.exact_newton_joint_hessian(&states)?.is_some(), false)
+                }
+            } else {
+                (family.exact_newton_joint_hessian(&states)?.is_some(), false)
             }
-            None => family.exact_newton_joint_hessian(&states)?.is_some(),
-        }
-    } else {
-        family.exact_newton_joint_hessian(&states)?.is_some()
-    };
-    let use_joint_newton = has_joint_exacthessian && specs.len() >= 2;
+        } else {
+            (family.exact_newton_joint_hessian(&states)?.is_some(), false)
+        };
+    // Multi-block families have always taken the joint path when an exact
+    // joint Hessian is available. Single-block families now also take it when
+    // the matrix-free workspace is wired — the joint loop then runs entirely
+    // operator-form (PCG on the workspace operator + log-likelihood-only line
+    // search + gradient-only refresh through
+    // `exact_newton_joint_gradient_evaluation`) and never builds the dense
+    // per-block Hessian inside the inner solve.
+    let use_joint_newton =
+        has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
     let inner_tol = options.inner_tol;
     let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
@@ -11376,13 +11358,14 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // on binomial-logit + P-spline benchmarks. If the primary Arc + Analytic
     // plan fails, surface the non-convergence as an error rather than masking
     // it with a weaker method.
-    // FLOP estimate of one dense exact joint Hessian assembly. For the
-    // custom-family path the joint coefficient dimension sums per-block
-    // designs; the per-row outer-product cost is (Σ p_b)² weighted by the
-    // sample count. When this exceeds DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD,
-    // OuterProblem::capability() promotes prefer_gradient_only and the
-    // planner routes the outer to BFGS+gradient even though the family
-    // declares an analytic Hessian. This is the cost-aware counterpart to
+    // Standard-GAM dense problem dimensions for the custom-family joint
+    // outer. The joint coefficient dimension sums per-block designs; the
+    // per-row outer-product cost is (Σ p_b)² weighted by the sample count.
+    // OuterProblem::with_standard_gam_dimensions feeds both the per-inner-
+    // solve (n·p²) and per-outer-eval (k²·n·p²) cost models that promote
+    // prefer_gradient_only when one Newton iteration or the LAML pairwise
+    // Hessian assembly would dominate wall-clock time. Sparse designs are a
+    // no-op (different cost model). This is the cost-aware counterpart to
     // the existing `multi_block_beta_dependent` EFS opt-out: both let the
     // planner skip a path it would otherwise have committed to.
     let total_p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
@@ -11390,8 +11373,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .first()
         .map(|s| s.design.nrows())
         .unwrap_or(0);
-    let dense_hessian_work =
-        (n_obs_joint as f64) * (total_p_joint as f64) * (total_p_joint as f64);
+    let all_blocks_dense = specs.iter().all(|s| s.design.as_sparse().is_none());
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
@@ -11402,7 +11384,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())
-        .with_dense_hessian_work_hint(dense_hessian_work);
+        .with_standard_gam_dimensions(n_obs_joint, total_p_joint, all_blocks_dense);
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
@@ -11741,6 +11723,27 @@ mod tests {
             joint_coupled_coefficient_hessian_cost(200, &specs)
                 > default_coefficient_hessian_cost(&specs)
         );
+    }
+
+    #[test]
+    fn use_joint_matrix_free_path_triggers_at_each_documented_threshold() {
+        // p ≥ 512 is sufficient regardless of n.
+        assert!(use_joint_matrix_free_path(512, 1));
+        assert!(use_joint_matrix_free_path(2048, 4));
+        assert!(!use_joint_matrix_free_path(511, 1));
+
+        // n ≥ 50_000 AND p ≥ 32: both must hold.
+        assert!(use_joint_matrix_free_path(32, 50_000));
+        assert!(!use_joint_matrix_free_path(31, 50_000));
+        assert!(!use_joint_matrix_free_path(32, 49_999));
+
+        // n · p ≥ 4_000_000 is the linear-work fallback.
+        assert!(use_joint_matrix_free_path(40, 100_000));
+        assert!(!use_joint_matrix_free_path(40, 99_999));
+
+        // Below every threshold: dense path.
+        assert!(!use_joint_matrix_free_path(8, 100));
+        assert!(!use_joint_matrix_free_path(64, 1000));
     }
 
     #[test]

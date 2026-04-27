@@ -5,7 +5,7 @@ use crate::custom_family::{
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_block_spatial_psi_derivatives, cost_gated_outer_order, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    fit_custom_family, slice_joint_into_block_working_sets,
+    fit_custom_family,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
@@ -7047,12 +7047,15 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let flex_active = self.effective_flex_active(block_states)?;
 
-        // ── Joint-then-slice path (rigid, p < 512) ──────────────────────
+        // ── Block-diagonal direct path (rigid, p < 512) ─────────────────
         //
-        // Block Hessians are principal blocks of the joint Hessian—never
-        // independently derived. The RowKernel<2> is the single source of
-        // truth in objective space (negative log-likelihood), and the family
-        // score/observed-information convention is applied once here.
+        // The RowKernel<2> is the single source of truth in objective space
+        // (negative log-likelihood). The full joint Hessian's off-diagonal
+        // marginal/logslope cross block is unused by the per-block working
+        // sets the inner solver consumes, so we accumulate only the two
+        // diagonal blocks via the family's sparse-aware syr / axpy.  This
+        // avoids the Θ(n·(p_m+p_g)²) joint assembly + immediate slice that
+        // the previous implementation paid.
         if !flex_active && slices.total < 512 {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern)?;
@@ -7060,48 +7063,89 @@ impl BernoulliMarginalSlopeFamily {
             let joint_gradient = Self::exact_newton_score_from_objective_gradient(
                 row_kernel_gradient(&kern, &cache),
             );
-            let joint_hessian = Self::exact_newton_observed_information_from_objective_hessian(
-                row_kernel_hessian_dense(&kern, &cache),
-            );
-            let mut block_gradients = vec![
-                joint_gradient.slice(s![slices.marginal.clone()]).to_owned(),
-                joint_gradient.slice(s![slices.logslope.clone()]).to_owned(),
-            ];
-            let mut block_ranges = vec![slices.marginal.clone(), slices.logslope.clone()];
-            if let Some(range) = slices.h.clone() {
-                block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
-                block_ranges.push(range);
+
+            let mut hess_marginal =
+                Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
+            let mut hess_logslope =
+                Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
+            for row in 0..cache.n {
+                let h = &cache.hessians[row];
+                self.marginal_design
+                    .syr_row_into(row, h[0][0], &mut hess_marginal)?;
+                self.logslope_design
+                    .syr_row_into(row, h[1][1], &mut hess_logslope)?;
             }
-            if let Some(range) = slices.w.clone() {
-                block_gradients.push(joint_gradient.slice(s![range.clone()]).to_owned());
-                block_ranges.push(range);
+            let hess_marginal =
+                Self::exact_newton_observed_information_from_objective_hessian(hess_marginal);
+            let hess_logslope =
+                Self::exact_newton_observed_information_from_objective_hessian(hess_logslope);
+
+            let grad_marginal = joint_gradient.slice(s![slices.marginal.clone()]).to_owned();
+            let grad_logslope = joint_gradient.slice(s![slices.logslope.clone()]).to_owned();
+
+            let mut sets = vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_marginal,
+                    hessian: SymmetricMatrix::Dense(hess_marginal),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_logslope,
+                    hessian: SymmetricMatrix::Dense(hess_logslope),
+                },
+            ];
+            if let Some(range) = slices.h.as_ref() {
+                // Rigid mode does not exercise h/w; mirror the blockwise
+                // fallback by exposing zero working sets.
+                sets.push(BlockWorkingSet::ExactNewton {
+                    gradient: Array1::zeros(range.len()),
+                    hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                });
+            }
+            if let Some(range) = slices.w.as_ref() {
+                sets.push(BlockWorkingSet::ExactNewton {
+                    gradient: Array1::zeros(range.len()),
+                    hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
+                });
             }
             return Ok(FamilyEvaluation {
                 log_likelihood: ll,
-                blockworking_sets: slice_joint_into_block_working_sets(
-                    block_gradients,
-                    &joint_hessian,
-                    &block_ranges,
-                ),
+                blockworking_sets: sets,
             });
         }
 
-        // ── Joint-then-slice path (flex, p < 512) ───────────────────────
+        // ── Block-diagonal direct path (flex, p < 512) ──────────────────
         //
-        // The flex path has variable-dimension primary space (q, g, h?, w?).
-        // The joint Hessian is built column-by-column via matvec.
-        // Gradients are extracted from the per-row analytic flex loop.
+        // The flex path's primary space is variable-dimension (q, g, h?, w?).
+        // Per-row gradient and Hessian come from `compute_row_analytic_flex_into`.
+        // We accumulate directly into per-block Hessians — marginal and
+        // log-slope via the family's sparse-aware syr (pulling back through
+        // the corresponding designs), and the optional flex blocks (h, w) by
+        // direct sub-block sum since their primary scalars equal their
+        // coefficients (no design pull-back). The previously-formed full
+        // joint Hessian + slice path is gone; the off-diagonal cross blocks
+        // were never read by the inner solver.
         if flex_active && slices.total < 512 {
             let cache = self.build_exact_eval_cache_with_order(block_states)?;
             let primary = cache.primary.clone();
             let n = self.y.len();
 
-            // Gradient-only accumulation (no Hessian).
             let mut ll = 0.0;
             let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
             let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
+            let mut hess_marginal =
+                Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
+            let mut hess_logslope =
+                Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
             let mut grad_h: Option<Array1<f64>> = slices.h.as_ref().map(|r| Array1::zeros(r.len()));
             let mut grad_w: Option<Array1<f64>> = slices.w.as_ref().map(|r| Array1::zeros(r.len()));
+            let mut hess_h: Option<Array2<f64>> = slices
+                .h
+                .as_ref()
+                .map(|r| Array2::zeros((r.len(), r.len())));
+            let mut hess_w: Option<Array2<f64>> = slices
+                .w
+                .as_ref()
+                .map(|r| Array2::zeros((r.len(), r.len())));
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
             for row in 0..n {
                 let row_ctx = Self::row_ctx(&cache, row);
@@ -7130,42 +7174,67 @@ impl BernoulliMarginalSlopeFamily {
                         &mut g,
                     )?;
                 }
-                if let (Some(ph), Some(gh)) = (primary.h.as_ref(), grad_h.as_mut()) {
+                self.marginal_design
+                    .syr_row_into(row, scratch.hess[[0, 0]], &mut hess_marginal)?;
+                self.logslope_design
+                    .syr_row_into(row, scratch.hess[[1, 1]], &mut hess_logslope)?;
+                if let (Some(ph), Some(gh), Some(hh)) =
+                    (primary.h.as_ref(), grad_h.as_mut(), hess_h.as_mut())
+                {
                     for idx in 0..ph.len() {
                         gh[idx] += Self::exact_newton_score_component_from_objective_gradient(
                             scratch.grad[ph.start + idx],
                         );
                     }
+                    for row_h in 0..ph.len() {
+                        for col_h in 0..ph.len() {
+                            hh[[row_h, col_h]] +=
+                                scratch.hess[[ph.start + row_h, ph.start + col_h]];
+                        }
+                    }
                 }
-                if let (Some(pw), Some(gw)) = (primary.w.as_ref(), grad_w.as_mut()) {
+                if let (Some(pw), Some(gw), Some(hw)) =
+                    (primary.w.as_ref(), grad_w.as_mut(), hess_w.as_mut())
+                {
                     for idx in 0..pw.len() {
                         gw[idx] += Self::exact_newton_score_component_from_objective_gradient(
                             scratch.grad[pw.start + idx],
                         );
                     }
+                    for row_w in 0..pw.len() {
+                        for col_w in 0..pw.len() {
+                            hw[[row_w, col_w]] +=
+                                scratch.hess[[pw.start + row_w, pw.start + col_w]];
+                        }
+                    }
                 }
             }
 
-            let joint = self
-                .exact_newton_joint_hessian(block_states)?
-                .ok_or("BernoulliMarginalSlopeFamily flex: joint hessian unavailable")?;
-            let mut block_gradients = vec![grad_marginal, grad_logslope];
-            let mut block_ranges = vec![slices.marginal.clone(), slices.logslope.clone()];
-            if let (Some(range), Some(gradient)) = (slices.h.clone(), grad_h) {
-                block_ranges.push(range);
-                block_gradients.push(gradient);
+            let mut blockworking_sets = vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_marginal,
+                    hessian: SymmetricMatrix::Dense(hess_marginal),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_logslope,
+                    hessian: SymmetricMatrix::Dense(hess_logslope),
+                },
+            ];
+            if let (Some(gradient), Some(hessian)) = (grad_h, hess_h) {
+                blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                    gradient,
+                    hessian: SymmetricMatrix::Dense(hessian),
+                });
             }
-            if let (Some(range), Some(gradient)) = (slices.w.clone(), grad_w) {
-                block_ranges.push(range);
-                block_gradients.push(gradient);
+            if let (Some(gradient), Some(hessian)) = (grad_w, hess_w) {
+                blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                    gradient,
+                    hessian: SymmetricMatrix::Dense(hessian),
+                });
             }
             return Ok(FamilyEvaluation {
                 log_likelihood: ll,
-                blockworking_sets: slice_joint_into_block_working_sets(
-                    block_gradients,
-                    &joint,
-                    &block_ranges,
-                ),
+                blockworking_sets,
             });
         }
 
@@ -7534,9 +7603,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern)?;
-            return Ok(Some(crate::families::row_kernel::row_kernel_hessian_dense(
-                &kern, &cache,
-            )));
+            return Ok(Some(row_kernel_hessian_dense(&kern, &cache)));
         }
 
         let cache = self.build_exact_eval_cache_with_order(block_states)?;

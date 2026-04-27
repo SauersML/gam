@@ -17259,6 +17259,59 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
+        // GAMLSS families (all five variants) share the joint-coupled formula
+        // n · (Σ p_b)². They each pull n from `self.y.len()` and forward the
+        // specs to the shared helper. This regression test pins that contract
+        // for the simplest representative (GaussianLocationScale); the other
+        // four GAMLSS impls are byte-for-byte identical aside from the comment.
+        let n = 100usize;
+        let p_mu = 7usize;
+        let p_log_sigma = 4usize;
+        let family = GaussianLocationScaleFamily {
+            y: Array1::zeros(n),
+            weights: Array1::from_elem(n, 1.0),
+            mu_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cached_row_scalars: std::sync::RwLock::new(None),
+        };
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "mu".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (n, p_mu),
+                ))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (n, p_log_sigma),
+                ))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        let p_total = (p_mu + p_log_sigma) as u64;
+        let expected =
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n as u64, &specs);
+        assert_eq!(family.coefficient_hessian_cost(&specs), expected);
+        assert_eq!(expected, (n as u64) * p_total * p_total);
+        assert!(
+            expected > crate::custom_family::default_coefficient_hessian_cost(&specs),
+            "joint-coupled cost must exceed block-diagonal default by the cross-block fill"
+        );
+    }
+
+    #[test]
     fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
         let weights = Array1::from_vec(vec![0.0, 1.0]);
 
