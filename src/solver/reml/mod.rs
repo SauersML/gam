@@ -3301,17 +3301,29 @@ impl PenalizedGeometry for EvalShared {
     }
 }
 
+/// LRU cache keyed by sanitized ρ vectors that holds compacted PIRLS results
+/// for warm-starting outer line searches and revisited evaluations.
+///
+/// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
+/// records its own estimated footprint (the surviving n-length vectors plus
+/// the two p×p Hessians plus per-entry overhead) and the cache evicts in
+/// LRU order until the running total fits under the budget. An entry that
+/// individually exceeds the budget is rejected silently rather than poisoning
+/// the cache.
 struct PirlsLruCache {
-    map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64)>,
-    capacity: usize,
+    // Stored tuple: (compacted result, last-touched clock, estimated bytes).
+    map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
+    byte_budget: usize,
+    current_bytes: usize,
     clock: u64,
 }
 
 impl PirlsLruCache {
-    fn new(capacity: usize) -> Self {
+    fn new(byte_budget: usize) -> Self {
         Self {
             map: HashMap::new(),
-            capacity: capacity.max(1),
+            byte_budget: byte_budget.max(1),
+            current_bytes: 0,
             clock: 0,
         }
     }
@@ -3328,30 +3340,88 @@ impl PirlsLruCache {
 
     fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
         self.clock += 1;
-        if self.map.contains_key(&key) {
-            self.map.insert(key, (value, self.clock));
+        let bytes = pirls_result_cache_bytes(&value);
+        // Refuse entries that on their own already exceed the entire budget;
+        // caching one would force eviction of every other entry without
+        // leaving room for the new one anyway.
+        if bytes > self.byte_budget {
+            if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
+                self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
+            }
             return;
         }
-
-        while self.map.len() >= self.capacity {
-            // Evict least-recently-used entry (lowest timestamp)
-            if let Some(evict_key) = self
+        if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
+            self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
+        }
+        while self.current_bytes + bytes > self.byte_budget {
+            let evict_key = self
                 .map
                 .iter()
-                .min_by_key(|(_, (_, ts))| *ts)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&evict_key);
-            } else {
-                break;
+                .min_by_key(|(_, (_, ts, _))| *ts)
+                .map(|(k, _)| k.clone());
+            match evict_key {
+                Some(k) => {
+                    if let Some((_, _, evict_bytes)) = self.map.remove(&k) {
+                        self.current_bytes = self.current_bytes.saturating_sub(evict_bytes);
+                    }
+                }
+                None => break,
             }
         }
-
-        self.map.insert(key, (value, self.clock));
+        self.current_bytes += bytes;
+        self.map.insert(key, (value, self.clock, bytes));
     }
 
     fn clear(&mut self) {
         self.map.clear();
+        self.current_bytes = 0;
+    }
+}
+
+/// Estimate the in-cache footprint of a (compacted) PIRLS result.
+///
+/// Mirrors what `compact_for_reml_cache` keeps:
+/// * six surviving n-length f64 arrays (final_eta, solveweights,
+///   solveworking_response, solvemu, solve_c_array, solve_d_array);
+/// * the p-length coefficient vector;
+/// * the two p×p Hessians (dense or CSC sparse);
+/// * the `ReparamResult` payload — the dominant scaling term beyond n, since
+///   it carries `s_transformed`, `qs`, and `e_transformed` as p×p / rank×p
+///   matrices.
+/// A small constant overhead absorbs scalar fields, enum discriminants, and
+/// the HashMap entry. This errs on the conservative side: overestimation
+/// causes earlier eviction, never under-counting that would let the cache
+/// silently exceed the byte budget.
+fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
+    use std::mem::size_of;
+    let n_array_elems = result.final_eta.len()
+        + result.solveweights.len()
+        + result.solveworking_response.len()
+        + result.solvemu.len()
+        + result.solve_c_array.len()
+        + result.solve_d_array.len();
+    let p = result.beta_transformed.0.len();
+    let pen_h = symmetric_matrix_cache_bytes(&result.penalized_hessian_transformed);
+    let stab_h = symmetric_matrix_cache_bytes(&result.stabilizedhessian_transformed);
+    let reparam = (result.reparam_result.s_transformed.len()
+        + result.reparam_result.qs.len()
+        + result.reparam_result.e_transformed.len()
+        + result.reparam_result.det1.len())
+        * size_of::<f64>();
+    n_array_elems * size_of::<f64>() + p * size_of::<f64>() + pen_h + stab_h + reparam + 1024
+}
+
+fn symmetric_matrix_cache_bytes(m: &crate::linalg::matrix::SymmetricMatrix) -> usize {
+    use crate::linalg::matrix::SymmetricMatrix;
+    use std::mem::size_of;
+    match m {
+        SymmetricMatrix::Dense(a) => a.len() * size_of::<f64>(),
+        SymmetricMatrix::Sparse(s) => {
+            // CSC sparse: f64 values + usize row indices + usize column pointers.
+            let (symbolic, values) = s.parts();
+            values.len() * (size_of::<f64>() + size_of::<usize>())
+                + symbolic.col_ptr().len() * size_of::<usize>()
+        }
     }
 }
 
@@ -3369,7 +3439,7 @@ struct EvalCacheManager {
 impl EvalCacheManager {
     fn new() -> Self {
         Self {
-            pirls_cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
+            pirls_cache: RwLock::new(PirlsLruCache::new(PIRLS_CACHE_BYTE_BUDGET)),
             current_eval_bundle: RwLock::new(None),
             current_outer_eval: RwLock::new(None),
             pirls_cache_enabled: AtomicBool::new(true),

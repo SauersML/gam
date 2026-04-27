@@ -2329,6 +2329,15 @@ impl<'a> RemlState<'a> {
             return Ok(cached);
         }
 
+        // Detect whether we are running under outer-loop seed screening. While
+        // screening is active the planner caps inner iterations to a small
+        // value (~3) and trial seeds are EXPECTED to fail certification — those
+        // are not user-visible errors, just rejected candidates whose costs are
+        // ranked. We thread this flag down so the warn/error sites below can
+        // demote screening-mode failures to debug.
+        let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
+        let in_screening = screening_cap > 0;
+
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs
         let pirls_result = {
@@ -2339,8 +2348,7 @@ impl<'a> RemlState<'a> {
                 None
             };
             let mut pirls_config = self.config.as_pirls_config();
-            let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
-            if screening_cap > 0 {
+            if in_screening {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(screening_cap);
             }
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
@@ -2396,7 +2404,14 @@ impl<'a> RemlState<'a> {
         };
 
         if let Err(e) = &pirls_result {
-            log::warn!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
+            if in_screening {
+                // Seed-screening intentionally caps inner iterations very low,
+                // so trial-point failures here are routine and ranked — not
+                // bugs.
+                log::debug!("[seed-screen] P-IRLS rejected candidate: {e:?}");
+            } else {
+                log::warn!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
+            }
             // Keep the previous successful warm start even when a trial point
             // fails. Outer line search commonly probes unstable candidates and
             // then returns to nearby feasible rho values where the prior warm
@@ -2429,12 +2444,25 @@ impl<'a> RemlState<'a> {
                     max_abs_eta: pirls_result.max_abs_eta,
                 })
             }
-            pirls::PirlsStatus::MaxIterationsReached => {
-                log::error!(
-                    "P-IRLS reached max iterations without certifying a valid minimum (gradient norm {:.3e}, iter {})",
-                    pirls_result.lastgradient_norm,
-                    pirls_result.iteration
-                );
+            pirls::PirlsStatus::MaxIterationsReached
+            | pirls::PirlsStatus::LmStepSearchExhausted => {
+                let kind = match pirls_result.status {
+                    pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
+                    _ => "max iterations reached",
+                };
+                if in_screening {
+                    log::debug!(
+                        "[seed-screen] P-IRLS rejected: {kind} (gradient norm {:.3e}, iter {})",
+                        pirls_result.lastgradient_norm,
+                        pirls_result.iteration
+                    );
+                } else {
+                    log::error!(
+                        "P-IRLS could not certify a valid minimum: {kind} (gradient norm {:.3e}, iter {})",
+                        pirls_result.lastgradient_norm,
+                        pirls_result.iteration
+                    );
+                }
                 Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: pirls_result.iteration,
                     last_change: pirls_result.lastgradient_norm,

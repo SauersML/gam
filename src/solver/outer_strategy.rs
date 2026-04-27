@@ -480,10 +480,8 @@ fn rank_seeds_with_screening(
         return seeds.to_vec();
     };
 
-    let previous_cap = screening_cap.swap(
-        config.seed_config.screen_max_inner_iterations.max(1),
-        Ordering::Relaxed,
-    );
+    let cap_value = config.seed_config.screen_max_inner_iterations.max(1);
+    let previous_cap = screening_cap.swap(cap_value, Ordering::Relaxed);
     let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
     let mut rejected = 0usize;
 
@@ -495,15 +493,51 @@ fn rank_seeds_with_screening(
         }
     }
 
+    // First-pass screening collapsed every seed to non-finite. That happens
+    // when the inner solver cannot certify a usable mode within the screening
+    // iteration cap, often because the cap is too shallow for the family or
+    // the problem is mildly ill-conditioned at every seed. Rather than commit
+    // to heuristic ordering and let the actual fit pick a poor first start,
+    // do a second pass with the cap disabled. If even one seed becomes finite
+    // under the full inner budget, we get a real ranking; if all still fail
+    // we fall back to heuristic order with the failure surfaced.
+    if ranked.is_empty() {
+        screening_cap.store(0, Ordering::Relaxed);
+        log::debug!(
+            "[OUTER] {context}: seed screening produced no finite cheap costs; \
+             retrying with screening cap disabled"
+        );
+        let mut second_rejected = 0usize;
+        for (idx, seed) in seeds.iter().enumerate() {
+            obj.reset();
+            match obj.eval_cost(seed) {
+                Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
+                Ok(_) | Err(_) => second_rejected += 1,
+            }
+        }
+        if ranked.is_empty() {
+            log::info!(
+                "[OUTER] {context}: no finite seed cost even with full inner budget \
+                 ({} seeds, {} rejected); keeping heuristic order",
+                seeds.len(),
+                second_rejected,
+            );
+            screening_cap.store(previous_cap, Ordering::Relaxed);
+            obj.reset();
+            return seeds.to_vec();
+        }
+        log::info!(
+            "[OUTER] {context}: full-budget retry ranked {}/{} seeds; the screening cap \
+             ({}) was too shallow for this problem",
+            ranked.len(),
+            seeds.len(),
+            cap_value,
+        );
+        rejected = second_rejected;
+    }
+
     screening_cap.store(previous_cap, Ordering::Relaxed);
     obj.reset();
-
-    if ranked.is_empty() {
-        log::info!(
-            "[OUTER] {context}: seed screening produced no finite cheap costs; keeping heuristic order"
-        );
-        return seeds.to_vec();
-    }
 
     ranked.sort_by(|(idx_a, cost_a), (idx_b, cost_b)| {
         cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
@@ -526,7 +560,7 @@ fn rank_seeds_with_screening(
          (screen_max_inner_iterations={}); rejected={}",
         ordered.len() - rejected,
         seeds.len(),
-        config.seed_config.screen_max_inner_iterations.max(1),
+        cap_value,
         rejected,
     );
 
@@ -725,7 +759,11 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
     } else {
         ""
     };
-    log::debug!(
+    // Promoted to info: this fires once per outer optimization dispatch and
+    // tells the user immediately whether ARC, BFGS, EFS, etc. was selected
+    // and why. That information is otherwise inferred only from the per-iter
+    // log tag prefix once the loop has started.
+    log::info!(
         "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}{barrier_note}{hybrid_note}",
         cap.n_params,
         cap.gradient,

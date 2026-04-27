@@ -2419,6 +2419,15 @@ pub(crate) enum RadialScalarKind {
         s_order: usize,
         dim: usize,
     },
+    /// Thin-Plate Spline kernel: isotropic with a scalar length-scale, used
+    /// only with `n_axes = 1` (`ScalarTotal` streaming mode). The chain rule
+    /// for ψ = log κ = -log(length_scale) and r̃ = ‖x − c‖ gives
+    /// ∂φ/∂ψ   = φ'(z)·z
+    /// ∂²φ/∂ψ² = φ''(z)·z² + φ'(z)·z
+    /// where z = r̃ / length_scale. With the operator's c=0, s_0 = r̃²,
+    /// `shape_0 = q·s_0` and `shape_00 = t·s_0² + 2 q s_0` reproduce both
+    /// derivatives exactly when q = φ'(r̃)/r̃ and t = (φ''(r̃) − q)/r̃².
+    ThinPlate { length_scale: f64, dim: usize },
 }
 
 impl RadialScalarKind {
@@ -2447,6 +2456,30 @@ impl RadialScalarKind {
                 let (q, t, _, _) = duchon_polyharmonic_operator_block_jets(r, *block_order, *dim)?;
                 Ok((phi, q, t))
             }
+            RadialScalarKind::ThinPlate { length_scale, dim } => {
+                // At collision r=0 the operator's `s_0 = r²` is itself zero,
+                // so q and t are multiplied by zero and never observed; we
+                // still need a finite phi (= 0 for the standard TPS kernels).
+                if r < 1e-14 {
+                    let (phi, _, _) =
+                        thin_plate_kernel_triplet_from_scaled_distance(0.0, *dim)?;
+                    return Ok((phi, 0.0, 0.0));
+                }
+                let scaled_r = r / *length_scale;
+                let (phi, phi_kernel_first, phi_kernel_second) =
+                    thin_plate_kernel_triplet_from_scaled_distance(scaled_r, *dim)?;
+                // The implicit operator uses derivatives w.r.t. the unscaled r
+                // (the operator's chain rule will rescale them to ψ-derivatives
+                // via s_0 = r²). Convert φ'(z), φ''(z) → φ'(r), φ''(r) by the
+                // length-scale chain rule:
+                //   φ'(r)  = φ'(z) / length_scale
+                //   φ''(r) = φ''(z) / length_scale²
+                let phi_r = phi_kernel_first / *length_scale;
+                let phi_rr = phi_kernel_second / (*length_scale * *length_scale);
+                let q = phi_r / r;
+                let t = (phi_rr - q) / (r * r);
+                Ok((phi, q, t))
+            }
         }
     }
 
@@ -2466,6 +2499,9 @@ impl RadialScalarKind {
                 dim,
                 ..
             } => duchon_scaling_exponent(*p_order, *s_order, *dim) / *dim as f64,
+            // ThinPlate is a pure radial kernel φ(z) with no κ^δ prefactor;
+            // the chain rule has no isotropic share term.
+            RadialScalarKind::ThinPlate { .. } => 0.0,
         }
     }
 
@@ -11568,15 +11604,18 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             }
         }
         for a in 0..dim {
+            // raw_first[a] / raw_second_diag[a] are dropped after this loop.
+            // When there is no identifiability transform we previously cloned
+            // them just to slice into primary_*; move them instead.
             let projected_first = if let Some(z) = z_opt.as_ref() {
                 z.t().dot(&raw_first[a]).dot(z)
             } else {
-                raw_first[a].clone()
+                std::mem::take(&mut raw_first[a])
             };
             let projected_second = if let Some(z) = z_opt.as_ref() {
                 z.t().dot(&raw_second_diag[a]).dot(z)
             } else {
-                raw_second_diag[a].clone()
+                std::mem::take(&mut raw_second_diag[a])
             };
             primary_first[a]
                 .slice_mut(s![0..kernel_cols, 0..kernel_cols])
@@ -14288,108 +14327,62 @@ fn active_thin_plate_penalty_derivatives(
         .collect()
 }
 
-fn build_thin_plate_design_psi_derivativeswithworkspace(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-    identifiability_transform: Option<&Array2<f64>>,
-    workspace: &mut BasisWorkspace,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
-    let n = data.nrows();
-    let k = centers.nrows();
-    let kernel_cols = z_kernel.ncols();
-    let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
-    let total_cols = kernel_cols + poly_cols;
-    let mut out_psi = Array2::<f64>::zeros((n, total_cols));
-    let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
-
-    // Exact ThinPlate design derivatives in the stored psi = log(kappa)
-    // coordinates, with kappa = 1 / length_scale.
-    //
-    // For each design kernel entry
-    //   K_ij(psi) = phi(r_ij(psi)),
-    //   r_ij(psi) = ||x_i - c_j|| / length_scale = ||x_i - c_j|| exp(psi),
-    //
-    // the chain rule gives
-    //   r_ij,psi     = r_ij
-    //   r_ij,psipsi  = r_ij
-    //   K_ij,psi     = phi_r(r_ij) * r_ij
-    //   K_ij,psipsi  = phi_rr(r_ij) * r_ij^2 + phi_r(r_ij) * r_ij.
-    //
-    // The TPS polynomial null-space block is psi-independent, so its derivatives
-    // are identically zero. After differentiating the raw kernel block, the
-    // same frozen nullspace projection Z_kernel and frozen identifiability
-    // transform Z are applied:
-    //   K_c,psi     = K_psi Z_kernel
-    //   K_c,psipsi  = K_psipsi Z_kernel
-    //   X_psi       = [K_c,psi | 0] Z
-    //   X_psipsi    = [K_c,psipsi | 0] Z.
-    let derivative_result: Result<(), BasisError> = out_psi
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(out_psi_psi.axis_iter_mut(Axis(0)).into_par_iter())
-        .enumerate()
-        .try_for_each(|(i, (mut row_psi, mut row_psi_psi))| {
-            let mut local_psi = vec![0.0; k];
-            let mut local_psi_psi = vec![0.0; k];
-            for j in 0..k {
-                let mut dist2 = 0.0;
-                for axis in 0..data.ncols() {
-                    let delta = data[[i, axis]] - centers[[j, axis]];
-                    dist2 += delta * delta;
-                }
-                let (_, phi_psi, phi_psi_psi) = thin_plate_kernel_psi_triplet_from_distance(
-                    dist2.sqrt(),
-                    spec.length_scale,
-                    data.ncols(),
-                )?;
-                local_psi[j] = phi_psi;
-                local_psi_psi[j] = phi_psi_psi;
-            }
-            for col in 0..kernel_cols {
-                let mut acc_psi = 0.0;
-                let mut acc_psi_psi = 0.0;
-                for j in 0..k {
-                    let z_jc = z_kernel[[j, col]];
-                    acc_psi += local_psi[j] * z_jc;
-                    acc_psi_psi += local_psi_psi[j] * z_jc;
-                }
-                row_psi[col] = acc_psi;
-                row_psi_psi[col] = acc_psi_psi;
-            }
-            Ok(())
-        });
-    derivative_result?;
-
-    if let Some(zf) = identifiability_transform {
-        if total_cols != zf.nrows() {
-            return Err(BasisError::DimensionMismatch(format!(
-                "ThinPlate identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
-                total_cols,
-                zf.nrows()
-            )));
-        }
-        return Ok((fast_ab(&out_psi, zf), fast_ab(&out_psi_psi, zf)));
-    }
-
-    Ok((out_psi, out_psi_psi))
+/// Which orders of psi-derivative the ThinPlate builders should materialize.
+///
+/// At biobank scale the design-side derivative arrays are dense `n × p`
+/// (hundreds of MiB at n≈3×10⁵) and one of the two top-level callers always
+/// discards a full half. Letting the caller request only what it needs keeps
+/// the inner kernel loop in single-pass form for the `Both` path while
+/// dropping the unused allocation entirely on the `First` / `Second` paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinPlateDerivativeOrder {
+    First,
+    Second,
+    Both,
 }
+
+impl ThinPlateDerivativeOrder {
+    #[inline]
+    fn wants_first(self) -> bool {
+        matches!(self, Self::First | Self::Both)
+    }
+    #[inline]
+    fn wants_second(self) -> bool {
+        matches!(self, Self::Second | Self::Both)
+    }
+}
+
+// The dense per-pair ThinPlate ψ-derivative builder used to live here. It has
+// been replaced by `build_thin_plate_scalar_design_psi_derivatives`, which
+// drives the same math through the shared scalar streaming infrastructure
+// (`build_scalar_design_psi_derivatives_shared`) so biobank-scale TPS terms no
+// longer materialize dense `(n × p)` first/second derivative arrays.
 
 fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     centers: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    order: ThinPlateDerivativeOrder,
+) -> Result<(Option<Array2<f64>>, Option<Array2<f64>>), BasisError> {
     let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
     let kernel_cols = z_kernel.ncols();
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let total_cols = kernel_cols + poly_cols;
     let k = centers.nrows();
     let d = centers.ncols();
-    let mut omega_psi = Array2::<f64>::zeros((k, k));
-    let mut omega_psi_psi = Array2::<f64>::zeros((k, k));
+    let want_first = order.wants_first();
+    let want_second = order.wants_second();
+    let mut omega_psi = if want_first {
+        Some(Array2::<f64>::zeros((k, k)))
+    } else {
+        None
+    };
+    let mut omega_psi_psi = if want_second {
+        Some(Array2::<f64>::zeros((k, k)))
+    } else {
+        None
+    };
 
     // Exact ThinPlate bending-penalty derivatives.
     //
@@ -14418,35 +14411,73 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
             }
             let (_, phi_psi, phi_psi_psi) =
                 thin_plate_kernel_psi_triplet_from_distance(dist2.sqrt(), spec.length_scale, d)?;
-            omega_psi[[i, j]] = phi_psi;
-            omega_psi[[j, i]] = phi_psi;
-            omega_psi_psi[[i, j]] = phi_psi_psi;
-            omega_psi_psi[[j, i]] = phi_psi_psi;
+            if let Some(ref mut buf) = omega_psi {
+                buf[[i, j]] = phi_psi;
+                buf[[j, i]] = phi_psi;
+            }
+            if let Some(ref mut buf) = omega_psi_psi {
+                buf[[i, j]] = phi_psi_psi;
+                buf[[j, i]] = phi_psi_psi;
+            }
         }
     }
 
-    let kernel_psi = {
-        let zt_s = z_kernel.t().dot(&omega_psi);
-        zt_s.dot(&z_kernel)
-    };
-    let kernel_psi_psi = {
-        let zt_s = z_kernel.t().dot(&omega_psi_psi);
-        zt_s.dot(&z_kernel)
+    let project = |kernel_block: Array2<f64>| -> Array2<f64> {
+        let mut s = Array2::<f64>::zeros((total_cols, total_cols));
+        s.slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&kernel_block);
+        project_penalty_matrix(&s, identifiability_transform)
     };
 
-    let mut s_psi = Array2::<f64>::zeros((total_cols, total_cols));
-    let mut s_psi_psi = Array2::<f64>::zeros((total_cols, total_cols));
-    s_psi
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&kernel_psi);
-    s_psi_psi
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&kernel_psi_psi);
+    let s_psi_out = omega_psi.map(|m| {
+        let kernel_psi = z_kernel.t().dot(&m).dot(&z_kernel);
+        project(kernel_psi)
+    });
+    let s_psi_psi_out = omega_psi_psi.map(|m| {
+        let kernel_psi_psi = z_kernel.t().dot(&m).dot(&z_kernel);
+        project(kernel_psi_psi)
+    });
 
-    Ok((
-        project_penalty_matrix(&s_psi, identifiability_transform),
-        project_penalty_matrix(&s_psi_psi, identifiability_transform),
-    ))
+    Ok((s_psi_out, s_psi_psi_out))
+}
+
+/// Build the design ψ-derivatives for a Thin-Plate Spline term via the shared
+/// scalar streaming infrastructure that Duchon already uses at biobank scale.
+///
+/// At small `n` this materializes both the first and second derivative arrays
+/// just like the legacy dense path; at biobank scale the policy elects
+/// streaming and both arrays come back as zero-sized — only an
+/// `ImplicitDesignPsiDerivative` is returned, and downstream consumers
+/// (`spatial_log_kappa_hyper_dirs_frominfo_list`) dispatch matvecs through it
+/// instead of materializing dense `(n × p)` arrays per axis.
+fn build_thin_plate_scalar_design_psi_derivatives(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<ScalarDesignPsiDerivatives, BasisError> {
+    let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
+    let kernel_cols = z_kernel.ncols();
+    let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
+    let p_after_pad = kernel_cols + poly_cols;
+    let p_final = identifiability_transform
+        .map(|zf| zf.ncols())
+        .unwrap_or(p_after_pad);
+    build_scalar_design_psi_derivatives_shared(
+        data,
+        centers,
+        None,
+        p_final,
+        Some(z_kernel),
+        identifiability_transform.cloned(),
+        poly_cols,
+        RadialScalarKind::ThinPlate {
+            length_scale: spec.length_scale,
+            dim: data.ncols(),
+        },
+        0.0,
+    )
 }
 
 pub fn build_thin_plate_basis_log_kappa_derivative(
@@ -14475,25 +14506,31 @@ pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
             ));
         }
     };
-    let (design_derivative, _) = build_thin_plate_design_psi_derivativeswithworkspace(
+    let scalar = build_thin_plate_scalar_design_psi_derivatives(
         data,
         centers.view(),
         spec,
         identifiability_transform.as_ref(),
         workspace,
     )?;
-    let (primary_derivative, _) = build_thin_plate_penalty_psi_derivativeswithworkspace(
+    let (primary_derivative_opt, _) = build_thin_plate_penalty_psi_derivativeswithworkspace(
         centers.view(),
         spec,
         identifiability_transform.as_ref(),
         workspace,
+        ThinPlateDerivativeOrder::First,
     )?;
+    let primary_derivative = primary_derivative_opt.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "ThinPlate first-order penalty psi-derivative was not produced".to_string(),
+        )
+    })?;
     let penalties_derivative =
         active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?;
     Ok(BasisPsiDerivativeResult {
-        design_derivative,
+        design_derivative: scalar.design_first,
         penalties_derivative,
-        implicit_operator: None,
+        implicit_operator: scalar.implicit_operator,
     })
 }
 
@@ -14523,25 +14560,31 @@ pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
             ));
         }
     };
-    let (_, designsecond_derivative) = build_thin_plate_design_psi_derivativeswithworkspace(
+    let scalar = build_thin_plate_scalar_design_psi_derivatives(
         data,
         centers.view(),
         spec,
         identifiability_transform.as_ref(),
         workspace,
     )?;
-    let (_, primarysecond_derivative) = build_thin_plate_penalty_psi_derivativeswithworkspace(
+    let (_, primarysecond_derivative_opt) = build_thin_plate_penalty_psi_derivativeswithworkspace(
         centers.view(),
         spec,
         identifiability_transform.as_ref(),
         workspace,
+        ThinPlateDerivativeOrder::Second,
     )?;
+    let primarysecond_derivative = primarysecond_derivative_opt.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "ThinPlate second-order penalty psi-derivative was not produced".to_string(),
+        )
+    })?;
     let penaltiessecond_derivative =
         active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primarysecond_derivative)?;
     Ok(BasisPsiSecondDerivativeResult {
-        designsecond_derivative,
+        designsecond_derivative: scalar.design_second_diag,
         penaltiessecond_derivative,
-        implicit_operator: None,
+        implicit_operator: scalar.implicit_operator,
     })
 }
 
