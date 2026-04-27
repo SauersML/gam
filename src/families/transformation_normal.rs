@@ -27,11 +27,10 @@ use crate::faer_ndarray::{
 };
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
-    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
+    FamilyEvaluation, MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
@@ -1422,18 +1421,15 @@ impl CustomFamily for TransformationNormalFamily {
         // non-positive value is an upstream invariant break worth surfacing
         // loudly.
         let mut weighted_inv_hp_sq = Array1::<f64>::zeros(h_prime.len());
-        ndarray::Zip::indexed(&mut weighted_inv_hp_sq)
-            .and(self.weights.view())
-            .and(&h_prime)
-            .try_for_each(|i, slot, &w, &hp| -> Result<(), String> {
-                if !hp.is_finite() || hp <= 0.0 {
-                    return Err(format!(
-                        "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
-                    ));
-                }
-                *slot = w / (hp * hp);
-                Ok(())
-            })?;
+        for i in 0..h_prime.len() {
+            let hp = h_prime[i];
+            if !hp.is_finite() || hp <= 0.0 {
+                return Err(format!(
+                    "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
+                ));
+            }
+            weighted_inv_hp_sq[i] = self.weights[i] / (hp * hp);
+        }
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
             h_prime,
@@ -3905,7 +3901,13 @@ mod tests {
             [0.6, 0.3, -0.5],
             [1.4, -0.1, 0.7],
         ];
-        let right = array![[2.0, -1.0], [-0.5, 0.8], [1.2, 0.3], [-0.7, 1.1], [0.4, -0.6]];
+        let right = array![
+            [2.0, -1.0],
+            [-0.5, 0.8],
+            [1.2, 0.3],
+            [-0.7, 1.1],
+            [0.4, -0.6]
+        ];
         let weights = array![0.9, 1.3, 0.7, 1.1, 0.5];
         let v = array![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
         let n = left.nrows();

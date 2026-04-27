@@ -17,7 +17,6 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
-use crate::matrix::SymmetricMatrix;
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
@@ -28,6 +27,7 @@ use crate::families::sigma_link::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::linalg::utils::solve_spd_pcg_with_info;
+use crate::matrix::SymmetricMatrix;
 use crate::matrix::{DenseDesignOperator, DesignMatrix};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
@@ -117,19 +117,20 @@ fn dense_block_or_operator<'a>(
     }
 
     let dense_bytes = 8usize.saturating_mul(n).saturating_mul(p);
-    let compute_ok = match crate::linalg::matrix::panic_or_error_if_biobank_mode_compute_budget_exceeded(
-        "gamlss dense_block_or_operator",
-        n,
-        p,
-        crate::linalg::matrix::POLICY_DEFAULT_OUTER_ITER_ESTIMATE,
-        policy,
-    ) {
-        Ok(()) => true,
-        Err(msg) => {
-            log::info!("{msg}; falling back to operator path");
-            false
-        }
-    };
+    let compute_ok =
+        match crate::linalg::matrix::panic_or_error_if_biobank_mode_compute_budget_exceeded(
+            "gamlss dense_block_or_operator",
+            n,
+            p,
+            crate::linalg::matrix::POLICY_DEFAULT_OUTER_ITER_ESTIMATE,
+            policy,
+        ) {
+            Ok(()) => true,
+            Err(msg) => {
+                log::info!("{msg}; falling back to operator path");
+                false
+            }
+        };
     if compute_ok && dense_bytes <= budget_bytes {
         if let Ok(arc) = design
             .try_to_dense_with_policy(&policy.material_policy(), "gamlss dense_block_or_operator")
@@ -6677,12 +6678,13 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.family.exact_newton_joint_hessian_directional_derivative_from_designs(
-            &self.block_states,
-            &DenseOrOperator::Borrowed(&self.xmu),
-            &DenseOrOperator::Borrowed(&self.x_ls),
-            d_beta_flat,
-        )
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_from_designs(
+                &self.block_states,
+                &DenseOrOperator::Borrowed(&self.xmu),
+                &DenseOrOperator::Borrowed(&self.x_ls),
+                d_beta_flat,
+            )
     }
 
     fn second_directional_derivative(
@@ -6837,11 +6839,7 @@ struct GaussianLocationScaleWiggleHessianRowPieces {
 }
 
 impl GaussianLocationScaleWiggleHessianRowPieces {
-    fn assemble_dense(
-        &self,
-        xmu: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
+    fn assemble_dense(&self, xmu: &Array2<f64>, x_ls: &Array2<f64>) -> Result<Array2<f64>, String> {
         let h_mm = xt_diag_x_dense(xmu, &self.coeff_mm)?;
         let h_ml = xt_diag_y_dense(xmu, &self.coeff_ml, x_ls)?;
         let h_ll = xt_diag_x_dense(x_ls, &self.coeff_ll)?;
@@ -12748,9 +12746,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // matrix — the off-diagonal cross block is unused for IRLS-style block
         // working sets and would cost O(p_t * p_ls * n) to form. The diagonal
         // blocks are computed from the same row coefficients as the joint.
-        let (x_t, x_ls) = self.exact_joint_dense_block_designs(None)?.ok_or(
-            "BinomialLocationScaleFamily: joint block designs unavailable",
-        )?;
+        let (x_t, x_ls) = self
+            .exact_joint_dense_block_designs(None)?
+            .ok_or("BinomialLocationScaleFamily: joint block designs unavailable")?;
         let (h_tt, h_ll) =
             self.exact_newton_block_diagonal_hessians_from_designs(block_states, &x_t, &x_ls)?;
         Ok(FamilyEvaluation {
@@ -15657,11 +15655,7 @@ struct BinomialLocationScaleWiggleHessianRowPieces {
 }
 
 impl BinomialLocationScaleWiggleHessianRowPieces {
-    fn assemble_dense(
-        &self,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
+    fn assemble_dense(&self, x_t: &Array2<f64>, x_ls: &Array2<f64>) -> Result<Array2<f64>, String> {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let pw = self.b0.ncols();
@@ -15828,9 +15822,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         // Per-block diagonal Hessians without ever materializing the full p×p
         // joint matrix. The shared row-pieces struct exposes block diagonals
         // directly, so the cross blocks (h_tl, h_tw, h_lw) are not formed.
-        let (x_t, x_ls) = self.exact_joint_dense_block_designs(None)?.ok_or(
-            "BinomialLocationScaleWiggleFamily: joint block designs unavailable",
-        )?;
+        let (x_t, x_ls) = self
+            .exact_joint_dense_block_designs(None)?
+            .ok_or("BinomialLocationScaleWiggleFamily: joint block designs unavailable")?;
         let pieces = self.wiggle_hessian_row_pieces(block_states)?;
         let (h_tt, h_ll, h_ww) = pieces.assemble_block_diagonals(&x_t, &x_ls)?;
         Ok(FamilyEvaluation {
@@ -16841,11 +16835,12 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.family.exact_newton_joint_hessiansecond_directional_derivative(
-            &self.block_states,
-            d_beta_u_flat,
-            d_beta_v_flat,
-        )
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+            )
     }
 }
 

@@ -1,8 +1,7 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::pirls::{
-    LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState,
-    array1_l2_norm,
+    LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
 use crate::types::{Coefficients, LinearPredictor};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
