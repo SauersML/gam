@@ -169,8 +169,13 @@ fn tiny_logit_lamlvs_exact_oracle_regular_regime() {
             g_laml,
             g_exact
         );
+        // Hardened from 1.25 -> 0.50: a relative error above 50% on a 3x2
+        // logit problem in the regular regime is not "approximately right"
+        // — it indicates the LAML gradient is materially miscalibrated
+        // against the closed-form oracle. The previous bound permitted
+        // bugs that doubled the gradient magnitude.
         assert!(
-            rel_err < 1.25,
+            rel_err < 0.50,
             "regular-regime discrepancy too large at rho={:.3}: g_laml={:.6e}, g_exact={:.6e}, rel={:.3e}",
             rho,
             g_laml,
@@ -216,12 +221,15 @@ fn tiny_logit_lamlvs_exact_oracle_regular_regime_sweep_is_stable() {
         cosine > 0.85,
         "regular sweep cosine too low: cosine={cosine:.6}"
     );
+    // Hardened: median 1.0 -> 0.30 and max 1.25 -> 0.50. A regular-regime
+    // sweep should track the oracle to within ~30% on average; the previous
+    // bounds let bugs that doubled the gradient magnitude pass.
     assert!(
-        median_rel < 1.0,
+        median_rel < 0.30,
         "regular sweep median relative error too high: median_rel={median_rel:.3e}"
     );
     assert!(
-        max_rel < 1.25,
+        max_rel < 0.50,
         "regular sweep max relative error too high: max_rel={max_rel:.3e}"
     );
 }
@@ -255,8 +263,11 @@ fn tiny_logit_lamlvs_exact_oracle_near_separation_stress() {
     }
 
     // Sanity cap: we expect larger error than regular regime, but still bounded.
+    // Hardened 2.5 -> 1.25. Even in the near-separation stress regime the LAML
+    // gradient should not differ from the exact oracle by more than ~125%; a
+    // looser bound let cosine-only bugs sneak through.
     assert!(
-        worst_rel < 2.5,
+        worst_rel < 1.25,
         "stress-case discrepancy exploded: worst_rel={:.3e}",
         worst_rel
     );
@@ -288,8 +299,9 @@ fn tiny_logit_lamlvs_exact_oracle_stress_sweep_direction_consistent() {
         mismatches == 0,
         "stress sweep produced too many sign mismatches: {mismatches}"
     );
+    // Hardened 2.5 -> 1.25; matches the near-separation single-test bound.
     assert!(
-        worst_rel < 2.5,
+        worst_rel < 1.25,
         "stress sweep relative error exploded: worst_rel={worst_rel:.3e}"
     );
 }
@@ -304,8 +316,10 @@ fn test_lamlgradient_exact_formula_ground_truth() {
     let g_laml = lamlgradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
     assert_eq!(g_laml.signum(), g_exact.signum());
+    // Hardened 1.25 -> 0.50: the closed-form ground-truth path should agree
+    // with the exact quadrature oracle to within 50%.
     assert!(
-        rel_err < 1.25,
+        rel_err < 0.50,
         "ground-truth mismatch at rho={rho:.3}: g_laml={g_laml:.6e}, g_exact={g_exact:.6e}, rel={rel_err:.3e}",
     );
 }
@@ -323,8 +337,9 @@ fn test_lamlgradient_firth_exact_formula_ground_truth() {
     let g_laml = lamlgradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
     assert_eq!(g_laml.signum(), g_exact.signum());
+    // Hardened 2.5 -> 1.25: near-separation stress design, but still bounded.
     assert!(
-        rel_err < 2.5,
+        rel_err < 1.25,
         "firth-path ground-truth mismatch at rho={rho:.3}: g_laml={g_laml:.6e}, g_exact={g_exact:.6e}, rel={rel_err:.3e}",
     );
 }

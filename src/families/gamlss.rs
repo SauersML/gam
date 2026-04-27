@@ -8984,6 +8984,175 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
     fn block_geometry_is_dynamic(&self) -> bool {
         true
     }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let workspace = GaussianLocationScaleWiggleHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            xmu.into_owned(),
+            x_ls.into_owned(),
+        )?;
+        Ok(Some(Arc::new(workspace)))
+    }
+}
+
+/// Matrix-free joint-Hessian operator for the 3-block Gaussian
+/// location-scale wiggle family. See `GaussianLocationScaleWiggleHessianRowPieces`
+/// for the per-row weight structure. The matvec applies
+///
+///   r_μ  = D_mm u_μ + D_ml u_ls + D_mw_b (B v_w) + D_mw_d (B' v_w),
+///   r_ls = D_ml u_μ + D_ll u_ls + D_lw_b (B v_w),
+///   r_b  = D_mw_b u_μ + D_lw_b u_ls + D_ww (B v_w),
+///   r_d  = D_mw_d u_μ,
+///
+/// then forms `out_w = B^T r_b + (B')^T r_d`. The ls-wiggle cross block has
+/// no B' contribution because the wiggle enters the Gaussian likelihood only
+/// through `q = η_μ + η_w` (no σ-chain), so the Gaussian wiggle has one
+/// fewer cross-coefficient than the binomial wiggle.
+struct GaussianLocationScaleWiggleHessianWorkspace {
+    family: GaussianLocationScaleWiggleFamily,
+    block_states: Vec<ParameterBlockState>,
+    xmu: Array2<f64>,
+    x_ls: Array2<f64>,
+    pieces: GaussianLocationScaleWiggleHessianRowPieces,
+}
+
+impl GaussianLocationScaleWiggleHessianWorkspace {
+    fn new(
+        family: GaussianLocationScaleWiggleFamily,
+        block_states: Vec<ParameterBlockState>,
+        _specs: Vec<ParameterBlockSpec>,
+        xmu: Array2<f64>,
+        x_ls: Array2<f64>,
+    ) -> Result<Self, String> {
+        let pieces = family.wiggle_hessian_row_pieces(&block_states)?;
+        Ok(Self {
+            family,
+            block_states,
+            xmu,
+            x_ls,
+            pieces,
+        })
+    }
+}
+
+impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWorkspace {
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        let pmu = self.xmu.ncols();
+        let p_ls = self.x_ls.ncols();
+        let pw = self.pieces.basis.ncols();
+        let total = pmu + p_ls + pw;
+        if v.len() != total {
+            return Err(format!(
+                "GaussianLocationScaleWiggle matvec dimension mismatch: got {}, expected {}",
+                v.len(),
+                total
+            ));
+        }
+        let v_mu = v.slice(s![0..pmu]);
+        let v_ls = v.slice(s![pmu..pmu + p_ls]);
+        let v_w = v.slice(s![pmu + p_ls..total]);
+
+        let u_mu = self.xmu.dot(&v_mu);
+        let u_ls = self.x_ls.dot(&v_ls);
+        let u_b = self.pieces.basis.dot(&v_w);
+        let u_d = self.pieces.basis_d1.dot(&v_w);
+
+        let r_mu = &self.pieces.coeff_mm * &u_mu
+            + &self.pieces.coeff_ml * &u_ls
+            + &self.pieces.coeff_mw_b * &u_b
+            + &self.pieces.coeff_mw_d * &u_d;
+        let r_ls = &self.pieces.coeff_ml * &u_mu
+            + &self.pieces.coeff_ll * &u_ls
+            + &self.pieces.coeff_lw_b * &u_b;
+        let r_b = &self.pieces.coeff_mw_b * &u_mu
+            + &self.pieces.coeff_lw_b * &u_ls
+            + &self.pieces.coeff_ww * &u_b;
+        let r_d = &self.pieces.coeff_mw_d * &u_mu;
+
+        let out_mu = self.xmu.t().dot(&r_mu);
+        let out_ls = self.x_ls.t().dot(&r_ls);
+        let out_w = self.pieces.basis.t().dot(&r_b) + &self.pieces.basis_d1.t().dot(&r_d);
+
+        let mut out = Array1::<f64>::zeros(total);
+        out.slice_mut(s![0..pmu]).assign(&out_mu);
+        out.slice_mut(s![pmu..pmu + p_ls]).assign(&out_ls);
+        out.slice_mut(s![pmu + p_ls..total]).assign(&out_w);
+        Ok(Some(out))
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        let pmu = self.xmu.ncols();
+        let p_ls = self.x_ls.ncols();
+        let pw = self.pieces.basis.ncols();
+        let total = pmu + p_ls + pw;
+        let mut diag = Array1::<f64>::zeros(total);
+        let n = self.pieces.coeff_mm.len();
+        for j in 0..pmu {
+            let col = self.xmu.column(j);
+            let mut acc = 0.0;
+            for i in 0..n {
+                let v = col[i];
+                acc += self.pieces.coeff_mm[i] * v * v;
+            }
+            diag[j] = acc;
+        }
+        for j in 0..p_ls {
+            let col = self.x_ls.column(j);
+            let mut acc = 0.0;
+            for i in 0..n {
+                let v = col[i];
+                acc += self.pieces.coeff_ll[i] * v * v;
+            }
+            diag[pmu + j] = acc;
+        }
+        for j in 0..pw {
+            let col = self.pieces.basis.column(j);
+            let mut acc = 0.0;
+            for i in 0..n {
+                let v = col[i];
+                acc += self.pieces.coeff_ww[i] * v * v;
+            }
+            diag[pmu + p_ls + j] = acc;
+        }
+        Ok(Some(diag))
+    }
+
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_from_designs(
+                &self.block_states,
+                &self.xmu,
+                &self.x_ls,
+                d_beta_flat,
+            )
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+                &self.block_states,
+                &self.xmu,
+                &self.x_ls,
+                d_beta_u_flat,
+                d_beta_v_flat,
+            )
+    }
 }
 
 impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {

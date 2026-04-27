@@ -88,6 +88,9 @@ fn probit_fit_and_predict_fast_integration() {
 
 #[test]
 fn probitworkingvectors_are_finite_for_extreme_eta() {
+    // Eta laid out so we can index the limit cases directly:
+    //   0 -> -100 (saturated low), 1 -> -20, 2 -> 0 (peak weight),
+    //   3 -> +20, 4 -> +100 (saturated high)
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0]);
     let eta = Array1::from_vec(vec![-100.0, -20.0, 0.0, 20.0, 100.0]);
     let w = Array1::ones(y.len());
@@ -106,9 +109,110 @@ fn probitworkingvectors_are_finite_for_extreme_eta() {
     )
     .expect("probit working-vector update should succeed");
 
-    assert!(mu.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
-    assert!(weights.iter().all(|v| v.is_finite() && *v >= 0.0));
-    assert!(z.iter().all(|v| v.is_finite()));
+    // --- Finiteness / bounds (preserved from the original smoke test) ---
+    assert!(
+        mu.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0),
+        "probit mu out of [0,1] or non-finite: mu={mu:?}"
+    );
+    assert!(
+        weights.iter().all(|v| v.is_finite() && *v >= 0.0),
+        "probit weights non-finite or negative: weights={weights:?}"
+    );
+    assert!(z.iter().all(|v| v.is_finite()), "probit z non-finite: z={z:?}");
+
+    // --- Mathematical contract for Φ ---
+    // mu must implement the standard normal CDF, so the saturated tails
+    // collapse to {0, 1} and the centered eta gives 0.5 exactly.
+    assert!(
+        mu[0] < 1e-12,
+        "Φ(-100) must collapse to ~0; got mu[0]={}",
+        mu[0]
+    );
+    assert!(
+        mu[1] < 1e-6,
+        "Φ(-20) must be tiny; got mu[1]={}",
+        mu[1]
+    );
+    assert!(
+        (mu[2] - 0.5).abs() < 1e-12,
+        "Φ(0) must equal 0.5 exactly within fp tol; got mu[2]={}",
+        mu[2]
+    );
+    assert!(
+        mu[3] > 1.0 - 1e-6,
+        "Φ(+20) must be ~1; got mu[3]={}",
+        mu[3]
+    );
+    assert!(
+        mu[4] > 1.0 - 1e-12,
+        "Φ(+100) must collapse to ~1; got mu[4]={}",
+        mu[4]
+    );
+
+    // mu must be monotonically non-decreasing in eta (probit link is
+    // strictly increasing).
+    for i in 1..mu.len() {
+        assert!(
+            mu[i] >= mu[i - 1] - 1e-15,
+            "probit mu must be non-decreasing in eta; mu[{i}]={mu_i} < mu[{prev_i}]={mu_prev}",
+            mu_i = mu[i],
+            prev_i = i - 1,
+            mu_prev = mu[i - 1]
+        );
+    }
+
+    // --- IRLS weight contract ---
+    // The probit IRLS weight is φ(η)² / [Φ(η)(1-Φ(η))], which is largest
+    // near η = 0 and tends to 0 as |η| → ∞. We don't pin a specific value
+    // (the implementation may clamp small denominators), but the qualitative
+    // ordering must hold.
+    assert!(
+        weights[2] > weights[0],
+        "probit weight at eta=0 must exceed weight at eta=-100; w[0]={}, w[2]={}",
+        weights[0],
+        weights[2]
+    );
+    assert!(
+        weights[2] > weights[4],
+        "probit weight at eta=0 must exceed weight at eta=+100; w[2]={}, w[4]={}",
+        weights[2],
+        weights[4]
+    );
+    assert!(
+        weights[2] > weights[1],
+        "probit weight at eta=0 must exceed weight at eta=-20; w[1]={}, w[2]={}",
+        weights[1],
+        weights[2]
+    );
+    assert!(
+        weights[2] > weights[3],
+        "probit weight at eta=0 must exceed weight at eta=+20; w[3]={}, w[2]={}",
+        weights[3],
+        weights[2]
+    );
+
+    // --- Working-response sign contract ---
+    // For a saturated η (μ ≈ y), the residual (y-μ) is tiny; combined with a
+    // tiny weight, z is allowed to be wide, but the sign of (z - η) must
+    // match the sign of (y - μ): if y is the larger class, z should pull
+    // upward (z - η > 0), otherwise downward.
+    for i in 0..y.len() {
+        let residual = y[i] - mu[i];
+        if residual.abs() > 1e-9 {
+            let pull = z[i] - eta[i];
+            assert!(
+                pull * residual >= -1e-12,
+                "probit working response must pull η toward y on row {i}: \
+                 y={}, mu={}, eta={}, z={}, pull={}, residual={}",
+                y[i],
+                mu[i],
+                eta[i],
+                z[i],
+                pull,
+                residual,
+            );
+        }
+    }
 }
 
 #[test]
@@ -179,6 +283,8 @@ fn cloglog_fit_and_predict_fast_integration() {
 
 #[test]
 fn cloglogworkingvectors_are_finite_for_extreme_eta() {
+    // Same eta layout as the probit test: index 2 is η=0 where the
+    // canonical cloglog mean is exactly 1 - 1/e.
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0]);
     let eta = Array1::from_vec(vec![-100.0, -20.0, 0.0, 20.0, 100.0]);
     let w = Array1::ones(y.len());
@@ -197,7 +303,53 @@ fn cloglogworkingvectors_are_finite_for_extreme_eta() {
     )
     .expect("cloglog working-vector update should succeed");
 
-    assert!(mu.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
-    assert!(weights.iter().all(|v| v.is_finite() && *v >= 0.0));
-    assert!(z.iter().all(|v| v.is_finite()));
+    // --- Finiteness / bounds (preserved from the original smoke test) ---
+    assert!(
+        mu.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0),
+        "cloglog mu out of [0,1] or non-finite: mu={mu:?}"
+    );
+    assert!(
+        weights.iter().all(|v| v.is_finite() && *v >= 0.0),
+        "cloglog weights non-finite or negative: weights={weights:?}"
+    );
+    assert!(z.iter().all(|v| v.is_finite()), "cloglog z non-finite: z={z:?}");
+
+    // --- Mathematical contract for the cloglog mean function ---
+    // μ(η) = 1 - exp(-exp(η))
+    //   η = -100: exp(-exp(-100)) ≈ exp(-tiny) ≈ 1, so μ ≈ 0
+    //   η =    0: μ = 1 - 1/e
+    //   η = +100: μ ≈ 1
+    assert!(
+        mu[0] < 1e-12,
+        "cloglog μ(-100) must collapse to ~0; got mu[0]={}",
+        mu[0]
+    );
+    let expected_zero = 1.0 - (-1.0_f64).exp();
+    assert!(
+        (mu[2] - expected_zero).abs() < 1e-12,
+        "cloglog μ(0) must equal 1 - exp(-1) = {expected_zero}; got mu[2]={}",
+        mu[2]
+    );
+    assert!(
+        mu[3] > 1.0 - 1e-9,
+        "cloglog μ(+20) must be ~1 (exp(20) saturates the inner exp); got mu[3]={}",
+        mu[3]
+    );
+    assert!(
+        mu[4] > 1.0 - 1e-12,
+        "cloglog μ(+100) must collapse to ~1; got mu[4]={}",
+        mu[4]
+    );
+
+    // mu must be monotonically non-decreasing in eta (cloglog link is
+    // strictly increasing).
+    for i in 1..mu.len() {
+        assert!(
+            mu[i] >= mu[i - 1] - 1e-15,
+            "cloglog mu must be non-decreasing in eta; mu[{i}]={mu_i} < mu[{prev_i}]={mu_prev}",
+            mu_i = mu[i],
+            prev_i = i - 1,
+            mu_prev = mu[i - 1]
+        );
+    }
 }
