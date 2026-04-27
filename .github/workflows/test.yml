@@ -193,3 +193,19 @@ jobs:
             tests/bench_fuzz_vs_mgcv_test.py \
             tests/bench_biobank_scale_runner_test.py \
             -v --tb=short
+
+      - name: Build gam release binary
+        # The integration scripts below shell out to target/release/gam.
+        # The maturin wheel build above produces the Python extension, not
+        # the CLI binary; we need an explicit cargo build.
+        run: cargo build --release --bin gam
+
+      - name: Run CLI integration scripts (numeric contract checks)
+        # Both scripts now perform numeric contract assertions on top of
+        # exit-code checks: PIT pipeline asserts |z̄| < 0.5 and 0.5 < sd(z) < 1.8;
+        # marginal-slope asserts each prediction column is in [0,1] and not
+        # collapsed to a constant value. A mutation that emits constant or
+        # biased predictions will fail here, not silently exit 0.
+        run: |
+          python tests/integration_marginal_slope.py
+          python tests/integration_pit_pipeline.py

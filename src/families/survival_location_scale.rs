@@ -7638,15 +7638,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         specs: &[crate::custom_family::ParameterBlockSpec],
     ) -> u64 {
         // Survival location-scale couples its blocks (threshold/time/log-σ
-        // and any link/time wiggles) through the survival likelihood, so
-        // the joint Hessian is dense over (Σ p_b)² and per-evaluation work
-        // is n · (Σ p_b)².
-        let n = self.n as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        // and any link/time wiggles) through the survival likelihood: every
+        // row contributes a dense outer-product over (Σ p_b) coefficients.
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {

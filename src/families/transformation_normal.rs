@@ -660,6 +660,61 @@ fn chunked_weighted_bt_d_designmatrix(
     Ok(out)
 }
 
+/// Apply a Khatri-Rao weighted Gram to a vector, fusing the forward and
+/// transpose halves through a single `(n × p_resp)` buffer.
+///
+/// Computes `out = (A ⊙ B)^T diag(weights) (A ⊙ B) v`, where
+///   - `left = A` is the dense response factor `(n × p_resp)`,
+///   - `right = B` is the dense covariate factor `(n × p_cov)`,
+///   - `weights` is the per-row diagonal,
+///   - `v` flattens the response-major coefficient block `(p_resp × p_cov)`.
+///
+/// The standard factored apply
+/// `transpose_mul(weights · forward_mul(v))` allocates the `(n × p_resp)`
+/// intermediate twice — once inside `forward_mul` (`B · V^T`) and once
+/// inside `transpose_mul` (`weighted_left = scaled · A` row-wise). This
+/// fused helper allocates that buffer exactly once: it is filled by the
+/// forward gemm `R = B · V^T`, then overwritten in place row by row to
+/// `U[i, a] = w_i · (A[i, :] · R[i, :]) · A[i, a]`, then consumed by the
+/// transpose gemm `U^T · B`. FLOP count is unchanged (two BLAS gemms plus
+/// one `O(n · p_resp)` row pass); peak transient memory drops by
+/// `n · p_resp · 8` bytes — at biobank scale that is ~33 MiB saved per
+/// matvec, multiplied across the inner-PCG and outer-trace matvec budgets.
+fn fused_khatri_rao_weighted_gram_apply(
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    weights: &Array1<f64>,
+    v: &Array1<f64>,
+) -> Array1<f64> {
+    let n = left.nrows();
+    let p_resp = left.ncols();
+    let p_cov = right.ncols();
+    debug_assert_eq!(right.nrows(), n);
+    debug_assert_eq!(weights.len(), n);
+    debug_assert_eq!(v.len(), p_resp * p_cov);
+    let v_mat = v
+        .view()
+        .into_shape_with_order((p_resp, p_cov))
+        .expect("v reshape to (p_resp, p_cov) — caller validates length");
+    // Forward phase: buf = B · V^T.
+    let mut buf = fast_ab(right, &v_mat.t().to_owned());
+    // Inner pass: overwrite buf row-by-row to U[i, :] = w_i · xv_i · A[i, :].
+    ndarray::Zip::from(buf.rows_mut())
+        .and(left.rows())
+        .and(weights.view())
+        .for_each(|mut buf_row, left_row, &w| {
+            let xv_i = left_row.dot(&buf_row);
+            let factor = w * xv_i;
+            buf_row.assign(&left_row);
+            buf_row *= factor;
+        });
+    // Transpose phase: result_mat = U^T · B → (p_resp × p_cov).
+    let result_mat = fast_atb(&buf, right);
+    result_mat
+        .into_shape_with_order((p_resp * p_cov,))
+        .expect("p_resp · p_cov flatten")
+}
+
 // ---------------------------------------------------------------------------
 // CustomFamily implementation
 // ---------------------------------------------------------------------------
@@ -1439,13 +1494,32 @@ impl TransformationNormalJointHessianWorkspace {
         // Term 2: factored (X_deriv^T diag(w/h'²) X_deriv) · v.
         //
         // The deriv kernel changes with β, so we apply it through the
-        // Khatri–Rao operator: forward_mul, scale in place by the cached
-        // (w/h'²) kernel, transpose_mul. Two BLAS gemms plus one O(n) scale,
-        // zero p×p storage.
-        let mut deriv_image = self.family.x_deriv_kron.forward_mul(v);
-        deriv_image *= &self.weighted_inv_hp_sq;
-        out += &self.family.x_deriv_kron.transpose_mul(&deriv_image);
+        // Khatri-Rao factor pair `(response_deriv_basis, covariate_design)`.
+        // Dense covariates take the fused path that allocates one
+        // `(n × p_resp)` buffer; sparse / operator-backed covariates fall
+        // through to the existing factored apply on `x_deriv_kron`, which
+        // uses the operator's `apply` / `apply_transpose` chunk primitives.
+        out += &self.factored_deriv_apply(v);
         Ok(out)
+    }
+
+    /// Factored apply of `X_deriv^T diag(weighted_inv_hp_sq) X_deriv` to `v`.
+    ///
+    /// Selects the fused dense-covariate path when available; otherwise calls
+    /// through `KroneckerDesign::forward_mul` / `transpose_mul`.
+    fn factored_deriv_apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
+            fused_khatri_rao_weighted_gram_apply(
+                &self.family.response_deriv_basis,
+                cov_dense,
+                &self.weighted_inv_hp_sq,
+                v,
+            )
+        } else {
+            let mut deriv_image = self.family.x_deriv_kron.forward_mul(v);
+            deriv_image *= &self.weighted_inv_hp_sq;
+            self.family.x_deriv_kron.transpose_mul(&deriv_image)
+        }
     }
 
     /// Exact diagonal of the unpenalized joint Hessian.
@@ -1657,12 +1731,23 @@ impl TransformationNormalDhMatrixFreeOperator {
 
     /// `(dH) · v = X_deriv^T diag(weight_kernel) X_deriv v`.
     ///
-    /// One forward_mul + one in-place per-row scale + one transpose_mul:
-    /// two BLAS gemms and a single (n,) buffer reused for the scale.
+    /// Dense covariate: single fused (n × p_resp) buffer (see
+    /// `fused_khatri_rao_weighted_gram_apply`). Sparse/operator covariate:
+    /// fall through to `forward_mul → in-place scale → transpose_mul` on
+    /// the cached `KroneckerDesign`. Two BLAS gemms either way.
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let mut image = self.family.x_deriv_kron.forward_mul(v);
-        image *= &self.weight_kernel;
-        self.family.x_deriv_kron.transpose_mul(&image)
+        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
+            fused_khatri_rao_weighted_gram_apply(
+                &self.family.response_deriv_basis,
+                cov_dense,
+                &self.weight_kernel,
+                v,
+            )
+        } else {
+            let mut image = self.family.x_deriv_kron.forward_mul(v);
+            image *= &self.weight_kernel;
+            self.family.x_deriv_kron.transpose_mul(&image)
+        }
     }
 }
 
@@ -1735,11 +1820,21 @@ impl TransformationNormalD2hMatrixFreeOperator {
 
     /// `(d²H) · w = X_deriv^T diag(weight_kernel) X_deriv w`.
     ///
-    /// Same single-buffer in-place scale + two BLAS gemms as the dH apply.
+    /// Same fused dense-covariate path / KroneckerDesign fallback as the dH
+    /// apply.
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let mut image = self.family.x_deriv_kron.forward_mul(v);
-        image *= &self.weight_kernel;
-        self.family.x_deriv_kron.transpose_mul(&image)
+        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
+            fused_khatri_rao_weighted_gram_apply(
+                &self.family.response_deriv_basis,
+                cov_dense,
+                &self.weight_kernel,
+                v,
+            )
+        } else {
+            let mut image = self.family.x_deriv_kron.forward_mul(v);
+            image *= &self.weight_kernel;
+            self.family.x_deriv_kron.transpose_mul(&image)
+        }
     }
 }
 
@@ -3779,6 +3874,57 @@ mod tests {
                     got[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fused_khatri_rao_weighted_gram_apply_matches_explicit_dense() {
+        // Hand-constructed oracle: build (A ⊙ B) explicitly, compute
+        // X^T diag(w) X · v, and compare to the fused helper. Locks in the
+        // math (factored vs replicated) without going through the workspace.
+        let left = array![
+            [1.0, 0.5, -0.2],
+            [-0.3, 1.1, 0.4],
+            [0.2, -0.7, 0.9],
+            [0.6, 0.3, -0.5],
+            [1.4, -0.1, 0.7],
+        ];
+        let right = array![[2.0, -1.0], [-0.5, 0.8], [1.2, 0.3], [-0.7, 1.1], [0.4, -0.6]];
+        let weights = array![0.9, 1.3, 0.7, 1.1, 0.5];
+        let v = array![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
+        let n = left.nrows();
+        let p_resp = left.ncols();
+        let p_cov = right.ncols();
+        assert_eq!(weights.len(), n);
+        assert_eq!(v.len(), p_resp * p_cov);
+        // Replicated reference X[i, a*p_cov + b] = A[i, a] · B[i, b].
+        let mut x_rep = Array2::<f64>::zeros((n, p_resp * p_cov));
+        for i in 0..n {
+            for a in 0..p_resp {
+                for b in 0..p_cov {
+                    x_rep[[i, a * p_cov + b]] = left[[i, a]] * right[[i, b]];
+                }
+            }
+        }
+        let mut weighted_x = x_rep.clone();
+        for i in 0..n {
+            let w = weights[i];
+            for j in 0..(p_resp * p_cov) {
+                weighted_x[[i, j]] *= w;
+            }
+        }
+        let dense_h = x_rep.t().dot(&weighted_x);
+        let want = dense_h.dot(&v);
+        let got = fused_khatri_rao_weighted_gram_apply(&left, &right, &weights, &v);
+        assert_eq!(got.len(), want.len());
+        for i in 0..want.len() {
+            let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+            assert!(
+                (want[i] - got[i]).abs() <= tol,
+                "fused mismatch at {i}: dense={:.6e}, fused={:.6e}",
+                want[i],
+                got[i],
+            );
         }
     }
 

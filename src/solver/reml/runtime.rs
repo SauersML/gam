@@ -2530,20 +2530,21 @@ impl<'a> RemlState<'a> {
                 // approximate score. The result is not cached, the warm
                 // start is not updated, and KKT is not enforced (the actual
                 // fit at full inner budget will).
-                let finite_objective = pirls_result.deviance.is_finite()
-                    && pirls_result.stable_penalty_term.is_finite();
-                let finite_beta = pirls_result
-                    .beta_transformed
-                    .0
-                    .iter()
-                    .all(|v| v.is_finite());
-                let finite_hessian_proxy = pirls_result.gradient_natural_scale.is_finite();
-                let finite_residual = pirls_result.lastgradient_norm.is_finite();
+                // Order the predicates so the O(1) scalar finiteness checks
+                // run before the O(p) β-vector walk: short-circuit means a
+                // pathological partial fit (NaN deviance, NaN
+                // gradient_natural_scale, etc.) is rejected without paying
+                // the linear scan over coefficients.
                 if in_screening
-                    && finite_objective
-                    && finite_beta
-                    && finite_hessian_proxy
-                    && finite_residual
+                    && pirls_result.deviance.is_finite()
+                    && pirls_result.stable_penalty_term.is_finite()
+                    && pirls_result.gradient_natural_scale.is_finite()
+                    && pirls_result.lastgradient_norm.is_finite()
+                    && pirls_result
+                        .beta_transformed
+                        .0
+                        .iter()
+                        .all(|v| v.is_finite())
                 {
                     log::debug!(
                         "[seed-screen] partial-fit accepted for ranking: {kind} (|g| {:.3e}, r_g {:.3e}, iter {})",
@@ -2733,7 +2734,19 @@ impl<'a> RemlState<'a> {
             }
 
             const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
-            let want_hot_diag = self.should_compute_hot_diagnostics(cost_call_idx);
+            // Hot diagnostics walk the Hessian eigenspectrum and emit
+            // ill-conditioning warnings. They are only meaningful for fully
+            // converged inner modes — partial fits accepted from seed
+            // screening (cap=3) routinely yield indefinite Hessians, and
+            // surfacing those as `Penalized Hessian not PD` warnings would
+            // confuse log readers and mask real production-fit issues.
+            let is_partial_fit = matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::MaxIterationsReached
+                    | pirls::PirlsStatus::LmStepSearchExhausted,
+            );
+            let want_hot_diag =
+                !is_partial_fit && self.should_compute_hot_diagnostics(cost_call_idx);
             if ridge_used > 0.0 && want_hot_diag {
                 // Eigenvalue diagnostics require dense; only pay the cost when
                 // hot diagnostics are requested and ridge was applied.

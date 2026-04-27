@@ -54,6 +54,18 @@ class RunSuiteMappingTests(unittest.TestCase):
             model_spec="s_temp ~ s(year, type=ps, knots=7) via release binary [5-fold CV]",
         )
         self.assertEqual(result["evaluation"], "5-fold CV")
+        # Required-metadata contract: every successful result row must carry
+        # the metadata fields downstream tooling (validate_result_metadata,
+        # the JSON aggregator, the report generator) depends on. A mutation
+        # that drops any of these would silently corrupt aggregated reports.
+        for required in ("status", "scenario_name", "contender", "evaluation", "model_spec"):
+            self.assertIn(
+                required,
+                result,
+                f"finalized CV result missing required key {required!r}; got {sorted(result)}",
+            )
+        self.assertEqual(result["scenario_name"], "wine_temp_vs_year")
+        self.assertEqual(result["contender"], "rust_gam")
 
     def test_finalize_cv_result_rejects_reserved_metric_keys(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "reserved result keys: evaluation"):

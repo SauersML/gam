@@ -6180,16 +6180,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Two fully-coupled blocks (mean p_t, log-σ p_ℓ): the joint Hessian
-        // has size (p_t + p_ℓ)² and each of the n rows contributes a full
-        // outer-product to all four blocks, so honest per-evaluation work is
-        // n · (p_t + p_ℓ)² rather than the block-diagonal sum n · (p_t² + p_ℓ²).
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        // Two fully-coupled blocks (mean p_t, log-σ p_ℓ): every row contributes
+        // an outer-product over all (p_t + p_ℓ) coefficients, so honest cost is
+        // n · (p_t + p_ℓ)² rather than the block-diagonal n · (p_t² + p_ℓ²).
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -8636,14 +8630,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Three fully-coupled blocks (mean p_t, log-σ p_ℓ, link-wiggle p_w):
-        // every cross-block in the joint Hessian is dense, so per-evaluation
-        // work is n · (p_t + p_ℓ + p_w)².
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        // every cross-block in the joint Hessian is dense.
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
     fn block_linear_constraints(
@@ -9527,12 +9515,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Mean and link-wiggle blocks couple through the binomial weight,
         // giving a dense joint Hessian of size (p_μ + p_w)² per row.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
     fn block_linear_constraints(
@@ -12698,12 +12681,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Two fully-coupled blocks (threshold p_t, log-σ p_ℓ): joint Hessian
         // size (p_t + p_ℓ)² per row.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -15735,12 +15713,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Three fully-coupled blocks (threshold p_t, log-σ p_ℓ, link-wiggle
         // p_w): joint Hessian size (p_t + p_ℓ + p_w)² per row.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
     /// The wiggle family carries a structural null-space direction: the

@@ -38,6 +38,70 @@ def generate_data(n=300, seed=42):
     return rows
 
 
+def _is_finite(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return f == f and f not in (float("inf"), float("-inf"))
+
+
+def _validate_prediction_output(name, path):
+    """Read the prediction CSV produced by gam predict and assert it
+    looks like a valid probability or survival output. Raises RuntimeError
+    on contract violation so the caller treats it as a failed run."""
+    import csv as _csv
+
+    with open(path, "r", encoding="utf-8") as fh:
+        reader = _csv.DictReader(fh)
+        rows_out = list(reader)
+    if not rows_out:
+        raise RuntimeError(f"{name} produced an empty prediction output")
+    header = list(rows_out[0].keys())
+
+    # Pick the most informative column we can verify. Bernoulli marginal
+    # slope predicts a probability (`mean` or `prob`); survival marginal
+    # slope predicts a survival probability or hazard.
+    candidates = ["mean", "prob", "survival_prob"]
+    column = next((c for c in candidates if c in header), None)
+    if column is None:
+        # Nothing we can verify numerically; skip rather than fail because
+        # some predict modes emit only `eta`. Print so an integrator can see.
+        print(f"  [warn] {name} prediction has columns {header}; no numeric "
+              f"contract enforced")
+        return
+
+    values = []
+    for r in rows_out:
+        v = r.get(column)
+        if not _is_finite(v):
+            raise RuntimeError(
+                f"{name} prediction column {column} has non-finite entry: {v}"
+            )
+        values.append(float(v))
+
+    if not values:
+        raise RuntimeError(f"{name} prediction column {column} was empty")
+
+    # Probability columns must sit in [0, 1].
+    out_of_band = [(i, v) for i, v in enumerate(values) if v < -1e-9 or v > 1.0 + 1e-9]
+    if out_of_band:
+        raise RuntimeError(
+            f"{name} prediction column {column} has {len(out_of_band)} values "
+            f"outside [0,1]; first: {out_of_band[:3]}"
+        )
+
+    # Spread sanity: a model that collapsed to a constant prediction is
+    # uninformative, even if every value is in [0, 1]. Require a non-trivial
+    # range across the test rows for marginal-slope contenders.
+    spread = max(values) - min(values)
+    if spread < 1e-4:
+        raise RuntimeError(
+            f"{name} prediction column {column} is essentially constant "
+            f"(range={spread:.2e}); model has not learned anything"
+        )
+
+
 def write_csv(rows, path):
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -97,6 +161,12 @@ def main():
             out = os.path.join(tmpdir, f"{name}_pred.csv")
             R[f"pred_{name}"] = run(
                 ["predict", mp(name), dp, "--out", out], f"predict:{name}")
+            # Numeric contract: a successful predict run must produce
+            # well-formed probability/survival output. A model that always
+            # emits `mean = 0.5` would still exit 0; the structured check
+            # below catches that.
+            if R[f"pred_{name}"] and os.path.exists(out):
+                _validate_prediction_output(name, out)
 
     # ── Bernoulli marginal-slope ─────────────────────────────────────
     bern("bern_rigid",
