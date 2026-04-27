@@ -610,17 +610,51 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
     if family == "binomial":
         model_type = "gam"  # no binomial gamlss for now
 
-    n_obs = choice([50, 100, 200, 500, 1000, 2000, 5000])
+    # Sample size distribution — keep n=50 well-represented (worst-case
+    # small-data behavior) AND ensure n>=2000 has weight too: that's where
+    # bugs like the fast_xt_diag_x sign bug only surfaced after the faer
+    # dense threshold.
+    n_obs = choice([
+        50, 50, 50, 100, 100, 200, 200, 500, 500,
+        1000, 1000, 2000, 2000, 5000, 10000,
+    ])
     n_smooths = choice([1, 1, 2, 2, 3, 3, 5, 7, 10])
-    knots = choice([4, 5, 7, 8, 10, 12, 15, 20])
+    # Knot grid spans both very-low (k=3, under-smoothed) and very-high
+    # (k=25, over-parameterized vs small n) so under/over-fit regressions
+    # both surface.
+    knots = choice([3, 3, 4, 5, 7, 8, 10, 12, 15, 18, 20, 25])
     double_penalty = rng.random() < 0.5
-    noise_sd = choice([0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0])
-    noise_kind = choice(list(NOISE_FN.keys()))
+    noise_sd = choice([0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0])
+    # Bias toward pathological noise distributions (cauchy / contaminated /
+    # sparse_outlier / mixture / periodic_het) that exercise the IRLS
+    # robustness path. Plain gaussian is still reachable but down-weighted.
+    _hard_noise = [
+        "cauchy", "contaminated", "sparse_outlier", "mixture",
+        "periodic_het", "ar1", "lognormal", "bimodal",
+    ]
+    _easy_noise = ["gaussian", "t", "laplace", "skew", "uniform",
+                   "heteroscedastic", "quantized"]
+    noise_kind = (choice(_hard_noise) if rng.random() < 0.55
+                  else choice(_easy_noise))
     smooth_kinds = [choice(list(SMOOTH_FN.keys())) for _ in range(n_smooths)]
-    x_distribution = choice(list(XDIST_FN.keys()))
+    # Bias toward harder x distributions (heavy-tailed, low-dim manifold,
+    # near-collinear, mixture-of-lines, clustered) that produce
+    # ill-conditioned design matrices.
+    _hard_x = ["heavy_tailed", "low_dim_manifold", "mixture_of_lines",
+               "clustered", "correlated", "bimodal", "sparse"]
+    _easy_x = ["uniform", "normal", "skewed", "uniform_wide", "grid"]
+    x_distribution = (choice(_hard_x) if rng.random() < 0.55
+                      else choice(_easy_x))
     basis_type = choice(["ps"]*3 + ["tps"]*2 + ["duchon"]*3)
-    collinear_strength = choice([0]*4 + [0.3, 0.5, 0.7, 0.9])
-    signal_structure = choice(list(SIGNAL_BUILDERS.keys()))
+    # Push collinearity harder: ~70% of trials now have >0 collinearity, with
+    # near-collinear (0.85+) configurations explicitly represented.
+    collinear_strength = choice([0]*3 + [0.3, 0.5, 0.7, 0.85, 0.9, 0.95])
+    # Signal structure: bias toward the more demanding builders (regime
+    # changes near support boundary, stacked, low-dim manifold, surface_2d).
+    _hard_signal = ["regime", "stacked", "low_dim_manifold",
+                    "additive_interaction", "surface_2d"]
+    signal_structure = (choice(_hard_signal) if rng.random() < 0.55
+                        else choice(list(SIGNAL_BUILDERS.keys())))
     sigma_kind = choice(list(SIGMA_FN.keys())) if model_type == "gamlss" else "constant"
     duchon_order = choice([0, 0, 1])
     duchon_power = choice([1, 2, 2])
@@ -853,13 +887,18 @@ def mgcv_formula(cols, sc):
         m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
         k_val = sc.knots
         duchon_term = f"s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
-        extra = [f"s({c}, bs='ps', k=min({sc.knots + 4}, nrow(train_df)-1))" for c in cols[dims:]]
+        # Match rust ps d.o.f. exactly — no +4 padding on mgcv side. The
+        # previous +4 gave mgcv ~8 extra basis functions per term and
+        # spuriously inflated the apparent gap; see the seed-138
+        # forced-duchon investigation.
+        extra = [f"s({c}, bs='ps', k=min({sc.knots}, nrow(train_df)-1))" for c in cols[dims:]]
         return "y ~ " + " + ".join([duchon_term] + extra)
     elif sc.basis_type == "tps":
         terms = [f"s({c}, bs='tp', k=min({sc.knots}, nrow(train_df)-1))" for c in cols]
         return "y ~ " + " + ".join(terms)
     else:
-        terms = [f"s({c}, bs='ps', k=min({sc.knots + 4}, nrow(train_df)-1))" for c in cols]
+        # Match rust ps d.o.f. exactly — no +4 padding on mgcv side.
+        terms = [f"s({c}, bs='ps', k=min({sc.knots}, nrow(train_df)-1))" for c in cols]
         return "y ~ " + " + ".join(terms)
 
 
@@ -879,7 +918,12 @@ def mgcv_sigma_formula(cols, sc):
         # polyharmonic kernels.
         m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
         return f"~ s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
-    k_val = max(3, sc.knots // 2) + (4 if sc.basis_type == "ps" else 0)
+    # Match rust noise-side d.o.f. exactly — rust uses
+    # `knots=max(3, sc.knots // 2)` (see rust_noise_terms above), and
+    # mgcv must use the same effective k or the comparison is unfair.
+    # Previously this added +4 in the ps branch, mirroring the
+    # since-removed mean-side asymmetry.
+    k_val = max(3, sc.knots // 2)
     bs = "ps" if sc.basis_type == "ps" else "tp"
     return f"~ s({cols[0]}, bs='{bs}', k=min({k_val}, nrow(train_df)-1))"
 
@@ -1456,6 +1500,14 @@ def print_leaderboard(results, top_n=25):
     # Failure details
     rust_fails = [r for r in results if r.rust.get("error")]
     mgcv_fails = [r for r in results if r.mgcv.get("error")]
+    # mgcv-chokepoint scenarios: rust evaluated finitely while mgcv hit an
+    # R-side error. These were previously silently dropped from the gap
+    # distribution; they are scenarios mgcv finds harder than rust does
+    # and should be surfaced as positive evidence in the leaderboard.
+    mgcv_chokepoints = [
+        r for r in results
+        if r.mgcv.get("error") and not r.rust.get("error")
+    ]
     if rust_fails or mgcv_fails:
         print(f"\n{'=' * 120}")
         print(f"  FAILURES — rust: {len(rust_fails)} | mgcv: {len(mgcv_fails)}")
@@ -1473,6 +1525,27 @@ def print_leaderboard(results, top_n=25):
                     print(f"    stderr: {stderr[:200]}")
                 if cmd:
                     print(f"    cmd: {cmd[:200]}")
+    if mgcv_chokepoints:
+        print(f"\n{'=' * 120}")
+        print(
+            f"  MGCV CHOKEPOINTS — {len(mgcv_chokepoints)} scenario(s) where "
+            f"rust succeeded but mgcv erred"
+        )
+        print("=" * 120)
+        for r in mgcv_chokepoints[:20]:
+            s = r.scenario
+            err = (r.mgcv.get("error", "") or "")[:200]
+            metric = "r2" if s.get("family") == "gaussian" else "auc"
+            rv = r.rust.get(metric)
+            rs = f"{rv:.4f}" if rv is not None else "FAIL"
+            print(
+                f"  [MGCV-CHOKE] seed={s['seed']} "
+                f"{s['family']}/{s['model_type']}/{s['basis_type']} "
+                f"n={s['n_obs']} k={s['n_smooths']} kn={s['knots']} "
+                f"sig={s.get('signal_structure', '?')[:8]} "
+                f"noise={s.get('noise_kind', '?')[:8]} :: "
+                f"rust {metric}={rs} | mgcv error: {err}"
+            )
     print()
 
 
@@ -1480,9 +1553,24 @@ def print_leaderboard(results, top_n=25):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
+_DEPTH_DEFAULTS = {
+    "lean": 100,
+    "default": 200,
+    "deep": 500,
+    "heavy": 1000,
+}
+
+
+def _default_n_trials() -> int:
+    depth = (os.environ.get("FUZZ_DEPTH") or "default").lower().strip()
+    return _DEPTH_DEFAULTS.get(depth, _DEPTH_DEFAULTS["default"])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Adversarial fuzzer: Rust GAM vs mgcv")
-    parser.add_argument("--n-trials", type=int, default=100)
+    parser.add_argument("--n-trials", type=int, default=_default_n_trials(),
+                        help="Number of trials. Defaults track FUZZ_DEPTH "
+                             "(lean=100 / default=200 / deep=500 / heavy=1000).")
     parser.add_argument("--seed-start", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--top", type=int, default=15)
@@ -1492,7 +1580,10 @@ def main():
     parser.add_argument("--rust-timeout", type=int, default=DEFAULT_RUST_TIMEOUT)
     parser.add_argument("--r-timeout", type=int, default=DEFAULT_R_TIMEOUT)
     parser.add_argument("--max-total-seconds", type=int, default=None)
-    parser.add_argument("--max-scenario-cost", type=float, default=None)
+    # Cost cap default raised from the historical 75_000 (which skipped ~41%
+    # of generated scenarios) to 200_000 so the harness produces enough
+    # valid mgcv-vs-rust comparisons to satisfy the coverage gate.
+    parser.add_argument("--max-scenario-cost", type=float, default=200_000.0)
     parser.add_argument(
         "--baseline-json",
         type=str,
