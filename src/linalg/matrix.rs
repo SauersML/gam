@@ -10,7 +10,7 @@ use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
 };
-use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -26,6 +26,10 @@ const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
+/// Minimum n*p product for the dense-row parallel fold/reduce paths
+/// (`diag_gram`, `apply_weighted_normal`, `dense_transpose_matvec_view`).
+/// Below this, the sequential row loop wins on overhead.
+const DENSE_ROW_PARALLEL_MIN_NP: u64 = 200_000;
 /// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
 /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
 const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
@@ -260,17 +264,42 @@ fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<
 
 #[inline]
 fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(matrix.ncols());
-    for i in 0..matrix.nrows() {
-        let vi = vector[i];
-        if vi == 0.0 {
-            continue;
+    let n = matrix.nrows();
+    let p = matrix.ncols();
+    if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
+        let mut out = Array1::<f64>::zeros(p);
+        for i in 0..n {
+            let vi = vector[i];
+            if vi == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                out[j] += matrix[[i, j]] * vi;
+            }
         }
-        for j in 0..matrix.ncols() {
-            out[j] += matrix[[i, j]] * vi;
-        }
+        return out;
     }
-    out
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || Array1::<f64>::zeros(p),
+            |mut acc, i| {
+                let vi = vector[i];
+                if vi != 0.0 {
+                    for j in 0..p {
+                        acc[j] += matrix[[i, j]] * vi;
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || Array1::<f64>::zeros(p),
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        )
 }
 
 #[inline]
@@ -732,18 +761,44 @@ impl LinearOperator for DenseDesignMatrix {
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
         match self {
             Self::Materialized(matrix) => {
+                let n = matrix.nrows();
                 let p = matrix.ncols();
-                let mut diag = Array1::<f64>::zeros(p);
-                for i in 0..matrix.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
+                if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
+                    let mut diag = Array1::<f64>::zeros(p);
+                    for i in 0..n {
+                        let wi = weights[i].max(0.0);
+                        if wi == 0.0 {
+                            continue;
+                        }
+                        for j in 0..p {
+                            let xij = matrix[[i, j]];
+                            diag[j] += wi * xij * xij;
+                        }
                     }
-                    for j in 0..p {
-                        let xij = matrix[[i, j]];
-                        diag[j] += wi * xij * xij;
-                    }
+                    return Ok(diag);
                 }
+                let diag = (0..n)
+                    .into_par_iter()
+                    .fold(
+                        || Array1::<f64>::zeros(p),
+                        |mut acc, i| {
+                            let wi = weights[i].max(0.0);
+                            if wi != 0.0 {
+                                for j in 0..p {
+                                    let xij = matrix[[i, j]];
+                                    acc[j] += wi * xij * xij;
+                                }
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || Array1::<f64>::zeros(p),
+                        |mut a, b| {
+                            a += &b;
+                            a
+                        },
+                    );
                 Ok(diag)
             }
             Self::Lazy(op) => op.diag_gram(weights),
@@ -759,25 +814,58 @@ impl LinearOperator for DenseDesignMatrix {
     ) -> Array1<f64> {
         match self {
             Self::Materialized(matrix) => {
+                let n = matrix.nrows();
                 let p = matrix.ncols();
-                let mut out = Array1::<f64>::zeros(p);
-                for i in 0..matrix.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
+                let mut out = if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
+                    let mut out = Array1::<f64>::zeros(p);
+                    for i in 0..n {
+                        let wi = weights[i].max(0.0);
+                        if wi == 0.0 {
+                            continue;
+                        }
+                        let mut row_dot = 0.0_f64;
+                        for j in 0..p {
+                            row_dot += matrix[[i, j]] * vector[j];
+                        }
+                        if row_dot == 0.0 {
+                            continue;
+                        }
+                        let scaled = wi * row_dot;
+                        for j in 0..p {
+                            out[j] += scaled * matrix[[i, j]];
+                        }
                     }
-                    let mut row_dot = 0.0_f64;
-                    for j in 0..p {
-                        row_dot += matrix[[i, j]] * vector[j];
-                    }
-                    if row_dot == 0.0 {
-                        continue;
-                    }
-                    let scaled = wi * row_dot;
-                    for j in 0..p {
-                        out[j] += scaled * matrix[[i, j]];
-                    }
-                }
+                    out
+                } else {
+                    (0..n)
+                        .into_par_iter()
+                        .fold(
+                            || Array1::<f64>::zeros(p),
+                            |mut acc, i| {
+                                let wi = weights[i].max(0.0);
+                                if wi != 0.0 {
+                                    let mut row_dot = 0.0_f64;
+                                    for j in 0..p {
+                                        row_dot += matrix[[i, j]] * vector[j];
+                                    }
+                                    if row_dot != 0.0 {
+                                        let scaled = wi * row_dot;
+                                        for j in 0..p {
+                                            acc[j] += scaled * matrix[[i, j]];
+                                        }
+                                    }
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || Array1::<f64>::zeros(p),
+                            |mut a, b| {
+                                a += &b;
+                                a
+                            },
+                        )
+                };
                 if let Some(pen) = penalty {
                     out += &pen.dot(vector);
                 }
