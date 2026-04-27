@@ -96,9 +96,7 @@ pub fn panic_or_error_if_biobank_mode_compute_budget_exceeded(
     estimated_outer_iters: usize,
     policy: &ResourcePolicy,
 ) -> Result<(), String> {
-    let assembly_flops = (n as u64)
-        .saturating_mul(p as u64)
-        .saturating_mul(p as u64);
+    let assembly_flops = (n as u64).saturating_mul(p as u64).saturating_mul(p as u64);
     let total_flops = assembly_flops
         .saturating_mul(estimated_outer_iters as u64)
         .saturating_mul(POLICY_INNER_ITER_ESTIMATE);
@@ -110,8 +108,7 @@ pub fn panic_or_error_if_biobank_mode_compute_budget_exceeded(
              inner_iters≈{inner_iter_estimate} per outer step — \
              switch to an operator-backed design (avoids the n·p² assembly), \
              or implement a matrix-free Hessian workspace for this family",
-            total_flops as f64,
-            policy.max_compute_budget_flops as f64,
+            total_flops as f64, policy.max_compute_budget_flops as f64,
         ));
     }
     Ok(())

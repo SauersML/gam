@@ -30,10 +30,9 @@ use crate::families::custom_family::{
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
-    FamilyEvaluation, MaterializablePsiDerivativeOperator, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    FamilyEvaluation, MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -4389,7 +4388,13 @@ mod tests {
             [0.6, 0.3, -0.5],
             [1.4, -0.1, 0.7],
         ];
-        let right = array![[2.0, -1.0], [-0.5, 0.8], [1.2, 0.3], [-0.7, 1.1], [0.4, -0.6]];
+        let right = array![
+            [2.0, -1.0],
+            [-0.5, 0.8],
+            [1.2, 0.3],
+            [-0.7, 1.1],
+            [0.4, -0.6]
+        ];
         let weights = array![0.9, 1.3, 0.7, 1.1, 0.5];
         let v = array![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
         let n = left.nrows();
