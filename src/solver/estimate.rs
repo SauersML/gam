@@ -1849,12 +1849,19 @@ where
         // geometry decision in `select_reml_geometry` may route a sparse
         // design to the dense-spectral backend (firth, dense linear
         // constraints, or per-ρ penalized-Hessian density above 0.10).  Read
-        // the actual runtime backend kind at a representative ρ (the neutral
-        // ρ=0 baseline that seeding.rs always includes) so that biobank-scale
-        // Matern fits (n=320 000, p=101, sparse design, dense per-ρ
-        // selection) get gated to BFGS+gradient instead of ARC + analytic
-        // Hessian, which OOMs at 14.56 GiB RSS.
-        let probe_rho = Array1::<f64>::zeros(k);
+        // the actual runtime backend kind at a representative ρ — prefer the
+        // caller-supplied `heuristic_lambdas` when available since they
+        // reflect the per-ρ penalty mass the real fit is going to land near;
+        // fall back to the neutral ρ=0 baseline that `seeding.rs` always
+        // includes — so that biobank-scale Matern fits (n=320 000, p=101,
+        // sparse design, dense per-ρ selection) get gated to BFGS+gradient
+        // instead of ARC + analytic Hessian, which OOMs at 14.56 GiB RSS.
+        let probe_rho = match heuristic_lambdas {
+            Some(h) if h.len() == k => {
+                Array1::from_iter(h.iter().map(|v| v.max(1.0e-300).ln()))
+            }
+            _ => Array1::<f64>::zeros(k),
+        };
         let dense_design = reml_state.runtime_geometry_is_dense(&probe_rho);
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)

@@ -10,8 +10,27 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
-mod common;
-use common::TestMode;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TestMode {
+    Fast,
+    Hard,
+}
+
+impl TestMode {
+    fn from_env() -> Self {
+        match std::env::var("GAM_TEST_MODE").as_deref() {
+            Ok(v) if v.eq_ignore_ascii_case("hard") => TestMode::Hard,
+            _ => TestMode::Fast,
+        }
+    }
+
+    fn select<T>(self, fast: T, hard: T) -> T {
+        match self {
+            TestMode::Fast => fast,
+            TestMode::Hard => hard,
+        }
+    }
+}
 
 #[test]
 fn thin_plate_fit_gam_gaussian_fast_integration() {
