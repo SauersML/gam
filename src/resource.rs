@@ -146,27 +146,6 @@ pub fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
     (target_bytes / bytes_per_row).max(1)
 }
 
-/// Per-pass FLOP count for one CTN monotonicity fraction-to-boundary scan
-/// (`2·n·n_grid·p_resp + 2·n·p_resp·p_cov`). Used by the baseline-fit gate to
-/// decide whether to run a warm-start fit before exact-joint optimization.
-pub fn ctn_monotonicity_pass_ops(
-    n: usize,
-    n_grid: usize,
-    p_resp: usize,
-    p_cov: usize,
-) -> u128 {
-    2u128
-        .saturating_mul(n as u128)
-        .saturating_mul(n_grid as u128)
-        .saturating_mul(p_resp as u128)
-        .saturating_add(
-            2u128
-                .saturating_mul(n as u128)
-                .saturating_mul(p_resp as u128)
-                .saturating_mul(p_cov as u128),
-        )
-}
-
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
