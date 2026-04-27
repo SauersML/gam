@@ -818,15 +818,31 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn coefficient_hessian_cost(&self, _specs: &[ParameterBlockSpec]) -> u64 {
-        // Khatri–Rao tensor design: the coefficient block is
-        // X = R ⊙ C with rows length p_resp · p_cov. The exact dense Hessian
-        // therefore costs n · (p_resp·p_cov)² flops to assemble, which is the
-        // honest work model for routing — n·p² with p = p_resp·p_cov.
-        let n = self.response_val_basis.nrows() as u64;
+        // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
+        // rows length p_resp · p_cov. Two regimes:
+        //
+        // * **Dense regime** (small enough that the unified evaluator builds
+        //   `weighted_gram` directly): per-evaluation cost is the dense
+        //   `n · (p_resp · p_cov)²` Khatri–Rao gram build.
+        //
+        // * **Matrix-free regime** (large enough that
+        //   `use_joint_matrix_free_path` returns true and the evaluator
+        //   factors `H v` through `forward_mul` / `transpose_mul` on the
+        //   Khatri–Rao operands): per-`Hv` matvec cost is just
+        //   `n · (p_resp + p_cov)` flops — see `ctn_matrix_free_workspace`.
+        //   The trait doc specifies that matrix-free families report the
+        //   per-`Hv` cost so the gate reflects the operator path actually
+        //   used at fit time, not the dense build the evaluator skips.
+        let n_usize = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols() as u64;
         let p_cov = self.covariate_design.ncols() as u64;
         let p_total = p_resp.saturating_mul(p_cov);
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        let n = n_usize as u64;
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n_usize) {
+            n.saturating_mul(p_resp.saturating_add(p_cov))
+        } else {
+            n.saturating_mul(p_total.saturating_mul(p_total))
+        }
     }
 
     fn exact_outer_derivative_order(

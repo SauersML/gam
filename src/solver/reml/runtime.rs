@@ -48,19 +48,14 @@ fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
 /// and this helper is a strict no-op for them.
 #[inline]
 fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
-    if !cost.is_finite() {
+    if !cost.is_finite() || !pr.status.is_failed_max_iterations() {
         return cost;
     }
-    match pr.status {
-        pirls::PirlsStatus::MaxIterationsReached | pirls::PirlsStatus::LmStepSearchExhausted => {
-            let r_g = pr.relative_gradient_norm();
-            if r_g.is_finite() {
-                cost + 0.5 * r_g * r_g
-            } else {
-                f64::INFINITY
-            }
-        }
-        _ => cost,
+    let r_g = pr.relative_gradient_norm();
+    if r_g.is_finite() {
+        cost + 0.5 * r_g * r_g
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -2740,13 +2735,8 @@ impl<'a> RemlState<'a> {
             // screening (cap=3) routinely yield indefinite Hessians, and
             // surfacing those as `Penalized Hessian not PD` warnings would
             // confuse log readers and mask real production-fit issues.
-            let is_partial_fit = matches!(
-                pirls_result.status,
-                pirls::PirlsStatus::MaxIterationsReached
-                    | pirls::PirlsStatus::LmStepSearchExhausted,
-            );
-            let want_hot_diag =
-                !is_partial_fit && self.should_compute_hot_diagnostics(cost_call_idx);
+            let want_hot_diag = !pirls_result.status.is_failed_max_iterations()
+                && self.should_compute_hot_diagnostics(cost_call_idx);
             if ridge_used > 0.0 && want_hot_diag {
                 // Eigenvalue diagnostics require dense; only pay the cost when
                 // hot diagnostics are requested and ridge was applied.
