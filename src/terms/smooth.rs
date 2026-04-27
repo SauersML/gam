@@ -4702,16 +4702,12 @@ fn fit_term_collection_on_realized_design(
     if runtime_caches.is_empty() {
         return Ok(fitted);
     }
-    // Sample-size guard: the Charbonnier-penalized adaptive overlay can drive
-    // operator log-λ's down to the box floor when residual d.o.f. is thin,
-    // turning an already-good standard-REML fit into a near-interpolation.
-    // Skip the overlay when n is not comfortably larger than the column count
-    // (kernel + nullspace + parametric) of the realized design.
-    let n_obs = fitted.design.design.nrows();
-    let p_total = fitted.design.design.ncols();
-    if n_obs < 4usize.saturating_mul(p_total).max(200) {
-        return Ok(fitted);
-    }
+    // Spatial-adaptive overlay always runs when the operator caches are
+    // non-empty. Catastrophic-overfit protection lives in the operator-log-λ
+    // box bound (Fix B at the BFGS bounds construction), which caps maximum
+    // unpenalization regardless of n. Production fits at n≈300K must run the
+    // overlay; the previous n-gate (n < max(4·p_total, 200)) silently skipped
+    // it for any small-n test, contradicting that contract.
     fit_term_collectionwith_exact_spatial_adaptive_regularization(
         fitted,
         y,
