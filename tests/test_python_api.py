@@ -86,6 +86,13 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path):
     predicted = model.predict(prediction_rows())
     assert list(predicted) == ["eta", "mean"]
     assert len(predicted["mean"]) == 3
+    # The training data is exactly y = x + 1 with no noise, so the
+    # identity-link Gaussian model must recover that linear function within
+    # numerical tolerance — a renamed column or swapped eta/mean would break
+    # at least one of these checks.
+    expected_mean = [2.5, 3.5, 4.5]
+    np.testing.assert_allclose(predicted["mean"], expected_mean, atol=1e-6)
+    np.testing.assert_allclose(predicted["eta"], predicted["mean"], atol=1e-12)
 
     with_interval = model.predict(prediction_rows(), interval=0.95)
     assert list(with_interval) == [
@@ -95,6 +102,16 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path):
         "mean_lower",
         "mean_upper",
     ]
+    # The mean point estimate must sit strictly inside the 95% interval and
+    # the interval must be non-degenerate for a well-conditioned fit.
+    interval_mean = np.asarray(with_interval["mean"], dtype=float)
+    interval_lower = np.asarray(with_interval["mean_lower"], dtype=float)
+    interval_upper = np.asarray(with_interval["mean_upper"], dtype=float)
+    interval_se = np.asarray(with_interval["effective_se"], dtype=float)
+    assert np.all(interval_lower <= interval_mean + 1e-12)
+    assert np.all(interval_mean <= interval_upper + 1e-12)
+    assert np.all(interval_upper > interval_lower)
+    assert np.all(interval_se > 0.0)
 
     check = model.check(prediction_rows())
     assert check.ok
@@ -164,11 +181,20 @@ def test_numpy_inputs_and_outputs():
     est.fit(x_train, y_train)
     pred = est.predict(x_test)
 
+    # Training data is y = x + 1; identity-link Gaussian must recover this.
     assert pred.shape == (2,)
+    np.testing.assert_allclose(pred, [2.5, 3.5], atol=1e-6)
 
     model = gam.fit({"x0": x_train[:, 0].tolist(), "y": y_train.tolist()}, "y ~ x0")
     raw = model.predict(x_test, return_type="numpy")
     assert raw.shape == (2, 2)
+    # The numpy-return contract is column-ordered (eta, mean). Identity link
+    # means the two columns must agree numerically, and both columns must
+    # match the analytic predictions — a swapped eta/mean column would fail
+    # the dict-mode test above; here we lock in the array-mode contract.
+    raw = np.asarray(raw, dtype=float)
+    np.testing.assert_allclose(raw[:, 0], raw[:, 1], atol=1e-12)
+    np.testing.assert_allclose(raw[:, 1], [2.5, 3.5], atol=1e-6)
 
 
 def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target():
@@ -194,18 +220,53 @@ def test_sklearn_classifier_roundtrip():
     )
     est = GAMClassifier(formula="y ~ x", family="binomial")
     est.fit(train)
-    proba = est.predict_proba(pd.DataFrame([{"x": 1.5}, {"x": 3.5}]))
-    pred = est.predict(pd.DataFrame([{"x": 1.5}, {"x": 3.5}]))
+    test_frame = pd.DataFrame([{"x": 1.5}, {"x": 3.5}])
+    proba = est.predict_proba(test_frame)
+    pred = est.predict(test_frame)
 
     assert proba.shape == (2, 2)
     assert pred.shape == (2,)
     assert est.classes_.tolist() == [0, 1]
 
+    # Probability rows must sum to 1 (proper categorical distribution).
+    proba_arr = np.asarray(proba, dtype=float)
+    np.testing.assert_allclose(proba_arr.sum(axis=1), 1.0, atol=1e-9)
+    # Each column must be in [0, 1].
+    assert np.all((proba_arr >= 0.0) & (proba_arr <= 1.0))
+    # The training set has positive class probability that increases in x;
+    # a swapped class-axis or reversed link would invert this ordering.
+    assert proba_arr[1, 1] > proba_arr[0, 1], (
+        f"P(y=1 | x=3.5) must exceed P(y=1 | x=1.5); got "
+        f"P(1.5)={proba_arr[0, 1]:.4f}, P(3.5)={proba_arr[1, 1]:.4f}"
+    )
+    assert proba_arr[0, 0] > proba_arr[1, 0], (
+        "P(y=0 | x=1.5) must exceed P(y=0 | x=3.5)"
+    )
+    # Hard predictions must use argmax over predict_proba.
+    expected_hard = est.classes_.take(np.argmax(proba_arr, axis=1))
+    np.testing.assert_array_equal(np.asarray(pred).reshape(-1), expected_hard)
+
 
 def test_predict_rejects_schema_mismatch():
     model = gam.fit(training_rows(), "y ~ x")
-    with pytest.raises(gam.SchemaMismatchError):
+
+    # 1) Wrong column name (no required feature present).
+    with pytest.raises(gam.SchemaMismatchError) as exc_info:
         model.predict([{"z": 1.0}])
+    assert "x" in str(exc_info.value), (
+        f"schema-mismatch error must name the missing column; got: {exc_info.value}"
+    )
+
+    # 2) Required column missing in a row that has *other* columns. The
+    # presence of unrelated keys must not silently mask the missing feature.
+    with pytest.raises(gam.SchemaMismatchError):
+        model.predict([{"y": 0.0, "irrelevant": 7.0}])
+
+    # 3) An empty row list. A predict call with no rows is unambiguously
+    # ill-formed; the runtime must reject it rather than returning an empty
+    # frame that could silently propagate as "no predictions made".
+    with pytest.raises((ValueError, gam.SchemaMismatchError, RuntimeError)):
+        model.predict([])
 
 
 # ---------------------------------------------------------------------------
@@ -366,16 +427,44 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
 
     hazard = pred.hazard_at(grid)
     assert hazard.shape == (len(df), grid.shape[0])
-    assert np.all(np.isfinite(hazard))
+    assert np.all(np.isfinite(hazard)), (
+        f"survival hazard contains non-finite values; min={np.nanmin(hazard)}, "
+        f"max={np.nanmax(hazard)}"
+    )
+    # Hazard rates are non-negative everywhere; the original test required
+    # strict positivity which is the stronger contract for Gompertz-Makeham
+    # baselines plus a smooth additive perturbation.
+    assert np.all(hazard >= 0.0)
     assert np.all(hazard > 0.0)
 
     survival = pred.survival_at(grid)
     assert survival.shape == (len(df), grid.shape[0])
     assert np.all(np.isfinite(survival))
-    assert np.all((survival > 0.0) & (survival <= 1.0 + 1e-9))
+    # Survival is a probability and must lie in (0, 1].
+    assert np.all((survival > 0.0) & (survival <= 1.0 + 1e-9)), (
+        f"survival outside (0,1]: min={float(survival.min())}, "
+        f"max={float(survival.max())}"
+    )
     # Survival is non-increasing in time for every sample.
     deltas = np.diff(survival, axis=1)
-    assert np.all(deltas <= 1e-9)
+    assert np.all(deltas <= 1e-9), (
+        "survival must be non-increasing in time; offending row indices: "
+        f"{np.argwhere(deltas > 1e-9)[:10].tolist()}"
+    )
+
+    # New: cumulative hazard must be non-decreasing in time, and at the
+    # earliest grid point the cumulative hazard should be the smallest.
+    cumhaz = pred.cumulative_hazard_at(grid)
+    assert cumhaz.shape == (len(df), grid.shape[0])
+    assert np.all(np.isfinite(cumhaz))
+    cumhaz_deltas = np.diff(cumhaz, axis=1)
+    assert np.all(cumhaz_deltas >= -1e-8), (
+        "cumulative hazard must be non-decreasing in time; offending row indices: "
+        f"{np.argwhere(cumhaz_deltas < -1e-8)[:10].tolist()}"
+    )
+    # H(t) and S(t) are linked by S = exp(-H): broken interpolation of one
+    # would break this consistency.
+    np.testing.assert_allclose(np.exp(-cumhaz), survival, atol=1e-8)
 
 
 def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path):

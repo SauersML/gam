@@ -2313,6 +2313,20 @@ impl CustomFamily for LatentSurvivalFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // `evaluate_exact_newton_joint_dense` builds a fully dense joint
+        // Hessian over (Σ p_b)² across the time, mean, and optional log-σ
+        // blocks via per-row pullback of the latent-survival primary kernel.
+        // Honest assembly cost is `n · (Σ p_b)²`; the block-diagonal default
+        // would understate the dense cross-block fill.
+        let n = self.event_target.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (ll, joint_gradient, joint_hessian) =
             self.evaluate_exact_newton_joint_dense(block_states)?;
@@ -2691,6 +2705,66 @@ mod tests {
         )
         .expect("row primary evaluation")
         .0
+    }
+
+    #[test]
+    fn latent_survival_coefficient_cost_uses_joint_coupled_formula() {
+        // `evaluate_exact_newton_joint_dense` builds a fully dense joint
+        // Hessian over (Σ p_b)² across the time, mean, and log-σ blocks via
+        // per-row pullback of the latent-survival primary kernel. The override
+        // must reflect that joint coupling rather than the block-diagonal
+        // default.
+        let family = learnable_sigma_test_family();
+        let n = family.event_target.len() as u64;
+        let p_time = 2u64;
+        let p_mean = 2u64;
+        let p_log_sigma = 1u64;
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "time".to_string(),
+                design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((
+                    n as usize,
+                    p_time as usize,
+                )))),
+                offset: Array1::zeros(n as usize),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "mean".to_string(),
+                design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((
+                    n as usize,
+                    p_mean as usize,
+                )))),
+                offset: Array1::zeros(n as usize),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((
+                    n as usize,
+                    p_log_sigma as usize,
+                )))),
+                offset: Array1::zeros(n as usize),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        let p_total = p_time + p_mean + p_log_sigma;
+        let expected_joint = n * p_total * p_total;
+        let expected_block_diag =
+            n * (p_time * p_time + p_mean * p_mean + p_log_sigma * p_log_sigma);
+        assert_eq!(family.coefficient_hessian_cost(&specs), expected_joint);
+        // Cross-block fill (time–mean, time–log_sigma, mean–log_sigma) makes
+        // the joint cost strictly larger than the block-diagonal default.
+        assert!(expected_joint > expected_block_diag);
     }
 
     #[test]

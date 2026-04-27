@@ -1057,7 +1057,15 @@ def survival_metrics_from_native_probabilities(
 def _survival_probability_column(rows: list[dict[str, str]], *, method_name: str) -> np.ndarray:
     if not rows:
         raise RuntimeError(f"{method_name} survival prediction output is empty")
-    key = "survival_prob" if "survival_prob" in rows[0] else "mean"
+    if "survival_prob" in rows[0]:
+        key = "survival_prob"
+    elif "mean" in rows[0]:
+        key = "mean"
+    else:
+        raise RuntimeError(
+            f"{method_name} survival prediction output missing 'survival_prob' "
+            f"or 'mean' column; got columns {sorted(rows[0].keys())}"
+        )
     values = np.array([float(r[key]) for r in rows], dtype=float)
     if not np.all(np.isfinite(values)):
         raise RuntimeError(

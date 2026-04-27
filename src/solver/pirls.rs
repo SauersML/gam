@@ -25,13 +25,17 @@ use faer::sparse::linalg::matmul::{
     sparse_sparse_matmul_symbolic,
 };
 use faer::sparse::{SparseColMat, Triplet};
-use faer::sparse::{SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat};
+use faer::sparse::{
+    SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat, SymbolicSparseColMatRef,
+};
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
 use ndarray::{
     Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Data, Ix1, Ix2, ShapeBuilder, Zip, s,
 };
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 use serde::{Deserialize, Serialize};
 use statrs::function::gamma::{digamma, ln_gamma};
 
@@ -57,6 +61,17 @@ fn array2_is_finite(values: &Array2<f64>) -> bool {
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
 const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
+
+/// Absolute cap on `|η|` at any inner P-IRLS iterate.
+///
+/// A sensible guard against runaway underdetermined systems: when `p > n`
+/// with weak penalty the optimizer can wander along a likelihood ridge,
+/// sending η to extreme values where the gradient overflows. Step
+/// candidates that drive `max|η|` past this bound are rejected as LM
+/// halving triggers, and the rescue logic recognises a fit pinned
+/// against the cap with a deviance plateau as the same "saturated
+/// boundary" class as separated binomial fits.
+const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
 #[inline]
 fn gamma_shape_score(shape: f64, target: f64) -> f64 {
@@ -2025,38 +2040,60 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
     }
 }
 
-/// Backend strategy for sparse XᵀWX assembly.
+// Cutoff between the dense outer-product backend and sparse SpGEMM. At p=1024
+// the dense p×p output buffer is 8 MiB — L3-resident on most current targets
+// and small enough that per-thread copies used during parallel reduction stay
+// within an order of magnitude of the cache hierarchy.
+const DENSE_OUTER_MAX_P: usize = 1024;
+
+// Estimated FLOP threshold below which spawning rayon workers for the dense
+// outer-product path costs more than the work itself. Calibrated to cover
+// rayon's per-task overhead (microseconds) plus the cost of zeroing one dense
+// buffer per worker; below this, everything stays on the calling thread.
+const DENSE_OUTER_PARALLEL_FLOP_THRESHOLD: u64 = 100_000;
+
+/// Backend selection for sparse-design XᵀWX assembly.
 ///
-/// At small p, a row-by-row dense outer-product accumulator
-/// (cost ≈ Σᵢ nnz(rowᵢ)²) is faster than sparse SpGEMM and parallelizes
-/// trivially via per-thread dense p×p accumulators. The crossover point is
-/// roughly when a dense p×p buffer no longer fits in L2/L3.
+/// XᵀWX = Σᵢ wᵢ · xᵢ xᵢᵀ. The matrix is symmetric, so only the upper triangle
+/// needs to be computed; the only consumer (`assemble_upper`) filters to
+/// row ≤ col. Two backends trade off in opposite memory regimes:
+///
+/// * **Dense outer-product** (small p): allocate a dense p×p buffer and
+///   accumulate one rank-1 update per data row. Per-row work is nnz(xᵢ)² —
+///   for B-spline-style designs this dominates SpGEMM by orders of magnitude.
+///
+/// * **Sparse SpGEMM** (large p): faer's symbolic + numeric pipeline. Avoids
+///   the dense p×p buffer when it would no longer be cache-resident.
 enum XtWxBackend {
-    /// Row-outer-product into a dense p×p buffer; scattered into the symbolic
-    /// XᵀX pattern at the end of `compute_numeric`. Chosen when p is small
-    /// enough that the dense buffer is L2/L3-resident.
-    DenseOuter {
-        /// Reusable dense p×p accumulator (row-major; the inner loop writes
-        /// `dense[[j, k]] += w·xⱼ·xₖ` so contiguous-k writes are cache-friendly).
-        xtwx_dense: Array2<f64>,
-        par: Par,
-    },
-    /// Sparse SpGEMM via faer's symbolic+numeric pipeline. Used when a dense
-    /// p×p buffer is impractical.
-    SparseSpGemm {
-        wxvalues: Vec<f64>,
-        wx_tvalues: Vec<f64>,
-        info: SparseMatMulInfo,
-        scratch: MemBuffer,
-        par: Par,
-    },
+    Dense(DenseOuterState),
+    Sparse(SparseSpGemmState),
 }
 
-/// Maximum p for which the dense outer-product backend is preferred over
-/// sparse SpGEMM. At p=1024 the dense p×p buffer is 8 MiB, which still fits
-/// comfortably in L3 on most current targets and is large enough that a
-/// per-thread copy used during parallel reduction is acceptable.
-const DENSE_OUTER_MAX_P: usize = 1024;
+/// State for the dense outer-product backend.
+///
+/// `xtwx_dense` is row-major p×p; the inner loop fills only the upper triangle
+/// (j ≤ k), exploiting faer's CSC convention that row indices within each
+/// column are stored in ascending order. Lower-triangle entries are left at
+/// zero — they are written through the scatter to `xtwxvalues` but never read,
+/// because `assemble_upper` filters to row ≤ col.
+///
+/// `thread_buffers` is bounded at exactly `rayon::current_num_threads()` and
+/// reused across PIRLS iterations, so allocation cost is amortized across the
+/// entire fit rather than paid per call.
+struct DenseOuterState {
+    xtwx_dense: Array2<f64>,
+    thread_buffers: Vec<Array2<f64>>,
+}
+
+/// State for the sparse-SpGEMM backend (faer numeric matmul scratch and the
+/// pre-scaled (√W)·X factors that feed it).
+struct SparseSpGemmState {
+    wxvalues: Vec<f64>,
+    wx_tvalues: Vec<f64>,
+    info: SparseMatMulInfo,
+    scratch: MemBuffer,
+    par: Par,
+}
 
 pub(crate) struct SparseXtWxCache {
     xtwx_symbolic: SymbolicSparseColMat<usize>,
@@ -2075,39 +2112,40 @@ pub(crate) struct SparseXtWxCache {
 
 impl SparseXtWxCache {
     fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
-        // For X^T X where X is CSC: X^T is a SparseRowMat, which we need to convert
-        // to CSC format for the matmul API. Use the symbolic method properly.
-        let x_t_csc =
-            x.as_ref().transpose().to_col_major().map_err(|_| {
-                EstimationError::InvalidInput("failed to transpose to CSC".to_string())
-            })?;
+        // For X^T X where X is CSC: X^T is a SparseRowMat, which we need to
+        // convert to CSC format for the matmul API.
+        let x_t_csc = x.as_ref().transpose().to_col_major().map_err(|_| {
+            EstimationError::InvalidInput("failed to transpose to CSC".to_string())
+        })?;
         let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(x_t_csc.symbolic(), x.symbolic())
             .map_err(|_| {
                 EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
             })?;
         let xtwxvalues = vec![0.0; xtwx_symbolic.row_idx().len()];
-        let par = sparse_xtwx_par();
 
         let backend = if x.ncols() <= DENSE_OUTER_MAX_P {
-            XtWxBackend::DenseOuter {
+            XtWxBackend::Dense(DenseOuterState {
                 xtwx_dense: Array2::<f64>::zeros((x.ncols(), x.ncols())),
-                par,
-            }
+                thread_buffers: Vec::new(),
+            })
         } else {
-            let wxvalues = vec![0.0; x.val().len()];
-            let wx_tvalues = vec![0.0; x_t_csc.val().len()];
+            // SpGEMM scratch is sized for a fixed parallelism handle, so we
+            // capture it once at construction; `get_global_parallelism()` is
+            // stable for the lifetime of the process.
+            let par = get_global_parallelism();
             let scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
                 xtwx_symbolic.as_ref(),
                 par,
             ));
-            XtWxBackend::SparseSpGemm {
-                wxvalues,
-                wx_tvalues,
+            XtWxBackend::Sparse(SparseSpGemmState {
+                wxvalues: vec![0.0; x.val().len()],
+                wx_tvalues: vec![0.0; x_t_csc.val().len()],
                 info,
                 scratch,
                 par,
-            }
+            })
         };
+
         Ok(Self {
             xtwx_symbolic,
             xtwxvalues,
@@ -2143,168 +2181,209 @@ impl SparseXtWxCache {
         }
 
         match &mut self.backend {
-            XtWxBackend::DenseOuter { xtwx_dense, par } => {
-                Self::compute_numeric_dense_outer(
-                    &self.x_t_csc,
-                    weights,
-                    self.nrows,
-                    self.ncols,
-                    xtwx_dense,
-                    *par,
-                );
-                // Scatter the dense p×p accumulator into the symbolic XᵀX pattern.
-                // The pattern stores both halves of the symmetric product, so we
-                // simply read each (row, col) from the dense buffer.
+            XtWxBackend::Dense(state) => {
+                state.compute(self.x_t_csc.as_ref(), weights, self.nrows, self.ncols);
+                // Scatter the upper triangle of `xtwx_dense` into the
+                // symbolic XᵀX pattern. The pattern stores both halves of
+                // the symmetric product, but `assemble_upper` (the sole
+                // consumer) reads only entries with row ≤ col, so writing
+                // the lower half would be wasted work. The unwritten
+                // lower-triangle entries of `xtwxvalues` start at zero
+                // (from `vec![0.0; …]` at construction) and remain zero
+                // throughout this cache's lifetime, since the dense outer
+                // product never writes to lower-triangle positions either.
                 let col_ptr = self.xtwx_symbolic.col_ptr();
                 let row_idx = self.xtwx_symbolic.row_idx();
+                let dense = &state.xtwx_dense;
                 for col in 0..self.ncols {
                     let start = col_ptr[col];
                     let end = col_ptr[col + 1];
                     for idx in start..end {
                         let row = row_idx[idx];
-                        self.xtwxvalues[idx] = xtwx_dense[[row, col]];
+                        if row <= col {
+                            self.xtwxvalues[idx] = dense[[row, col]];
+                        }
                     }
                 }
             }
-            XtWxBackend::SparseSpGemm {
-                wxvalues,
-                wx_tvalues,
-                info,
-                scratch,
-                par,
-            } => {
-                let x_ref = x.as_ref();
-                // Build right factor: sqrt(W) * X (same CSC sparsity pattern as X).
-                for col in 0..self.ncols {
-                    let rows = x_ref.row_idx_of_col_raw(col);
-                    let xvals = x_ref.val_of_col(col);
-                    let range = x_ref.col_range(col);
-                    let wxvals = &mut wxvalues[range];
-                    for ((dst, &src), row) in
-                        wxvals.iter_mut().zip(xvals.iter()).zip(rows.iter())
-                    {
-                        let w = weights[row.unbound()].max(0.0);
-                        *dst = src * w.sqrt();
-                    }
-                }
-
-                // Build left factor: (sqrt(W) * X)^T in CSC form, using X^T sparsity.
-                // X^T has columns corresponding to rows of X, so scale each column
-                // by sqrt(wrow).
-                let x_t_ref = self.x_t_csc.as_ref();
-                for col in 0..x_t_ref.ncols() {
-                    let w = weights[col].max(0.0).sqrt();
-                    let x_tvals = x_t_ref.val_of_col(col);
-                    let range = x_t_ref.col_range(col);
-                    let wx_tvals = &mut wx_tvalues[range];
-                    for (dst, &src) in wx_tvals.iter_mut().zip(x_tvals.iter()) {
-                        *dst = src * w;
-                    }
-                }
-
-                let wx_ref = SparseColMatRef::new(x.symbolic(), &wxvalues[..]);
-                let wx_t_ref = SparseColMatRef::new(self.x_t_csc.symbolic(), &wx_tvalues[..]);
-                let mut stack = MemStack::new(scratch);
-                let xtwx_symbolic = self.xtwx_symbolic.as_ref();
-                let xtwxmut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwxvalues);
-                sparse_sparse_matmul_numeric(
-                    xtwxmut,
-                    Accum::Replace,
-                    wx_t_ref,
-                    wx_ref,
-                    1.0,
-                    &*info,
-                    *par,
-                    &mut stack,
-                );
-            }
+            XtWxBackend::Sparse(state) => state.compute(
+                x,
+                self.x_t_csc.as_ref(),
+                weights,
+                self.ncols,
+                self.xtwx_symbolic.as_ref(),
+                &mut self.xtwxvalues,
+            ),
         }
 
         Ok(())
     }
+}
 
-    /// Row-by-row outer-product accumulator for XᵀWX into a dense p×p buffer.
+impl DenseOuterState {
+    /// Compute the upper triangle of XᵀWX = Σᵢ wᵢ · xᵢ xᵢᵀ into
+    /// `self.xtwx_dense`.
     ///
-    /// Math: XᵀWX = Σᵢ wᵢ · xᵢ xᵢᵀ where xᵢ is row i of X. For a row with
-    /// nonzero columns C(i) and values v(i), the outer product is supported on
-    /// C(i) × C(i), so the per-row work is |C(i)|², not p². For typical bases
-    /// (B-spline degree d ⇒ |C(i)| ≤ d+1) this is dramatically cheaper than
-    /// either sparse SpGEMM or dense GEMM-on-densified-X.
-    ///
-    /// Parallelism: each worker accumulates into its own p×p buffer; the
-    /// reductions sum the per-thread buffers at the end. Allocation scales with
-    /// the number of rayon work-stealing chunks (≈ number of workers), not n.
-    fn compute_numeric_dense_outer(
-        x_t_csc: &SparseColMat<usize, f64>,
+    /// Decides serial vs parallel from a cost model on total estimated FLOPs
+    /// and the number of available rayon workers. In parallel mode each
+    /// worker accumulates into a thread-local p×p buffer (allocated once and
+    /// reused across calls); the workers are summed into `xtwx_dense` in
+    /// place, preserving its allocation rather than replacing it with a
+    /// freshly-allocated reduction result.
+    fn compute(
+        &mut self,
+        x_t: SparseColMatRef<'_, usize, f64>,
         weights: &Array1<f64>,
         n: usize,
         p: usize,
-        out: &mut Array2<f64>,
-        par: Par,
     ) {
-        debug_assert_eq!(out.nrows(), p);
-        debug_assert_eq!(out.ncols(), p);
-        out.fill(0.0);
+        debug_assert_eq!(self.xtwx_dense.dim(), (p, p));
+        self.xtwx_dense.fill(0.0);
         if n == 0 || p == 0 {
             return;
         }
 
-        let x_t_ref = x_t_csc.as_ref();
+        // Cost model: per-row outer-product is nnz(xᵢ)². With avg_nnz ≈
+        // nnz_total / n, total work ≈ nnz_total² / n. For designs with
+        // uniform row support (e.g. B-splines) this proxy is tight; for
+        // mixed-support designs it is an order-of-magnitude estimate, which
+        // is all we need to gate parallel spawn.
+        let nnz_total = x_t.symbolic().row_idx().len() as u64;
+        let work = nnz_total
+            .saturating_mul(nnz_total)
+            .checked_div(n as u64)
+            .unwrap_or(u64::MAX);
+        let n_threads = rayon::current_num_threads();
+        let parallelize = n_threads > 1 && work >= DENSE_OUTER_PARALLEL_FLOP_THRESHOLD;
 
-        let accumulate_row = |acc: &mut Array2<f64>, i: usize| {
-            let w_i = weights[i].max(0.0);
-            if w_i == 0.0 {
-                return;
-            }
-            let cols = x_t_ref.row_idx_of_col_raw(i);
-            let vals = x_t_ref.val_of_col(i);
-            let nnz_i = cols.len();
-            for jj in 0..nnz_i {
-                let j = cols[jj].unbound();
-                let wvj = w_i * vals[jj];
-                let mut row_j = acc.row_mut(j);
-                let row_slice = row_j
-                    .as_slice_mut()
-                    .expect("dense XᵀWX buffer is row-major and contiguous");
-                for kk in 0..nnz_i {
-                    let k = cols[kk].unbound();
-                    row_slice[k] += wvj * vals[kk];
+        if !parallelize {
+            accumulate_outer_upper(&mut self.xtwx_dense, x_t, weights, 0..n);
+            return;
+        }
+
+        // Bounded thread allocation: exactly `n_threads` p×p buffers, one
+        // per worker, reused across calls.
+        if self.thread_buffers.len() != n_threads {
+            self.thread_buffers
+                .resize_with(n_threads, || Array2::<f64>::zeros((p, p)));
+        }
+        let chunk = n.div_ceil(n_threads);
+        self.thread_buffers
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(t, buf)| {
+                buf.fill(0.0);
+                let start = t * chunk;
+                let end = (start + chunk).min(n);
+                if start < end {
+                    accumulate_outer_upper(buf, x_t, weights, start..end);
                 }
-            }
-        };
+            });
 
-        if matches!(par, Par::Seq) {
-            for i in 0..n {
-                accumulate_row(out, i);
-            }
-        } else {
-            // Per-worker dense accumulators reduced into one. Rayon's `fold`
-            // calls the seed once per work-stealing chunk, not per element, so
-            // allocation cost is amortized to ≈ #threads.
-            let combined = (0..n)
-                .into_par_iter()
-                .fold(
-                    || Array2::<f64>::zeros((p, p)),
-                    |mut acc, i| {
-                        accumulate_row(&mut acc, i);
-                        acc
-                    },
-                )
-                .reduce_with(|a, b| a + b)
-                .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
-            *out = combined;
+        // Reduce per-thread buffers into the cached output. The += preserves
+        // `xtwx_dense`'s storage; we never reallocate it.
+        for buf in &self.thread_buffers {
+            self.xtwx_dense += buf;
         }
     }
 }
 
-fn sparse_xtwx_par() -> Par {
-    // Always hand the global parallelism handle to faer's SpGEMM. The previous
-    // rule, `ncols < 128 ⇒ Par::Seq`, forced the dominant inner-loop operation
-    // onto a single thread for the Matérn pilot (n=10000, p=101) — well below
-    // the cutoff in p but with plenty of work overall. Faer's matmul makes its
-    // own small-problem decision internally, so a hand-rolled dimension gate
-    // here only suppresses real parallelism without adding precision.
-    get_global_parallelism()
+impl SparseSpGemmState {
+    /// Compute XᵀWX into the symbolic-pattern array `xtwxvalues` via faer's
+    /// sparse-sparse matmul: XᵀWX = (√W·X)ᵀ · (√W·X).
+    fn compute(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        x_t: SparseColMatRef<'_, usize, f64>,
+        weights: &Array1<f64>,
+        p: usize,
+        xtwx_symbolic: SymbolicSparseColMatRef<'_, usize>,
+        xtwxvalues: &mut [f64],
+    ) {
+        let x_ref = x.as_ref();
+        // Right factor: √W · X, stored in X's CSC sparsity pattern.
+        for col in 0..p {
+            let rows = x_ref.row_idx_of_col_raw(col);
+            let xvals = x_ref.val_of_col(col);
+            let range = x_ref.col_range(col);
+            let dst = &mut self.wxvalues[range];
+            for ((d, &s), row) in dst.iter_mut().zip(xvals.iter()).zip(rows.iter()) {
+                let w = weights[row.unbound()].max(0.0);
+                *d = s * w.sqrt();
+            }
+        }
+        // Left factor: (√W · X)ᵀ in X^T's CSC sparsity pattern. X^T's columns
+        // correspond to rows of X, so each column scales by sqrt(w_row).
+        for col in 0..x_t.ncols() {
+            let w = weights[col].max(0.0).sqrt();
+            let xvals = x_t.val_of_col(col);
+            let range = x_t.col_range(col);
+            let dst = &mut self.wx_tvalues[range];
+            for (d, &s) in dst.iter_mut().zip(xvals.iter()) {
+                *d = s * w;
+            }
+        }
+
+        let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wxvalues[..]);
+        let wx_t_ref = SparseColMatRef::new(x_t.symbolic(), &self.wx_tvalues[..]);
+        let mut stack = MemStack::new(&mut self.scratch);
+        let xtwxmut = SparseColMatMut::new(xtwx_symbolic, xtwxvalues);
+        sparse_sparse_matmul_numeric(
+            xtwxmut,
+            Accum::Replace,
+            wx_t_ref,
+            wx_ref,
+            1.0,
+            &self.info,
+            self.par,
+            &mut stack,
+        );
+    }
+}
+
+/// Accumulate the upper triangle of Σᵢ wᵢ · xᵢ xᵢᵀ over `rows` into `acc`.
+///
+/// `x_t` is Xᵀ in CSC: column i lists the nonzero columns of row i of X.
+/// Faer's CSC convention stores these in ascending order, so iterating
+/// `jj < kk` over per-row index pairs gives `j ≤ k` and only ever writes
+/// to `acc[[j, k]]` with `j ≤ k` (the upper triangle, including the
+/// diagonal at `jj == kk`).
+///
+/// Inner-loop layout: `acc` is row-major p×p, so row j lives in the
+/// contiguous slice `acc_data[j·p .. (j+1)·p]`. We reborrow that slice once
+/// per outer-product step — cheaper than ndarray's `row_mut(j).as_slice_mut()`
+/// because it skips the per-call stride-validation and contiguity check.
+#[inline]
+fn accumulate_outer_upper(
+    acc: &mut Array2<f64>,
+    x_t: SparseColMatRef<'_, usize, f64>,
+    weights: &Array1<f64>,
+    rows: std::ops::Range<usize>,
+) {
+    debug_assert_eq!(acc.nrows(), acc.ncols());
+    let p = acc.ncols();
+    let acc_data = acc
+        .as_slice_mut()
+        .expect("dense XᵀWX accumulator is row-major and contiguous");
+
+    for i in rows {
+        let w_i = weights[i].max(0.0);
+        if w_i == 0.0 {
+            continue;
+        }
+        let cols = x_t.row_idx_of_col_raw(i);
+        let vals = x_t.val_of_col(i);
+        let nnz_i = cols.len();
+        for jj in 0..nnz_i {
+            let j = cols[jj].unbound();
+            let wvj = w_i * vals[jj];
+            let row = &mut acc_data[j * p..j * p + p];
+            for kk in jj..nnz_i {
+                let k = cols[kk].unbound();
+                row[k] += wvj * vals[kk];
+            }
+        }
+    }
 }
 
 fn compute_jeffreys_pirls_diagnostics_sparse(
@@ -2450,6 +2529,80 @@ fn projected_gradient_norm(
         sum_sq += g * g;
     }
     sum_sq.sqrt()
+}
+
+/// "Soft" P-IRLS acceptance reasons — fits that did not certify strict KKT
+/// stationarity but that the post-loop rescue would still classify as
+/// `StalledAtValidMinimum`. Evaluating them per-iter (gated by a streak)
+/// lets the loop exit at the iteration that first meets the criterion
+/// instead of grinding to `MaxIterations` only to be rescued with the
+/// same conditions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PirlsSoftAccept {
+    /// Projected gradient inside the 10× near-stationary band AND the
+    /// deviance has plateaued at `tol · objective_scale` — the standard
+    /// "good-enough plateau" rescue.
+    NearStationaryPlateau,
+    /// `max|η|` is pinned against [`PIRLS_ETA_ABS_CAP`] AND the deviance
+    /// has plateaued. Same saturated-boundary class as separated binomial
+    /// fits: extra Newton work only re-tries the clipped boundary.
+    BoundarySaturation,
+    /// Projected gradient is small *relative to the objective magnitude*
+    /// (not just the dimension scale) AND the deviance has plateaued
+    /// strictly (×0.1 floor) AND is non-decreasing. This is the
+    /// per-observation rescue for biobank-scale GLMs where ‖g‖ scales
+    /// with √n and the absolute KKT test becomes systematically too
+    /// tight even when the fit is functionally converged.
+    RelativeBandPlateau,
+}
+
+/// Evaluate every "soft" acceptance criterion that the post-loop rescue
+/// applies to a fit which has hit `MaxIterations`. Returns the first
+/// matching reason, or `None` if no criterion fires.
+///
+/// The same helper is used in two places, with one structural difference:
+/// per-iter calls require a streak of at least two consecutive matches
+/// (defense against a single noisy step that briefly satisfies the band)
+/// before exiting; the post-loop call accepts immediately because the
+/// iteration budget is already exhausted. Sharing the helper guarantees
+/// the two acceptance contexts stay in sync — anything accepted post-loop
+/// is also a candidate for early-exit, and anything that meets the early
+/// criterion would have been accepted post-loop.
+#[inline]
+fn pirls_soft_acceptance(
+    state: &WorkingState,
+    projected_grad: f64,
+    deviance_change: f64,
+    max_abs_eta: f64,
+    tol: f64,
+) -> Option<PirlsSoftAccept> {
+    let objective_scale = state
+        .deviance
+        .abs()
+        .max(state.penalty_term.abs())
+        .max(1.0);
+    let scaled_dev_tol = tol * objective_scale;
+
+    if state.near_stationary_kkt(projected_grad, tol)
+        && deviance_change.abs() < scaled_dev_tol
+    {
+        return Some(PirlsSoftAccept::NearStationaryPlateau);
+    }
+
+    if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12)
+        && deviance_change.abs() < scaled_dev_tol
+    {
+        return Some(PirlsSoftAccept::BoundarySaturation);
+    }
+
+    if projected_grad <= tol.max(1e-6) * objective_scale
+        && deviance_change.abs() < scaled_dev_tol * 0.1
+        && deviance_change >= 0.0
+    {
+        return Some(PirlsSoftAccept::RelativeBandPlateau);
+    }
+
+    None
 }
 
 fn constrained_stationarity_norm(
@@ -3210,11 +3363,6 @@ where
     F: FnMut(&WorkingModelIterationInfo),
 {
     const LM_MAX_LAMBDA: f64 = 1e12;
-    // Hard cap on |eta|. For most GLM/survival links (logit, probit,
-    // cloglog, Φ-transform), |eta| > 40 drives the link response to 0/1,
-    // making gradients overflow. Even for the identity link this is a
-    // sensible guard against runaway underdetermined systems.
-    const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
     fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
@@ -3266,15 +3414,17 @@ where
     let mut max_abs_eta = 0.0;
     let mut status = PirlsStatus::MaxIterationsReached;
     let mut iterations = 0usize;
-    // Streak counter for the relative-band plateau check. The post-loop
-    // rescue accepts a fit when the relative gradient is small AND the
-    // deviance has plateaued at dev_tol*0.1, but only after the iteration
-    // budget is exhausted. Mirroring that test in-loop saves the wasted
-    // iterations spent grinding to MaxIterations only to be accepted at
-    // the end with the same condition. A single iteration meeting the
-    // criterion is not robust evidence (one noisy step can fake it), so we
-    // require two consecutive iterations to fire the early exit.
-    let mut relative_band_plateau_streak = 0usize;
+    // Streak counter for the soft-acceptance plateau check. Every soft
+    // criterion the post-loop rescue would apply to a fit that has hit
+    // MaxIterations is also evaluated per-iter via [`pirls_soft_acceptance`]
+    // — a fit which has functionally converged exits at the iteration it
+    // first satisfies the criterion, instead of grinding through the rest
+    // of the budget only to be rescued with the same conditions. A single
+    // iteration meeting the band is not robust evidence (one noisy step
+    // can fake it), so we require two consecutive matches before exiting
+    // — virtually free when the optimizer has truly settled, and a
+    // principled defence against false positives otherwise.
+    let mut plateau_streak = 0usize;
     let mut final_state: Option<WorkingState> = None;
     let mut newton_direction = Array1::<f64>::zeros(beta.len());
     let mut linear_active_hint: Option<Vec<usize>> =
@@ -3673,12 +3823,6 @@ where
                             .as_ref()
                             .expect("final_state set immediately above");
 
-                        let deviance_scale = current_penalized
-                            .abs()
-                            .max(candidate_penalized.abs())
-                            .max(1.0);
-                        let dev_tol = options.convergence_tolerance * deviance_scale;
-
                         // Newton-decrement acceptance (Boyd & Vandenberghe §9.5.1):
                         // at the pre-step iterate the squared decrement is
                         //     λ_N²(β) = gᵀ H⁻¹ g  =  −g · d_N,
@@ -3718,59 +3862,49 @@ where
                         // Newton decrement is an independent additional
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.
-                        let kkt_pass = final_state_ref
+                        if final_state_ref
                             .certifies_kkt(convergence_grad_norm, options.convergence_tolerance)
-                            || nd_pass;
-
-                        if kkt_pass {
+                            || nd_pass
+                        {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
-                        // Plateau within the near-stationary band: neither
-                        // the strict KKT nor the strict deviance test passed,
-                        // but both are inside their 10× guard bands and the
-                        // deviance is non-decreasing. This is a usable but
-                        // non-strict minimum.
-                        if deviance_change.abs() < dev_tol * 0.01
-                            && deviance_change >= 0.0
-                            && final_state_ref.near_stationary_kkt(
-                                convergence_grad_norm,
-                                options.convergence_tolerance,
-                            )
-                        {
-                            status = PirlsStatus::StalledAtValidMinimum;
-                            break 'pirls_loop;
-                        }
 
-                        // Two-iteration relative-band plateau, mirroring the
-                        // post-loop rescue. Without this in-loop check, a
-                        // fit meeting the rescue's three conditions at
-                        // iteration k still grinds through (max_iter − k)
-                        // further iterations only to be accepted post-loop
-                        // with the same condition. At biobank scale that is
-                        // hundreds of n·p² inner iterations of wasted work.
-                        // Two consecutive iterations rule out a single noisy
-                        // step faking convergence.
-                        let objective_scale_for_relative = final_state_ref
-                            .deviance
-                            .abs()
-                            .max(final_state_ref.penalty_term.abs())
-                            .max(1.0);
-                        let scaled_dev_tol_relative =
-                            options.convergence_tolerance * objective_scale_for_relative;
-                        let relative_band_grad_bound = options.convergence_tolerance.max(1e-6)
-                            * objective_scale_for_relative;
-                        if convergence_grad_norm <= relative_band_grad_bound
-                            && deviance_change.abs() < scaled_dev_tol_relative * 0.1
-                            && deviance_change >= 0.0
-                        {
-                            relative_band_plateau_streak += 1;
-                            if relative_band_plateau_streak >= 2 {
-                                status = PirlsStatus::StalledAtValidMinimum;
-                                break 'pirls_loop;
+                        // Soft acceptance: every criterion the post-loop
+                        // rescue would apply to a fit that has hit
+                        // MaxIterations, evaluated per-iter so a fit that
+                        // has functionally converged exits at the iteration
+                        // it first satisfies the criterion instead of
+                        // grinding through the rest of the budget only to
+                        // be rescued with the same conditions. The streak
+                        // requirement (≥2 consecutive matches) defends
+                        // against a single noisy step briefly satisfying
+                        // the band — when the optimizer has truly settled,
+                        // two consecutive matches cost only one extra
+                        // iteration of inner work and give principled
+                        // protection against false positives.
+                        match pirls_soft_acceptance(
+                            final_state_ref,
+                            convergence_grad_norm,
+                            deviance_change,
+                            max_abs_eta,
+                            options.convergence_tolerance,
+                        ) {
+                            Some(reason) => {
+                                plateau_streak += 1;
+                                if plateau_streak >= 2 {
+                                    log::debug!(
+                                        "[PIRLS] iter {iter} early-exit on soft acceptance: \
+                                         {reason:?} (‖g‖={convergence_grad_norm:.3e}, \
+                                         Δdev={deviance_change:.3e})"
+                                    );
+                                    status = PirlsStatus::StalledAtValidMinimum;
+                                    break 'pirls_loop;
+                                }
                             }
-                        } else {
-                            relative_band_plateau_streak = 0;
+                            None => {
+                                plateau_streak = 0;
+                            }
                         }
 
                         break; // Break inner lambda loop, continue outer pirls loop
@@ -3920,36 +4054,33 @@ where
         options.linear_constraints.as_ref(),
     );
     if status.is_failed_max_iterations() {
-        let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
-        let scaled_dev_tol = options.convergence_tolerance * objective_scale;
         let tol = options.convergence_tolerance;
-
+        // Strict KKT met after the loop bailed: reclassify as a valid
+        // (if non-strictly-converged) minimum. The remaining soft-acceptance
+        // criteria (near-stationary plateau, boundary saturation, relative
+        // band) are checked uniformly through `pirls_soft_acceptance` so the
+        // post-loop rescue and the per-iter early-exit stay in lockstep —
+        // anything accepted here is also a candidate for early-exit, and
+        // anything that meets the early criterion would have been rescued
+        // here.
         if state.certifies_kkt(final_projected_grad, tol) {
-            // Strict KKT met after the loop bailed; reclassify as a valid
-            // (if non-strictly-converged) minimum.
+            log::debug!(
+                "[PIRLS] post-loop rescue: strict KKT after MaxIterations \
+                 (‖g‖={final_projected_grad:.3e})"
+            );
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if state.near_stationary_kkt(final_projected_grad, tol)
-            && last_deviance_change.abs() < scaled_dev_tol
-        {
-            // Plateaued objective + near-stationary projected gradient.
-            status = PirlsStatus::StalledAtValidMinimum;
-        } else if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12)
-            && last_deviance_change.abs() < scaled_dev_tol
-        {
-            // The objective has flattened against the explicit eta guard. This
-            // is the same saturated boundary class as separated binomial fits:
-            // extra Newton work only re-tries the clipped boundary.
-            status = PirlsStatus::StalledAtValidMinimum;
-        } else if final_projected_grad <= tol.max(1e-6) * objective_scale
-            && last_deviance_change.abs() < scaled_dev_tol * 0.1
-            && last_deviance_change >= 0.0
-        {
-            // Objective-scale relative band: a third independent rescue that
-            // accepts ‖g‖ small *relative to |F(β)|*. The strict KKT band has
-            // already failed, the eta cap is not active, and we additionally
-            // require a tighter (×0.1) deviance plateau plus monotone
-            // non-decreasing change to rule out a not-yet-converged fit being
-            // silently classified as stalled-but-valid.
+        } else if let Some(reason) = pirls_soft_acceptance(
+            &state,
+            final_projected_grad,
+            last_deviance_change,
+            max_abs_eta,
+            tol,
+        ) {
+            log::debug!(
+                "[PIRLS] post-loop rescue on soft acceptance: {reason:?} \
+                 (‖g‖={final_projected_grad:.3e}, \
+                 Δdev={last_deviance_change:.3e})"
+            );
             status = PirlsStatus::StalledAtValidMinimum;
         }
     }
@@ -8419,7 +8550,7 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{Array1, Array2, array};
 
     fn scalar_working_state(
         beta: &Coefficients,
@@ -8735,6 +8866,161 @@ mod root_cause_tests {
         assert!(kkt.dual_feasibility <= 1e-12);
         assert!(kkt.complementarity <= 1e-12);
         assert!(kkt.stationarity <= 1e-12);
+    }
+
+    /// The user's biobank pathological case: a fit with `n=320000`,
+    /// `p=20`, projected stationarity residual `‖g‖ = 1.465e-5`. The old
+    /// absolute test `‖g‖ < 1e-6` rejects this as non-converged, even
+    /// though the normalized residual is ~2.6e-8. After the fix, the
+    /// scale-invariant certificate accepts it under EITHER bound.
+    #[test]
+    fn certifies_kkt_accepts_biobank_pathological_case() {
+        let n = 320_000usize;
+        let p = 20usize;
+        let g_norm = 1.465e-5;
+        let tol = 1e-6;
+
+        let state = WorkingState {
+            eta: LinearPredictor::new(Array1::zeros(n)),
+            gradient: Array1::zeros(p),
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
+            log_likelihood: 0.0,
+            deviance: 1.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            // At convergence the score and penalty gradient nearly cancel;
+            // both are O(√n) for standardized columns. Use a representative
+            // magnitude so the natural-scale bound has something to chew on.
+            gradient_natural_scale: 1.0e3,
+        };
+
+        // Dimension-based bound: tol * sqrt(n) * sqrt(p) ≈ 1e-6 * 565.7 * 4.47 ≈ 2.5e-3
+        // Natural-scale bound: 1.465e-5 / (1 + 1e3) ≈ 1.5e-8
+        // Both pass; old absolute test 1.465e-5 < 1e-6 fails.
+        assert!(
+            state.certifies_kkt(g_norm, tol),
+            "scale-invariant certificate should accept biobank pathological case"
+        );
+        assert!(
+            !(g_norm < tol),
+            "this test must witness the failure of the old absolute test; \
+             otherwise it does not prove the fix"
+        );
+    }
+
+    /// The strict KKT certificate must be invariant under uniform rescaling
+    /// of the objective `F → c·F` (which scales `‖g‖`, `‖score‖`, and
+    /// `‖S·β‖` all by the same `c`). The additive `1` floor in the
+    /// natural-scale denominator makes the test approximately invariant
+    /// at small natural scale and exactly invariant in the limit.
+    #[test]
+    fn certifies_kkt_is_scale_invariant() {
+        let n = 1000usize;
+        let p = 10usize;
+        let tol = 1e-6;
+        let g_norm = 1.0;
+        let natural_scale = 5.0e6; // dominates the +1 floor
+
+        let mk_state = |g: Array1<f64>, ns: f64| WorkingState {
+            eta: LinearPredictor::new(Array1::zeros(n)),
+            gradient: g,
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            gradient_natural_scale: ns,
+        };
+
+        let base = mk_state(Array1::zeros(p), natural_scale);
+        let scaled = mk_state(Array1::zeros(p), natural_scale * 1000.0);
+
+        // Numerator scales by c; denominator scales by c when the natural
+        // scale dominates. So r_g is invariant.
+        assert_eq!(
+            base.certifies_kkt(g_norm, tol),
+            scaled.certifies_kkt(g_norm * 1000.0, tol),
+            "KKT classification must be invariant under uniform F → c·F"
+        );
+    }
+
+    /// The two scale-invariant certificates must each be sufficient on its
+    /// own (acceptance under EITHER suffices). One is data-driven (natural
+    /// scale), the other purely structural (sqrt(n)·sqrt(p)). Both should
+    /// accept obviously-converged states; failures of one should not block
+    /// the other.
+    #[test]
+    fn certifies_kkt_accepts_under_either_bound() {
+        let n = 100usize;
+        let p = 5usize;
+        let tol = 1e-6;
+
+        let state_well_scaled = WorkingState {
+            eta: LinearPredictor::new(Array1::zeros(n)),
+            gradient: Array1::zeros(p),
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            gradient_natural_scale: 1.0e6,
+        };
+        // Natural-scale bound: 1.0 / (1+1e6) ≈ 1e-6 → at threshold; pass.
+        // Dimension bound: 1.0 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.2e-5 → fail.
+        // Acceptance under EITHER: pass (via natural-scale).
+        assert!(state_well_scaled.certifies_kkt(0.99e-6 * (1.0 + 1.0e6), tol));
+
+        let state_unscaled = WorkingState {
+            eta: LinearPredictor::new(Array1::zeros(n)),
+            gradient: Array1::zeros(p),
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            gradient_natural_scale: 0.0,
+        };
+        // Natural-scale bound: 2e-6 / 1 = 2e-6 → fail (above tol=1e-6).
+        // Dimension bound: 2e-6 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.236e-5 → pass.
+        // Acceptance under EITHER: pass (via dimension).
+        assert!(state_unscaled.certifies_kkt(2.0e-6, tol));
+    }
+
+    /// The near-stationary band is exactly 10× the strict KKT tolerance,
+    /// applied under either bound. It classifies a usable but non-strictly
+    /// converged minimum as `StalledAtValidMinimum` rather than as a hard
+    /// non-convergence.
+    #[test]
+    fn near_stationary_kkt_uses_ten_times_band() {
+        let n = 100usize;
+        let p = 4usize;
+        let tol = 1e-6;
+        let state = WorkingState {
+            eta: LinearPredictor::new(Array1::zeros(n)),
+            gradient: Array1::zeros(p),
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            gradient_natural_scale: 99.0,
+        };
+        // Natural-scale band: relative ‖g‖ = g/(1+99) = g/100 ≤ 10·tol = 1e-5
+        // ⇒ accept when g ≤ 1e-3.
+        assert!(state.near_stationary_kkt(9.9e-4, tol));
+        assert!(!state.near_stationary_kkt(2.0e-3, tol));
+        // Strict KKT at the same point should be ~10× tighter.
+        assert!(!state.certifies_kkt(9.9e-4, tol));
     }
 
     /// Hypothesis 3: LM gain-ratio fallback should accept when both predicted

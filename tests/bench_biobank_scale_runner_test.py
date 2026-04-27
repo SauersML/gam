@@ -30,19 +30,61 @@ class BiobankScaleRunnerTests(unittest.TestCase):
 
         self.assertEqual(int(cfg["target_n"]), 400000)
 
-        payload = {"include": [spec.__dict__ for spec in _RUNNER.build_method_specs(cfg)]}
-        methods = {row["name"]: row for row in payload["include"]}
+        specs = _RUNNER.build_method_specs(cfg)
 
-        self.assertIn("rust_margslope_aniso_duchon16d_50", methods)
-        lane = methods["rust_margslope_aniso_duchon16d_50"]
-        self.assertEqual(lane["dataset"], "disease")
-        self.assertEqual(lane["family"], "binomial")
-        self.assertEqual(lane["backend"], "rust_gam")
-        self.assertEqual(lane["spatial_basis"], "duchon")
-        self.assertEqual(lane["centers"], 24)
-        self.assertTrue(lane["marginal_slope"])
-        self.assertTrue(lane["scale_dimensions"])
-        self.assertEqual(lane["z_column"], "pgs_ctn_z")
+        marginal_slope_disease = [
+            s
+            for s in specs
+            if s.dataset == "disease"
+            and s.backend == "rust_gam"
+            and s.family == "binomial"
+            and s.marginal_slope
+        ]
+        self.assertEqual(
+            len(marginal_slope_disease),
+            1,
+            "expected exactly one disease + Rust + binomial + marginal-slope lane in the "
+            "default biobank matrix; found "
+            f"{[s.name for s in marginal_slope_disease]}",
+        )
+        lane = marginal_slope_disease[0]
+
+        self.assertEqual(lane.spatial_basis, "duchon")
+        self.assertEqual(lane.pc_count, 16, f"{lane.name} must run on 16 PCs")
+        self.assertTrue(lane.scale_dimensions, f"{lane.name} must enable per-axis scales")
+        self.assertEqual(lane.z_column, "pgs_ctn_z", f"{lane.name} must read CTN z column")
+
+        self.assertIsNotNone(
+            lane.mean_linkwiggle_knots,
+            f"{lane.name} must enable mean linkwiggle (production calibration)",
+        )
+        self.assertGreaterEqual(int(lane.mean_linkwiggle_knots), 1)
+        self.assertIsNotNone(
+            lane.logslope_linkwiggle_knots,
+            f"{lane.name} must enable score-warp linkwiggle on the logslope side",
+        )
+        self.assertGreaterEqual(int(lane.logslope_linkwiggle_knots), 1)
+
+        self.assertIsNotNone(
+            lane.max_centers,
+            f"{lane.name} must declare a max-centers cap for biobank scale",
+        )
+        self.assertLessEqual(
+            int(lane.centers),
+            int(lane.max_centers),
+            f"{lane.name} centers={lane.centers} exceeds its own max_centers cap "
+            f"{lane.max_centers}",
+        )
+
+        capped_at_biobank_n = _RUNNER.effective_marginal_slope_centers(
+            lane, train_rows=int(cfg["target_n"])
+        )
+        self.assertLessEqual(
+            capped_at_biobank_n,
+            int(lane.max_centers),
+            f"{lane.name} effective centers at n={cfg['target_n']} ({capped_at_biobank_n}) "
+            f"must not exceed max_centers cap {lane.max_centers}",
+        )
 
     def test_marginal_slope_formula_supports_linkwiggle_and_scorewarp(self) -> None:
         spec = _RUNNER.MethodSpec(
@@ -176,18 +218,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "legacy survival backend"):
             _RUNNER.build_method_specs(cfg)
 
-    def test_run_rust_survival_uses_explicit_survival_contract(self) -> None:
-        spec = _RUNNER.MethodSpec(
-            name="rust_gamlss_survival_ps",
-            dataset="survival",
-            backend="rust_survival",
-            family="survival",
-            spatial_basis="ps",
-            smooth_kind="separate",
-            survival_likelihood="location-scale",
-            survival_distribution="probit",
-        )
-        train_rows = [
+    def _survival_contract_train_rows(self) -> list[dict[str, float]]:
+        return [
             {
                 "time": 4.0,
                 "event": 1.0,
@@ -215,7 +247,9 @@ class BiobankScaleRunnerTests(unittest.TestCase):
                 "pc4_std": -0.4,
             },
         ]
-        test_rows = [
+
+    def _survival_contract_test_rows(self) -> list[dict[str, float]]:
+        return [
             {
                 "time": 6.0,
                 "event": 1.0,
@@ -230,10 +264,23 @@ class BiobankScaleRunnerTests(unittest.TestCase):
                 "pc4_std": 0.2,
             }
         ]
+
+    def test_run_rust_survival_uses_explicit_survival_contract(self) -> None:
+        spec = _RUNNER.MethodSpec(
+            name="rust_gamlss_survival_ps",
+            dataset="survival",
+            backend="rust_survival",
+            family="survival",
+            spatial_basis="ps",
+            smooth_kind="separate",
+            survival_likelihood="location-scale",
+            survival_distribution="probit",
+        )
+        train_rows = self._survival_contract_train_rows()
+        test_rows = self._survival_contract_test_rows()
         snapshots: dict[str, object] = {}
         orig_load_bin = _RUNNER.load_or_build_rust_binary
         orig_run_cmd = _RUNNER.run_cmd_stream
-        orig_survival_metrics = _RUNNER.survival_metrics
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
@@ -241,6 +288,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
                 if cmd[1] == "fit":
                     fit_input = Path(cmd[-2])
                     snapshots["fit_formula"] = cmd[-1]
+                    snapshots["fit_cmd"] = list(cmd)
                     snapshots["fit_rows"] = _RUNNER.read_csv_rows(fit_input)
                     Path(cmd[cmd.index("--out") + 1]).write_text("{}", encoding="utf-8")
                     return 0, "", ""
@@ -250,16 +298,20 @@ class BiobankScaleRunnerTests(unittest.TestCase):
                     input_rows = _RUNNER.read_csv_rows(input_path)
                     snapshots.setdefault("predict_inputs", []).append(input_rows)
                     out_path.parent.mkdir(parents=True, exist_ok=True)
+                    n = max(len(input_rows), 1)
                     with out_path.open("w", encoding="utf-8", newline="") as fh:
-                        writer = csv.DictWriter(fh, fieldnames=["risk_score"])
+                        writer = csv.DictWriter(fh, fieldnames=["survival_prob"])
                         writer.writeheader()
-                        for idx, _row in enumerate(input_rows):
-                            writer.writerow({"risk_score": float(idx)})
+                        for idx in range(len(input_rows)):
+                            # Monotone-decreasing survival in (0,1] across the grid so
+                            # downstream lifted-metric computations stay well-defined.
+                            writer.writerow(
+                                {"survival_prob": float(0.99 - 0.05 * idx / max(n - 1, 1))}
+                            )
                     return 0, "", ""
                 raise AssertionError(f"unexpected command: {cmd}")
 
             _RUNNER.run_cmd_stream = _fake_run_cmd
-            _RUNNER.survival_metrics = lambda *args, **kwargs: {"c_index": 0.5}
 
             with tempfile.TemporaryDirectory() as td:
                 td_path = Path(td)
@@ -271,7 +323,6 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         finally:
             _RUNNER.load_or_build_rust_binary = orig_load_bin
             _RUNNER.run_cmd_stream = orig_run_cmd
-            _RUNNER.survival_metrics = orig_survival_metrics
 
         self.assertIn("Surv(__entry, time, event)", snapshots["fit_formula"])
         self.assertIn(
@@ -282,11 +333,112 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         fit_rows = snapshots["fit_rows"]
         self.assertTrue(all(float(row["__entry"]) == 0.0 for row in fit_rows))
         self.assertEqual([float(row["time"]) for row in fit_rows], [4.0, 10.0])
+
         predict_inputs = snapshots["predict_inputs"]
+        # The runner must issue exactly two predict invocations: one for the
+        # explicit horizon test set, then one for the stacked native survival
+        # grid used to compute proper survival metrics.
         self.assertEqual(len(predict_inputs), 2)
-        for rows in predict_inputs:
-            self.assertTrue(all(float(row["__entry"]) == 0.0 for row in rows))
-            self.assertTrue(all(float(row["time"]) == 7.0 for row in rows))
+
+        # First predict: one row per test row, all at the median-derived horizon.
+        horizon = _RUNNER.survival_eval_horizon_from_rows(train_rows)
+        self.assertEqual(len(predict_inputs[0]), len(test_rows))
+        self.assertTrue(
+            all(abs(float(row["time"]) - horizon) < 1e-12 for row in predict_inputs[0])
+        )
+
+        # Second predict: native survival grid stacks rows over the score grid.
+        import numpy as np
+
+        grid = _RUNNER._survival_score_grid(
+            np.array([float(r["time"]) for r in train_rows], dtype=float)
+        )
+        expected_native_rows = len(test_rows) * grid.shape[0]
+        self.assertEqual(
+            len(predict_inputs[1]),
+            expected_native_rows,
+            f"native survival grid must stack {len(test_rows)} test rows × "
+            f"{grid.shape[0]} grid points = {expected_native_rows}; "
+            f"got {len(predict_inputs[1])}",
+        )
+
+        # Every row of every predict invocation must carry __entry left-truncation,
+        # otherwise the survival likelihood degenerates silently.
+        for invocation_idx, rows in enumerate(predict_inputs):
+            for row_idx, row in enumerate(rows):
+                self.assertIn(
+                    "__entry",
+                    row,
+                    f"predict invocation {invocation_idx} row {row_idx} missing __entry",
+                )
+                self.assertEqual(
+                    float(row["__entry"]),
+                    0.0,
+                    f"predict invocation {invocation_idx} row {row_idx} has non-zero __entry",
+                )
+
+        # The fit command must explicitly carry the survival likelihood mode,
+        # so a silent backend swap is impossible.
+        fit_cmd = snapshots["fit_cmd"]
+        self.assertIn("--survival-likelihood", fit_cmd)
+        self.assertEqual(
+            fit_cmd[fit_cmd.index("--survival-likelihood") + 1],
+            "location-scale",
+        )
+
+    def test_run_rust_survival_rejects_invalid_native_grid_columns(self) -> None:
+        """A malformed native survival prediction must fail with a clear error,
+        not silently report nonsense metrics."""
+        spec = _RUNNER.MethodSpec(
+            name="rust_gamlss_survival_ps",
+            dataset="survival",
+            backend="rust_survival",
+            family="survival",
+            spatial_basis="ps",
+            smooth_kind="separate",
+            survival_likelihood="location-scale",
+            survival_distribution="probit",
+        )
+        train_rows = self._survival_contract_train_rows()
+        test_rows = self._survival_contract_test_rows()
+
+        orig_load_bin = _RUNNER.load_or_build_rust_binary
+        orig_run_cmd = _RUNNER.run_cmd_stream
+        try:
+            _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
+
+            def _fake_run_cmd(cmd, cwd=None):
+                if cmd[1] == "fit":
+                    Path(cmd[cmd.index("--out") + 1]).write_text("{}", encoding="utf-8")
+                    return 0, "", ""
+                if cmd[1] == "predict":
+                    input_path = Path(cmd[3])
+                    out_path = Path(cmd[cmd.index("--out") + 1])
+                    input_rows = _RUNNER.read_csv_rows(input_path)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Emit risk_score (legacy/wrong column name) instead of survival_prob.
+                    with out_path.open("w", encoding="utf-8", newline="") as fh:
+                        writer = csv.DictWriter(fh, fieldnames=["risk_score"])
+                        writer.writeheader()
+                        for idx in range(len(input_rows)):
+                            writer.writerow({"risk_score": float(idx)})
+                    return 0, "", ""
+                raise AssertionError(f"unexpected command: {cmd}")
+
+            _RUNNER.run_cmd_stream = _fake_run_cmd
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                train_csv = td_path / "train.csv"
+                test_csv = td_path / "test.csv"
+                _write_csv(train_csv, train_rows)
+                _write_csv(test_csv, test_rows)
+                with self.assertRaises(RuntimeError) as ctx:
+                    _RUNNER.run_rust_survival(spec, train_csv, test_csv, td_path)
+                self.assertIn(spec.name, str(ctx.exception))
+        finally:
+            _RUNNER.load_or_build_rust_binary = orig_load_bin
+            _RUNNER.run_cmd_stream = orig_run_cmd
 
     def test_survival_formula_rhs_supports_linkwiggle_and_timewiggle(self) -> None:
         spec = _RUNNER.MethodSpec(
