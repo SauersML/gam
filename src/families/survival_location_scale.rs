@@ -7751,10 +7751,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         true
     }
 
-    fn coefficient_hessian_cost(
-        &self,
-        specs: &[crate::custom_family::ParameterBlockSpec],
-    ) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
         // Survival location-scale couples its blocks (threshold/time/log-σ
         // and any link/time wiggles) through the survival likelihood: every
         // row contributes a dense outer-product over (Σ p_b) coefficients.
