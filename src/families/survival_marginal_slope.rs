@@ -12782,6 +12782,23 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         )))
     }
 
+    fn supports_matrix_free_joint_hessian(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> bool {
+        // The workspace impl above unconditionally returns `Some(workspace)`
+        // — the rigid path produces a `RowKernelHessianWorkspace` and the
+        // flex path produces a
+        // `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`. Both
+        // route the joint Hessian through Hv operators rather than dense
+        // assembly, so when the unified evaluator's `use_joint_matrix_free_path`
+        // predicate fires the eval will return `JointHessianSource::Operator`
+        // and ARC's `run_operator_trust_region` absorbs the per-iteration
+        // cost. The cost-driven `prefer_gradient_only` downgrade in
+        // `OuterProblem` is therefore suppressed for this family.
+        true
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],

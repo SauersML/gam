@@ -10672,7 +10672,8 @@ fn try_exact_joint_spatial_aniso_optimization(
         /// Cost-only evaluation. BFGS line-search probes route through the
         /// evaluator's true value-only path so they neither construct
         /// `try_build_spatial_log_kappa_hyper_dirs` nor assemble a gradient
-        /// that the line search will discard.
+        /// that the line search will discard. Split-borrow on `self.cache`
+        /// + `self.evaluator` matches the pattern already used by `eval_full`.
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
@@ -10680,17 +10681,20 @@ fn try_exact_joint_spatial_aniso_optimization(
             if self.cache.ensure_theta(theta).is_err() {
                 return f64::INFINITY;
             }
-            let design = self.cache.design().clone();
-            match self.evaluator.evaluate_cost_only(
-                &design.design,
-                &design.penalties,
-                &design.nullspace_dims,
-                design.linear_constraints.clone(),
-                theta,
-                self.rho_dim,
-                None,
-                "spatial-aniso-joint cost-only",
-            ) {
+            let result = {
+                let design = self.cache.design();
+                self.evaluator.evaluate_cost_only(
+                    &design.design,
+                    &design.penalties,
+                    &design.nullspace_dims,
+                    design.linear_constraints.clone(),
+                    theta,
+                    self.rho_dim,
+                    None,
+                    "spatial-aniso-joint cost-only",
+                )
+            };
+            match result {
                 Ok(cost) => {
                     self.cache.store_cost(cost);
                     cost
@@ -10987,6 +10991,10 @@ fn try_exact_joint_spatial_isotropic_optimization(
         /// `(V, ∇V)` evaluation. Here we route through the evaluator's true
         /// value-only path (`evaluate_cost_only`), which skips both the
         /// hyper-direction construction and the gradient assembly.
+        ///
+        /// The split borrow on `self.cache` (immutable, for the design)
+        /// and `self.evaluator` (mutable) is the same disjoint-field
+        /// pattern already used by `eval_full` above.
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
             if let Some(cost) = self.cache.memoized_cost(theta) {
                 return cost;
@@ -10994,17 +11002,20 @@ fn try_exact_joint_spatial_isotropic_optimization(
             if self.cache.ensure_theta(theta).is_err() {
                 return f64::INFINITY;
             }
-            let design = self.cache.design().clone();
-            match self.evaluator.evaluate_cost_only(
-                &design.design,
-                &design.penalties,
-                &design.nullspace_dims,
-                design.linear_constraints.clone(),
-                theta,
-                self.rho_dim,
-                None,
-                "spatial-iso-joint cost-only",
-            ) {
+            let result = {
+                let design = self.cache.design();
+                self.evaluator.evaluate_cost_only(
+                    &design.design,
+                    &design.penalties,
+                    &design.nullspace_dims,
+                    design.linear_constraints.clone(),
+                    theta,
+                    self.rho_dim,
+                    None,
+                    "spatial-iso-joint cost-only",
+                )
+            };
+            match result {
                 Ok(cost) => {
                     self.cache.store_cost(cost);
                     cost
