@@ -15,49 +15,9 @@ kind of data through two different entry points.
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pandas as pd
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# Test mode (FAST vs HARD).
-#
-# Most integration tests run with small `n`, a single seed, and tolerance
-# bounds calibrated for that sample size. Set ``GAM_TEST_MODE=hard`` to
-# enable larger samples, multiple seeds, and tighter tolerances. Hard mode
-# is intended for nightly or pre-release runs, not every PR.
-#
-# Tests opt in via the ``test_mode`` fixture below or by inspecting the
-# environment variable directly.
-# ---------------------------------------------------------------------------
-
-
-def _read_test_mode() -> str:
-    """Returns ``'hard'`` if ``GAM_TEST_MODE=hard``, otherwise ``'fast'``."""
-    val = os.environ.get("GAM_TEST_MODE", "").strip().lower()
-    return "hard" if val == "hard" else "fast"
-
-
-@pytest.fixture(scope="session")
-def test_mode() -> str:
-    """Session-scoped fixture exposing the current test mode.
-
-    Use it inside a test as e.g.::
-
-        def test_foo(test_mode):
-            n = 200 if test_mode == "fast" else 5000
-            seeds = [0] if test_mode == "fast" else [0, 1, 2, 3, 4]
-            ...
-
-    Or, for parameterized tolerance:
-
-        def test_bar(test_mode):
-            tol = 0.10 if test_mode == "fast" else 0.02
-    """
-    return _read_test_mode()
 
 
 def _build_synthetic_biobank(seed: int = 0, n: int = 200) -> pd.DataFrame:
