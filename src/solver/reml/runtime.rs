@@ -2520,14 +2520,16 @@ impl<'a> RemlState<'a> {
                 // Seed screening's purpose is to rank candidate seeds by an
                 // approximate cost. Requiring full KKT-style convergence under
                 // a 3-iteration cap would discard all informative seeds, so
-                // when the partial state is finite (objective, β, Hessian,
-                // residual all finite — Hessian finiteness is implied by
-                // `gradient_natural_scale.is_finite()`, which is the L2 norm
-                // of Sβ + ridge·β) we surface the result as Ok and let
-                // downstream cost computation derive a finite approximate
-                // score. The result is not cached and the warm start is not
-                // updated (status is not Converged/Stalled, so the existing
-                // branches above do not run).
+                // when the partial state is finite — objective (deviance +
+                // penalty), β coordinates, residual gradient norm, and the
+                // gradient-natural-scale (‖score‖ + ‖Sβ‖ + ridge·‖β‖, which
+                // covers the penalty and ridge contributions to H and
+                // detects state-blowup pathologies upstream of an explicit
+                // O(p²) Hessian-eigenspectrum walk) — we surface the result
+                // as Ok and let downstream cost computation derive a finite
+                // approximate score. The result is not cached, the warm
+                // start is not updated, and KKT is not enforced (the actual
+                // fit at full inner budget will).
                 let finite_objective = pirls_result.deviance.is_finite()
                     && pirls_result.stable_penalty_term.is_finite();
                 let finite_beta = pirls_result

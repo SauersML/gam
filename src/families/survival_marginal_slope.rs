@@ -12584,15 +12584,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Survival marginal-slope rows couple time, marginal, log-slope, and
         // optional flex blocks (score-warp / link-deviation) through the row
-        // kernel. The joint Hessian is dense over `(Σ p_b)²` per row, so the
-        // honest assembly cost is `n · (Σ p_b)²`. The block-diagonal default
-        // would understate by the cross-block outer-product terms.
-        let n = self.n as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |acc, p| acc.saturating_add(p));
-        n.saturating_mul(p_total.saturating_mul(p_total))
+        // kernel.
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
     }
 
     fn exact_outer_derivative_order(
