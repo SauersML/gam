@@ -1080,6 +1080,230 @@ def classify_primary_divergence(result: FuzzResult) -> tuple[str, str]:
     return "", ""
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CI GATES
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Hard regression gates evaluated after all trials complete. The harness
+# prints a per-gate failure summary and exits 1 if any gate fires. These
+# gates are stricter than the per-trial classification used for log
+# decoration (`!!!`, `!!`) — those exist to flag trials at all; gates
+# decide CI conclusion.
+
+# Any individual trial with rust worse than mgcv by this much on its primary
+# metric (R² for gaussian, AUC for binomial) trips the "huge per-trial gap"
+# gate. We expect zero of these on a healthy run.
+PER_TRIAL_FAIL_GAP = 0.30
+
+# Any (family, model_type, basis_type) cohort with median gap worse than
+# this much (rust median behind mgcv) trips the "cohort regression" gate.
+COHORT_MEDIAN_FAIL_GAP = 0.05
+
+# Cohorts with at least this many valid trials are eligible for cohort
+# gates; smaller cohorts are too noisy to reason about.
+COHORT_MIN_TRIALS = 6
+
+# Any cohort where (mgcv wins) - (rust wins) exceeds this many trips the
+# "systematic disadvantage" gate. mgcv/rust win counts use the same
+# ±0.01 deadband as the leaderboard.
+COHORT_NET_WINS_FAIL = 5
+
+# Minimum fraction of requested trials that must produce a comparable
+# mgcv-vs-rust pair. Below this we cannot trust the harness output.
+MIN_VALID_TRIAL_FRACTION = 0.80
+
+# Metrics we check for rust NaN/inf when mgcv produced a finite value.
+NAN_GATED_METRICS = ("r2", "auc", "rmse", "logloss", "mae", "brier")
+
+
+def _metric_is_nonfinite(value) -> bool:
+    if value is None:
+        return False
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return False
+    return not math.isfinite(f)
+
+
+def _metric_is_finite(value) -> bool:
+    if value is None:
+        return False
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(f)
+
+
+def compute_ci_gates(
+    results,
+    requested_trials: int,
+    skipped_count: int = 0,
+    baseline: Optional[dict] = None,
+) -> dict:
+    """Evaluate the four (or five, with baseline) regression gates.
+
+    Returns a dict with:
+      - failed: bool
+      - gate_failures: list[dict] — per-gate detail (gate, message, offenders)
+    """
+    valid_trials = [r for r in results if r.primary_gap is not None]
+    valid_count = len(valid_trials)
+
+    gate_failures: list[dict] = []
+
+    # Gate 1: per-trial huge-gap regressions.
+    big_gap_offenders = []
+    for r in results:
+        gap = r.primary_gap
+        if gap is None:
+            continue
+        if gap > PER_TRIAL_FAIL_GAP:
+            big_gap_offenders.append(r)
+    if big_gap_offenders:
+        gate_failures.append({
+            "gate": "per_trial_gap",
+            "message": (
+                f"{len(big_gap_offenders)} trial(s) with primary-metric gap "
+                f"> {PER_TRIAL_FAIL_GAP:.2f} (rust worse than mgcv)"
+            ),
+            "offenders": big_gap_offenders,
+        })
+
+    # Gate 2: cohort median gap regressions.
+    cohorts: dict = {}
+    for r in valid_trials:
+        key = (
+            r.scenario.get("family", "?"),
+            r.scenario.get("model_type", "?"),
+            r.scenario.get("basis_type", "?"),
+        )
+        cohorts.setdefault(key, []).append(r)
+
+    cohort_median_offenders = []
+    cohort_net_wins_offenders = []
+    for key, members in cohorts.items():
+        if len(members) < COHORT_MIN_TRIALS:
+            continue
+        gaps = [r.primary_gap for r in members if r.primary_gap is not None]
+        if not gaps:
+            continue
+        median_gap = float(np.median(gaps))
+        if median_gap > COHORT_MEDIAN_FAIL_GAP:
+            cohort_median_offenders.append({
+                "cohort": key,
+                "median_gap": median_gap,
+                "n": len(gaps),
+            })
+        mgcv_wins = sum(1 for g in gaps if g > 0.01)
+        rust_wins = sum(1 for g in gaps if g < -0.01)
+        net = mgcv_wins - rust_wins
+        if net > COHORT_NET_WINS_FAIL:
+            cohort_net_wins_offenders.append({
+                "cohort": key,
+                "mgcv_wins": mgcv_wins,
+                "rust_wins": rust_wins,
+                "net": net,
+                "n": len(gaps),
+            })
+
+    if cohort_median_offenders:
+        gate_failures.append({
+            "gate": "cohort_median",
+            "message": (
+                f"{len(cohort_median_offenders)} cohort(s) with median gap "
+                f"> {COHORT_MEDIAN_FAIL_GAP:.2f} (rust median behind mgcv)"
+            ),
+            "offenders": cohort_median_offenders,
+        })
+    if cohort_net_wins_offenders:
+        gate_failures.append({
+            "gate": "cohort_net_wins",
+            "message": (
+                f"{len(cohort_net_wins_offenders)} cohort(s) with mgcv-wins "
+                f"minus rust-wins > {COHORT_NET_WINS_FAIL}"
+            ),
+            "offenders": cohort_net_wins_offenders,
+        })
+
+    # Gate 3: rust-NaN / rust-inf where mgcv was finite.
+    nan_offenders = []
+    for r in results:
+        for m in NAN_GATED_METRICS:
+            mv = r.mgcv.get(m)
+            rv = r.rust.get(m)
+            if _metric_is_finite(mv) and _metric_is_nonfinite(rv):
+                nan_offenders.append((r, m, rv, mv))
+                break
+    if nan_offenders:
+        gate_failures.append({
+            "gate": "rust_nan_inf",
+            "message": (
+                f"{len(nan_offenders)} trial(s) where rust produced NaN/inf "
+                f"on a metric mgcv evaluated finitely"
+            ),
+            "offenders": nan_offenders,
+        })
+
+    # Gate 4: insufficient valid-comparison coverage.
+    min_required = max(1, int(math.ceil(MIN_VALID_TRIAL_FRACTION * requested_trials)))
+    if valid_count < min_required:
+        gate_failures.append({
+            "gate": "coverage",
+            "message": (
+                f"only {valid_count}/{requested_trials} trial(s) produced a "
+                f"valid mgcv-vs-rust comparison "
+                f"(skipped above cost cap: {skipped_count}); "
+                f"reduce cap or add coverage. Minimum required: "
+                f"{min_required}"
+            ),
+            "offenders": [],
+        })
+
+    # Gate 5 (optional): regression vs prior baseline.
+    if baseline:
+        baseline_offenders = []
+        baseline_threshold = float(baseline.get("threshold", 0.05))
+        cohort_baselines = baseline.get("cohorts", {}) or {}
+        for key, members in cohorts.items():
+            cohort_key = "/".join(key)
+            base_gap = cohort_baselines.get(cohort_key)
+            if base_gap is None:
+                continue
+            gaps = [r.primary_gap for r in members if r.primary_gap is not None]
+            if not gaps:
+                continue
+            current_median = float(np.median(gaps))
+            delta = current_median - float(base_gap)
+            if delta > baseline_threshold:
+                baseline_offenders.append({
+                    "cohort": key,
+                    "current_median_gap": current_median,
+                    "baseline_median_gap": float(base_gap),
+                    "delta": delta,
+                    "n": len(gaps),
+                })
+        if baseline_offenders:
+            gate_failures.append({
+                "gate": "baseline_regression",
+                "message": (
+                    f"{len(baseline_offenders)} cohort(s) regressed against "
+                    f"baseline by more than {baseline_threshold:.2f}"
+                ),
+                "offenders": baseline_offenders,
+            })
+
+    return {
+        "failed": bool(gate_failures),
+        "gate_failures": gate_failures,
+        "valid_count": valid_count,
+        "requested_trials": requested_trials,
+        "skipped_count": skipped_count,
+        "min_required": min_required,
+    }
+
+
 def run_trial(sc, rust_timeout, r_timeout):
     train_df, test_df, cols = generate_data(sc)
     with tempfile.TemporaryDirectory(prefix="gam_fuzz_") as tmpdir:
@@ -1179,6 +1403,18 @@ def main():
     parser.add_argument("--r-timeout", type=int, default=DEFAULT_R_TIMEOUT)
     parser.add_argument("--max-total-seconds", type=int, default=None)
     parser.add_argument("--max-scenario-cost", type=float, default=None)
+    parser.add_argument(
+        "--baseline-json",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a JSON baseline of expected per-cohort median "
+            "gaps. Format: {\"threshold\": 0.05, \"cohorts\": "
+            "{\"gaussian/gam/duchon\": 0.10, ...}}. When provided, the run "
+            "FAILS if any cohort's current median gap exceeds baseline by "
+            "more than threshold."
+        ),
+    )
     args = parser.parse_args()
 
     if not RUST_BINARY.exists():
@@ -1274,6 +1510,21 @@ def main():
             err_m = " [M:ERR]" if result.mgcv.get("error") else ""
             divergence_level, _ = classify_primary_divergence(result)
             flag = " !!!" if divergence_level == "fail" else (" !!" if divergence_level == "warn" else "")
+            # Per-trial gate marker — if this trial alone trips the
+            # per-trial CI gate, surface that distinct from the warn/fail
+            # decoration above so CI logs are searchable for "[FAIL]".
+            if (
+                result.primary_gap is not None
+                and result.primary_gap > PER_TRIAL_FAIL_GAP
+            ):
+                flag += " [FAIL]"
+            # Rust NaN/inf where mgcv is finite is also gate-tripping.
+            for _gm in NAN_GATED_METRICS:
+                _mv = result.mgcv.get(_gm)
+                _rv = result.rust.get(_gm)
+                if _metric_is_finite(_mv) and _metric_is_nonfinite(_rv):
+                    flag += " [FAIL:nan]"
+                    break
             t_rust = result.rust.get("time", 0) or 0
             t_mgcv = result.mgcv.get("time", 0) or 0
             time_s = f"  rust={t_rust:.1f}s mgcv={t_mgcv:.1f}s" if max(t_rust, t_mgcv) > 0.5 else ""
@@ -1305,35 +1556,48 @@ def main():
 
     # ─── CI fail policy ────────────────────────────────────────────────
     #
-    # Until this block was added, `main()` returned normally after
-    # print_leaderboard regardless of per-trial outcomes, so the fuzz CI
-    # workflow was green even when every trial hit "[R:ERR]" or reported a
-    # large mgcv-vs-rust disagreement. `!!!` / `[R:ERR]` were purely human-
-    # readable log decorations with no effect on exit code.
+    # The harness fails non-zero on any of:
+    #   1. rust-only execution failures (rust errored where mgcv didn't);
+    #   2. per-trial primary-metric gap > PER_TRIAL_FAIL_GAP;
+    #   3. cohort median primary-metric gap > COHORT_MEDIAN_FAIL_GAP;
+    #   4. cohort net mgcv-wins minus rust-wins > COHORT_NET_WINS_FAIL;
+    #   5. rust returned NaN/inf on any metric mgcv evaluated finitely;
+    #   6. fewer than MIN_VALID_TRIAL_FRACTION of requested trials produced
+    #      a valid mgcv-vs-rust comparison;
+    #   7. (optional) cohort regression versus a baseline JSON when
+    #      `--baseline-json` is supplied.
     #
-    # The CI gate blocks executable Rust failures: invalid generated specs,
-    # timeouts, crashes, and resource exhaustion where mgcv handled the same
-    # scenario. Large mgcv-vs-rust gaps remain visible in logs/artifacts and
-    # keep the `!!` / `!!!` markers, but they are not resource-health checks.
-    #
-    # 1. **rust-only failures** — any trial where `rust.error` is set while
-    #    `mgcv.error` is None. This is the harness's unambiguous "rust
-    #    regressed on a scenario mgcv handles" signal. Transient timeouts
-    #    are counted; if a timeout is genuinely uninformative it is a
-    #    separate bug to fix upstream, not a failure mode to tolerate.
-    #
-    # Large correctness gaps are exploratory fuzz output. They are summarized
-    # below so they remain searchable in CI logs without turning the resource
-    # smoke gate into a statistical acceptance benchmark.
+    # All gates that fire are reported together — we don't short-circuit
+    # after the first — so a single CI run surfaces every regression
+    # category at once.
     rust_only_failures = [
         r for r in results
         if r.rust.get("error") and not r.mgcv.get("error")
     ]
-    large_gap_regressions = [
-        (r, reason) for r in results
-        for level, reason in [classify_primary_divergence(r)]
-        if level == "fail"
-    ]
+
+    baseline = None
+    if args.baseline_json:
+        try:
+            with open(args.baseline_json) as bf:
+                baseline = json.load(bf)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"\nCI FAIL: --baseline-json {args.baseline_json!r} could "
+                f"not be loaded: {exc}"
+            )
+            sys.exit(1)
+
+    skipped_count = len(skipped_scenarios)
+
+    gates = compute_ci_gates(
+        results,
+        requested_trials=args.n_trials,
+        skipped_count=skipped_count,
+        baseline=baseline,
+    )
+
+    any_failure = bool(rust_only_failures) or gates["failed"]
+
     if rust_only_failures:
         print(f"\n{'=' * 120}")
         print("  CI FAIL: fuzz harness detected Rust execution failures")
@@ -1342,44 +1606,97 @@ def main():
             f"  rust-only failures (rust.error set, mgcv.error unset): "
             f"{len(rust_only_failures)}"
         )
-        for r in rust_only_failures[:10]:
+        for r in rust_only_failures[:20]:
             s = r.scenario
             err = str(r.rust.get("error", ""))[:200]
             print(
-                f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
+                f"    [FAIL] seed={s['seed']} {s['family']}/{s['model_type']}/"
                 f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
                 f"kn={s['knots']} :: {err}"
             )
-        sys.exit(1)
 
-    if large_gap_regressions:
+    if gates["failed"]:
         print(f"\n{'=' * 120}")
-        print("  CI WARN: fuzz harness observed large mgcv-vs-rust gaps")
+        print("  CI FAIL: fuzz harness tripped regression gates")
         print("=" * 120)
         print(
-            "  large benchmark regressions "
-            "(absolute primary-metric gap, or gaussian RMSE inflation on the same fold): "
-            f"{len(large_gap_regressions)}"
+            f"  trials: {gates['valid_count']}/{gates['requested_trials']} "
+            f"valid (skipped above cost cap: {gates['skipped_count']}; "
+            f"min required: {gates['min_required']})"
         )
-        large_gap_regressions.sort(
-            key=lambda item: (
-                item[0].primary_gap or 0,
-                gaussian_rmse_ratio(item[0]) or 1.0,
-            ),
-            reverse=True,
+        for gf in gates["gate_failures"]:
+            print(f"\n  ── gate [{gf['gate']}] ── {gf['message']}")
+            offenders = gf.get("offenders", [])
+            if gf["gate"] == "per_trial_gap":
+                offenders_sorted = sorted(
+                    offenders,
+                    key=lambda r: (r.primary_gap or 0),
+                    reverse=True,
+                )
+                for r in offenders_sorted[:20]:
+                    s = r.scenario
+                    rv = r.rust.get(r.primary_metric or "r2")
+                    mv = r.mgcv.get(r.primary_metric or "r2")
+                    rs = f"{rv:.4f}" if rv is not None else "FAIL"
+                    ms = f"{mv:.4f}" if mv is not None else "FAIL"
+                    print(
+                        f"    [FAIL] seed={s['seed']} "
+                        f"{s['family']}/{s['model_type']}/{s['basis_type']} "
+                        f"n={s['n_obs']} k={s['n_smooths']} "
+                        f"kn={s['knots']} :: {r.primary_metric}: "
+                        f"rust={rs} mgcv={ms} "
+                        f"gap={r.primary_gap:+.4f}"
+                    )
+            elif gf["gate"] == "cohort_median":
+                for o in offenders:
+                    fam, mt, basis = o["cohort"]
+                    print(
+                        f"    [FAIL] cohort {fam}/{mt}/{basis} "
+                        f"median_gap={o['median_gap']:+.4f} "
+                        f"(n={o['n']})"
+                    )
+            elif gf["gate"] == "cohort_net_wins":
+                for o in offenders:
+                    fam, mt, basis = o["cohort"]
+                    print(
+                        f"    [FAIL] cohort {fam}/{mt}/{basis} "
+                        f"mgcv_wins={o['mgcv_wins']} "
+                        f"rust_wins={o['rust_wins']} "
+                        f"net={o['net']:+d} (n={o['n']})"
+                    )
+            elif gf["gate"] == "rust_nan_inf":
+                for r, metric, rv, mv in offenders[:20]:
+                    s = r.scenario
+                    print(
+                        f"    [FAIL] seed={s['seed']} "
+                        f"{s['family']}/{s['model_type']}/{s['basis_type']} "
+                        f"n={s['n_obs']} k={s['n_smooths']} "
+                        f"kn={s['knots']} :: rust {metric}={rv!r} "
+                        f"(mgcv {metric}={mv:.4f})"
+                    )
+            elif gf["gate"] == "coverage":
+                # Message already printed above; no per-offender list.
+                pass
+            elif gf["gate"] == "baseline_regression":
+                for o in offenders:
+                    fam, mt, basis = o["cohort"]
+                    print(
+                        f"    [FAIL] cohort {fam}/{mt}/{basis} "
+                        f"current_median={o['current_median_gap']:+.4f} "
+                        f"baseline_median={o['baseline_median_gap']:+.4f} "
+                        f"delta={o['delta']:+.4f} (n={o['n']})"
+                    )
+
+    if any_failure:
+        print(f"\n{'=' * 120}")
+        gates_fired = [gf["gate"] for gf in gates["gate_failures"]]
+        if rust_only_failures:
+            gates_fired.insert(0, "rust_only_failures")
+        print(
+            f"  CI FAIL: gates fired: {', '.join(gates_fired) or '(none)'}"
         )
-        for r, reason in large_gap_regressions[:10]:
-            s = r.scenario
-            rv = r.rust.get(r.primary_metric or "r2")
-            mv = r.mgcv.get(r.primary_metric or "r2")
-            rs = f"{rv:.4f}" if rv is not None else "FAIL"
-            ms = f"{mv:.4f}" if mv is not None else "FAIL"
-            print(
-                f"    seed={s['seed']} {s['family']}/{s['model_type']}/"
-                f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
-                f"kn={s['knots']} :: {r.primary_metric}: "
-                f"rust={rs} mgcv={ms} gap={r.primary_gap:+.4f} ({reason})"
-            )
+        print("=" * 120)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
