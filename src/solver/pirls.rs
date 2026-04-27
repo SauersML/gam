@@ -3571,25 +3571,43 @@ where
         options.linear_constraints.as_ref(),
     );
     if status.is_failed_max_iterations() {
+        let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
+        let scaled_dev_tol = options.convergence_tolerance * objective_scale;
         if final_projected_grad < options.convergence_tolerance {
             status = PirlsStatus::StalledAtValidMinimum;
         } else if final_projected_grad <= near_stationary_tol
-            && last_deviance_change.abs()
-                < options.convergence_tolerance
-                    * state.deviance.abs().max(state.penalty_term.abs()).max(1.0)
+            && last_deviance_change.abs() < scaled_dev_tol
         {
             // The objective has plateaued and the projected gradient is
             // already inside the near-stationary band, so accept this as a
             // stalled but usable minimum.
             status = PirlsStatus::StalledAtValidMinimum;
         } else if max_abs_eta >= PIRLS_ETA_ABS_CAP * (1.0 - 1e-12)
-            && last_deviance_change.abs()
-                < options.convergence_tolerance
-                    * state.deviance.abs().max(state.penalty_term.abs()).max(1.0)
+            && last_deviance_change.abs() < scaled_dev_tol
         {
             // The objective has flattened against the explicit eta guard. This
             // is the same saturated boundary class as separated binomial fits:
             // extra Newton work only re-tries the clipped boundary.
+            status = PirlsStatus::StalledAtValidMinimum;
+        } else if final_projected_grad
+            <= options.convergence_tolerance.max(1e-6) * objective_scale
+            && last_deviance_change.abs() < scaled_dev_tol * 0.1
+            && last_deviance_change >= 0.0
+        {
+            // Per-observation / per-likelihood-scale convergence: at large n,
+            // ‖g‖ scales with n (since the score is a sum of n contributions)
+            // and the absolute KKT test ‖g‖ < tol becomes systematically too
+            // tight even when the fit is functionally converged. Accept here
+            // when ‖g‖ is small *relative* to the objective magnitude AND the
+            // deviance has plateaued more strictly than the absolute scaled
+            // tolerance (×0.1 floor) AND deviance change is non-negative
+            // (genuine plateau, not still climbing). All three together rule
+            // out a not-yet-converged fit being silently classified as
+            // stalled-but-valid: the strict band already failed, the eta cap
+            // is not active, and we have an unusually tight plateau plus a
+            // gradient in the relative band. This is the path that the user's
+            // analysis flagged for biobank-scale GLMs where ‖g‖=1.27e-2 at
+            // n≈3e5 is functionally converged but trips the absolute test.
             status = PirlsStatus::StalledAtValidMinimum;
         }
     }
