@@ -4,6 +4,7 @@
 - Analytic, closed-forms should be supported in general for all model types.
 - Penalties must always be on the final function itself, never on the model coefficients.
 - Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
+- Never vendor external software.
 - The program must never run out of memory on reasonably-resourced computers.
 - REML (or LAML) always used, never GCV.
 - Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
