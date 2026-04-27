@@ -1737,32 +1737,24 @@ where
         use crate::solver::outer_strategy::{Derivative, OuterEvalOrder, OuterProblem};
 
         let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
-        // Estimate the FLOP cost of one dense exact Hessian assembly so the
-        // outer planner can divert to gradient-only optimization when the
-        // dense path would dominate wall-clock time.  For a standard GLM the
-        // weighted Gram XᵀWX has work n·p² (one weighted outer product per
-        // observation, p²/2 unique entries); we use the un-halved form as a
-        // conservative upper bound that absorbs symmetrization and any
-        // family-specific multipliers.  The threshold inside
-        // `OuterProblem::with_dense_hessian_work_hint` decides when this
-        // crosses into "BFGS+gradient is faster end-to-end" territory at the
-        // single-inner-solve scale.
+        // Standard-GAM dense problem dimensions configure both cost models
+        // the planner uses to decide whether ARC+Hessian or BFGS+gradient
+        // is faster end-to-end at biobank scale:
+        //
+        //   - per-inner-solve cost (n · p²) gates the single-Hessian-
+        //     assembly downgrade,
+        //   - per-outer-eval cost (k² · n · p²) gates the LAML-Hessian
+        //     pairwise-assembly downgrade — independent of (1) and
+        //     necessary because the LAML outer Hessian's k² pairwise
+        //     inner-derived terms can dominate per-outer work even when
+        //     each individual inner solve is moderate.
+        //
+        // Sparse designs short-circuit the policy because the n · p²
+        // model does not apply to sparse linear algebra; ARC stays in
+        // place and the sparse path's iteration-count advantage holds.
         let n_obs = reml_state.x().nrows();
         let p_total = reml_state.x().ncols();
-        let dense_hessian_work = (n_obs as f64) * (p_total as f64) * (p_total as f64);
-        // Independently of the per-inner-solve check above, the outer
-        // analytic-LAML Hessian itself assembles k² inner-solve-derived
-        // pairwise terms per outer evaluation. When that aggregate cost
-        // dominates, ARC's super-linear convergence cannot amortize the
-        // Hessian assembly and BFGS — which only needs the analytic
-        // gradient — wins on total wall-clock time. The check here
-        // captures the regime that the per-inner-solve work-hint above
-        // does not see (e.g. n·p² alone is moderate but k²·n·p² is huge),
-        // and it short-circuits to ARC for sparse designs and small k
-        // where ARC's iteration-count advantage still wins.
         let dense_design = matches!(reml_state.x(), DesignMatrix::Dense(_));
-        let prefer_gradient_only_for_outer_hessian =
-            self::reml::standard_gam_outer_prefer_gradient_only(n_obs, p_total, k, dense_design);
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
@@ -1770,6 +1762,7 @@ where
             } else {
                 Derivative::Unavailable
             })
+            .with_standard_gam_dimensions(n_obs, p_total, dense_design)
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
             ))
@@ -1777,9 +1770,7 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_rho_bound(crate::estimate::RHO_BOUND)
-            .with_dense_hessian_work_hint(dense_hessian_work)
-            .with_prefer_gradient_only(prefer_gradient_only_for_outer_hessian);
+            .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
         } else {

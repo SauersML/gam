@@ -12581,6 +12581,20 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         true
     }
 
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Survival marginal-slope rows couple time, marginal, log-slope, and
+        // optional flex blocks (score-warp / link-deviation) through the row
+        // kernel. The joint Hessian is dense over `(Σ p_b)²` per row, so the
+        // honest assembly cost is `n · (Σ p_b)²`. The block-diagonal default
+        // would understate by the cross-block outer-product terms.
+        let n = self.n as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |acc, p| acc.saturating_add(p));
+        n.saturating_mul(p_total.saturating_mul(p_total))
+    }
+
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
@@ -14504,6 +14518,53 @@ mod tests {
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             ExactOuterDerivativeOrder::Second
         );
+    }
+
+    #[test]
+    fn survival_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
+        // Rigid three-block shape: time p=12, marginal p=20, log-slope p=8.
+        // The row kernel couples all three blocks, so the joint Hessian is
+        // dense over (12+20+8)²=1600 entries per row. The override must
+        // return n·(Σ p_b)², not the block-diagonal Σ n·p_b².
+        let n = 200usize;
+        let p_time = 12usize;
+        let p_marg = 20usize;
+        let p_log = 8usize;
+        let family = SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(Array1::zeros(n)),
+            weights: Arc::new(Array1::from_elem(n, 1.0)),
+            z: Arc::new(Array1::zeros(n)),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((n, p_time))),
+            design_exit: DesignMatrix::from(Array2::zeros((n, p_time))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((n, p_time))),
+            offset_entry: Arc::new(Array1::zeros(n)),
+            offset_exit: Arc::new(Array1::zeros(n)),
+            derivative_offset_exit: Arc::new(Array1::ones(n)),
+            marginal_design: DesignMatrix::from(Array2::zeros((n, p_marg))),
+            logslope_design: DesignMatrix::from(Array2::zeros((n, p_log))),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let specs = vec![
+            dummy_penalized_blockspec(p_time, 1),
+            dummy_penalized_blockspec(p_marg, 1),
+            dummy_penalized_blockspec(p_log, 1),
+        ];
+        let p_total = (p_time + p_marg + p_log) as u64;
+        let expected_joint = (n as u64) * p_total * p_total;
+        let expected_block_diag_at_full_n =
+            (n as u64) * ((p_time * p_time + p_marg * p_marg + p_log * p_log) as u64);
+        assert_eq!(family.coefficient_hessian_cost(&specs), expected_joint);
+        // Joint coupling exceeds block-diagonal by the cross-block fill
+        // 2·n·(p_t·p_m + p_t·p_l + p_m·p_l).
+        assert!(expected_joint > expected_block_diag_at_full_n);
     }
 
     #[test]

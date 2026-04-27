@@ -2059,18 +2059,6 @@ impl<'a> RemlState<'a> {
         self.warm_start_beta.write().unwrap().take();
     }
 
-    /// Returns true when the outer optimizer has installed a seed-screening
-    /// inner-iteration cap (a multi-start ranking pass). While active, the
-    /// inner P-IRLS budget is intentionally tiny, partial-fit results are
-    /// surfaced as `Ok` for cost ranking instead of being rejected, the
-    /// screening residual penalty is applied to the cost, and KKT-style
-    /// constraint certification is skipped (the actual fit at full inner
-    /// budget will certify it).
-    #[inline]
-    pub(super) fn screening_active(&self) -> bool {
-        self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0
-    }
-
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
@@ -2387,13 +2375,17 @@ impl<'a> RemlState<'a> {
         // Detect whether we are running under outer-loop seed screening. While
         // screening is active the planner caps inner iterations to a small
         // value (~3); trial seeds are NOT expected to certify a stationary
-        // mode under that cap. Partial fits with finite β and deviance are
-        // surfaced as Ok so the caller can rank them by an approximate cost
-        // (`screening_residual_penalty`); only non-finite states are rejected.
-        // We thread this flag down so the warn/error sites below also demote
-        // screening-mode rejections from error- to debug-level diagnostics.
+        // mode under that cap. Partial fits whose objective (deviance +
+        // penalty), β, Hessian proxy, and residual are all finite are
+        // surfaced as `Ok` so the caller can rank them by an approximate
+        // cost (`screening_residual_penalty`); KKT enforcement, the
+        // pirls_cache LRU write, and the warm-start update are all
+        // suppressed to keep screening-mode results out of cross-call
+        // state. The single atomic load below feeds both the bool and the
+        // iteration cap from one observation, avoiding a stale-value race
+        // between the two derivations.
         let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
-        let in_screening = self.screening_active();
+        let in_screening = screening_cap > 0;
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs
@@ -2489,14 +2481,25 @@ impl<'a> RemlState<'a> {
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                self.updatewarm_start_from(pirls_result.as_ref());
-                // This is a successful fit. Cache only if key is valid (not NaN).
-                if use_cache && let Some(key) = key_opt {
-                    self.cache_manager
-                        .pirls_cache
-                        .write()
-                        .unwrap()
-                        .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
+                // Screening-time fits run under a 3-iteration cap and skip
+                // KKT certification. Even when PIRLS reports Converged, the
+                // result is one rank-ordering datum, not a vetted production
+                // mode: keep it strictly out of cross-call state so it can
+                // never leak into the actual fit. The screening loop in
+                // `rank_seeds_with_screening` invalidates the bundle slot and
+                // warm start between seeds anyway, but suppressing the writes
+                // here makes the isolation a local invariant rather than a
+                // contract held by the caller.
+                if !in_screening {
+                    self.updatewarm_start_from(pirls_result.as_ref());
+                    // Cache only if key is valid (not NaN).
+                    if use_cache && let Some(key) = key_opt {
+                        self.cache_manager
+                            .pirls_cache
+                            .write()
+                            .unwrap()
+                            .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
+                    }
                 }
                 Ok(pirls_result)
             }

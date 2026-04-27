@@ -201,72 +201,6 @@ pub(crate) fn firth_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
         && quadratic_work <= FIRTH_MAX_QUADRATIC_WORK
 }
 
-/// Per-outer-iteration FLOP budget above which the standard-GAM REML outer
-/// switches from analytic-Hessian (ARC) to gradient-only (BFGS).
-///
-/// The standard-GAM analytic outer Hessian is the LAML Hessian whose pairwise
-/// derivative entries each require an inner-system solve; assembling the full
-/// k×k Hessian costs roughly k² · n·p² FLOPs per outer evaluation on top of
-/// the gradient. ARC's super-linear convergence amortizes this when the
-/// per-iteration work is small, but at biobank scale (n ≈ 3 × 10⁵, p ≈ 65,
-/// k ≈ 6) the Hessian assembly dominates and BFGS — which only needs the
-/// gradient — wins on total wall-clock time even though it takes more
-/// outer iterations to converge.
-///
-/// 5 × 10⁹ FLOPs/eval is the empirical inflection point: below it, ARC's
-/// fewer outer iterations more than pay for the Hessian assembly; above it,
-/// BFGS's amortized curvature catches up. The threshold is intentionally
-/// conservative so small/moderate problems still get ARC.
-const STANDARD_GAM_OUTER_HESSIAN_BUDGET_FLOPS: u128 = 5_000_000_000;
-
-/// Minimum smoothing-parameter count below which ARC's super-linear
-/// convergence advantage outweighs any per-iteration Hessian cost.
-///
-/// For k ≤ 3 the Hessian is at most 9 entries and the dim-k BFGS history
-/// has too little information to approximate curvature well, so ARC wins
-/// regardless of how big n·p² is.
-const STANDARD_GAM_OUTER_BFGS_MIN_K: usize = 4;
-
-/// Decide whether the standard-GAM REML outer should set
-/// `prefer_gradient_only` based on a work model of the analytic-Hessian
-/// path versus gradient-only BFGS.
-///
-/// The standard-GAM analytic Hessian path costs approximately
-///   `H_work ≈ k² · n · p²`
-/// FLOPs per outer evaluation (one inner-system solve per Hessian-entry
-/// pair). Gradient-only BFGS pays only the inner-solve cost without the
-/// Hessian assembly, but needs more outer evaluations to converge — the
-/// crossover is governed by both the absolute Hessian work and the
-/// curvature-approximation accuracy of BFGS at the given dimension.
-///
-/// Returns true (prefer gradient-only) when **all** hold:
-///   1. The design is dense — the n·p² model assumes dense XᵀWX.
-///   2. The smoothing-parameter count k is at least
-///      [`STANDARD_GAM_OUTER_BFGS_MIN_K`] — below that ARC always wins.
-///   3. The Hessian work `k² · n · p²` exceeds
-///      [`STANDARD_GAM_OUTER_HESSIAN_BUDGET_FLOPS`].
-///
-/// For sparse designs the cost model does not apply and the existing ARC
-/// path is left in place; sparse linear algebra dominates differently and
-/// the ARC iteration count advantage typically holds.
-pub(crate) fn standard_gam_outer_prefer_gradient_only(
-    n_obs: usize,
-    p_coeff: usize,
-    n_smoothing_params: usize,
-    is_dense: bool,
-) -> bool {
-    if !is_dense || n_smoothing_params < STANDARD_GAM_OUTER_BFGS_MIN_K {
-        return false;
-    }
-    let inner_solve_work = (n_obs as u128)
-        .saturating_mul(p_coeff as u128)
-        .saturating_mul(p_coeff as u128);
-    let hessian_pair_work = inner_solve_work
-        .saturating_mul(n_smoothing_params as u128)
-        .saturating_mul(n_smoothing_params as u128);
-    hessian_pair_work > STANDARD_GAM_OUTER_HESSIAN_BUDGET_FLOPS
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -288,44 +222,6 @@ mod tests {
         assert!(super::firth_problem_scale_allows(2_000, 200));
         assert!(!super::firth_problem_scale_allows(4_800, 241));
         assert!(!super::firth_problem_scale_allows(4_800, 433));
-    }
-
-    #[test]
-    fn standard_gam_outer_prefer_gradient_only_biobank_duchon_triggers() {
-        // Biobank-scale Duchon: n=320K, p=65, k=6 → k²·n·p² ≈ 4.9e10 > 5e9
-        // budget. The analytic outer Hessian assembly dominates so the policy
-        // must steer the planner to gradient-only BFGS.
-        assert!(super::standard_gam_outer_prefer_gradient_only(
-            320_000, 65, 6, true
-        ));
-    }
-
-    #[test]
-    fn standard_gam_outer_prefer_gradient_only_small_problem_keeps_arc() {
-        // Small problem: n=1000, p=10, k=4 → k²·n·p² = 1.6e6 ≪ budget. ARC's
-        // super-linear convergence should still win, so the policy stays off.
-        assert!(!super::standard_gam_outer_prefer_gradient_only(
-            1_000, 10, 4, true
-        ));
-    }
-
-    #[test]
-    fn standard_gam_outer_prefer_gradient_only_low_k_keeps_arc() {
-        // For k ≤ 3 the BFGS curvature history is too thin to win against ARC
-        // regardless of n·p². The policy must short-circuit on k.
-        assert!(!super::standard_gam_outer_prefer_gradient_only(
-            320_000, 65, 3, true
-        ));
-    }
-
-    #[test]
-    fn standard_gam_outer_prefer_gradient_only_sparse_design_keeps_arc() {
-        // The n·p² model assumes dense XᵀWX; sparse linear algebra is governed
-        // by a different cost model. The policy must not trigger for sparse
-        // designs even at biobank scale.
-        assert!(!super::standard_gam_outer_prefer_gradient_only(
-            320_000, 65, 6, false
-        ));
     }
 
     #[test]

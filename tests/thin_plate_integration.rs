@@ -197,6 +197,51 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         mse_test < 0.12,
         "TPS simulated integration test is too inaccurate: mse_test={mse_test:.6e}"
     );
+
+    // --- Baseline-beating contract ---
+    // The mean-only baseline MSE is the variance of the true test surface.
+    // A useful TPS fit must beat it by a wide margin; otherwise the model
+    // has degenerated to a constant prediction.
+    let mean_truth = y_test_true.mean().unwrap_or(0.0);
+    let mse_mean_baseline = (&y_test_true - mean_truth)
+        .mapv(|v| v * v)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+    assert!(
+        mse_test < 0.5 * mse_mean_baseline,
+        "TPS fit must beat mean-only baseline by ≥50%: mse_test={mse_test:.6e}, \
+         mse_mean_baseline={mse_mean_baseline:.6e}"
+    );
+
+    // --- Structural contract: the bump near (0.25, -0.15) ---
+    // The data-generating function has a Gaussian bump centered at
+    // (0.25, -0.15). Predictions at the bump center must be larger than
+    // predictions far from it (corners of the unit square). A TPS fit that
+    // failed to learn the bump structure would not satisfy this.
+    let probe_xs = [
+        [0.25_f64, -0.15_f64], // bump center
+        [-0.95, 0.95],         // far corner
+        [0.95, -0.95],         // far corner
+    ];
+    let probe = Array2::from_shape_vec((3, 2), probe_xs.iter().flatten().copied().collect())
+        .expect("probe matrix shape");
+    let probe_basis = gam::basis::create_thin_plate_spline_basis(probe.view(), knots.view())
+        .expect("TPS probe basis");
+    let probe_pred = predict_gam(
+        probe_basis.basis.clone(),
+        fit.beta.view(),
+        Array1::zeros(3).view(),
+        LikelihoodFamily::GaussianIdentity,
+    )
+    .expect("predict_gam should succeed for probe");
+    let center_pred = probe_pred.mean[0];
+    let corner_pred_a = probe_pred.mean[1];
+    let corner_pred_b = probe_pred.mean[2];
+    assert!(
+        center_pred > corner_pred_a && center_pred > corner_pred_b,
+        "TPS fit failed to learn the bump structure: center={center_pred:.4}, \
+         corner_a={corner_pred_a:.4}, corner_b={corner_pred_b:.4}"
+    );
 }
 
 #[test]

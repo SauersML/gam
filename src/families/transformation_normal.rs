@@ -1345,19 +1345,24 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let beta = &block_states[0].beta;
         let h_prime = self.x_deriv_kron.forward_mul(beta);
-        for (i, value) in h_prime.iter().enumerate() {
-            if !value.is_finite() || *value <= 0.0 {
-                return Err(format!(
-                    "TransformationNormalFamily Hessian workspace: h'[{i}] = {value} is not strictly positive"
-                ));
-            }
-        }
-        let weighted_inv_hp_sq: Array1<f64> = self
-            .weights
-            .iter()
-            .zip(h_prime.iter())
-            .map(|(&w, &hp)| w / (hp * hp))
-            .collect();
+        // Build weighted_inv_hp_sq[i] = w_i / h'_i² and validate h' > 0 in one
+        // pass — the inner solver's barrier line search keeps h' strictly
+        // positive on observed rows, so the only way to land here with a
+        // non-positive value is an upstream invariant break worth surfacing
+        // loudly.
+        let mut weighted_inv_hp_sq = Array1::<f64>::zeros(h_prime.len());
+        ndarray::Zip::indexed(&mut weighted_inv_hp_sq)
+            .and(self.weights.view())
+            .and(&h_prime)
+            .try_for_each(|i, slot, &w, &hp| -> Result<(), String> {
+                if !hp.is_finite() || hp <= 0.0 {
+                    return Err(format!(
+                        "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
+                    ));
+                }
+                *slot = w / (hp * hp);
+                Ok(())
+            })?;
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
             h_prime,
@@ -1421,79 +1426,113 @@ impl TransformationNormalJointHessianWorkspace {
                 self.p_total()
             ));
         }
-        // Term 1: X_val^T diag(w) X_val · v.
-        let val_image = self.family.x_val_kron.forward_mul(v);
-        let weighted_val: Array1<f64> = val_image
-            .iter()
-            .zip(self.family.weights.iter())
-            .map(|(&u, &w)| u * w)
-            .collect();
-        let mut out = self.family.x_val_kron.transpose_mul(&weighted_val);
+        // Term 1: (X_val^T W X_val) · v.
+        //
+        // The val gram is constant in β (the weights are the family's row
+        // weights, not the β-dependent 1/h'² kernel), so the family caches it
+        // once at construction. A dense gemv on the cached p×p matrix is
+        // O(p²) ≈ 9·10⁴ FLOPs at biobank scale — strictly cheaper than the
+        // factored apply (~10⁷ FLOPs) and the only term whose constant
+        // structure the workspace can exploit.
+        let mut out = self.family.x_val_weighted_gram.dot(v);
 
-        // Term 2: X_deriv^T diag(w / h'^2) X_deriv · v.
-        let deriv_image = self.family.x_deriv_kron.forward_mul(v);
-        let weighted_deriv: Array1<f64> = deriv_image
-            .iter()
-            .zip(self.weighted_inv_hp_sq.iter())
-            .map(|(&u, &w)| u * w)
-            .collect();
-        out += &self.family.x_deriv_kron.transpose_mul(&weighted_deriv);
+        // Term 2: factored (X_deriv^T diag(w/h'²) X_deriv) · v.
+        //
+        // The deriv kernel changes with β, so we apply it through the
+        // Khatri–Rao operator: forward_mul, scale in place by the cached
+        // (w/h'²) kernel, transpose_mul. Two BLAS gemms plus one O(n) scale,
+        // zero p×p storage.
+        let mut deriv_image = self.family.x_deriv_kron.forward_mul(v);
+        deriv_image *= &self.weighted_inv_hp_sq;
+        out += &self.family.x_deriv_kron.transpose_mul(&deriv_image);
         Ok(out)
     }
 
-    /// Diagonal of the unpenalized joint Hessian for Khatri-Rao designs.
+    /// Exact diagonal of the unpenalized joint Hessian.
     ///
-    /// For X = A ⊙ B the diagonal of `X^T diag(w) X` is
-    ///   `H_(a,b),(a,b) = Σ_i w_i A_{i,a}^2 B_{i,b}^2`
-    /// which is computed in O(n * p_resp * p_cov) without materializing X
-    /// or its squared columns.
+    /// `H = (X_val^T W X_val) + (X_deriv^T diag(w/h'²) X_deriv)`. The first
+    /// term's diagonal is a single `diag()` extraction off the cached
+    /// `x_val_weighted_gram`; the second term is the Khatri–Rao identity
+    ///
+    ///   `H_deriv_(a,b),(a,b) = Σ_i (w/h'²)_i · A_deriv[i,a]² · B[i,b]²`,
+    ///
+    /// which we compute as `(M_w)^T · B²` block-by-block over row chunks,
+    /// where `M_w[i,a] = (w/h'²)_i · A_deriv[i,a]²`. Each chunk is one
+    /// `fast_atb` BLAS call, the chunks are reduced in parallel, and the
+    /// covariate design is consumed via `try_row_chunk` so sparse covariates
+    /// stream without densifying.
     fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
-        let resp_val = &self.family.response_val_basis;
-        let resp_deriv = &self.family.response_deriv_basis;
-        let cov_dense = self
-            .family
-            .covariate_design
-            .as_dense_ref()
-            .ok_or_else(|| {
-                "CTN joint Hessian diagonal requires dense covariate design".to_string()
-            })?;
-        let p_resp = resp_val.ncols();
-        let p_cov = cov_dense.ncols();
-        let n = resp_val.nrows();
+        let p_resp = self.family.response_deriv_basis.ncols();
+        let p_cov = self.family.covariate_design.ncols();
         let total = p_resp * p_cov;
-        let weights = self.family.weights.as_ref();
+        let cached_diag = self.family.x_val_weighted_gram.diag();
+        if cached_diag.len() != total {
+            return Err(format!(
+                "CTN diagonal: cached val gram diag length {} != p_total {}",
+                cached_diag.len(),
+                total
+            ));
+        }
+        // Term 1: precomputed val diagonal — one Array1 clone, no recomputation.
+        let mut diag = cached_diag.to_owned();
 
-        // Pre-square the covariate design once.
-        let mut cov_sq = cov_dense.clone();
-        cov_sq.mapv_inplace(|v| v * v);
+        // Term 2: factored deriv diagonal, streamed in row chunks.
+        let n = self.family.weights.len();
+        if n == 0 {
+            return Ok(diag);
+        }
+        let policy = &self.family.policy;
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            (p_cov + p_resp).max(1),
+        )
+        .max(1);
+        let chunks: Vec<(usize, usize)> = (0..n)
+            .step_by(rows_per_chunk)
+            .map(|s| (s, (s + rows_per_chunk).min(n)))
+            .collect();
+        let resp_deriv = &self.family.response_deriv_basis;
+        let cov_design = &self.family.covariate_design;
+        let weighted_inv_hp_sq = &self.weighted_inv_hp_sq;
 
-        let mut diag = Array1::<f64>::zeros(total);
-        let mut tilde_w = Array1::<f64>::zeros(n);
+        let partial: Array2<f64> = chunks
+            .into_par_iter()
+            .try_fold(
+                || Array2::<f64>::zeros((p_resp, p_cov)),
+                |mut local, (start, end)| -> Result<Array2<f64>, String> {
+                    let m = end - start;
+                    // Pre-square the covariate row chunk in place — the row_chunk
+                    // helper already returns an owned Array2 we are free to mutate.
+                    let mut cov_sq_chunk = cov_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("CTN diagonal covariate row_chunk: {e}"))?;
+                    cov_sq_chunk.mapv_inplace(|v| v * v);
+                    // M_w[i, a] = (w/h'²)_{start+i} · A_deriv[start+i, a]².
+                    let mut m_w = Array2::<f64>::zeros((m, p_resp));
+                    for i_local in 0..m {
+                        let i = start + i_local;
+                        let c = weighted_inv_hp_sq[i];
+                        for a in 0..p_resp {
+                            let d = resp_deriv[[i, a]];
+                            m_w[[i_local, a]] = c * d * d;
+                        }
+                    }
+                    // (p_resp × p_cov) += M_w^T · B² — one BLAS gemm per chunk.
+                    local += &fast_atb(&m_w, &cov_sq_chunk);
+                    Ok(local)
+                },
+            )
+            .try_reduce(
+                || Array2::<f64>::zeros((p_resp, p_cov)),
+                |mut a, b| {
+                    a += &b;
+                    Ok(a)
+                },
+            )?;
+        // Flatten (p_resp × p_cov) into the row-major p_total layout.
         for a in 0..p_resp {
-            // Term 1 contribution: tilde_w[i] = w_i * A_{i,a}^2
-            for i in 0..n {
-                let aval = resp_val[[i, a]];
-                tilde_w[i] = weights[i] * aval * aval;
-            }
-            for b in 0..p_cov {
-                let mut acc = 0.0;
-                for i in 0..n {
-                    acc += tilde_w[i] * cov_sq[[i, b]];
-                }
-                diag[a * p_cov + b] += acc;
-            }
-            // Term 2 contribution: tilde_w[i] = (w_i / h'^2) * D_{i,a}^2
-            for i in 0..n {
-                let dval = resp_deriv[[i, a]];
-                tilde_w[i] = self.weighted_inv_hp_sq[i] * dval * dval;
-            }
-            for b in 0..p_cov {
-                let mut acc = 0.0;
-                for i in 0..n {
-                    acc += tilde_w[i] * cov_sq[[i, b]];
-                }
-                diag[a * p_cov + b] += acc;
-            }
+            let mut slice = diag.slice_mut(s![a * p_cov..(a + 1) * p_cov]);
+            slice += &partial.row(a);
         }
         Ok(diag)
     }
@@ -1601,11 +1640,11 @@ impl TransformationNormalDhMatrixFreeOperator {
         let n = h_prime.len();
         debug_assert_eq!(d_h_prime.len(), n);
         let weights = family.weights.as_ref();
-        let mut weight_kernel = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let hp = h_prime[i];
-            weight_kernel[i] = -2.0 * weights[i] * d_h_prime[i] / (hp * hp * hp);
-        }
+        // weight_kernel[i] = -2 · w_i · d_h_prime[i] / h_prime[i]³
+        let weight_kernel = ndarray::Zip::from(weights.view())
+            .and(&*h_prime)
+            .and(&d_h_prime)
+            .map_collect(|&w, &hp, &dhp| -2.0 * w * dhp / (hp * hp * hp));
         Self {
             family,
             weight_kernel,
@@ -1616,14 +1655,14 @@ impl TransformationNormalDhMatrixFreeOperator {
         self.family.x_deriv_kron.ncols()
     }
 
+    /// `(dH) · v = X_deriv^T diag(weight_kernel) X_deriv v`.
+    ///
+    /// One forward_mul + one in-place per-row scale + one transpose_mul:
+    /// two BLAS gemms and a single (n,) buffer reused for the scale.
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let image = self.family.x_deriv_kron.forward_mul(v);
-        let n = image.len();
-        let mut weighted = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            weighted[i] = self.weight_kernel[i] * image[i];
-        }
-        self.family.x_deriv_kron.transpose_mul(&weighted)
+        let mut image = self.family.x_deriv_kron.forward_mul(v);
+        image *= &self.weight_kernel;
+        self.family.x_deriv_kron.transpose_mul(&image)
     }
 }
 
@@ -1633,20 +1672,18 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
         self.apply(v)
     }
 
+    /// Materialize `dH` as a dense p×p matrix using the analytic identity
+    /// `dH = X_deriv^T diag(weight_kernel) X_deriv`.
+    ///
+    /// Reuses `KroneckerDesign::weighted_gram`, which performs the symmetric
+    /// Khatri–Rao gram in `Θ(p_resp² · n · p_cov²)` BLAS work — strictly fewer
+    /// FLOPs than `p` separate matvecs (which would each repeat both gemms
+    /// without amortizing across the symmetric structure). Reached only when
+    /// a legacy consumer goes through `DriftDerivResult::into_operator().to_dense()`.
     fn to_dense(&self) -> Array2<f64> {
-        // Legacy fallback for consumers that go through
-        // `DriftDerivResult::into_operator().to_dense()`. The hot trace/logdet
-        // path applies `mul_vec` directly and never reaches this branch.
-        let p = self.p_total();
-        let mut out = Array2::<f64>::zeros((p, p));
-        let mut basis = Array1::<f64>::zeros(p);
-        for j in 0..p {
-            basis[j] = 1.0;
-            let col = self.apply(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
-        out
+        self.family
+            .x_deriv_kron
+            .weighted_gram(&self.weight_kernel, &self.family.policy)
     }
 
     fn is_implicit(&self) -> bool {
@@ -1677,13 +1714,15 @@ impl TransformationNormalD2hMatrixFreeOperator {
         debug_assert_eq!(d_h_prime_u.len(), n);
         debug_assert_eq!(d_h_prime_v.len(), n);
         let weights = family.weights.as_ref();
-        let mut weight_kernel = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let hp = h_prime[i];
-            let hp2 = hp * hp;
-            let hp4 = hp2 * hp2;
-            weight_kernel[i] = 6.0 * weights[i] * d_h_prime_u[i] * d_h_prime_v[i] / hp4;
-        }
+        // weight_kernel[i] = 6 · w_i · d_h_prime_u[i] · d_h_prime_v[i] / h_prime[i]⁴
+        let weight_kernel = ndarray::Zip::from(weights.view())
+            .and(&*h_prime)
+            .and(&d_h_prime_u)
+            .and(&d_h_prime_v)
+            .map_collect(|&w, &hp, &dhp_u, &dhp_v| {
+                let hp2 = hp * hp;
+                6.0 * w * dhp_u * dhp_v / (hp2 * hp2)
+            });
         Self {
             family,
             weight_kernel,
@@ -1694,14 +1733,13 @@ impl TransformationNormalD2hMatrixFreeOperator {
         self.family.x_deriv_kron.ncols()
     }
 
+    /// `(d²H) · w = X_deriv^T diag(weight_kernel) X_deriv w`.
+    ///
+    /// Same single-buffer in-place scale + two BLAS gemms as the dH apply.
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let image = self.family.x_deriv_kron.forward_mul(v);
-        let n = image.len();
-        let mut weighted = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            weighted[i] = self.weight_kernel[i] * image[i];
-        }
-        self.family.x_deriv_kron.transpose_mul(&weighted)
+        let mut image = self.family.x_deriv_kron.forward_mul(v);
+        image *= &self.weight_kernel;
+        self.family.x_deriv_kron.transpose_mul(&image)
     }
 }
 
@@ -1711,17 +1749,13 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
         self.apply(v)
     }
 
+    /// Dense form via `KroneckerDesign::weighted_gram` — see
+    /// `TransformationNormalDhMatrixFreeOperator::to_dense` for the
+    /// FLOP-count rationale.
     fn to_dense(&self) -> Array2<f64> {
-        let p = self.p_total();
-        let mut out = Array2::<f64>::zeros((p, p));
-        let mut basis = Array1::<f64>::zeros(p);
-        for j in 0..p {
-            basis[j] = 1.0;
-            let col = self.apply(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
-        out
+        self.family
+            .x_deriv_kron
+            .weighted_gram(&self.weight_kernel, &self.family.policy)
     }
 
     fn is_implicit(&self) -> bool {

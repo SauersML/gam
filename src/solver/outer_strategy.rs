@@ -470,6 +470,28 @@ fn expensive_unsuccessful_seed_limit(
     }
 }
 
+/// Multipliers for the seed-screening cap cascade, applied to the user's
+/// `screen_max_inner_iterations`.
+///
+/// The cascade evaluates seeds at successive caps until at least one
+/// produces a finite cost — at which point it ranks them and exits. The
+/// geometric ×4 progression keeps each escalation step cheap relative to
+/// the next while still letting the cap reach the full inner budget if
+/// needed: `initial × {1, 4, 16}` followed by uncapped (`0` interpreted
+/// by the inner solver as "use the full `pirls_config.max_iterations`").
+///
+/// Worst-case extra work bounds: every seed pays at most
+/// `initial × (1 + 4 + 16)` = 21 × initial inner iterations across the
+/// three capped stages before falling through to the uncapped pass —
+/// negligible overhead compared to a full P-IRLS solve, paid only when
+/// every cap stage collapsed all seeds to non-finite cost.
+const SEED_SCREENING_CASCADE_MULTIPLIERS: [usize; 3] = [1, 4, 16];
+
+/// Sentinel cap value passed to the inner solver to mean "no cap — use
+/// the full `pirls_config.max_iterations`". Always the final cascade
+/// stage after the geometric escalation exhausts.
+const SEED_SCREENING_UNCAPPED: usize = 0;
+
 fn rank_seeds_with_screening(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -483,24 +505,22 @@ fn rank_seeds_with_screening(
     let initial_cap = config.seed_config.screen_max_inner_iterations.max(1);
     let previous_cap = screening_cap.swap(initial_cap, Ordering::Relaxed);
 
-    // Cascade caps: initial → 4× → 16× → uncapped (0).
-    //
-    // The original two-stage protocol (initial cap → fully uncapped on
-    // every seed) has a degenerate worst case: when every seed under the
-    // shallow cap collapses to a non-finite cost, we re-evaluate every
-    // seed at the *full* inner budget. At biobank scale (n ≈ 3 × 10⁵, p
-    // dense) one full P-IRLS solve is hundreds of n·p² operations, so
-    // ranking N seeds costs N × full_pirls_work just to pick a starting
-    // point. The cascade replaces that all-or-nothing jump with a
-    // geometric escalation that exits the moment any seed produces a
-    // finite cost — typically at an intermediate cap that costs a small
-    // multiple of the initial cap rather than the entire inner budget.
-    //
-    // Worst-case work is bounded by (initial × 1) + (initial × 4) +
-    // (initial × 16) + max_inner ≈ 21 × initial + max_inner per seed,
-    // which is a small overhead on top of the original uncapped fallback
-    // and is paid only when every cap stage produces no finite signal.
-    let cascade_caps = [initial_cap, initial_cap * 4, initial_cap * 16, 0usize];
+    // Geometric cap cascade: each stage exits the moment any seed produces
+    // a finite cost. The original two-stage protocol (initial cap → fully
+    // uncapped on every seed) has a degenerate worst case at biobank scale
+    // — when every seed at the shallow cap collapses, we re-evaluate every
+    // seed at the *full* inner budget, costing `N_seeds × full_pirls_work`
+    // just to pick a starting point. The cascade replaces that all-or-
+    // nothing jump with a geometric escalation: the typical case stays at
+    // the initial cap (one pass), and the rare uniform-failure case pays
+    // only `21 × initial` extra inner iterations before the uncapped
+    // fallback.
+    let cascade_caps = [
+        initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[0]),
+        initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[1]),
+        initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[2]),
+        SEED_SCREENING_UNCAPPED,
+    ];
 
     let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
     let mut rejected = 0usize;
@@ -1803,6 +1823,31 @@ pub struct OuterProblem {
 /// would dominate wall-clock time.
 pub const DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD: f64 = 5.0e9;
 
+/// Per-outer-evaluation FLOP budget above which the analytic LAML outer
+/// Hessian's pairwise inner-solve assembly (`k² · n · p²`) is judged too
+/// expensive for ARC's super-linear convergence to amortize, and the
+/// planner switches to gradient-only BFGS instead.
+///
+/// This is independent of [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]: that
+/// constant gates the *single-inner-solve* cost (when one Hessian assembly
+/// is already too slow), while this one gates the *aggregate Hessian
+/// assembly* cost (when k² inner-derived pairwise terms together dominate
+/// the per-outer-iteration work). Both can independently trigger the
+/// gradient-only downgrade — they capture different regimes.
+///
+/// The same 5 × 10⁹ inflection-point empirical value applies: below it,
+/// ARC's fewer outer iterations more than pay for the Hessian assembly;
+/// above it, BFGS's amortized curvature catches up.
+pub const STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS: u128 = 5_000_000_000;
+
+/// Minimum smoothing-parameter count below which ARC's super-linear
+/// convergence advantage outweighs any per-iteration Hessian cost.
+///
+/// For `k ≤ 3` the outer Hessian is at most nine entries and the dim-`k`
+/// BFGS history is too thin to approximate curvature well, so ARC wins
+/// regardless of how big `n · p²` is.
+pub const STANDARD_GAM_OUTER_BFGS_MIN_K: usize = 4;
+
 impl OuterProblem {
     pub fn new(n_params: usize) -> Self {
         Self {
@@ -1930,6 +1975,58 @@ impl OuterProblem {
     /// dense second-order work.
     pub fn with_dense_hessian_work_hint(mut self, work_flops: f64) -> Self {
         self.dense_hessian_work_hint = Some(work_flops);
+        self
+    }
+
+    /// Standard-GAM dense problem dimensions: a single fluent call that
+    /// configures both the per-inner-solve work hint (`n · p²`, gating
+    /// [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]) AND the per-outer-eval
+    /// Hessian-assembly policy (`k² · n · p²`, gating
+    /// [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`]).
+    ///
+    /// The two cost models are independent and complementary:
+    ///
+    ///   - The per-inner-solve hint catches problems where one Hessian
+    ///     assembly is already too slow, regardless of how many smoothing
+    ///     parameters are in play.
+    ///   - The per-outer-eval policy catches problems where each individual
+    ///     inner solve is moderate but the analytic LAML Hessian's k²
+    ///     pairwise inner-derived terms together dominate the per-outer
+    ///     work and ARC's super-linear convergence cannot amortize the
+    ///     extra cost.
+    ///
+    /// Both can independently set `prefer_gradient_only` to steer the
+    /// planner to BFGS+gradient instead of ARC+Hessian. For sparse designs
+    /// (`is_dense = false`) both checks are skipped — the n·p² model
+    /// assumes dense XᵀWX, and sparse linear algebra is governed by a
+    /// different cost model under which ARC's iteration-count advantage
+    /// typically holds.
+    ///
+    /// Callers who already passed `prefer_gradient_only` via
+    /// [`with_prefer_gradient_only`] keep that flag — this method only
+    /// upgrades it from `false` to `true` when the policy fires.
+    pub fn with_standard_gam_dimensions(
+        mut self,
+        n_obs: usize,
+        p_coeff: usize,
+        is_dense: bool,
+    ) -> Self {
+        if !is_dense {
+            return self;
+        }
+        let n_p_squared = (n_obs as f64) * (p_coeff as f64) * (p_coeff as f64);
+        self.dense_hessian_work_hint = Some(n_p_squared);
+        if self.n_params >= STANDARD_GAM_OUTER_BFGS_MIN_K {
+            let inner_solve_work = (n_obs as u128)
+                .saturating_mul(p_coeff as u128)
+                .saturating_mul(p_coeff as u128);
+            let hessian_pair_work = inner_solve_work
+                .saturating_mul(self.n_params as u128)
+                .saturating_mul(self.n_params as u128);
+            if hessian_pair_work > STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS {
+                self.prefer_gradient_only = true;
+            }
+        }
         self
     }
 
@@ -3077,7 +3174,7 @@ mod tests {
     use super::*;
     use ::opt::FixedPointObjective;
     use ndarray::array;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct FailingSeedMaterializationOperator {
@@ -3130,6 +3227,92 @@ mod tests {
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::Bfgs);
         assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn standard_gam_dimensions_biobank_duchon_triggers_gradient_only() {
+        // Biobank-scale dense Duchon: n=320K, p=65, k=6 → k²·n·p² ≈ 4.9e10
+        // > 5e9 budget. The aggregate Hessian-assembly policy must steer
+        // the planner to gradient-only, even though the per-inner-solve
+        // hint (n·p² ≈ 1.35e9) is below its own 5e9 threshold.
+        let problem = OuterProblem::new(6)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_standard_gam_dimensions(320_000, 65, true);
+        let cap = problem.capability();
+        assert!(cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Bfgs);
+    }
+
+    #[test]
+    fn standard_gam_dimensions_per_inner_solve_hint_alone_triggers_gradient_only() {
+        // n=20K, p=600, k=2 → n·p² = 7.2e9 > 5e9 (existing per-inner-solve
+        // threshold) but k²·n·p² = 2.88e10 — same order. The per-inner-solve
+        // hint is what fires here because k=2 is below the BFGS-min-k cutoff,
+        // so the aggregate-assembly policy short-circuits.
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_standard_gam_dimensions(20_000, 600, true);
+        let cap = problem.capability();
+        assert!(cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Bfgs);
+    }
+
+    #[test]
+    fn standard_gam_dimensions_small_problem_keeps_arc() {
+        // Small dense problem: n=1000, p=10, k=4 → both hints below
+        // threshold, so ARC stays selected.
+        let problem = OuterProblem::new(4)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_standard_gam_dimensions(1_000, 10, true);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Arc);
+    }
+
+    #[test]
+    fn standard_gam_dimensions_low_k_keeps_arc_at_biobank_scale() {
+        // For k ≤ 3 the BFGS curvature history is too thin to win. The
+        // aggregate-assembly policy must short-circuit on k regardless of
+        // n·p². The per-inner-solve hint also stays below threshold here
+        // (n·p² = 1.35e9 < 5e9), so neither check fires.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_standard_gam_dimensions(320_000, 65, true);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Arc);
+    }
+
+    #[test]
+    fn standard_gam_dimensions_sparse_design_keeps_arc() {
+        // Sparse designs: the n·p² model assumes dense XᵀWX, so the policy
+        // is a no-op and ARC remains selected even at biobank scale.
+        let problem = OuterProblem::new(6)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_standard_gam_dimensions(320_000, 65, false);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Arc);
+    }
+
+    #[test]
+    fn standard_gam_dimensions_preserves_explicit_prefer_gradient_only() {
+        // A caller that already set prefer_gradient_only(true) (e.g. from
+        // a family-specific reason) keeps that flag even when the problem
+        // is small enough that the policy alone wouldn't have fired.
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_prefer_gradient_only(true)
+            .with_standard_gam_dimensions(1_000, 10, true);
+        let cap = problem.capability();
+        assert!(cap.prefer_gradient_only);
+        assert_eq!(plan(&cap).solver, Solver::Bfgs);
     }
 
     #[test]

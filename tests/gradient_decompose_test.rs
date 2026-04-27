@@ -130,6 +130,27 @@ fn rel_l2(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     (a - b).iter().map(|v| v * v).sum::<f64>().sqrt() / na.max(nb).max(1e-12)
 }
 
+/// Per-component diagnostics used to catch a single badly-wrong gradient
+/// component that an L2-only assertion would smear into the noise. Returns
+/// `(worst_rel, worst_idx, worst_abs)` where `worst_rel = |a_i - b_i| /
+/// max(|a_i|, |b_i|, 1e-8)` peaked over indices.
+fn worst_component_rel(a: &Array1<f64>, b: &Array1<f64>) -> (f64, usize, f64) {
+    let mut worst_rel = 0.0_f64;
+    let mut worst_idx = 0usize;
+    let mut worst_abs = 0.0_f64;
+    for i in 0..a.len() {
+        let abs_err = (a[i] - b[i]).abs();
+        let denom = a[i].abs().max(b[i].abs()).max(1e-8);
+        let rel = abs_err / denom;
+        if rel > worst_rel {
+            worst_rel = rel;
+            worst_idx = i;
+            worst_abs = abs_err;
+        }
+    }
+    (worst_rel, worst_idx, worst_abs)
+}
+
 /// Solve PIRLS for logit to convergence, returning (beta, eta, mu, w, H, log_lik).
 fn solve_pirls_logit(
     y: &Array1<f64>,
@@ -515,9 +536,22 @@ fn test_single_penalty_logit_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
+    let (worst_rel, worst_idx, worst_abs) = worst_component_rel(&analytic, &fd);
     assert!(
         err < 0.05,
         "Single-penalty logit gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
+    );
+    // Per-component check: catches a single badly-wrong component that the
+    // L2-norm check above would average out. The L2 bound is 0.05; we allow
+    // the worst component to drift somewhat further (FD noise dominates
+    // small entries) but cap it well below "doubled magnitude".
+    assert!(
+        worst_rel < 0.20,
+        "Single-penalty logit gradient component {worst_idx} wrong: \
+         rel={worst_rel:.3e}, abs={worst_abs:.3e}, \
+         analytic[{worst_idx}]={ai:.6e}, fd[{worst_idx}]={fi:.6e}",
+        ai = analytic[worst_idx],
+        fi = fd[worst_idx],
     );
 }
 
@@ -571,9 +605,18 @@ fn test_two_overlapping_penalties_logit_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
+    let (worst_rel, worst_idx, worst_abs) = worst_component_rel(&analytic, &fd);
     assert!(
         err < 0.05,
         "Overlapping-penalty logit gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
+    );
+    assert!(
+        worst_rel < 0.20,
+        "Overlapping-penalty logit gradient component {worst_idx} wrong: \
+         rel={worst_rel:.3e}, abs={worst_abs:.3e}, \
+         analytic[{worst_idx}]={ai:.6e}, fd[{worst_idx}]={fi:.6e}",
+        ai = analytic[worst_idx],
+        fi = fd[worst_idx],
     );
 }
 
@@ -627,9 +670,18 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
     let fd = fd_gradient_from_externalcost(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-5);
 
     let err = rel_l2(&analytic, &fd);
+    let (worst_rel, worst_idx, worst_abs) = worst_component_rel(&analytic, &fd);
     assert!(
         err < 0.05,
         "Non-overlapping-penalty logit gradient wrong: rel_l2={err:.3e}\nanalytic={analytic:?}\nfd={fd:?}"
+    );
+    assert!(
+        worst_rel < 0.20,
+        "Non-overlapping-penalty logit gradient component {worst_idx} wrong: \
+         rel={worst_rel:.3e}, abs={worst_abs:.3e}, \
+         analytic[{worst_idx}]={ai:.6e}, fd[{worst_idx}]={fi:.6e}",
+        ai = analytic[worst_idx],
+        fi = fd[worst_idx],
     );
 }
 

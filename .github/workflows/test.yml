@@ -175,3 +175,21 @@ jobs:
 
       - name: Run Python API + pipeline smoke tests
         run: python -m pytest tests/test_python_api.py -v --tb=short
+
+      - name: Run Python tables tests
+        # In-tree pure-Python tests against the gam._tables helpers; no
+        # benchmark binaries or external services are required.
+        run: python -m pytest tests/test_tables.py -v --tb=short
+
+      - name: Run benchmark configuration / mapping tests
+        # These are pure-Python contract tests over the bench/ orchestration
+        # scripts (run_suite.py, fuzz_vs_mgcv.py, biobank_scale/runner.py).
+        # They mock subprocess calls and never invoke the Rust binary, so
+        # they are safe for the standard CI runner.
+        run: |
+          python -m pytest \
+            tests/bench_run_suite_mapping_test.py \
+            tests/bench_run_suite_optional_imports_test.py \
+            tests/bench_fuzz_vs_mgcv_test.py \
+            tests/bench_biobank_scale_runner_test.py \
+            -v --tb=short

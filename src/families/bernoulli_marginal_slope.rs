@@ -10127,6 +10127,98 @@ mod tests {
             cost_gated_outer_order(&big_specs, big_cost),
             ExactOuterDerivativeOrder::First
         );
+
+        // Production CTN-on-PC scenario: K=22 (ρ_dim=6 + log-κ_dim=16), n≈4·10⁵
+        // observations with p_total = p_resp·p_cov ≈ 300 covers a Khatri–Rao
+        // joint Hessian whose dense build is n·p² ≈ 3.6·10¹⁰ flops. Combined
+        // with K²=484 the work exceeds 10¹³, so the gate must downgrade to
+        // first-order BFGS even though K²=484 alone fits comfortably under
+        // any element-count cap. This is the regression that the inner-cost
+        // gate exists to prevent.
+        //
+        // Pass the production coefficient cost directly (the gate only reads
+        // K from specs; allocating a 400k×300 zero matrix would burn ~1 GB
+        // for no reason).
+        let ctn_specs = vec![ParameterBlockSpec {
+            name: "ctn".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, 1,
+            )))),
+            offset: ndarray::Array1::zeros(1),
+            penalties: (0..22)
+                .map(|_| crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((1, 1))))
+                .collect(),
+            nullspace_dims: vec![0; 22],
+            initial_log_lambdas: ndarray::Array1::zeros(22),
+            initial_beta: None,
+        }];
+        let ctn_cost: u64 = 400_000u64 * 300 * 300;
+        assert_eq!(
+            cost_gated_outer_order(&ctn_specs, ctn_cost),
+            ExactOuterDerivativeOrder::First
+        );
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
+        use crate::custom_family::default_coefficient_hessian_cost;
+        use crate::matrix::DesignMatrix;
+
+        // Two-block rigid marginal-slope shape: marginal p=20, log-slope p=8,
+        // n=1000. The default block-diagonal formula gives Σ n·p_b² =
+        // 1000·(400 + 64) = 464_000. The joint-coupled override must add
+        // the cross-block outer-product fill 2·n·p_marg·p_log = 320_000,
+        // producing n·(p_marg + p_log)² = 1000·784 = 784_000.
+        let n = 1000usize;
+        let p_marg = 20usize;
+        let p_log = 8usize;
+        let marg_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((n, p_marg))));
+        let log_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((n, p_log))));
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(Array1::zeros(n)),
+            weights: Arc::new(Array1::from_elem(n, 1.0)),
+            z: Arc::new(Array1::zeros(n)),
+            gaussian_frailty_sd: None,
+            base_link: bernoulli_marginal_slope_probit_link(),
+            marginal_design: marg_design.clone(),
+            logslope_design: log_design.clone(),
+            score_warp: None,
+            link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "marginal".to_string(),
+                design: marg_design,
+                offset: Array1::zeros(n),
+                penalties: vec![crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((
+                    p_marg, p_marg,
+                )))],
+                nullspace_dims: vec![0],
+                initial_log_lambdas: Array1::zeros(1),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "logslope".to_string(),
+                design: log_design,
+                offset: Array1::zeros(n),
+                penalties: vec![crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((
+                    p_log, p_log,
+                )))],
+                nullspace_dims: vec![0],
+                initial_log_lambdas: Array1::zeros(1),
+                initial_beta: None,
+            },
+        ];
+
+        let p_total = (p_marg + p_log) as u64;
+        let expected_joint = (n as u64) * p_total * p_total;
+        let expected_block_diag = (n as u64) * ((p_marg * p_marg + p_log * p_log) as u64);
+        assert_eq!(family.coefficient_hessian_cost(&specs), expected_joint);
+        assert_eq!(default_coefficient_hessian_cost(&specs), expected_block_diag);
+        assert!(family.coefficient_hessian_cost(&specs) > default_coefficient_hessian_cost(&specs));
     }
 
     #[test]
