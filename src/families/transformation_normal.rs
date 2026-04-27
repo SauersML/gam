@@ -1360,7 +1360,6 @@ impl CustomFamily for TransformationNormalFamily {
             .collect();
         let workspace = TransformationNormalJointHessianWorkspace::new(
             self.clone(),
-            block_states.to_vec(),
             h_prime,
             weighted_inv_hp_sq,
         )?;
@@ -1385,7 +1384,6 @@ impl CustomFamily for TransformationNormalFamily {
 /// the materialized joint Hessian.
 struct TransformationNormalJointHessianWorkspace {
     family: TransformationNormalFamily,
-    block_states: Vec<ParameterBlockState>,
     /// h'_i = X_deriv · β at the current iterate. Cached so the matrix-free
     /// directional-derivative operators can reuse it without rerunning
     /// `forward_mul(beta)`.
@@ -1397,13 +1395,11 @@ struct TransformationNormalJointHessianWorkspace {
 impl TransformationNormalJointHessianWorkspace {
     fn new(
         family: TransformationNormalFamily,
-        block_states: Vec<ParameterBlockState>,
         h_prime: Array1<f64>,
         weighted_inv_hp_sq: Array1<f64>,
     ) -> Result<Self, String> {
         Ok(Self {
             family,
-            block_states,
             h_prime,
             weighted_inv_hp_sq,
         })

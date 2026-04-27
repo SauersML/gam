@@ -3217,6 +3217,15 @@ where
     let mut max_abs_eta = 0.0;
     let mut status = PirlsStatus::MaxIterationsReached;
     let mut iterations = 0usize;
+    // Streak counter for the relative-band plateau check. The post-loop
+    // rescue accepts a fit when the relative gradient is small AND the
+    // deviance has plateaued at dev_tol*0.1, but only after the iteration
+    // budget is exhausted. Mirroring that test in-loop saves the wasted
+    // iterations spent grinding to MaxIterations only to be accepted at
+    // the end with the same condition. A single iteration meeting the
+    // criterion is not robust evidence (one noisy step can fake it), so we
+    // require two consecutive iterations to fire the early exit.
+    let mut relative_band_plateau_streak = 0usize;
     let mut final_state: Option<WorkingState> = None;
     let mut newton_direction = Array1::<f64>::zeros(beta.len());
     let mut linear_active_hint: Option<Vec<usize>> =

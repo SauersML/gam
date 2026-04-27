@@ -6139,6 +6139,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     // exhausts max_iter through every seed instead of surfacing the failure,
     // burning the full job budget on directionally wrong updates. Disable the
     // fallback so the optimizer commits to its principled plan.
+    // Cost-aware downgrade: in addition to the existing dense-design heuristic
+    // above, feed the planner a FLOP estimate of one dense exact-joint
+    // Hessian assembly so the work-cost threshold can divert to gradient-only
+    // optimization when n·p² is large enough for a single Newton iteration to
+    // dominate wall-clock time, regardless of the sparse/dense routing.
+    let dense_hessian_work = (baseline.design.design.nrows() as f64)
+        * (baseline.design.design.ncols() as f64)
+        * (baseline.design.design.ncols() as f64);
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -6147,6 +6155,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Derivative::Unavailable
         })
         .with_prefer_gradient_only(prefer_gradient_only)
+        .with_dense_hessian_work_hint(dense_hessian_work)
         .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
