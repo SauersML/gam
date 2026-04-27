@@ -2642,16 +2642,12 @@ fn run_operator_trust_region(
     for iter in 0..max_iter {
         let g_proj = projected_gradient(&x_k, &eval_k.gradient, bounds);
         let g_norm = g_proj.dot(&g_proj).sqrt();
-        // Scale-invariant outer KKT certificate: V_LAML scales with n (the
-        // dominant likelihood term is O(n)) so its gradient ∇V scales the
-        // same way. An absolute test ‖∇V‖ < τ becomes systematically too
-        // tight at biobank n. Comparing against τ · (1 + |V(ρ)|) makes the
-        // certificate invariant under V → c·V (the additive 1 is a unit
-        // floor for the trivial-cost case). This matches the inner-PIRLS
-        // fix and mirrors how mgcv's `magic` REML driver scales its score
-        // tolerance by the absolute objective.
-        let outer_kkt_scale = 1.0 + eval_k.cost.abs();
-        if g_norm.is_finite() && g_norm <= tolerance * outer_kkt_scale {
+        // Scale-invariant outer KKT certificate via `outer_scaled_tolerance`,
+        // recomputed each iteration with the iteration-current cost so the
+        // scale tracks the descent. Same form as the BFGS / ARC paths and
+        // the inner-PIRLS fix; see the helper's doc comment for derivation.
+        let scaled_tol = outer_scaled_tolerance(tolerance, eval_k.cost);
+        if g_norm.is_finite() && g_norm <= scaled_tol {
             return Ok(OuterResult {
                 rho: x_k,
                 final_value: eval_k.cost,
