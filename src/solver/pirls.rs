@@ -2086,9 +2086,17 @@ struct DenseOuterState {
 
 /// State for the sparse-SpGEMM backend (faer numeric matmul scratch and the
 /// pre-scaled (√W)·X factors that feed it).
+///
+/// `sqrt_weights` caches `√max(0, wᵢ)` for each row of X. Without it, the
+/// right-factor loop would recompute the same sqrt once per nonzero of X
+/// (each row weight gets read by every column that has a nonzero in that
+/// row), so for an n=400 K · avg-nnz-per-row=10 design that's 4 M sqrts
+/// per PIRLS iteration. Precomputing once collapses that to n sqrts and
+/// the inner loop becomes a pure multiply.
 struct SparseSpGemmState {
     wxvalues: Vec<f64>,
     wx_tvalues: Vec<f64>,
+    sqrt_weights: Vec<f64>,
     info: SparseMatMulInfo,
     scratch: MemBuffer,
     par: Par,
@@ -2140,6 +2148,7 @@ impl SparseXtWxCache {
             XtWxBackend::Sparse(SparseSpGemmState {
                 wxvalues: vec![0.0; x.val().len()],
                 wx_tvalues: vec![0.0; x_t_csc.val().len()],
+                sqrt_weights: vec![0.0; x.nrows()],
                 info,
                 scratch,
                 par,
@@ -2300,6 +2309,19 @@ impl SparseSpGemmState {
         xtwx_symbolic: SymbolicSparseColMatRef<'_, usize>,
         xtwxvalues: &mut [f64],
     ) {
+        let n = x_t.ncols();
+        debug_assert_eq!(weights.len(), n);
+        debug_assert_eq!(self.sqrt_weights.len(), n);
+
+        // Cache √max(0, w) once per row so the inner loops can multiply
+        // without repeated sqrt calls. Single owning slice avoids ndarray
+        // bounds checks in the hot loops below.
+        let sqrt_w = self.sqrt_weights.as_mut_slice();
+        for (dst, &w) in sqrt_w.iter_mut().zip(weights.iter()) {
+            *dst = w.max(0.0).sqrt();
+        }
+        let sqrt_w: &[f64] = sqrt_w;
+
         let x_ref = x.as_ref();
         // Right factor: √W · X, stored in X's CSC sparsity pattern.
         for col in 0..p {
@@ -2308,14 +2330,14 @@ impl SparseSpGemmState {
             let range = x_ref.col_range(col);
             let dst = &mut self.wxvalues[range];
             for ((d, &s), row) in dst.iter_mut().zip(xvals.iter()).zip(rows.iter()) {
-                let w = weights[row.unbound()].max(0.0);
-                *d = s * w.sqrt();
+                *d = s * sqrt_w[row.unbound()];
             }
         }
         // Left factor: (√W · X)ᵀ in X^T's CSC sparsity pattern. X^T's columns
-        // correspond to rows of X, so each column scales by sqrt(w_row).
-        for col in 0..x_t.ncols() {
-            let w = weights[col].max(0.0).sqrt();
+        // correspond to rows of X, so each column scales by √w_row — read
+        // straight from the cached slice with no per-column sqrt.
+        for col in 0..n {
+            let w = sqrt_w[col];
             let xvals = x_t.val_of_col(col);
             let range = x_t.col_range(col);
             let dst = &mut self.wx_tvalues[range];
