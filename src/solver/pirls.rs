@@ -4703,7 +4703,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             config.max_iterations
         },
         convergence_tolerance: config.convergence_tolerance,
-        max_step_halving: base_max_step_halving.min(config.max_iterations.max(1)),
+        // LM step-halving is a per-iteration damping retry budget; it is
+        // independent of the total outer-iteration cap. Tying the two
+        // together collapsed step halving to 3 under seed screening (where
+        // max_iterations is intentionally capped low), turning recoverable
+        // damping into spurious failures.
+        max_step_halving: base_max_step_halving,
         min_step_size: if firth_active { 1e-12 } else { 1e-10 },
         firth_bias_reduction: firth_active,
         coefficient_lower_bounds: None,
