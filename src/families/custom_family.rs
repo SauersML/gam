@@ -6689,17 +6689,14 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                     Array1::<f64>::zeros(total)
                 }
             };
-            let penalty =
-                apply_joint_block_penalty(&ranges_vec, &s_lambdas_owned, v, ridge_floor);
+            let penalty = apply_joint_block_penalty(&ranges_vec, &s_lambdas_owned, v, ridge_floor);
             out += &penalty;
             out
         };
         let (probes, steps) = default_slq_parameters(total);
         let logdet_h_total =
             stochastic_lanczos_logdet_spd_operator(total, apply_op, probes, steps, 0xC75_5C75_5C75)
-                .map_err(|e| {
-                    format!("matrix-free SLQ logdet for joint Hessian + S_lambda: {e}")
-                })?;
+                .map_err(|e| format!("matrix-free SLQ logdet for joint Hessian + S_lambda: {e}"))?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
     // Fallback: try the non-rescaled symmetrized path (for families that
@@ -11734,10 +11731,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // the existing `multi_block_beta_dependent` EFS opt-out: both let the
     // planner skip a path it would otherwise have committed to.
     let total_p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
-    let n_obs_joint = specs
-        .first()
-        .map(|s| s.design.nrows())
-        .unwrap_or(0);
+    let n_obs_joint = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
     let all_blocks_dense = specs.iter().all(|s| s.design.as_sparse().is_none());
     // First-order work gate (P6 / task #9): the BFGS / L-BFGS path can be
     // selected by either `cost_gated_outer_order` (family declares
@@ -12121,7 +12115,10 @@ mod tests {
             joint_coupled_coefficient_hessian_cost(200, &specs),
             200 * 40 * 40
         );
-        assert_eq!(default_coefficient_hessian_cost(&specs), 200 * (144 + 400 + 64));
+        assert_eq!(
+            default_coefficient_hessian_cost(&specs),
+            200 * (144 + 400 + 64)
+        );
         assert!(
             joint_coupled_coefficient_hessian_cost(200, &specs)
                 > default_coefficient_hessian_cost(&specs)

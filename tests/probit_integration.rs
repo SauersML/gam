@@ -118,7 +118,10 @@ fn probitworkingvectors_are_finite_for_extreme_eta() {
         weights.iter().all(|v| v.is_finite() && *v >= 0.0),
         "probit weights non-finite or negative: weights={weights:?}"
     );
-    assert!(z.iter().all(|v| v.is_finite()), "probit z non-finite: z={z:?}");
+    assert!(
+        z.iter().all(|v| v.is_finite()),
+        "probit z non-finite: z={z:?}"
+    );
 
     // --- Mathematical contract for Φ ---
     // mu must implement the standard normal CDF, so the saturated tails
@@ -132,21 +135,13 @@ fn probitworkingvectors_are_finite_for_extreme_eta() {
         "Φ(-100) must collapse to ~0; got mu[0]={}",
         mu[0]
     );
-    assert!(
-        mu[1] < 1e-3,
-        "Φ(-20) must be tiny; got mu[1]={}",
-        mu[1]
-    );
+    assert!(mu[1] < 1e-6, "Φ(-20) must be tiny; got mu[1]={}", mu[1]);
     assert!(
         (mu[2] - 0.5).abs() < 1e-9,
         "Φ(0) must equal 0.5 within fp tol; got mu[2]={}",
         mu[2]
     );
-    assert!(
-        mu[3] > 1.0 - 1e-3,
-        "Φ(+20) must be ~1; got mu[3]={}",
-        mu[3]
-    );
+    assert!(mu[3] > 1.0 - 1e-6, "Φ(+20) must be ~1; got mu[3]={}", mu[3]);
     assert!(
         mu[4] > 1.0 - 1e-6,
         "Φ(+100) must collapse to ~1; got mu[4]={}",
@@ -318,7 +313,10 @@ fn cloglogworkingvectors_are_finite_for_extreme_eta() {
         weights.iter().all(|v| v.is_finite() && *v >= 0.0),
         "cloglog weights non-finite or negative: weights={weights:?}"
     );
-    assert!(z.iter().all(|v| v.is_finite()), "cloglog z non-finite: z={z:?}");
+    assert!(
+        z.iter().all(|v| v.is_finite()),
+        "cloglog z non-finite: z={z:?}"
+    );
 
     // --- Mathematical contract for the cloglog mean function ---
     // μ(η) = 1 - exp(-exp(η))
