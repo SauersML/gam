@@ -904,6 +904,40 @@ impl CustomFamily for TransformationNormalFamily {
         }
     }
 
+    fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        // Honest CTN per-gradient cost. The default
+        // (`coefficient_hessian_cost / 2`) only counts the inner Newton solve
+        // and undercounts each outer evaluation, because CTN also runs a
+        // monotonicity fraction-to-boundary scan via
+        // `KronDesign::min_step_to_boundary` on every gradient/cost step.
+        // That pass walks the n_cov × n_grid virtual row space, forming
+        // chunk-local `c · Rᵀ` and `d · Rᵀ` factors, with cost
+        // `2 · n · n_grid · p_resp + 2 · n · p_resp · p_cov`. At biobank
+        // scale (n=320 000, n_grid=293, p_resp=32, p_cov=23) that is
+        // ≈ 6.5·10⁹ multiply-adds per pass — orders of magnitude above
+        // the matrix-free `Hv` cost — so leaving it out of the gradient
+        // cost reports a per-eval budget tens of times smaller than
+        // reality, and `cost_gated_first_order_max_iter` lets the BFGS
+        // loop request far more outer iterations than the global FLOP
+        // budget can pay for. That is the proximate cause of the
+        // `rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast`
+        // and survival-marginal-slope timeouts: the CTN baseline
+        // custom-family fit runs to its full requested `outer_max_iter`
+        // because the gate never fires.
+        let inner = self.coefficient_hessian_cost(specs) / 2;
+        let n = self.response_val_basis.nrows() as u64;
+        let p_resp = self.response_val_basis.ncols() as u64;
+        let p_cov = self.covariate_design.ncols() as u64;
+        let n_grid = match &self.x_deriv_grid_kron {
+            KroneckerDesign::Kronecker { response_grid, .. } => response_grid.nrows() as u64,
+            KroneckerDesign::KhatriRao { .. } => 0,
+        };
+        let monotonicity_pass = n
+            .saturating_mul(2u64.saturating_mul(n_grid).saturating_mul(p_resp))
+            .saturating_add(n.saturating_mul(2u64.saturating_mul(p_resp).saturating_mul(p_cov)));
+        inner.saturating_add(monotonicity_pass)
+    }
+
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
