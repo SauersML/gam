@@ -2826,7 +2826,36 @@ impl ArcCore {
         for k in 0..self.max_iterations {
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+            // Per-iteration progress so a long-running outer optimization is
+            // never silent. Tier the level so fast solves stay quiet at info
+            // (first few + periodic) while slow solves still get every step
+            // at debug.
+            log::debug!(
+                "[ARC] iter={} f={:.6e} ||g||={:.3e} sigma={:.3e} fe={} ge={} he={}",
+                k,
+                f_k,
+                g_norm,
+                self.sigma,
+                func_evals,
+                grad_evals,
+                hess_evals
+            );
+            if k < 4 || k % 5 == 0 {
+                log::info!(
+                    "[ARC] iter={} f={:.6e} ||g||={:.3e} sigma={:.3e}",
+                    k,
+                    f_k,
+                    g_norm,
+                    self.sigma
+                );
+            }
             if g_norm.is_finite() && g_norm <= self.tolerance {
+                log::info!(
+                    "[ARC] converged at iter={} f={:.6e} ||g||={:.3e}",
+                    k,
+                    f_k,
+                    g_norm
+                );
                 return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
@@ -2987,9 +3016,10 @@ impl ArcCore {
             };
             let rho = (f_k - f_trial) / denom;
             model_failure_streak = 0;
+            let accepted = rho >= self.eta1;
             // ARC accept/reject decision:
             // accept trial point iff rho >= eta1.
-            if rho >= self.eta1 {
+            if accepted {
                 if h_trial.nrows() != n || h_trial.ncols() != n {
                     return Err(ArcError::HessianShapeMismatch {
                         expected: n,
@@ -3012,16 +3042,32 @@ impl ArcCore {
 
             // Canonical ARC sigma update:
             // very successful -> decrease; successful -> keep; unsuccessful -> increase.
-            if rho >= self.eta2 {
+            let sigma_before = self.sigma;
+            let action = if rho >= self.eta2 {
                 self.sigma = (self.sigma * self.gamma1).max(self.sigma_min);
+                "very-successful"
             } else if rho >= self.eta1 {
                 self.sigma = self.sigma.max(self.sigma_min);
+                "successful"
             } else if rho.is_finite() {
                 self.sigma = (self.sigma * self.gamma2).min(self.sigma_max);
+                "unsuccessful"
             } else {
                 // Numerically pathological ratio: use the stronger growth factor.
                 self.sigma = (self.sigma * self.gamma3).min(self.sigma_max);
-            }
+                "pathological-rho"
+            };
+            log::debug!(
+                "[ARC] iter={} step={}: rho={:.3e} action={} sigma {:.3e} -> {:.3e} \
+                 step_norm={:.3e}",
+                k,
+                if accepted { "accept" } else { "reject" },
+                rho,
+                action,
+                sigma_before,
+                self.sigma,
+                s_norm,
+            );
         }
 
         let g_proj_k = self.projected_gradient(&x_k, &g_k);
@@ -3723,6 +3769,27 @@ impl BfgsCore {
             self.spd_fail_seen = false;
             g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+            // Per-iteration progress so a long-running outer optimization is
+            // never silent. First few iters always logged at info; then every
+            // 5th iter; full per-iter detail is at debug.
+            log::debug!(
+                "[BFGS] iter={} f={:.6e} ||g||={:.3e} Δ={:.3e} fe={} ge={}",
+                k,
+                f_k,
+                g_norm,
+                self.trust_radius,
+                func_evals,
+                grad_evals
+            );
+            if k < 4 || k % 5 == 0 {
+                log::info!(
+                    "[BFGS] iter={} f={:.6e} ||g||={:.3e} Δ={:.3e}",
+                    k,
+                    f_k,
+                    g_norm,
+                    self.trust_radius
+                );
+            }
             if !g_norm.is_finite() {
                 log::debug!(
                     "[BFGS] Non-finite gradient norm at iter {}: g_norm={:?}",
@@ -3736,15 +3803,14 @@ impl BfgsCore {
                 let sol = Solution::gradient_based(
                     x_k, f_k, g_k, g_norm, None, k, func_evals, grad_evals, 0,
                 );
-                log::debug!(
-                    "[BFGS] Converged by gradient: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
+                log::info!(
+                    "[BFGS] converged at iter={} f={:.6e} ||g||={:.3e} fe={} ge={}",
                     k,
                     sol.final_value,
                     sol.final_gradient_norm
                         .expect("gradient-based solution must report gradient norm"),
                     sol.func_evals,
-                    sol.grad_evals,
-                    self.trust_radius
+                    sol.grad_evals
                 );
                 return Ok(sol);
             }

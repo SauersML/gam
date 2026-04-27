@@ -9546,7 +9546,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         Some(t) => t,
         None => return Ok(None),
     };
-    let aniso_result = match &termspec.basis {
+    let mut aniso_result = match &termspec.basis {
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
@@ -9615,15 +9615,19 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             // present (spatial_log_kappa_hyper_dirs_frominfo_list uses from_implicit).
             (Array2::<f64>::zeros((0, 0)), Array2::<f64>::zeros((0, 0)))
         } else {
-            let x_first = aniso_result.design_first[a].clone();
-            let x_second = aniso_result.design_second_diag[a].clone();
+            // Move the dense (n × p) matrices out of aniso_result instead of
+            // cloning. Each axis index `a` is read exactly once across the
+            // loop, and aniso_result is dropped at function exit, so leaving
+            // empty placeholders behind in those vec slots is safe.
+            let x_first = std::mem::take(&mut aniso_result.design_first[a]);
+            let x_second = std::mem::take(&mut aniso_result.design_second_diag[a]);
             if x_first.ncols() != smooth_term.coeff_range.len() {
                 return Ok(None);
             }
             (x_first, x_second)
         };
-        let s_psi_components = aniso_result.penalties_first[a].clone();
-        let s_psi_psi_components = aniso_result.penalties_second_diag[a].clone();
+        let s_psi_components = std::mem::take(&mut aniso_result.penalties_first[a]);
+        let s_psi_psi_components = std::mem::take(&mut aniso_result.penalties_second_diag[a]);
         // Build cross-design entries for other axes b != a in this group.
         // These will be indexed by (b, cross_matrix) where b is the axis
         // offset within the d-entry block.
@@ -9901,177 +9905,201 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     info_list: Vec<SpatialPsiDerivative>,
 ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
     use crate::estimate::reml::ImplicitDerivLevel;
+    use std::collections::HashMap;
 
-    let mut hyper_dirs = Vec::with_capacity(info_list.len());
     let log_kappa_dim = info_list.len();
-    for (i, info) in info_list.iter().enumerate() {
+    // Layout-only metadata (group_id per axis) is cheap to snapshot up front so
+    // the consumption loop below can MOVE the dense (n × p) derivative arrays
+    // out of each entry instead of cloning. At biobank scale (n≈3×10⁵, 16-axis
+    // CTN) the prior `.clone()` sites doubled peak working memory for the
+    // psi-derivative pass through several GiB.
+    let group_ids: Vec<Option<usize>> = info_list.iter().map(|e| e.aniso_group_id).collect();
+    let mut group_indices_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, gid) in group_ids.iter().enumerate() {
+        if let Some(g) = gid {
+            group_indices_map.entry(*g).or_default().push(idx);
+        }
+    }
+
+    let mut hyper_dirs = Vec::with_capacity(log_kappa_dim);
+    for (i, info) in info_list.into_iter().enumerate() {
+        let SpatialPsiDerivative {
+            penalty_index: _,
+            penalty_indices,
+            global_range,
+            total_p,
+            x_psi_local,
+            s_psi_components_local,
+            x_psi_psi_local,
+            s_psi_psi_components_local,
+            aniso_group_id,
+            aniso_cross_designs,
+            aniso_cross_penalty_provider,
+            implicit_operator,
+            implicit_axis,
+        } = info;
+
         let mut xsecond = vec![None; log_kappa_dim];
         // Diagonal second derivative (same axis).
-        xsecond[i] = Some(if let Some(ref op) = info.implicit_operator {
+        xsecond[i] = Some(if let Some(ref op) = implicit_operator {
             crate::estimate::reml::HyperDesignDerivative::from_implicit(
                 op.clone(),
-                ImplicitDerivLevel::SecondDiag(info.implicit_axis),
-                info.global_range.clone(),
-                info.total_p,
+                ImplicitDerivLevel::SecondDiag(implicit_axis),
+                global_range.clone(),
+                total_p,
             )
         } else {
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
-                info.x_psi_psi_local.clone(),
-                info.global_range.clone(),
-                info.total_p,
+                x_psi_psi_local,
+                global_range.clone(),
+                total_p,
             )
         });
         // Cross second derivatives for axes in the same aniso group.
-        if let Some(ref cross_designs) = info.aniso_cross_designs {
-            // Find the base index of this aniso group in the info_list.
-            // Entries for the same group are contiguous: the first entry
-            // with matching group_id gives the base, and axis b is at base+b.
-            if let Some(gid) = info.aniso_group_id {
-                let base = info_list
-                    .iter()
-                    .position(|e| e.aniso_group_id == Some(gid))
+        if let Some(cross_designs) = aniso_cross_designs {
+            // Use the base index of this aniso group in the original info_list.
+            // Entries for the same group are contiguous: the first index in the
+            // group gives the base, and axis b is at base+b.
+            if let Some(gid) = aniso_group_id {
+                let base = group_indices_map
+                    .get(&gid)
+                    .and_then(|v| v.first().copied())
                     .unwrap_or(i);
-                for &(b_axis, ref cross_mat) in cross_designs {
+                for (b_axis, cross_mat) in cross_designs.into_iter() {
                     let j = base + b_axis;
                     if j < log_kappa_dim {
-                        xsecond[j] = Some(if let Some(ref op) = info.implicit_operator {
+                        xsecond[j] = Some(if let Some(ref op) = implicit_operator {
                             crate::estimate::reml::HyperDesignDerivative::from_implicit(
                                 op.clone(),
-                                ImplicitDerivLevel::SecondCross(info.implicit_axis, b_axis),
-                                info.global_range.clone(),
-                                info.total_p,
+                                ImplicitDerivLevel::SecondCross(implicit_axis, b_axis),
+                                global_range.clone(),
+                                total_p,
                             )
                         } else {
                             crate::estimate::reml::HyperDesignDerivative::from_embedded(
-                                cross_mat.clone(),
-                                info.global_range.clone(),
-                                info.total_p,
+                                cross_mat,
+                                global_range.clone(),
+                                total_p,
                             )
                         });
                     }
                 }
             }
         }
-        let s_components = info
-            .penalty_indices
+        let s_components = penalty_indices
             .iter()
             .copied()
-            .zip(info.s_psi_components_local.iter().map(|local| {
+            .zip(s_psi_components_local.into_iter().map(|local| {
                 crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                    local.clone(),
-                    info.global_range.clone(),
-                    info.total_p,
+                    local,
+                    global_range.clone(),
+                    total_p,
                 )
             }))
             .collect::<Vec<_>>();
-        let s2_components = info
-            .penalty_indices
+        let s2_components = penalty_indices
             .iter()
             .copied()
-            .zip(info.s_psi_psi_components_local.iter().map(|local| {
+            .zip(s_psi_psi_components_local.into_iter().map(|local| {
                 crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                    local.clone(),
-                    info.global_range.clone(),
-                    info.total_p,
+                    local,
+                    global_range.clone(),
+                    total_p,
                 )
             }))
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
         let mut penaltysecond_partner_indices: Option<Vec<usize>> = None;
-        let penaltysecond_component_provider = if let (Some(provider), Some(gid)) = (
-            info.aniso_cross_penalty_provider.clone(),
-            info.aniso_group_id,
-        ) {
-            let group_indices = info_list
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, entry)| (entry.aniso_group_id == Some(gid)).then_some(idx))
-                .collect::<Vec<_>>();
-            let axis_in_group =
-                group_indices
-                    .iter()
-                    .position(|&idx| idx == i)
-                    .ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "missing spatial hyper axis {} in anisotropy group {}",
-                            i, gid
+        let penaltysecond_component_provider =
+            if let (Some(provider), Some(gid)) = (aniso_cross_penalty_provider, aniso_group_id) {
+                let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
+                let axis_in_group =
+                    group_indices
+                        .iter()
+                        .position(|&idx| idx == i)
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(format!(
+                                "missing spatial hyper axis {} in anisotropy group {}",
+                                i, gid
+                            ))
+                        })?;
+                penaltysecond_partner_indices = Some(
+                    group_indices
+                        .iter()
+                        .copied()
+                        .filter(|&idx| idx != i)
+                        .collect(),
+                );
+                let penalty_indices_inner = penalty_indices.clone();
+                let global_range_inner = global_range.clone();
+                let total_p_inner = total_p;
+                let group_indices_inner = group_indices;
+                Some(std::sync::Arc::new(
+                    move |j: usize| -> Result<
+                        Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
+                        EstimationError,
+                    > {
+                        let Some(other_axis_in_group) =
+                            group_indices_inner.iter().position(|&idx| idx == j)
+                        else {
+                            return Ok(None);
+                        };
+                        if other_axis_in_group == axis_in_group {
+                            return Ok(None);
+                        }
+                        let cross_pens = provider(other_axis_in_group)?;
+                        if cross_pens.is_empty() {
+                            return Ok(None);
+                        }
+                        Ok(Some(
+                            penalty_indices_inner
+                                .iter()
+                                .copied()
+                                .zip(cross_pens.into_iter().map(|local| {
+                                    crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                                        local,
+                                        global_range_inner.clone(),
+                                        total_p_inner,
+                                    )
+                                }))
+                                .map(|(penalty_index, matrix)| {
+                                    crate::estimate::reml::PenaltyDerivativeComponent {
+                                        penalty_index,
+                                        matrix,
+                                    }
+                                })
+                                .collect(),
                         ))
-                    })?;
-            let penalty_indices = info.penalty_indices.clone();
-            let global_range = info.global_range.clone();
-            let total_p = info.total_p;
-            penaltysecond_partner_indices = Some(
-                group_indices
-                    .iter()
-                    .copied()
-                    .filter(|&idx| idx != i)
-                    .collect(),
-            );
-            Some(std::sync::Arc::new(
-                move |j: usize| -> Result<
-                    Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
-                    EstimationError,
-                > {
-                    let Some(other_axis_in_group) = group_indices.iter().position(|&idx| idx == j)
-                    else {
-                        return Ok(None);
-                    };
-                    if other_axis_in_group == axis_in_group {
-                        return Ok(None);
-                    }
-                    let cross_pens = provider(other_axis_in_group)?;
-                    if cross_pens.is_empty() {
-                        return Ok(None);
-                    }
-                    Ok(Some(
-                        penalty_indices
-                            .iter()
-                            .copied()
-                            .zip(cross_pens.into_iter().map(|local| {
-                                crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                                    local,
-                                    global_range.clone(),
-                                    total_p,
-                                )
-                            }))
-                            .map(|(penalty_index, matrix)| {
-                                crate::estimate::reml::PenaltyDerivativeComponent {
-                                    penalty_index,
-                                    matrix,
-                                }
-                            })
-                            .collect(),
-                    ))
-                },
-            )
-                as std::sync::Arc<
-                    dyn Fn(
-                            usize,
-                        ) -> Result<
-                            Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
-                            EstimationError,
-                        > + Send
-                        + Sync
-                        + 'static,
-                >)
-        } else {
-            None
-        };
+                    },
+                )
+                    as std::sync::Arc<
+                        dyn Fn(
+                                usize,
+                            ) -> Result<
+                                Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
+                                EstimationError,
+                            > + Send
+                            + Sync
+                            + 'static,
+                    >)
+            } else {
+                None
+            };
         // First derivative: use implicit operator when available to avoid
         // storing dense (n x p) matrices for all D axes simultaneously.
-        let x_first_hyper = if let Some(ref op) = info.implicit_operator {
+        let x_first_hyper = if let Some(ref op) = implicit_operator {
             crate::estimate::reml::HyperDesignDerivative::from_implicit(
                 op.clone(),
-                ImplicitDerivLevel::First(info.implicit_axis),
-                info.global_range.clone(),
-                info.total_p,
+                ImplicitDerivLevel::First(implicit_axis),
+                global_range.clone(),
+                total_p,
             )
         } else {
             crate::estimate::reml::HyperDesignDerivative::from_embedded(
-                info.x_psi_local.clone(),
-                info.global_range.clone(),
-                info.total_p,
+                x_psi_local,
+                global_range.clone(),
+                total_p,
             )
         };
         let mut dir = DirectionalHyperParam::new_compact(
