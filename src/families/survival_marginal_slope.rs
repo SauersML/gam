@@ -12586,7 +12586,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        if cost_gated_outer_order(specs) == ExactOuterDerivativeOrder::First {
+        if cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
+            == ExactOuterDerivativeOrder::First
+        {
             return ExactOuterDerivativeOrder::First;
         }
         survival_row_work_order(self, specs)

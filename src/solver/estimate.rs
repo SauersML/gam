@@ -455,11 +455,24 @@ fn map_hessian_to_original_basis(
     Ok(tmp.dot(&qs.t()))
 }
 
+/// Default inner P-IRLS tolerance floor.
+///
+/// The inner Newton iteration certifies the coefficient mode against this
+/// (scale-aware) tolerance independently of the outer REML tolerance. Coupling
+/// the two collapses two unrelated convergence concepts: when a user dials the
+/// outer tolerance up to e.g. 1e-3 to make the smoothing-parameter search
+/// coarser, the inner solve becomes coarse too, returning betas whose
+/// stationarity residual is ~1e-3·scale rather than the floating-point noise
+/// floor. Outer derivatives then read those imprecise betas as if they were
+/// the true mode and accumulate error. Keeping the inner floor at 1e-6 lets
+/// the outer loop relax without contaminating the coefficient certificate.
+pub(crate) const PIRLS_INNER_TOLERANCE_FLOOR: f64 = 1e-6;
+
 #[derive(Clone)]
 pub(crate) struct RemlConfig {
     likelihood: GlmLikelihoodSpec,
     link_kind: InverseLink,
-    convergence_tolerance: f64,
+    pirls_convergence_tolerance: f64,
     max_iterations: usize,
     reml_convergence_tolerance: f64,
     firth_bias_reduction: bool,
@@ -467,10 +480,18 @@ pub(crate) struct RemlConfig {
 
 impl RemlConfig {
     fn external(likelihood: GlmLikelihoodSpec, reml_tol: f64, firth_bias_reduction: bool) -> Self {
+        // Inner P-IRLS certifies the coefficient mode against
+        // `pirls_convergence_tolerance`; the outer REML iteration certifies
+        // the smoothing-parameter optimum against `reml_convergence_tolerance`.
+        // These are different concepts and must not be coupled. The inner
+        // tolerance is at most the outer tolerance (so a user who *tightens*
+        // the outer also tightens the inner), but never coarser than the
+        // floor — a coarse outer must not silently pollute the inner mode.
+        let pirls_tol = reml_tol.min(PIRLS_INNER_TOLERANCE_FLOOR);
         Self {
             likelihood,
             link_kind: InverseLink::Standard(likelihood.link_function()),
-            convergence_tolerance: reml_tol,
+            pirls_convergence_tolerance: pirls_tol,
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
@@ -483,6 +504,15 @@ impl RemlConfig {
         self
     }
 
+    /// Override the inner P-IRLS tolerance independently of the outer REML
+    /// tolerance. The provided value is used directly (no flooring) so that
+    /// callers who genuinely want a tight inner certificate can request one.
+    #[allow(dead_code)]
+    pub(crate) fn with_pirls_tolerance(mut self, pirls_tol: f64) -> Self {
+        self.pirls_convergence_tolerance = pirls_tol;
+        self
+    }
+
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
@@ -492,7 +522,7 @@ impl RemlConfig {
             likelihood: self.likelihood,
             link_kind: self.link_kind.clone(),
             max_iterations: self.max_iterations,
-            convergence_tolerance: self.convergence_tolerance,
+            convergence_tolerance: self.pirls_convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
         }
     }
@@ -1716,6 +1746,18 @@ where
         use crate::solver::outer_strategy::{Derivative, OuterEvalOrder, OuterProblem};
 
         let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
+        // Estimate the FLOP cost of one dense exact Hessian assembly so the
+        // outer planner can divert to gradient-only optimization when the
+        // dense path would dominate wall-clock time.  For a standard GLM the
+        // weighted Gram XᵀWX has work n·p² (one weighted outer product per
+        // observation, p²/2 unique entries); we use the un-halved form as a
+        // conservative upper bound that absorbs symmetrization and any
+        // family-specific multipliers.  The threshold inside
+        // `OuterProblem::with_dense_hessian_work_hint` decides when this
+        // crosses into "BFGS+gradient is faster end-to-end" territory.
+        let n_obs = reml_state.x().nrows();
+        let p_total = reml_state.x().ncols();
+        let dense_hessian_work = (n_obs as f64) * (p_total as f64) * (p_total as f64);
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
@@ -1730,7 +1772,8 @@ where
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config.clone())
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
-            .with_rho_bound(crate::estimate::RHO_BOUND);
+            .with_rho_bound(crate::estimate::RHO_BOUND)
+            .with_dense_hessian_work_hint(dense_hessian_work);
         let problem = if let Some(ref h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
         } else {

@@ -1251,8 +1251,14 @@ impl WorkingModelSurvival {
 
         h += &self.derivative_xt_diag_x(&w_event_outer);
 
+        // Norm of the unpenalized score, captured before adding the penalty
+        // and ridge contributions, for the scale-invariant convergence
+        // certificate (||score||_2 + ||S*beta||_2 (+ ridge*||beta||_2)).
+        let score_norm = grad.iter().map(|v| v * v).sum::<f64>().sqrt();
+
         let penaltygrad = self.penalties.gradient(beta);
         let penalty_dev = self.penalties.deviance(beta);
+        let penaltygrad_norm = penaltygrad.iter().map(|v| v * v).sum::<f64>().sqrt();
 
         let mut totalgrad = grad;
         totalgrad += &penaltygrad;
@@ -1268,6 +1274,8 @@ impl WorkingModelSurvival {
         //   grad += ridge * beta,  Hess += ridge * I
         // which correspond to 0.5 * ridge * ||beta||^2.
         let ridge_penalty = 0.5 * ridge_used * beta.dot(beta);
+        let ridge_grad_norm =
+            ridge_used * beta.iter().map(|v| v * v).sum::<f64>().sqrt();
 
         let log_likelihood = -nll;
         let deviance = 2.0 * nll;
@@ -1282,6 +1290,7 @@ impl WorkingModelSurvival {
             firth: crate::pirls::FirthDiagnostics::Inactive,
             ridge_used,
             hessian_curvature: crate::pirls::HessianCurvatureKind::Observed,
+            gradient_natural_scale: score_norm + penaltygrad_norm + ridge_grad_norm,
         })
     }
 

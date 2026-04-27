@@ -720,6 +720,13 @@ pub struct WorkingState {
     // 0.5 * ridge * ||beta||^2 on the log-likelihood scale.
     pub ridge_used: f64,
     pub hessian_curvature: HessianCurvatureKind,
+    // Natural scale of the penalized gradient, used to form a scale-invariant
+    // KKT certificate.  Equal to ||X'(weighted_residual)||_2 + ||S*beta||_2
+    // (+ ridge*||beta||_2 when a stabilizing ridge is active).  Under
+    // stochastic noise the score component scales as O(sqrt(n)), so an
+    // absolute ||g||_2 < tol test rejects fits whose normalized stationarity
+    // residual is already negligible. Convergence uses ||g||_2 / (1 + this).
+    pub gradient_natural_scale: f64,
 }
 
 impl WorkingState {
@@ -727,6 +734,23 @@ impl WorkingState {
     pub fn jeffreys_logdet(&self) -> Option<f64> {
         self.firth.jeffreys_logdet()
     }
+
+    /// Scale-invariant relative gradient residual.
+    ///
+    /// Returns ||g||_2 / (1 + ||score||_2 + ||S*beta||_2 + ridge*||beta||_2).
+    /// `g_norm` is the projected/constrained stationarity residual in the
+    /// current PIRLS basis; the denominator is the natural magnitude of the
+    /// penalized gradient and is invariant under uniform rescaling of the
+    /// objective.
+    #[inline]
+    pub fn relative_gradient_norm(&self, g_norm: f64) -> f64 {
+        g_norm / (1.0 + self.gradient_natural_scale)
+    }
+}
+
+#[inline]
+fn array1_l2_norm(v: &Array1<f64>) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -1836,7 +1860,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 *wr = residual * wi;
             });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
+        // Score norm ||X' (weighted residual)||_2 — captured before adding the
+        // penalty contribution so the natural gradient scale can be assembled
+        // for the scale-invariant convergence certificate.
+        let score_norm = array1_l2_norm(&gradient);
         let s_beta = self.penalty.apply(beta.as_ref());
+        let s_beta_norm = array1_l2_norm(&s_beta);
         gradient += &s_beta;
         let (hessian_weights, hessian_c, hessian_d, hessian_curvature) =
             self.hessian_curvature_arrays(requested_curvature)?;
@@ -1857,9 +1886,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             self.coordinate_design,
             WorkingCoordinateDesign::OriginalSparseNative
         ) {
-            let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
-                self.sparse_penalized_hessian(&solver_weights, ridge)
-            })?;
+            // The SPD-check factor is discarded here: the downstream consumer
+            // is the LM Newton step, which always factorizes
+            // (H + loop_lambda · I) with a non-zero loop_lambda (initial value
+            // 1e-6), so it sees a different matrix.
+            let (h_sparse, _factor, ridge_used) =
+                ensure_sparse_positive_definitewithridge(|ridge| {
+                    self.sparse_penalized_hessian(&solver_weights, ridge)
+                })?;
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
         } else {
             let mut penalized_hessian = self.penalized_hessian(&solver_weights)?;
@@ -1890,13 +1924,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         );
 
         let mut penalty_term = beta.as_ref().dot(&s_beta);
+        let mut ridge_grad_norm = 0.0;
         if ridge_used > 0.0 {
             let ridge_penalty = ridge_used * beta.as_ref().dot(beta.as_ref());
             penalty_term += ridge_penalty;
             gradient.zip_mut_with(beta.as_ref(), |g, &b| *g += ridge_used * b);
+            ridge_grad_norm = ridge_used * array1_l2_norm(beta.as_ref());
         }
 
         self.last_penalty_term = penalty_term;
+        let gradient_natural_scale = score_norm + s_beta_norm + ridge_grad_norm;
 
         Ok(WorkingState {
             eta: LinearPredictor::new(std::mem::replace(
@@ -1915,6 +1952,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             firth,
             ridge_used,
             hessian_curvature,
+            gradient_natural_scale,
         })
     }
 
@@ -1938,20 +1976,52 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
     }
 }
 
+/// Backend strategy for sparse XᵀWX assembly.
+///
+/// At small p, a row-by-row dense outer-product accumulator
+/// (cost ≈ Σᵢ nnz(rowᵢ)²) is faster than sparse SpGEMM and parallelizes
+/// trivially via per-thread dense p×p accumulators. The crossover point is
+/// roughly when a dense p×p buffer no longer fits in L2/L3.
+enum XtWxBackend {
+    /// Row-outer-product into a dense p×p buffer; scattered into the symbolic
+    /// XᵀX pattern at the end of `compute_numeric`. Chosen when p is small
+    /// enough that the dense buffer is L2/L3-resident.
+    DenseOuter {
+        /// Reusable dense p×p accumulator (row-major; the inner loop writes
+        /// `dense[[j, k]] += w·xⱼ·xₖ` so contiguous-k writes are cache-friendly).
+        xtwx_dense: Array2<f64>,
+        par: Par,
+    },
+    /// Sparse SpGEMM via faer's symbolic+numeric pipeline. Used when a dense
+    /// p×p buffer is impractical.
+    SparseSpGemm {
+        wxvalues: Vec<f64>,
+        wx_tvalues: Vec<f64>,
+        info: SparseMatMulInfo,
+        scratch: MemBuffer,
+        par: Par,
+    },
+}
+
+/// Maximum p for which the dense outer-product backend is preferred over
+/// sparse SpGEMM. At p=1024 the dense p×p buffer is 8 MiB, which still fits
+/// comfortably in L3 on most current targets and is large enough that a
+/// per-thread copy used during parallel reduction is acceptable.
+const DENSE_OUTER_MAX_P: usize = 1024;
+
 pub(crate) struct SparseXtWxCache {
     xtwx_symbolic: SymbolicSparseColMat<usize>,
     xtwxvalues: Vec<f64>,
-    wxvalues: Vec<f64>,
-    wx_tvalues: Vec<f64>,
-    info: SparseMatMulInfo,
-    scratch: MemBuffer,
-    par: Par,
     nrows: usize,
     ncols: usize,
     nnz: usize,
     x_col_ptr: Vec<usize>,
     xrow_idx: Vec<usize>,
-    x_t_csc: SparseColMat<usize, f64>, // CSC format of X transpose for matmul
+    /// CSC of Xᵀ. In CSC, column i of Xᵀ stores the nonzeros of row i of X,
+    /// so this doubles as a CSR view of X for row-by-row access in the
+    /// dense-outer path.
+    x_t_csc: SparseColMat<usize, f64>,
+    backend: XtWxBackend,
 }
 
 impl SparseXtWxCache {
@@ -1967,27 +2037,38 @@ impl SparseXtWxCache {
                 EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
             })?;
         let xtwxvalues = vec![0.0; xtwx_symbolic.row_idx().len()];
-        let wxvalues = vec![0.0; x.val().len()];
-        let wx_tvalues = vec![0.0; x_t_csc.val().len()];
-        let par = sparse_xtwx_par(x.ncols());
-        let scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
-            xtwx_symbolic.as_ref(),
-            par,
-        ));
+        let par = sparse_xtwx_par();
+
+        let backend = if x.ncols() <= DENSE_OUTER_MAX_P {
+            XtWxBackend::DenseOuter {
+                xtwx_dense: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                par,
+            }
+        } else {
+            let wxvalues = vec![0.0; x.val().len()];
+            let wx_tvalues = vec![0.0; x_t_csc.val().len()];
+            let scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
+                xtwx_symbolic.as_ref(),
+                par,
+            ));
+            XtWxBackend::SparseSpGemm {
+                wxvalues,
+                wx_tvalues,
+                info,
+                scratch,
+                par,
+            }
+        };
         Ok(Self {
             xtwx_symbolic,
             xtwxvalues,
-            wxvalues,
-            wx_tvalues,
-            info,
-            scratch,
-            par,
             nrows: x.nrows(),
             ncols: x.ncols(),
             nnz: x.val().len(),
             x_col_ptr: x.symbolic().col_ptr().to_vec(),
             xrow_idx: x.symbolic().row_idx().to_vec(),
             x_t_csc,
+            backend,
         })
     }
 
@@ -2012,58 +2093,169 @@ impl SparseXtWxCache {
             )));
         }
 
-        let x_ref = x.as_ref();
-        // Build right factor: sqrt(W) * X (same CSC sparsity pattern as X).
-        for col in 0..self.ncols {
-            let rows = x_ref.row_idx_of_col_raw(col);
-            let xvals = x_ref.val_of_col(col);
-            let range = x_ref.col_range(col);
-            let wxvals = &mut self.wxvalues[range];
-            for ((dst, &src), row) in wxvals.iter_mut().zip(xvals.iter()).zip(rows.iter()) {
-                let w = weights[row.unbound()].max(0.0);
-                *dst = src * w.sqrt();
+        match &mut self.backend {
+            XtWxBackend::DenseOuter { xtwx_dense, par } => {
+                Self::compute_numeric_dense_outer(
+                    &self.x_t_csc,
+                    weights,
+                    self.nrows,
+                    self.ncols,
+                    xtwx_dense,
+                    *par,
+                );
+                // Scatter the dense p×p accumulator into the symbolic XᵀX pattern.
+                // The pattern stores both halves of the symmetric product, so we
+                // simply read each (row, col) from the dense buffer.
+                let col_ptr = self.xtwx_symbolic.col_ptr();
+                let row_idx = self.xtwx_symbolic.row_idx();
+                for col in 0..self.ncols {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        self.xtwxvalues[idx] = xtwx_dense[[row, col]];
+                    }
+                }
+            }
+            XtWxBackend::SparseSpGemm {
+                wxvalues,
+                wx_tvalues,
+                info,
+                scratch,
+                par,
+            } => {
+                let x_ref = x.as_ref();
+                // Build right factor: sqrt(W) * X (same CSC sparsity pattern as X).
+                for col in 0..self.ncols {
+                    let rows = x_ref.row_idx_of_col_raw(col);
+                    let xvals = x_ref.val_of_col(col);
+                    let range = x_ref.col_range(col);
+                    let wxvals = &mut wxvalues[range];
+                    for ((dst, &src), row) in
+                        wxvals.iter_mut().zip(xvals.iter()).zip(rows.iter())
+                    {
+                        let w = weights[row.unbound()].max(0.0);
+                        *dst = src * w.sqrt();
+                    }
+                }
+
+                // Build left factor: (sqrt(W) * X)^T in CSC form, using X^T sparsity.
+                // X^T has columns corresponding to rows of X, so scale each column
+                // by sqrt(wrow).
+                let x_t_ref = self.x_t_csc.as_ref();
+                for col in 0..x_t_ref.ncols() {
+                    let w = weights[col].max(0.0).sqrt();
+                    let x_tvals = x_t_ref.val_of_col(col);
+                    let range = x_t_ref.col_range(col);
+                    let wx_tvals = &mut wx_tvalues[range];
+                    for (dst, &src) in wx_tvals.iter_mut().zip(x_tvals.iter()) {
+                        *dst = src * w;
+                    }
+                }
+
+                let wx_ref = SparseColMatRef::new(x.symbolic(), &wxvalues[..]);
+                let wx_t_ref = SparseColMatRef::new(self.x_t_csc.symbolic(), &wx_tvalues[..]);
+                let mut stack = MemStack::new(scratch);
+                let xtwx_symbolic = self.xtwx_symbolic.as_ref();
+                let xtwxmut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwxvalues);
+                sparse_sparse_matmul_numeric(
+                    xtwxmut,
+                    Accum::Replace,
+                    wx_t_ref,
+                    wx_ref,
+                    1.0,
+                    &*info,
+                    *par,
+                    &mut stack,
+                );
             }
         }
-
-        // Build left factor: (sqrt(W) * X)^T in CSC form, using X^T sparsity.
-        // X^T has columns corresponding to rows of X, so scale each column by sqrt(wrow).
-        let x_t_ref = self.x_t_csc.as_ref();
-        for col in 0..x_t_ref.ncols() {
-            let w = weights[col].max(0.0).sqrt();
-            let x_tvals = x_t_ref.val_of_col(col);
-            let range = x_t_ref.col_range(col);
-            let wx_tvals = &mut self.wx_tvalues[range];
-            for (dst, &src) in wx_tvals.iter_mut().zip(x_tvals.iter()) {
-                *dst = src * w;
-            }
-        }
-
-        let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wxvalues);
-        let wx_t_ref = SparseColMatRef::new(self.x_t_csc.symbolic(), &self.wx_tvalues);
-        let mut stack = MemStack::new(&mut self.scratch);
-        let xtwx_symbolic = self.xtwx_symbolic.as_ref();
-        let xtwxmut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwxvalues);
-        sparse_sparse_matmul_numeric(
-            xtwxmut,
-            Accum::Replace,
-            wx_t_ref,
-            wx_ref,
-            1.0,
-            &self.info,
-            self.par,
-            &mut stack,
-        );
 
         Ok(())
     }
+
+    /// Row-by-row outer-product accumulator for XᵀWX into a dense p×p buffer.
+    ///
+    /// Math: XᵀWX = Σᵢ wᵢ · xᵢ xᵢᵀ where xᵢ is row i of X. For a row with
+    /// nonzero columns C(i) and values v(i), the outer product is supported on
+    /// C(i) × C(i), so the per-row work is |C(i)|², not p². For typical bases
+    /// (B-spline degree d ⇒ |C(i)| ≤ d+1) this is dramatically cheaper than
+    /// either sparse SpGEMM or dense GEMM-on-densified-X.
+    ///
+    /// Parallelism: each worker accumulates into its own p×p buffer; the
+    /// reductions sum the per-thread buffers at the end. Allocation scales with
+    /// the number of rayon work-stealing chunks (≈ number of workers), not n.
+    fn compute_numeric_dense_outer(
+        x_t_csc: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+        n: usize,
+        p: usize,
+        out: &mut Array2<f64>,
+        par: Par,
+    ) {
+        debug_assert_eq!(out.nrows(), p);
+        debug_assert_eq!(out.ncols(), p);
+        out.fill(0.0);
+        if n == 0 || p == 0 {
+            return;
+        }
+
+        let x_t_ref = x_t_csc.as_ref();
+
+        let accumulate_row = |acc: &mut Array2<f64>, i: usize| {
+            let w_i = weights[i].max(0.0);
+            if w_i == 0.0 {
+                return;
+            }
+            let cols = x_t_ref.row_idx_of_col_raw(i);
+            let vals = x_t_ref.val_of_col(i);
+            let nnz_i = cols.len();
+            for jj in 0..nnz_i {
+                let j = cols[jj].unbound();
+                let wvj = w_i * vals[jj];
+                let mut row_j = acc.row_mut(j);
+                let row_slice = row_j
+                    .as_slice_mut()
+                    .expect("dense XᵀWX buffer is row-major and contiguous");
+                for kk in 0..nnz_i {
+                    let k = cols[kk].unbound();
+                    row_slice[k] += wvj * vals[kk];
+                }
+            }
+        };
+
+        if matches!(par, Par::Seq) {
+            for i in 0..n {
+                accumulate_row(out, i);
+            }
+        } else {
+            // Per-worker dense accumulators reduced into one. Rayon's `fold`
+            // calls the seed once per work-stealing chunk, not per element, so
+            // allocation cost is amortized to ≈ #threads.
+            let combined = (0..n)
+                .into_par_iter()
+                .fold(
+                    || Array2::<f64>::zeros((p, p)),
+                    |mut acc, i| {
+                        accumulate_row(&mut acc, i);
+                        acc
+                    },
+                )
+                .reduce_with(|a, b| a + b)
+                .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
+            *out = combined;
+        }
+    }
 }
 
-fn sparse_xtwx_par(ncols: usize) -> Par {
-    if ncols < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    }
+fn sparse_xtwx_par() -> Par {
+    // Always hand the global parallelism handle to faer's SpGEMM. The previous
+    // rule, `ncols < 128 ⇒ Par::Seq`, forced the dominant inner-loop operation
+    // onto a single thread for the Matérn pilot (n=10000, p=101) — well below
+    // the cutoff in p but with plenty of work overall. Faer's matmul makes its
+    // own small-problem decision internally, so a hand-rolled dimension gate
+    // here only suppresses real parallelism without adding precision.
+    get_global_parallelism()
 }
 
 fn compute_jeffreys_pirls_diagnostics_sparse(
@@ -2336,23 +2528,38 @@ pub(crate) fn sparse_reml_penalized_hessian(
     workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
 }
 
+/// Assemble a sparse SPD Hessian with adaptive diagonal ridge, returning the
+/// matrix, its successful Cholesky factor, and the ridge that was needed.
+///
+/// Returning the factor avoids the previous double-factorization where the SPD
+/// check would factor the matrix and discard the factor, then the caller would
+/// immediately call `factorize_sparse_spd` again on the same matrix to solve.
 fn ensure_sparse_positive_definitewithridge<F>(
     mut assemble: F,
-) -> Result<(SparseColMat<usize, f64>, f64), EstimationError>
+) -> Result<
+    (
+        SparseColMat<usize, f64>,
+        crate::linalg::sparse_exact::SparseExactFactor,
+        f64,
+    ),
+    EstimationError,
+>
 where
     F: FnMut(f64) -> Result<SparseColMat<usize, f64>, EstimationError>,
 {
     let mut ridge = 0.0_f64;
     for _ in 0..16 {
         let h = assemble(ridge)?;
-        if factorize_sparse_spd(&h).is_ok() {
-            return Ok((h, ridge));
+        match factorize_sparse_spd(&h) {
+            Ok(factor) => return Ok((h, factor, ridge)),
+            Err(_) => {
+                ridge = if ridge == 0.0 {
+                    FIXED_STABILIZATION_RIDGE
+                } else {
+                    ridge * 10.0
+                };
+            }
         }
-        ridge = if ridge == 0.0 {
-            FIXED_STABILIZATION_RIDGE
-        } else {
-            ridge * 10.0
-        };
     }
     Err(EstimationError::HessianNotPositiveDefinite {
         min_eigenvalue: f64::NAN,
@@ -3040,7 +3247,23 @@ where
     let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
     let lambda_factor = 10.0;
     let lm_max_attempts = options.max_step_halving.max(1);
-    let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 10.0;
+    // Scale-invariant KKT certificate: the absolute test ‖g‖ < τ is not scale
+    // invariant — F and cF share an optimum but ‖∇(cF)‖ = c‖∇F‖, so the same
+    // τ classifies one as converged and the other as not. ‖g‖₂ also grows as
+    // O(√n) for standardized columns (the score is a sum of n contributions),
+    // so an absolute τ becomes systematically too tight at large n. We compare
+    // the projected gradient against a problem-size–normalized tolerance
+    //   ‖g‖ ≤ τ · √n · max(1, √p)
+    // so τ retains its advertised meaning at biobank scale.
+    let p_dim = beta.as_ref().len();
+    let kkt_scale_for = |n: usize| -> f64 {
+        let n_root = (n.max(1) as f64).sqrt();
+        let p_root = (p_dim as f64).sqrt().max(1.0);
+        n_root * p_root
+    };
+    let near_stationary_tol_for = |n: usize| -> f64 {
+        options.convergence_tolerance.max(1e-6) * 10.0 * kkt_scale_for(n)
+    };
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -3395,21 +3618,67 @@ where
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
                         // redefine the objective's stabilization ridge.
+                        let n_eff_for_kkt = accepted_state.eta.len();
+                        // Capture the data-driven natural scale before moving
+                        // accepted_state into final_state.  The natural scale
+                        // is ||X'(weighted_residual)||_2 + ||S*beta||_2
+                        // (+ ridge*||beta||_2), which gives the scale-invariant
+                        // certificate ||g||_2 / (1 + scale) ≤ τ.  This is
+                        // strictly tighter than the dimension-only kkt_scale
+                        // bound when the data are well-scaled and strictly
+                        // looser when the columns of X are not standardized,
+                        // so we accept under either bound.
+                        let natural_scale = accepted_state.gradient_natural_scale;
                         final_state = Some(accepted_state);
                         let deviance_scale = current_penalized
                             .abs()
                             .max(candidate_penalized.abs())
                             .max(1.0);
-                        let grad_tol = options.convergence_tolerance; // Absolute norm check
+                        // Scale-invariant projected-gradient KKT tolerance.
+                        let grad_tol_dim =
+                            options.convergence_tolerance * kkt_scale_for(n_eff_for_kkt);
+                        let relative_grad = convergence_grad_norm / (1.0 + natural_scale);
                         let dev_tol = options.convergence_tolerance * deviance_scale;
+                        let near_stationary_tol = near_stationary_tol_for(n_eff_for_kkt);
+                        let near_stationary_relative =
+                            options.convergence_tolerance.max(1e-6) * 10.0;
 
-                        if convergence_grad_norm < grad_tol {
+                        // Newton-decrement acceptance.  At the pre-step iterate
+                        // the squared decrement is λ_N² = gᵀH⁻¹g, and the
+                        // direction we just solved is d ≈ -H_reg⁻¹g, so
+                        //     lin = g·d ≈ -gᵀH_reg⁻¹g  ⇒  λ_N² ≈ −lin.
+                        // The damped Hessian H_reg = H + λ_lm·I differs from H
+                        // by O(λ_lm), which is small near a minimum (`lambda`
+                        // begins at 1e-6 and only grows on rejected steps).
+                        // The scale-invariant criterion
+                        //     λ_N² / (1 + |F(β)|) ≤ τ²
+                        // is the textbook Newton stopping rule: ½λ_N² is the
+                        // predicted decrease in F from this iterate, so when it
+                        // falls below the objective's natural rounding scale the
+                        // step is below floating-point noise and further inner
+                        // iterations cannot improve the certificate. This is an
+                        // *additional* acceptance — it never weakens the
+                        // gradient-norm tests, only certifies convergence in
+                        // problems where ‖g‖ is intrinsically large (e.g. very
+                        // ill-conditioned designs) but H⁻¹g is already tiny.
+                        let f_scale = 1.0 + current_penalized.abs().max(1.0);
+                        let newton_decrement_sq = (-lin).max(0.0);
+                        let nd_threshold = options.convergence_tolerance
+                            * options.convergence_tolerance
+                            * f_scale;
+                        let nd_pass = newton_decrement_sq <= nd_threshold;
+
+                        let kkt_pass = convergence_grad_norm < grad_tol_dim
+                            || relative_grad < options.convergence_tolerance
+                            || nd_pass;
+
+                        if kkt_pass {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
                         if deviance_change.abs() < dev_tol
                             && deviance_change >= 0.0
-                            && convergence_grad_norm < grad_tol
+                            && kkt_pass
                         {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
@@ -3421,7 +3690,8 @@ where
                         // strict KKT tolerance has actually been met.
                         if deviance_change.abs() < dev_tol * 0.01
                             && deviance_change >= 0.0
-                            && convergence_grad_norm <= near_stationary_tol
+                            && (convergence_grad_norm <= near_stationary_tol
+                                || relative_grad <= near_stationary_relative)
                         {
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
@@ -3454,10 +3724,16 @@ where
                         );
                         let projected_grad = stategrad_norm;
                         let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
+                        let near_stationary_tol = near_stationary_tol_for(state.eta.len());
+                        let relative_grad = state.relative_gradient_norm(projected_grad);
+                        let near_stationary_relative =
+                            options.convergence_tolerance.max(1e-6) * 10.0;
+                        let near_stationary_pass = projected_grad <= near_stationary_tol
+                            || relative_grad <= near_stationary_relative;
 
                         // Near stationarity: the screening rejected all candidates, but the
                         // gradient is tiny. Treat this as converged rather than escalating damping.
-                        if projected_grad <= near_stationary_tol
+                        if near_stationary_pass
                             && predicted_reduction.abs() <= reduction_noise_floor
                         {
                             lastgradient_norm = stategrad_norm;
@@ -3475,7 +3751,7 @@ where
                             lastgradient_norm = stategrad_norm;
                             // Only accept "stalled but valid" when we are near stationarity.
                             // Otherwise report MaxIterationsReached so callers can fail fast.
-                            if projected_grad <= near_stationary_tol {
+                            if near_stationary_pass {
                                 status = PirlsStatus::StalledAtValidMinimum;
                             } else {
                                 // Surface what actually exhausted: damping reached its
@@ -3573,9 +3849,17 @@ where
     if status.is_failed_max_iterations() {
         let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
         let scaled_dev_tol = options.convergence_tolerance * objective_scale;
-        if final_projected_grad < options.convergence_tolerance {
+        let final_kkt_scale = kkt_scale_for(state.eta.len());
+        let final_near_stationary_tol = near_stationary_tol_for(state.eta.len());
+        let final_relative_grad = state.relative_gradient_norm(final_projected_grad);
+        let final_near_stationary_relative =
+            options.convergence_tolerance.max(1e-6) * 10.0;
+        if final_projected_grad < options.convergence_tolerance * final_kkt_scale
+            || final_relative_grad < options.convergence_tolerance
+        {
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if final_projected_grad <= near_stationary_tol
+        } else if (final_projected_grad <= final_near_stationary_tol
+            || final_relative_grad <= final_near_stationary_relative)
             && last_deviance_change.abs() < scaled_dev_tol
         {
             // The objective has plateaued and the projected gradient is
@@ -4540,7 +4824,9 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             .as_ref()
             .map(|transform| transform.apply_transpose(&xt_wr))
             .unwrap_or(xt_wr);
+        let score_norm = array1_l2_norm(&gradient_data);
         let s_beta = penalty_active.apply(beta_transformed.as_ref());
+        let s_beta_norm = array1_l2_norm(&s_beta);
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
@@ -4553,11 +4839,13 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         } else {
             penalized_hessian.clone()
         };
+        let mut ridge_grad_norm = 0.0;
         if ridge_used > 0.0 {
             let ridge_penalty =
                 ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
             penalty_term += ridge_penalty;
             gradient += &beta_transformed.as_ref().mapv(|v| ridge_used * v);
+            ridge_grad_norm = ridge_used * array1_l2_norm(beta_transformed.as_ref());
         }
 
         let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -4576,6 +4864,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             firth: FirthDiagnostics::Inactive,
             ridge_used,
             hessian_curvature: HessianCurvatureKind::Fisher,
+            gradient_natural_scale: score_norm + s_beta_norm + ridge_grad_norm,
         };
 
         let working_summary = WorkingModelPirlsResult {
@@ -4768,8 +5057,16 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
+        // Near-stationarity in the dual sense: either the absolute residual
+        // is tiny, or its scale-invariant counterpart ‖g‖ / (1 + ‖score‖ +
+        // ‖S β‖) is. The latter is required at biobank n where the absolute
+        // test is systematically too tight.
+        let absolute_tol = options.convergence_tolerance.max(1e-6) * 10.0;
+        let relative_grad = working_summary
+            .state
+            .relative_gradient_norm(working_summary.lastgradient_norm);
         let grad_ok =
-            working_summary.lastgradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
+            working_summary.lastgradient_norm <= absolute_tol || relative_grad <= absolute_tol;
         if (working_summary.last_deviance_change.abs() <= dev_tol
             || working_summary.last_step_size <= step_floor)
             && grad_ok
@@ -4784,8 +5081,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
+        let absolute_tol = options.convergence_tolerance.max(1e-6) * 10.0;
+        let relative_grad = working_summary
+            .state
+            .relative_gradient_norm(working_summary.lastgradient_norm);
         let grad_ok =
-            working_summary.lastgradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
+            working_summary.lastgradient_norm <= absolute_tol || relative_grad <= absolute_tol;
         if (working_summary.last_deviance_change.abs() <= dev_tol
             || working_summary.last_step_size <= step_floor)
             && grad_ok
@@ -4936,20 +5237,23 @@ fn solve_penalized_least_squares_implicit(
             };
             let weights_owned = weights.to_owned();
 
-            // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I
-            let (h_sparse, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
-                let ridge = if ridge == 0.0 {
-                    FIXED_STABILIZATION_RIDGE
-                } else {
-                    ridge
-                };
-                workspace.assemble_sparse_penalized_hessian(
-                    x_sparse,
-                    &weights_owned,
-                    s_transformed,
-                    ridge,
-                )
-            })?;
+            // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I.
+            //    The Cholesky factor is reused from the SPD check so we avoid
+            //    factorizing the same matrix twice.
+            let (h_sparse, factor, ridge_used) =
+                ensure_sparse_positive_definitewithridge(|ridge| {
+                    let ridge = if ridge == 0.0 {
+                        FIXED_STABILIZATION_RIDGE
+                    } else {
+                        ridge
+                    };
+                    workspace.assemble_sparse_penalized_hessian(
+                        x_sparse,
+                        &weights_owned,
+                        s_transformed,
+                        ridge,
+                    )
+                })?;
 
             // 2. RHS = X'W(z - offset)
             let mut wz = z.to_owned();
@@ -4957,8 +5261,7 @@ fn solve_penalized_least_squares_implicit(
             wz *= &weights_owned;
             let rhs = x_original.transpose_vector_multiply(&wz);
 
-            // 3. Sparse Cholesky solve
-            let factor = factorize_sparse_spd(&h_sparse)?;
+            // 3. Sparse Cholesky solve (factor reused from step 1)
             let betavec = solve_sparse_spd(&factor, &rhs)?;
 
             // 4. EDF via sparse factorization
@@ -8068,6 +8371,7 @@ mod root_cause_tests {
             firth: FirthDiagnostics::Inactive,
             ridge_used: 0.0,
             hessian_curvature: curvature,
+            gradient_natural_scale: 0.0,
         }
     }
 
