@@ -2249,8 +2249,9 @@ impl OuterProblem {
     fn capability(&self) -> OuterCapability {
         // Cost-driven gradient-only routing fires when *either* cost model
         // crosses its threshold:
-        //   - per-inner-solve cost (n·p²)  via `dense_hessian_work_too_large`
-        //   - aggregate Hessian-pair cost (k²·n·p²) via the second helper
+        //   - per-inner-solve cost (n·p²) via `dense_hessian_work_too_large`
+        //   - aggregate Hessian-assembly cost (k·n·p² + k²·p²) via the
+        //     second helper
         //
         // BUT — when the family produces an Hv operator instead of a dense
         // Hessian, ARC routes through `run_operator_trust_region` and the
@@ -2373,10 +2374,10 @@ impl OuterProblem {
         // dominating wall-clock time. Log the work estimate alongside the
         // routing decision so the user can attribute "ARC -> BFGS" downgrades
         // to the cost model rather than a mystery heuristic. Both the
-        // per-inner-solve hint (n·p²) and the aggregate Hessian-pair hint
-        // (k²·n·p²) are surfaced when set, along with whether the matrix-
-        // free Hv-operator path will absorb the cost (in which case ARC
-        // stays even with a high cost estimate).
+        // per-inner-solve hint (n·p²) and the aggregate Hessian-assembly
+        // hint (k·n·p² + k²·p²) are surfaced when set, along with whether
+        // the matrix-free Hv-operator path will absorb the cost (in which
+        // case ARC stays even with a high cost estimate).
         if self.dense_hessian_work_hint.is_some()
             || self.aggregate_hessian_pair_work_hint.is_some()
         {
@@ -3626,8 +3627,8 @@ mod tests {
     #[test]
     fn outer_problem_matrix_free_suppresses_aggregate_work_downgrade() {
         // Biobank-scale standard-GAM dimensions trigger the aggregate
-        // k²·n·p² check (n=320 000, p=65, k=6 ⇒ 4.9e10 ≫ 5e9), but
-        // matrix-free availability suppresses the cost-driven downgrade.
+        // k·n·p² + k²·p² check (n=320K, p=65, k=6 ⇒ ≈ 8.1·10⁹ > 5·10⁹),
+        // but matrix-free availability suppresses the cost-driven downgrade.
         let problem = OuterProblem::new(6)
             .with_gradient(Derivative::Analytic)
             .with_hessian(Derivative::Analytic)
