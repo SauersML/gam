@@ -3589,8 +3589,7 @@ where
             // is the same saturated boundary class as separated binomial fits:
             // extra Newton work only re-tries the clipped boundary.
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if final_projected_grad
-            <= options.convergence_tolerance.max(1e-6) * objective_scale
+        } else if final_projected_grad <= options.convergence_tolerance.max(1e-6) * objective_scale
             && last_deviance_change.abs() < scaled_dev_tol * 0.1
             && last_deviance_change >= 0.0
         {
