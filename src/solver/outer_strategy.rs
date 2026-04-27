@@ -3213,6 +3213,67 @@ mod tests {
     }
 
     #[test]
+    fn outer_problem_low_work_hint_keeps_arc() {
+        // n=10⁴, p=30 ⇒ n·p² = 9·10⁶, well under the 5·10⁹ threshold.
+        // The planner must stay on ARC + analytic Hessian.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_dense_hessian_work_hint(9.0e6);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn outer_problem_high_work_hint_downgrades_to_bfgs() {
+        // n=3·10⁵, p=300 ⇒ n·p² = 2.7·10¹⁰, above the 5·10⁹ threshold.
+        // The planner must auto-route Analytic+Analytic to BFGS+BfgsApprox
+        // because each ARC iteration's dense Hessian assembly would dominate
+        // wall-clock time at this scale.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_dense_hessian_work_hint(2.7e10);
+        let cap = problem.capability();
+        assert!(cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn outer_problem_explicit_prefer_gradient_only_overrides_low_work_hint() {
+        // Even when the work-cost says ARC is fine, an explicit
+        // `with_prefer_gradient_only(true)` from the caller wins.
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic)
+            .with_dense_hessian_work_hint(1.0)
+            .with_prefer_gradient_only(true);
+        let cap = problem.capability();
+        assert!(cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+    }
+
+    #[test]
+    fn outer_problem_no_work_hint_preserves_default_arc() {
+        // No `with_dense_hessian_work_hint` call — the cost model is silent
+        // and the planner falls back to whatever `prefer_gradient_only` was
+        // set to (default false ⇒ ARC).
+        let problem = OuterProblem::new(3)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Analytic);
+        let cap = problem.capability();
+        assert!(!cap.prefer_gradient_only);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+    }
+
+    #[test]
     fn plan_prefer_gradient_only_downgrades_analytic_hessian_to_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
