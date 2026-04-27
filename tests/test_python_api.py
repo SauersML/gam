@@ -251,8 +251,9 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
         transformation_normal=True,
         scale_dimensions=True,
     )
-    pred = model.predict(df, return_type="dict")
-    z = np.asarray(pred["eta"], dtype=float)
+    # Transformation-normal models return the per-row z-score directly as
+    # a numpy array (see _model.predict docstring); no return_type indirection.
+    z = np.asarray(model.predict(df), dtype=float)
 
     assert z.shape == (len(df),)
     assert np.all(np.isfinite(z))
@@ -283,9 +284,7 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
         transformation_normal=True,
         scale_dimensions=True,
     )
-    df["pgs_ctn_z"] = np.asarray(
-        calib.predict(df, return_type="dict")["eta"], dtype=float
-    )
+    df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
 
     disease_formula = (
         f"disease ~ z + {_pc_duchon()} "
@@ -344,9 +343,7 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         transformation_normal=True,
         scale_dimensions=True,
     )
-    df["pgs_ctn_z"] = np.asarray(
-        calib.predict(df, return_type="dict")["eta"], dtype=float
-    )
+    df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
 
     formula = (
         "Surv(age_entry, age_exit, event) ~ z "
