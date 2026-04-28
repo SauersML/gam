@@ -4489,19 +4489,42 @@ pub fn reml_laml_evaluate(
 
 const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 
-/// Minimum coefficient dimension at which the unified evaluator returns the
-/// outer Hessian as a matrix-free `HessianResult::Operator` instead of a dense
-/// matrix.  Below this threshold AND below the n·p threshold the dense path
-/// is cheaper end-to-end.
+/// Minimum coefficient dimension at which the matrix-free operator path is
+/// selected unconditionally — once `p` is this large the dense `p × p`
+/// assembly itself dominates and operator HVPs win regardless of `n` or `K`.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD: usize = 512;
 
-/// Minimum `n · p` at which the matrix-free operator path beats the dense
-/// path even though `p < MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD`.  At biobank
-/// scale (n=320 K, p≈100) the per-evaluation dense Hessian assembly is
-/// O(k · n · p²) ≈ 10¹⁰ FLOPs and dominates wall-clock; the matrix-free Hv
-/// path absorbs it via O(n · p) HVPs.  At small-data (n≤2 K) the dense path
-/// is cheaper end-to-end.  The 1 M cutoff captures the crossover.
-pub(crate) const MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD: usize = 1_000_000;
+/// Sample-count threshold for the (`n`, `p`) crossover branch: when `n` is
+/// large enough that per-row work dominates, the operator path wins even
+/// at moderate `p`.
+pub(crate) const MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
+
+/// Coefficient dimension paired with [`MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD`]
+/// in the (`n`, `p`) crossover branch.
+pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N: usize = 32;
+
+/// `n · p` linear-work cutoff: per-eval `O(K · n · p²)` dense assembly
+/// dominates once `n · p` crosses this threshold even when both `n` and `p`
+/// are individually below the per-axis thresholds.
+pub(crate) const MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD: usize = 4_000_000;
+
+/// Smoothing-parameter count above which the operator path wins regardless
+/// of `n` and `p`: the per-outer-eval Hessian-assembly cost is
+/// `O(K · n · p²)`, so `K` itself drives the crossover.
+pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
+
+/// Predicate for selecting the matrix-free Hv-operator outer-Hessian
+/// representation over the dense `K × K` assembly.  Cost selects
+/// representation, never capability — the operator path delivers the same
+/// math as the dense path with `O(n · p)` HVPs instead of dense `p × p`
+/// assembly.
+pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
+    p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD
+        || (n >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
+            && p >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N)
+        || n.saturating_mul(p) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD
+        || k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD
+}
 
 fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
@@ -5500,6 +5523,14 @@ struct UnifiedOuterHessianOperator {
     pair_g: Vec<Vec<Option<Array1<f64>>>>,
     base_h2: Array2<f64>,
     m_pair_trace: Array2<f64>,
+    /// Precomputed pair-wise logdet-Hessian cross traces.
+    /// `cross_trace[i, j] = tr(G_ε(H) Ḣ_i Ḣ_j)` decomposed across the
+    /// dense and operator components of each coord's `total_drift`.
+    /// Populated only when `incl_logdet_h`.  matvec recovers the alpha-combo
+    /// trace as `cross_trace.row(idx).dot(alpha)`, replacing the per-HVP
+    /// recomputation that previously rebuilt these traces every time the
+    /// K×K outer Hessian was materialized via K matvecs.
+    cross_trace: Option<Array2<f64>>,
     profiled_phi: f64,
     profiled_nu: f64,
     profiled_dp_cgrad: f64,
@@ -5514,50 +5545,6 @@ struct UnifiedOuterHessianOperator {
 }
 
 impl UnifiedOuterHessianOperator {
-    fn combined_drift(
-        &self,
-        alpha: &Array1<f64>,
-    ) -> (
-        Option<Array2<f64>>,
-        Option<Array2<f64>>,
-        Option<WeightedHyperOperator>,
-    ) {
-        let p = self.hop.dim();
-        let has_dense = self
-            .coords
-            .iter()
-            .enumerate()
-            .any(|(idx, coord)| alpha[idx] != 0.0 && coord.total_drift.dense.is_some());
-        let mut dense = has_dense.then(|| Array2::<f64>::zeros((p, p)));
-        let mut dense_rotated = (has_dense && self.hop.as_dense_spectral().is_some())
-            .then(|| Array2::<f64>::zeros((p, p)));
-        let mut ops = Vec::new();
-        for (idx, coord) in self.coords.iter().enumerate() {
-            let weight = alpha[idx];
-            if weight == 0.0 {
-                continue;
-            }
-            if let (Some(target), Some(matrix)) = (dense.as_mut(), coord.total_drift.dense.as_ref())
-            {
-                target.scaled_add(weight, matrix);
-            }
-            if let (Some(target), Some(matrix)) = (
-                dense_rotated.as_mut(),
-                coord.total_drift.dense_rotated.as_ref(),
-            ) {
-                target.scaled_add(weight, matrix);
-            }
-            for op in &coord.total_drift.operators {
-                ops.push((weight, Arc::clone(op)));
-            }
-        }
-        let operator = (!ops.is_empty()).then_some(WeightedHyperOperator {
-            terms: ops,
-            dim_hint: p,
-        });
-        (dense, dense_rotated, operator)
-    }
-
     fn signed_mode_combo_for_correction(&self, alpha: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.hop.dim());
         for (j, coord) in self.coords.iter().enumerate() {
@@ -5767,7 +5754,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
         let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
-        let (alpha_dense, alpha_dense_rotated, alpha_op) = self.combined_drift(alpha);
         let mut out = Array1::<f64>::zeros(self.coords.len());
 
         for idx in 0..self.coords.len() {
@@ -5778,40 +5764,9 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             let base_h2 = self.base_h2.row(idx).dot(alpha);
             let m_terms = self.m_pair_trace.row(idx).dot(alpha);
 
-            let cross_trace = if !self.incl_logdet_h {
-                0.0
-            } else {
-                let mut value = if let (Some(left_dense), Some(alpha_dense)) =
-                    (coord.total_drift.dense.as_ref(), alpha_dense.as_ref())
-                {
-                    if let (Some(dense_hop), Some(left_rot), Some(alpha_rot)) = (
-                        self.hop.as_dense_spectral(),
-                        coord.total_drift.dense_rotated.as_ref(),
-                        alpha_dense_rotated.as_ref(),
-                    ) {
-                        dense_hop.trace_logdet_hessian_cross_rotated(left_rot, alpha_rot)
-                    } else {
-                        self.hop.trace_logdet_hessian_cross(left_dense, alpha_dense)
-                    }
-                } else {
-                    0.0
-                };
-                if let Some(op) = alpha_op.as_ref() {
-                    if let Some(left_dense) = coord.total_drift.dense.as_ref() {
-                        value -= self.hop.trace_hinv_matrix_operator_cross(left_dense, op);
-                    }
-                    for left in &coord.total_drift.operators {
-                        value -= self.hop.trace_hinv_operator_cross(left.as_ref(), op);
-                    }
-                }
-                if let Some(alpha_dense) = alpha_dense.as_ref() {
-                    for left in &coord.total_drift.operators {
-                        value -= self
-                            .hop
-                            .trace_hinv_matrix_operator_cross(alpha_dense, left.as_ref());
-                    }
-                }
-                value
+            let cross_trace = match self.cross_trace.as_ref() {
+                Some(ct) => ct.row(idx).dot(alpha),
+                None => 0.0,
             };
 
             let correction = if self.incl_logdet_h {
@@ -6079,6 +6034,65 @@ fn build_outer_hessian_operator(
         }
     }
 
+    // Precompute pair-wise logdet-Hessian cross traces:
+    //   cross_trace[i, j] = tr(G_ε(H) Ḣ_i Ḣ_j)
+    // Each coord's total Hessian drift Ḣ decomposes into a dense block plus
+    // operator terms; the bilinear form expands across all four
+    // dense-dense / dense-op / op-dense / op-op cross combinations.  By
+    // bilinearity of `tr(G_ε(H) · · )` in the second factor, the full
+    // alpha-combo cross trace recovered in matvec via
+    //   cross_trace.row(i).dot(alpha)
+    // matches the previous on-the-fly recomputation that built `alpha_dense`,
+    // `alpha_dense_rotated`, and `alpha_op` at every HVP.
+    let cross_trace: Option<Array2<f64>> = if incl_logdet_h {
+        let mut ct = Array2::<f64>::zeros((total, total));
+        let dense_hop_opt = hop.as_dense_spectral();
+        for ii in 0..total {
+            for jj in ii..total {
+                let left = &coords[ii].total_drift;
+                let right = &coords[jj].total_drift;
+                let mut value = 0.0;
+                if let (Some(left_dense), Some(right_dense)) =
+                    (left.dense.as_ref(), right.dense.as_ref())
+                {
+                    if let (Some(dense_hop), Some(left_rot), Some(right_rot)) = (
+                        dense_hop_opt,
+                        left.dense_rotated.as_ref(),
+                        right.dense_rotated.as_ref(),
+                    ) {
+                        value +=
+                            dense_hop.trace_logdet_hessian_cross_rotated(left_rot, right_rot);
+                    } else {
+                        value += hop.trace_logdet_hessian_cross(left_dense, right_dense);
+                    }
+                }
+                if let Some(left_dense) = left.dense.as_ref() {
+                    for op in &right.operators {
+                        value -= hop.trace_hinv_matrix_operator_cross(left_dense, op.as_ref());
+                    }
+                }
+                if let Some(right_dense) = right.dense.as_ref() {
+                    for op in &left.operators {
+                        value -= hop.trace_hinv_matrix_operator_cross(right_dense, op.as_ref());
+                    }
+                }
+                for left_op in &left.operators {
+                    for right_op in &right.operators {
+                        value -=
+                            hop.trace_hinv_operator_cross(left_op.as_ref(), right_op.as_ref());
+                    }
+                }
+                ct[[ii, jj]] = value;
+                if ii != jj {
+                    ct[[jj, ii]] = value;
+                }
+            }
+        }
+        Some(ct)
+    } else {
+        None
+    };
+
     let leverage = if incl_logdet_h {
         match &kernel {
             OuterHessianDerivativeKernel::ScalarGlm { x, .. } => {
@@ -6136,6 +6150,7 @@ fn build_outer_hessian_operator(
         pair_g,
         base_h2,
         m_pair_trace,
+        cross_trace,
         profiled_phi,
         profiled_nu,
         profiled_dp_cgrad,

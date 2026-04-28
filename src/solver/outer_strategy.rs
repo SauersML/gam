@@ -109,6 +109,18 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
     }
 }
 
+/// Maximum outer-Hessian operator dimension at which the planner materializes
+/// the K×K dense matrix (via basis-probing the Hv operator) before handing it
+/// to the dense ARC/Newton path. Below this threshold operator-CG buys
+/// nothing — the K Hv applications it costs to materialize are exactly the K
+/// the planner would otherwise spend over the lifetime of one outer iteration's
+/// Steihaug-Toint inner solve, but the dense path then runs an exact factorization
+/// instead of inexact CG. This is faster, simpler, and more accurate when the
+/// outer parameter dimension is small (typical for spatial smoothing fits with
+/// ≤ a few dozen smoothing parameters); above the threshold the per-outer K²
+/// materialization cost outweighs the per-iteration inner-CG savings.
+pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
+
 /// Hv-apply counter wrapping an `OuterHessianOperator`.
 ///
 /// Used by `run_operator_trust_region` so the per-iteration log line can
@@ -711,6 +723,22 @@ impl std::fmt::Display for OuterPlan {
     }
 }
 
+impl OuterPlan {
+    /// Stable, grep-friendly routing token for biobank/log regression
+    /// assertions. Emits `solver=<Solver>;hessian=<Source>;matrix-free=<bool>`.
+    /// `matrix-free=true` is reported when the plan keeps
+    /// `HessianSource::Analytic` (runtime may then use operator HVPs);
+    /// the BFGS/EFS variants report `matrix-free=false` because no Hessian
+    /// operator is supplied to the runner.
+    pub fn routing_log_line(&self) -> String {
+        let matrix_free = matches!(self.hessian_source, HessianSource::Analytic);
+        format!(
+            "solver={:?};hessian={:?};matrix-free={}",
+            self.solver, self.hessian_source, matrix_free
+        )
+    }
+}
+
 /// Select the outer optimization strategy from the declared capability.
 ///
 /// This is a pure function with no side effects. All policy lives here.
@@ -841,11 +869,12 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
     // and why. That information is otherwise inferred only from the per-iter
     // log tag prefix once the loop has started.
     log::info!(
-        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {}{hess_warning}{barrier_note}{hybrid_note}",
+        "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {} [{}]{hess_warning}{barrier_note}{hybrid_note}",
         cap.n_params,
         cap.gradient,
         cap.hessian,
         the_plan,
+        the_plan.routing_log_line(),
     );
 }
 
@@ -1469,6 +1498,12 @@ struct OuterSecondOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
     hessian_source: HessianSource,
+    /// When the evaluator returns `HessianResult::Operator(op)` and
+    /// `op.dim() <= materialize_operator_max_dim`, the bridge basis-probes the
+    /// operator into a dense K×K matrix so the dense ARC path can run an exact
+    /// factorization instead of operator-CG. See
+    /// [`OUTER_HVP_MATERIALIZE_MAX_DIM`] for the rationale.
+    materialize_operator_max_dim: usize,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -1507,7 +1542,25 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         let hessian = match self.hessian_source {
-            HessianSource::Analytic => eval.hessian.into_option(),
+            HessianSource::Analytic => match eval.hessian {
+                HessianResult::Analytic(h) => Some(h),
+                HessianResult::Operator(ref op)
+                    if op.dim() <= self.materialize_operator_max_dim =>
+                {
+                    // Small-K outer Hessian: basis-probe the Hv operator into a
+                    // dense K×K matrix so the dense ARC path can run an exact
+                    // factorization instead of inexact operator-CG. See
+                    // `OUTER_HVP_MATERIALIZE_MAX_DIM` for the rationale.
+                    Some(op.materialize_dense().map_err(|message| {
+                        ObjectiveEvalError::Fatal {
+                            message: format!(
+                                "outer Hessian operator materialization failed: {message}"
+                            ),
+                        }
+                    })?)
+                }
+                HessianResult::Operator(_) | HessianResult::Unavailable => None,
+            },
             HessianSource::BfgsApprox
             | HessianSource::EfsFixedPoint
             | HessianSource::HybridEfsFixedPoint => None,
@@ -2856,7 +2909,7 @@ fn run_outer_with_plan(
                             EstimationError::RemlOptimizationFailed(message)
                         }
                     });
-                let seed_eval = match seed_eval {
+                let mut seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
                     Err(err) => {
                         log::warn!(
@@ -2877,6 +2930,40 @@ fn run_outer_with_plan(
                 started_seeds += 1;
                 seed_slot = started_seeds;
 
+                let small_k_operator = matches!(
+                    seed_eval.hessian,
+                    HessianResult::Operator(ref op) if op.dim() <= OUTER_HVP_MATERIALIZE_MAX_DIM
+                );
+                if small_k_operator {
+                    // K is small enough that a one-shot K×K basis-probe of the
+                    // Hv operator is cheaper end-to-end than running
+                    // Steihaug-Toint CG inside operator trust-region. Convert
+                    // the seed Hessian to dense in-place; the dense ARC path
+                    // and the bridge's `materialize_operator_max_dim` field
+                    // ensure subsequent outer evaluations are also
+                    // materialized.
+                    if let HessianResult::Operator(op) = &seed_eval.hessian {
+                        match op.materialize_dense() {
+                            Ok(dense) => {
+                                seed_eval.hessian = HessianResult::Analytic(dense);
+                            }
+                            Err(message) => {
+                                let err = EstimationError::RemlOptimizationFailed(format!(
+                                    "outer Hessian operator materialization failed: {message}"
+                                ));
+                                log::warn!(
+                                    "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                                );
+                                rejection_reasons.push((
+                                    seed_idx,
+                                    "validation",
+                                    err.to_string(),
+                                ));
+                                continue 'seed_attempts;
+                            }
+                        }
+                    }
+                }
                 if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
                     log::debug!(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
@@ -2898,6 +2985,7 @@ fn run_outer_with_plan(
                         obj,
                         layout,
                         hessian_source,
+                        materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
                     };
 
                     let (lo, hi) = &bounds_template;
@@ -3874,6 +3962,7 @@ mod tests {
             obj: &mut obj,
             layout: OuterThetaLayout::new(1, 0),
             hessian_source: HessianSource::Analytic,
+            materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
         };
         let grad_sample =
             FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
@@ -3957,6 +4046,182 @@ mod tests {
         let p = plan(&cap);
         assert_eq!(p.solver, Solver::HybridEfs);
         assert_eq!(p.hessian_source, HessianSource::HybridEfsFixedPoint);
+    }
+
+    // ----------------------------------------------------------------------
+    // Routing regression tests (spec section 12).
+    //
+    // Post-#1 (compute-budget failure paths removed) and #2 (Hessian
+    // cost-gating in custom_family.rs removed), the planner no longer
+    // downgrades `(Analytic, Analytic)` to BFGS at any problem size. The
+    // contract is:
+    //
+    //   high dense work + analytic+analytic     → ARC + Analytic
+    //                                             (runtime then chooses
+    //                                              operator HVP per family)
+    //   high dense work + analytic + Unavailable → BFGS + BfgsApprox
+    //                                             (matrix-free not advertised
+    //                                              by the family — BFGS is
+    //                                              still the right choice)
+    //
+    // `routing_log_line()` exposes a stable token that biobank log
+    // regressions in tests/bench_biobank_scale_runner_test.py pin against.
+    // ----------------------------------------------------------------------
+
+    fn cap_for_routing(
+        gradient: Derivative,
+        hessian: Derivative,
+        n_params: usize,
+    ) -> OuterCapability {
+        OuterCapability {
+            gradient,
+            hessian,
+            n_params,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        }
+    }
+
+    #[test]
+    fn routing_analytic_analytic_stays_arc_at_biobank_scale() {
+        // Biobank-scale standard GAM (n=320K, p=65, k=6) used to trigger the
+        // aggregate `k·n·p²` cost-driven downgrade. Post-#1 the planner has
+        // no scale-driven downgrade, so `(Analytic, Analytic)` must stay on
+        // ARC + Analytic regardless of the problem dimensions.
+        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 6);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn routing_analytic_analytic_stays_arc_at_dense_work_scale() {
+        // n=3·10⁵, p=300 used to trigger the per-inner-solve `n·p²` downgrade
+        // (`2.7·10¹⁰ ≫ 5·10⁹`). Post-#1, no work-hint API exists; ARC stays.
+        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 3);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn routing_unavailable_hessian_routes_to_bfgs() {
+        // Spec section 12: when the family cannot provide a second derivative
+        // (matrix-free or otherwise), BFGS is the correct route.
+        let cap = cap_for_routing(Derivative::Analytic, Derivative::Unavailable, 8);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn routing_explicit_prefer_gradient_only_still_routes_to_bfgs() {
+        // A family that explicitly opts into gradient-only (e.g. for a
+        // structurally hostile surrogate surface) keeps BFGS even with both
+        // derivatives declared analytic.
+        let mut cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 6);
+        cap.prefer_gradient_only = true;
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn routing_log_line_arc_analytic_advertises_matrix_free() {
+        // Token pinned by tests/bench_biobank_scale_runner_test.py. Renaming
+        // any of these substrings is a log-regression and breaks downstream
+        // grep patterns.
+        let p = OuterPlan {
+            solver: Solver::Arc,
+            hessian_source: HessianSource::Analytic,
+        };
+        let line = p.routing_log_line();
+        assert!(line.contains("solver=Arc"), "got {line}");
+        assert!(line.contains("hessian=Analytic"), "got {line}");
+        assert!(line.contains("matrix-free=true"), "got {line}");
+    }
+
+    #[test]
+    fn routing_log_line_bfgs_reports_no_matrix_free() {
+        let p = OuterPlan {
+            solver: Solver::Bfgs,
+            hessian_source: HessianSource::BfgsApprox,
+        };
+        let line = p.routing_log_line();
+        assert!(line.contains("solver=Bfgs"), "got {line}");
+        assert!(line.contains("hessian=BfgsApprox"), "got {line}");
+        assert!(line.contains("matrix-free=false"), "got {line}");
+    }
+
+    #[test]
+    fn routing_log_line_efs_reports_no_matrix_free() {
+        // EFS variants don't expose a Hessian operator either, so the
+        // matrix-free token is `false`.
+        for source in [
+            HessianSource::EfsFixedPoint,
+            HessianSource::HybridEfsFixedPoint,
+        ] {
+            let p = OuterPlan {
+                solver: Solver::Efs,
+                hessian_source: source,
+            };
+            assert!(
+                p.routing_log_line().contains("matrix-free=false"),
+                "{:?} should not advertise matrix-free",
+                source
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-family routing regression tests.
+    //
+    // Each family that gains matrix-free Hessian operators must, at the
+    // OuterProblem build site, declare both derivatives `Analytic` so the
+    // planner stays on ARC + Analytic. These tests pin that contract from
+    // the planner side. The runtime's choice between dense-Hessian-assembly
+    // and operator-HVPs is independent of the planner; a separate per-family
+    // test (in the family's own module) should pin that.
+    //
+    // TODO(team-lead): once #4/#7 land and Matern/iso-kappa/marginal-slope
+    // each set their OuterProblem to (Analytic, Analytic), extend these
+    // assertions with a runtime hook that confirms the matrix-free path
+    // is actually taken (e.g. via a counter advertised by the family).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn routing_custom_family_gamlss_stays_on_arc_when_both_derivs_analytic() {
+        // Post-#5/#12, GAMLSS advertises matrix-free directional operators
+        // for the joint Hessian; the OuterProblem build site must declare
+        // both derivatives Analytic so ARC + Analytic stays in effect.
+        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 4);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn routing_matern_iso_kappa_stays_on_arc_when_both_derivs_analytic() {
+        // Post-#7, Matern/TPS spatial κ/τ derivative drifts ship as
+        // HyperOperators; planner contract: (Analytic, Analytic) → ARC.
+        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 5);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
+    }
+
+    #[test]
+    fn routing_marginal_slope_stays_on_arc_when_both_derivs_analytic() {
+        // Bernoulli/survival marginal-slope: the planner contract is the
+        // same — (Analytic, Analytic) → ARC + Analytic. Runtime selects
+        // operator HVPs via `use_joint_matrix_free_path`.
+        let cap = cap_for_routing(Derivative::Analytic, Derivative::Analytic, 3);
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Arc);
+        assert_eq!(p.hessian_source, HessianSource::Analytic);
     }
 
     #[test]
