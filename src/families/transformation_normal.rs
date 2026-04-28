@@ -2200,8 +2200,8 @@ fn build_response_basis(
     let raw_deriv = raw_deriv_basis.as_ref().clone();
 
     // --- Apply deviation transform: dev = raw · Z ---
-    let dev_val = raw_val.dot(&transform); // n × dev_dim
-    let dev_deriv = raw_deriv.dot(&transform); // n × dev_dim
+    let dev_val = fast_ab(&raw_val, &transform); // n × dev_dim
+    let dev_deriv = fast_ab(&raw_deriv, &transform); // n × dev_dim
 
     // --- Assemble full response basis: [1, y, dev] ---
     let p_resp = 2 + dev_dim;
@@ -2291,7 +2291,7 @@ fn evaluate_response_derivative_basis(
             transform.nrows()
         ));
     }
-    let dev_deriv = raw_deriv.dot(transform);
+    let dev_deriv = fast_ab(&raw_deriv, transform);
     resp_deriv.slice_mut(s![.., 2..]).assign(&dev_deriv);
     Ok(resp_deriv)
 }
@@ -3714,7 +3714,7 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let deriv = self.cov_deriv(axis)?;
         if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
-            return Ok(deriv.x_psi.dot(u));
+            return Ok(crate::faer_ndarray::fast_av(&deriv.x_psi, u));
         }
         let Some(op) = deriv.implicit_operator.as_ref() else {
             return Err(crate::terms::basis::BasisError::InvalidInput(format!(
@@ -3731,7 +3731,7 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let deriv = self.cov_deriv(axis)?;
         if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
-            return Ok(deriv.x_psi.t().dot(v));
+            return Ok(crate::faer_ndarray::fast_atv(&deriv.x_psi, v));
         }
         let Some(op) = deriv.implicit_operator.as_ref() else {
             return Err(crate::terms::basis::BasisError::InvalidInput(format!(
@@ -3765,7 +3765,7 @@ impl TensorKroneckerPsiOperator {
             && let Some(mat) = rows.get(axis_e)
         {
             if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
-                return Ok(mat.dot(u));
+                return Ok(crate::faer_ndarray::fast_av(mat, u));
             }
         }
         Ok(Array1::<f64>::zeros(self.n_data()))
@@ -3795,7 +3795,7 @@ impl TensorKroneckerPsiOperator {
             && let Some(mat) = rows.get(axis_e)
         {
             if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
-                return Ok(mat.t().dot(v));
+                return Ok(crate::faer_ndarray::fast_atv(mat, v));
             }
         }
         Ok(Array1::<f64>::zeros(self.p_cov()))
