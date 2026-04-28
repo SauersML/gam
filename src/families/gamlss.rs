@@ -19297,7 +19297,7 @@ mod tests {
         let p = states[0].beta.len() + states[1].beta.len();
         let u = array![0.07, -0.04, 0.21, 0.08, -0.13];
         let v = array![0.30, -0.70, 0.50, -0.20, 0.15];
-        let eps = 1e-5;
+        let eps = 1e-6;
         // Build perturbed states (β ± ε u) using the fixture's designs to
         // recompute η.
         let perturb = |sign: f64| -> Vec<ParameterBlockState> {
@@ -19360,7 +19360,7 @@ mod tests {
         let u = array![0.07, -0.04, 0.21, 0.08, -0.13];
         let u_fd = array![0.30, -0.70, 0.50, -0.20, 0.15];
         let probe = array![-0.21, 0.11, 0.05, 0.32, -0.04];
-        let eps = 1e-5;
+        let eps = 1e-6;
         let perturb = |sign: f64| -> Vec<ParameterBlockState> {
             let mut out = states.clone();
             let pt = states[0].beta.len();
@@ -19739,7 +19739,7 @@ mod tests {
 
     #[test]
     fn binomial_location_scale_wiggle_workspace_dh_operator_finite_difference() {
-        let (family, states, specs, xt, xls, xw) = bls_wiggle_workspace_fixture();
+        let (family, states, specs, xt, xls, _xw) = bls_wiggle_workspace_fixture();
         let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
         let u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
         let v = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin());
@@ -19759,12 +19759,15 @@ mod tests {
             }
             out[0].eta = xt.dot(&out[0].beta);
             out[1].eta = xls.dot(&out[1].beta);
-            // Wiggle eta uses the q-evaluated basis at fixed q0 from xt/xls;
-            // for FD purposes we hold the basis fixed at the unperturbed q0
-            // and just update etaw = X_w β_w with the static basis sample
-            // already cached in xw above. This is consistent with how the
-            // dense `exact_newton_joint_hessian` samples B at the current q0.
-            out[2].eta = xw.dot(&out[2].beta);
+            let q0 = Array1::from_iter(out[0].eta.iter().zip(out[1].eta.iter()).map(
+                |(&eta_t, &eta_ls)| {
+                    binomial_location_scale_q0(eta_t, exp_sigma_from_eta_scalar(eta_ls))
+                },
+            ));
+            out[2].eta = family
+                .wiggle_design(q0.view())
+                .expect("perturbed wiggle basis")
+                .dot(&out[2].beta);
             out
         };
         let states_plus = perturb(1.0);
