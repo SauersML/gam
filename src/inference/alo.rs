@@ -982,38 +982,120 @@ pub fn compute_multiblock_alo_leverages(
 
     let mut leverage = Array1::<f64>::zeros(n);
 
+    // Hoisted scratch: B×B flat row-major buffers for A_i, W_i and AW = A·W,
+    // plus a per-block (chunk_size_max × p_blk) row-major copy of the chunked
+    // X_blk so its rows are contiguous (cheap inner dot products).
+    let bb_sz = b * b;
+    let mut a_i = vec![0.0f64; bb_sz];
+    let mut aw = vec![0.0f64; bb_sz];
+    let mut w_flat = vec![0.0f64; bb_sz];
+
+    // Column-major faer storage for q_blocks: q_k has shape (p_tot, chunk_len)
+    // with contiguous columns, so `col_as_slice(local_i)` is a direct stripe.
+    let mut q_storage: Vec<FaerMat<f64>> = (0..b).map(|_| FaerMat::<f64>::zeros(0, 0)).collect();
+
+    // Per-block H_inv stripe scratch (p_tot × p_blk) reused across chunks.
+    let block_widths: Vec<usize> = block_designs.iter().map(|d| d.ncols()).collect();
+    let mut h_stripes: Vec<FaerMat<f64>> = block_widths
+        .iter()
+        .map(|&p_blk| FaerMat::<f64>::zeros(p_tot, p_blk))
+        .collect();
+    // Populate the H_inv stripes once: each block reads a constant column slab
+    // out of `penalized_hessian_inv` and copies it into a column-major faer Mat.
+    for blk in 0..b {
+        let off_b = col_offsets[blk];
+        let p_blk = block_widths[blk];
+        let stripe = &mut h_stripes[blk];
+        for c in 0..p_blk {
+            for r in 0..p_tot {
+                stripe[(r, c)] = penalized_hessian_inv[(r, off_b + c)];
+            }
+        }
+    }
+
+    // Per-block X^T scratch in column-major faer storage (p_blk × chunk_len).
+    let mut xt_storage: Vec<FaerMat<f64>> = block_widths
+        .iter()
+        .map(|&p_blk| FaerMat::<f64>::zeros(p_blk, 0))
+        .collect();
+
     for chunk_start in (0..n).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(n);
         let chunk_len = chunk_end - chunk_start;
-        let mut q_blocks = Vec::with_capacity(b);
+
+        // Build q_blocks[blk] = H_inv[:, off..off+p_blk] · X_blk[chunk, :]^T
+        // entirely in column-major faer storage so subsequent column reads
+        // are contiguous f64 stripes — replaces the per-chunk `to_owned()`
+        // ndarray slicing + row-major `dot()` from the original.
         for blk in 0..b {
-            let x_chunk_t = block_designs[blk]
-                .slice(s![chunk_start..chunk_end, ..])
-                .t()
-                .to_owned();
-            let off_b = col_offsets[blk];
-            let h_slice = penalized_hessian_inv
-                .slice(s![.., off_b..off_b + x_chunk_t.nrows()])
-                .to_owned();
-            q_blocks.push(h_slice.dot(&x_chunk_t));
+            let p_blk = block_widths[blk];
+
+            // Resize XT to (p_blk × chunk_len) and copy the design chunk
+            // transposed into column-major layout.
+            if xt_storage[blk].ncols() != chunk_len {
+                xt_storage[blk] = FaerMat::<f64>::zeros(p_blk, chunk_len);
+            }
+            let x_chunk = block_designs[blk].slice(s![chunk_start..chunk_end, ..]);
+            let xt = &mut xt_storage[blk];
+            for local_i in 0..chunk_len {
+                let row = x_chunk.row(local_i);
+                for j in 0..p_blk {
+                    xt[(j, local_i)] = row[j];
+                }
+            }
+
+            // Resize q to (p_tot × chunk_len) and run faer matmul.
+            if q_storage[blk].ncols() != chunk_len {
+                q_storage[blk] = FaerMat::<f64>::zeros(p_tot, chunk_len);
+            }
+            let q = &mut q_storage[blk];
+            matmul(
+                q.as_mut(),
+                Accum::Replace,
+                h_stripes[blk].as_ref(),
+                xt_storage[blk].as_ref(),
+                1.0,
+                Par::Seq,
+            );
         }
 
         for local_i in 0..chunk_len {
             let i = chunk_start + local_i;
             let w_i = &block_weights[i];
-            let mut tr = 0.0f64;
-            for a in 0..b {
-                let x_a = &block_designs[a];
-                let p_a = x_a.ncols();
-                let off_a = col_offsets[a];
-                for k in 0..b {
-                    let q_k = &q_blocks[k];
-                    let mut g_ak = 0.0f64;
-                    for j in 0..p_a {
-                        g_ak += x_a[(i, j)] * q_k[(off_a + j, local_i)];
-                    }
-                    tr += g_ak * w_i[(k, a)];
+
+            // Flatten W_i once per observation (row-major).
+            for r in 0..b {
+                for c in 0..b {
+                    w_flat[r * b + c] = w_i[(r, c)];
                 }
+            }
+
+            // Assemble A_i[a, k] = X_a[i, :] · q_k[off_a:off_a+p_a, local_i].
+            // For each k, read its column once (contiguous f64 stripe), then
+            // for each a take the matching offset slab.
+            for r in 0..bb_sz {
+                a_i[r] = 0.0;
+            }
+            for k in 0..b {
+                let q_k = &q_storage[k];
+                let q_col = q_k.col_as_slice(local_i);
+                for a in 0..b {
+                    let p_a = block_widths[a];
+                    let off_a = col_offsets[a];
+                    let xa_row = block_designs[a].row(i);
+                    let mut dot = 0.0f64;
+                    for j in 0..p_a {
+                        dot = xa_row[j].mul_add(q_col[off_a + j], dot);
+                    }
+                    a_i[a * b + k] = dot;
+                }
+            }
+
+            // AW = A_i · W_i (B×B), then leverage = trace(AW) = sum_{a,k} A[a,k]·W[k,a].
+            mat_mul_flat(&a_i, &w_flat, &mut aw, b);
+            let mut tr = 0.0f64;
+            for d in 0..b {
+                tr += aw[d * b + d];
             }
             leverage[i] = tr;
         }
