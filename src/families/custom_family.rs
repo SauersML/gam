@@ -16173,30 +16173,32 @@ mod tests {
     }
 
     /// Regression check: when `strict_solve_spd_with_lm_continuation` is given a
-    /// strictly negative-definite matrix, the LM δ-ridge schedule cannot rescue
-    /// it (every escalation still has a Cholesky failure on the perturbed
-    /// matrix because the lowest eigenvalue is < -delta). The terminal eigen-
-    /// floor fallback must therefore kick in and return a finite solution that
-    /// satisfies `Q diag(1/Λ̃) Qᵀ rhs` with `Λ̃_i = max(Λ_i, ε λ_max)`.
+    /// strongly negative-definite matrix whose `|λ_min|` exceeds the LM δ-ridge
+    /// schedule's terminal δ (≈ ε · trace_scale · 10¹⁶), the bare schedule can't
+    /// rescue Cholesky and the terminal eigen-floor fallback must return a
+    /// finite solution equal to `Q diag(1/Λ̃) Qᵀ rhs`, with
+    /// `Λ̃_i = max(Λ_i, ε λ_max)`.
     ///
-    /// Also verifies that the solution produced by the eigen-floor route is
-    /// equal (within tolerance) to the rhs left-multiplied by the explicit
-    /// floored pseudoinverse — i.e. that the analytic spec from task #9 is what
-    /// the code computes.
+    /// We also exercise the schedule-success path with a milder matrix to lock
+    /// in that the eigen-floor doesn't perturb the LM-δ output for cases the
+    /// schedule can already handle.
     #[test]
     fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
+        // δ schedule from `delta0 = max(ε·tr/p, 1e-12)`, growth 10×, 16 steps.
+        // With `tr = 4·1e30` we get `delta0 ≈ ε·1e30 ≈ 2.2e14`; terminal δ at
+        // escalation 16 is `2.2e14 · 1e16 = 2.2e30`. Set `λ_min ≈ -1e32` to
+        // outpace the schedule and force the eigen-floor branch.
         let p = 4usize;
-        // Symmetric strictly-negative-definite matrix; Cholesky always fails.
         let mut h = Array2::<f64>::zeros((p, p));
         for i in 0..p {
-            h[[i, i]] = -1.0 - (i as f64) * 0.1;
+            h[[i, i]] = -1e32 - (i as f64) * 1e30;
         }
-        h[[0, 1]] = 0.05;
-        h[[1, 0]] = 0.05;
-        let rhs = Array1::from_vec(vec![1.0, -0.5, 0.25, 0.75]);
+        h[[0, 1]] = 5e29;
+        h[[1, 0]] = 5e29;
+        let rhs = Array1::from_vec(vec![1e30, -5e29, 2.5e29, 7.5e29]);
+
         let (x, stats) = strict_solve_spd_with_lm_continuation(&h, &rhs)
             .expect("eigen-floor fallback must succeed on the negative-definite matrix");
-        // Hitting the eigen-floor branch is signaled by escalations > MAX_ESCALATIONS.
         assert!(
             stats.escalations > 16,
             "expected eigen-floor terminal fallback (escalations > MAX_ESCALATIONS), got {}",
@@ -16205,7 +16207,8 @@ mod tests {
         for &v in x.iter() {
             assert!(v.is_finite(), "eigen-floor solve returned non-finite component {v}");
         }
-        // Reconstruct the floored inverse and check x ≈ inv · rhs.
+
+        // Reconstruct the analytic floored solve and compare component-wise.
         let mut sym = h.clone();
         symmetrize_dense_in_place(&mut sym);
         let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
@@ -16234,17 +16237,15 @@ mod tests {
     }
 
     /// Companion regression check for `strict_logdet_spd_with_lm_continuation`:
-    /// on a strictly-negative-definite matrix, the LM δ-ridge cannot factor
-    /// `H + δI` for any reasonable δ (it would turn it positive only when
-    /// δ > -λ_min, and the ridge growth caps δ at a bounded value). The
-    /// terminal eigen-floor fallback must therefore return `Σ log Λ̃_i` with
-    /// `Λ̃_i = max(Λ_i, ε λ_max)`.
+    /// on a strongly negative-definite matrix the LM δ-ridge schedule cannot
+    /// factor `H + δI` (`|λ_min|` exceeds the terminal δ), so the eigen-floor
+    /// fallback must return `Σ log Λ̃_i` with `Λ̃_i = max(Λ_i, ε λ_max)`.
     #[test]
     fn strict_logdet_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
         let p = 4usize;
         let mut h = Array2::<f64>::zeros((p, p));
         for i in 0..p {
-            h[[i, i]] = -1.0 - (i as f64) * 0.1;
+            h[[i, i]] = -1e32 - (i as f64) * 1e30;
         }
         let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
             .expect("eigen-floor logdet fallback must succeed");
