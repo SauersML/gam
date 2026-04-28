@@ -97,6 +97,53 @@ impl<'a> RemlState<'a> {
         true
     }
 
+    /// Predicts whether the unified outer evaluator will return the outer
+    /// Hessian as a matrix-free `HessianResult::Operator` rather than a dense
+    /// matrix. Mirrors the runtime check at the top of
+    /// `reml_laml_evaluate`'s Hessian branch:
+    ///
+    ///   `p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD`
+    ///   `&& effective_deriv` exposes a scalar-GLM kernel
+    ///   `&& penalty_subspace_trace` is not installed
+    ///
+    /// The planner uses this to call
+    /// `OuterProblem::with_matrix_free_hessian_available(true)` so the
+    /// cost-driven `prefer_gradient_only` downgrade is suppressed when ARC's
+    /// `run_operator_trust_region` will absorb per-iteration cost via
+    /// O(n·p) HVPs. Conservative — returns `false` when:
+    ///
+    ///   - p is below the threshold (operator path won't fire),
+    ///   - link is Identity (Gaussian — `has_corrections=false`, no kernel),
+    ///   - Firth bias reduction is active (FirthAwareGlmDerivatives returns
+    ///     `None` from `scalar_glm_ingredients`),
+    ///   - linear constraints are present (BarrierDerivativeProvider wraps
+    ///     and returns `None` from `scalar_glm_ingredients`).
+    ///
+    /// Returning `false` does not block the operator path at runtime; it just
+    /// means the planner will not preemptively suppress the cost-driven
+    /// downgrade based on the prediction.
+    pub(crate) fn matrix_free_outer_hessian_likely_available(
+        &self,
+        p_total: usize,
+        has_linear_constraints: bool,
+    ) -> bool {
+        use super::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
+        if p_total < MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD {
+            return false;
+        }
+        if has_linear_constraints {
+            return false;
+        }
+        let link = self.config.link_function();
+        if link == LinkFunction::Identity {
+            return false;
+        }
+        if self.config.firth_bias_reduction && matches!(link, LinkFunction::Logit) {
+            return false;
+        }
+        true
+    }
+
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
         match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => {

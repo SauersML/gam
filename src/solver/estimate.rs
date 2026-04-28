@@ -1866,6 +1866,17 @@ where
             _ => Array1::<f64>::zeros(k),
         };
         let dense_design = reml_state.runtime_geometry_is_dense(&probe_rho);
+        // Predict whether the unified evaluator will return the outer Hessian
+        // as `HessianResult::Operator` (matrix-free Hv) — mirrors the
+        // dim-threshold + family + constraint checks in
+        // `reml_laml_evaluate`. When true, ARC's `run_operator_trust_region`
+        // absorbs per-iteration cost via O(n·p) HVPs and the cost-driven
+        // BFGS downgrade in `OuterProblem::capability` should be suppressed.
+        let matrix_free_hessian_available = analytic_outer_hessian_available
+            && reml_state.matrix_free_outer_hessian_likely_available(
+                p_total,
+                fit_linear_constraints.is_some(),
+            );
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
@@ -1874,6 +1885,7 @@ where
                 Derivative::Unavailable
             })
             .with_standard_gam_dimensions(n_obs, p_total, dense_design)
+            .with_matrix_free_hessian_available(matrix_free_hessian_available)
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
             ))

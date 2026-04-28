@@ -6504,6 +6504,95 @@ fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(ident)
 }
 
+/// Strict-mode SPD inverse with the same Levenberg-Marquardt δ-ridge
+/// continuation as [`strict_solve_spd_with_lm_continuation`]: when bare
+/// Cholesky on `H` rejects, factor `H + δI` with δ escalated geometrically,
+/// then invert.  If the cap is exhausted, fall back to a symmetric
+/// eigendecomposition with an eigenvalue floor `eps_floor = 1e-12 · max|λ|`
+/// applied uniformly, so the reconstructed inverse equals the
+/// pseudo-Laplace inverse on well-conditioned modes plus a floor-controlled
+/// regularization on rank-deficient directions.
+///
+/// Mirrors [`strict_solve_spd_with_lm_continuation`] for the inverse path:
+/// preserves strict semantics (a valid SPD inverse with bounded, recorded
+/// perturbation) while preventing fragile pilot Hessians from collapsing
+/// the spatial-adaptive seed and routing the optimizer into a cold
+/// full-data run.
+pub(crate) fn strict_inverse_spd_with_lm_continuation(
+    matrix: &Array2<f64>,
+) -> Result<(Array2<f64>, StrictSpdLmStats), String> {
+    const MAX_ESCALATIONS: usize = 16;
+    const RIDGE_GROWTH: f64 = 10.0;
+
+    if let Ok(inv) = strict_inverse_spd(matrix) {
+        return Ok((inv, StrictSpdLmStats::default()));
+    }
+
+    let p = matrix.nrows();
+    if p == 0 {
+        return Ok((Array2::<f64>::zeros((0, 0)), StrictSpdLmStats::default()));
+    }
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
+    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
+
+    let mut delta = delta0;
+    for escalation in 1..=MAX_ESCALATIONS {
+        let mut ridged = sym.clone();
+        for i in 0..p {
+            ridged[[i, i]] += delta;
+        }
+        if let Ok(chol) = ridged.cholesky(Side::Lower) {
+            let mut ident = Array2::<f64>::eye(p);
+            chol.solve_mat_in_place(&mut ident);
+            symmetrize_dense_in_place(&mut ident);
+            return Ok((
+                ident,
+                StrictSpdLmStats {
+                    delta_used: delta,
+                    escalations: escalation,
+                },
+            ));
+        }
+        delta *= RIDGE_GROWTH;
+    }
+
+    // δ-ridge schedule exhausted; fall back to eigen-floor reconstruction.
+    // Clamp every eigenvalue from below by eps_floor = 1e-12 · max|λ|, then
+    // reconstruct V · diag(1/λ_clamped) · Vᵀ. Preserves all well-conditioned
+    // modes exactly and replaces rank-deficient directions with a
+    // controlled high-curvature pseudoinverse.
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
+        format!(
+            "strict pseudo-laplace SPD inverse failed even with LM δ-ridge continuation \
+             (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
+             eigen-floor fallback also failed: {e}"
+        )
+    })?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+    let mut inv = Array2::<f64>::zeros((p, p));
+    for (k, &ev) in evals.iter().enumerate() {
+        let ev_clamped = ev.max(eps_floor);
+        let inv_ev = 1.0 / ev_clamped;
+        for i in 0..p {
+            let vi = evecs[[i, k]];
+            for j in 0..p {
+                inv[[i, j]] += inv_ev * vi * evecs[[j, k]];
+            }
+        }
+    }
+    symmetrize_dense_in_place(&mut inv);
+    Ok((
+        inv,
+        StrictSpdLmStats {
+            delta_used: delta,
+            escalations: MAX_ESCALATIONS + 1,
+        },
+    ))
+}
+
 fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
@@ -11806,7 +11895,16 @@ fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     };
     symmetrize_dense_in_place(&mut h);
     if use_exact_newton_strict_spd(family) {
-        strict_inverse_spd(&h)
+        let (inv, stats) = strict_inverse_spd_with_lm_continuation(&h)?;
+        if stats.escalations > 0 {
+            log::debug!(
+                "[strict-spd] inverse δ-ridge continuation: δ={:.3e}, escalations={}, p={}",
+                stats.delta_used,
+                stats.escalations,
+                h.nrows(),
+            );
+        }
+        Ok(inv)
     } else {
         match inverse_spdwith_retry(&h, effective_solverridge(options.ridge_floor), 8) {
             Ok(cov) => Ok(cov),
