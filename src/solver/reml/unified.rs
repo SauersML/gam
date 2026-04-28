@@ -4463,10 +4463,7 @@ const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 /// Minimum coefficient dimension at which the unified evaluator returns the
 /// outer Hessian as a matrix-free `HessianResult::Operator` instead of a dense
 /// matrix.  Below this threshold AND below the n·p threshold the dense path
-/// is cheaper end-to-end.  The planner mirrors these thresholds via
-/// [`RemlState::matrix_free_outer_hessian_likely_available`] so it can
-/// advertise matrix-free availability and suppress the cost-driven BFGS
-/// downgrade in `OuterProblem`.
+/// is cheaper end-to-end.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD: usize = 512;
 
 /// Minimum `n · p` at which the matrix-free operator path beats the dense
