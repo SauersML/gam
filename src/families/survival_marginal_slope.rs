@@ -12631,17 +12631,6 @@ impl SurvivalMarginalSlopeFamily {
 
 // ── CustomFamily impl ─────────────────────────────────────────────────
 
-/// Maximum exact outer-Hessian row work proxy before downgrading to
-/// first-order.
-///
-/// Rigid survival fits still pay dense coefficient pullbacks and keep a tight
-/// budget. Flexible time/link/score models use row-local directional kernels
-/// whose coefficient transport is linear in realized block width, so they can
-/// afford a larger exact second-order window before BFGS becomes the better
-/// trade.
-const EXACT_OUTER_MAX_ROW_WORK_RIGID: u64 = 2_000_000;
-const EXACT_OUTER_MAX_ROW_WORK_FLEX: u64 = 40_000_000;
-
 fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, String> {
     if knots.is_empty() {
         return Err("survival-marginal-slope timewiggle requires at least one knot".to_string());
@@ -12649,47 +12638,6 @@ fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, 
     let probe = 0.5 * (knots[0] + knots[knots.len() - 1]);
     let h0 = Array1::from_vec(vec![probe]);
     Ok(monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?.ncols())
-}
-
-fn survival_row_work_order(
-    family: &SurvivalMarginalSlopeFamily,
-    specs: &[ParameterBlockSpec],
-) -> ExactOuterDerivativeOrder {
-    let n = family.n as u64;
-    let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
-    let k_pairs = k.saturating_mul(k.saturating_add(1)) / 2;
-    let k_directional = k.saturating_add(k_pairs).saturating_add(k_pairs);
-    let total_coeffs: u64 = specs.iter().map(|s| s.design.ncols() as u64).sum();
-    let rigid = !family.flex_active() && !family.flex_timewiggle_active();
-    let primary_total = if family.flex_active() {
-        flex_primary_slices(family).total as u64
-    } else {
-        N_PRIMARY as u64
-    };
-    let effective_primary_cost = if rigid {
-        1u64
-    } else {
-        primary_total.saturating_mul(primary_total)
-    };
-    let coefficient_cost = if rigid {
-        total_coeffs.saturating_mul(total_coeffs)
-    } else {
-        total_coeffs
-    };
-    let row_work = n
-        .saturating_mul(coefficient_cost)
-        .saturating_mul(k_directional)
-        .saturating_mul(effective_primary_cost);
-    let budget = if rigid {
-        EXACT_OUTER_MAX_ROW_WORK_RIGID
-    } else {
-        EXACT_OUTER_MAX_ROW_WORK_FLEX
-    };
-    if row_work > budget {
-        ExactOuterDerivativeOrder::First
-    } else {
-        ExactOuterDerivativeOrder::Second
-    }
 }
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
