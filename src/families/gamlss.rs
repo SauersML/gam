@@ -6642,18 +6642,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
         self.exact_newton_joint_hessian_for_specs(block_states, Some(specs))
     }
 
-    fn exact_newton_joint_gradient_evaluation(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_block_designs_owned(Some(specs))? else {
-            return Ok(None);
-        };
-        self.exact_newton_joint_gradient_from_designs(block_states, &x_t, &x_ls)
-            .map(Some)
-    }
-
     fn exact_newton_joint_hessian_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -14199,6 +14187,18 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_block_designs_owned(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_gradient_from_designs(block_states, &x_t, &x_ls)
+            .map(Some)
+    }
+
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
@@ -19307,6 +19307,62 @@ mod tests {
             },
         ];
         (family, states, specs)
+    }
+
+    #[derive(Clone)]
+    struct NoDensifyOperator {
+        dense: Array2<f64>,
+    }
+
+    impl crate::matrix::LinearOperator for NoDensifyOperator {
+        fn nrows(&self) -> usize {
+            self.dense.nrows()
+        }
+
+        fn ncols(&self) -> usize {
+            self.dense.ncols()
+        }
+
+        fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+            self.dense.dot(vector)
+        }
+
+        fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+            self.dense.t().dot(vector)
+        }
+
+        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+            if weights.len() != self.nrows() {
+                return Err(format!(
+                    "NoDensifyOperator weight length mismatch: weights={}, nrows={}",
+                    weights.len(),
+                    self.nrows()
+                ));
+            }
+            let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
+            Ok(self.dense.t().dot(&weighted))
+        }
+    }
+
+    impl DenseDesignOperator for NoDensifyOperator {
+        fn row_chunk_into(
+            &self,
+            rows: std::ops::Range<usize>,
+            mut out: ndarray::ArrayViewMut2<'_, f64>,
+        ) -> Result<(), crate::resource::MatrixMaterializationError> {
+            out.assign(&self.dense.slice(s![rows, ..]));
+            Ok(())
+        }
+
+        fn to_dense(&self) -> Array2<f64> {
+            panic!("binomial location-scale operator workspace must not densify designs")
+        }
+    }
+
+    fn no_densify_design(dense: Array2<f64>) -> DesignMatrix {
+        DesignMatrix::from(crate::matrix::DenseDesignMatrix::from(Arc::new(
+            NoDensifyOperator { dense },
+        )))
     }
 
     #[test]
