@@ -946,6 +946,15 @@ pub enum EstimationError {
 
     #[error("Prediction error")]
     PredictionError,
+
+    #[error(
+        "P-IRLS exceeded its wall-clock budget after {elapsed_seconds:.1}s (limit {max_seconds:.1}s, \
+         configurable via GAM_PIRLS_MAX_SECONDS); the outer line search should shrink the step."
+    )]
+    PirlsTimeBudgetExceeded {
+        elapsed_seconds: f64,
+        max_seconds: f64,
+    },
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
