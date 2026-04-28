@@ -1958,6 +1958,39 @@ impl HyperOperator for ImplicitHyperOperator {
 }
 
 impl ImplicitHyperOperator {
+    fn accumulate_c_correction_xt_into(
+        &self,
+        x_col: ArrayView1<'_, f64>,
+        mut n_work: ArrayViewMut1<'_, f64>,
+        mut p_work: ArrayViewMut1<'_, f64>,
+        mut out_col: ArrayViewMut1<'_, f64>,
+    ) {
+        let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() else {
+            return;
+        };
+        let c = c_x_psi_beta.as_ref();
+        debug_assert_eq!(x_col.len(), c.len());
+        debug_assert_eq!(n_work.len(), c.len());
+        debug_assert_eq!(p_work.len(), self.p);
+
+        for i in 0..c.len() {
+            n_work[i] = c[i] * x_col[i];
+        }
+        design_matrix_transpose_apply_view_into(&self.x_design, n_work.view(), p_work.view_mut());
+        out_col += &p_work;
+    }
+
+    fn c_correction_bilinear(&self, x_v: &Array1<f64>, x_u: &Array1<f64>) -> f64 {
+        let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() else {
+            return 0.0;
+        };
+        x_v.iter()
+            .zip(x_u.iter())
+            .zip(c_x_psi_beta.iter())
+            .map(|((&xv, &xu), &c)| xv * c * xu)
+            .sum()
+    }
+
     /// Compute the design-part bilinear form u^T (X^T C_d X) z using precomputed
     /// shared X-multiplies, avoiding the full B_d matvec.
     ///
@@ -2992,16 +3025,6 @@ impl PenaltySubspaceTrace {
     /// of `A`.
     pub fn trace_operator(&self, a: &dyn HyperOperator) -> f64 {
         self.trace_projected_logdet_reduced(&self.reduce_operator(a))
-    }
-
-    /// `−tr(K · A · K · B)` cross-trace for `A`, `B` exposed only as
-    /// `HyperOperator`s.  The minus sign matches the
-    /// `trace_logdet_hessian_cross` convention used by the dense path so
-    /// callers can drop in the operator variant without sign flips.
-    pub fn cross_operator(&self, a: &dyn HyperOperator, b: &dyn HyperOperator) -> f64 {
-        let ra = self.reduce_operator(a);
-        let rb = self.reduce_operator(b);
-        -self.trace_projected_logdet_cross_reduced(&ra, &rb)
     }
 }
 
