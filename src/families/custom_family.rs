@@ -12135,19 +12135,6 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // If the primary plan still fails after the cascade, the runner surfaces
     // the `RemlOptimizationFailed` error so the user sees the underlying
     // non-convergence rather than a silent partial result.
-    // Standard-GAM dense problem dimensions for the custom-family joint
-    // outer. The joint coefficient dimension sums per-block designs; the
-    // per-row outer-product cost is (Σ p_b)² weighted by the sample count.
-    // OuterProblem::with_standard_gam_dimensions feeds both the per-inner-
-    // solve (n·p²) and per-outer-eval (k²·n·p²) cost models that promote
-    // prefer_gradient_only when one Newton iteration or the LAML pairwise
-    // Hessian assembly would dominate wall-clock time. Sparse designs are a
-    // no-op (different cost model). This is the cost-aware counterpart to
-    // the existing `multi_block_beta_dependent` EFS opt-out: both let the
-    // planner skip a path it would otherwise have committed to.
-    let total_p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
-    let n_obs_joint = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
-    let all_blocks_dense = specs.iter().all(|s| s.design.as_sparse().is_none());
     // First-order work gate (P6 / task #9): the BFGS / L-BFGS path can be
     // selected by either `cost_gated_outer_order` (family declares
     // `Unavailable` Hessian) or `OuterProblem::with_standard_gam_dimensions`
@@ -12179,24 +12166,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_max_iter(outer_first_order_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
-        .with_initial_rho(rho0.clone())
-        .with_standard_gam_dimensions(n_obs_joint, total_p_joint, all_blocks_dense)
-        // Matrix-free awareness: when the family supplies a Hv-operator
-        // joint Hessian (`exact_newton_joint_hessian_workspace` returns
-        // Some) AND the unified evaluator's dimension predicate fires, the
-        // eval returns `JointHessianSource::Operator` and ARC routes
-        // through `run_operator_trust_region`. The per-iteration cost the
-        // dense-work threshold guards against has been replaced by O(n·p)
-        // HVPs, so suppress the cost-driven `prefer_gradient_only`
-        // downgrade. Without this signal CTN and the four GAMLSS
-        // location-scale variants used to be sent to BFGS+gradient at
-        // biobank scale even though their matrix-free workspaces would
-        // have absorbed the cost while preserving ARC's super-linear
-        // convergence.
-        .with_matrix_free_hessian_available(
-            family.supports_matrix_free_joint_hessian(specs)
-                && use_joint_matrix_free_path(total_p_joint, n_obs_joint),
-        );
+        .with_initial_rho(rho0.clone());
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
