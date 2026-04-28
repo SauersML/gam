@@ -2392,15 +2392,11 @@ fn add_weighted_chunk_gradient(
     weights: &Array1<f64>,
     target: &mut Array1<f64>,
 ) {
-    *target += &chunk.t().dot(weights);
+    *target += &crate::faer_ndarray::fast_atv(chunk, weights);
 }
 
 fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &Array1<f64>, target: &mut Array2<f64>) {
-    let mut weighted_chunk = chunk.clone();
-    for (mut row, &weight) in weighted_chunk.outer_iter_mut().zip(weights.iter()) {
-        row *= weight;
-    }
-    *target += &chunk.t().dot(&weighted_chunk);
+    *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, weights);
 }
 
 /// Chunk size for parallel row accumulation. Rows within a chunk are
@@ -7102,17 +7098,59 @@ impl BernoulliMarginalSlopeFamily {
                 row_kernel_gradient(&kern, &cache),
             );
 
-            let mut hess_marginal =
-                Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
-            let mut hess_logslope =
-                Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
-            for row in 0..cache.n {
-                let h = &cache.hessians[row];
-                self.marginal_design
-                    .syr_row_into(row, h[0][0], &mut hess_marginal)?;
-                self.logslope_design
-                    .syr_row_into(row, h[1][1], &mut hess_logslope)?;
-            }
+            let n = cache.n;
+            let p_marginal = slices.marginal.len();
+            let p_logslope = slices.logslope.len();
+            let (hess_marginal, hess_logslope) = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    || -> Result<(Array2<f64>, Array2<f64>), String> {
+                        Ok((
+                            Array2::<f64>::zeros((p_marginal, p_marginal)),
+                            Array2::<f64>::zeros((p_logslope, p_logslope)),
+                        ))
+                    },
+                    |acc, chunk_idx| -> Result<(Array2<f64>, Array2<f64>), String> {
+                        let (mut hm, mut hl) = acc?;
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        let rows = end - start;
+                        let marginal_chunk = self
+                            .marginal_design
+                            .try_row_chunk(start..end)
+                            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                        let logslope_chunk = self
+                            .logslope_design
+                            .try_row_chunk(start..end)
+                            .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                        let mut hm_w = Array1::<f64>::zeros(rows);
+                        let mut hl_w = Array1::<f64>::zeros(rows);
+                        for local_row in 0..rows {
+                            let h = &cache.hessians[start + local_row];
+                            hm_w[local_row] = h[0][0];
+                            hl_w[local_row] = h[1][1];
+                        }
+                        add_weighted_chunk_gram(&marginal_chunk, &hm_w, &mut hm);
+                        add_weighted_chunk_gram(&logslope_chunk, &hl_w, &mut hl);
+                        Ok((hm, hl))
+                    },
+                )
+                .try_reduce(
+                    || -> Result<(Array2<f64>, Array2<f64>), String> {
+                        Ok((
+                            Array2::<f64>::zeros((p_marginal, p_marginal)),
+                            Array2::<f64>::zeros((p_logslope, p_logslope)),
+                        ))
+                    },
+                    |left, right| -> Result<(Array2<f64>, Array2<f64>), String> {
+                        let (mut lhm, mut lhl) = left?;
+                        let (rhm, rhl) = right?;
+                        lhm += &rhm;
+                        lhl += &rhl;
+                        Ok((lhm, lhl))
+                    },
+                )??;
+
             let hess_marginal =
                 Self::exact_newton_observed_information_from_objective_hessian(hess_marginal);
             let hess_logslope =
@@ -7167,62 +7205,100 @@ impl BernoulliMarginalSlopeFamily {
             let primary = cache.primary.clone();
             let n = self.y.len();
 
-            let mut ll = 0.0;
-            let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
-            let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
-            let mut hess_marginal =
-                Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
-            let mut hess_logslope =
-                Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
-            let mut grad_h: Option<Array1<f64>> = slices.h.as_ref().map(|r| Array1::zeros(r.len()));
-            let mut grad_w: Option<Array1<f64>> = slices.w.as_ref().map(|r| Array1::zeros(r.len()));
-            let mut hess_h: Option<Array2<f64>> =
-                slices.h.as_ref().map(|r| Array2::zeros((r.len(), r.len())));
-            let mut hess_w: Option<Array2<f64>> =
-                slices.w.as_ref().map(|r| Array2::zeros((r.len(), r.len())));
-            let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-            for row in 0..n {
-                let row_ctx = Self::row_ctx(&cache, row);
-                let row_neglog = self.compute_row_analytic_flex_into(
-                    row,
-                    block_states,
-                    &primary,
-                    row_ctx,
-                    true,
-                    &mut scratch,
-                )?;
-                ll -= row_neglog;
-                {
-                    let mut m = grad_marginal.view_mut();
-                    self.marginal_design.axpy_row_into(
-                        row,
-                        Self::exact_newton_score_component_from_objective_gradient(scratch.grad[0]),
-                        &mut m,
-                    )?;
-                }
-                {
-                    let mut g = grad_logslope.view_mut();
-                    self.logslope_design.axpy_row_into(
-                        row,
-                        Self::exact_newton_score_component_from_objective_gradient(scratch.grad[1]),
-                        &mut g,
-                    )?;
-                }
-                self.marginal_design
-                    .syr_row_into(row, scratch.hess[[0, 0]], &mut hess_marginal)?;
-                self.logslope_design
-                    .syr_row_into(row, scratch.hess[[1, 1]], &mut hess_logslope)?;
-                if let (Some(ph), Some(gh), Some(hh)) =
-                    (primary.h.as_ref(), grad_h.as_mut(), hess_h.as_mut())
-                {
-                    accumulate_flex_block_grad_hess(ph, &scratch, gh, hh);
-                }
-                if let (Some(pw), Some(gw), Some(hw)) =
-                    (primary.w.as_ref(), grad_w.as_mut(), hess_w.as_mut())
-                {
-                    accumulate_flex_block_grad_hess(pw, &scratch, gw, hw);
-                }
-            }
+            let make_acc = || BernoulliExactNewtonAccumulator::new(&slices);
+            let reduced = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let rows = end - start;
+                    let marginal_chunk = self
+                        .marginal_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                    let logslope_chunk = self
+                        .logslope_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                    let mut grad_marginal_weights = Array1::<f64>::zeros(rows);
+                    let mut grad_logslope_weights = Array1::<f64>::zeros(rows);
+                    let mut hess_marginal_weights = Array1::<f64>::zeros(rows);
+                    let mut hess_logslope_weights = Array1::<f64>::zeros(rows);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+
+                    for local_row in 0..rows {
+                        let row = start + local_row;
+                        let row_ctx = Self::row_ctx(&cache, row);
+                        let row_neglog = self.compute_row_analytic_flex_into(
+                            row,
+                            block_states,
+                            &primary,
+                            row_ctx,
+                            true,
+                            &mut scratch,
+                        )?;
+                        acc.ll -= row_neglog;
+                        grad_marginal_weights[local_row] =
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                scratch.grad[0],
+                            );
+                        grad_logslope_weights[local_row] =
+                            Self::exact_newton_score_component_from_objective_gradient(
+                                scratch.grad[1],
+                            );
+                        hess_marginal_weights[local_row] = scratch.hess[[0, 0]];
+                        hess_logslope_weights[local_row] = scratch.hess[[1, 1]];
+
+                        if let (Some(primary_h), Some(grad_h), Some(hess_h)) =
+                            (primary.h.as_ref(), acc.grad_h.as_mut(), acc.hess_h.as_mut())
+                        {
+                            accumulate_flex_block_grad_hess(primary_h, &scratch, grad_h, hess_h);
+                        }
+                        if let (Some(primary_w), Some(grad_w), Some(hess_w)) =
+                            (primary.w.as_ref(), acc.grad_w.as_mut(), acc.hess_w.as_mut())
+                        {
+                            accumulate_flex_block_grad_hess(primary_w, &scratch, grad_w, hess_w);
+                        }
+                    }
+
+                    add_weighted_chunk_gradient(
+                        &marginal_chunk,
+                        &grad_marginal_weights,
+                        &mut acc.grad_marginal,
+                    );
+                    add_weighted_chunk_gradient(
+                        &logslope_chunk,
+                        &grad_logslope_weights,
+                        &mut acc.grad_logslope,
+                    );
+                    add_weighted_chunk_gram(
+                        &marginal_chunk,
+                        &hess_marginal_weights,
+                        &mut acc.hess_marginal,
+                    );
+                    add_weighted_chunk_gram(
+                        &logslope_chunk,
+                        &hess_logslope_weights,
+                        &mut acc.hess_logslope,
+                    );
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                    left.add(&right);
+                    Ok(left)
+                })?;
+
+            let BernoulliExactNewtonAccumulator {
+                ll,
+                grad_marginal,
+                grad_logslope,
+                hess_marginal,
+                hess_logslope,
+                grad_h,
+                grad_w,
+                hess_h,
+                hess_w,
+            } = reduced;
 
             let mut blockworking_sets = vec![
                 BlockWorkingSet::ExactNewton {
