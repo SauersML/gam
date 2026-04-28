@@ -2792,3 +2792,171 @@ impl<'a> RemlState<'a> {
         Ok(coords)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array1, Array2, array};
+    use std::sync::Arc;
+
+    /// `DenseMatrixHyperOperator` is a generic `dyn HyperOperator` adapter for
+    /// a known dense matrix; we use it as a deterministic stand-in for the
+    /// base operator (e.g. `ImplicitHyperOperator`) when wiring an
+    /// augmentation test. `super::*` brings the unified types in via
+    /// `super::unified::DenseMatrixHyperOperator`.
+    fn dense_op(matrix: Array2<f64>) -> Arc<dyn super::super::unified::HyperOperator> {
+        Arc::new(super::super::unified::DenseMatrixHyperOperator { matrix })
+    }
+
+    /// Contract: `FirthAugmentedSingleHyperOperator::mul_vec(v)` reproduces
+    /// `base.mul_vec(v) − (Hφ_τ|β · v)` where `Hφ_τ|β` is the dense
+    /// fixed-β Firth Hessian-drift built by
+    /// `firth_hphi_tau_partial_apply(op, x_tau, kernel, eye)`.
+    ///
+    /// On a tiny logit fixture (n=6, p=3) we
+    ///   1. construct a `FirthDenseOperator` and a single-coordinate
+    ///      `FirthTauPartialKernel` via `op.exact_tau_kernel`,
+    ///   2. dense-build the same `−Hφ_τ` matrix the operator action subtracts,
+    ///   3. probe `mul_vec` along several v and compare to
+    ///      `base · v − Hφ_τ · v` to within tight tolerance.
+    #[test]
+    fn firth_augmented_single_hyper_operator_matches_dense_reference() {
+        let x = array![
+            [1.0, -0.6, 0.10],
+            [1.0, -0.2, 0.45],
+            [1.0, 0.1, -0.20],
+            [1.0, 0.7, 0.30],
+            [1.0, 1.1, -0.50],
+            [1.0, 0.3, 0.55],
+        ];
+        let p = x.ncols();
+        let beta = array![0.20, -0.45, 0.30];
+        let eta = x.dot(&beta);
+
+        let firth_op = Arc::new(
+            super::super::FirthDenseOperator::build(&x, &eta).expect("Firth dense operator"),
+        );
+        // Spatial-coordinate τ-direction design (same shape as X by contract).
+        let x_tau = array![
+            [0.05, 0.10, -0.02],
+            [0.04, -0.03, 0.20],
+            [-0.06, 0.08, 0.10],
+            [0.07, 0.02, -0.15],
+            [-0.04, 0.13, 0.05],
+            [0.03, -0.10, 0.08],
+        ];
+        let tau_bundle = firth_op.exact_tau_kernel(&x_tau, &beta, true);
+        let kernel = tau_bundle
+            .tau_kernel
+            .clone()
+            .expect("τ-kernel requested with include_hphi_tau_kernel=true");
+
+        // Dense reference: H_base · v − Hφ_τ · v.
+        let mut base_matrix = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                base_matrix[[i, j]] = if i == j {
+                    1.5 + (i as f64) * 0.1
+                } else {
+                    0.05 * ((i as f64 + 1.0) - (j as f64 + 1.0))
+                };
+            }
+        }
+        let eye = Array2::<f64>::eye(p);
+        let hphi_tau_dense = firth_op.hphi_tau_partial_apply(&x_tau, &kernel, &eye);
+
+        let aug = FirthAugmentedSingleHyperOperator {
+            base: dense_op(base_matrix.clone()),
+            firth_op: Arc::clone(&firth_op),
+            tau_kernel: kernel.clone(),
+            x_tau_dense: x_tau.clone(),
+            p,
+        };
+
+        let probes = [
+            array![1.0, 0.0, 0.0],
+            array![0.0, 1.0, 0.0],
+            array![0.0, 0.0, 1.0],
+            array![0.30, -0.70, 0.50],
+            array![-0.42, 0.11, 0.93],
+        ];
+        for (k, v) in probes.iter().enumerate() {
+            let want = &base_matrix.dot(v) - &hphi_tau_dense.dot(v);
+            let got = aug.mul_vec(v);
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-10 * want[i].abs().max(1.0) + 1e-10;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "Firth-aug single op mul_vec[{k},{i}]: want={:.6e}, got={:.6e}",
+                    want[i],
+                    got[i],
+                );
+            }
+        }
+    }
+
+    /// Centered FD check: the operator is linear in v, so the finite-difference
+    /// quotient `(op.mul_vec(v + ε e_j) − op.mul_vec(v − ε e_j)) / (2ε)` must
+    /// equal the j-th column of the represented map. This locks in
+    /// (a) numeric stability of the underlying `firth_hphi_tau_partial_apply`
+    /// across the centered-difference ε scale, and
+    /// (b) that no nonlinear approximation snuck into the operator pipeline.
+    #[test]
+    fn firth_augmented_single_hyper_operator_centered_fd_matches_jacobian_column() {
+        let x = array![
+            [1.0, -0.4, 0.20],
+            [1.0, 0.2, -0.10],
+            [1.0, 0.6, 0.30],
+            [1.0, 0.9, -0.40],
+        ];
+        let p = x.ncols();
+        let beta = array![0.10, -0.30, 0.20];
+        let eta = x.dot(&beta);
+        let firth_op = Arc::new(
+            super::super::FirthDenseOperator::build(&x, &eta).expect("Firth dense operator"),
+        );
+
+        let x_tau = array![
+            [0.04, 0.08, -0.05],
+            [0.06, -0.02, 0.10],
+            [-0.03, 0.05, 0.07],
+            [0.05, -0.07, 0.04],
+        ];
+        let kernel = firth_op
+            .exact_tau_kernel(&x_tau, &beta, true)
+            .tau_kernel
+            .expect("τ kernel");
+
+        let base_matrix = array![[2.0, 0.05, -0.02], [0.05, 1.5, 0.10], [-0.02, 0.10, 1.2],];
+        let aug = FirthAugmentedSingleHyperOperator {
+            base: dense_op(base_matrix),
+            firth_op: Arc::clone(&firth_op),
+            tau_kernel: kernel,
+            x_tau_dense: x_tau,
+            p,
+        };
+
+        let v_base = array![0.10, -0.05, 0.20];
+        let eps = 1e-6;
+        for j in 0..p {
+            let mut e_j = Array1::<f64>::zeros(p);
+            e_j[j] = 1.0;
+            let mut v_plus = v_base.clone();
+            v_plus[j] += eps;
+            let mut v_minus = v_base.clone();
+            v_minus[j] -= eps;
+            let fd = (&aug.mul_vec(&v_plus) - &aug.mul_vec(&v_minus)).mapv(|x| x / (2.0 * eps));
+            let analytic = aug.mul_vec(&e_j);
+            for i in 0..p {
+                let tol = 1e-7 * analytic[i].abs().max(1.0) + 1e-7;
+                assert!(
+                    (analytic[i] - fd[i]).abs() <= tol,
+                    "Firth-aug single FD col {j} row {i}: analytic={:.6e}, fd={:.6e}",
+                    analytic[i],
+                    fd[i],
+                );
+            }
+        }
+    }
+}

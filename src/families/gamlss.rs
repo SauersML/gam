@@ -8066,6 +8066,198 @@ impl GaussianLocationScaleWiggleFamily {
         ))))
     }
 
+    /// Build a matrix-free `RowCoeffOperator` for the GLS Wiggle joint
+    /// second directional derivative `D²_β H_L[u, v]`. Channels: X_mu,
+    /// X_ls, B, B', B'', B'''. Pair list mirrors the 8-term `xt_diag_*`
+    /// assembly in `_from_designs`, with row-coefficient bundles that
+    /// absorb the `ξ_u, ξ_v, ξ_u·ξ_v` row factors arising from
+    /// `basis_u = diag(ξ_u)·B'`, `basis_uv = diag(ξ_u·ξ_v)·B''`, etc.
+    fn gls_wiggle_second_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        xmu_arc: Arc<Array2<f64>>,
+        x_ls_arc: Arc<Array2<f64>>,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        if block_states.len() != 3 {
+            return Err(format!(
+                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let pmu = xmu_arc.ncols();
+        let p_ls = x_ls_arc.ncols();
+        let q0_eta = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        let layout = GamlssBetaLayout::withwiggle(pmu, p_ls, betaw.len());
+        let (umu, u_ls, uw) = layout.split_three(d_beta_u, "GLS Wiggle d2H operator (u)")?;
+        let (vmu, v_ls, vw) = layout.split_three(d_beta_v, "GLS Wiggle d2H operator (v)")?;
+        if q0_eta.len() != n
+            || eta_ls.len() != n
+            || etaw.len() != n
+            || self.weights.len() != n
+        {
+            return Err("GaussianLocationScaleWiggleFamily input size mismatch".to_string());
+        }
+        let q = q0_eta + etaw;
+        let geom = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
+        let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
+
+        let xi_u = fast_av(xmu_arc.as_ref(), &umu);
+        let xi_v = fast_av(xmu_arc.as_ref(), &vmu);
+        let zeta_u = fast_av(x_ls_arc.as_ref(), &u_ls);
+        let zeta_v = fast_av(x_ls_arc.as_ref(), &v_ls);
+        let phi_u = fast_av(&geom.basis, &uw);
+        let phi_v = fast_av(&geom.basis, &vw);
+        let b1u = fast_av(&geom.basis_d1, &uw);
+        let b1v = fast_av(&geom.basis_d1, &vw);
+        let b2u = fast_av(&geom.basis_d2, &uw);
+        let b2v = fast_av(&geom.basis_d2, &vw);
+        let b3u = fast_av(&geom.basis_d3, &uw);
+        let b3v = fast_av(&geom.basis_d3, &vw);
+
+        let mut q_u = &geom.dq_dq0 * &xi_u;
+        q_u += &phi_u;
+        let mut q_v = &geom.dq_dq0 * &xi_v;
+        q_v += &phi_v;
+        let mut s1_u = &geom.d2q_dq02 * &xi_u;
+        s1_u += &b1u;
+        let mut s1_v = &geom.d2q_dq02 * &xi_v;
+        s1_v += &b1v;
+        let mut g2_u = &geom.d3q_dq03 * &xi_u;
+        g2_u += &b2u;
+        let mut g2_v = &geom.d3q_dq03 * &xi_v;
+        g2_v += &b2v;
+        let q_uv = &(&geom.d2q_dq02 * &(&xi_u * &xi_v)) + &(&b1u * &xi_v) + &(&b1v * &xi_u);
+        let s1_uv = &(&geom.d3q_dq03 * &(&xi_u * &xi_v)) + &(&b2u * &xi_v) + &(&b2v * &xi_u);
+        let g2_uv = &(&geom.d4q_dq04 * &(&xi_u * &xi_v)) + &(&b3u * &xi_v) + &(&b3v * &xi_u);
+
+        let szeta_u = &rows.kappa * &zeta_u;
+        let szeta_v = &rows.kappa * &zeta_v;
+        let zeta_u_zeta_v = &zeta_u * &zeta_v;
+        let dw_u = -2.0 * &rows.w * &szeta_u;
+        let dw_v = -2.0 * &rows.w * &szeta_v;
+        let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v)
+            - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
+        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta_u);
+        let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &szeta_v);
+        let dm_uv = &(2.0 * &rows.w * &(&q_u * &szeta_v + &q_v * &szeta_u))
+            - &(&rows.w * &q_uv)
+            + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
+            - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
+        let dn_uv = &(2.0 * &rows.w * &(&q_u * &q_v))
+            + &(4.0 * &rows.m * &(&q_u * &szeta_v + &q_v * &szeta_u))
+            - &(2.0 * &rows.m * &q_uv)
+            + &(4.0 * &rows.n * &(&szeta_u * &szeta_v))
+            - 2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v;
+        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta_u);
+        let dn_v = -(2.0 * &rows.m * &q_v) - &(2.0 * &rows.n * &szeta_v);
+        let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
+        let kappa_tprime =
+            &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
+        let amn = &rows.obs_weight - &rows.n;
+
+        let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
+            + &(2.0 * &dw_u * &geom.dq_dq0 * &s1_v)
+            + &(2.0 * &dw_v * &geom.dq_dq0 * &s1_u)
+            + &(2.0 * &rows.w * &s1_u * &s1_v)
+            + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_uv)
+            - &(&dm_uv * &geom.d2q_dq02)
+            - &(&dm_u * &g2_v)
+            - &(&dm_v * &g2_u)
+            - &(&rows.m * &g2_uv);
+        let a_md_v = &dm_v * &geom.dq_dq0 + &rows.m * &s1_v;
+        let a_md_u = &dm_u * &geom.dq_dq0 + &rows.m * &s1_u;
+        let coeff_ml_uv = 2.0
+            * &rows.kappa
+            * &(&dm_uv * &geom.dq_dq0 + &dm_u * &s1_v + &dm_v * &s1_u + &rows.m * &s1_uv)
+            + 2.0 * &rows.kappa_prime * &(&zeta_u * &a_md_v + &zeta_v * &a_md_u)
+            + 2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * &geom.dq_dq0;
+        let two_ki2_minus_kpi = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
+        let four_kkpi_minus_kdpi = 4.0 * &(&rows.kappa * &rows.kappa_prime) - &rows.kappa_dprime;
+        let zeta_n_sym = &zeta_u * &dn_v + &zeta_v * &dn_u;
+        let bracketed_eta_eta = 4.0
+            * &rows.n
+            * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
+            + &kappa_tprime * &amn;
+        let coeff_ll_uv = &two_ki2_minus_kpi * &dn_uv
+            + &four_kkpi_minus_kdpi * &zeta_n_sym
+            + &bracketed_eta_eta * &zeta_u_zeta_v;
+
+        let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
+        let a_v = &dw_v * &geom.dq_dq0 + &rows.w * &s1_v;
+        let a_uv = &dw_uv * &geom.dq_dq0 + &dw_u * &s1_v + &dw_v * &s1_u + &rows.w * &s1_uv;
+        let c_u = -&dm_u;
+        let c_v = -&dm_v;
+        let c_uv = -&dm_uv;
+        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&zeta_u * &rows.m);
+        let l_v = 2.0 * &rows.kappa * &dm_v + 2.0 * &rows.kappa_prime * &(&zeta_v * &rows.m);
+        let l_uv = 2.0 * &rows.kappa * &dm_uv
+            + 2.0 * &rows.kappa_prime * &(&zeta_u * &dm_v + &zeta_v * &dm_u)
+            + 2.0 * &rows.kappa_dprime * &(&zeta_u_zeta_v * &rows.m);
+
+        // Pair-coefficient bundles. Cross-block (mu, B'/B'') absorb basis_u/v/uv row scaling.
+        let xi_u_xi_v = &xi_u * &xi_v;
+        let coeff_m_b1 = &(&a_u * &xi_v) + &(&a_v * &xi_u) + &c_uv;
+        let coeff_m_b2 = &(&rows.w * &geom.dq_dq0 * &xi_u_xi_v)
+            + &(&c_u * &xi_v)
+            + &(&c_v * &xi_u);
+        let coeff_m_b3 = -(&rows.m * &xi_u_xi_v);
+        let coeff_ls_b1 = &(&l_u * &xi_v) + &(&l_v * &xi_u);
+        let coeff_ls_b2 = 2.0 * &rows.kappa * &rows.m * &xi_u_xi_v;
+        // Wiggle-wiggle from a_ab + a_ab^T + a_ij + a_ij^T + a_iwj + a_iwj^T + a_jwi + a_jwi^T:
+        //   a_ab = B''^T diag(w·ξ_uξ_v) B    → pair (B, B'', w·ξ_uξ_v)
+        //   a_ij = B'^T diag(w·ξ_uξ_v) B'   → pair (B', B', 2·w·ξ_uξ_v)  (a_ij + a_ij^T)
+        //   a_iwj+a_jwi = B'^T diag(dw_v·ξ_u + dw_u·ξ_v) B → pair (B, B', sum)
+        let coeff_b_b1 = &(&dw_u * &xi_v) + &(&dw_v * &xi_u);
+        let coeff_b_b2 = &rows.w * &xi_u_xi_v;
+        let coeff_b1_b1 = 2.0 * &(&rows.w * &xi_u_xi_v);
+
+        let xmu_design: Arc<Array2<f64>> = xmu_arc;
+        let x_ls_design: Arc<Array2<f64>> = x_ls_arc;
+        let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
+        let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
+        let basis_d2: Arc<Array2<f64>> = Arc::new(geom.basis_d2.clone());
+        let basis_d3: Arc<Array2<f64>> = Arc::new(geom.basis_d3.clone());
+        let pw = basis.ncols();
+
+        let channels = vec![
+            RowCoeffChannel { block: 0, design: xmu_design },
+            RowCoeffChannel { block: 1, design: x_ls_design },
+            RowCoeffChannel { block: 2, design: basis },
+            RowCoeffChannel { block: 2, design: basis_d1 },
+            RowCoeffChannel { block: 2, design: basis_d2 },
+            RowCoeffChannel { block: 2, design: basis_d3 },
+        ];
+        let pair_coeffs = vec![
+            RowCoeffPair { a: 0, b: 0, coeff: coeff_mm_uv },
+            RowCoeffPair { a: 0, b: 1, coeff: coeff_ml_uv },
+            RowCoeffPair { a: 1, b: 1, coeff: coeff_ll_uv },
+            RowCoeffPair { a: 0, b: 2, coeff: a_uv },
+            RowCoeffPair { a: 0, b: 3, coeff: coeff_m_b1 },
+            RowCoeffPair { a: 0, b: 4, coeff: coeff_m_b2 },
+            RowCoeffPair { a: 0, b: 5, coeff: coeff_m_b3 },
+            RowCoeffPair { a: 1, b: 2, coeff: l_uv },
+            RowCoeffPair { a: 1, b: 3, coeff: coeff_ls_b1 },
+            RowCoeffPair { a: 1, b: 4, coeff: coeff_ls_b2 },
+            RowCoeffPair { a: 2, b: 2, coeff: dw_uv },
+            RowCoeffPair { a: 2, b: 3, coeff: coeff_b_b1 },
+            RowCoeffPair { a: 2, b: 4, coeff: coeff_b_b2 },
+            RowCoeffPair { a: 3, b: 3, coeff: coeff_b1_b1 },
+        ];
+        Ok(Some(Arc::new(RowCoeffOperator::new(
+            channels,
+            vec![pmu, p_ls, pw],
+            pair_coeffs,
+            n,
+        ))))
+    }
+
     fn exact_newton_joint_hessiansecond_directional_derivative_from_designs(
         &self,
         block_states: &[ParameterBlockState],
@@ -9667,6 +9859,21 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
                 d_beta_u_flat,
                 d_beta_v_flat,
             )
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        self.family.gls_wiggle_second_directional_operator(
+            &self.block_states,
+            self.xmu.clone(),
+            self.x_ls.clone(),
+            d_beta_u,
+            d_beta_v,
+        )
     }
 }
 

@@ -1228,6 +1228,12 @@ pub type FixedDriftDerivFn =
 /// materializing B_i as a (p × p) matrix and calling `A_k · w`, we compute
 /// `B_i · w` on the fly using implicit design-derivative matvecs.
 pub trait HyperOperator: Send + Sync {
+    /// Operator dimension `p` such that `B · v` consumes a `p`-vector and
+    /// produces a `p`-vector.  No default — every impl must answer cheaply
+    /// from a stored field or constructor argument.  Implementations must
+    /// not materialize the operator to read a shape.
+    fn dim(&self) -> usize;
+
     /// Compute B · v (matrix-vector product). v and result are p-vectors.
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64>;
 
@@ -1342,6 +1348,10 @@ pub struct DenseMatrixHyperOperator {
 }
 
 impl HyperOperator for DenseMatrixHyperOperator {
+    fn dim(&self) -> usize {
+        self.matrix.nrows()
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         self.matrix.dot(v)
     }
@@ -1389,6 +1399,10 @@ pub struct CompositeHyperOperator {
 }
 
 impl HyperOperator for CompositeHyperOperator {
+    fn dim(&self) -> usize {
+        self.dim_hint
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v.view(), out.view_mut());
@@ -2912,10 +2926,12 @@ impl PenaltySubspaceTrace {
     ///
     /// Exposed so callers that need the same reduced matrix for both the
     /// single-trace `tr(K · A)` and the cross-trace `tr(K · A · K · B)`
-    /// can avoid repeating the p × p · p × r matmuls.
+    /// can avoid repeating the p × p · p × r matmuls.  Routes through
+    /// faer's parallel SIMD GEMM (`fast_atb` / `fast_ab`) so the p-large
+    /// contraction axis amortizes across all cores.
     pub fn reduce(&self, a: &Array2<f64>) -> Array2<f64> {
-        let u_s_t_a = self.u_s.t().dot(a);
-        u_s_t_a.dot(&self.u_s)
+        let u_s_t_a = crate::faer_ndarray::fast_atb(&self.u_s, a);
+        crate::faer_ndarray::fast_ab(&u_s_t_a, &self.u_s)
     }
 
     /// Compute `tr(H_proj⁻¹ · R)` given an already-reduced `R = U_Sᵀ A U_S`.
@@ -2948,10 +2964,11 @@ impl PenaltySubspaceTrace {
     /// Reduce a `HyperOperator` `A` to its `r × r` projection
     /// `U_Sᵀ · A · U_S` without materializing the dense `p × p` block.
     /// Uses `A.mul_mat(U_S)` so an Hv-only operator is probed in `r` matvecs
-    /// (each `O(work_of_A)`), then a single `r × p × r` reduction.
+    /// (each `O(work_of_A)`), then a single `r × p × r` reduction routed
+    /// through faer's parallel SIMD GEMM (`fast_atb`).
     pub fn reduce_operator(&self, a: &dyn HyperOperator) -> Array2<f64> {
         let au = a.mul_mat(&self.u_s);
-        self.u_s.t().dot(&au)
+        crate::faer_ndarray::fast_atb(&self.u_s, &au)
     }
 
     /// `tr(K · A)` for `A` exposed only as a `HyperOperator`.  Mirrors

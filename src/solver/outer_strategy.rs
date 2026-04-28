@@ -21,7 +21,7 @@ use ::opt::{
     MaxIterations, ObjectiveEvalError, SecondOrderObjective, SecondOrderSample, Solution,
     Tolerance, ZerothOrderObjective,
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -29,18 +29,47 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// This is the exact outer Hessian action `H_outer * v` evaluated at the
 /// current outer point, without requiring dense materialization.
+///
+/// The trait provides three increasingly batched primitives:
+///
+/// - [`matvec`](Self::matvec) — single column, the only one implementors must
+///   provide.
+/// - [`mul_mat`](Self::mul_mat) — multi-column; the default falls back to
+///   column-by-column `matvec`. Implementors override this when they can
+///   amortize per-Hv-apply overhead (cached factorizations, parallel matvecs)
+///   across many right-hand-sides.
+/// - [`materialize_dense`](Self::materialize_dense) — the special case
+///   `mul_mat(I_dim)` followed by a symmetric average of the off-diagonals to
+///   absorb round-off asymmetry. Used by the small-K planner path
+///   (see [`OUTER_HVP_MATERIALIZE_MAX_DIM`]) and by post-fit posterior code
+///   paths that need a concrete matrix.
 pub trait OuterHessianOperator: Send + Sync {
     fn dim(&self) -> usize;
     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String>;
 
-    fn materialize_dense(&self) -> Result<Array2<f64>, String> {
+    /// Apply the operator to all `m` columns of `factor`, returning a
+    /// `dim × m` matrix whose `j`th column is `H · factor[:, j]`.
+    ///
+    /// The default implementation calls [`matvec`](Self::matvec) once per
+    /// column. Implementors override when batching is cheaper (cached
+    /// factorizations, parallel matvecs over independent columns, BLAS-3
+    /// kernels). All [`materialize_dense`](Self::materialize_dense) callers
+    /// route through this method, so an override automatically accelerates
+    /// the small-K materialization path used by the planner.
+    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
         let dim = self.dim();
-        let mut dense = Array2::<f64>::zeros((dim, dim));
-        let mut basis = Array1::<f64>::zeros(dim);
-        for col in 0..dim {
-            basis[col] = 1.0;
-            let hv = self.matvec(&basis)?;
-            basis[col] = 0.0;
+        if factor.nrows() != dim {
+            return Err(format!(
+                "outer Hessian operator factor row count mismatch: got {}, expected {}",
+                factor.nrows(),
+                dim
+            ));
+        }
+        let m = factor.ncols();
+        let mut out = Array2::<f64>::zeros((dim, m));
+        for j in 0..m {
+            let col = factor.column(j).to_owned();
+            let hv = self.matvec(&col)?;
             if hv.len() != dim {
                 return Err(format!(
                     "outer Hessian operator matvec length mismatch: got {}, expected {}",
@@ -48,7 +77,27 @@ pub trait OuterHessianOperator: Send + Sync {
                     dim
                 ));
             }
-            dense.column_mut(col).assign(&hv);
+            out.column_mut(j).assign(&hv);
+        }
+        Ok(out)
+    }
+
+    /// Materialize the outer Hessian into a dense `dim × dim` matrix by
+    /// applying the operator to the identity in a single
+    /// [`mul_mat`](Self::mul_mat) call, then averaging the off-diagonals to
+    /// stabilize against round-off asymmetry.
+    fn materialize_dense(&self) -> Result<Array2<f64>, String> {
+        let dim = self.dim();
+        let identity = Array2::<f64>::eye(dim);
+        let mut dense = self.mul_mat(identity.view())?;
+        if dense.nrows() != dim || dense.ncols() != dim {
+            return Err(format!(
+                "outer Hessian operator mul_mat returned {}x{}, expected {}x{}",
+                dense.nrows(),
+                dense.ncols(),
+                dim,
+                dim
+            ));
         }
         for row in 0..dim {
             for col in (row + 1)..dim {
@@ -90,35 +139,77 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
         Ok(out)
     }
 
-    fn materialize_dense(&self) -> Result<Array2<f64>, String> {
-        let mut dense = self.base.materialize_dense()?;
+    /// Batched apply: delegate to the inner operator's `mul_mat` (which may
+    /// itself parallelize), then add `rho_block` to the leading `k × k`
+    /// block. This propagates the batched-amortization benefit to wrappers
+    /// — `materialize_dense` (which goes through `mul_mat(eye)`) and any
+    /// future K-column inner-CG batching path.
+    fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let mut out = self.base.mul_mat(factor)?;
         let k = self.rho_block.nrows();
-        if k > dense.nrows() || k > dense.ncols() {
-            return Err(format!(
-                "rho-block Hessian update shape mismatch: got {}x{}, dense operator is {}x{}",
-                self.rho_block.nrows(),
-                self.rho_block.ncols(),
-                dense.nrows(),
-                dense.ncols()
-            ));
+        if k > 0 {
+            if k > out.nrows() {
+                return Err(format!(
+                    "rho-block Hessian update shape mismatch: rho_block is {}x{}, mul_mat output has {} rows",
+                    self.rho_block.nrows(),
+                    self.rho_block.ncols(),
+                    out.nrows()
+                ));
+            }
+            // Update the leading-k rows of `out` by the rho_block contribution
+            // to the first k rows of v: out[..k, :] += rho_block · factor[..k, :].
+            let factor_top = factor.slice(ndarray::s![..k, ..]);
+            let rho_contrib = self.rho_block.dot(&factor_top);
+            out.slice_mut(ndarray::s![..k, ..])
+                .scaled_add(1.0, &rho_contrib);
         }
-        dense
-            .slice_mut(ndarray::s![..k, ..k])
-            .scaled_add(1.0, &self.rho_block);
-        Ok(dense)
+        Ok(out)
     }
 }
 
 /// Maximum outer-Hessian operator dimension at which the planner materializes
-/// the K×K dense matrix (via basis-probing the Hv operator) before handing it
-/// to the dense ARC/Newton path. Below this threshold operator-CG buys
-/// nothing — the K Hv applications it costs to materialize are exactly the K
-/// the planner would otherwise spend over the lifetime of one outer iteration's
-/// Steihaug-Toint inner solve, but the dense path then runs an exact factorization
-/// instead of inexact CG. This is faster, simpler, and more accurate when the
-/// outer parameter dimension is small (typical for spatial smoothing fits with
-/// ≤ a few dozen smoothing parameters); above the threshold the per-outer K²
-/// materialization cost outweighs the per-iteration inner-CG savings.
+/// the `K × K` dense matrix (via [`OuterHessianOperator::mul_mat`]`(I_K)`)
+/// before handing it to the dense ARC/Newton path.
+///
+/// # Cost model
+///
+/// Matrix-free operator trust-region runs Steihaug-Toint CG inside each outer
+/// step; CG converges in at most `K` iterations on a `K × K` SPD operator,
+/// so its per-outer-step cost is bounded above by `K · cost(matvec)`.
+/// Materializing the operator into a dense matrix costs the same: one
+/// `mul_mat(I_K)` is exactly `K` Hv applies (modulo the per-eval cache
+/// amortization implementors can put behind [`mul_mat`](OuterHessianOperator::mul_mat)).
+///
+/// At the same per-iteration cost the dense path additionally:
+///
+/// - factors `H` *exactly* (Cholesky / eigendecomp) and reuses the
+///   factorization across the trust-region's polynomial-step search, where
+///   CG would have to restart from `g`;
+/// - delivers the unmodified Newton step instead of CG's truncated step;
+/// - lets the existing ARC trust-region implementation (`ArcOptimizer`) take
+///   over the entire policy with all its cubic-regularization machinery
+///   instead of re-implementing it for the operator path.
+///
+/// At small `K` (this regime — typical for spatial smoothing fits with a few
+/// dozen smoothing parameters) the dense path therefore wins at every layer:
+/// fewer total Hv applies (CG often takes more than `K` iterations across the
+/// full trust-region search), fewer policy bugs, fewer numerics. At large
+/// `K` the `O(K²)` materialization storage and `O(K³)` factorization cost
+/// dominate and operator-CG's truncated approximation pays off.
+///
+/// Crossover is empirical and conservative: 64 is well below the regime where
+/// the `K × K` dense factorization could become a bottleneck (it's
+/// microseconds at this scale) and well above the `K ≤ 16` regime where
+/// every realistic GAM smoothing-parameter count lands.
+///
+/// # Single source of truth
+///
+/// This constant only governs *planner-side* representation choice. The
+/// *eval-side* operator-vs-dense gate lives in
+/// [`crate::solver::reml::unified::prefer_outer_hessian_operator`] and
+/// considers `(n, p, K)` jointly. Don't add a duplicate `K`-only check on the
+/// eval side; if you need to tune the materialization threshold, change this
+/// constant.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
 
 /// Hv-apply counter wrapping an `OuterHessianOperator`.
