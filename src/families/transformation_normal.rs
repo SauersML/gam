@@ -556,14 +556,11 @@ fn weighted_crossprod_dense(
 ) -> Array2<f64> {
     debug_assert_eq!(left.nrows(), weights.len());
     debug_assert_eq!(right.nrows(), weights.len());
-    let mut weighted_right = right.clone();
-    for i in 0..weighted_right.nrows() {
-        let wi = weights[i];
-        for j in 0..weighted_right.ncols() {
-            weighted_right[[i, j]] *= wi;
-        }
-    }
-    fast_atb(left, &weighted_right)
+    // Streaming `left^T diag(w) right`: fast_xt_diag_y allocates only one
+    // chunk-of-rows worth of weighted-Y instead of cloning the full
+    // n × right.ncols matrix. At biobank scale (n=300K, p_cov=200) that drops
+    // a transient ~480 MiB allocation per call to a few-MiB sliding chunk.
+    crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
 }
 
 /// Weighted cross-product of two rowwise-Kronecker designs, kept strictly
