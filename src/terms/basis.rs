@@ -2307,7 +2307,7 @@ fn design_constraint_cross(
                 row *= weight;
             }
         }
-        cross += &basis_chunk.t().dot(&constraint_chunk);
+        cross += &fast_atb(&basis_chunk, &constraint_chunk);
     }
     Ok(cross)
 }
@@ -2321,7 +2321,7 @@ fn design_gram_matrix(design: &DesignMatrix) -> Result<Array2<f64>, BasisError> 
         let chunk = design
             .try_row_chunk(start..end)
             .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
-        gram += &chunk.t().dot(&chunk);
+        gram += &fast_atb(&chunk, &chunk);
     }
     Ok(gram)
 }
@@ -5290,7 +5290,7 @@ fn apply_bspline_identifiability_policy(
         }
         BSplineIdentifiability::RemoveLinearTrend => {
             let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
-            (design.dot(&z), Some(z))
+            (fast_ab(&design, &z), Some(z))
         }
         BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
             let (b_c, z) = applyweighted_orthogonality_constraint(
@@ -5309,7 +5309,7 @@ fn apply_bspline_identifiability_policy(
                     z.nrows()
                 )));
             }
-            (design.dot(&z), Some(z))
+            (fast_ab(&design, &z), Some(z))
         }
     };
 
