@@ -7498,8 +7498,14 @@ impl HessianOperator for DenseSpectralOperator {
 
     fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
         // h^G_i = ‖(X G)_{i,:}‖² where G_ε = G Gᵀ and G = self.g_factor.
+        // The dominant cost at biobank scale is the (n × p)·(p × rank) matmul
+        // — for matern60 with n=320K, p=101 that's ~3.3 GFLOPs and the
+        // ndarray default `.dot()` runs single-threaded (no BLAS feature
+        // enabled in this crate's build), so per-eval gradient at full data
+        // spends ~600 ms here on one core. faer's matmul parallelizes across
+        // the 320K-row dimension at zero accuracy cost.
         let xd = x.to_dense_arc();
-        let xg = xd.as_ref().dot(&self.g_factor);
+        let xg = crate::faer_ndarray::fast_ab(xd.as_ref(), &self.g_factor);
         xg.outer_iter()
             .map(|r| r.iter().map(|v| v * v).sum())
             .collect()
