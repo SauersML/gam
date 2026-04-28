@@ -6852,16 +6852,27 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
         out
     }
 
+    fn mul_basis_columns_into(
+        &self,
+        start: usize,
+        mut out: ndarray::ArrayViewMut2<'_, f64>,
+    ) {
+        let cols = out.ncols();
+        debug_assert!(start + cols <= self.dim);
+        let mut basis = Array1::<f64>::zeros(self.dim);
+        for local_col in 0..cols {
+            let global_col = start + local_col;
+            basis[global_col] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(local_col).assign(&col);
+            basis[global_col] = 0.0;
+        }
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         // Build by basis-vector probing — small-K materialization path.
         let mut out = Array2::<f64>::zeros((self.dim, self.dim));
-        let mut basis = Array1::<f64>::zeros(self.dim);
-        for j in 0..self.dim {
-            basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
+        self.mul_basis_columns_into(0, out.view_mut());
         out
     }
 
