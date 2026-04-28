@@ -9,11 +9,14 @@
 
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, Exp as RandExp, Normal as RandNormal};
-use statrs::distribution::{Continuous, ContinuousCDF, Exp as StatrsExp, InverseGamma, Normal};
+use statrs::distribution::{ContinuousCDF, Normal};
 use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
 
 const PI_SQ: f64 = PI * PI;
-const PRECOMPUTE_K: usize = 50;
+// 1 / sqrt(pi) — used in the inverse-gamma PDF coefficient
+// f(x; α=0.5, β=2k²) = sqrt(2k²/π) · x^{-3/2} · exp(-2k²/x)
+//                    = k · sqrt(2)/sqrt(π) · x^{-3/2} · exp(-2k²/x).
+const SQRT_2_OVER_SQRT_PI: f64 = 1.128_379_167_095_512_57; // sqrt(2 / pi)
 
 /// Sampler for the Pólya-Gamma PG(1, c) distribution.
 #[derive(Debug, Clone)]
@@ -21,8 +24,6 @@ pub struct PolyaGamma {
     exp: RandExp<f64>,
     std_norm: Normal,
     std_norm_sampler: RandNormal<f64>,
-    inv_gamma: Vec<InverseGamma>,
-    series_exp: Vec<StatrsExp>,
 }
 
 impl PolyaGamma {
@@ -31,18 +32,6 @@ impl PolyaGamma {
             exp: RandExp::new(1.0).expect("Exp(1) valid"),
             std_norm: Normal::standard(),
             std_norm_sampler: RandNormal::new(0.0, 1.0).expect("N(0,1) valid"),
-            inv_gamma: (0..PRECOMPUTE_K)
-                .map(|k| {
-                    let k = k as f64 + 0.5;
-                    InverseGamma::new(0.5, 2.0 * k * k).expect("IG valid")
-                })
-                .collect(),
-            series_exp: (0..PRECOMPUTE_K)
-                .map(|k| {
-                    let k = k as f64 + 0.5;
-                    StatrsExp::new(k * k * PI_SQ / 2.0).expect("Exp valid")
-                })
-                .collect(),
         }
     }
 
@@ -96,25 +85,28 @@ impl PolyaGamma {
         1.0 / (1.0 + exp_terms)
     }
 
+    #[inline]
     fn series_coefficient(&self, n: usize, x: f64) -> f64 {
-        let k0 = n as f64 + 0.5;
         if x <= 0.0 {
-            0.0
-        } else if x <= FRAC_2_PI {
-            if n < self.inv_gamma.len() {
-                self.inv_gamma[n].pdf(x) * 2.0
-            } else {
-                let ig = InverseGamma::new(0.5, 2.0 * k0 * k0).expect("IG valid");
-                ig.pdf(x) * 2.0
-            }
+            return 0.0;
+        }
+        let k0 = n as f64 + 0.5;
+        let k_sq = k0 * k0;
+        if x <= FRAC_2_PI {
+            // 2 · InverseGamma(α=1/2, β=2k²) PDF at x
+            //   = 2 · (β^α / Γ(α)) · x^{-α-1} · exp(-β/x)
+            //   = 2 · sqrt(2k²/π) · x^{-3/2} · exp(-2k²/x)
+            //   = (2 · k · sqrt(2/π)) · x^{-3/2} · exp(-2k²/x).
+            let coeff = 2.0 * k0 * SQRT_2_OVER_SQRT_PI;
+            let inv_x = 1.0 / x;
+            // x^{-3/2} = inv_x · sqrt(inv_x) — avoids a `powf`.
+            let x_neg_three_half = inv_x * inv_x.sqrt();
+            coeff * x_neg_three_half * (-2.0 * k_sq * inv_x).exp()
         } else {
-            let scale = 1.0 / (PI * k0 * k0);
-            if n < self.series_exp.len() {
-                scale * self.series_exp[n].pdf(x)
-            } else {
-                let exp = StatrsExp::new(k0 * k0 * PI_SQ / 2.0).expect("Exp valid");
-                scale * exp.pdf(x)
-            }
+            // (1 / (π · k²)) · Exp(rate = k² π² / 2) PDF at x
+            //   = (1 / (π · k²)) · (k² π² / 2) · exp(-k² π² x / 2)
+            //   = (π / 2) · exp(-k² π² x / 2).
+            FRAC_PI_2 * (-0.5 * k_sq * PI_SQ * x).exp()
         }
     }
 
