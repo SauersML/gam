@@ -85,8 +85,7 @@
       "scale_dimensions": true,
       "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
-      "logslope_linkwiggle_knots": 8,
-      "max_centers": 24
+      "logslope_linkwiggle_knots": 8
     },
     {
       "name": "r_mgcv_matern60",
@@ -113,8 +112,7 @@
       "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
       "logslope_linkwiggle_knots": 8,
-      "timewiggle_knots": 8,
-      "max_centers": 24
+      "timewiggle_knots": 8
     },
     {
       "name": "r_mgcv_survival_ps",
