@@ -939,15 +939,17 @@ pub trait CustomFamily {
     /// The default returns `false`.  Families that override
     /// `exact_newton_joint_hessian_workspace` to return `Some(workspace)`
     /// at evaluation time should also override this to return `true` so
-    /// that the outer planner — which decides between ARC and BFGS *before*
-    /// any evaluation occurs — knows the matrix-free Hv path is available.
+    /// the outer build site can promote `cap_hessian` to `Analytic` before
+    /// the first evaluation.
     ///
-    /// Used by `OuterProblem::with_matrix_free_hessian_available` at the
-    /// REML/LAML outer construction sites: when the dimensions cross
-    /// `use_joint_matrix_free_path`'s thresholds *and* this returns `true`,
-    /// the eval will return `HessianResult::Operator`, ARC will route to
-    /// `run_operator_trust_region`, and the work-cost downgrade should be
-    /// suppressed (BFGS is no longer faster per outer iteration).
+    /// Used at `fit_custom_family`'s outer setup: when this returns `true`
+    /// AND `use_joint_matrix_free_path(total_p_joint, n_obs_joint)` fires,
+    /// `cap_hessian` is forced to `Derivative::Analytic` so the planner
+    /// keeps ARC + analytic-Hessian routing instead of degrading to BFGS
+    /// when the family declared `Unavailable` for the dense Hessian. The
+    /// runtime evaluator then returns `HessianResult::Operator` and ARC
+    /// dispatches via `run_operator_trust_region` (or the K×K basis-probe
+    /// materialization at small K, per `OUTER_HVP_MATERIALIZE_MAX_DIM`).
     fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         false
     }

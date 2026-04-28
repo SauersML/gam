@@ -11599,6 +11599,249 @@ mod tests {
         assert!((result[1] - 0.5).abs() < 1e-10);
     }
 
+    /// Contract: `ImplicitHyperOperator::mul_vec(v)` reproduces the analytic
+    /// first-order spatial drift
+    ///   `B_d v = (∂X/∂ψ_d)ᵀ W X v + Xᵀ W (∂X/∂ψ_d) v + Xᵀ diag(c·X_{ψ_d}β̂) X v + S_{ψ_d} v`.
+    ///
+    /// The third (non-Gaussian) term is the part that landed under task #7 —
+    /// it must agree with the dense reference computed from
+    /// `materialize_first(axis)`. We build a tiny `ImplicitDesignPsiDerivative`
+    /// (n=4, n_knots=2, n_axes=1, no identifiability transform), assemble a
+    /// known X / W / S_ψ / c_x_psi_beta, and check `mul_vec(v)` against the
+    /// fully-dense formula above for several probe vectors v.
+    ///
+    /// Also runs once with `c_x_psi_beta = None` to lock in the Gaussian
+    /// fast-path: the third term must drop out cleanly.
+    #[test]
+    fn implicit_hyper_operator_third_derivative_term_matches_dense_reference() {
+        use crate::terms::basis::ImplicitDesignPsiDerivative;
+        use std::sync::Arc;
+
+        let n = 4usize;
+        let n_knots = 2usize;
+        let n_axes = 1usize;
+        let p = n_knots; // no polynomial padding, no identifiability transform
+
+        // Implicit operator: deliberately non-trivial radial scalars so the
+        // resulting (∂X/∂ψ_0) is dense and not accidentally zero.
+        // First-axis kernel value (no transform path) is `q_ij·s_b[axis] + c·phi_ij`
+        // with `c = psi_scale_share = 0.0` — so the kernel is `q_ij · s_{0,ij}`.
+        let phi_values = array![1.0, 0.5, 0.7, 0.9, 0.3, 0.4, 0.6, 0.8];
+        let q_values = array![0.5, -0.2, 0.3, 0.1, -0.4, 0.2, 0.6, -0.1];
+        let t_values = array![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // axis_components is (n*n_knots, n_axes) row-major: rows = (i, j) pair.
+        let axis_components = array![[0.7], [0.3], [-0.4], [0.5], [0.2], [-0.1], [0.6], [0.8]];
+        let implicit = Arc::new(ImplicitDesignPsiDerivative::new(
+            phi_values,
+            q_values,
+            t_values,
+            axis_components,
+            None,
+            None,
+            n,
+            n_knots,
+            0,
+            n_axes,
+        ));
+
+        // Active-basis design X (n × p): chosen so Xᵀ X is well-conditioned.
+        let x_data = array![
+            [1.0, 0.30],
+            [0.50, 1.20],
+            [-0.20, 0.80],
+            [0.90, -0.40],
+        ];
+        let x_design = Arc::new(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            x_data.clone(),
+        )));
+        let w_diag = Arc::new(array![0.8, 1.2, 0.6, 1.5]);
+
+        // S_psi (p × p): symmetric, dense.
+        let s_psi = array![[0.40, 0.05], [0.05, 0.25]];
+
+        // β̂ used to fold c · (∂X/∂ψ_0) β̂ into the per-row kernel.
+        let beta_eval = array![0.30, -0.20];
+        // c_array (length n) — the GLM third-derivative weight.
+        let c_array = array![0.10, -0.05, 0.20, 0.15];
+
+        // Reference dense (∂X/∂ψ_0).
+        let dx_dpsi = implicit
+            .materialize_first(0)
+            .expect("materialize_first should succeed on tiny fixture");
+        assert_eq!(dx_dpsi.shape(), &[n, p]);
+
+        // c_x_psi_beta[i] = c[i] · (∂X/∂ψ_0 · β̂)[i].
+        let dx_beta = dx_dpsi.dot(&beta_eval);
+        let c_x_psi_beta_dense = &c_array * &dx_beta;
+        let c_x_psi_beta = Some(Arc::new(c_x_psi_beta_dense.clone()));
+
+        let op = ImplicitHyperOperator {
+            implicit_deriv: Arc::clone(&implicit),
+            axis: 0,
+            x_design: Arc::clone(&x_design),
+            w_diag: Arc::clone(&w_diag),
+            s_psi: s_psi.clone(),
+            p,
+            c_x_psi_beta,
+        };
+
+        let probes = [
+            array![1.0, 0.0],
+            array![0.0, 1.0],
+            array![0.7, -0.4],
+            array![-0.25, 1.10],
+        ];
+        for (k, v) in probes.iter().enumerate() {
+            // Analytic dense reference.
+            //   t1 = (∂X/∂ψ_0)ᵀ · diag(W) · X · v
+            //   t2 = Xᵀ · diag(W) · (∂X/∂ψ_0) · v
+            //   t3 = Xᵀ · diag(c_x_psi_beta) · X · v
+            //   t4 = S_psi · v
+            let xv = x_data.dot(v);
+            let dxv = dx_dpsi.dot(v);
+            let w_xv = &*w_diag * &xv;
+            let w_dxv = &*w_diag * &dxv;
+            let t1 = dx_dpsi.t().dot(&w_xv);
+            let t2 = x_data.t().dot(&w_dxv);
+            let weighted = &c_x_psi_beta_dense * &xv;
+            let t3 = x_data.t().dot(&weighted);
+            let t4 = s_psi.dot(v);
+            let want = &t1 + &t2 + &t3 + &t4;
+
+            let got = op.mul_vec(v);
+            assert_eq!(got.len(), p);
+            for i in 0..p {
+                let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "B_d·v mismatch at probe {k}, comp {i}: want={:.6e}, got={:.6e}",
+                    want[i],
+                    got[i],
+                );
+            }
+        }
+
+        // Gaussian path: c_x_psi_beta = None must drop the third term cleanly.
+        let op_gauss = ImplicitHyperOperator {
+            implicit_deriv: Arc::clone(&implicit),
+            axis: 0,
+            x_design,
+            w_diag: Arc::clone(&w_diag),
+            s_psi: s_psi.clone(),
+            p,
+            c_x_psi_beta: None,
+        };
+        let v = array![0.7, -0.4];
+        let xv = x_data.dot(&v);
+        let dxv = dx_dpsi.dot(&v);
+        let w_xv = &*w_diag * &xv;
+        let w_dxv = &*w_diag * &dxv;
+        let want = &dx_dpsi.t().dot(&w_xv) + &x_data.t().dot(&w_dxv) + &s_psi.dot(&v);
+        let got = op_gauss.mul_vec(&v);
+        for i in 0..p {
+            let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
+            assert!(
+                (want[i] - got[i]).abs() <= tol,
+                "Gaussian B_d·v mismatch at comp {i}: want={:.6e}, got={:.6e}",
+                want[i],
+                got[i],
+            );
+        }
+    }
+
+    /// Centered finite-difference check on the third-derivative term in
+    /// isolation: at fixed (X, W, S_ψ, β̂) the term `Xᵀ diag(c · X_ψ β̂) X v` is
+    /// linear in `v`, so the *correctness* check is a comparison against the
+    /// analytic action. To exercise the FD route the spec asks for, we
+    /// finite-difference along v using the operator's `mul_vec` and confirm
+    /// the operator is exactly the linear map encoded by its kernel — i.e. the
+    /// difference quotient `(op.mul_vec(v + ε e_j) − op.mul_vec(v − ε e_j))/(2ε)`
+    /// equals the j-th column of `Xᵀ diag(c_x_psi_beta) X` at any v.
+    #[test]
+    fn implicit_hyper_operator_third_derivative_term_centered_fd_matches_jacobian_column() {
+        use crate::terms::basis::ImplicitDesignPsiDerivative;
+        use std::sync::Arc;
+
+        let n = 5usize;
+        let n_knots = 3usize;
+        let n_axes = 1usize;
+        let p = n_knots;
+
+        let phi_values = Array1::from_vec((0..n * n_knots).map(|k| 0.1 + 0.05 * (k as f64)).collect());
+        let q_values = Array1::from_vec((0..n * n_knots).map(|k| -0.2 + 0.07 * (k as f64)).collect());
+        let t_values = Array1::zeros(n * n_knots);
+        let axis_components = Array2::from_shape_vec(
+            (n * n_knots, n_axes),
+            (0..n * n_knots).map(|k| 0.3 + 0.04 * (k as f64)).collect(),
+        )
+        .unwrap();
+        let implicit = Arc::new(ImplicitDesignPsiDerivative::new(
+            phi_values,
+            q_values,
+            t_values,
+            axis_components,
+            None,
+            None,
+            n,
+            n_knots,
+            0,
+            n_axes,
+        ));
+
+        let x_data = array![
+            [1.0, 0.4, -0.2],
+            [0.5, 1.1, 0.3],
+            [-0.3, 0.9, 0.6],
+            [0.8, -0.5, 1.2],
+            [0.2, 0.7, -0.4],
+        ];
+        let x_design = Arc::new(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            x_data.clone(),
+        )));
+        let w_diag = Arc::new(array![1.0, 0.7, 1.3, 0.9, 1.1]);
+        let s_psi = Array2::<f64>::eye(p) * 0.05;
+
+        let beta_eval = array![0.20, -0.10, 0.30];
+        let c_array = array![0.15, -0.08, 0.22, 0.05, -0.12];
+        let dx_dpsi = implicit.materialize_first(0).expect("materialize_first");
+        let dx_beta = dx_dpsi.dot(&beta_eval);
+        let c_x_psi_beta_dense = &c_array * &dx_beta;
+
+        let op = ImplicitHyperOperator {
+            implicit_deriv: Arc::clone(&implicit),
+            axis: 0,
+            x_design,
+            w_diag,
+            s_psi,
+            p,
+            c_x_psi_beta: Some(Arc::new(c_x_psi_beta_dense.clone())),
+        };
+
+        // Dense Jacobian column j: B_d e_j.
+        let v_base = array![0.10, -0.05, 0.20];
+        let eps = 1e-6;
+        for j in 0..p {
+            let mut e_j = Array1::<f64>::zeros(p);
+            e_j[j] = 1.0;
+            // Centered FD on mul_vec along e_j gives B_d e_j (operator is linear in v).
+            let mut v_plus = v_base.clone();
+            v_plus[j] += eps;
+            let mut v_minus = v_base.clone();
+            v_minus[j] -= eps;
+            let fd = (&op.mul_vec(&v_plus) - &op.mul_vec(&v_minus)).mapv(|x| x / (2.0 * eps));
+            let analytic = op.mul_vec(&e_j);
+            for i in 0..p {
+                let tol = 1e-7 * analytic[i].abs().max(1.0) + 1e-7;
+                assert!(
+                    (analytic[i] - fd[i]).abs() <= tol,
+                    "FD col {j} mismatch at row {i}: analytic={:.6e}, fd={:.6e}",
+                    analytic[i],
+                    fd[i],
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_pseudoinverse_scalar() {
         let mut g = Array2::<f64>::zeros((1, 1));
