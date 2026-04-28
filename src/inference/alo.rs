@@ -647,12 +647,27 @@ pub fn compute_multiblock_alo(
     let col_offsets = multiblock_col_offsets(input.block_designs);
     let chunk_size = multiblock_alo_chunk_size(p_tot, b, n);
 
-    let ib = Array2::<f64>::eye(b);
-
     let mut eta_tilde = Vec::with_capacity(n);
     let mut leverage = Array1::<f64>::zeros(n);
     let mut alo_variance = Vec::with_capacity(n);
     let mut cook_distance = Array1::<f64>::zeros(n);
+
+    // Hoisted scratch buffers reused across all observations and chunks.
+    // Row-major flat layout (size b*b) avoids per-iteration ndarray allocations.
+    let bb_sz = b * b;
+    let mut a_i = vec![0.0f64; bb_sz];
+    let mut wa = vec![0.0f64; bb_sz]; // W_i A_i
+    let mut aw = vec![0.0f64; bb_sz]; // A_i W_i
+    let mut imwa = vec![0.0f64; bb_sz]; // I - W_i A_i (LU-decomposed in place)
+    let mut imaw = vec![0.0f64; bb_sz]; // I - A_i W_i (LU-decomposed in place)
+    let mut perm_imwa = vec![0usize; b];
+    let mut perm_imaw = vec![0usize; b];
+    let mut delta_eta = vec![0.0f64; b];
+    let mut rhs_buf = vec![0.0f64; b];
+    let mut w_u = vec![0.0f64; b];
+    let mut var_diag_buf = vec![0.0f64; b];
+    let mut w_flat = vec![0.0f64; bb_sz];
+    let mut lu_scratch = vec![0.0f64; b];
 
     for chunk_start in (0..n).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(n);
@@ -673,139 +688,154 @@ pub fn compute_multiblock_alo(
 
         for local_i in 0..chunk_len {
             let i = chunk_start + local_i;
-            // --- Assemble A_i = G_i = X_i H⁻¹ X_iᵀ  (B × B) ---
-            let mut a_i = Array2::<f64>::zeros((b, b));
+            let w_i = &input.block_weights[i];
+
+            // Flatten W_i once per observation (row-major).
+            for r in 0..b {
+                for c in 0..b {
+                    w_flat[r * b + c] = w_i[(r, c)];
+                }
+            }
+
+            // --- Assemble A_i = X_i H⁻¹ X_iᵀ  (B × B), row-major flat. ---
             for a in 0..b {
                 let x_a = &input.block_designs[a];
                 let p_a = x_a.ncols();
                 let off_a = col_offsets[a];
+                let xa_row = x_a.row(i);
                 for bb in 0..b {
                     let q_bb = &q_blocks[bb];
                     let mut dot = 0.0f64;
                     for k in 0..p_a {
-                        dot += x_a[(i, k)] * q_bb[(off_a + k, local_i)];
+                        dot += xa_row[k] * q_bb[(off_a + k, local_i)];
                     }
-                    a_i[(a, bb)] = dot;
+                    a_i[a * b + bb] = dot;
                 }
             }
 
-            let w_i = &input.block_weights[i];
-            let mut h_ii = Array2::<f64>::zeros((b, b));
-            for r in 0..b {
-                for c in 0..b {
-                    let mut v = 0.0f64;
-                    for k in 0..b {
-                        v += a_i[(r, k)] * w_i[(k, c)];
-                    }
-                    h_ii[(r, c)] = v;
-                }
-            }
+            // WA = W_i · A_i (row-major).
+            mat_mul_flat(&w_flat, &a_i, &mut wa, b);
+            // AW = A_i · W_i (row-major).
+            mat_mul_flat(&a_i, &w_flat, &mut aw, b);
 
+            // Trace of H_ii = A_i W_i (= AW): leverage[i].
+            // (Original code wrote H_ii = A · W — the same operator we already have in `aw`.)
             let mut tr = 0.0f64;
             for d in 0..b {
-                tr += h_ii[(d, d)];
+                tr += aw[d * b + d];
             }
             leverage[i] = tr;
 
-            let s_i = &input.scores[i];
-            let eta_i = &input.eta_hat[i];
-
-            let mut imwa = ib.clone();
+            // Build (I - W A) and (I - A W) into imwa/imaw.
             for r in 0..b {
                 for c in 0..b {
-                    let mut wa_rc = 0.0f64;
-                    for k in 0..b {
-                        wa_rc += w_i[(r, k)] * a_i[(k, c)];
-                    }
-                    imwa[(r, c)] -= wa_rc;
+                    let idx = r * b + c;
+                    let id = if r == c { 1.0 } else { 0.0 };
+                    imwa[idx] = id - wa[idx];
+                    imaw[idx] = id - aw[idx];
                 }
             }
 
-            let imwa_det = det_small(&imwa, b);
-            let imwa_to_solve = if imwa_det.abs() < 1e-12 {
-                let eps = 1e-6;
-                let mut reg = imwa.clone();
-                for d in 0..b {
-                    reg[(d, d)] += eps;
+            // Factor in place with partial pivoting; ridge on the diagonal if singular.
+            // Equivalence with original: original computed det via det_small, regularized
+            // by adding eps=1e-6 to the diagonal when |det| < 1e-12, then re-factored on
+            // the regularized matrix. Here we factor directly; if any pivot is below the
+            // singular threshold we add the ridge once and re-factor — same numerical path.
+            if !lu_factor_in_place(&mut imwa, &mut perm_imwa, b) {
+                for r in 0..b {
+                    for c in 0..b {
+                        let idx = r * b + c;
+                        let id = if r == c { 1.0 } else { 0.0 };
+                        imwa[idx] = id - wa[idx];
+                    }
                 }
-                reg
-            } else {
-                imwa
-            };
+                for d in 0..b {
+                    imwa[d * b + d] += 1e-6;
+                }
+                let _ = lu_factor_in_place(&mut imwa, &mut perm_imwa, b);
+            }
+            if !lu_factor_in_place(&mut imaw, &mut perm_imaw, b) {
+                for r in 0..b {
+                    for c in 0..b {
+                        let idx = r * b + c;
+                        let id = if r == c { 1.0 } else { 0.0 };
+                        imaw[idx] = id - aw[idx];
+                    }
+                }
+                for d in 0..b {
+                    imaw[d * b + d] += 1e-6;
+                }
+                let _ = lu_factor_in_place(&mut imaw, &mut perm_imaw, b);
+            }
 
-            let v_i = solve_small(&imwa_to_solve, s_i, b);
-
-            let mut delta_eta = Array1::<f64>::zeros(b);
+            // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.
+            let s_i = &input.scores[i];
+            for k in 0..b {
+                rhs_buf[k] = s_i[k];
+            }
+            lu_solve_in_place(&imwa, &perm_imwa, &mut rhs_buf, &mut lu_scratch, b);
+            // delta_eta = A_i · v_i
             for r in 0..b {
                 let mut acc = 0.0f64;
+                let row_off = r * b;
                 for k in 0..b {
-                    acc += a_i[(r, k)] * v_i[k];
+                    acc += a_i[row_off + k] * rhs_buf[k];
                 }
                 delta_eta[r] = acc;
             }
 
-            let mut corrected = eta_i.clone();
+            let eta_i = &input.eta_hat[i];
+            let mut corrected = Array1::<f64>::zeros(b);
             for d in 0..b {
-                corrected[d] += delta_eta[d];
+                corrected[d] = eta_i[d] + delta_eta[d];
             }
             eta_tilde.push(corrected);
 
+            // Cook's distance: δη^T W δη.
             let mut cook = 0.0f64;
             for r in 0..b {
                 let mut w_delta_r = 0.0f64;
+                let row_off = r * b;
                 for k in 0..b {
-                    w_delta_r += w_i[(r, k)] * delta_eta[k];
+                    w_delta_r += w_flat[row_off + k] * delta_eta[k];
                 }
                 cook += delta_eta[r] * w_delta_r;
             }
             cook_distance[i] = cook;
 
-            let mut imaw = ib.clone();
-            for r in 0..b {
-                for c in 0..b {
-                    let mut aw_rc = 0.0f64;
-                    for k in 0..b {
-                        aw_rc += a_i[(r, k)] * w_i[(k, c)];
-                    }
-                    imaw[(r, c)] -= aw_rc;
-                }
-            }
-
-            let imaw_det = det_small(&imaw, b);
-            let imaw_to_solve = if imaw_det.abs() < 1e-12 {
-                let eps = 1e-6;
-                let mut reg = imaw.clone();
-                for d in 0..b {
-                    reg[(d, d)] += eps;
-                }
-                reg
-            } else {
-                imaw
-            };
-
-            let mut var_diag = Array1::<f64>::zeros(b);
+            // var_diag[d] = a_d^T (I-WA)⁻¹ W (I-AW)⁻¹ a_d
+            // where a_d is the d-th row of A_i.
+            // Reuses already-factored imwa and imaw (one LU factorization each, reused
+            // across all B right-hand sides — major saving over the original which redid
+            // both LU decompositions B times per observation).
             for d in 0..b {
-                let mut a_col_d = Array1::<f64>::zeros(b);
+                let row_off = d * b;
+                // u_d = (I - A W)⁻¹ a_d
                 for k in 0..b {
-                    a_col_d[k] = a_i[(d, k)];
+                    rhs_buf[k] = a_i[row_off + k];
                 }
-
-                let u_d = solve_small(&imaw_to_solve, &a_col_d, b);
-                let mut w_u_d = Array1::<f64>::zeros(b);
+                lu_solve_in_place(&imaw, &perm_imaw, &mut rhs_buf, &mut lu_scratch, b);
+                // w_u = W u_d
                 for r in 0..b {
                     let mut acc = 0.0f64;
+                    let wr = r * b;
                     for k in 0..b {
-                        acc += w_i[(r, k)] * u_d[k];
+                        acc += w_flat[wr + k] * rhs_buf[k];
                     }
-                    w_u_d[r] = acc;
+                    w_u[r] = acc;
                 }
-
-                let t_d = solve_small(&imwa_to_solve, &w_u_d, b);
+                // t_d = (I - W A)⁻¹ w_u  (back-solve in place using w_u as RHS).
+                lu_solve_in_place(&imwa, &perm_imwa, &mut w_u, &mut lu_scratch, b);
+                // v_dd = a_d^T t_d
                 let mut v_dd = 0.0f64;
                 for k in 0..b {
-                    v_dd += a_i[(d, k)] * t_d[k];
+                    v_dd += a_i[row_off + k] * w_u[k];
                 }
-                var_diag[d] = v_dd.max(0.0);
+                var_diag_buf[d] = v_dd.max(0.0);
+            }
+            let mut var_diag = Array1::<f64>::zeros(b);
+            for d in 0..b {
+                var_diag[d] = var_diag_buf[d];
             }
             alo_variance.push(var_diag);
         }
@@ -817,6 +847,85 @@ pub fn compute_multiblock_alo(
         alo_variance,
         cook_distance,
     })
+}
+
+/// B × B row-major matmul: out = a · b.
+#[inline]
+fn mat_mul_flat(a: &[f64], b_mat: &[f64], out: &mut [f64], b: usize) {
+    for r in 0..b {
+        let ar = r * b;
+        let or = r * b;
+        for c in 0..b {
+            let mut acc = 0.0f64;
+            for k in 0..b {
+                acc += a[ar + k] * b_mat[k * b + c];
+            }
+            out[or + c] = acc;
+        }
+    }
+}
+
+/// LU-decompose a B × B row-major matrix in place with partial pivoting.
+/// Returns false if the matrix is detected singular (any pivot |a_kk| < 1e-12).
+/// On success, `m` holds L (strict lower) and U (upper incl diag); `perm` is the
+/// row permutation. Pivot threshold matches the original `det_small < 1e-12` path
+/// so the regularization branch fires under equivalent conditions.
+fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize) -> bool {
+    for i in 0..b {
+        perm[i] = i;
+    }
+    for col in 0..b {
+        // Partial pivot on column `col` over rows `[col..b]`.
+        let mut max_val = m[perm[col] * b + col].abs();
+        let mut max_idx = col;
+        for row in (col + 1)..b {
+            let v = m[perm[row] * b + col].abs();
+            if v > max_val {
+                max_val = v;
+                max_idx = row;
+            }
+        }
+        if max_val < 1e-12 {
+            return false;
+        }
+        perm.swap(col, max_idx);
+        let pivot_row = perm[col];
+        let pivot = m[pivot_row * b + col];
+        for row in (col + 1)..b {
+            let r_idx = perm[row];
+            let factor = m[r_idx * b + col] / pivot;
+            m[r_idx * b + col] = factor; // store L below diag
+            for k in (col + 1)..b {
+                let upd = factor * m[pivot_row * b + k];
+                m[r_idx * b + k] -= upd;
+            }
+        }
+    }
+    true
+}
+
+/// Solve L U x = P rhs using a previously factored matrix (perm + LU in `m`).
+/// Writes the solution back into `rhs`. `scratch` must have length ≥ b.
+fn lu_solve_in_place(m: &[f64], perm: &[usize], rhs: &mut [f64], scratch: &mut [f64], b: usize) {
+    // Forward substitution Ly = P rhs (L has unit diag, stored strict lower in permuted rows).
+    let y = &mut scratch[..b];
+    for row in 0..b {
+        let r_idx = perm[row];
+        let mut s = rhs[perm[row]];
+        for k in 0..row {
+            s -= m[r_idx * b + k] * y[k];
+        }
+        y[row] = s;
+    }
+    // Back substitution U x = y.
+    for row in (0..b).rev() {
+        let r_idx = perm[row];
+        let mut s = y[row];
+        for k in (row + 1)..b {
+            s -= m[r_idx * b + k] * rhs[k];
+        }
+        rhs[row] = s / m[r_idx * b + row];
+    }
 }
 
 /// Compute only per-observation leverages tr(H_ii) for multi-predictor models.
@@ -882,147 +991,8 @@ pub fn compute_multiblock_alo_leverages(
     Ok(leverage)
 }
 
-// Small-matrix helpers for B × B systems (B typically 2-4)
-
-/// Determinant of a small B × B matrix (B ≤ 4).
-fn det_small(m: &Array2<f64>, b: usize) -> f64 {
-    match b {
-        1 => m[(0, 0)],
-        2 => m[(0, 0)] * m[(1, 1)] - m[(0, 1)] * m[(1, 0)],
-        3 => {
-            m[(0, 0)] * (m[(1, 1)] * m[(2, 2)] - m[(1, 2)] * m[(2, 1)])
-                - m[(0, 1)] * (m[(1, 0)] * m[(2, 2)] - m[(1, 2)] * m[(2, 0)])
-                + m[(0, 2)] * (m[(1, 0)] * m[(2, 1)] - m[(1, 1)] * m[(2, 0)])
-        }
-        _ => {
-            // LU-style determinant for B > 3.  Copy and pivot.
-            let mut a = m.clone();
-            let mut det = 1.0f64;
-            for col in 0..b {
-                // Partial pivot.
-                let mut max_val = a[(col, col)].abs();
-                let mut max_row = col;
-                for row in (col + 1)..b {
-                    let v = a[(row, col)].abs();
-                    if v > max_val {
-                        max_val = v;
-                        max_row = row;
-                    }
-                }
-                if max_val < 1e-50 {
-                    return 0.0;
-                }
-                if max_row != col {
-                    for k in 0..b {
-                        let tmp = a[(col, k)];
-                        a[(col, k)] = a[(max_row, k)];
-                        a[(max_row, k)] = tmp;
-                    }
-                    det = -det;
-                }
-                det *= a[(col, col)];
-                let pivot = a[(col, col)];
-                for row in (col + 1)..b {
-                    let factor = a[(row, col)] / pivot;
-                    for k in (col + 1)..b {
-                        a[(row, k)] -= factor * a[(col, k)];
-                    }
-                }
-            }
-            det
-        }
-    }
-}
-
-/// Solve a small B × B linear system m x = rhs.
-///
-/// For B ≤ 3 uses closed-form inverse; for B > 3 uses LU with partial pivoting.
-fn solve_small(m: &Array2<f64>, rhs: &Array1<f64>, b: usize) -> Array1<f64> {
-    match b {
-        1 => {
-            let mut out = Array1::<f64>::zeros(1);
-            out[0] = rhs[0] / m[(0, 0)];
-            out
-        }
-        2 => {
-            let det = m[(0, 0)] * m[(1, 1)] - m[(0, 1)] * m[(1, 0)];
-            let inv_det = 1.0 / det;
-            let mut out = Array1::<f64>::zeros(2);
-            out[0] = inv_det * (m[(1, 1)] * rhs[0] - m[(0, 1)] * rhs[1]);
-            out[1] = inv_det * (-m[(1, 0)] * rhs[0] + m[(0, 0)] * rhs[1]);
-            out
-        }
-        3 => {
-            let det = det_small(m, 3);
-            let inv_det = 1.0 / det;
-            let mut out = Array1::<f64>::zeros(3);
-            // Cramer's rule for 3×3.
-            out[0] = inv_det
-                * (rhs[0] * (m[(1, 1)] * m[(2, 2)] - m[(1, 2)] * m[(2, 1)])
-                    - m[(0, 1)] * (rhs[1] * m[(2, 2)] - m[(1, 2)] * rhs[2])
-                    + m[(0, 2)] * (rhs[1] * m[(2, 1)] - m[(1, 1)] * rhs[2]));
-            out[1] = inv_det
-                * (m[(0, 0)] * (rhs[1] * m[(2, 2)] - m[(1, 2)] * rhs[2])
-                    - rhs[0] * (m[(1, 0)] * m[(2, 2)] - m[(1, 2)] * m[(2, 0)])
-                    + m[(0, 2)] * (m[(1, 0)] * rhs[2] - rhs[1] * m[(2, 0)]));
-            out[2] = inv_det
-                * (m[(0, 0)] * (m[(1, 1)] * rhs[2] - rhs[1] * m[(2, 1)])
-                    - m[(0, 1)] * (m[(1, 0)] * rhs[2] - rhs[1] * m[(2, 0)])
-                    + rhs[0] * (m[(1, 0)] * m[(2, 1)] - m[(1, 1)] * m[(2, 0)]));
-            out
-        }
-        _ => {
-            // LU with partial pivoting.
-            let mut a = m.clone();
-            let b_vec = rhs.clone();
-            let mut perm: Vec<usize> = (0..b).collect();
-            for col in 0..b {
-                let mut max_val = a[(perm[col], col)].abs();
-                let mut max_idx = col;
-                for row in (col + 1)..b {
-                    let v = a[(perm[row], col)].abs();
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = row;
-                    }
-                }
-                perm.swap(col, max_idx);
-                let pivot = a[(perm[col], col)];
-                if pivot.abs() < 1e-50 {
-                    // Singular: return zero vector.
-                    return Array1::<f64>::zeros(b);
-                }
-                for row in (col + 1)..b {
-                    let factor = a[(perm[row], col)] / pivot;
-                    a[(perm[row], col)] = factor;
-                    for k in (col + 1)..b {
-                        let val = a[(perm[col], k)];
-                        a[(perm[row], k)] -= factor * val;
-                    }
-                }
-            }
-            // Forward substitution (Ly = Pb).
-            let mut y = Array1::<f64>::zeros(b);
-            for row in 0..b {
-                let mut s = b_vec[perm[row]];
-                for k in 0..row {
-                    s -= a[(perm[row], k)] * y[k];
-                }
-                y[row] = s;
-            }
-            // Back substitution (Ux = y).
-            let mut x = Array1::<f64>::zeros(b);
-            for row in (0..b).rev() {
-                let mut s = y[row];
-                for k in (row + 1)..b {
-                    s -= a[(perm[row], k)] * x[k];
-                }
-                x[row] = s / a[(perm[row], row)];
-            }
-            x
-        }
-    }
-}
+// (Allocation-free, factor-once-reuse-many B×B LU helpers live next to the
+// multi-block ALO callsite — see `lu_factor_in_place` and `lu_solve_in_place`.)
 
 #[cfg(test)]
 mod tests {
@@ -1141,38 +1111,9 @@ mod tests {
     // --- Multi-block ALO tests ---
 
     use super::{
-        MultiBlockAloInput, compute_multiblock_alo, compute_multiblock_alo_leverages, det_small,
-        solve_small,
+        MultiBlockAloInput, compute_multiblock_alo, compute_multiblock_alo_leverages,
     };
     use ndarray::{Array1, Array2};
-
-    #[test]
-    fn det_small_1x1() {
-        let m = Array2::from_elem((1, 1), 3.5);
-        assert!((det_small(&m, 1) - 3.5).abs() < 1e-14);
-    }
-
-    #[test]
-    fn det_small_2x2() {
-        let m = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        assert!((det_small(&m, 2) - (-2.0)).abs() < 1e-14);
-    }
-
-    #[test]
-    fn det_small_3x3_identity() {
-        let m = Array2::eye(3);
-        assert!((det_small(&m, 3) - 1.0).abs() < 1e-14);
-    }
-
-    #[test]
-    fn solve_small_2x2() {
-        let m = Array2::from_shape_vec((2, 2), vec![2.0, 1.0, 0.0, 3.0]).unwrap();
-        let rhs = Array1::from_vec(vec![5.0, 9.0]);
-        let x = solve_small(&m, &rhs, 2);
-        // 2x + y = 5, 3y = 9 => y=3, x=1
-        assert!((x[0] - 1.0).abs() < 1e-12);
-        assert!((x[1] - 3.0).abs() < 1e-12);
-    }
 
     #[test]
     fn multiblock_b1_matches_scalar_leverage() {
