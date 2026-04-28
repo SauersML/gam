@@ -7,7 +7,7 @@ use crate::types::LinkFunction;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Par};
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
 
 /// Approximate leave-one-out diagnostics derived from a fitted model.
 #[derive(Debug, Clone)]
@@ -360,7 +360,16 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let mut se_sandwich = Array1::<f64>::zeros(n);
 
     let block_cols = 8192usize;
-    let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
+    // Allocate the RHS scratch in column-major (Fortran) order so its column
+    // slices are contiguous and align with faer's column-major solve output.
+    // This removes redundant `xrow = x_dense.row(obs)` indirection inside the
+    // per-observation loop: rhs_chunk_buf already holds X^T at the right cols.
+    let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols).f());
+    // Reusable column-major ndarray buffers for the solved chunk and its
+    // E*S product. Materializing once per chunk lets the inner loop iterate
+    // contiguous column slices and use fused mul_add reductions.
+    let mut s_chunk_nd = Array2::<f64>::zeros((p, block_cols).f());
+    let mut es_chunk_nd = Array2::<f64>::zeros((e_rank, block_cols).f());
 
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
@@ -374,9 +383,22 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
         let rhs_chunk = FaerArrayView::new(&rhs_chunkview);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
 
-        let mut es_chunk_storage = FaerMat::<f64>::zeros(e_rank, width);
+        // Copy the faer column-major solve output into an ndarray column-major
+        // view so we can take contiguous column slices below.
+        {
+            let mut s_view = s_chunk_nd.slice_mut(s![.., ..width]);
+            for j in 0..width {
+                let mut col = s_view.column_mut(j);
+                let dst = col.as_slice_mut().expect("column-major column slice");
+                for i in 0..p {
+                    dst[i] = s_chunk[(i, j)];
+                }
+            }
+        }
+
         if e_rank > 0 {
             if let Some(e) = input.penalty_root {
+                let mut es_chunk_storage = FaerMat::<f64>::zeros(e_rank, width);
                 let eview = FaerArrayView::new(e);
                 matmul(
                     es_chunk_storage.as_mut(),
@@ -386,25 +408,45 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
                     1.0,
                     Par::Seq,
                 );
+                let mut es_view = es_chunk_nd.slice_mut(s![.., ..width]);
+                for j in 0..width {
+                    let mut col = es_view.column_mut(j);
+                    let dst = col.as_slice_mut().expect("column-major column slice");
+                    for r in 0..e_rank {
+                        dst[r] = es_chunk_storage[(r, j)];
+                    }
+                }
             }
         }
 
+        let rhs_view = rhs_chunk_buf.slice(s![.., ..width]);
+        let s_view = s_chunk_nd.slice(s![.., ..width]);
+        let es_view = es_chunk_nd.slice(s![.., ..width]);
+
         for local_col in 0..width {
             let obs = chunk_start + local_col;
-            let xrow = x_dense.row(obs);
+            // All three column slices are contiguous (column-major storage).
+            let rhs_col = rhs_view.column(local_col);
+            let s_col = s_view.column(local_col);
+            let rhs_slice = rhs_col.as_slice().expect("column-major col contiguous");
+            let s_slice = s_col.as_slice().expect("column-major col contiguous");
+
             let mut x_hinv_x = 0.0f64;
             let mut s_norm2 = 0.0f64;
-            for row in 0..p {
-                let sval = s_chunk[(row, local_col)];
-                let xval = xrow[row];
+            // Fused dot products over the same column: one cache-friendly pass.
+            for k in 0..p {
+                let sval = s_slice[k];
+                let xval = rhs_slice[k];
                 x_hinv_x = sval.mul_add(xval, x_hinv_x);
                 s_norm2 = sval.mul_add(sval, s_norm2);
             }
             let ai = w_h[obs].max(0.0) * x_hinv_x;
             let mut es_norm2 = 0.0f64;
             if e_rank > 0 {
+                let es_col = es_view.column(local_col);
+                let es_slice = es_col.as_slice().expect("column-major col contiguous");
                 for r in 0..e_rank {
-                    let v = es_chunk_storage[(r, local_col)];
+                    let v = es_slice[r];
                     es_norm2 = v.mul_add(v, es_norm2);
                 }
             }
