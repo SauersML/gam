@@ -8373,11 +8373,8 @@ impl SurvivalMarginalSlopeFamily {
             let da = unit_primary_direction_ref(a).view();
             for b in a..N_PRIMARY {
                 let db = unit_primary_direction_ref(b).view();
-                let value = self.row_neglog_directional_refs(
-                    row,
-                    block_states,
-                    &[da, db, dir_u, dir_v],
-                )?;
+                let value =
+                    self.row_neglog_directional_refs(row, block_states, &[da, db, dir_u, dir_v])?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
             }
@@ -15734,11 +15731,7 @@ mod tests {
             for b in 0..N_PRIMARY {
                 let dir_b = unit_primary_direction(b);
                 let hess_exact = family
-                    .row_neglog_directional_refs(
-                        0,
-                        &block_states,
-                        &[dir_a.view(), dir_b.view()],
-                    )
+                    .row_neglog_directional_refs(0, &block_states, &[dir_a.view(), dir_b.view()])
                     .expect("exact row hessian");
                 assert_close(
                     hess_closed[[a, b]],
