@@ -6497,9 +6497,49 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
             }
         }
     }
-    Err(format!(
-        "strict pseudo-laplace SPD solve failed even with LM δ-ridge continuation \
-         (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e})"
+
+    // δ-ridge schedule exhausted; fall back to rank-aware eigen-floor solve.
+    // Floors every eigenvalue at `eps_floor = 1e-12 · max|λ|` so the resulting
+    // step is `Q diag(1/Λ̃) Qᵀ rhs` — well-conditioned modes solved exactly,
+    // rank-deficient directions resolved with controlled curvature. Mirrors
+    // the eigen-floor fallback in `strict_inverse_spd_with_lm_continuation`
+    // and gives the pilot a warm geometry to hand to operator Newton/ARC
+    // instead of bouncing all the way out to a cold full-data run.
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
+        format!(
+            "strict pseudo-laplace SPD solve failed even with LM δ-ridge continuation \
+             (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
+             eigen-floor fallback also failed: {e}"
+        )
+    })?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+    // x = Q diag(1/Λ̃) Qᵀ rhs.
+    let mut q_t_rhs = Array1::<f64>::zeros(p);
+    for k in 0..p {
+        let mut acc = 0.0;
+        for i in 0..p {
+            acc += evecs[[i, k]] * rhs[i];
+        }
+        q_t_rhs[k] = acc;
+    }
+    for k in 0..p {
+        q_t_rhs[k] /= evals[k].max(eps_floor);
+    }
+    let mut x = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        let mut acc = 0.0;
+        for k in 0..p {
+            acc += evecs[[i, k]] * q_t_rhs[k];
+        }
+        x[i] = acc;
+    }
+    Ok((
+        x,
+        StrictSpdLmStats {
+            delta_used: delta,
+            escalations: MAX_ESCALATIONS + 1,
+        },
     ))
 }
 
@@ -6669,9 +6709,24 @@ pub(crate) fn strict_logdet_spd_with_lm_continuation(
             }
         }
     }
-    Err(format!(
-        "strict pseudo-laplace SPD logdet failed even with LM δ-ridge continuation \
-         (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e})"
+    // δ-ridge schedule exhausted; eigen-floor fallback.
+    // `log|C̃| = Σ log Λ̃_i` with `Λ̃_i = max(Λ_i, ε λ_max)`.
+    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
+        format!(
+            "strict pseudo-laplace SPD logdet failed even with LM δ-ridge continuation \
+             (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
+             eigen-floor fallback also failed: {e}"
+        )
+    })?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+    let logdet: f64 = evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum();
+    Ok((
+        logdet,
+        StrictSpdLmStats {
+            delta_used: delta,
+            escalations: MAX_ESCALATIONS + 1,
+        },
     ))
 }
 
@@ -16115,6 +16170,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression check: when `strict_solve_spd_with_lm_continuation` is given a
+    /// strictly negative-definite matrix, the LM δ-ridge schedule cannot rescue
+    /// it (every escalation still has a Cholesky failure on the perturbed
+    /// matrix because the lowest eigenvalue is < -delta). The terminal eigen-
+    /// floor fallback must therefore kick in and return a finite solution that
+    /// satisfies `Q diag(1/Λ̃) Qᵀ rhs` with `Λ̃_i = max(Λ_i, ε λ_max)`.
+    ///
+    /// Also verifies that the solution produced by the eigen-floor route is
+    /// equal (within tolerance) to the rhs left-multiplied by the explicit
+    /// floored pseudoinverse — i.e. that the analytic spec from task #9 is what
+    /// the code computes.
+    #[test]
+    fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
+        let p = 4usize;
+        // Symmetric strictly-negative-definite matrix; Cholesky always fails.
+        let mut h = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h[[i, i]] = -1.0 - (i as f64) * 0.1;
+        }
+        h[[0, 1]] = 0.05;
+        h[[1, 0]] = 0.05;
+        let rhs = Array1::from_vec(vec![1.0, -0.5, 0.25, 0.75]);
+        let (x, stats) = strict_solve_spd_with_lm_continuation(&h, &rhs)
+            .expect("eigen-floor fallback must succeed on the negative-definite matrix");
+        // Hitting the eigen-floor branch is signaled by escalations > MAX_ESCALATIONS.
+        assert!(
+            stats.escalations > 16,
+            "expected eigen-floor terminal fallback (escalations > MAX_ESCALATIONS), got {}",
+            stats.escalations,
+        );
+        for &v in x.iter() {
+            assert!(v.is_finite(), "eigen-floor solve returned non-finite component {v}");
+        }
+        // Reconstruct the floored inverse and check x ≈ inv · rhs.
+        let mut sym = h.clone();
+        symmetrize_dense_in_place(&mut sym);
+        let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+        let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+        let mut want = Array1::<f64>::zeros(p);
+        for k in 0..p {
+            let mut q_t_rhs = 0.0;
+            for i in 0..p {
+                q_t_rhs += evecs[[i, k]] * rhs[i];
+            }
+            let scaled = q_t_rhs / evals[k].max(eps_floor);
+            for i in 0..p {
+                want[i] += evecs[[i, k]] * scaled;
+            }
+        }
+        for i in 0..p {
+            let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+            assert!(
+                (want[i] - x[i]).abs() <= tol,
+                "eigen-floor solve component {i}: want={:.6e}, got={:.6e}",
+                want[i],
+                x[i],
+            );
+        }
+    }
+
+    /// Companion regression check for `strict_logdet_spd_with_lm_continuation`:
+    /// on a strictly-negative-definite matrix, the LM δ-ridge cannot factor
+    /// `H + δI` for any reasonable δ (it would turn it positive only when
+    /// δ > -λ_min, and the ridge growth caps δ at a bounded value). The
+    /// terminal eigen-floor fallback must therefore return `Σ log Λ̃_i` with
+    /// `Λ̃_i = max(Λ_i, ε λ_max)`.
+    #[test]
+    fn strict_logdet_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
+        let p = 4usize;
+        let mut h = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h[[i, i]] = -1.0 - (i as f64) * 0.1;
+        }
+        let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
+            .expect("eigen-floor logdet fallback must succeed");
+        assert!(
+            stats.escalations > 16,
+            "expected eigen-floor terminal fallback for logdet, got escalations={}",
+            stats.escalations,
+        );
+        let mut sym = h.clone();
+        symmetrize_dense_in_place(&mut sym);
+        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+        let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+        let want: f64 = evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum();
+        let tol = 1e-10 * want.abs().max(1.0) + 1e-10;
+        assert!(
+            (want - logdet).abs() <= tol,
+            "eigen-floor logdet: want={:.6e}, got={:.6e}",
+            want,
+            logdet,
+        );
     }
 
     // ---------- eta_backup heterogeneous-shape regression tests ----------
