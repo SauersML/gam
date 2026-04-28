@@ -3921,18 +3921,10 @@ impl JointBetaRhoPosterior {
         let chol = solve_upper_triangular_transpose(&l_h, n_beta);
         let chol_t = chol.t().to_owned();
 
-        // Build combined penalty at the LAML mode (for SharedData)
-        let lambdas_mode: Array1<f64> = rho_mode.mapv(f64::exp);
-        let mut s_combined = Array2::<f64>::zeros((n_beta, n_beta));
-        for (k, cp) in penalty_canonical.iter().enumerate() {
-            cp.accumulate_weighted(&mut s_combined, lambdas_mode[k]);
-        }
-
         let data = SharedData {
             x: Arc::new(x.to_owned()),
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
-            penalty: Arc::new(s_combined),
             mode: Arc::new(mode.to_owned()),
             gamma_shape: gamma_shape.unwrap_or(1.0),
             n_samples,
