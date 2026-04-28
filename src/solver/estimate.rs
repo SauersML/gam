@@ -1560,12 +1560,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let p = x.ncols();
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
-        let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
-            &specs,
-            nullspace_dims,
-            p,
-            context,
-        )?;
+        let (canonical, active_nullspace_dims) =
+            crate::construction::canonicalize_penalty_specs(&specs, nullspace_dims, p, context)?;
 
         let x_fit = self.conditioning.apply_to_design(x);
         let fit_linear_constraints = self
@@ -1857,9 +1853,7 @@ where
         // sparse design, dense per-ρ selection) get gated to BFGS+gradient
         // instead of ARC + analytic Hessian, which OOMs at 14.56 GiB RSS.
         let probe_rho = match heuristic_lambdas {
-            Some(h) if h.len() == k => {
-                Array1::from_iter(h.iter().map(|v| v.max(1.0e-300).ln()))
-            }
+            Some(h) if h.len() == k => Array1::from_iter(h.iter().map(|v| v.max(1.0e-300).ln())),
             _ => Array1::<f64>::zeros(k),
         };
         let dense_design = reml_state.runtime_geometry_is_dense(&probe_rho);

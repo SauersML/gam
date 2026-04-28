@@ -6043,8 +6043,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         if idx < rho_dim {
             -30.0_f64
         } else if idx < operator_slots_end {
-            (initial_theta[idx] - OPERATOR_LAMBDA_LOG_WINDOW)
-                .clamp(OPERATOR_LAMBDA_LOG_LOWER_FLOOR, OPERATOR_LAMBDA_LOG_UPPER_CAP)
+            (initial_theta[idx] - OPERATOR_LAMBDA_LOG_WINDOW).clamp(
+                OPERATOR_LAMBDA_LOG_LOWER_FLOOR,
+                OPERATOR_LAMBDA_LOG_UPPER_CAP,
+            )
         } else {
             let eps_floor = adaptive_opts.min_epsilon.max(1e-12).ln();
             (initial_theta[idx] - EPSILON_LOG_WINDOW).max(eps_floor)
@@ -6054,8 +6056,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         if idx < rho_dim {
             30.0_f64
         } else if idx < operator_slots_end {
-            (initial_theta[idx] + OPERATOR_LAMBDA_LOG_WINDOW)
-                .clamp(OPERATOR_LAMBDA_LOG_LOWER_FLOOR, OPERATOR_LAMBDA_LOG_UPPER_CAP)
+            (initial_theta[idx] + OPERATOR_LAMBDA_LOG_WINDOW).clamp(
+                OPERATOR_LAMBDA_LOG_LOWER_FLOOR,
+                OPERATOR_LAMBDA_LOG_UPPER_CAP,
+            )
         } else {
             let eps_floor = adaptive_opts.min_epsilon.max(1e-12).ln();
             (initial_theta[idx] + EPSILON_LOG_WINDOW).max(eps_floor)

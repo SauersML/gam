@@ -5649,11 +5649,7 @@ impl SurvivalMarginalSlopeFamily {
             let da = unit_primary_direction_ref(a);
             for b in a..N_PRIMARY {
                 let db = unit_primary_direction_ref(b);
-                let value = self.row_neglog_directional_refs(
-                    row,
-                    block_states,
-                    &[da, db, dir],
-                )?;
+                let value = self.row_neglog_directional_refs(row, block_states, &[da, db, dir])?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
             }
@@ -8377,11 +8373,8 @@ impl SurvivalMarginalSlopeFamily {
             let da = unit_primary_direction_ref(a);
             for b in a..N_PRIMARY {
                 let db = unit_primary_direction_ref(b);
-                let value = self.row_neglog_directional_refs(
-                    row,
-                    block_states,
-                    &[da, db, dir_u, dir_v],
-                )?;
+                let value =
+                    self.row_neglog_directional_refs(row, block_states, &[da, db, dir_u, dir_v])?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
             }
@@ -12817,10 +12810,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         )))
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a

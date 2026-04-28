@@ -27,11 +27,11 @@ use crate::faer_ndarray::{
 };
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart,
-    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder,
-    FamilyEvaluation, MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
+    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
@@ -1580,10 +1580,7 @@ impl CustomFamily for TransformationNormalFamily {
         ))
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // CTN's joint Hessian is always supplied as a matrix-free Hv
         // operator: `exact_newton_joint_hessian_workspace` above unconditionally
         // returns a `TransformationNormalJointHessianWorkspace` for any single
@@ -2453,13 +2450,8 @@ impl KroneckerActiveSetCache {
         }
         let mid_i = n / 2;
         let mid_j = p / 2;
-        [
-            c[[0, 0]],
-            c[[mid_i, mid_j]],
-            c[[n - 1, p - 1]],
-        ]
+        [c[[0, 0]], c[[mid_i, mid_j]], c[[n - 1, p - 1]]]
     }
-
 }
 
 /// Discriminated union over two factored representations of a Kronecker-shaped
@@ -2868,11 +2860,8 @@ impl KroneckerDesign {
                     }
                     return Some(m);
                 }
-                let chunk_rows = crate::resource::rows_for_target_bytes(
-                    8 * 1024 * 1024,
-                    p.max(1),
-                )
-                .max(1);
+                let chunk_rows =
+                    crate::resource::rows_for_target_bytes(8 * 1024 * 1024, p.max(1)).max(1);
                 let mut m = 0.0_f64;
                 let mut start = 0usize;
                 while start < n {
@@ -2996,9 +2985,7 @@ impl KroneckerDesign {
             // within α ≤ 1.0", and (b) the assertion in
             // `ctn_active_set_certificate_matches_full_grid_when_bound_passes`
             // will catch any drift.
-            if alpha_active.is_finite()
-                && cache.min_inactive_margin > alpha_active * lipschitz
-            {
+            if alpha_active.is_finite() && cache.min_inactive_margin > alpha_active * lipschitz {
                 return alpha_active;
             }
         }
@@ -3006,16 +2993,7 @@ impl KroneckerDesign {
         // Cache stale or certificate failed: full grid scan refreshes both
         // the answer AND the active set.
         let alpha_full = Self::min_step_kronecker_reduce(response_grid, c, d, slack, dh_eps);
-        Self::refresh_active_set_cache(
-            response_grid,
-            c,
-            slack,
-            dh_eps,
-            n,
-            n_grid,
-            p_resp,
-            cache,
-        );
+        Self::refresh_active_set_cache(response_grid, c, slack, dh_eps, n, n_grid, p_resp, cache);
         alpha_full
     }
 
@@ -4044,10 +4022,7 @@ mod tests {
         // KhatriRao the production caller must keep working via fallback, so
         // the assertion documents the precondition rather than gating it.
         assert!(
-            matches!(
-                family.x_deriv_grid_kron,
-                KroneckerDesign::Kronecker { .. }
-            ),
+            matches!(family.x_deriv_grid_kron, KroneckerDesign::Kronecker { .. }),
             "toy family must keep the Kronecker grid variant for cached-path coverage"
         );
         // δ direction with a negative leading h' contribution so the grid
@@ -4585,14 +4560,12 @@ mod tests {
         assert_eq!(want_grad.len(), p);
 
         let gradient_eval = family
-            .exact_newton_joint_gradient_evaluation(
-                std::slice::from_ref(&state),
-                &[spec.clone()],
-            )
+            .exact_newton_joint_gradient_evaluation(std::slice::from_ref(&state), &[spec.clone()])
             .expect("gradient-only call")
             .expect("gradient-only result must be present");
         assert!(
-            (want_ll - gradient_eval.log_likelihood).abs() <= 1e-12 * want_ll.abs().max(1.0) + 1e-12,
+            (want_ll - gradient_eval.log_likelihood).abs()
+                <= 1e-12 * want_ll.abs().max(1.0) + 1e-12,
             "log-likelihood mismatch: evaluate={:.6e}, gradient-only={:.6e}",
             want_ll,
             gradient_eval.log_likelihood,
@@ -5705,7 +5678,9 @@ pub fn fit_transformation_normal(
 
             exact_warm_start.replace(Some(eval.warm_start));
 
-            if matches!(eval_mode, EvalMode::ValueGradientHessian) && !eval.outer_hessian.is_analytic() {
+            if matches!(eval_mode, EvalMode::ValueGradientHessian)
+                && !eval.outer_hessian.is_analytic()
+            {
                 return Err(
                     "transformation exact joint objective did not return an outer Hessian"
                         .to_string(),

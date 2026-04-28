@@ -7026,8 +7026,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // search + gradient-only refresh through
     // `exact_newton_joint_gradient_evaluation`) and never builds the dense
     // per-block Hessian inside the inner solve.
-    let use_joint_newton =
-        has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
+    let use_joint_newton = has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source);
     let inner_tol = options.inner_tol;
     let inner_max_cycles = options.inner_max_cycles;
     let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles);
@@ -9165,9 +9164,7 @@ fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static
 /// plumbing.  Returns only `(value, gradient)`; the warm-start is internal
 /// state with a private type and is dropped at the boundary.
 #[cfg(test)]
-pub(crate) fn test_outerobjective_andgradient<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
+pub(crate) fn test_outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -16505,7 +16502,9 @@ mod tests {
         let map_second =
             resolve_custom_family_x_psi_psi_map(&deriv, &deriv, 0, n, p, 0..n, "zero", &policy)
                 .expect("resolve x_psi_psi map");
-        let fwd_second = map_second.forward_mul(u.view()).expect("forward_mul second");
+        let fwd_second = map_second
+            .forward_mul(u.view())
+            .expect("forward_mul second");
         assert_eq!(fwd_second.len(), n);
         assert!(fwd_second.iter().all(|x| *x == 0.0));
     }
