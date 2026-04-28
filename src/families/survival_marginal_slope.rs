@@ -2,7 +2,7 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, build_block_spatial_psi_derivatives,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
@@ -14001,7 +14001,7 @@ pub fn fit_survival_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::CustomFamily;
+    use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
     use crate::matrix::{DenseDesignMatrix, SymmetricMatrix};
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;

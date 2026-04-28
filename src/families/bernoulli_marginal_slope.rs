@@ -2,7 +2,7 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
     fit_custom_family,
@@ -8746,7 +8746,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::CustomFamily;
+    use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
     use crate::families::bernoulli_marginal_slope::exact_kernel::{
         DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
         LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
