@@ -1833,6 +1833,27 @@ fn apply_input_standardization(x: &mut Array2<f64>, scales: &[f64]) {
     }
 }
 
+/// Geometric mean of strictly positive scales: `(∏ s_a)^(1/d)`.
+///
+/// Computed via log-sum-divide to avoid overflow / underflow when d is large
+/// or when individual scales are small. The Matérn / Duchon / thin-plate
+/// auto-standardization paths use this to compensate the user's
+/// `length_scale` so the kernel range remains expressed in *original* data
+/// coordinates after per-axis division by σ_a:
+///
+///   ‖x_std − c_std‖ / L_eff with L_eff = L_user / σ_geom
+///
+/// matches `‖x − c‖ / L_user` exactly for uniform σ_a (= σ_geom) and reduces
+/// to the natural anisotropic-Mahalanobis preconditioning when σ_a vary —
+/// the convention σ_geom = (∏σ_a)^(1/d) preserves the kernel volume scale.
+fn geometric_mean_scale(scales: &[f64]) -> f64 {
+    if scales.is_empty() {
+        return 1.0;
+    }
+    let log_mean: f64 = scales.iter().map(|&s| s.ln()).sum::<f64>() / scales.len() as f64;
+    log_mean.exp()
+}
+
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p = data.ncols();
@@ -3186,41 +3207,38 @@ pub fn build_smooth_design_withworkspace(
                     shape_axis_col = Some(feature_cols[0]);
                 }
                 let mut x = select_columns(data, feature_cols)?;
-                // Auto-standardization (per-axis division by σ_a) silently
-                // reinterprets the user's `length_scale` from original data
-                // coordinates into post-standardization coordinates: for
-                // uniform σ_a = σ, `kernel(||x_std − c_std||/L)` equals
-                // `kernel(||x − c||/(σ·L))`, so the effective kernel range
-                // shrinks by σ. For data already on similar per-axis scales
-                // (e.g. all axes uniform [-1,1] → σ ≈ 0.577 across the board),
-                // this collapses the kernel to near-zero for any user-chosen
-                // length_scale and produces a near-trivial fit. Standardize
-                // only when the caller passed explicit `input_scales`, or when
-                // the data's per-axis scales differ enough that an isotropic
-                // kernel in original coords would be dominated by a single
-                // axis. Per-axis anisotropy with similar scales is owned by
-                // `MaternBasisSpec::aniso_log_scales` (auto-initialized via
-                // `maybe_initialize_aniso_contrasts`), which works on the
-                // user's `length_scale` in original units.
-                let scales = if let Some(s) = input_scales {
+                // Auto-standardization (per-axis division by σ_a) reinterprets
+                // the user's `length_scale` from original data coordinates
+                // into post-standardization coordinates: for uniform σ_a = σ,
+                // `kernel(‖x_std − c_std‖/L)` equals `kernel(‖x − c‖/(σ·L))`,
+                // so the effective kernel range shrinks by σ. To keep
+                // `length_scale` consistently expressed in *original* data
+                // coordinates regardless of axis variances, we standardize
+                // and divide L by σ_geom = (∏σ_a)^(1/d). For uniform σ this
+                // recovers the user's kernel exactly; for anisotropic data
+                // the resulting per-axis effective scales σ_a / σ_geom are
+                // the standard Mahalanobis preconditioning and preserve the
+                // geometric-mean kernel range. Storing the σ vector in
+                // metadata.input_scales makes the same transformation
+                // replayable at predict time.
+                let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    Some(s.clone())
+                    (Some(s.clone()), spec.length_scale)
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    let max_s = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let min_s = s.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let scales_are_similar = min_s > 0.0 && (max_s / min_s) < 2.0;
-                    if scales_are_similar {
-                        // Treat the user's length_scale as a scale in
-                        // original data coordinates; do not rescale.
-                        None
+                    let sigma_geom = geometric_mean_scale(&s);
+                    apply_input_standardization(&mut x, &s);
+                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
+                        spec.length_scale / sigma_geom
                     } else {
-                        apply_input_standardization(&mut x, &s);
-                        Some(s)
-                    }
+                        spec.length_scale
+                    };
+                    (Some(s), l_eff)
                 } else {
-                    None
+                    (None, spec.length_scale)
                 };
-                let mut result = build_matern_basiswithworkspace(x.view(), spec, workspace)?;
+                let mut spec_local = spec.clone();
+                spec_local.length_scale = length_scale_eff;
+                let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
                 if let BasisMetadata::Matern { input_scales, .. } = &mut result.metadata {
                     *input_scales = scales;
                 }
