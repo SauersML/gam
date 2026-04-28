@@ -2978,22 +2978,27 @@ impl KroneckerDesign {
                     }
                 }
             }
-            // Certificate: m_inactive - α_A · L > slack ⇒ no inactive can bind
-            // at any α ≤ α_A. The cached `min_inactive_margin = min (h_{i,g}
-            // - slack)` over (i,g) ∉ A was computed in `refresh_active_set_cache`
-            // already net of `slack`, so the strict-feasibility comparison
-            // collapses to `m_inactive > α_A · L` (the comment-form expansion
-            // would double-count slack). When α_A = +∞ (no active pair binds),
-            // we still need to certify no inactive pair binds within the
-            // caller's eventual `α_max ≤ 1.0` step (downstream callsite caps
-            // at min(1.0, ...)), so the bound becomes `m_inactive > 1.0 · L`.
-            let alpha_for_bound = if alpha_active.is_finite() {
-                alpha_active
-            } else {
-                1.0
-            };
-            let bound_ok = cache.min_inactive_margin > alpha_for_bound * lipschitz;
-            if bound_ok {
+            // Certificate: m_inactive - α_A · L > slack ⇒ no inactive pair can
+            // bind at any α ≤ α_A.  The cached `min_inactive_margin = min
+            // (h_{i,g} - slack)` over (i,g) ∉ A was already netted of `slack`
+            // in `refresh_active_set_cache`, so the strict-feasibility test
+            // collapses to `m_inactive > α_A · L`.
+            //
+            // When `α_active = +∞` (no active pair binds along `d`), the
+            // Lipschitz bound `|d_{i,g}| ≤ L` gives a LOWER bound on inactive
+            // hit points (they bind at α ≥ m_inactive / L) but NOT an upper
+            // bound on the minimum.  So the certificate cannot prove
+            // bit-equivalence with the full-grid scan in that regime — we
+            // must fall through to the full scan to find the true minimum.
+            // Substituting `α_for_bound = 1.0` to certify within a downstream
+            // `min(1.0, ·)` cap is unprincipled because (a) it changes this
+            // function's stated contract from "exact min α" to "exact min α
+            // within α ≤ 1.0", and (b) the assertion in
+            // `ctn_active_set_certificate_matches_full_grid_when_bound_passes`
+            // will catch any drift.
+            if alpha_active.is_finite()
+                && cache.min_inactive_margin > alpha_active * lipschitz
+            {
                 return alpha_active;
             }
         }
