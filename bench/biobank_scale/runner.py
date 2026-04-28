@@ -43,6 +43,33 @@ def _env_int_optional(name: str) -> int | None:
 
 
 _CMD_TIMEOUT_SEC = _env_int_optional("BENCH_CMD_TIMEOUT_SEC")
+
+# Routing-log scraping. When `--emit-routing-log` is passed to `run-method`,
+# `do_run_method` sets `BIOBANK_ROUTING_LOG_PATH` to the destination file.
+# `run_cmd_stream` then appends every captured stderr line that contains the
+# `[OUTER]` log marker emitted by `crate::solver::outer_strategy::log_plan` —
+# the line carries the stable `solver=...;hessian=...;matrix-free=...` token
+# defined by `OuterPlan::routing_log_line()`. Bench tests scrape this file.
+_ROUTING_LOG_OUTER_MARKER = "[OUTER]"
+
+
+def _routing_log_path() -> Path | None:
+    raw = os.environ.get("BIOBANK_ROUTING_LOG_PATH")
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _append_routing_lines(path: Path, captured_stderr: str) -> None:
+    matched = [
+        line for line in captured_stderr.splitlines() if _ROUTING_LOG_OUTER_MARKER in line
+    ]
+    if not matched:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for line in matched:
+            fh.write(line.rstrip("\n") + "\n")
 ROUTINE_SURVIVAL_HORIZONS = (1.0, 2.0, 5.0, 10.0)
 SURVIVAL_ENTRY_COLUMN = "__entry"
 F64_BYTES = 8
@@ -1255,7 +1282,10 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
         )
         print(msg, file=sys.stderr, flush=True)
         raise TimeoutError(msg)
-    return rc, "".join(out_buf), "".join(err_buf)
+    captured_stderr = "".join(err_buf)
+    if (routing_path := _routing_log_path()) is not None:
+        _append_routing_lines(routing_path, captured_stderr)
+    return rc, "".join(out_buf), captured_stderr
 
 
 def tool_exists(name: str) -> bool:
@@ -2257,6 +2287,15 @@ def do_run_method(args: argparse.Namespace) -> int:
     spec = specs[args.method]
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "emit_routing_log", False):
+        routing_log_path = out_dir / f"{spec.name}.routing.log"
+        # Truncate so re-runs do not accumulate stale routing tokens.
+        routing_log_path.write_text("", encoding="utf-8")
+        os.environ["BIOBANK_ROUTING_LOG_PATH"] = str(routing_log_path)
+        # log_plan emits at info level. If RUST_LOG is already configured by
+        # the caller we leave it alone; otherwise default to gam=info so the
+        # `[OUTER]` line reaches stderr.
+        os.environ.setdefault("RUST_LOG", "gam=info")
     try:
         result = run_method(spec, args.prep_dir.resolve(), out_dir)
         payload = {
@@ -2507,6 +2546,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--method", required=True)
     run.add_argument("--out-dir", type=Path, required=True)
     run.add_argument("--out-json", type=Path, required=True)
+    run.add_argument(
+        "--emit-routing-log",
+        action="store_true",
+        help=(
+            "Capture `[OUTER]` log lines from the Rust subprocess (which include "
+            "the `solver=...;hessian=...;matrix-free=...` routing token) into a "
+            "sidecar file at <out-dir>/<method>.routing.log. Sets RUST_LOG=gam=info "
+            "in the subprocess environment so log_plan output reaches stderr."
+        ),
+    )
     run.set_defaults(func=do_run_method)
 
     agg = sub.add_parser("aggregate")
