@@ -818,17 +818,14 @@ fn fused_khatri_rao_weighted_gram_apply_batched(
 
     // Unstack into result (p_resp · p_cov × k): row index `p_resp * c + a` of
     // `result_stacked` is the (a, :) row of column c reshaped to (p_resp, p_cov).
+    // out is row-major so out.column_mut(c) is non-contiguous; index by hand.
     let mut out = Array2::<f64>::zeros((p_resp * p_cov, k));
     for c in 0..k {
-        let mut out_col = out.column_mut(c);
-        let mut out_view = out_col
-            .view_mut()
-            .into_shape_with_order((p_resp, p_cov))
-            .expect("out column reshape to (p_resp, p_cov)");
         for a in 0..p_resp {
-            out_view
-                .row_mut(a)
-                .assign(&result_stacked.row(p_resp * c + a));
+            let row = result_stacked.row(p_resp * c + a);
+            for b in 0..p_cov {
+                out[[a * p_cov + b, c]] = row[b];
+            }
         }
     }
     out
@@ -4944,6 +4941,60 @@ mod tests {
                 want[i],
                 got[i],
             );
+        }
+    }
+
+    #[test]
+    fn fused_khatri_rao_batched_matches_per_column() {
+        // The batched helper is the hot path for `projected_operator` (one
+        // BLAS3 matmul replaces K small per-column applies). Here we lock in
+        // that `_batched(F)` equals `[_apply(F[:,0]) | _apply(F[:,1]) | ...]`
+        // to within roundoff for several columns of arbitrary content.
+        let left = array![
+            [1.0, 0.5, -0.2],
+            [-0.3, 1.1, 0.4],
+            [0.2, -0.7, 0.9],
+            [0.6, 0.3, -0.5],
+            [1.4, -0.1, 0.7]
+        ];
+        let right = array![
+            [2.0, -1.0],
+            [-0.5, 0.8],
+            [1.2, 0.3],
+            [-0.7, 1.1],
+            [0.4, -0.6]
+        ];
+        let weights = array![0.9, 1.3, 0.7, 1.1, 0.5];
+        let p_resp = left.ncols();
+        let p_cov = right.ncols();
+        let p_total = p_resp * p_cov;
+
+        // Build a (p_total × 4) factor with linearly independent columns.
+        let factor = array![
+            [0.1, 1.0, -0.5, 0.2],
+            [-0.2, 0.0, 0.8, -0.3],
+            [0.3, -0.4, 0.1, 0.7],
+            [-0.4, 0.5, 0.2, -0.1],
+            [0.5, -0.6, -0.7, 0.4],
+            [-0.6, 0.7, 0.3, -0.5]
+        ];
+        assert_eq!(factor.nrows(), p_total);
+        let k = factor.ncols();
+
+        let got = fused_khatri_rao_weighted_gram_apply_batched(&left, &right, &weights, &factor);
+        assert_eq!(got.dim(), (p_total, k));
+        for c in 0..k {
+            let v = factor.column(c).to_owned();
+            let want = fused_khatri_rao_weighted_gram_apply(&left, &right, &weights, &v);
+            for i in 0..p_total {
+                let tol = 1e-11 * want[i].abs().max(1.0) + 1e-11;
+                assert!(
+                    (want[i] - got[[i, c]]).abs() <= tol,
+                    "batched mismatch at col {c} row {i}: per-col={:.6e}, batched={:.6e}",
+                    want[i],
+                    got[[i, c]],
+                );
+            }
         }
     }
 
