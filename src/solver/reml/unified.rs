@@ -1795,37 +1795,13 @@ pub struct ImplicitHyperOperator {
 
 impl HyperOperator for ImplicitHyperOperator {
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
-
-        // Term 1: (∂X/∂ψ_d)^T (W · (X · v))
-        let x_v = self.x_design.matrixvectormultiply(v); // (n,)
-        let w_x_v = &*self.w_diag * &x_v; // (n,)
-        let term1 = self
-            .implicit_deriv
-            .transpose_mul(self.axis, &w_x_v.view())
-            .expect("radial scalar evaluation failed during implicit hyper transpose_mul"); // (p,)
-
-        // Term 2: X^T (W · ((∂X/∂ψ_d) · v))
-        let dx_v = self
-            .implicit_deriv
-            .forward_mul(self.axis, &v.view())
-            .expect("radial scalar evaluation failed during implicit hyper forward_mul"); // (n,)
-        let w_dx_v = &*self.w_diag * &dx_v; // (n,)
-        let term2 = self.x_design.transpose_vector_multiply(&w_dx_v); // (p,)
-
-        // Term 3: S_{ψ_d} · v
-        let term3 = self.s_psi.dot(v); // (p,)
-
-        let mut out = term1 + term2 + term3;
-
-        // Term 4 (non-Gaussian only): X^T diag(c ⊙ X_{ψ_d} β̂) X v.
-        // Streams O(n p): one X·v matvec (already computed as x_v above),
-        // one elementwise product, one X^T matvec.
-        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
-            let weighted = c_x_psi_beta.as_ref() * &x_v;
-            out += &self.x_design.transpose_vector_multiply(&weighted);
-        }
-
+        // Single canonical path: route every matvec through `mul_vec_into`,
+        // which routes through `matvec_with_shared_xz_into`. The four terms of
+        // B_d are assembled there, with the third-derivative correction added
+        // by `accumulate_c_correction_xt_into` so the four matvec entry points
+        // share one inner kernel.
+        let mut out = Array1::<f64>::zeros(self.p);
+        self.mul_vec_into(v.view(), out.view_mut());
         out
     }
 
@@ -1894,21 +1870,13 @@ impl HyperOperator for ImplicitHyperOperator {
             );
             out_col += &term;
 
-            // Non-Gaussian fixed-β third-derivative correction column j:
-            //   X^T (c ⊙ X_{ψ_d} β̂ ⊙ X e_j) = X^T (c_x_psi_beta ⊙ x_col).
-            if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
-                let c = c_x_psi_beta.as_ref();
-                Zip::from(weighted.view_mut())
-                    .and(c.view())
-                    .and(x_col.view())
-                    .for_each(|dst, &c_i, &x_i| *dst = c_i * x_i);
-                design_matrix_transpose_apply_view_into(
-                    &self.x_design,
-                    weighted.view(),
-                    term.view_mut(),
-                );
-                out_col += &term;
-            }
+            // Non-Gaussian third-derivative correction column j: shared kernel.
+            self.accumulate_c_correction_xt_into(
+                x_col.view(),
+                weighted.view_mut(),
+                term.view_mut(),
+                out_col,
+            );
         }
     }
 
@@ -6173,11 +6141,30 @@ fn build_outer_hessian_operator(
                         value -= hop.trace_hinv_matrix_operator_cross(right_dense, op.as_ref());
                     }
                 }
-                for left_op in &left.operators {
-                    for right_op in &right.operators {
-                        value -=
-                            hop.trace_hinv_operator_cross(left_op.as_ref(), right_op.as_ref());
-                    }
+                if !left.operators.is_empty() && !right.operators.is_empty() {
+                    // Bundle each side's per-mode operators into a single
+                    // weight-1 linear combination so the cross trace expands
+                    // as `tr(H⁻¹ Â B̂) = Σ_a Σ_b tr(H⁻¹ A_a B_b)` with one
+                    // call into the cross-trace kernel instead of the full
+                    // O(|left.ops|·|right.ops|) sweep. Mathematically
+                    // equivalent (bilinearity of `tr(H⁻¹ · ·)`).
+                    let left_bundle = WeightedHyperOperator {
+                        terms: left
+                            .operators
+                            .iter()
+                            .map(|op| (1.0, Arc::clone(op)))
+                            .collect(),
+                        dim_hint: hop.dim(),
+                    };
+                    let right_bundle = WeightedHyperOperator {
+                        terms: right
+                            .operators
+                            .iter()
+                            .map(|op| (1.0, Arc::clone(op)))
+                            .collect(),
+                        dim_hint: hop.dim(),
+                    };
+                    value -= hop.trace_hinv_operator_cross(&left_bundle, &right_bundle);
                 }
                 ct[[ii, jj]] = value;
                 if ii != jj {
