@@ -4293,7 +4293,12 @@ pub fn reml_laml_evaluate(
 
             Some(result)
         } else {
-            // All-dense path (original code).
+            // All-dense path: reached only when `any_operator` is false (i.e.
+            // no penalty or ext coordinate uses the operator fast-path), so
+            // every match arm here should resolve to `Dense(_)`. The
+            // `Operator(_)` arms keep the match exhaustive and materialize
+            // defensively; the debug_asserts catch any future refactor that
+            // forgets to set the `any_operator` flag for a new coord type.
             let mut all_h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
 
             // rho-coordinates: H_k = A_k + correction(v_k)
@@ -4304,7 +4309,14 @@ pub fn reml_laml_evaluate(
                     rho_corrections[idx].as_ref(),
                 ) {
                     DriftDerivResult::Dense(matrix) => all_h_k_matrices.push(matrix),
-                    DriftDerivResult::Operator(op) => all_h_k_matrices.push(op.to_dense()),
+                    DriftDerivResult::Operator(op) => {
+                        debug_assert!(
+                            false,
+                            "all-dense stochastic-trace branch hit Operator drift for rho coord {idx}; \
+                             `any_operator` flag in unified.rs must be wrong"
+                        );
+                        all_h_k_matrices.push(op.to_dense());
+                    }
                 }
             }
 
@@ -4321,7 +4333,14 @@ pub fn reml_laml_evaluate(
                 };
                 match hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim()) {
                     DriftDerivResult::Dense(matrix) => all_h_k_matrices.push(matrix),
-                    DriftDerivResult::Operator(op) => all_h_k_matrices.push(op.to_dense()),
+                    DriftDerivResult::Operator(op) => {
+                        debug_assert!(
+                            false,
+                            "all-dense stochastic-trace branch hit Operator drift for ext coord; \
+                             `any_operator` flag in unified.rs must be wrong"
+                        );
+                        all_h_k_matrices.push(op.to_dense());
+                    }
                 }
             }
 
