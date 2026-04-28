@@ -5477,9 +5477,14 @@ impl StoredFirstDrift {
     }
 }
 
-struct WeightedHyperOperator {
-    terms: Vec<(f64, Arc<dyn HyperOperator>)>,
-    dim_hint: usize,
+/// Linear combination of `HyperOperator` factors with explicit scalar
+/// weights. Used to bundle a coord's per-mode drift operators (or any other
+/// per-term linear combination) into a single matrix-free operator that
+/// implements the same `HyperOperator` trait, so callers downstream do not
+/// need to handle a vector of (weight, op) pairs themselves.
+pub(crate) struct WeightedHyperOperator {
+    pub(crate) terms: Vec<(f64, Arc<dyn HyperOperator>)>,
+    pub(crate) dim_hint: usize,
 }
 
 impl HyperOperator for WeightedHyperOperator {
