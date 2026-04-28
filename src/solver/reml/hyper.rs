@@ -1064,28 +1064,22 @@ impl<'a> RemlState<'a> {
                 },
             ))
         } else {
-            let cost = self.compute_cost(&rho)?;
-            let grad = self.compute_gradient(&rho)?;
+            // Rho-only fallback (no tau hyper-directions). Route through
+            // `compute_outer_eval_with_order` so the unified evaluator's
+            // representation choice (Operator vs Analytic) is preserved
+            // end-to-end. The previous hand-rolled assembly forced a dense
+            // materialization via `compute_lamlhessian_consistent`, which
+            // bypassed the matrix-free routing in `prefer_outer_hessian_operator`
+            // and silently degraded large-K joint-hyper outers to the dense
+            // path even when the eval-side had elected Operator.
+            let eval = self.compute_outer_eval_with_order(&rho, order)?;
             log::debug!(
                 "[outer-timing] compute_joint_hyper_eval (rho-only, dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 t_outer_start.elapsed().as_secs_f64(),
-                cost,
+                eval.cost,
             );
-            Ok((
-                cost,
-                grad,
-                if matches!(
-                    order,
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
-                ) {
-                    crate::solver::outer_strategy::HessianResult::Analytic(
-                        self.compute_lamlhessian_consistent(&rho)?,
-                    )
-                } else {
-                    crate::solver::outer_strategy::HessianResult::Unavailable
-                },
-            ))
+            Ok((eval.cost, eval.gradient, eval.hessian))
         }
     }
 
