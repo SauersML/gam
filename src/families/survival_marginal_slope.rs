@@ -10408,16 +10408,22 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
-        // Zero-allocation hot path: views directly over the stack arrays, no
-        // Array1::from_vec or intermediate Array2 buffer.
+        // Zero-allocation hot path: views over stack arrays, fused contraction
+        // loop writes directly into the [[f64;4];4] result without allocating
+        // an intermediate Array1 or Array2.
         let dir_view = ndarray::aview1(&dir[..]);
-        let out =
-            self.family
-                .row_primary_third_contracted(row, &self.block_states, dir_view)?;
-        let mut r = [[0.0; 4]; 4];
-        for a in 0..4 {
-            for b in 0..4 {
-                r[a][b] = out[[a, b]];
+        let mut r = [[0.0_f64; 4]; 4];
+        for a in 0..N_PRIMARY {
+            let da = unit_primary_direction_ref(a).view();
+            for b in a..N_PRIMARY {
+                let db = unit_primary_direction_ref(b).view();
+                let value = self.family.row_neglog_directional_refs(
+                    row,
+                    &self.block_states,
+                    &[da, db, dir_view],
+                )?;
+                r[a][b] = value;
+                r[b][a] = value;
             }
         }
         Ok(r)
@@ -10429,19 +10435,22 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         dir_u: &[f64; 4],
         dir_v: &[f64; 4],
     ) -> Result<[[f64; 4]; 4], String> {
-        // Zero-allocation hot path: views directly over the stack arrays.
+        // Zero-allocation hot path: views over stack arrays, fused contraction
+        // loop writes directly into the [[f64;4];4] result.
         let u_view = ndarray::aview1(&dir_u[..]);
         let v_view = ndarray::aview1(&dir_v[..]);
-        let out = self.family.row_primary_fourth_contracted(
-            row,
-            &self.block_states,
-            u_view,
-            v_view,
-        )?;
-        let mut r = [[0.0; 4]; 4];
-        for a in 0..4 {
-            for b in 0..4 {
-                r[a][b] = out[[a, b]];
+        let mut r = [[0.0_f64; 4]; 4];
+        for a in 0..N_PRIMARY {
+            let da = unit_primary_direction_ref(a).view();
+            for b in a..N_PRIMARY {
+                let db = unit_primary_direction_ref(b).view();
+                let value = self.family.row_neglog_directional_refs(
+                    row,
+                    &self.block_states,
+                    &[da, db, u_view, v_view],
+                )?;
+                r[a][b] = value;
+                r[b][a] = value;
             }
         }
         Ok(r)
@@ -10625,7 +10634,7 @@ impl SurvivalMarginalSlopeFamily {
                         q_geom.dqd1_time.dot(&d_time) + q_geom.dqd1_marginal.dot(&d_marginal),
                         self.logslope_design.dot_row_view(row, d_logslope),
                     ]);
-                    let t_ud = self.row_primary_third_contracted(row, block_states, &u_d)?;
+                    let t_ud = self.row_primary_third_contracted(row, block_states, u_d.view())?;
                     let h_ud = h_pi.dot(&u_d);
 
                     // Term 1 + 3: reuse core accumulator with (H·u^d, T[u^d])
@@ -11210,9 +11219,14 @@ impl SurvivalMarginalSlopeFamily {
                         self.logslope_design.dot_row_view(row, dv_g),
                     ]);
 
-                    let t_d = self.row_primary_third_contracted(row, block_states, &ud)?;
-                    let t_e = self.row_primary_third_contracted(row, block_states, &ue)?;
-                    let q_de = self.row_primary_fourth_contracted(row, block_states, &ud, &ue)?;
+                    let t_d = self.row_primary_third_contracted(row, block_states, ud.view())?;
+                    let t_e = self.row_primary_third_contracted(row, block_states, ue.view())?;
+                    let q_de = self.row_primary_fourth_contracted(
+                        row,
+                        block_states,
+                        ud.view(),
+                        ue.view(),
+                    )?;
                     let h_ud = h_pi.dot(&ud);
                     let h_ue = h_pi.dot(&ue);
 
@@ -11297,7 +11311,8 @@ impl SurvivalMarginalSlopeFamily {
                     };
 
                     // Ψ = Q[ud,ue] + T[due_d]
-                    let t_due = self.row_primary_third_contracted(row, block_states, &due_d)?;
+                    let t_due =
+                        self.row_primary_third_contracted(row, block_states, due_d.view())?;
                     let psi = &q_de + &t_due;
 
                     // γ = T_d·ue + H·due_d
