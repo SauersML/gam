@@ -2427,6 +2427,7 @@ struct KroneckerActiveSetCache {
     dh_eps: f64,
 }
 
+#[allow(dead_code)]
 impl KroneckerActiveSetCache {
     fn new() -> Self {
         Self {
@@ -2831,11 +2832,8 @@ impl KroneckerDesign {
     ///
     /// Bit-equivalent to `min_step_to_boundary(β, δ, slack, dh_eps)` when
     /// `c = X · β_matᵀ` and `d = X · δ_matᵀ`, but reuses the projections
-    /// supplied by the caller so a line-search probe that only changes one
-    /// of `(β, δ)` need refresh just one factor with a single `apply` pass.
-    /// Panics if invoked on a `KhatriRao` design — those callers should keep
-    /// using the un-cached entry point since their `forward_mul` already
-    /// streams over the `n` observation rows.
+    /// supplied by the caller.
+    #[allow(dead_code)]
     fn min_step_to_boundary_with_projections(
         &self,
         c: ndarray::ArrayView2<'_, f64>,
