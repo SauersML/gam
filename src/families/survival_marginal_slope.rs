@@ -38,7 +38,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -4933,7 +4933,7 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        dirs: &[&Array1<f64>],
+        dirs: &[ArrayView1<'_, f64>],
     ) -> Result<f64, String> {
         let k = dirs.len();
         if k > 4 {
@@ -5642,13 +5642,13 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        dir: &Array1<f64>,
+        dir: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
-            let da = unit_primary_direction_ref(a);
+            let da = unit_primary_direction_ref(a).view();
             for b in a..N_PRIMARY {
-                let db = unit_primary_direction_ref(b);
+                let db = unit_primary_direction_ref(b).view();
                 let value = self.row_neglog_directional_refs(row, block_states, &[da, db, dir])?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
@@ -8357,7 +8357,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.effective_flex_active(block_states)? {
             self.row_flex_primary_third_contracted_exact(row, block_states, dir)
         } else {
-            self.row_primary_third_contracted(row, block_states, dir)
+            self.row_primary_third_contracted(row, block_states, dir.view())
         }
     }
 
@@ -8365,16 +8365,19 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
+        dir_u: ArrayView1<'_, f64>,
+        dir_v: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
-            let da = unit_primary_direction_ref(a);
+            let da = unit_primary_direction_ref(a).view();
             for b in a..N_PRIMARY {
-                let db = unit_primary_direction_ref(b);
-                let value =
-                    self.row_neglog_directional_refs(row, block_states, &[da, db, dir_u, dir_v])?;
+                let db = unit_primary_direction_ref(b).view();
+                let value = self.row_neglog_directional_refs(
+                    row,
+                    block_states,
+                    &[da, db, dir_u, dir_v],
+                )?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
             }
@@ -8392,7 +8395,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.effective_flex_active(block_states)? {
             self.row_flex_primary_fourth_contracted_exact(row, block_states, dir_u, dir_v)
         } else {
-            self.row_primary_fourth_contracted(row, block_states, dir_u, dir_v)
+            self.row_primary_fourth_contracted(row, block_states, dir_u.view(), dir_v.view())
         }
     }
 
@@ -10405,10 +10408,12 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
-        let dir_arr = Array1::from_vec(dir.to_vec());
-        let out = self
-            .family
-            .row_primary_third_contracted(row, &self.block_states, &dir_arr)?;
+        // Zero-allocation hot path: views directly over the stack arrays, no
+        // Array1::from_vec or intermediate Array2 buffer.
+        let dir_view = ndarray::aview1(&dir[..]);
+        let out =
+            self.family
+                .row_primary_third_contracted(row, &self.block_states, dir_view)?;
         let mut r = [[0.0; 4]; 4];
         for a in 0..4 {
             for b in 0..4 {
@@ -10424,11 +10429,15 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         dir_u: &[f64; 4],
         dir_v: &[f64; 4],
     ) -> Result<[[f64; 4]; 4], String> {
-        let u = Array1::from_vec(dir_u.to_vec());
-        let v = Array1::from_vec(dir_v.to_vec());
-        let out = self
-            .family
-            .row_primary_fourth_contracted(row, &self.block_states, &u, &v)?;
+        // Zero-allocation hot path: views directly over the stack arrays.
+        let u_view = ndarray::aview1(&dir_u[..]);
+        let v_view = ndarray::aview1(&dir_v[..]);
+        let out = self.family.row_primary_fourth_contracted(
+            row,
+            &self.block_states,
+            u_view,
+            v_view,
+        )?;
         let mut r = [[0.0; 4]; 4];
         for a in 0..4 {
             for b in 0..4 {
@@ -15704,13 +15713,17 @@ mod tests {
         for a in 0..N_PRIMARY {
             let dir_a = unit_primary_direction(a);
             let grad_exact = family
-                .row_neglog_directional_refs(0, &block_states, &[&dir_a])
+                .row_neglog_directional_refs(0, &block_states, &[dir_a.view()])
                 .expect("exact row gradient");
             assert_close(grad_closed[a], grad_exact, 1e-10, &format!("grad[{a}]"));
             for b in 0..N_PRIMARY {
                 let dir_b = unit_primary_direction(b);
                 let hess_exact = family
-                    .row_neglog_directional_refs(0, &block_states, &[&dir_a, &dir_b])
+                    .row_neglog_directional_refs(
+                        0,
+                        &block_states,
+                        &[dir_a.view(), dir_b.view()],
+                    )
                     .expect("exact row hessian");
                 assert_close(
                     hess_closed[[a, b]],
