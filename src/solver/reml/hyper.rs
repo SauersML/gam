@@ -327,9 +327,9 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
         // `firth_hphi_tau_partial_apply` takes a (p × m) rhs block; wrap v as
         // a (p × 1) column, run the partial apply, and pull off column 0.
         let rhs = v.view().insert_axis(Axis(1)).to_owned();
-        let firth_out = self
-            .firth_op
-            .hphi_tau_partial_apply(&self.x_tau_dense, &self.tau_kernel, &rhs);
+        let firth_out =
+            self.firth_op
+                .hphi_tau_partial_apply(&self.x_tau_dense, &self.tau_kernel, &rhs);
         base - firth_out.column(0).to_owned()
     }
 
