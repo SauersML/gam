@@ -1725,6 +1725,10 @@ struct BernoulliBlockHessianOperator {
 }
 
 impl HyperOperator for BernoulliBlockHessianOperator {
+    fn dim(&self) -> usize {
+        self.total
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);

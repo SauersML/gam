@@ -2532,6 +2532,10 @@ struct BlockHessianOperator {
 }
 
 impl HyperOperator for BlockHessianOperator {
+    fn dim(&self) -> usize {
+        self.slices.total
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let v_t = v.slice(s![self.slices.time.clone()]);
         let v_m = v.slice(s![self.slices.marginal.clone()]);

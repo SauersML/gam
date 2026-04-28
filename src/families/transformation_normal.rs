@@ -2123,6 +2123,10 @@ impl TransformationNormalDhMatrixFreeOperator {
 }
 
 impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
+    fn dim(&self) -> usize {
+        self.p_total()
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p_total());
         self.apply(v)
@@ -2240,6 +2244,10 @@ impl TransformationNormalD2hMatrixFreeOperator {
 }
 
 impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
+    fn dim(&self) -> usize {
+        self.p_total()
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p_total());
         self.apply(v)
