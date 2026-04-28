@@ -1823,10 +1823,6 @@ struct TransformationNormalJointHessianWorkspace {
     /// the full row-space Kronecker designs (~hundreds of MiB at biobank
     /// scale) per call. Arc-sharing makes operator construction O(1).
     family: Arc<TransformationNormalFamily>,
-    /// h'_i = X_deriv · β at the current iterate. Cached so the matrix-free
-    /// directional-derivative operators can reuse it without rerunning
-    /// `forward_mul(beta)`.
-    h_prime: Arc<Array1<f64>>,
     /// Row weights w / h'^2 for the X_deriv^T diag(·) X_deriv summand.
     weighted_inv_hp_sq: Array1<f64>,
     /// `1 / h'^3` cached per accepted β. Reused as the per-row factor in the
@@ -1852,7 +1848,6 @@ impl TransformationNormalJointHessianWorkspace {
         });
         Ok(Self {
             family,
-            h_prime: Arc::new(h_prime),
             weighted_inv_hp_sq,
             inv_hp_cu: Arc::new(inv_hp_cu),
             inv_hp_qu: Arc::new(inv_hp_qu),
@@ -4856,6 +4851,198 @@ mod tests {
                     got[i]
                 );
             }
+        }
+    }
+
+    /// FD check for the cached CTN barrier dH operator (third-derivative formula
+    /// `D(∇²B)[u]v = -2 μ Dᵀ((Du)(Dv)/c³)`).
+    ///
+    /// At fixed direction `d_beta`, builds `H(β ± ε d_beta) v` matrix-free via
+    /// `apply_hessian` and checks that the centered FD quotient converges to the
+    /// operator's `mul_vec(v)`. This locks in both the analytic formula and the
+    /// `inv_hp_cu` cache (a stale cache would only show up under ε perturbation,
+    /// not in the dense-equivalence test that probes a single iterate).
+    #[test]
+    fn ctn_dh_operator_matches_fd_under_beta_perturbation() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+        let d_beta = array![0.07, -0.04, 0.21, 0.08];
+        let v = array![0.30, -0.20, 0.45, -0.10];
+        assert_eq!(d_beta.len(), p);
+        assert_eq!(v.len(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
+            .expect("workspace build")
+            .expect("workspace present");
+        let want = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH op call")
+            .expect("dH op present")
+            .mul_vec(&v);
+
+        let eps = 1e-5;
+        let make_state = |scale: f64| ParameterBlockState {
+            beta: &state.beta + &(d_beta.mapv(|b| scale * b)),
+            eta: state.eta.clone(),
+        };
+        let plus = family
+            .exact_newton_joint_hessian_workspace(
+                std::slice::from_ref(&make_state(eps)),
+                &[spec.clone()],
+            )
+            .expect("plus workspace")
+            .expect("plus workspace present");
+        let minus = family
+            .exact_newton_joint_hessian_workspace(
+                std::slice::from_ref(&make_state(-eps)),
+                &[spec.clone()],
+            )
+            .expect("minus workspace")
+            .expect("minus workspace present");
+        let hv_plus = plus.hessian_matvec(&v).expect("plus matvec").expect("plus matvec");
+        let hv_minus = minus.hessian_matvec(&v).expect("minus matvec").expect("minus matvec");
+        let fd: Array1<f64> = (&hv_plus - &hv_minus).mapv(|x| x / (2.0 * eps));
+
+        for i in 0..p {
+            let scale = want[i].abs().max(1.0);
+            // O(ε²) centered FD on a smooth Hessian gives ~1e-7 relative error
+            // at ε=1e-5; loose 5e-5 tolerance covers the dominant truncation
+            // term plus the inflation by `||v||·||d_beta||`.
+            let tol = 5e-5 * scale + 5e-7;
+            assert!(
+                (want[i] - fd[i]).abs() <= tol,
+                "dH FD mismatch at {i}: op={:.6e}, fd={:.6e}, tol={:.6e}",
+                want[i],
+                fd[i],
+                tol,
+            );
+        }
+    }
+
+    /// FD check for the cached CTN barrier d²H operator (fourth-derivative
+    /// formula `D²(∇²B)[u,w]v = 6 μ Dᵀ((Du)(Dw)(Dv)/c⁴)`).
+    ///
+    /// Centered FD on the dH operator along `dir_w` recovers d²H[u, w] · v;
+    /// this exercises both the cached `inv_hp_qu` and the chained Khatri–Rao
+    /// apply on the perturbed iterate.
+    #[test]
+    fn ctn_d2h_operator_matches_fd_under_beta_perturbation() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+        let dir_u = array![0.05, -0.03, 0.08, 0.02];
+        let dir_w = array![-0.02, 0.04, 0.01, -0.03];
+        let v = array![0.30, -0.20, 0.45, -0.10];
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
+            .expect("workspace build")
+            .expect("workspace present");
+        let want = workspace
+            .second_directional_derivative_operator(&dir_u, &dir_w)
+            .expect("d2H op call")
+            .expect("d2H op present")
+            .mul_vec(&v);
+
+        let eps = 1e-5;
+        let make_state = |scale: f64| ParameterBlockState {
+            beta: &state.beta + &(dir_w.mapv(|b| scale * b)),
+            eta: state.eta.clone(),
+        };
+        let plus_ws = family
+            .exact_newton_joint_hessian_workspace(
+                std::slice::from_ref(&make_state(eps)),
+                &[spec.clone()],
+            )
+            .expect("plus ws")
+            .expect("plus ws present");
+        let minus_ws = family
+            .exact_newton_joint_hessian_workspace(
+                std::slice::from_ref(&make_state(-eps)),
+                &[spec.clone()],
+            )
+            .expect("minus ws")
+            .expect("minus ws present");
+        let dh_plus = plus_ws
+            .directional_derivative_operator(&dir_u)
+            .expect("plus dH op call")
+            .expect("plus dH op present")
+            .mul_vec(&v);
+        let dh_minus = minus_ws
+            .directional_derivative_operator(&dir_u)
+            .expect("minus dH op call")
+            .expect("minus dH op present")
+            .mul_vec(&v);
+        let fd: Array1<f64> = (&dh_plus - &dh_minus).mapv(|x| x / (2.0 * eps));
+
+        for i in 0..p {
+            let scale = want[i].abs().max(1.0);
+            let tol = 5e-5 * scale + 5e-7;
+            assert!(
+                (want[i] - fd[i]).abs() <= tol,
+                "d2H FD mismatch at {i}: op={:.6e}, fd={:.6e}, tol={:.6e}",
+                want[i],
+                fd[i],
+                tol,
+            );
+        }
+    }
+
+    /// FD check for the CTN barrier `∇²B v` operator itself: centered FD on the
+    /// log-likelihood gradient w.r.t. β reproduces `H(β) v` (to within FD
+    /// truncation). This is the `μ Dᵀ((Dv)/c²)` formula plus the
+    /// β-independent `X_val^T W X_val` term.
+    #[test]
+    fn ctn_hessian_matvec_matches_grad_fd() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, spec) = toy_family_and_derivatives(&psi);
+        let p = spec.design.ncols();
+        let v = array![0.30, -0.20, 0.45, -0.10];
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
+            .expect("workspace build")
+            .expect("workspace present");
+        let hv = workspace
+            .hessian_matvec(&v)
+            .expect("matvec call")
+            .expect("matvec present");
+
+        let eps = 1e-6;
+        // CTN's `evaluate()` returns the score (gradient of log-likelihood)
+        // through the working-set; the joint Hessian is `-d²ℓ/dβ²`, so
+        // `H · v ≈ -[grad(β + εv) - grad(β - εv)] / (2ε)`.
+        let make_state = |scale: f64| ParameterBlockState {
+            beta: &state.beta + &(v.mapv(|b| scale * b)),
+            eta: state.eta.clone(),
+        };
+        let grad_at = |st: &ParameterBlockState| -> Array1<f64> {
+            let eval = family
+                .evaluate(std::slice::from_ref(st))
+                .expect("evaluate must succeed");
+            match &eval.blockworking_sets[0] {
+                BlockWorkingSet::ExactNewton { gradient, .. } => gradient.clone(),
+                _ => panic!("CTN must report ExactNewton working set"),
+            }
+        };
+        let grad_plus = grad_at(&make_state(eps));
+        let grad_minus = grad_at(&make_state(-eps));
+        // The score is +∂ℓ/∂β, and H = -∂²ℓ/∂β². Centered FD on the score gives
+        // dscore/dβ · v = -H · v, so we negate to compare against `hv`.
+        let fd: Array1<f64> = (&grad_plus - &grad_minus).mapv(|x| -x / (2.0 * eps));
+
+        for i in 0..p {
+            let scale = hv[i].abs().max(1.0);
+            let tol = 1e-4 * scale + 1e-6;
+            assert!(
+                (hv[i] - fd[i]).abs() <= tol,
+                "Hv FD mismatch at {i}: op={:.6e}, fd={:.6e}, tol={:.6e}",
+                hv[i],
+                fd[i],
+                tol,
+            );
         }
     }
 
