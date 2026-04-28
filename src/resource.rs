@@ -6,27 +6,11 @@ pub struct ResourcePolicy {
     pub max_owned_data_cache_bytes: usize,
     pub row_chunk_target_bytes: usize,
     pub derivative_storage_mode: DerivativeStorageMode,
-    /// DEPRECATED: compute estimates must NEVER reject runs.  Field is kept
-    /// for ABI compatibility but is ignored — the preflight gate
-    /// `panic_or_error_if_biobank_mode_compute_budget_exceeded` is now a
-    /// no-op.  The architecture's response to "expensive dense work" is to
-    /// route to matrix-free / operator-backed designs and matrix-free
-    /// Hessian-vector products + operator trust-region, never to refuse the
-    /// fit.  Memory-safety checks (`max_single_materialization_bytes`)
-    /// remain as the only rejection criterion.
-    pub max_compute_budget_flops: u64,
 }
 
 pub const SPATIAL_DISTANCE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 pub const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
-
-/// Default compute-budget ceiling for dense materialization paths, in
-/// flop-equivalent units. ~10¹³ flops corresponds to roughly 30 minutes on a
-/// biobank-class node assuming ~10 Gflop/s sustained throughput on the dense
-/// kernels involved. Beyond this the configuration is rejected with guidance
-/// toward operator-backed designs or matrix-free Hessian workspaces.
-pub const DEFAULT_MAX_COMPUTE_BUDGET_FLOPS: u64 = 10_000_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DerivativeStorageMode {
@@ -91,7 +75,6 @@ impl ResourcePolicy {
             max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MiB
             row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MiB per chunk
             derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
-            max_compute_budget_flops: DEFAULT_MAX_COMPUTE_BUDGET_FLOPS,
         }
     }
 
@@ -114,10 +97,6 @@ impl ResourcePolicy {
             max_owned_data_cache_bytes: 512 * 1024 * 1024,
             row_chunk_target_bytes: 64 * 1024 * 1024,
             derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
-            // Permissive-small-data is for tests and small-n usage where the
-            // compute-budget gate would only generate noise; raise it well
-            // beyond any realistic small-data fit.
-            max_compute_budget_flops: u64::MAX,
         }
     }
 
