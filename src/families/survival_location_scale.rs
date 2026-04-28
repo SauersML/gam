@@ -7849,7 +7849,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // h_tl, h_tw, h_lw) are not required by per-block working sets, so
         // we never materialize them. See `assemble_block_diagonal_hessians_from_quantities`.
         let q = self.collect_joint_quantities(block_states)?;
-        let block_hessians = self.assemble_block_diagonal_hessians_from_quantities(&q, block_states)?;
+        let block_hessians =
+            self.assemble_block_diagonal_hessians_from_quantities(&q, block_states)?;
         if block_hessians.len() != block_gradients.len() {
             return Err(format!(
                 "SurvivalLocationScaleFamily evaluate block count mismatch: gradients={}, hessians={}",

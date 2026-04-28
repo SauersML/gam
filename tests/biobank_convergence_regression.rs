@@ -124,8 +124,11 @@ fn biobank_convergence_regression() {
 
     // True η: a non-trivial smooth oscillation in [-1.5, 1.5].
     let two_pi = std::f64::consts::TAU;
-    let true_eta: Array1<f64> =
-        Array1::from_iter(x_raw.iter().map(|&t| (two_pi * t).sin() + 0.5 * (2.0 * two_pi * t).cos()));
+    let true_eta: Array1<f64> = Array1::from_iter(
+        x_raw
+            .iter()
+            .map(|&t| (two_pi * t).sin() + 0.5 * (2.0 * two_pi * t).cos()),
+    );
 
     // Bernoulli draws from logit^{-1}(η).
     let y = Array1::from_iter(true_eta.iter().map(|&eta| {

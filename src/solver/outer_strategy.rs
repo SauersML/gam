@@ -1653,8 +1653,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 for &i in psi_indices {
                     combined_step[i] = 0.0;
                 }
-                self.consecutive_psi_zero_iters =
-                    self.consecutive_psi_zero_iters.saturating_add(1);
+                self.consecutive_psi_zero_iters = self.consecutive_psi_zero_iters.saturating_add(1);
                 if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
                     // Persistent ψ stagnation: the EFS ψ step direction is no
                     // longer descent-correlated at this iterate. Continuing on
@@ -2239,10 +2238,7 @@ impl OuterProblem {
     /// [`STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS`].
     fn aggregate_hessian_pair_work_too_large(&self) -> bool {
         self.aggregate_hessian_pair_work_hint
-            .map(|w| {
-                w.is_finite()
-                    && w > STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS as f64
-            })
+            .map(|w| w.is_finite() && w > STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS as f64)
             .unwrap_or(false)
     }
 
@@ -2328,9 +2324,7 @@ impl OuterProblem {
             eval_order_fn: None,
             reset_fn,
             efs_fn,
-            screening_proxy_fn: None::<
-                fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-            >,
+            screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
         }
     }
 
@@ -2364,9 +2358,7 @@ impl OuterProblem {
             eval_order_fn: Some(eval_order_fn),
             reset_fn,
             efs_fn,
-            screening_proxy_fn: None::<
-                fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-            >,
+            screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
         }
     }
 
@@ -2423,8 +2415,7 @@ impl OuterProblem {
         // hint (k·n·p² + k²·p²) are surfaced when set, along with whether
         // the matrix-free Hv-operator path will absorb the cost (in which
         // case ARC stays even with a high cost estimate).
-        if self.dense_hessian_work_hint.is_some()
-            || self.aggregate_hessian_pair_work_hint.is_some()
+        if self.dense_hessian_work_hint.is_some() || self.aggregate_hessian_pair_work_hint.is_some()
         {
             let dense_work = self.dense_hessian_work_hint.unwrap_or(f64::NAN);
             let aggregate_work = self.aggregate_hessian_pair_work_hint.unwrap_or(f64::NAN);
@@ -3086,10 +3077,8 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let scaled_tol =
-                        outer_scaled_tolerance(config.tolerance, seed_eval.cost);
-                    let tol =
-                        Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
+                    let scaled_tol = outer_scaled_tolerance(config.tolerance, seed_eval.cost);
+                    let tol = Tolerance::new(scaled_tol).expect("outer tolerance must be valid");
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -3542,8 +3531,7 @@ mod tests {
 
         // Scale ratio must be the same for both magnitudes.
         let ratio_base = outer_scaled_tolerance(base_tol, v_base) / (1.0 + v_base);
-        let ratio_scaled =
-            outer_scaled_tolerance(base_tol, v_scaled) / (1.0 + v_scaled);
+        let ratio_scaled = outer_scaled_tolerance(base_tol, v_scaled) / (1.0 + v_scaled);
         assert!(
             (ratio_base - ratio_scaled).abs() < 1e-15,
             "scale ratio must be invariant: base={ratio_base:.3e}  scaled={ratio_scaled:.3e}"
@@ -4118,9 +4106,7 @@ mod tests {
                 *st = 42;
             }),
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-            screening_proxy_fn: None::<
-                fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>,
-            >,
+            screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
@@ -4174,9 +4160,7 @@ mod tests {
                     psi_indices: Some(vec![11]),
                 })
             }),
-            screening_proxy_fn: None::<
-                fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>,
-            >,
+            screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         };
         let mut bridge = OuterFixedPointBridge {
             obj: &mut obj,
@@ -5396,5 +5380,4 @@ mod tests {
             "aux direct-search must project the seed before evaluating its cost",
         );
     }
-
 }

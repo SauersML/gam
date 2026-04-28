@@ -2489,15 +2489,11 @@ impl CustomFamily for LatentSurvivalFamily {
         let block_ranges = self.joint_block_ranges();
         let mut blockworking_sets = vec![
             BlockWorkingSet::ExactNewton {
-                gradient: joint_gradient
-                    .slice(s![block_ranges[0].clone()])
-                    .to_owned(),
+                gradient: joint_gradient.slice(s![block_ranges[0].clone()]).to_owned(),
                 hessian: SymmetricMatrix::Dense(hess_time),
             },
             BlockWorkingSet::ExactNewton {
-                gradient: joint_gradient
-                    .slice(s![block_ranges[1].clone()])
-                    .to_owned(),
+                gradient: joint_gradient.slice(s![block_ranges[1].clone()]).to_owned(),
                 hessian: SymmetricMatrix::Dense(hess_mean),
             },
         ];
