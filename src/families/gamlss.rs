@@ -6798,6 +6798,10 @@ impl RowCoeffOperator {
 }
 
 impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.dim);
         // 1) For each channel, compute u_a = X_a · v[block_a slice].

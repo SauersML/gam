@@ -97,6 +97,10 @@ fn build_active_design_matrix(
 }
 
 impl super::unified::HyperOperator for TauTauPairHyperOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p);
 
@@ -245,6 +249,10 @@ struct TauBetaDriftDerivOperator {
 }
 
 impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p);
         let x_v = self.x_design.matrixvectormultiply(v);
@@ -321,6 +329,10 @@ struct FirthAugmentedSingleHyperOperator {
 }
 
 impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p);
         let base = self.base.mul_vec(v);
@@ -369,6 +381,10 @@ struct FirthAugmentedPairHyperOperator {
 }
 
 impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p);
         let base = self.base.mul_vec(v);
