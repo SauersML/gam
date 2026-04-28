@@ -896,9 +896,10 @@ impl FirthDenseOperator {
             + crate::faer_ndarray::fast_xt_diag_x(&self.x_reduced, &dw);
 
         let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
-        let x_tauk = x_tau_reduced.dot(&self.k_reduced);
+        let x_tauk = fast_ab(x_tau_reduced, &self.k_reduced);
         let dot_h_explicit = 2.0 * Self::rowwise_dot(&x_tauk, &self.x_reduced);
-        let dot_h_implicit = Self::rowwise_dot(&self.x_reduced.dot(&dot_k), &self.x_reduced);
+        let dot_h_implicit =
+            Self::rowwise_dot(&fast_ab(&self.x_reduced, &dot_k), &self.x_reduced);
         let dot_h = dot_h_explicit + dot_h_implicit;
         (dot_i, dot_h)
     }
@@ -1619,16 +1620,16 @@ impl FirthDenseOperator {
         let dh_ij: Array1<f64> = {
             let mut acc = Array1::<f64>::zeros(n);
             if x_tau_tau_is_some {
-                let rij_k = x_rij.dot(k);
+                let rij_k = fast_ab(x_rij, k);
                 acc = acc + 2.0 * Self::rowwise_dot(&rij_k, x_r);
             }
-            let xr_kddot = x_r.dot(&k_ddot);
+            let xr_kddot = fast_ab(x_r, &k_ddot);
             acc = acc + Self::rowwise_dot(&xr_kddot, x_r);
-            let ri_kdot_j = x_ri.dot(dot_k_j);
+            let ri_kdot_j = fast_ab(x_ri, dot_k_j);
             acc = acc + 2.0 * Self::rowwise_dot(&ri_kdot_j, x_r);
-            let rj_kdot_i = x_rj.dot(dot_k_i);
+            let rj_kdot_i = fast_ab(x_rj, dot_k_i);
             acc = acc + 2.0 * Self::rowwise_dot(&rj_kdot_i, x_r);
-            let ri_k = x_ri.dot(k);
+            let ri_k = fast_ab(x_ri, k);
             acc = acc + 2.0 * Self::rowwise_dot(&ri_k, x_rj);
             acc
         };
