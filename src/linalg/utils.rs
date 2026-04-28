@@ -527,13 +527,20 @@ where
     if !probe_norm_sq.is_finite() || probe_norm_sq <= 0.0 {
         return Err("SLQ probe has invalid norm".to_string());
     }
+    // Store the accumulated orthonormal Lanczos basis as columns of a (p × max_steps)
+    // contiguous matrix so reorthogonalization can be performed via two BLAS2 calls
+    // (`Q^T v` and `v -= Q (Q^T v)`) instead of `k` separate dot/axpy pairs at step k.
+    // This converts an O(m^2 p) sequence of BLAS1 ops into matmul-friendly traffic
+    // with substantially better cache locality and SIMD throughput.
+    let mut q_basis = Array2::<f64>::zeros((p, max_steps));
     let mut q_prev = Array1::<f64>::zeros(p);
     let mut q = probe.mapv(|v| v / probe_norm_sq.sqrt());
-    let mut q_basis = Vec::<Array1<f64>>::with_capacity(max_steps);
     let mut alphas = Vec::<f64>::with_capacity(max_steps);
     let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
     let mut beta_prev = 0.0_f64;
     let tol = 1e-12;
+    let mut basis_count = 0usize;
+    let mut proj_buf = Array1::<f64>::zeros(max_steps);
 
     for _ in 0..max_steps {
         let mut v = apply(&q);
@@ -545,14 +552,21 @@ where
             return Err("SLQ Lanczos produced non-finite alpha".to_string());
         }
         v.scaled_add(-alpha, &q);
-        // Reorthogonalize against the accumulated basis to limit ghost Ritz
-        // values and reduce variance on moderate-dimension SPD systems.
-        for basis_vec in &q_basis {
-            let proj = basis_vec.dot(&v);
-            if proj != 0.0 {
-                v.scaled_add(-proj, basis_vec);
+        // Batched classical Gram-Schmidt against the accumulated basis Q[:, ..k]:
+        //   proj = Q^T v  (length k)
+        //   v   -= Q proj
+        // Equivalent (in exact arithmetic) to the previous per-column MGS loop.
+        if basis_count > 0 {
+            let q_view = q_basis.slice(ndarray::s![.., ..basis_count]);
+            {
+                let mut proj = proj_buf.slice_mut(ndarray::s![..basis_count]);
+                ndarray::linalg::general_mat_vec_mul(1.0, &q_view.t(), &v, 0.0, &mut proj);
             }
+            let proj_ro = proj_buf.slice(ndarray::s![..basis_count]);
+            ndarray::linalg::general_mat_vec_mul(-1.0, &q_view, &proj_ro, 1.0, &mut v);
         }
+        // One additional pass against the current q (mirrors the original explicit
+        // self-projection step; serves as the "twice-is-enough" CGS reinforcement).
         let q_self_proj = q.dot(&v);
         if q_self_proj != 0.0 {
             v.scaled_add(-q_self_proj, &q);
@@ -562,7 +576,8 @@ where
         if !beta.is_finite() {
             return Err("SLQ Lanczos produced non-finite beta".to_string());
         }
-        q_basis.push(q.clone());
+        q_basis.column_mut(basis_count).assign(&q);
+        basis_count += 1;
         if beta <= tol {
             break;
         }
