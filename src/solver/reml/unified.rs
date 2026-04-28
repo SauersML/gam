@@ -704,14 +704,16 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
             .hessian_second_derivative_correction(v_k, v_l, u_kl)?;
 
         // Firth D(Hφ)[B_{kl}]: B_{kl} direction is u_kl in β-space.
-        let deta_kl: Array1<f64> = self.firth_op.x_dense.dot(u_kl);
+        let deta_kl: Array1<f64> = crate::faer_ndarray::fast_av(&self.firth_op.x_dense, u_kl);
         let dir_kl = self.firth_op.direction_from_deta(deta_kl);
         let firth_first = self.firth_op.hphi_direction(&dir_kl);
 
         // Firth D²(Hφ)[B_k, B_l]: second directional derivative.
-        let deta_k: Array1<f64> = self.firth_op.x_dense.dot(v_k).mapv(|v| -v);
+        let deta_k: Array1<f64> =
+            crate::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
         let dir_k = self.firth_op.direction_from_deta(deta_k);
-        let deta_l: Array1<f64> = self.firth_op.x_dense.dot(v_l).mapv(|v| -v);
+        let deta_l: Array1<f64> =
+            crate::faer_ndarray::fast_av(&self.firth_op.x_dense, v_l).mapv(|v| -v);
         let dir_l = self.firth_op.direction_from_deta(deta_l);
         let p = v_k.len();
         let eye = Array2::<f64>::eye(p);
