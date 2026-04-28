@@ -590,7 +590,8 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         //
         // This method returns the correction (dH/dρₖ − Aₖ), which is NEGATIVE.
         let x = self.x_transformed.to_dense_arc();
-        let x_v = x.dot(v_k); // X vₖ: n-vector
+        let x_ref = x.as_ref();
+        let x_v = crate::faer_ndarray::fast_av(x_ref, v_k); // X vₖ: n-vector
 
         // Elementwise: −c ⊙ (X vₖ)
         let mut neg_c_xv = x_v;
@@ -598,27 +599,8 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
             .and(&self.c_array)
             .for_each(|xv_i, &c_i| *xv_i *= -c_i);
 
-        // −Xᵀ diag(c ⊙ Xvₖ) X
-        let x_ref = x.as_ref();
-        let n = x_ref.nrows();
-        let p = x_ref.ncols();
-        let mut result = Array2::zeros((p, p));
-        for i in 0..n {
-            let w = neg_c_xv[i];
-            if w.abs() > 0.0 {
-                let xi = x_ref.row(i);
-                for a in 0..p {
-                    let wa = w * xi[a];
-                    for b in a..p {
-                        let val = wa * xi[b];
-                        result[[a, b]] += val;
-                        if a != b {
-                            result[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
+        // −Xᵀ diag(c ⊙ Xvₖ) X via parallel SIMD GEMM
+        let result = crate::faer_ndarray::fast_xt_diag_y(x_ref, &neg_c_xv, x_ref);
 
         Ok(Some(result))
     }
@@ -633,12 +615,12 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
         //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
         let x = self.x_transformed.to_dense_arc();
-        let x_vk = x.dot(v_k);
-        let x_vl = x.dot(v_l);
-        let x_ukl = x.dot(u_kl);
+        let x_ref = x.as_ref();
+        let x_vk = crate::faer_ndarray::fast_av(x_ref, v_k);
+        let x_vl = crate::faer_ndarray::fast_av(x_ref, v_l);
+        let x_ukl = crate::faer_ndarray::fast_av(x_ref, u_kl);
 
-        let n = x.nrows();
-        let p = x.ncols();
+        let n = x_ref.nrows();
         let mut weights = Array1::zeros(n);
 
         // c ⊙ X u_{kl}
@@ -656,25 +638,8 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
                 .for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
         }
 
-        // Xᵀ diag(weights) X
-        let x_ref = x.as_ref();
-        let mut result = Array2::zeros((p, p));
-        for i in 0..n {
-            let wi = weights[i];
-            if wi.abs() > 0.0 {
-                let xi = x_ref.row(i);
-                for a in 0..p {
-                    let wa = wi * xi[a];
-                    for b in a..p {
-                        let val = wa * xi[b];
-                        result[[a, b]] += val;
-                        if a != b {
-                            result[[b, a]] += val;
-                        }
-                    }
-                }
-            }
-        }
+        // Xᵀ diag(weights) X via parallel SIMD GEMM
+        let result = crate::faer_ndarray::fast_xt_diag_y(x_ref, &weights, x_ref);
 
         Ok(Some(result))
     }
@@ -713,7 +678,8 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         let base_corr = self.base.hessian_derivative_correction(v_k)?;
 
         // Firth correction: −D(Hφ)[B_k] where B_k = −v_k, δη_k = X·(−v_k).
-        let deta_k: Array1<f64> = self.firth_op.x_dense.dot(v_k).mapv(|v| -v);
+        let deta_k: Array1<f64> =
+            crate::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
         let dir_k = self.firth_op.direction_from_deta(deta_k);
         let firth_corr = self.firth_op.hphi_direction(&dir_k);
 
@@ -4461,7 +4427,7 @@ fn compute_adjoint_z_c(
         .and(ing.c_array)
         .and(leverage)
         .for_each(|w, &c, &h| *w = c * h);
-    let v = x_ref.t().dot(&weighted);
+    let v = crate::faer_ndarray::fast_atv(x_ref, &weighted);
     Ok(hop.solve(&v))
 }
 
@@ -4480,8 +4446,8 @@ fn compute_fourth_derivative_trace(
     };
     let xd = ing.x.to_dense_arc();
     let x_ref = xd.as_ref();
-    let x_vk = x_ref.dot(v_k);
-    let x_vl = x_ref.dot(v_l);
+    let x_vk = crate::faer_ndarray::fast_av(x_ref, v_k);
+    let x_vl = crate::faer_ndarray::fast_av(x_ref, v_l);
 
     let mut acc = 0.0;
     Zip::from(d_array)

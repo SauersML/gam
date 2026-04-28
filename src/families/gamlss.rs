@@ -16,7 +16,9 @@ use crate::custom_family::{
     shared_dense_arc, weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::{fast_atv, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y};
+use crate::faer_ndarray::{
+    fast_ab, fast_atb, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
+};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
@@ -89,15 +91,15 @@ impl DenseOrOperator<'_> {
         let p = self.ncols();
         assert_eq!(beta.len(), p);
         match self {
-            Self::Borrowed(dense) => dense.dot(&beta),
-            Self::Owned(dense) => dense.dot(&beta),
+            Self::Borrowed(dense) => fast_av(*dense, &beta),
+            Self::Owned(dense) => fast_av(dense, &beta),
             Self::Operator(design) => {
                 let mut out = Array1::<f64>::zeros(n);
                 for rows in exact_design_row_chunks(n, p) {
                     let chunk = design
                         .try_row_chunk(rows.clone())
                         .expect("gamlss DesignSlot::dot: design row chunk materialization failed");
-                    out.slice_mut(s![rows]).assign(&chunk.dot(&beta));
+                    out.slice_mut(s![rows]).assign(&fast_av(&chunk, &beta));
                 }
                 out
             }
@@ -5867,9 +5869,9 @@ impl GaussianLocationScaleFamily {
         let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_mu =
-            xmu_map.transpose_mul(weights_a.scoremu.view()) + xmu.t().dot(&weights_a.dscoremu);
-        let score_ls =
-            x_ls_map.transpose_mul(weights_a.score_ls.view()) + x_ls.t().dot(&weights_a.dscore_ls);
+            xmu_map.transpose_mul(weights_a.scoremu.view()) + fast_atv(xmu, &weights_a.dscoremu);
+        let score_ls = x_ls_map.transpose_mul(weights_a.score_ls.view())
+            + fast_atv(x_ls, &weights_a.dscore_ls);
         let score_psi = gaussian_pack_joint_score(&score_mu, &score_ls);
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
             dir_a.xmu_psi.cloned_first_action(),
@@ -6019,11 +6021,11 @@ impl GaussianLocationScaleFamily {
             &(xmu_ab_map.transpose_mul(weights_i.scoremu.view())
                 + xmu_i_map.transpose_mul(weights_j.dscoremu.view())
                 + xmu_j_map.transpose_mul(weights_i.dscoremu.view())
-                + xmu.t().dot(&secondweights.d2scoremu)),
+                + fast_atv(xmu, &secondweights.d2scoremu)),
             &(x_ls_ab_map.transpose_mul(weights_i.score_ls.view())
                 + x_ls_i_map.transpose_mul(weights_j.dscore_ls.view())
                 + x_ls_j_map.transpose_mul(weights_i.dscore_ls.view())
-                + x_ls.t().dot(&secondweights.d2score_ls)),
+                + fast_atv(x_ls, &secondweights.d2score_ls)),
         );
         let hessian_psi_psi = gaussian_joint_psisecondhessian_fromweights(
             xmu,
@@ -6102,8 +6104,8 @@ impl GaussianLocationScaleFamily {
         }
         let umu = d_beta_flat.slice(s![0..pmu]);
         let u_ls = d_beta_flat.slice(s![pmu..pmu + p_ls]);
-        let ximu = xmu.dot(&umu);
-        let xi_ls = x_ls.dot(&u_ls);
+        let ximu = fast_av(xmu, &umu);
+        let xi_ls = fast_av(x_ls, &u_ls);
         let uzamu = xmu_map.forward_mul(umu);
         let uza_ls = x_ls_map.forward_mul(u_ls);
         // Mixed drift T_a[u] = D_beta H_a^{(D)}[u] for the Gaussian family.
@@ -6646,12 +6648,12 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
                 total
             ));
         }
-        let u_mu = self.xmu.dot(&v.slice(s![0..pmu]));
-        let u_ls = self.x_ls.dot(&v.slice(s![pmu..total]));
+        let u_mu = fast_av(&self.xmu, &v.slice(s![0..pmu]));
+        let u_ls = fast_av(&self.x_ls, &v.slice(s![pmu..total]));
         let r_mu = &self.coeff_mm * &u_mu + &self.coeff_ml * &u_ls;
         let r_ls = &self.coeff_ml * &u_mu + &self.coeff_ll * &u_ls;
-        let out_mu = self.xmu.t().dot(&r_mu);
-        let out_ls = self.x_ls.t().dot(&r_ls);
+        let out_mu = fast_atv(&self.xmu, &r_mu);
+        let out_ls = fast_atv(&self.x_ls, &r_ls);
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pmu]).assign(&out_mu);
         out.slice_mut(s![pmu..total]).assign(&out_ls);
@@ -7517,17 +7519,17 @@ impl GaussianLocationScaleWiggleFamily {
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
-        let xi = xmu.dot(&umu);
-        let zeta = x_ls.dot(&u_ls);
+        let xi = fast_av(xmu, &umu);
+        let zeta = fast_av(x_ls, &u_ls);
         // logb κ-scaled η_ls direction; κ' = dκ/dη_ls = κ(1−κ).
         let szeta = &rows.kappa * &zeta;
-        let phi = geom.basis.dot(&uw);
+        let phi = fast_av(&geom.basis, &uw);
         let mut q_u = &geom.dq_dq0 * &xi;
         q_u += &phi;
         let mut s1_u = &geom.d2q_dq02 * &xi;
-        s1_u += &geom.basis_d1.dot(&uw);
+        s1_u += &fast_av(&geom.basis_d1, &uw);
         let mut g2_u = &geom.d3q_dq03 * &xi;
-        g2_u += &geom.basis_d2.dot(&uw);
+        g2_u += &fast_av(&geom.basis_d2, &uw);
         let basis_u = scale_matrix_rows(&geom.basis_d1, &xi)?;
         let basis1_u = scale_matrix_rows(&geom.basis_d2, &xi)?;
         let dw_u = -2.0 * &rows.w * &szeta;
@@ -7608,18 +7610,18 @@ impl GaussianLocationScaleWiggleFamily {
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
 
-        let xi_u = xmu.dot(&umu);
-        let xi_v = xmu.dot(&vmu);
-        let zeta_u = x_ls.dot(&u_ls);
-        let zeta_v = x_ls.dot(&v_ls);
-        let phi_u = geom.basis.dot(&uw);
-        let phi_v = geom.basis.dot(&vw);
-        let b1u = geom.basis_d1.dot(&uw);
-        let b1v = geom.basis_d1.dot(&vw);
-        let b2u = geom.basis_d2.dot(&uw);
-        let b2v = geom.basis_d2.dot(&vw);
-        let b3u = geom.basis_d3.dot(&uw);
-        let b3v = geom.basis_d3.dot(&vw);
+        let xi_u = fast_av(xmu, &umu);
+        let xi_v = fast_av(xmu, &vmu);
+        let zeta_u = fast_av(x_ls, &u_ls);
+        let zeta_v = fast_av(x_ls, &v_ls);
+        let phi_u = fast_av(&geom.basis, &uw);
+        let phi_v = fast_av(&geom.basis, &vw);
+        let b1u = fast_av(&geom.basis_d1, &uw);
+        let b1v = fast_av(&geom.basis_d1, &vw);
+        let b2u = fast_av(&geom.basis_d2, &uw);
+        let b2v = fast_av(&geom.basis_d2, &vw);
+        let b3u = fast_av(&geom.basis_d3, &uw);
+        let b3v = fast_av(&geom.basis_d3, &vw);
 
         let mut q_u = &geom.dq_dq0 * &xi_u;
         q_u += &phi_u;
