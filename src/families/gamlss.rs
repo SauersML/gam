@@ -11830,61 +11830,14 @@ impl BinomialLocationScaleFamily {
             None,
             &self.link_kind,
         )?;
-
-        let mut coeff_tt_v = vec![0.0_f64; n];
-        let mut coeff_tl_v = vec![0.0_f64; n];
-        let mut coeff_ll_v = vec![0.0_f64; n];
-        let y_slice = self.y.as_slice().expect("y must be contiguous");
-        let w_slice = self.weights.as_slice().expect("weights must be contiguous");
-        let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
-        let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
-        let dsigma_slice = core
-            .dsigma_deta
-            .as_slice()
-            .expect("dsigma_deta must be contiguous");
-        let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
-        let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
-        let d2mu_slice = core
-            .d2mu_dq2
-            .as_slice()
-            .expect("d2mu_dq2 must be contiguous");
-        let d3mu_slice = core
-            .d3mu_dq3
-            .as_slice()
-            .expect("d3mu_dq3 must be contiguous");
-        let det_slice = d_eta_t.as_slice().expect("d_eta_t must be contiguous");
-        let del_slice = d_eta_ls.as_slice().expect("d_eta_ls must be contiguous");
-        let link_kind = &self.link_kind;
-        coeff_tt_v
-            .par_iter_mut()
-            .zip(coeff_tl_v.par_iter_mut())
-            .zip(coeff_ll_v.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((c_tt, c_tl), c_ll))| {
-                let q = q0_slice[i];
-                let r = 1.0 / sigma_slice[i];
-                let s = dsigma_slice[i] / sigma_slice[i];
-                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                    y_slice[i],
-                    w_slice[i],
-                    q,
-                    mu_slice[i],
-                    dmu_slice[i],
-                    d2mu_slice[i],
-                    d3mu_slice[i],
-                    link_kind,
-                );
-                let a = det_slice[i];
-                let b = del_slice[i];
-                let sb = s * b;
-                let du = -r * a - q * sb;
-                *c_tt = r * r * (m3 * du - 2.0 * m2 * sb);
-                *c_tl = s * r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
-                *c_ll = s * s * (m1 + 3.0 * q * m2 + q * q * m3) * du;
-            });
-        let coeff_tt = Array1::from_vec(coeff_tt_v);
-        let coeff_tl = Array1::from_vec(coeff_tl_v);
-        let coeff_ll = Array1::from_vec(coeff_ll_v);
+        let (coeff_tt, coeff_tl, coeff_ll) = binomial_location_scale_first_directional_coefficients(
+            &self.y,
+            &self.weights,
+            &core,
+            &d_eta_t,
+            &d_eta_ls,
+            &self.link_kind,
+        );
 
         let d_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
         let d_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
@@ -11992,57 +11945,17 @@ impl BinomialLocationScaleFamily {
             None,
             &self.link_kind,
         )?;
-
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
+        let (coeff_tt, coeff_tl, coeff_ll) =
+            binomial_location_scalesecond_directional_coefficients(
+                &self.y,
+                &self.weights,
+                &core,
+                &d_eta_t_u,
+                &d_eta_ls_u,
+                &d_eta_tv,
+                &d_eta_lsv,
                 &self.link_kind,
             )?;
-            let s = core.dsigma_deta[i] / core.sigma[i];
-            let a = d_eta_t_u[i];
-            let b = s * d_eta_ls_u[i];
-            let c = d_eta_tv[i];
-            let d = s * d_eta_lsv[i];
-            let du = -r * a - q * b;
-            let dv = -r * c - q * d;
-            let d2 = r * (a * d + b * c) + q * b * d;
-            coeff_tt[i] =
-                r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
-            // Cross block carries overall κ; scale-scale block carries κ².
-            coeff_tl[i] = s
-                * r
-                * (q * m4 * du * dv
-                    + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
-                    + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
-                    + m1 * b * d);
-            coeff_ll[i] = s
-                * s
-                * (q * q * m4 * du * dv
-                    + m3 * (q * q * d2 + 5.0 * q * du * dv)
-                    + m2 * (3.0 * q * d2 + 4.0 * du * dv)
-                    + m1 * d2);
-        }
 
         let d2_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
         let d2_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
@@ -18608,6 +18521,211 @@ mod tests {
                 assert!(
                     (want[i] - got[i]).abs() <= tol,
                     "BLS dH op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_workspace_d2h_operator_matches_dense() {
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let d_beta_u = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let d_beta_v = array![-0.11, 0.13, -0.05, -0.22, 0.09];
+        assert_eq!(d_beta_u.len(), p);
+        assert_eq!(d_beta_v.len(), p);
+
+        let dense_d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&states, &d_beta_u, &d_beta_v)
+            .expect("dense d2H build")
+            .expect("dense d2H present");
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&d_beta_u, &d_beta_v)
+            .expect("d2H operator call")
+            .expect("d2H operator present");
+
+        let probes = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            let want = dense_d2h.dot(w);
+            let got = d2h_op.mul_vec(w);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "BLS d2H op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_workspace_dh_operator_finite_difference() {
+        // FD check: [H(β + ε u) v − H(β − ε u) v] / (2ε) ≈ DH[u] v
+        // The operator must agree with a centered finite-difference of the
+        // dense Hessian along an arbitrary coefficient direction u.
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let u = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let v = array![0.30, -0.70, 0.50, -0.20, 0.15];
+        let eps = 1e-5;
+        // Build perturbed states (β ± ε u) using the fixture's designs to
+        // recompute η.
+        let perturb = |sign: f64| -> Vec<ParameterBlockState> {
+            let mut out = states.clone();
+            let pt = states[0].beta.len();
+            for j in 0..pt {
+                out[0].beta[j] += sign * eps * u[j];
+            }
+            for j in 0..(p - pt) {
+                out[1].beta[j] += sign * eps * u[pt + j];
+            }
+            // recompute η from spec design and new beta.
+            let xt_dense = specs[0].design.as_dense_ref().expect("dense xt");
+            let xls_dense = specs[1].design.as_dense_ref().expect("dense xls");
+            out[0].eta = xt_dense.dot(&out[0].beta);
+            out[1].eta = xls_dense.dot(&out[1].beta);
+            out
+        };
+        let states_plus = perturb(1.0);
+        let states_minus = perturb(-1.0);
+        let h_plus = family
+            .exact_newton_joint_hessian(&states_plus)
+            .expect("dense H+")
+            .expect("dense H+ present");
+        let h_minus = family
+            .exact_newton_joint_hessian(&states_minus)
+            .expect("dense H-")
+            .expect("dense H- present");
+        let fd = (h_plus.dot(&v) - h_minus.dot(&v)) / (2.0 * eps);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&u)
+            .expect("dH op call")
+            .expect("dH op present");
+        let analytic = dh_op.mul_vec(&v);
+
+        for i in 0..p {
+            let tol = 1e-5 * fd[i].abs().max(1.0) + 1e-5;
+            assert!(
+                (fd[i] - analytic[i]).abs() <= tol,
+                "BLS dH FD mismatch at {i}: fd={:.6e}, analytic={:.6e}",
+                fd[i],
+                analytic[i]
+            );
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_workspace_d2h_operator_finite_difference() {
+        // FD check on the second directional: [DH(β + ε u') [u] v
+        //                                     − DH(β − ε u') [u] v]/(2ε)
+        // ≈ D²H[u', u] v. We choose u' = v as the FD-direction and probe
+        // with an arbitrary u.
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let u = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let u_fd = array![0.30, -0.70, 0.50, -0.20, 0.15];
+        let probe = array![-0.21, 0.11, 0.05, 0.32, -0.04];
+        let eps = 1e-5;
+        let perturb = |sign: f64| -> Vec<ParameterBlockState> {
+            let mut out = states.clone();
+            let pt = states[0].beta.len();
+            for j in 0..pt {
+                out[0].beta[j] += sign * eps * u_fd[j];
+            }
+            for j in 0..(p - pt) {
+                out[1].beta[j] += sign * eps * u_fd[pt + j];
+            }
+            let xt_dense = specs[0].design.as_dense_ref().expect("dense xt");
+            let xls_dense = specs[1].design.as_dense_ref().expect("dense xls");
+            out[0].eta = xt_dense.dot(&out[0].beta);
+            out[1].eta = xls_dense.dot(&out[1].beta);
+            out
+        };
+        let states_plus = perturb(1.0);
+        let states_minus = perturb(-1.0);
+        let dh_plus = family
+            .exact_newton_joint_hessian_directional_derivative(&states_plus, &u)
+            .expect("dense dH+")
+            .expect("dense dH+ present");
+        let dh_minus = family
+            .exact_newton_joint_hessian_directional_derivative(&states_minus, &u)
+            .expect("dense dH-")
+            .expect("dense dH- present");
+        let fd = (dh_plus.dot(&probe) - dh_minus.dot(&probe)) / (2.0 * eps);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&u_fd, &u)
+            .expect("d2H op call")
+            .expect("d2H op present");
+        let analytic = d2h_op.mul_vec(&probe);
+
+        for i in 0..p {
+            let tol = 5e-5 * fd[i].abs().max(1.0) + 5e-5;
+            assert!(
+                (fd[i] - analytic[i]).abs() <= tol,
+                "BLS d2H FD mismatch at {i}: fd={:.6e}, analytic={:.6e}",
+                fd[i],
+                analytic[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_workspace_d2h_operator_matches_dense() {
+        let (family, states, specs) = gls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let d_beta_u = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let d_beta_v = array![-0.11, 0.13, -0.05, -0.22, 0.09];
+
+        let dense_d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&states, &d_beta_u, &d_beta_v)
+            .expect("dense d2H build")
+            .expect("dense d2H present");
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&d_beta_u, &d_beta_v)
+            .expect("d2H op call")
+            .expect("d2H op present");
+
+        let probes = vec![
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            let want = dense_d2h.dot(w);
+            let got = d2h_op.mul_vec(w);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "GLS d2H op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
                     want[i],
                     got[i]
                 );

@@ -394,127 +394,31 @@ impl ExactOuterDerivativeOrder {
     }
 }
 
-/// Maximum dense outer-Hessian size (f64 elements) before downgrading to
-/// first-order when a caller insists on materializing it. Keyed to the outer
-/// hyperparameter dimension K alone — once this is exceeded, the K×K Hessian
-/// is itself too large to assemble or factor regardless of inner cost.
-const DEFAULT_EXACT_OUTER_MAX_ELEMENTS: u64 = 16_000_000;
-
-/// Maximum combined work `K² · coefficient_hessian_cost` allowed on the
-/// exact-second-order outer path. Each outer-Hessian element requires inner
-/// solves whose dominant arithmetic scales like the coefficient-space Hessian
-/// cost (`n·p²` for dense families, larger for tensor families). When the
-/// combined cost exceeds this budget the family is downgraded to first-order
-/// derivatives so the outer optimizer uses BFGS / L-BFGS instead of trying to
-/// materialize an exact outer Hessian whose per-evaluation cost is prohibitive.
+/// Capability gate for second-order exact outer derivatives.
 ///
-/// At biobank scale (K≈22, n≈4·10⁵, p≈300) the combined cost is
-/// 484·4·10⁵·9·10⁴ ≈ 1.7·10¹³, so the gate correctly routes such fits to the
-/// cheap-outer path even though K²=484 alone is small.
-const DEFAULT_EXACT_OUTER_MAX_COMBINED_COST: u64 = 1_000_000_000;
-
-/// Total floating-point budget for one full first-order outer optimization
-/// (BFGS / L-BFGS) on the custom-family path, in flop-equivalent units.
-///
-/// The gate downstream of [`cost_gated_outer_order`] turns this into a hard
-/// cap on the BFGS outer iteration count: once the per-evaluation
-/// coefficient-space gradient cost is known, the cap is
-///
-///   `max_iter ≤ FIRST_ORDER_TOTAL_BUDGET_FLOPS / (probes_per_step · gradient_cost)`.
-///
-/// `probes_per_step` is the conservative average number of additional
-/// value-only line-search probes per iteration. With warm-cached inner
-/// solutions a value-only probe is roughly one Newton step from the warm
-/// start, much cheaper than a fresh evaluate; we set the multiplier to
-/// `FIRST_ORDER_LINE_SEARCH_MULTIPLIER` to account for it.
-///
-/// At biobank scale (K=15, n=320 000, p_total=64) the joint-coupled
-/// gradient cost is ≈ 1.31·10⁹, so the cap evaluates to
-/// `2·10¹¹ / (3 · 1.31·10⁹) ≈ 50` iterations — enough to converge on a
-/// well-conditioned surrogate REML surface but not so much that a pathological
-/// search burns 2400 s wall-clock before the runner returns.
-pub const DEFAULT_FIRST_ORDER_TOTAL_BUDGET_FLOPS: u128 = 200_000_000_000;
-
-/// Multiplier covering value-only line-search probes per BFGS iteration.
-///
-/// Each outer step issues one value+gradient evaluation plus, on average,
-/// ~2 value-only line-search probes before Strong-Wolfe accepts. Value-only
-/// evaluations on the custom-family path use the warm-cached inner solution
-/// (`fit_custom_family`'s `cost_fn` callback rebuilds from the prior warm
-/// state in 1–2 Newton steps instead of restarting from cold), so the
-/// per-probe cost is roughly half of a fresh value+gradient evaluation. The
-/// effective multiplier is therefore ≈ 1·full + 2·½ = 2 full evaluations
-/// per outer step; we use 3 conservatively to leave headroom for harder
-/// line searches at biobank scale.
-const FIRST_ORDER_LINE_SEARCH_MULTIPLIER: u128 = 3;
-
-/// Hard floor on the first-order outer iteration cap regardless of the
-/// per-evaluation cost: small problems should always get at least this many
-/// iterations to converge; large problems may have their cap reduced down
-/// to this number but never below it.
-const FIRST_ORDER_OUTER_MIN_MAX_ITER: usize = 30;
-
-/// Shared cost-aware gate for second-order exact outer derivatives.
-///
-/// The outer Hessian returned by `compute_outer_hessian` has shape
-/// (K+ext_dim) × (K+ext_dim) where K = total number of smoothing parameters,
-/// but the work to *compute* each element scales with `coefficient_cost` —
-/// the per-Hessian-evaluation cost in the inner coefficient space, supplied
-/// by the family via [`CustomFamily::coefficient_hessian_cost`]. The gate
-/// therefore considers two thresholds:
-///
-/// 1. `K² > DEFAULT_EXACT_OUTER_MAX_ELEMENTS` — the dense K×K outer Hessian
-///    itself is too large to allocate or factor.
-/// 2. `K² · coefficient_cost > DEFAULT_EXACT_OUTER_MAX_COMBINED_COST` — the
-///    inner work per outer Hessian evaluation is prohibitive even when the
-///    K×K matrix is small, e.g. biobank-scale fits where K²=484 looks fine
-///    but n·p²≈10¹⁰ makes each outer-Hessian evaluation untenable.
-///
-/// Either condition routes the family to first-order BFGS/L-BFGS.
-///
-/// This is the legacy capability gate. It conflates "is dense Hessian
-/// affordable?" with "can the family supply a Hessian at all?" — appropriate
-/// only for families that cannot produce a matrix-free Hv operator. Families
-/// with `exact_newton_joint_hessian_workspace` should use
-/// [`cost_gated_outer_order_with_matrix_free`] so that an expensive *dense*
-/// assembly does not silently disable the operator path: the evaluator (via
-/// `use_joint_matrix_free_path`) will already pick `HessianResult::Operator`
-/// when dense is too big, and ARC's `run_operator_trust_region` absorbs the
-/// per-iteration cost in O(n·p) HVPs.
+/// Capability — not cost — drives the answer. A family that has the math for
+/// an analytic outer Hessian always returns [`ExactOuterDerivativeOrder::Second`].
+/// Expensive dense Hessian assemblies are handled by representation selection
+/// (matrix-free Hv operators via [`use_joint_matrix_free_path`] +
+/// [`CustomFamily::supports_matrix_free_joint_hessian`]); they do not disable
+/// the second-order capability.
 pub fn cost_gated_outer_order(
-    specs: &[ParameterBlockSpec],
-    coefficient_cost: u64,
+    _specs: &[ParameterBlockSpec],
+    _coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    cost_gated_outer_order_with_matrix_free(specs, coefficient_cost, false)
+    ExactOuterDerivativeOrder::Second
 }
 
 /// Capability-aware variant of [`cost_gated_outer_order`].
 ///
-/// When `matrix_free_available` is `true` the combined `K² · n·p²` cost gate
-/// is suppressed: at biobank scale the evaluator will return a Hv operator
-/// instead of building a dense Hessian, so the dense-assembly cost no longer
-/// applies. The hard `K² > DEFAULT_EXACT_OUTER_MAX_ELEMENTS` element cap is
-/// always enforced because it bounds the size of the K×K outer Hessian itself
-/// (which the operator path still allocates).
+/// Always returns [`ExactOuterDerivativeOrder::Second`]: cost selects the
+/// representation (dense Hessian vs Hv operator), never the capability.
 pub fn cost_gated_outer_order_with_matrix_free(
-    specs: &[ParameterBlockSpec],
-    coefficient_cost: u64,
-    matrix_free_available: bool,
+    _specs: &[ParameterBlockSpec],
+    _coefficient_cost: u64,
+    _matrix_free_available: bool,
 ) -> ExactOuterDerivativeOrder {
-    let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
-    let outer_elements = k.saturating_mul(k);
-    if outer_elements > DEFAULT_EXACT_OUTER_MAX_ELEMENTS {
-        return ExactOuterDerivativeOrder::First;
-    }
-    if matrix_free_available {
-        return ExactOuterDerivativeOrder::Second;
-    }
-    let combined = outer_elements.saturating_mul(coefficient_cost);
-    if combined > DEFAULT_EXACT_OUTER_MAX_COMBINED_COST {
-        ExactOuterDerivativeOrder::First
-    } else {
-        ExactOuterDerivativeOrder::Second
-    }
+    ExactOuterDerivativeOrder::Second
 }
 
 /// Default coefficient-space Hessian cost: `Σ_b n_b · p_b²`, summed across
@@ -561,37 +465,6 @@ pub fn joint_coupled_coefficient_hessian_cost(n: u64, specs: &[ParameterBlockSpe
 /// should override [`CustomFamily::coefficient_gradient_cost`] explicitly.
 pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
     default_coefficient_hessian_cost(specs) / 2
-}
-
-/// First-order outer max-iter cap derived from a global FLOP budget.
-///
-/// The cap ensures the BFGS / L-BFGS outer optimization cannot spend more
-/// than [`DEFAULT_FIRST_ORDER_TOTAL_BUDGET_FLOPS`] in coefficient-space work
-/// across all gradient and value-only line-search evaluations. The
-/// per-iteration cost is approximated as
-/// `FIRST_ORDER_LINE_SEARCH_MULTIPLIER · gradient_cost`.
-///
-/// Returns `requested_max_iter` if either the budget is not exceeded or the
-/// gradient cost is zero (degenerate / unspecified). Always returns at least
-/// [`FIRST_ORDER_OUTER_MIN_MAX_ITER`] so a problem cannot be capped down to
-/// trivially-few iterations.
-pub fn cost_gated_first_order_max_iter(requested_max_iter: usize, gradient_cost: u64) -> usize {
-    if gradient_cost == 0 {
-        return requested_max_iter;
-    }
-    let per_iter = FIRST_ORDER_LINE_SEARCH_MULTIPLIER.saturating_mul(gradient_cost as u128);
-    if per_iter == 0 {
-        return requested_max_iter;
-    }
-    let allowed = DEFAULT_FIRST_ORDER_TOTAL_BUDGET_FLOPS / per_iter;
-    let allowed = if allowed > usize::MAX as u128 {
-        usize::MAX
-    } else {
-        allowed as usize
-    };
-    requested_max_iter
-        .min(allowed)
-        .max(FIRST_ORDER_OUTER_MIN_MAX_ITER)
 }
 
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
@@ -12152,8 +12025,22 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
 
     let n_rho = rho0.len();
-    let (cap_gradient, cap_hessian) =
+    let (cap_gradient, mut cap_hessian) =
         custom_family_outer_derivatives(family, specs, &outer_options);
+    // Cost selects representation (dense vs Hv operator), not capability.
+    // When the family supplies a matrix-free joint Hessian and the runtime
+    // dimension predicate fires, the Hessian capability is unconditionally
+    // Analytic — the operator path absorbs the per-evaluation cost via
+    // O(n·p) HVPs.
+    {
+        let total_p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
+        let n_obs_joint = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
+        if family.supports_matrix_free_joint_hessian(specs)
+            && use_joint_matrix_free_path(total_p_joint, n_obs_joint)
+        {
+            cap_hessian = Derivative::Analytic;
+        }
+    }
     let hessian = cap_hessian;
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
@@ -12190,35 +12077,13 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     // If the primary plan still fails after the cascade, the runner surfaces
     // the `RemlOptimizationFailed` error so the user sees the underlying
     // non-convergence rather than a silent partial result.
-    // First-order work gate (P6 / task #9): the BFGS / L-BFGS path can be
-    // selected by either `cost_gated_outer_order` (family declares
-    // `Unavailable` Hessian) or `OuterProblem::with_standard_gam_dimensions`
-    // (cost-driven `prefer_gradient_only` downgrades a declared analytic
-    // Hessian to BfgsApprox). In either case each gradient evaluation still
-    // costs ≈ `coefficient_gradient_cost` flops in the inner coefficient
-    // space, and the unrestricted BFGS runner can burn
-    // `outer_max_iter · line_search_probes` of those evaluations (≈2400 s
-    // on `rust_gamlss_additive_duchon60`: K=15, n=320 000, p_total ≥ 64).
-    // The gate translates a global FLOP budget into a hard cap on the
-    // outer iteration count so total first-order work stays bounded; see
-    // `cost_gated_first_order_max_iter` for the budget model. The cap
-    // floors at `FIRST_ORDER_OUTER_MIN_MAX_ITER` so small problems never
-    // lose iterations they need to converge. Apply the cap unconditionally:
-    // when ARC is selected the cap is immaterial (ARC converges in O(20)
-    // outer iterations, well below the floor on this surface), and when
-    // the cascade later degrades to BFGS via the automatic fallback ladder,
-    // the same `max_iter` is reused and would otherwise spin.
-    let outer_first_order_max_iter = cost_gated_first_order_max_iter(
-        options.outer_max_iter,
-        family.coefficient_gradient_cost(specs),
-    );
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
         .with_fallback_policy(FallbackPolicy::Automatic)
         .with_tolerance(options.outer_tol)
-        .with_max_iter(outer_first_order_max_iter)
+        .with_max_iter(options.outer_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone());
