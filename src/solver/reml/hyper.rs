@@ -276,6 +276,105 @@ impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
     }
 }
 
+/// Matrix-free third-derivative correction for the spatial first-order
+/// hyperparameter Hessian drift `H_i = ∂(Hessian)/∂ψ_i`.
+///
+/// Augments [`super::unified::ImplicitHyperOperator`] with the GLM-`c` term
+///   `Xᵀ diag(c ⊙ X_ψ β) X v`
+/// that is currently materialized dense at hyper.rs:1507-1512 when
+/// `is_gaussian_identity = false`. The full first-order drift is
+///   `H_i v = (∂X/∂ψ_i)ᵀ W X v + Xᵀ W (∂X/∂ψ_i) v + Xᵀ diag(c ⊙ X_ψ β) X v + S_i v`,
+/// and this operator carries the third term so the dense build can be replaced
+/// by a matrix-free `CompositeHyperOperator { ImplicitHyperOperator, this }`
+/// in the spatial-ψ Firth/non-Gaussian case.
+///
+/// The kernel `c ⊙ X_ψ β` is captured at build time (a single n-vector) so
+/// `mul_vec` is two design matvecs plus one elementwise multiply per call —
+/// the same FLOP profile as `TauBetaDriftDerivOperator` but parameterised by
+/// the spatial implicit operator instead of a dense `x_tau`.
+///
+/// **Wiring**: not yet connected. Will plug into the
+/// `dense_b = if b_operator.is_some() { None } else { ... }` site at
+/// hyper.rs:1493+ once task #3 (operator selection rule) lands. Then the
+/// non-Gaussian path can keep `b_operator = Some(Composite{ImplicitHyper, this})`
+/// instead of falling through to the dense `weighted_cross + xt_diag_x_dense`
+/// build.
+#[allow(dead_code)]
+struct SpatialDesignThirdDerivativeCorrection {
+    /// The active-basis design matrix X (operator-backed when sparse / large).
+    x_design: std::sync::Arc<DesignMatrix>,
+    /// Per-row kernel `c ⊙ X_ψ β` (captured at the current iterate). For each
+    /// observation i, `kernel[i] = c[i] · (∂X/∂ψ · β̂)[i]`. Independent of v,
+    /// so cached once per outer evaluation.
+    kernel: Array1<f64>,
+    /// Total basis dimension p.
+    p: usize,
+}
+
+#[allow(dead_code)]
+impl SpatialDesignThirdDerivativeCorrection {
+    /// Build the correction operator for axis `axis` of the implicit
+    /// design-derivative.
+    ///
+    /// `c_array` carries the GLM third-derivative weight (the same `c` used in
+    /// `xt_diag_x_dense_into` at hyper.rs:1511); `beta_eval` is β̂ at the
+    /// current ρ and is forwarded through the implicit operator to obtain
+    /// `X_ψ β̂` once. The product is then folded with `c` into the per-row
+    /// kernel and stored.
+    fn new(
+        x_design: std::sync::Arc<DesignMatrix>,
+        implicit_deriv: &crate::terms::basis::ImplicitDesignPsiDerivative,
+        axis: usize,
+        beta_eval: &Array1<f64>,
+        c_array: &Array1<f64>,
+        p: usize,
+    ) -> Result<Self, EstimationError> {
+        let beta_local = beta_eval.view();
+        let x_psi_beta = implicit_deriv
+            .forward_mul(axis, &beta_local)
+            .map_err(EstimationError::from)?;
+        if x_psi_beta.len() != c_array.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "spatial third-derivative correction: X_psi*beta length {} != c length {}",
+                x_psi_beta.len(),
+                c_array.len()
+            )));
+        }
+        let kernel = c_array * &x_psi_beta;
+        Ok(Self {
+            x_design,
+            kernel,
+            p,
+        })
+    }
+}
+
+impl super::unified::HyperOperator for SpatialDesignThirdDerivativeCorrection {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+        // out = Xᵀ diag(kernel) X v
+        let x_v = self.x_design.matrixvectormultiply(v);
+        let weighted = &self.kernel * &x_v;
+        self.x_design.transpose_vector_multiply(&weighted)
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.p, self.p));
+        let mut basis = Array1::<f64>::zeros(self.p);
+        for j in 0..self.p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
 fn drift_deriv_result_from_parts(
     dense: Option<Array2<f64>>,
     mut operators: Vec<std::sync::Arc<dyn super::unified::HyperOperator>>,
