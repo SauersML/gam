@@ -3490,7 +3490,7 @@ def _flexible_link_name(link_name: str) -> str:
 
 def _default_rust_formula_link_for_family(family: str) -> str:
     if family == "binomial":
-        return "logit"
+        return "probit"
     if family == "gaussian":
         return "identity"
     if family == "survival":

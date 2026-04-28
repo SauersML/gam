@@ -13,10 +13,9 @@ use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed, padded_deviation_seed,
-    project_monotone_feasible_beta, signed_probit_logcdf_and_mills_ratio,
-    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
-    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
-    unary_derivatives_sqrt,
+    project_monotone_feasible_beta, signed_probit_neglog_derivatives_up_to_fourth,
+    standardize_latent_z_with_policy, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
@@ -32,6 +31,7 @@ use crate::families::survival_location_scale::{
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
+use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
