@@ -1457,6 +1457,26 @@ impl HyperOperator for CompositeHyperOperator {
         }
     }
 
+    /// Forward batched apply to inner operators so their `mul_mat` overrides
+    /// (matrix-free Khatri–Rao BLAS3 fuses) fire instead of the default
+    /// per-column parallel matvec — which would triple-nest rayon when an
+    /// inner op already parallelizes internally.
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            return self.operators[0].mul_mat(factor);
+        }
+        let p = factor.nrows();
+        let k = factor.ncols();
+        let mut out = Array2::<f64>::zeros((p, k));
+        if let Some(dense) = self.dense.as_ref() {
+            out += &dense.dot(factor);
+        }
+        for op in &self.operators {
+            out += &op.mul_mat(factor);
+        }
+        out
+    }
+
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let mut total = 0.0;
         if let Some(dense) = self.dense.as_ref() {
