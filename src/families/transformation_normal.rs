@@ -665,7 +665,6 @@ fn chunked_weighted_bt_d(
             par,
         );
     }
-    drop(out_view);
     out
 }
 
@@ -722,7 +721,6 @@ fn chunked_weighted_bt_d_designmatrix(
             par,
         );
     }
-    drop(out_view);
     Ok(out)
 }
 
