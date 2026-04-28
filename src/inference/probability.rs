@@ -24,6 +24,80 @@ pub fn normal_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
+#[inline]
+pub fn erfcx_nonnegative(x: f64) -> f64 {
+    if !x.is_finite() {
+        return if x.is_sign_positive() {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+    }
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x < 26.0 {
+        ((x * x).min(700.0)).exp() * erfc(x)
+    } else {
+        let inv = 1.0 / x;
+        let inv2 = inv * inv;
+        let poly = 1.0
+            + 0.5 * inv2
+            + 0.75 * inv2 * inv2
+            + 1.875 * inv2 * inv2 * inv2
+            + 6.5625 * inv2 * inv2 * inv2 * inv2;
+        inv * poly / std::f64::consts::PI.sqrt()
+    }
+}
+
+#[inline]
+pub fn normal_logcdf(x: f64) -> f64 {
+    if x == f64::INFINITY {
+        return 0.0;
+    }
+    if x == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x < 0.0 {
+        let u = -x / std::f64::consts::SQRT_2;
+        -u * u + (0.5 * erfcx_nonnegative(u).max(1e-300)).ln()
+    } else {
+        normal_cdf(x).clamp(1e-300, 1.0).ln()
+    }
+}
+
+#[inline]
+pub fn normal_logsf(x: f64) -> f64 {
+    normal_logcdf(-x)
+}
+
+#[inline]
+pub fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
+    if x == f64::INFINITY {
+        return (0.0, 0.0);
+    }
+    if x == f64::NEG_INFINITY {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
+    if x < 0.0 {
+        let u = -x / std::f64::consts::SQRT_2;
+        let ex = erfcx_nonnegative(u).max(1e-300);
+        let log_cdf = -u * u + (0.5 * ex).ln();
+        let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
+        (log_cdf, lambda)
+    } else {
+        let cdf = normal_cdf(x).clamp(1e-300, 1.0);
+        let lambda = normal_pdf(x) / cdf;
+        (cdf.ln(), lambda)
+    }
+}
+
 /// Standard normal quantile Φ⁻¹(p) using Acklam's rational approximation.
 #[inline]
 pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
