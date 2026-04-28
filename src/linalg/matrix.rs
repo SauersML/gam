@@ -3828,6 +3828,13 @@ pub fn xt_diag_x_symmetric(
     match design {
         DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(x.diag_xtw_x(diag)?)),
         DesignMatrix::Sparse(xs) => {
+            // Assemble X^T diag(w) X directly into a banded upper-triangle CSC
+            // via SparseHessianAccumulator.  Compared to the previous
+            // triplet-roundtrip path this avoids:
+            //   * O(nnz) heap-allocated Triplet vector,
+            //   * the implicit sort+merge inside try_new_from_triplets,
+            //   * the per-row branch reordering (a,b) → (row,col).
+            // For B-spline / banded patterns the inner add is O(1) arithmetic.
             let csr = xs
                 .to_csr_arc()
                 .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
@@ -3835,7 +3842,7 @@ pub fn xt_diag_x_symmetric(
             let row_ptr = sym.row_ptr();
             let col_idx = sym.col_idx();
             let vals = csr.val();
-            let mut upper = Vec::new();
+            let mut acc = SparseHessianAccumulator::from_single_csr(&*csr, xs.ncols());
             for i in 0..xs.nrows() {
                 let wi = diag[i];
                 if wi == 0.0 {
@@ -3845,21 +3852,20 @@ pub fn xt_diag_x_symmetric(
                 let end = row_ptr[i + 1];
                 for a_ptr in start..end {
                     let a = col_idx[a_ptr];
-                    let xa = vals[a_ptr];
-                    for b_ptr in a_ptr..end {
+                    let wxa = wi * vals[a_ptr];
+                    // Diagonal first (a == b → row == col == a).
+                    acc.add_upper(a, a, wxa * vals[a_ptr]);
+                    // Strictly upper-triangle entries.  Within row i the column
+                    // indices in CSR are sorted ascending, so for b_ptr > a_ptr
+                    // we have b > a and the (row, col) = (a, b) ordering is
+                    // already canonical.
+                    for b_ptr in (a_ptr + 1)..end {
                         let b = col_idx[b_ptr];
-                        let xb = vals[b_ptr];
-                        let value = wi * xa * xb;
-                        let (row, col) = if a <= b { (a, b) } else { (b, a) };
-                        upper.push(Triplet::new(row, col, value));
+                        acc.add_upper(a, b, wxa * vals[b_ptr]);
                     }
                 }
             }
-            let sparse = SparseColMat::try_new_from_triplets(xs.ncols(), xs.ncols(), &upper)
-                .map_err(|_| {
-                    "xt_diag_x_symmetric: failed to assemble sparse symmetric matrix".to_string()
-                })?;
-            Ok(SymmetricMatrix::Sparse(sparse))
+            Ok(SymmetricMatrix::Sparse(acc.into_sparse_col_mat()))
         }
     }
 }
