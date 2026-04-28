@@ -1857,36 +1857,6 @@ where
         // Sparse designs short-circuit the policy because the n · p²
         // model does not apply to sparse linear algebra; ARC stays in
         // place and the sparse path's iteration-count advantage holds.
-        let n_obs = reml_state.x().nrows();
-        let p_total = reml_state.x().ncols();
-        // The planner gates dense-Hessian work cost on `dense_design`, but the
-        // input `DesignMatrix` enum is not authoritative: the runtime REML
-        // geometry decision in `select_reml_geometry` may route a sparse
-        // design to the dense-spectral backend (firth, dense linear
-        // constraints, or per-ρ penalized-Hessian density above 0.10).  Read
-        // the actual runtime backend kind at a representative ρ — prefer the
-        // caller-supplied `heuristic_lambdas` when available since they
-        // reflect the per-ρ penalty mass the real fit is going to land near;
-        // fall back to the neutral ρ=0 baseline that `seeding.rs` always
-        // includes — so that biobank-scale Matern fits (n=320 000, p=101,
-        // sparse design, dense per-ρ selection) get gated to BFGS+gradient
-        // instead of ARC + analytic Hessian, which OOMs at 14.56 GiB RSS.
-        let probe_rho = match heuristic_lambdas {
-            Some(h) if h.len() == k => Array1::from_iter(h.iter().map(|v| v.max(1.0e-300).ln())),
-            _ => Array1::<f64>::zeros(k),
-        };
-        let dense_design = reml_state.runtime_geometry_is_dense(&probe_rho);
-        // Predict whether the unified evaluator will return the outer Hessian
-        // as `HessianResult::Operator` (matrix-free Hv) — mirrors the
-        // dim-threshold + family + constraint checks in
-        // `reml_laml_evaluate`. When true, ARC's `run_operator_trust_region`
-        // absorbs per-iteration cost via O(n·p) HVPs and the cost-driven
-        // BFGS downgrade in `OuterProblem::capability` should be suppressed.
-        let matrix_free_hessian_available = analytic_outer_hessian_available
-            && reml_state.matrix_free_outer_hessian_likely_available(
-                p_total,
-                fit_linear_constraints.is_some(),
-            );
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
@@ -1894,8 +1864,6 @@ where
             } else {
                 Derivative::Unavailable
             })
-            .with_standard_gam_dimensions(n_obs, p_total, dense_design)
-            .with_matrix_free_hessian_available(matrix_free_hessian_available)
             .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
                 fit_linear_constraints.as_ref(),
             ))
