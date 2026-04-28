@@ -165,25 +165,45 @@ fn selected_uncertainty_backend<'a>(
     }
 }
 
+/// Symmetric quadratic form `g' · C · g` for an SPD posterior covariance `C`.
+///
+/// Math-equivalent to the naïve double loop, but exploits symmetry of `C`:
+///   `g' C g = Σ_i g_i² C_ii + 2 Σ_{i<j} g_i g_j C_ij`.
+/// This halves the multiplications and reads each off-diagonal entry only
+/// once, while pulling each row out as a contiguous slice (`Array2` is
+/// row-major) so the inner accumulator vectorizes.
 #[inline]
 fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> Result<f64, EstimationError> {
-    if cov.nrows() != grad.len() || cov.ncols() != grad.len() {
+    let m = grad.len();
+    if cov.nrows() != m || cov.ncols() != m {
         return Err(EstimationError::InvalidInput(format!(
             "covariance/gradient dimension mismatch: covariance is {}x{}, gradient length is {}",
             cov.nrows(),
             cov.ncols(),
-            grad.len()
+            m
         )));
     }
-    let mut acc = 0.0_f64;
-    for i in 0..grad.len() {
-        for j in 0..grad.len() {
-            acc += grad[i] * cov[[i, j]] * grad[j];
+    let mut diag_acc = 0.0_f64;
+    let mut off_acc = 0.0_f64;
+    for i in 0..m {
+        let row = cov.row(i);
+        let row_slice = row.as_slice().expect("Array2 row is contiguous");
+        let gi = grad[i];
+        // Diagonal term g_i² C_ii.
+        diag_acc += gi * gi * row_slice[i];
+        // Strict upper triangle Σ_{j>i} g_i g_j C_ij; doubled below by symmetry.
+        let mut row_off = 0.0_f64;
+        for j in (i + 1)..m {
+            row_off += grad[j] * row_slice[j];
         }
+        off_acc += gi * row_off;
     }
-    Ok(acc.max(0.0))
+    Ok((diag_acc + 2.0 * off_acc).max(0.0))
 }
 
+/// Symmetric quadratic form for the mixture-link `∂μ/∂θ` row, exploiting the
+/// same `C = Cᵀ` symmetry as [`quadratic_form`]; see that function for the
+/// algebraic identity. Avoids materializing a separate `Vec<f64>` of `.mu`s.
 #[inline]
 fn quadratic_form_from_jetmu(
     cov: &Array2<f64>,
@@ -198,14 +218,20 @@ fn quadratic_form_from_jetmu(
             m
         )));
     }
-    let mut acc = 0.0_f64;
+    let mut diag_acc = 0.0_f64;
+    let mut off_acc = 0.0_f64;
     for i in 0..m {
+        let row = cov.row(i);
+        let row_slice = row.as_slice().expect("Array2 row is contiguous");
         let gi = partials[i].mu;
-        for j in 0..m {
-            acc += gi * cov[[i, j]] * partials[j].mu;
+        diag_acc += gi * gi * row_slice[i];
+        let mut row_off = 0.0_f64;
+        for j in (i + 1)..m {
+            row_off += partials[j].mu * row_slice[j];
         }
+        off_acc += gi * row_off;
     }
-    Ok(acc.max(0.0))
+    Ok((diag_acc + 2.0 * off_acc).max(0.0))
 }
 
 fn linear_predictorvariance_from_backend(
