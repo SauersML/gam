@@ -7479,7 +7479,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
+        crate::custom_family::cost_gated_outer_order_with_matrix_free(
+            specs,
+            self.coefficient_hessian_cost(specs),
+            self.supports_matrix_free_joint_hessian(specs),
+        )
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {

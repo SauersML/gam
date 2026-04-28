@@ -471,14 +471,43 @@ const FIRST_ORDER_OUTER_MIN_MAX_ITER: usize = 30;
 ///    but n·p²≈10¹⁰ makes each outer-Hessian evaluation untenable.
 ///
 /// Either condition routes the family to first-order BFGS/L-BFGS.
+///
+/// This is the legacy capability gate. It conflates "is dense Hessian
+/// affordable?" with "can the family supply a Hessian at all?" — appropriate
+/// only for families that cannot produce a matrix-free Hv operator. Families
+/// with `exact_newton_joint_hessian_workspace` should use
+/// [`cost_gated_outer_order_with_matrix_free`] so that an expensive *dense*
+/// assembly does not silently disable the operator path: the evaluator (via
+/// `use_joint_matrix_free_path`) will already pick `HessianResult::Operator`
+/// when dense is too big, and ARC's `run_operator_trust_region` absorbs the
+/// per-iteration cost in O(n·p) HVPs.
 pub fn cost_gated_outer_order(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
+) -> ExactOuterDerivativeOrder {
+    cost_gated_outer_order_with_matrix_free(specs, coefficient_cost, false)
+}
+
+/// Capability-aware variant of [`cost_gated_outer_order`].
+///
+/// When `matrix_free_available` is `true` the combined `K² · n·p²` cost gate
+/// is suppressed: at biobank scale the evaluator will return a Hv operator
+/// instead of building a dense Hessian, so the dense-assembly cost no longer
+/// applies. The hard `K² > DEFAULT_EXACT_OUTER_MAX_ELEMENTS` element cap is
+/// always enforced because it bounds the size of the K×K outer Hessian itself
+/// (which the operator path still allocates).
+pub fn cost_gated_outer_order_with_matrix_free(
+    specs: &[ParameterBlockSpec],
+    coefficient_cost: u64,
+    matrix_free_available: bool,
 ) -> ExactOuterDerivativeOrder {
     let k: u64 = specs.iter().map(|s| s.penalties.len() as u64).sum();
     let outer_elements = k.saturating_mul(k);
     if outer_elements > DEFAULT_EXACT_OUTER_MAX_ELEMENTS {
         return ExactOuterDerivativeOrder::First;
+    }
+    if matrix_free_available {
+        return ExactOuterDerivativeOrder::Second;
     }
     let combined = outer_elements.saturating_mul(coefficient_cost);
     if combined > DEFAULT_EXACT_OUTER_MAX_COMBINED_COST {
@@ -749,7 +778,11 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
+        cost_gated_outer_order_with_matrix_free(
+            specs,
+            self.coefficient_hessian_cost(specs),
+            self.supports_matrix_free_joint_hessian(specs),
+        )
     }
 
     /// Family-specific outer seeding policy.
@@ -6655,8 +6688,12 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     // expose the analytic Hessian and let ARC drive the outer iteration.
     //
     // Availability is a property of the family's second-derivative form, not
-    // of the inner problem size. The K×K affordability gate already lives
-    // inside `order.has_hessian()` via `cost_gated_outer_order`.
+    // of the inner problem size. The K×K affordability gate (16M element cap)
+    // still lives inside `order.has_hessian()` via
+    // `cost_gated_outer_order_with_matrix_free`. The combined `K² · n·p²`
+    // cost gate is now suppressed when the family supplies a matrix-free Hv
+    // workspace: the evaluator picks dense vs operator at evaluation time, so
+    // expensive dense assembly no longer disables the operator path.
     let hessian = if options.use_outer_hessian
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()

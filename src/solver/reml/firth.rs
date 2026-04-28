@@ -1537,15 +1537,15 @@ impl FirthDenseOperator {
         // ─────────────────────────────────────────────────────────────────
         //  η̇ vectors in β-rhs space (η_V := X V, η_{i,V} := X_i V, etc.)
         // ─────────────────────────────────────────────────────────────────
-        let eta_v = self.x_dense.dot(rhs); // n×m
-        let eta_i_v = x_tau_i.dot(rhs); // n×m
-        let eta_j_v = x_tau_j.dot(rhs); // n×m
+        let eta_v = fast_ab(&self.x_dense, rhs); // n×m
+        let eta_i_v = fast_ab(x_tau_i, rhs); // n×m
+        let eta_j_v = fast_ab(x_tau_j, rhs); // n×m
         // X_{ij} V from the reduced second-derivative design:
         //   reduce_explicit_design: X_{r,τ} = diag(√a) X_τ Q,
         //   invert:  X_{ij} = diag(1/√a) X_{r,ij} Qᵀ.
         let eta_ij_v: Array2<f64> = if x_tau_tau_is_some {
-            let qt_v = self.q_basis.t().dot(rhs); // r×m
-            let mut out = x_rij.dot(&qt_v); // n×m in sqrt(a)-scaled space
+            let qt_v = fast_atb(&self.q_basis, rhs); // r×m
+            let mut out = fast_ab(x_rij, &qt_v); // n×m in sqrt(a)-scaled space
             if let Some(scale) = self.observation_weight_sqrt.as_ref() {
                 for row in 0..out.nrows() {
                     let s = scale[row];
@@ -1661,9 +1661,6 @@ impl FirthDenseOperator {
         //    + X_jᵀ (γ̇_i ⊙ η_V)     + Xᵀ (γ̇_i ⊙ η_{j,V})
         //    + Xᵀ (γ̈_ij ⊙ η_V).
         // ─────────────────────────────────────────────────────────────────
-        let xt_i = x_tau_i.t();
-        let xt_j = x_tau_j.t();
-
         let mut diag_term = Array2::<f64>::zeros((p, m));
         let gamma_col = gamma.view().insert_axis(Axis(1));
         let gamma_i_col = gamma_dot_i.view().insert_axis(Axis(1));
@@ -1671,16 +1668,16 @@ impl FirthDenseOperator {
         let gamma_ij_col = gamma_ddot.view().insert_axis(Axis(1));
 
         // X_iᵀ (γ ⊙ η_{j,V}) + X_jᵀ (γ ⊙ η_{i,V})
-        diag_term = diag_term + xt_i.dot(&(&eta_j_v * &gamma_col));
-        diag_term = diag_term + xt_j.dot(&(&eta_i_v * &gamma_col));
+        diag_term = diag_term + fast_atb(x_tau_i, &(&eta_j_v * &gamma_col));
+        diag_term = diag_term + fast_atb(x_tau_j, &(&eta_i_v * &gamma_col));
         // X_iᵀ (γ̇_j ⊙ η_V) + X_jᵀ (γ̇_i ⊙ η_V)
-        diag_term = diag_term + xt_i.dot(&(&eta_v * &gamma_j_col));
-        diag_term = diag_term + xt_j.dot(&(&eta_v * &gamma_i_col));
+        diag_term = diag_term + fast_atb(x_tau_i, &(&eta_v * &gamma_j_col));
+        diag_term = diag_term + fast_atb(x_tau_j, &(&eta_v * &gamma_i_col));
         // Xᵀ (γ̇_j ⊙ η_{i,V}) + Xᵀ (γ̇_i ⊙ η_{j,V})
-        diag_term = diag_term + self.x_dense_t.dot(&(&eta_i_v * &gamma_j_col));
-        diag_term = diag_term + self.x_dense_t.dot(&(&eta_j_v * &gamma_i_col));
+        diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_i_v * &gamma_j_col));
+        diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_j_v * &gamma_i_col));
         // Xᵀ (γ̈_ij ⊙ η_V)
-        diag_term = diag_term + self.x_dense_t.dot(&(&eta_v * &gamma_ij_col));
+        diag_term = diag_term + fast_ab(&self.x_dense_t, &(&eta_v * &gamma_ij_col));
         // X_{ij}ᵀ (γ ⊙ η_V) + Xᵀ (γ ⊙ η_{ij,V})
         if x_tau_tau_is_some {
             // X_{ij}ᵀ = Q X_{r,ij}ᵀ · diag(1/√a)  (inverse of the reduce shim),
