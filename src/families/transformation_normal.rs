@@ -29,7 +29,7 @@ use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactOuterDerivativeOrder, FamilyEvaluation,
+    ExactNewtonJointPsiTerms, FamilyEvaluation,
     MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
