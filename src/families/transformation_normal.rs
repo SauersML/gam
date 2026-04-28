@@ -2427,7 +2427,6 @@ struct KroneckerActiveSetCache {
     dh_eps: f64,
 }
 
-#[allow(dead_code)]
 impl KroneckerActiveSetCache {
     fn new() -> Self {
         Self {
@@ -2824,31 +2823,6 @@ impl KroneckerDesign {
                     out.column_mut(a).assign(&covariate.apply(&row_a));
                 }
                 Some(out)
-            }
-        }
-    }
-
-    /// Cached `min_step_to_boundary` for the `Kronecker` variant.
-    ///
-    /// Bit-equivalent to `min_step_to_boundary(β, δ, slack, dh_eps)` when
-    /// `c = X · β_matᵀ` and `d = X · δ_matᵀ`, but reuses the projections
-    /// supplied by the caller.
-    #[allow(dead_code)]
-    fn min_step_to_boundary_with_projections(
-        &self,
-        c: ndarray::ArrayView2<'_, f64>,
-        d: ndarray::ArrayView2<'_, f64>,
-        slack: f64,
-        dh_eps: f64,
-    ) -> f64 {
-        match self {
-            KroneckerDesign::KhatriRao { .. } => panic!(
-                "min_step_to_boundary_with_projections is only defined for the \
-                 Kronecker variant; KhatriRao callers should use the un-cached \
-                 streaming path"
-            ),
-            KroneckerDesign::Kronecker { response_grid, .. } => {
-                Self::min_step_kronecker_reduce(response_grid, c, d, slack, dh_eps)
             }
         }
     }
@@ -4053,9 +4027,9 @@ mod tests {
     #[test]
     fn max_feasible_step_size_uses_cached_kronecker_reduction() {
         // End-to-end equivalence check for the production line-search caller.
-        // `max_feasible_step_size` projects β and δ through the covariate factor
-        // once and routes the monotonicity-grid reduction through
-        // `min_step_to_boundary_with_projections`; this test confirms the
+        // `max_feasible_step_size` projects β and δ through the covariate
+        // factor once and routes the monotonicity-grid reduction through
+        // `min_step_to_boundary_with_active_set`; this test confirms the
         // wired path matches the un-cached baseline exactly on a small CTN
         // configuration (toy family with a `Kronecker` grid design).
         let psi = array![0.15, -0.10];
@@ -4110,88 +4084,6 @@ mod tests {
             alpha_prod, expected,
             "wired max_feasible_step_size must match the un-cached baseline bit-for-bit \
              (cached α = {alpha_prod:?}, un-cached α = {expected:?})"
-        );
-    }
-
-    #[test]
-    fn kronecker_min_step_to_boundary_cached_matches_uncached() {
-        // Small CTN-like Kronecker design: covariate factor with n_cov=6 rows,
-        // p_cov=3 columns and a response monotonicity grid with n_grid=5 rows,
-        // p_resp=4 columns. The values are chosen so several virtual rows hit
-        // the descent threshold for a non-trivial reduction.
-        let covariate = DesignMatrix::Dense(DenseDesignMatrix::from(array![
-            [1.0, 0.40, -0.10],
-            [1.0, 0.55, 0.05],
-            [1.0, -0.20, 0.30],
-            [1.0, 0.10, -0.40],
-            [1.0, 0.70, 0.15],
-            [1.0, -0.35, 0.25],
-        ]));
-        let response_grid = array![
-            [1.0, 0.10, -0.05, 0.20],
-            [1.0, 0.30, 0.20, -0.10],
-            [1.0, -0.15, 0.40, 0.05],
-            [1.0, 0.45, -0.20, 0.30],
-            [1.0, -0.30, 0.05, 0.40],
-        ];
-        let design = KroneckerDesign::new_kronecker(response_grid.clone(), covariate.clone())
-            .expect("toy Kronecker design");
-        // β positive on the leading response coordinate so h'(grid) starts
-        // safely above the slack threshold; δ has a negative leading entry to
-        // drive at least one virtual row toward the boundary. Layout follows
-        // the row-major `(p_resp × p_cov)` reshape used by `forward_mul`.
-        let beta = array![
-            0.80, 0.10, -0.05, // a = 0
-            0.20, 0.05, 0.20, // a = 1
-            0.00, -0.10, 0.10, // a = 2
-            -0.05, 0.15, 0.00, // a = 3
-        ];
-        let delta = array![
-            -0.40, 0.05, 0.10, // a = 0
-            -0.15, -0.10, -0.05, // a = 1
-            0.05, 0.00, 0.05, // a = 2
-            0.00, -0.10, 0.05, // a = 3
-        ];
-        let slack = 1e-3;
-        let dh_eps = 1e-14;
-
-        let alpha_uncached = design.min_step_to_boundary(&beta, &delta, slack, dh_eps);
-        assert!(
-            alpha_uncached.is_finite() && alpha_uncached > 0.0,
-            "un-cached α must be a finite positive bound for this fixture: {alpha_uncached}"
-        );
-
-        // Cached path: project β and δ once via the helper, hand the (n × p_resp)
-        // factors to the cached entry point.
-        let c = design
-            .project_kronecker_factor(&beta)
-            .expect("Kronecker variant projects β");
-        let d = design
-            .project_kronecker_factor(&delta)
-            .expect("Kronecker variant projects δ");
-        let alpha_cached =
-            design.min_step_to_boundary_with_projections(c.view(), d.view(), slack, dh_eps);
-        assert_eq!(
-            alpha_cached, alpha_uncached,
-            "cached min_step_to_boundary_with_projections must be bit-equivalent to the un-cached path"
-        );
-
-        // Reusing C across a fresh δ′ (the line-search reuse pattern) must
-        // still match the un-cached call with that δ′.
-        let delta_prime = &delta * 0.5;
-        let d_prime = design
-            .project_kronecker_factor(&delta_prime)
-            .expect("Kronecker variant projects δ′");
-        let alpha_cached_prime = design.min_step_to_boundary_with_projections(
-            c.view(),
-            d_prime.view(),
-            slack,
-            dh_eps,
-        );
-        let alpha_uncached_prime = design.min_step_to_boundary(&beta, &delta_prime, slack, dh_eps);
-        assert_eq!(
-            alpha_cached_prime, alpha_uncached_prime,
-            "cached path with reused C and refreshed D must equal the un-cached path"
         );
     }
 
