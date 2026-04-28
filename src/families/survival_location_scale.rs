@@ -4386,7 +4386,7 @@ fn weighted_crossprod_dense(
         }
     }
     if fast_path_ok {
-        let out = left.t().dot(&weighted_right);
+        let out = fast_atb(left, &weighted_right);
         if out.iter().all(|value| value.is_finite()) {
             return Ok(out);
         }
@@ -4500,7 +4500,7 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
 }
 
 fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Array1<f64> {
-    let xc = x.dot(cov);
+    let xc = crate::faer_ndarray::fast_ab(&x, cov);
     Array1::from_iter((0..x.nrows()).map(|i| x.row(i).dot(&xc.row(i)).max(0.0).sqrt()))
 }
 
@@ -4704,7 +4704,7 @@ fn survival_wiggle_fourth_q(
             beta_w.len()
         ));
     }
-    Ok(basis_d4.dot(&beta_w))
+    Ok(fast_av(&basis_d4, &beta_w))
 }
 
 fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {

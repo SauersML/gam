@@ -46,6 +46,7 @@ use crate::smooth::{
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -4247,17 +4248,29 @@ fn binomial_location_scale_ll_only(
     link_kind: &InverseLink,
 ) -> Result<f64, String> {
     let n = y.len();
-    let mut ll = 0.0;
-    for i in 0..n {
-        let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(eta_ls[i]);
-        let q0 = binomial_location_scale_q0(eta_t[i], sigma);
-        let q = q0 + etawiggle.map_or(0.0, |w| w[i]);
-        let jet = inverse_link_jet_for_inverse_link(link_kind, q)
-            .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-        let (mu_clamped, _) = clamped_binomial_probability(jet.mu);
-        ll += weights[i] * (y[i] * mu_clamped.ln() + (1.0 - y[i]) * (1.0 - mu_clamped).ln());
-    }
-    Ok(ll)
+    let y_slice = y.as_slice().expect("y must be contiguous");
+    let w_slice = weights.as_slice().expect("weights must be contiguous");
+    let et_slice = eta_t.as_slice().expect("eta_t must be contiguous");
+    let el_slice = eta_ls.as_slice().expect("eta_ls must be contiguous");
+    let ew_slice = etawiggle.map(|w| w.as_slice().expect("etawiggle must be contiguous"));
+    (0..n)
+        .into_par_iter()
+        .try_fold(
+            || 0.0_f64,
+            |acc, i| -> Result<f64, String> {
+                let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(el_slice[i]);
+                let q0 = binomial_location_scale_q0(et_slice[i], sigma);
+                let q = q0 + ew_slice.map_or(0.0, |w| w[i]);
+                let jet = inverse_link_jet_for_inverse_link(link_kind, q)
+                    .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+                let (mu_clamped, _) = clamped_binomial_probability(jet.mu);
+                Ok(acc
+                    + w_slice[i]
+                        * (y_slice[i] * mu_clamped.ln()
+                            + (1.0 - y_slice[i]) * (1.0 - mu_clamped).ln()))
+            },
+        )
+        .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))
 }
 
 fn binomial_location_scale_core(
@@ -4278,42 +4291,56 @@ fn binomial_location_scale_core(
         return Err("binomial location-scale core wiggle size mismatch".to_string());
     }
 
-    let mut sigma = Array1::<f64>::uninit(n);
-    let mut dsigma_deta = Array1::<f64>::uninit(n);
-    let mut q0 = Array1::<f64>::uninit(n);
-    let mut mu = Array1::<f64>::uninit(n);
-    let mut dmu_dq = Array1::<f64>::uninit(n);
-    let mut d2mu_dq2 = Array1::<f64>::uninit(n);
-    let mut d3mu_dq3 = Array1::<f64>::uninit(n);
-    let mut ll = 0.0;
+    // Parallel per-row probit/inverse-link evaluation. At biobank scale
+    // (n = 320K) the sequential probit erfc loop was a major single-thread
+    // hotspot called dozens of times per outer REML gradient evaluation.
+    let y_slice = y.as_slice().expect("y must be contiguous");
+    let w_slice = weights.as_slice().expect("weights must be contiguous");
+    let et_slice = eta_t.as_slice().expect("eta_t must be contiguous");
+    let el_slice = eta_ls.as_slice().expect("eta_ls must be contiguous");
+    let ew_slice = etawiggle.map(|w| w.as_slice().expect("etawiggle must be contiguous"));
 
-    for i in 0..n {
-        let row = binomial_location_scalerow(
-            y[i],
-            weights[i],
-            eta_t[i],
-            eta_ls[i],
-            etawiggle.map_or(0.0, |w| w[i]),
-            link_kind,
-        )?;
-        sigma[i].write(row.sigma);
-        dsigma_deta[i].write(row.dsigma_deta);
-        q0[i].write(row.q0);
-        mu[i].write(row.inverse_link.mu);
-        dmu_dq[i].write(row.inverse_link.d1);
-        d2mu_dq2[i].write(row.inverse_link.d2);
-        d3mu_dq3[i].write(row.inverse_link.d3);
+    let rows: Vec<BinomialLocationScaleRow> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            binomial_location_scalerow(
+                y_slice[i],
+                w_slice[i],
+                et_slice[i],
+                el_slice[i],
+                ew_slice.map_or(0.0, |w| w[i]),
+                link_kind,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut sigma = Vec::with_capacity(n);
+    let mut dsigma_deta = Vec::with_capacity(n);
+    let mut q0 = Vec::with_capacity(n);
+    let mut mu = Vec::with_capacity(n);
+    let mut dmu_dq = Vec::with_capacity(n);
+    let mut d2mu_dq2 = Vec::with_capacity(n);
+    let mut d3mu_dq3 = Vec::with_capacity(n);
+    let mut ll = 0.0_f64;
+    for row in rows {
+        sigma.push(row.sigma);
+        dsigma_deta.push(row.dsigma_deta);
+        q0.push(row.q0);
+        mu.push(row.inverse_link.mu);
+        dmu_dq.push(row.inverse_link.d1);
+        d2mu_dq2.push(row.inverse_link.d2);
+        d3mu_dq3.push(row.inverse_link.d3);
         ll += row.ll;
     }
 
     Ok(BinomialLocationScaleCore {
-        sigma: unsafe { sigma.assume_init() },
-        dsigma_deta: unsafe { dsigma_deta.assume_init() },
-        q0: unsafe { q0.assume_init() },
-        mu: unsafe { mu.assume_init() },
-        dmu_dq: unsafe { dmu_dq.assume_init() },
-        d2mu_dq2: unsafe { d2mu_dq2.assume_init() },
-        d3mu_dq3: unsafe { d3mu_dq3.assume_init() },
+        sigma: Array1::from_vec(sigma),
+        dsigma_deta: Array1::from_vec(dsigma_deta),
+        q0: Array1::from_vec(q0),
+        mu: Array1::from_vec(mu),
+        dmu_dq: Array1::from_vec(dmu_dq),
+        d2mu_dq2: Array1::from_vec(d2mu_dq2),
+        d3mu_dq3: Array1::from_vec(d3mu_dq3),
         log_likelihood: ll,
     })
 }
@@ -11223,29 +11250,56 @@ impl BinomialLocationScaleFamily {
             None,
             &self.link_kind,
         )?;
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            // κ = (dσ/dη_ls)/σ = 1 for the exact exp link.
-            let kappa = core.dsigma_deta[i] / core.sigma[i];
-            let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            coeff_tt[i] = m2 * r * r;
-            coeff_tl[i] = kappa * r * (m1 + q * m2);
-            coeff_ll[i] = kappa * kappa * q * (m1 + q * m2);
-        }
-        Ok((coeff_tt, coeff_tl, coeff_ll))
+        let mut coeff_tt = vec![0.0_f64; n];
+        let mut coeff_tl = vec![0.0_f64; n];
+        let mut coeff_ll = vec![0.0_f64; n];
+        let y_slice = self.y.as_slice().expect("y must be contiguous");
+        let w_slice = self.weights.as_slice().expect("weights must be contiguous");
+        let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
+        let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
+        let dsigma_slice = core
+            .dsigma_deta
+            .as_slice()
+            .expect("dsigma_deta must be contiguous");
+        let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
+        let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+        let d2mu_slice = core
+            .d2mu_dq2
+            .as_slice()
+            .expect("d2mu_dq2 must be contiguous");
+        let d3mu_slice = core
+            .d3mu_dq3
+            .as_slice()
+            .expect("d3mu_dq3 must be contiguous");
+        let link_kind = &self.link_kind;
+        coeff_tt
+            .par_iter_mut()
+            .zip(coeff_tl.par_iter_mut())
+            .zip(coeff_ll.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((c_tt, c_tl), c_ll))| {
+                let q = q0_slice[i];
+                let r = 1.0 / sigma_slice[i];
+                let kappa = dsigma_slice[i] / sigma_slice[i];
+                let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
+                    y_slice[i],
+                    w_slice[i],
+                    q,
+                    mu_slice[i],
+                    dmu_slice[i],
+                    d2mu_slice[i],
+                    d3mu_slice[i],
+                    link_kind,
+                );
+                *c_tt = m2 * r * r;
+                *c_tl = kappa * r * (m1 + q * m2);
+                *c_ll = kappa * kappa * q * (m1 + q * m2);
+            });
+        Ok((
+            Array1::from_vec(coeff_tt),
+            Array1::from_vec(coeff_tl),
+            Array1::from_vec(coeff_ll),
+        ))
     }
 
     /// Exact diagonal-block-only Hessians (h_tt, h_ll) used by `evaluate()`
@@ -11430,33 +11484,60 @@ impl BinomialLocationScaleFamily {
             &self.link_kind,
         )?;
 
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            // s = (dσ/dη_ls) / σ = 1 for the exact exp link.
-            let s = core.dsigma_deta[i] / core.sigma[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let a = d_eta_t[i];
-            let b = d_eta_ls[i];
-            let sb = s * b;
-            let du = -r * a - q * sb;
-            coeff_tt[i] = r * r * (m3 * du - 2.0 * m2 * sb);
-            // Cross block carries overall κ; scale-scale block carries κ².
-            coeff_tl[i] = s * r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
-            coeff_ll[i] = s * s * (m1 + 3.0 * q * m2 + q * q * m3) * du;
-        }
+        let mut coeff_tt_v = vec![0.0_f64; n];
+        let mut coeff_tl_v = vec![0.0_f64; n];
+        let mut coeff_ll_v = vec![0.0_f64; n];
+        let y_slice = self.y.as_slice().expect("y must be contiguous");
+        let w_slice = self.weights.as_slice().expect("weights must be contiguous");
+        let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
+        let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
+        let dsigma_slice = core
+            .dsigma_deta
+            .as_slice()
+            .expect("dsigma_deta must be contiguous");
+        let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
+        let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+        let d2mu_slice = core
+            .d2mu_dq2
+            .as_slice()
+            .expect("d2mu_dq2 must be contiguous");
+        let d3mu_slice = core
+            .d3mu_dq3
+            .as_slice()
+            .expect("d3mu_dq3 must be contiguous");
+        let det_slice = d_eta_t.as_slice().expect("d_eta_t must be contiguous");
+        let del_slice = d_eta_ls.as_slice().expect("d_eta_ls must be contiguous");
+        let link_kind = &self.link_kind;
+        coeff_tt_v
+            .par_iter_mut()
+            .zip(coeff_tl_v.par_iter_mut())
+            .zip(coeff_ll_v.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((c_tt, c_tl), c_ll))| {
+                let q = q0_slice[i];
+                let r = 1.0 / sigma_slice[i];
+                let s = dsigma_slice[i] / sigma_slice[i];
+                let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                    y_slice[i],
+                    w_slice[i],
+                    q,
+                    mu_slice[i],
+                    dmu_slice[i],
+                    d2mu_slice[i],
+                    d3mu_slice[i],
+                    link_kind,
+                );
+                let a = det_slice[i];
+                let b = del_slice[i];
+                let sb = s * b;
+                let du = -r * a - q * sb;
+                *c_tt = r * r * (m3 * du - 2.0 * m2 * sb);
+                *c_tl = s * r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
+                *c_ll = s * s * (m1 + 3.0 * q * m2 + q * q * m3) * du;
+            });
+        let coeff_tt = Array1::from_vec(coeff_tt_v);
+        let coeff_tl = Array1::from_vec(coeff_tl_v);
+        let coeff_ll = Array1::from_vec(coeff_ll_v);
 
         let d_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
         let d_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
@@ -11949,45 +12030,115 @@ impl BinomialLocationScaleFamily {
         };
         let (z_t, z_ls) = (&dir_a.z_t_psi, &dir_a.z_ls_psi);
 
-        let mut r_t = Array1::<f64>::zeros(n);
-        let mut r_ls = Array1::<f64>::zeros(n);
-        let mut dr_t = Array1::<f64>::zeros(n);
-        let mut dr_ls = Array1::<f64>::zeros(n);
-        let mut h_tt = Array1::<f64>::zeros(n);
-        let mut h_tl = Array1::<f64>::zeros(n);
-        let mut h_ll = Array1::<f64>::zeros(n);
-        let mut dh_tt = Array1::<f64>::zeros(n);
-        let mut dh_tl = Array1::<f64>::zeros(n);
-        let mut dh_ll = Array1::<f64>::zeros(n);
-        let mut objective_psi = 0.0;
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i];
-            let s = core.dsigma_deta[i] / core.sigma[i];
-            let sz = s * z_ls[i];
-            let q_psi = -r * z_t[i] - q * sz;
-            let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            r_t[i] = -a * r;
-            r_ls[i] = -a * q * s;
-            dr_t[i] = -b * q_psi * r + a * r * sz;
-            dr_ls[i] = -(a + q * b) * q_psi;
-            h_tt[i] = b * r * r;
-            h_tl[i] = r * (a + q * b);
-            h_ll[i] = q * (a + q * b);
-            dh_tt[i] = r * r * (c * q_psi - 2.0 * b * sz);
-            dh_tl[i] = r * ((2.0 * b + c * q) * q_psi - (a + q * b) * sz);
-            dh_ll[i] = (a + 3.0 * q * b + q * q * c) * q_psi;
-            objective_psi += r_t[i] * z_t[i] + r_ls[i] * z_ls[i];
+        let mut r_t_v = vec![0.0_f64; n];
+        let mut r_ls_v = vec![0.0_f64; n];
+        let mut dr_t_v = vec![0.0_f64; n];
+        let mut dr_ls_v = vec![0.0_f64; n];
+        let mut h_tt_v = vec![0.0_f64; n];
+        let mut h_tl_v = vec![0.0_f64; n];
+        let mut h_ll_v = vec![0.0_f64; n];
+        let mut dh_tt_v = vec![0.0_f64; n];
+        let mut dh_tl_v = vec![0.0_f64; n];
+        let mut dh_ll_v = vec![0.0_f64; n];
+        let y_p = self.y.as_slice().expect("y must be contiguous");
+        let w_p = self.weights.as_slice().expect("weights must be contiguous");
+        let q0_p = core.q0.as_slice().expect("q0 must be contiguous");
+        let sigma_p = core.sigma.as_slice().expect("sigma must be contiguous");
+        let dsigma_p = core
+            .dsigma_deta
+            .as_slice()
+            .expect("dsigma_deta must be contiguous");
+        let mu_p = core.mu.as_slice().expect("mu must be contiguous");
+        let dmu_p = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+        let d2mu_p = core
+            .d2mu_dq2
+            .as_slice()
+            .expect("d2mu_dq2 must be contiguous");
+        let d3mu_p = core
+            .d3mu_dq3
+            .as_slice()
+            .expect("d3mu_dq3 must be contiguous");
+        let z_t_p = z_t.as_slice().expect("z_t must be contiguous");
+        let z_ls_p = z_ls.as_slice().expect("z_ls must be contiguous");
+        let link_kind_p = &self.link_kind;
+        // SAFETY: each parallel iteration writes a unique index i; raw pointer
+        // sends are needed because rayon does not directly support a 10-way
+        // par_iter_mut zip. Buffers are freshly allocated and not aliased.
+        struct PsiTermsPtrs {
+            r_t: *mut f64,
+            r_ls: *mut f64,
+            dr_t: *mut f64,
+            dr_ls: *mut f64,
+            h_tt: *mut f64,
+            h_tl: *mut f64,
+            h_ll: *mut f64,
+            dh_tt: *mut f64,
+            dh_tl: *mut f64,
+            dh_ll: *mut f64,
         }
+        unsafe impl Send for PsiTermsPtrs {}
+        unsafe impl Sync for PsiTermsPtrs {}
+        let ptrs = PsiTermsPtrs {
+            r_t: r_t_v.as_mut_ptr(),
+            r_ls: r_ls_v.as_mut_ptr(),
+            dr_t: dr_t_v.as_mut_ptr(),
+            dr_ls: dr_ls_v.as_mut_ptr(),
+            h_tt: h_tt_v.as_mut_ptr(),
+            h_tl: h_tl_v.as_mut_ptr(),
+            h_ll: h_ll_v.as_mut_ptr(),
+            dh_tt: dh_tt_v.as_mut_ptr(),
+            dh_tl: dh_tl_v.as_mut_ptr(),
+            dh_ll: dh_ll_v.as_mut_ptr(),
+        };
+        let objective_psi: f64 = (0..n)
+            .into_par_iter()
+            .with_min_len(1024)
+            .fold(
+                || 0.0_f64,
+                |acc, i| {
+                    let q = q0_p[i];
+                    let r = 1.0 / sigma_p[i];
+                    let s = dsigma_p[i] / sigma_p[i];
+                    let sz = s * z_ls_p[i];
+                    let q_psi = -r * z_t_p[i] - q * sz;
+                    let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
+                        y_p[i],
+                        w_p[i],
+                        q,
+                        mu_p[i],
+                        dmu_p[i],
+                        d2mu_p[i],
+                        d3mu_p[i],
+                        link_kind_p,
+                    );
+                    let r_t_i = -a * r;
+                    let r_ls_i = -a * q * s;
+                    unsafe {
+                        *ptrs.r_t.add(i) = r_t_i;
+                        *ptrs.r_ls.add(i) = r_ls_i;
+                        *ptrs.dr_t.add(i) = -b * q_psi * r + a * r * sz;
+                        *ptrs.dr_ls.add(i) = -(a + q * b) * q_psi;
+                        *ptrs.h_tt.add(i) = b * r * r;
+                        *ptrs.h_tl.add(i) = r * (a + q * b);
+                        *ptrs.h_ll.add(i) = q * (a + q * b);
+                        *ptrs.dh_tt.add(i) = r * r * (c * q_psi - 2.0 * b * sz);
+                        *ptrs.dh_tl.add(i) = r * ((2.0 * b + c * q) * q_psi - (a + q * b) * sz);
+                        *ptrs.dh_ll.add(i) = (a + 3.0 * q * b + q * q * c) * q_psi;
+                    }
+                    acc + r_t_i * z_t_p[i] + r_ls_i * z_ls_p[i]
+                },
+            )
+            .sum();
+        let r_t = Array1::from_vec(r_t_v);
+        let r_ls = Array1::from_vec(r_ls_v);
+        let dr_t = Array1::from_vec(dr_t_v);
+        let dr_ls = Array1::from_vec(dr_ls_v);
+        let h_tt = Array1::from_vec(h_tt_v);
+        let h_tl = Array1::from_vec(h_tl_v);
+        let h_ll = Array1::from_vec(h_ll_v);
+        let dh_tt = Array1::from_vec(dh_tt_v);
+        let dh_tl = Array1::from_vec(dh_tl_v);
+        let dh_ll = Array1::from_vec(dh_ll_v);
 
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
             dir_a.x_t_psi.cloned_first_action(),
@@ -12745,23 +12896,45 @@ impl CustomFamily for BinomialLocationScaleFamily {
         //   score_q = -m1   (m1 = dF/dq, F = -ℓ)
         //   grad_eta_t[i]  = score_q * q_t
         //   grad_eta_ls[i] = score_q * q_ls
-        let mut grad_eta_t = Array1::<f64>::zeros(n);
-        let mut grad_eta_ls = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                core.q0[i],
-                core.mu[i],
-                core.dmu_dq[i],
-                core.d2mu_dq2[i],
-                core.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let q0d = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
-            grad_eta_t[i] = -m1 * q0d.q_t;
-            grad_eta_ls[i] = -m1 * q0d.q_ls;
-        }
+        let mut grad_eta_t_v = vec![0.0_f64; n];
+        let mut grad_eta_ls_v = vec![0.0_f64; n];
+        let y_slice_e = self.y.as_slice().expect("y must be contiguous");
+        let w_slice_e = self.weights.as_slice().expect("weights must be contiguous");
+        let q0_slice_e = core.q0.as_slice().expect("q0 must be contiguous");
+        let sigma_slice_e = core.sigma.as_slice().expect("sigma must be contiguous");
+        let mu_slice_e = core.mu.as_slice().expect("mu must be contiguous");
+        let dmu_slice_e = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+        let d2mu_slice_e = core
+            .d2mu_dq2
+            .as_slice()
+            .expect("d2mu_dq2 must be contiguous");
+        let d3mu_slice_e = core
+            .d3mu_dq3
+            .as_slice()
+            .expect("d3mu_dq3 must be contiguous");
+        let eta_t_slice_e = eta_t.as_slice().expect("eta_t must be contiguous");
+        let link_kind_e = &self.link_kind;
+        grad_eta_t_v
+            .par_iter_mut()
+            .zip(grad_eta_ls_v.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (g_t, g_ls))| {
+                let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
+                    y_slice_e[i],
+                    w_slice_e[i],
+                    q0_slice_e[i],
+                    mu_slice_e[i],
+                    dmu_slice_e[i],
+                    d2mu_slice_e[i],
+                    d3mu_slice_e[i],
+                    link_kind_e,
+                );
+                let q0d = nonwiggle_q_derivs(eta_t_slice_e[i], sigma_slice_e[i]);
+                *g_t = -m1 * q0d.q_t;
+                *g_ls = -m1 * q0d.q_ls;
+            });
+        let grad_eta_t = Array1::from_vec(grad_eta_t_v);
+        let grad_eta_ls = Array1::from_vec(grad_eta_ls_v);
         let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
         let grad_ls = log_sigma_design.transpose_vector_multiply(&grad_eta_ls);
 
