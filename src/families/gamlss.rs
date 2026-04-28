@@ -8,8 +8,9 @@ use crate::custom_family::{
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
     CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, PsiDesignMap,
     build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
@@ -161,6 +162,38 @@ fn exact_design_row_chunks(n: usize, p: usize) -> impl Iterator<Item = std::ops:
     (0..n)
         .step_by(rows)
         .map(move |start| start..(start + rows).min(n))
+}
+
+fn design_weighted_column_squares(
+    design: &DesignMatrix,
+    weights: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    if weights.len() != n {
+        return Err(format!(
+            "design weighted column squares dimension mismatch: weights={}, rows={}",
+            weights.len(),
+            n
+        ));
+    }
+    let mut out = Array1::<f64>::zeros(p);
+    for rows in exact_design_row_chunks(n, p) {
+        let chunk = design.try_row_chunk(rows.clone()).map_err(|e| {
+            format!("design weighted column squares row chunk materialization failed: {e}")
+        })?;
+        for (local_i, row) in chunk.outer_iter().enumerate() {
+            let w = weights[rows.start + local_i];
+            if w == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                let x = row[j];
+                out[j] += w * x * x;
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[inline]
@@ -6895,6 +6928,65 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     }
 }
 
+struct DesignTwoBlockRowCoeffOperator {
+    x_a: DesignMatrix,
+    x_b: DesignMatrix,
+    c_aa: Array1<f64>,
+    c_ab: Array1<f64>,
+    c_bb: Array1<f64>,
+    dim: usize,
+    nrows: usize,
+    pa: usize,
+    pb: usize,
+}
+
+impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRowCoeffOperator {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.dim);
+        let v_a = v.slice(s![0..self.pa]).to_owned();
+        let v_b = v.slice(s![self.pa..self.dim]).to_owned();
+        let u_a = self.x_a.matrixvectormultiply(&v_a);
+        let u_b = self.x_b.matrixvectormultiply(&v_b);
+        debug_assert_eq!(u_a.len(), self.nrows);
+        debug_assert_eq!(u_b.len(), self.nrows);
+        let r_a = &self.c_aa * &u_a + &self.c_ab * &u_b;
+        let r_b = &self.c_ab * &u_a + &self.c_bb * &u_b;
+        let out_a = self.x_a.transpose_vector_multiply(&r_a);
+        let out_b = self.x_b.transpose_vector_multiply(&r_b);
+        let mut out = Array1::<f64>::zeros(self.dim);
+        out.slice_mut(s![0..self.pa]).assign(&out_a);
+        out.slice_mut(s![self.pa..self.dim]).assign(&out_b);
+        out
+    }
+
+    fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
+        let cols = out.ncols();
+        debug_assert!(start + cols <= self.dim);
+        let mut basis = Array1::<f64>::zeros(self.dim);
+        for local_col in 0..cols {
+            let global_col = start + local_col;
+            basis[global_col] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(local_col).assign(&col);
+            basis[global_col] = 0.0;
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.dim, self.dim));
+        self.mul_basis_columns_into(0, out.view_mut());
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
 /// Matrix-free joint-Hessian operator for the two-block Gaussian
 /// location-scale family. The dense Hessian decomposes as
 ///
@@ -7130,6 +7222,43 @@ fn make_two_block_row_coeff_operator(
         },
     ];
     RowCoeffOperator::new(channels, vec![pa, pb], pair_coeffs, nrows)
+}
+
+fn make_two_block_design_row_coeff_operator(
+    x_a: DesignMatrix,
+    x_b: DesignMatrix,
+    c_aa: Array1<f64>,
+    c_ab: Array1<f64>,
+    c_bb: Array1<f64>,
+) -> Result<DesignTwoBlockRowCoeffOperator, String> {
+    let nrows = x_a.nrows();
+    if x_b.nrows() != nrows
+        || c_aa.len() != nrows
+        || c_ab.len() != nrows
+        || c_bb.len() != nrows
+    {
+        return Err(format!(
+            "two-block row coefficient operator dimension mismatch: rows a={}, b={}, coeffs={}/{}/{}",
+            nrows,
+            x_b.nrows(),
+            c_aa.len(),
+            c_ab.len(),
+            c_bb.len()
+        ));
+    }
+    let pa = x_a.ncols();
+    let pb = x_b.ncols();
+    Ok(DesignTwoBlockRowCoeffOperator {
+        x_a,
+        x_b,
+        c_aa,
+        c_ab,
+        c_bb,
+        dim: pa + pb,
+        nrows,
+        pa,
+        pb,
+    })
 }
 
 struct GaussianLocationScaleWiggleJointPsiDirection {
@@ -11955,6 +12084,126 @@ impl BinomialLocationScaleFamily {
         Ok(None)
     }
 
+    fn exact_joint_block_designs_owned(
+        &self,
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<(DesignMatrix, DesignMatrix)>, String> {
+        let designs = if let (Some(x_t), Some(x_ls)) =
+            (self.threshold_design.as_ref(), self.log_sigma_design.as_ref())
+        {
+            Some((x_t.clone(), x_ls.clone()))
+        } else if let Some(specs) = specs {
+            if specs.len() != 2 {
+                return Err(format!(
+                    "BinomialLocationScaleFamily spec-aware operator path expects 2 specs, got {}",
+                    specs.len()
+                ));
+            }
+            Some((
+                specs[Self::BLOCK_T].design.clone(),
+                specs[Self::BLOCK_LOG_SIGMA].design.clone(),
+            ))
+        } else {
+            None
+        };
+        let Some((x_t, x_ls)) = designs else {
+            return Ok(None);
+        };
+        let n = self.y.len();
+        if x_t.nrows() != n || x_ls.nrows() != n {
+            return Err(format!(
+                "BinomialLocationScaleFamily operator designs have row mismatch: y={}, threshold={}, log_sigma={}",
+                n,
+                x_t.nrows(),
+                x_ls.nrows()
+            ));
+        }
+        Ok(Some((x_t, x_ls)))
+    }
+
+    fn exact_newton_joint_gradient_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &DesignMatrix,
+        x_ls: &DesignMatrix,
+    ) -> Result<ExactNewtonJointGradientEvaluation, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n
+            || eta_ls.len() != n
+            || self.weights.len() != n
+            || x_t.nrows() != n
+            || x_ls.nrows() != n
+        {
+            return Err("BinomialLocationScaleFamily joint gradient input size mismatch".to_string());
+        }
+
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let mut grad_eta_t_v = vec![0.0_f64; n];
+        let mut grad_eta_ls_v = vec![0.0_f64; n];
+        let y_slice = self.y.as_slice().expect("y must be contiguous");
+        let w_slice = self.weights.as_slice().expect("weights must be contiguous");
+        let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
+        let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
+        let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
+        let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+        let d2mu_slice = core
+            .d2mu_dq2
+            .as_slice()
+            .expect("d2mu_dq2 must be contiguous");
+        let d3mu_slice = core
+            .d3mu_dq3
+            .as_slice()
+            .expect("d3mu_dq3 must be contiguous");
+        let eta_t_slice = eta_t.as_slice().expect("eta_t must be contiguous");
+        let link_kind = &self.link_kind;
+        grad_eta_t_v
+            .par_iter_mut()
+            .zip(grad_eta_ls_v.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (g_t, g_ls))| {
+                let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
+                    y_slice[i],
+                    w_slice[i],
+                    q0_slice[i],
+                    mu_slice[i],
+                    dmu_slice[i],
+                    d2mu_slice[i],
+                    d3mu_slice[i],
+                    link_kind,
+                );
+                let q0d = nonwiggle_q_derivs(eta_t_slice[i], sigma_slice[i]);
+                *g_t = -m1 * q0d.q_t;
+                *g_ls = -m1 * q0d.q_ls;
+            });
+        let grad_eta_t = Array1::from_vec(grad_eta_t_v);
+        let grad_eta_ls = Array1::from_vec(grad_eta_ls_v);
+        let grad_t = x_t.transpose_vector_multiply(&grad_eta_t);
+        let grad_ls = x_ls.transpose_vector_multiply(&grad_eta_ls);
+        let total = grad_t.len() + grad_ls.len();
+        let mut gradient = Array1::<f64>::zeros(total);
+        gradient.slice_mut(s![0..grad_t.len()]).assign(&grad_t);
+        gradient.slice_mut(s![grad_t.len()..total]).assign(&grad_ls);
+        Ok(ExactNewtonJointGradientEvaluation {
+            log_likelihood: core.log_likelihood,
+            gradient,
+        })
+    }
+
     fn exact_newton_joint_hessian_for_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -14336,14 +14585,13 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
 ///   H v = (X_t^T r_t, X_ls^T r_ls).
 ///
 /// Cost is Θ(n (p_t + p_ls)) per matvec versus Θ(n (p_t + p_ls)^2) to form
-/// the dense matrix. The directional-derivative paths still use the dense
-/// `from_designs` helpers — the unified evaluator wraps any returned dense
-/// matrix in a HyperOperator when no native operator form exists.
+/// the dense matrix. The same block-operator structure is used for first and
+/// second directional derivatives.
 struct BinomialLocationScaleHessianWorkspace {
     family: BinomialLocationScaleFamily,
     block_states: Vec<ParameterBlockState>,
-    x_t: Arc<Array2<f64>>,
-    x_ls: Arc<Array2<f64>>,
+    x_t: DesignMatrix,
+    x_ls: DesignMatrix,
     coeff_tt: Array1<f64>,
     coeff_tl: Array1<f64>,
     coeff_ll: Array1<f64>,
@@ -14354,16 +14602,16 @@ impl BinomialLocationScaleHessianWorkspace {
         family: BinomialLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
         _specs: Vec<ParameterBlockSpec>,
-        x_t: Array2<f64>,
-        x_ls: Array2<f64>,
+        x_t: DesignMatrix,
+        x_ls: DesignMatrix,
     ) -> Result<Self, String> {
         let (coeff_tt, coeff_tl, coeff_ll) =
             family.exact_newton_joint_hessian_row_coefficients(&block_states)?;
         Ok(Self {
             family,
             block_states,
-            x_t: Arc::new(x_t),
-            x_ls: Arc::new(x_ls),
+            x_t,
+            x_ls,
             coeff_tt,
             coeff_tl,
             coeff_ll,
@@ -14384,14 +14632,16 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             ));
         }
         // u_t = X_t v_t, u_ls = X_ls v_ls
-        let u_t = fast_av(self.x_t.as_ref(), &v.slice(s![0..pt]));
-        let u_ls = fast_av(self.x_ls.as_ref(), &v.slice(s![pt..total]));
+        let u_t = self.x_t.matrixvectormultiply(&v.slice(s![0..pt]).to_owned());
+        let u_ls = self
+            .x_ls
+            .matrixvectormultiply(&v.slice(s![pt..total]).to_owned());
         // r_t = D_tt .* u_t + D_tl .* u_ls; r_ls = D_tl .* u_t + D_ll .* u_ls
         let r_t = &self.coeff_tt * &u_t + &self.coeff_tl * &u_ls;
         let r_ls = &self.coeff_tl * &u_t + &self.coeff_ll * &u_ls;
         // (X_t^T r_t, X_ls^T r_ls)
-        let out_t = fast_atv(self.x_t.as_ref(), &r_t);
-        let out_ls = fast_atv(self.x_ls.as_ref(), &r_ls);
+        let out_t = self.x_t.transpose_vector_multiply(&r_t);
+        let out_ls = self.x_ls.transpose_vector_multiply(&r_ls);
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pt]).assign(&out_t);
         out.slice_mut(s![pt..total]).assign(&out_ls);
@@ -14403,39 +14653,18 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         let pls = self.x_ls.ncols();
         let total = pt + pls;
         let mut diag = Array1::<f64>::zeros(total);
-        // diag(X_t^T D_tt X_t)[j] = sum_i D_tt[i] * X_t[i,j]^2
-        for j in 0..pt {
-            let col = self.x_t.column(j);
-            let mut acc = 0.0;
-            for i in 0..self.coeff_tt.len() {
-                let v = col[i];
-                acc += self.coeff_tt[i] * v * v;
-            }
-            diag[j] = acc;
-        }
-        for j in 0..pls {
-            let col = self.x_ls.column(j);
-            let mut acc = 0.0;
-            for i in 0..self.coeff_ll.len() {
-                let v = col[i];
-                acc += self.coeff_ll[i] * v * v;
-            }
-            diag[pt + j] = acc;
-        }
+        let diag_t = design_weighted_column_squares(&self.x_t, &self.coeff_tt)?;
+        let diag_ls = design_weighted_column_squares(&self.x_ls, &self.coeff_ll)?;
+        diag.slice_mut(s![0..pt]).assign(&diag_t);
+        diag.slice_mut(s![pt..total]).assign(&diag_ls);
         Ok(Some(diag))
     }
 
     fn directional_derivative(
         &self,
-        d_beta_flat: &Array1<f64>,
+        _d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessian_directional_derivative_from_designs(
-                &self.block_states,
-                self.x_t.as_ref(),
-                self.x_ls.as_ref(),
-                d_beta_flat,
-            )
+        Ok(None)
     }
 
     fn directional_derivative_operator(
@@ -14443,7 +14672,6 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
-        let n = self.x_t.nrows();
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
@@ -14464,8 +14692,12 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             None,
             &self.family.link_kind,
         )?;
-        let d_eta_t = fast_av(self.x_t.as_ref(), &d_beta_flat.slice(s![0..pt]));
-        let d_eta_ls = fast_av(self.x_ls.as_ref(), &d_beta_flat.slice(s![pt..total]));
+        let d_eta_t = self
+            .x_t
+            .matrixvectormultiply(&d_beta_flat.slice(s![0..pt]).to_owned());
+        let d_eta_ls = self
+            .x_ls
+            .matrixvectormultiply(&d_beta_flat.slice(s![pt..total]).to_owned());
         let (c_tt, c_tl, c_ll) = binomial_location_scale_first_directional_coefficients(
             &self.family.y,
             &self.family.weights,
@@ -14474,29 +14706,21 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             &d_eta_ls,
             &self.family.link_kind,
         );
-        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
+        Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
             self.x_t.clone(),
             self.x_ls.clone(),
             c_tt,
             c_tl,
             c_ll,
-            n,
-        ))))
+        )?)))
     }
 
     fn second_directional_derivative(
         &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
-                &self.block_states,
-                self.x_t.as_ref(),
-                self.x_ls.as_ref(),
-                d_beta_u_flat,
-                d_beta_v_flat,
-            )
+        Ok(None)
     }
 
     fn second_directional_derivative_operator(
@@ -14505,7 +14729,6 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
-        let n = self.x_t.nrows();
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
@@ -14527,10 +14750,18 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             None,
             &self.family.link_kind,
         )?;
-        let d_eta_t_u = fast_av(self.x_t.as_ref(), &d_beta_u.slice(s![0..pt]));
-        let d_eta_ls_u = fast_av(self.x_ls.as_ref(), &d_beta_u.slice(s![pt..total]));
-        let d_eta_t_v = fast_av(self.x_t.as_ref(), &d_beta_v.slice(s![0..pt]));
-        let d_eta_ls_v = fast_av(self.x_ls.as_ref(), &d_beta_v.slice(s![pt..total]));
+        let d_eta_t_u = self
+            .x_t
+            .matrixvectormultiply(&d_beta_u.slice(s![0..pt]).to_owned());
+        let d_eta_ls_u = self
+            .x_ls
+            .matrixvectormultiply(&d_beta_u.slice(s![pt..total]).to_owned());
+        let d_eta_t_v = self
+            .x_t
+            .matrixvectormultiply(&d_beta_v.slice(s![0..pt]).to_owned());
+        let d_eta_ls_v = self
+            .x_ls
+            .matrixvectormultiply(&d_beta_v.slice(s![pt..total]).to_owned());
         let (c_tt, c_tl, c_ll) = binomial_location_scalesecond_directional_coefficients(
             &self.family.y,
             &self.family.weights,
@@ -14541,14 +14772,13 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             &d_eta_ls_v,
             &self.family.link_kind,
         )?;
-        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
+        Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
             self.x_t.clone(),
             self.x_ls.clone(),
             c_tt,
             c_tl,
             c_ll,
-            n,
-        ))))
+        )?)))
     }
 }
 
