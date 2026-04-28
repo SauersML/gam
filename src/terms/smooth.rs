@@ -12,9 +12,9 @@ use crate::basis::{
     build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
     build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
-    estimate_penalty_nullity, filter_active_penalty_candidates, orthogonality_transform_for_design,
-    pairwise_distance_bounds, pairwise_distance_bounds_sampled, points_in_aniso_y_space,
-    select_centers_by_strategy,
+    estimate_penalty_nullity, filter_active_penalty_candidates, initial_aniso_contrasts,
+    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
+    points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -1580,21 +1580,18 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub min_length_scale: f64,
     /// Maximum allowed length_scale during κ search.
     pub max_length_scale: f64,
-    /// Automatic pilot-fit threshold for biobank-scale acceleration.
+    /// Automatic geometry-initializer threshold for biobank-scale spatial fits.
     ///
-    /// When n exceeds twice this value, κ/anisotropy optimization runs on a
-    /// spatially stratified random subsample of this size to obtain an
-    /// initializer, then the exact joint full-data [rho, psi] optimization
-    /// continues from that pilot geometry. This avoids repeated O(n·k) dense
-    /// basis rebuilds during the seeding phase while still enforcing
-    /// stationarity on the full objective.
+    /// When n exceeds twice this value, the fitter uses a spatially stratified
+    /// subsample only to seed κ/anisotropy geometry: centers are resolved,
+    /// axis contrasts are initialized from center/data spread, and one or two
+    /// cheap ψ reseeding updates are applied. It never runs PIRLS, REML, ARC,
+    /// BFGS, or any recursive optimizer on the pilot.
     ///
-    /// The subsample preserves spatial coverage via cell-based stratification
-    /// on the coordinates of the first eligible spatial term. The final
-    /// coefficients, smoothing parameters, and spatial geometry are then all
-    /// re-optimized on the full dataset.
+    /// The final coefficients, smoothing parameters, and spatial geometry are
+    /// always optimized on the full dataset.
     ///
-    /// Set to 0 to disable pilot-fit and always optimize on full data.
+    /// Set to 0 to skip the pilot geometry initializer.
     pub pilot_subsample_threshold: usize,
 }
 
@@ -9273,6 +9270,202 @@ fn stratified_spatial_subsample(
     selected
 }
 
+fn sampled_rows(data: ArrayView2<'_, f64>, indices: &[usize]) -> Array2<f64> {
+    let mut sampled = Array2::<f64>::zeros((indices.len(), data.ncols()));
+    for (new_row, &orig_row) in indices.iter().enumerate() {
+        sampled.row_mut(new_row).assign(&data.row(orig_row));
+    }
+    sampled
+}
+
+fn spatial_term_user_centers(term: &SmoothTermSpec) -> Option<ArrayView2<'_, f64>> {
+    match spatial_term_center_strategy(term) {
+        Some(CenterStrategy::UserProvided(centers)) => Some(centers.view()),
+        _ => None,
+    }
+}
+
+fn finite_centered_axis_contrasts(values: &[f64], expected_dim: usize) -> Option<Vec<f64>> {
+    if values.len() != expected_dim || expected_dim <= 1 {
+        return None;
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some(center_aniso_log_scales(values))
+}
+
+fn blended_pilot_axis_contrasts(
+    pilot_data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+    centers: ArrayView2<'_, f64>,
+) -> Option<Vec<f64>> {
+    let d = centers.ncols();
+    if d <= 1 {
+        return None;
+    }
+    let center_eta = initial_aniso_contrasts(centers);
+    let data_eta = standardized_spatial_term_data(pilot_data, term)
+        .ok()
+        .and_then(|x| finite_centered_axis_contrasts(&initial_aniso_contrasts(x.view()), d));
+    let center_eta = finite_centered_axis_contrasts(&center_eta, d)?;
+    let blended = match data_eta {
+        Some(data_eta) => center_eta
+            .iter()
+            .zip(data_eta.iter())
+            .map(|(&from_centers, &from_data)| 0.5 * (from_centers + from_data))
+            .collect::<Vec<_>>(),
+        None => center_eta,
+    };
+    finite_centered_axis_contrasts(&blended, d)
+}
+
+fn apply_pilot_spatial_psi_reseed(
+    pilot_data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    spatial_terms: &[usize],
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<TermCollectionSpec, EstimationError> {
+    let dims_per_term = spatial_dims_per_term(spec, spatial_terms);
+    let use_aniso = has_aniso_terms(spec, spatial_terms);
+    let log_kappa0 = if use_aniso {
+        SpatialLogKappaCoords::from_length_scales_aniso(spec, spatial_terms, kappa_options)
+    } else {
+        SpatialLogKappaCoords::from_length_scales(spec, spatial_terms, kappa_options)
+    };
+    let log_kappa0 = log_kappa0.reseed_from_data(pilot_data, spec, spatial_terms, kappa_options);
+    let log_kappa_lower = if use_aniso {
+        SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+            pilot_data,
+            spec,
+            spatial_terms,
+            &dims_per_term,
+            kappa_options,
+        )
+    } else {
+        SpatialLogKappaCoords::lower_bounds_from_data(
+            pilot_data,
+            spec,
+            spatial_terms,
+            kappa_options,
+        )
+    };
+    let log_kappa_upper = if use_aniso {
+        SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+            pilot_data,
+            spec,
+            spatial_terms,
+            &dims_per_term,
+            kappa_options,
+        )
+    } else {
+        SpatialLogKappaCoords::upper_bounds_from_data(
+            pilot_data,
+            spec,
+            spatial_terms,
+            kappa_options,
+        )
+    };
+    log_kappa0
+        .clamp_to_bounds(&log_kappa_lower, &log_kappa_upper)
+        .apply_tospec(spec, spatial_terms)
+}
+
+fn apply_spatial_anisotropy_pilot_initializer(
+    data: ArrayView2<'_, f64>,
+    spec: &mut TermCollectionSpec,
+    spatial_terms: &[usize],
+    target_size: usize,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> usize {
+    if target_size == 0 || data.nrows() <= target_size.saturating_mul(2) || spatial_terms.is_empty()
+    {
+        return 0;
+    }
+    if !has_aniso_terms(spec, spatial_terms) {
+        return 0;
+    }
+    let indices = stratified_spatial_subsample(data, spec, target_size);
+    let pilot_data = sampled_rows(data, &indices);
+    let mut working = spec.clone();
+    let mut updated_terms = 0usize;
+    const GEOMETRY_UPDATES: usize = 2;
+
+    for pass in 0..GEOMETRY_UPDATES {
+        let planned_terms = match plan_joint_spatial_centers_for_term_blocks(
+            pilot_data.view(),
+            &[working.smooth_terms.clone()],
+        )
+        .and_then(|mut blocks| {
+            blocks.pop().ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "pilot geometry initializer produced no smooth-term block".to_string(),
+                )
+            })
+        }) {
+            Ok(terms) => terms,
+            Err(err) => {
+                log::warn!(
+                    "[spatial-kappa] pilot geometry initializer skipped after center planning failed: {err}"
+                );
+                return updated_terms;
+            }
+        };
+
+        for &term_idx in spatial_terms {
+            let Some(current_eta) = get_spatial_aniso_log_scales(&working, term_idx) else {
+                continue;
+            };
+            let Some(d) = get_spatial_feature_dim(&working, term_idx) else {
+                continue;
+            };
+            if d <= 1 || current_eta.len() != d {
+                continue;
+            }
+            let Some(planned_term) = planned_terms.get(term_idx) else {
+                continue;
+            };
+            let Some(centers) = spatial_term_user_centers(planned_term) else {
+                continue;
+            };
+            let Some(eta) = blended_pilot_axis_contrasts(pilot_data.view(), planned_term, centers)
+            else {
+                continue;
+            };
+            if set_spatial_aniso_log_scales(&mut working, term_idx, eta).is_ok() {
+                updated_terms += usize::from(pass == 0);
+            }
+        }
+
+        match apply_pilot_spatial_psi_reseed(
+            pilot_data.view(),
+            &working,
+            spatial_terms,
+            kappa_options,
+        ) {
+            Ok(updated) => {
+                working = updated;
+            }
+            Err(err) => {
+                log::warn!(
+                    "[spatial-kappa] pilot geometry ψ reseed skipped after deterministic initializer error: {err}"
+                );
+                break;
+            }
+        }
+    }
+
+    if updated_terms > 0 {
+        log::info!(
+            "[spatial-kappa] initialized anisotropy from {}-row pilot geometry for {} spatial term(s); proceeding to full-data optimization",
+            indices.len(),
+            updated_terms
+        );
+        *spec = working;
+    }
+    updated_terms
+}
+
 pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
     spec.smooth_terms
         .iter()
@@ -12944,56 +13137,17 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 
     let pilot_threshold = kappa_options.pilot_subsample_threshold;
     if pilot_threshold > 0 && n > pilot_threshold * 2 {
-        let indices = stratified_spatial_subsample(data, spec, pilot_threshold);
-        let pilot_n = indices.len();
         log::info!(
-            "[spatial-kappa] n={n} exceeds pilot threshold {}; optimizing on \
-             {pilot_n}-observation spatially stratified subsample",
+            "[spatial-kappa] n={n} exceeds pilot threshold {}; using pilot geometry only for deterministic anisotropy initialization",
             pilot_threshold * 2,
         );
-        let mut data_pilot = Array2::<f64>::zeros((pilot_n, data.ncols()));
-        for (new_row, &orig_row) in indices.iter().enumerate() {
-            data_pilot.row_mut(new_row).assign(&data.row(orig_row));
-        }
-        let y_pilot: Array1<f64> = indices.iter().map(|&i| y[i]).collect();
-        let weights_pilot: Array1<f64> = indices.iter().map(|&i| weights[i]).collect();
-        let offset_pilot: Array1<f64> = indices.iter().map(|&i| offset[i]).collect();
-        let mut pilot_kappa = kappa_options.clone();
-        pilot_kappa.pilot_subsample_threshold = 0;
-        match fit_term_collectionwith_spatial_length_scale_optimization(
-            data_pilot.view(),
-            y_pilot,
-            weights_pilot,
-            offset_pilot,
-            spec,
-            family,
-            options,
-            &pilot_kappa,
-        ) {
-            Ok(pilot_result) => {
-                log::info!(
-                    "[spatial-kappa] pilot complete; using pilot geometry as the full-data initializer"
-                );
-                resolvedspec = pilot_result.resolvedspec;
-            }
-            Err(err) => {
-                // The full-data path that follows is no longer the OOM
-                // hazard it used to be: at biobank scale the runtime REML
-                // backend probe in `optimize_external_design...` reads the
-                // actual selected geometry (not the input `DesignMatrix`
-                // enum), so when the per-ρ density check forces dense the
-                // outer planner downgrades ARC + analytic Hessian to
-                // BFGS + analytic gradient.  Routing through full-data
-                // dense exact-Hessian REML is therefore no longer the
-                // automatic outcome of this branch.
-                log::warn!(
-                    "[spatial-kappa] pilot anisotropy optimization failed (seed-failure stats: \
-                     1 pilot fault); proceeding with direct full-data optimization from the \
-                     current geometry — outer planner will route through gradient-only BFGS \
-                     when the runtime backend selects dense at full data: {err}"
-                );
-            }
-        }
+        apply_spatial_anisotropy_pilot_initializer(
+            data,
+            &mut resolvedspec,
+            &spatial_terms,
+            pilot_threshold,
+            kappa_options,
+        );
     }
 
     let best = fit_term_collection_forspec(
@@ -16972,6 +17126,69 @@ mod tests {
                 );
             }
             _ => panic!("expected Duchon term"),
+        }
+    }
+
+    #[test]
+    fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
+        let data = Array2::from_shape_fn((32, 2), |(i, j)| {
+            if j == 0 {
+                i as f64 / 31.0
+            } else {
+                ((i % 8) as f64) * 0.03
+            }
+        });
+        let mut spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "pc_matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::UserProvided(array![
+                            [0.0, 0.0],
+                            [1.0, 0.0],
+                            [0.0, 0.05],
+                            [1.0, 0.05],
+                        ]),
+                        length_scale: 1.0,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::None,
+                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                    },
+                    input_scales: Some(vec![1.0, 1.0]),
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let spatial_terms = spatial_length_scale_term_indices(&spec);
+        let updated = apply_spatial_anisotropy_pilot_initializer(
+            data.view(),
+            &mut spec,
+            &spatial_terms,
+            8,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        );
+
+        assert_eq!(updated, 1);
+        match &spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => {
+                let eta = spec
+                    .aniso_log_scales
+                    .as_ref()
+                    .expect("pilot initializer should preserve anisotropy");
+                assert_eq!(eta.len(), 2);
+                assert!((eta[0] + eta[1]).abs() <= 1e-12);
+                assert!(
+                    eta.iter().any(|value| value.abs() > 1e-6),
+                    "pilot geometry should seed nonzero axis contrast"
+                );
+                assert!(spec.length_scale.is_finite() && spec.length_scale > 0.0);
+            }
+            _ => panic!("expected Matern term"),
         }
     }
 
