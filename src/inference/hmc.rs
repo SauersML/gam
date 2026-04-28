@@ -376,8 +376,6 @@ struct SharedData {
     y: Arc<Array1<f64>>,
     /// Observation/case weights [n_samples]
     weights: Arc<Array1<f64>>,
-    /// Combined penalty matrix S [dim, dim]
-    penalty: Arc<Array2<f64>>,
     /// MAP estimate (mode) μ [dim]
     mode: Arc<Array1<f64>>,
     /// Fitted Gamma shape (used only for Gamma-log likelihoods).
@@ -430,6 +428,17 @@ pub struct NutsPosterior {
     /// Whether to add the identifiable-subspace Jeffreys/Firth term to the
     /// target
     firth_enabled: bool,
+    /// Precomputed whitened-penalty operator `M = L^T S L` (dim×dim, symmetric
+    /// positive-semidefinite). The penalty term in z-coordinates is
+    ///   −0.5 βᵀSβ = −[c0 + (Lᵀ S μ)ᵀ z + 0.5 zᵀ M z],
+    /// so its z-gradient is just `−(L^T S μ + M z)` — no per-step `S·β` matvec
+    /// or `L^T·∇_β penalty` map is needed.
+    penalty_z_quad: Array2<f64>,
+    /// Precomputed `Lᵀ S μ` (length dim) — z-space gradient contribution from
+    /// the linear-in-z portion of the penalty.
+    penalty_z_lin: Array1<f64>,
+    /// Precomputed `0.5 μᵀ S μ` (scalar) — constant term of the penalty.
+    penalty_z_const: f64,
 }
 
 impl NutsPosterior {
@@ -510,12 +519,28 @@ impl NutsPosterior {
         let chol = solve_upper_triangular_transpose(&l_h, dim);
         let chol_t = chol.t().to_owned();
 
+        // Precompute the whitened penalty operator and constants so that the
+        // penalty contribution to logp/grad becomes a single symv against z.
+        // Math identity (β = μ + L z, L L^T = H^{-1}):
+        //   0.5 β^T S β = 0.5 μ^T S μ + (L^T S μ)^T z + 0.5 z^T (L^T S L) z
+        // and ∇_z [0.5 β^T S β] = L^T S μ + (L^T S L) z.
+        // This replaces three matvecs per leapfrog step (S·β, L·z used only
+        // for that purpose, and L^T·∇_β penalty) with one dim×dim symv.
+        let penalty_owned = penalty_matrix.to_owned();
+        let mode_owned = mode.to_owned();
+        let s_mu = penalty_owned.dot(&mode_owned);
+        let penalty_z_const = 0.5 * mode_owned.dot(&s_mu);
+        let penalty_z_lin = chol_t.dot(&s_mu);
+        // M = L^T S L = chol_t · (S · chol). Computed in two GEMMs at
+        // construction time only.
+        let s_chol = penalty_owned.dot(&chol);
+        let penalty_z_quad = chol_t.dot(&s_chol);
+
         let data = SharedData {
             x: Arc::new(x.to_owned()),
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
-            penalty: Arc::new(penalty_matrix.to_owned()),
-            mode: Arc::new(mode.to_owned()),
+            mode: Arc::new(mode_owned),
             gamma_shape,
             n_samples,
             dim,
@@ -527,6 +552,9 @@ impl NutsPosterior {
             chol_t,
             nuts_family,
             firth_enabled,
+            penalty_z_quad,
+            penalty_z_lin,
+            penalty_z_const,
         })
     }
 
@@ -562,21 +590,30 @@ impl NutsPosterior {
             }
         }
 
-        // === Step 4: Compute penalty and its gradient ===
-        // penalty = 0.5 * β^T @ S @ β
-        let s_beta = self.data.penalty.dot(&beta);
-        let penalty = 0.5 * beta.dot(&s_beta);
+        // === Step 4: Penalty in z-coordinates (precomputed; see `new`) ===
+        //   −0.5 βᵀ S β  =  −[c0 + lᵀ z + 0.5 zᵀ M z]
+        //   ∇_z (−0.5 βᵀ S β) = −(l + M z)
+        // where l = L^T S μ, M = L^T S L, c0 = 0.5 μᵀ S μ.
+        // This single dim×dim symmetric matvec replaces both the per-step
+        // S·β multiply and the L^T·∇_β penalty chain-rule multiply, and lets
+        // the penalty value, β-gradient and chain rule fuse into one pass.
+        let mz = self.penalty_z_quad.dot(z);
+        let lin_term = self.penalty_z_lin.dot(z);
+        let quad_term = 0.5 * z.dot(&mz);
+        let penalty = self.penalty_z_const + lin_term + quad_term;
 
-        // ∇_β penalty = S @ β
-        let grad_penalty_beta = s_beta;
-
-        // === Step 5: Combined gradient in β space ===
-        // ∇_β log p = ∇_β ll - ∇_β penalty
-        let grad_beta = &grad_ll_beta - &grad_penalty_beta;
-
-        // === Step 6: Chain rule to get gradient in z space ===
-        // ∇z = L^T @ ∇_β
-        let gradz = self.chol_t.dot(&grad_beta);
+        // === Step 5: z-space gradient ===
+        // ∇z log p = L^T ∇_β ℓ  −  (l + M z)
+        let mut gradz = self.chol_t.dot(&grad_ll_beta);
+        // gradz -= (penalty_z_lin + M z); fused in a single per-element loop
+        // to avoid temporary Array1 allocations.
+        let lin_view = self.penalty_z_lin.view();
+        ndarray::Zip::from(&mut gradz)
+            .and(&lin_view)
+            .and(&mz)
+            .for_each(|g, &l, &m| {
+                *g -= l + m;
+            });
 
         let logp = ll + firth_logdet - penalty;
 
@@ -1042,7 +1079,6 @@ mod tests {
             x: Arc::new(x.clone()),
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
-            penalty: Arc::new(Array2::zeros((1, 1))),
             mode: Arc::new(Array1::zeros(1)),
             gamma_shape: shape,
             n_samples: x.nrows(),
@@ -1083,7 +1119,6 @@ mod tests {
             x: Arc::new(x.clone()),
             y: Arc::new(y),
             weights: Arc::new(weights.clone()),
-            penalty: Arc::new(Array2::zeros((x.ncols(), x.ncols()))),
             mode: Arc::new(Array1::zeros(x.ncols())),
             gamma_shape: 1.0,
             n_samples: x.nrows(),
@@ -1442,7 +1477,6 @@ mod tests {
             x: Arc::new(x),
             y: Arc::new(y),
             weights: Arc::new(weights),
-            penalty: Arc::new(Array2::zeros((1, 1))),
             mode: Arc::new(Array1::zeros(1)),
             gamma_shape: 1.0,
             n_samples: 2,
@@ -1601,7 +1635,6 @@ mod tests {
             x: Arc::new(array![[1.0], [1.0]]),
             y: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 1.0]),
-            penalty: Arc::new(Array2::zeros((1, 1))),
             mode: Arc::new(Array1::zeros(1)),
             gamma_shape: 1.0,
             n_samples: 2,
