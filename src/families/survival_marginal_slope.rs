@@ -3,7 +3,7 @@ use crate::custom_family::{
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactOuterDerivativeOrder, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, build_block_spatial_psi_derivatives, cost_gated_outer_order,
+    PenaltyMatrix, build_block_spatial_psi_derivatives,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
 };

@@ -127,8 +127,18 @@ impl<'a> RemlState<'a> {
         p_total: usize,
         has_linear_constraints: bool,
     ) -> bool {
-        use super::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
-        if p_total < MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD {
+        use super::unified::{
+            MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD, MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD,
+        };
+        // Match the runtime gate in `reml_laml_evaluate`: matrix-free fires
+        // when EITHER p is large (dense p×p assembly cost) OR n·p is large
+        // (per-eval O(k·n·p²) dense assembly cost).  Predicting only on `p`
+        // missed the biobank case (p=101 but n=320 K → matrix-free wins).
+        let n_obs = self.y.len();
+        let n_times_p = n_obs.saturating_mul(p_total);
+        if p_total < MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD
+            && n_times_p < MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD
+        {
             return false;
         }
         if has_linear_constraints {
