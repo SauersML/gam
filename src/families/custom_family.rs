@@ -490,6 +490,26 @@ pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
     default_coefficient_hessian_cost(specs) / 2
 }
 
+/// Bound first-order outer iterations when each analytic-gradient evaluation is
+/// already biobank-scale work. This is only applied after the planner has
+/// selected a gradient-only route; second-order/ARC plans keep their requested
+/// iteration budget.
+pub fn cost_gated_first_order_max_iter(
+    requested: usize,
+    coefficient_gradient_cost: u64,
+    has_outer_hessian: bool,
+) -> usize {
+    const FIRST_ORDER_OUTER_WORK_BUDGET: u64 = 80_000_000_000;
+    const MIN_FIRST_ORDER_ITERS: usize = 4;
+
+    if has_outer_hessian || requested <= 1 || coefficient_gradient_cost == 0 {
+        return requested;
+    }
+
+    let affordable = (FIRST_ORDER_OUTER_WORK_BUDGET / coefficient_gradient_cost) as usize;
+    requested.min(affordable.max(MIN_FIRST_ORDER_ITERS))
+}
+
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
@@ -12040,6 +12060,18 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         custom_family_outer_derivatives(family, specs, &outer_options);
     let hessian = cap_hessian;
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
+    let outer_max_iter = cost_gated_first_order_max_iter(
+        options.outer_max_iter,
+        family.coefficient_gradient_cost(specs),
+        need_outer_hessian,
+    );
+    if outer_max_iter < options.outer_max_iter {
+        log::info!(
+            "[OUTER] custom family: first-order work gate reduced outer_max_iter {} -> {}",
+            options.outer_max_iter,
+            outer_max_iter,
+        );
+    }
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
     // families whose joint likelihood Hessian depends on β — e.g. GAMLSS /
@@ -12080,7 +12112,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .with_disable_fixed_point(multi_block_beta_dependent)
         .with_fallback_policy(FallbackPolicy::Automatic)
         .with_tolerance(options.outer_tol)
-        .with_max_iter(options.outer_max_iter)
+        .with_max_iter(outer_max_iter)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone());
@@ -12477,6 +12509,22 @@ mod tests {
         let g_cost = default_coefficient_gradient_cost(&specs);
         assert_eq!(h_cost, 500 * 100 + 500 * 196);
         assert_eq!(g_cost, h_cost / 2);
+    }
+
+    #[test]
+    fn first_order_outer_iter_gate_caps_expensive_gradient_paths() {
+        assert_eq!(
+            cost_gated_first_order_max_iter(60, 10_000_000_000, false),
+            8
+        );
+        assert_eq!(
+            cost_gated_first_order_max_iter(60, 100_000_000_000, false),
+            4
+        );
+        assert_eq!(
+            cost_gated_first_order_max_iter(60, 100_000_000_000, true),
+            60
+        );
     }
 
     #[test]
