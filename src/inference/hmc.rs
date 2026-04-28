@@ -325,7 +325,11 @@ fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> 
         // Forward-substitute L * y = e_col. y[i] = 0 for i < col.
         // Diagonal term:
         let d_col = l_rows[col * dim + col];
-        let inv_d_col = if d_col.abs() > 1e-15 { 1.0 / d_col } else { 0.0 };
+        let inv_d_col = if d_col.abs() > 1e-15 {
+            1.0 / d_col
+        } else {
+            0.0
+        };
         y[col] = inv_d_col;
 
         // Below-diagonal entries: y[i] = -(sum_{j=col..i} L[i,j] * y[j]) / L[i,i].
