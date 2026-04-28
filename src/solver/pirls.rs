@@ -3974,9 +3974,8 @@ where
                         let lambda_floor = final_state_ref.ridge_used.max(1.0e-12);
                         let nd_correction = 1.0 + loop_lambda / lambda_floor;
                         let newton_decrement_sq_upper = (-lin).max(0.0) * nd_correction;
-                        let nd_threshold = options.convergence_tolerance
-                            * options.convergence_tolerance
-                            * f_scale;
+                        let nd_threshold =
+                            options.convergence_tolerance * options.convergence_tolerance * f_scale;
                         let nd_pass = newton_decrement_sq_upper <= nd_threshold;
 
                         // Strict KKT: scale-invariant under EITHER the
@@ -9203,8 +9202,8 @@ mod root_cause_tests {
         // True Newton decrement²: gᵀ H⁻¹ g = 1/2 + 1/0.5 = 0.5 + 2.0 = 2.5
         let true_decrement_sq = g[0].powi(2) / 2.0 + g[1].powi(2) / 0.5;
         // Damped: gᵀ (H+λI)⁻¹ g = 1/(2+0.25) + 1/(0.5+0.25) = 1/2.25 + 1/0.75
-        let damped_decrement_sq = g[0].powi(2) / (2.0 + lambda_lm)
-            + g[1].powi(2) / (0.5 + lambda_lm);
+        let damped_decrement_sq =
+            g[0].powi(2) / (2.0 + lambda_lm) + g[1].powi(2) / (0.5 + lambda_lm);
         // Correction factor: 1 + λ_lm / λ_min = 1 + 0.25/0.5 = 1.5
         let correction = 1.0 + lambda_lm / lambda_min;
         let upper_bound = damped_decrement_sq * correction;

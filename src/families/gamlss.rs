@@ -6553,10 +6553,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on
@@ -9003,10 +9000,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl above: matrix-free fires when
         // `exact_joint_dense_block_designs` is satisfiable, which requires
         // both location and scale block designs to be present.  The wiggle
@@ -13047,10 +13041,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Mirror the workspace gating: matrix-free path fires whenever
         // `exact_joint_dense_block_designs` returns the threshold + log-σ
         // designs, which is the same condition `exact_joint_supported`
@@ -13165,8 +13156,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             let mut out = ndarray::Array1::<f64>::zeros(total);
             for b in 0..specs.len() {
                 let (start, end) = ranges[b];
-                out.slice_mut(s![start..end])
-                    .assign(&block_states[b].beta);
+                out.slice_mut(s![start..end]).assign(&block_states[b].beta);
             }
             out
         };
@@ -13253,15 +13243,14 @@ impl CustomFamily for BinomialLocationScaleFamily {
             let nullity = if !specs[b].nullspace_dims.is_empty()
                 && specs[b].nullspace_dims.len() == specs[b].penalties.len()
             {
-                let pen_dense: Vec<ndarray::Array2<f64>> = specs[b]
-                    .penalties
-                    .iter()
-                    .map(|p| p.to_dense())
-                    .collect();
-                Some(crate::solver::estimate::reml::unified::exact_intersection_nullity(
-                    &pen_dense,
-                    &specs[b].nullspace_dims,
-                ))
+                let pen_dense: Vec<ndarray::Array2<f64>> =
+                    specs[b].penalties.iter().map(|p| p.to_dense()).collect();
+                Some(
+                    crate::solver::estimate::reml::unified::exact_intersection_nullity(
+                        &pen_dense,
+                        &specs[b].nullspace_dims,
+                    ),
+                )
             } else {
                 None
             };
@@ -13364,9 +13353,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
                     let c_tl =
                         s_factor * r_val * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
                     let c_ll = s_factor * s_factor * (m1 + 3.0 * q * m2 + q * q * m3) * du;
-                    drift_trace += c_tt * leverage_00[i]
-                        + 2.0 * c_tl * leverage_01[i]
-                        + c_ll * leverage_11[i];
+                    drift_trace +=
+                        c_tt * leverage_00[i] + 2.0 * c_tl * leverage_01[i] + c_ll * leverage_11[i];
                 }
 
                 trace_h_inv_hdot[flat_idx] = tr_pen + drift_trace;
@@ -17074,10 +17062,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside

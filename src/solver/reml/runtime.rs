@@ -2799,10 +2799,7 @@ impl<'a> RemlState<'a> {
     /// the optimization objective itself is never changed by this method's
     /// presence.
     pub fn compute_screening_proxy(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        let in_screening = self
-            .screening_max_inner_iterations
-            .load(Ordering::Relaxed)
-            > 0;
+        let in_screening = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
         if !in_screening {
             return self.compute_cost(p);
         }
