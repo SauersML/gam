@@ -21,8 +21,8 @@ use gam::families::family_meta::{
 };
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
-    ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
-    infer_non_intercept_start,
+    ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_operator,
+    build_scale_deviation_transform, infer_non_intercept_start,
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
@@ -2130,19 +2130,19 @@ fn build_predict_input_for_model(
                 model.noise_non_intercept_start,
             )?;
             let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
-                let pred_d_dense = design.design.as_dense_cow();
-                let pred_dn_dense = design_noise_raw.design.as_dense_cow();
-                apply_scale_deviation_transform(&pred_d_dense, &pred_dn_dense, transform)?
+                build_scale_deviation_operator(
+                    design.design.clone(),
+                    design_noise_raw.design.clone(),
+                    transform,
+                )?
             } else {
-                design_noise_raw.design.to_dense()
+                design_noise_raw.design.clone()
             };
 
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset: offset.clone(),
-                design_noise: Some(DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
-                    prepared_noise_design,
-                ))),
+                design_noise: Some(prepared_noise_design),
                 offset_noise: Some(offset_noise.clone()),
                 auxiliary_scalar: None,
             })
@@ -3439,20 +3439,17 @@ fn run_predict_survival(
         } else {
             x_time_exit_dense
         };
-        let dense_threshold_design = threshold_design.design.to_dense();
-        let mut survival_primary_design =
-            Array2::<f64>::zeros((n, x_time_exit.ncols() + dense_threshold_design.ncols()));
-        survival_primary_design
-            .slice_mut(s![.., 0..x_time_exit.ncols()])
-            .assign(&x_time_exit);
-        survival_primary_design
-            .slice_mut(s![.., x_time_exit.ncols()..])
-            .assign(&dense_threshold_design);
-        let dense_raw_sigma = raw_sigma_design.design.to_dense();
+        let time_design = DesignMatrix::from(x_time_exit.clone());
+        let survival_primary_design =
+            DesignMatrix::hstack(vec![time_design, threshold_design.design.clone()])?;
         let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-            apply_scale_deviation_transform(&survival_primary_design, &dense_raw_sigma, transform)?
+            build_scale_deviation_operator(
+                survival_primary_design,
+                raw_sigma_design.design.clone(),
+                transform,
+            )?
         } else {
-            dense_raw_sigma
+            raw_sigma_design.design.clone()
         };
         let link_wiggle_knots = model
             .linkwiggle_knots
@@ -3471,9 +3468,7 @@ fn run_predict_survival(
                 .map_or(0, |w| w.beta.len()),
             x_threshold: threshold_design.design.clone(),
             eta_threshold_offset: primary_offset.clone(),
-            x_log_sigma: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
-                prepared_sigma_design,
-            )),
+            x_log_sigma: prepared_sigma_design,
             eta_log_sigma_offset: noise_offset.clone(),
             x_link_wiggle: None,
             link_wiggle_knots: link_wiggle_knots.clone(),

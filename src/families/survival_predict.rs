@@ -741,14 +741,14 @@ fn predict_survival_location_scale_batch(
     data: ArrayView2<'_, f64>,
     time_grid: Option<&[f64]>,
 ) -> Result<SurvivalPredictResult, String> {
-    use crate::families::scale_design::apply_scale_deviation_transform;
+    use crate::families::scale_design::build_scale_deviation_operator;
     use crate::families::survival_construction::{
         build_survival_marginal_slope_baseline_offsets, evaluate_survival_time_basis_row,
     };
     use crate::families::survival_location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
     };
-    use crate::matrix::{DenseDesignMatrix, DesignMatrix};
+    use crate::matrix::DesignMatrix;
 
     if time_grid.is_some() {
         return Err(
@@ -844,20 +844,17 @@ fn predict_survival_location_scale_batch(
     } else {
         x_time_exit_dense
     };
-    let dense_threshold = threshold_design.design.to_dense();
-    let mut survival_primary_design =
-        Array2::<f64>::zeros((n, x_time_exit.ncols() + dense_threshold.ncols()));
-    survival_primary_design
-        .slice_mut(s![.., 0..x_time_exit.ncols()])
-        .assign(&x_time_exit);
-    survival_primary_design
-        .slice_mut(s![.., x_time_exit.ncols()..])
-        .assign(&dense_threshold);
-    let dense_raw_sigma = raw_sigma_design.design.to_dense();
+    let time_design = DesignMatrix::from(x_time_exit.clone());
+    let survival_primary_design =
+        DesignMatrix::hstack(vec![time_design, threshold_design.design.clone()])?;
     let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-        apply_scale_deviation_transform(&survival_primary_design, &dense_raw_sigma, transform)?
+        build_scale_deviation_operator(
+            survival_primary_design,
+            raw_sigma_design.design.clone(),
+            transform,
+        )?
     } else {
-        dense_raw_sigma
+        raw_sigma_design.design.clone()
     };
     let link_wiggle_knots = model
         .linkwiggle_knots
@@ -876,7 +873,7 @@ fn predict_survival_location_scale_batch(
             .map_or(0, |w| w.beta.len()),
         x_threshold: threshold_design.design.clone(),
         eta_threshold_offset: primary_offset.clone(),
-        x_log_sigma: DesignMatrix::Dense(DenseDesignMatrix::from(prepared_sigma_design)),
+        x_log_sigma: prepared_sigma_design,
         eta_log_sigma_offset: noise_offset.clone(),
         x_link_wiggle: None,
         link_wiggle_knots,
