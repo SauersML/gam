@@ -1681,7 +1681,7 @@ impl CustomFamily for TransformationNormalFamily {
                 .unwrap()
                 .par_iter()
                 .enumerate()
-                .find_any(|(_, &hp)| !hp.is_finite() || hp <= 0.0)
+                .find_any(|&(_, hp)| !hp.is_finite() || *hp <= 0.0)
                 .map(|(i, &hp)| (i, hp))
         };
         if let Some((i, hp)) = bad {
