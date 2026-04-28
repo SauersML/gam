@@ -109,6 +109,43 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
     }
 }
 
+/// Hv-apply counter wrapping an `OuterHessianOperator`.
+///
+/// Used by `run_operator_trust_region` so the per-iteration log line can
+/// report exactly how many matrix-free Hv applications were spent inside
+/// the Steihaug-Toint CG inner solve. A high count at biobank scale is the
+/// quantitative signal that the matrix-free Hv kernel — not ARC's outer
+/// loop — is the bottleneck.
+struct HvApplyCounter<'a> {
+    inner: &'a dyn OuterHessianOperator,
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl<'a> HvApplyCounter<'a> {
+    fn new(inner: &'a dyn OuterHessianOperator) -> Self {
+        Self {
+            inner,
+            count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl<'a> OuterHessianOperator for HvApplyCounter<'a> {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.matvec(v)
+    }
+}
+
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Derivative {
