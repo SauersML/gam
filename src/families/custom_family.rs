@@ -15920,7 +15920,10 @@ mod tests {
             stats.escalations,
         );
         for &v in x.iter() {
-            assert!(v.is_finite(), "eigen-floor solve returned non-finite component {v}");
+            assert!(
+                v.is_finite(),
+                "eigen-floor solve returned non-finite component {v}"
+            );
         }
 
         // Reconstruct the analytic floored solve and compare component-wise.

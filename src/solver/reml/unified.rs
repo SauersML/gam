@@ -6135,8 +6135,7 @@ fn build_outer_hessian_operator(
                         left.dense_rotated.as_ref(),
                         right.dense_rotated.as_ref(),
                     ) {
-                        value +=
-                            dense_hop.trace_logdet_hessian_cross_rotated(left_rot, right_rot);
+                        value += dense_hop.trace_logdet_hessian_cross_rotated(left_rot, right_rot);
                     } else {
                         value += hop.trace_logdet_hessian_cross(left_dense, right_dense);
                     }
@@ -9604,9 +9603,7 @@ impl StochasticTraceEstimator {
                             // Non-Gaussian fixed-β third-derivative correction:
                             //   uᵀ Xᵀ diag(c ⊙ X_{ψ_e} β̂) X r_d
                             //   = Σ_i y_vec[i] · c_x_psi_beta_i · x_rd[i]
-                            if let Some(c_x_psi_beta) =
-                                implicit_ops[oi].c_x_psi_beta.as_ref()
-                            {
+                            if let Some(c_x_psi_beta) = implicit_ops[oi].c_x_psi_beta.as_ref() {
                                 let c = c_x_psi_beta.as_ref();
                                 for i in 0..w_dx_u.len() {
                                     design_val += y_vec[i] * c[i] * x_rd[i];
@@ -11664,12 +11661,7 @@ mod tests {
         ));
 
         // Active-basis design X (n × p): chosen so Xᵀ X is well-conditioned.
-        let x_data = array![
-            [1.0, 0.30],
-            [0.50, 1.20],
-            [-0.20, 0.80],
-            [0.90, -0.40],
-        ];
+        let x_data = array![[1.0, 0.30], [0.50, 1.20], [-0.20, 0.80], [0.90, -0.40],];
         let x_design = Arc::new(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             x_data.clone(),
         )));
@@ -11786,8 +11778,10 @@ mod tests {
         let n_axes = 1usize;
         let p = n_knots;
 
-        let phi_values = Array1::from_vec((0..n * n_knots).map(|k| 0.1 + 0.05 * (k as f64)).collect());
-        let q_values = Array1::from_vec((0..n * n_knots).map(|k| -0.2 + 0.07 * (k as f64)).collect());
+        let phi_values =
+            Array1::from_vec((0..n * n_knots).map(|k| 0.1 + 0.05 * (k as f64)).collect());
+        let q_values =
+            Array1::from_vec((0..n * n_knots).map(|k| -0.2 + 0.07 * (k as f64)).collect());
         let t_values = Array1::zeros(n * n_knots);
         let axis_components = Array2::from_shape_vec(
             (n * n_knots, n_axes),

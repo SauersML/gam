@@ -67,7 +67,7 @@ pub trait OuterHessianOperator: Send + Sync {
     /// factorizations, parallel matvecs over independent columns, BLAS-3
     /// kernels). All [`materialize_dense`](Self::materialize_dense) callers
     /// route through this method, so an override automatically accelerates
-    /// the small-K materialization path used by the planner.
+    /// any work-model-approved materialization path used by the planner.
     fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
         let dim = self.dim();
         if factor.nrows() != dim {
@@ -1569,11 +1569,10 @@ struct OuterSecondOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
     hessian_source: HessianSource,
-    /// When the evaluator returns `HessianResult::Operator(op)` and
-    /// `op.dim() <= materialize_operator_max_dim`, the bridge basis-probes the
+    /// When the evaluator returns `HessianResult::Operator(op)` and the
+    /// operator declares dense probing cheap, the bridge may basis-probe the
     /// operator into a dense K×K matrix so the dense ARC path can run an exact
-    /// factorization instead of operator-CG. See
-    /// [`OUTER_HVP_MATERIALIZE_MAX_DIM`] for the rationale.
+    /// factorization instead of operator-CG.
     materialize_operator_max_dim: usize,
 }
 
@@ -1622,13 +1621,14 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                     // Work-model-approved operator: basis-probe the Hv
                     // operator into a dense K×K matrix so the dense ARC path
                     // can run an exact factorization.
-                    Some(op.materialize_dense().map_err(|message| {
-                        ObjectiveEvalError::Fatal {
-                            message: format!(
-                                "outer Hessian operator materialization failed: {message}"
-                            ),
-                        }
-                    })?)
+                    Some(
+                        op.materialize_dense()
+                            .map_err(|message| ObjectiveEvalError::Fatal {
+                                message: format!(
+                                    "outer Hessian operator materialization failed: {message}"
+                                ),
+                            })?,
+                    )
                 }
                 HessianResult::Operator(_) | HessianResult::Unavailable => None,
             },
@@ -2630,7 +2630,11 @@ fn run_operator_trust_region(
                 elapsed,
             );
             if elapsed > arc_max_seconds_per_iter {
-                return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+                return Err(time_budget_exceeded(
+                    elapsed,
+                    arc_max_seconds_per_iter,
+                    iter,
+                ));
             }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
@@ -2652,7 +2656,11 @@ fn run_operator_trust_region(
                 elapsed,
             );
             if elapsed > arc_max_seconds_per_iter {
-                return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+                return Err(time_budget_exceeded(
+                    elapsed,
+                    arc_max_seconds_per_iter,
+                    iter,
+                ));
             }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
@@ -2680,7 +2688,11 @@ fn run_operator_trust_region(
                 elapsed,
             );
             if elapsed > arc_max_seconds_per_iter {
-                return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+                return Err(time_budget_exceeded(
+                    elapsed,
+                    arc_max_seconds_per_iter,
+                    iter,
+                ));
             }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
@@ -2708,7 +2720,11 @@ fn run_operator_trust_region(
         };
         let hv_applies = counter.count();
         let elapsed = iter_start.elapsed().as_secs_f64();
-        let next_cost = if accepted { eval_trial.cost } else { eval_k.cost };
+        let next_cost = if accepted {
+            eval_trial.cost
+        } else {
+            eval_k.cost
+        };
         log::info!(
             "[ARC-timing] iter={iter} status={} cost={:.6e}->{:.6e} grad_norm={:.3e} \
              rho={:.3} pred_dec={:.3e} act_dec={:.3e} trust_radius={:.3e}->{:.3e} \
@@ -2727,7 +2743,11 @@ fn run_operator_trust_region(
         );
 
         if elapsed > arc_max_seconds_per_iter {
-            return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+            return Err(time_budget_exceeded(
+                elapsed,
+                arc_max_seconds_per_iter,
+                iter,
+            ));
         }
 
         trust_radius = new_trust_radius;
@@ -3023,11 +3043,7 @@ fn run_outer_with_plan(
                                 log::warn!(
                                     "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                                 );
-                                rejection_reasons.push((
-                                    seed_idx,
-                                    "validation",
-                                    err.to_string(),
-                                ));
+                                rejection_reasons.push((seed_idx, "validation", err.to_string()));
                                 continue 'seed_attempts;
                             }
                         }

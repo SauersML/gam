@@ -623,10 +623,7 @@ impl FirthDenseOperator {
 
     #[inline]
     fn left_scaled_xt(&self, scale: &Array1<f64>, mat: &Array2<f64>) -> Array2<f64> {
-        fast_ab(
-            &self.x_dense_t,
-            &(mat * &scale.view().insert_axis(Axis(1))),
-        )
+        fast_ab(&self.x_dense_t, &(mat * &scale.view().insert_axis(Axis(1))))
     }
 
     #[inline]
@@ -898,8 +895,7 @@ impl FirthDenseOperator {
         let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
         let x_tauk = fast_ab(x_tau_reduced, &self.k_reduced);
         let dot_h_explicit = 2.0 * Self::rowwise_dot(&x_tauk, &self.x_reduced);
-        let dot_h_implicit =
-            Self::rowwise_dot(&fast_ab(&self.x_reduced, &dot_k), &self.x_reduced);
+        let dot_h_implicit = Self::rowwise_dot(&fast_ab(&self.x_reduced, &dot_k), &self.x_reduced);
         let dot_h = dot_h_explicit + dot_h_implicit;
         (dot_i, dot_h)
     }
