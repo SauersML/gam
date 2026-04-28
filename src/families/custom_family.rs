@@ -394,31 +394,54 @@ impl ExactOuterDerivativeOrder {
     }
 }
 
-/// Capability gate for second-order exact outer derivatives.
+/// Cost gate for second-order exact outer derivatives.
 ///
-/// Capability — not cost — drives the answer. A family that has the math for
-/// an analytic outer Hessian always returns [`ExactOuterDerivativeOrder::Second`].
-/// Expensive dense Hessian assemblies are handled by representation selection
-/// (matrix-free Hv operators via [`use_joint_matrix_free_path`] +
-/// [`CustomFamily::supports_matrix_free_joint_hessian`]); they do not disable
-/// the second-order capability.
+/// Analytic Hessian capability is not enough to select a second-order outer
+/// solve. Operator-backed families can make Hessian-vector products available
+/// without making `outer_dim` repeated applications affordable, so the gate
+/// combines the number of outer columns with the reported coefficient-space
+/// work. Large problems keep exact gradients and route to first-order/hybrid
+/// outer optimization instead of forcing ARC to evaluate an unaffordable
+/// Hessian.
 pub fn cost_gated_outer_order(
-    _specs: &[ParameterBlockSpec],
-    _coefficient_cost: u64,
+    specs: &[ParameterBlockSpec],
+    coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    ExactOuterDerivativeOrder::Second
+    const OUTER_HESSIAN_MAX_ELEMENTS: u64 = 16_000_000;
+    const OUTER_HESSIAN_MAX_WORK_UNITS: u64 = 1_000_000_000;
+
+    let outer_dim = specs
+        .iter()
+        .map(|spec| spec.penalties.len() as u64)
+        .fold(0u64, |acc, k| acc.saturating_add(k));
+    if outer_dim == 0 {
+        return ExactOuterDerivativeOrder::Second;
+    }
+
+    let outer_columns = outer_dim.max(1);
+    let outer_elements = outer_dim.saturating_mul(outer_dim);
+    let materialization_work = outer_columns.saturating_mul(coefficient_cost);
+
+    if outer_elements > OUTER_HESSIAN_MAX_ELEMENTS
+        || materialization_work > OUTER_HESSIAN_MAX_WORK_UNITS
+    {
+        ExactOuterDerivativeOrder::First
+    } else {
+        ExactOuterDerivativeOrder::Second
+    }
 }
 
 /// Capability-aware variant of [`cost_gated_outer_order`].
 ///
-/// Always returns [`ExactOuterDerivativeOrder::Second`]: cost selects the
-/// representation (dense Hessian vs Hv operator), never the capability.
+/// Matrix-free availability is only a representation capability. It does not
+/// make repeated Hessian-vector products cheap, so this delegates to the same
+/// cost gate as dense Hessian paths.
 pub fn cost_gated_outer_order_with_matrix_free(
-    _specs: &[ParameterBlockSpec],
-    _coefficient_cost: u64,
+    specs: &[ParameterBlockSpec],
+    coefficient_cost: u64,
     _matrix_free_available: bool,
 ) -> ExactOuterDerivativeOrder {
-    ExactOuterDerivativeOrder::Second
+    cost_gated_outer_order(specs, coefficient_cost)
 }
 
 /// Default coefficient-space Hessian cost: `Σ_b n_b · p_b²`, summed across
@@ -651,9 +674,12 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
+        let coefficient_work = self
+            .coefficient_hessian_cost(specs)
+            .max(self.coefficient_gradient_cost(specs));
         cost_gated_outer_order_with_matrix_free(
             specs,
-            self.coefficient_hessian_cost(specs),
+            coefficient_work,
             self.supports_matrix_free_joint_hessian(specs),
         )
     }
@@ -942,14 +968,9 @@ pub trait CustomFamily {
     /// the outer build site can promote `cap_hessian` to `Analytic` before
     /// the first evaluation.
     ///
-    /// Used at `fit_custom_family`'s outer setup: when this returns `true`
-    /// AND `use_joint_matrix_free_path(total_p_joint, n_obs_joint)` fires,
-    /// `cap_hessian` is forced to `Derivative::Analytic` so the planner
-    /// keeps ARC + analytic-Hessian routing instead of degrading to BFGS
-    /// when the family declared `Unavailable` for the dense Hessian. The
-    /// runtime evaluator then returns `HessianResult::Operator` and ARC
-    /// dispatches via `run_operator_trust_region` (or the K×K basis-probe
-    /// materialization at small K, per `OUTER_HVP_MATERIALIZE_MAX_DIM`).
+    /// This is a representation capability only. It must not promote an
+    /// expensive problem back to second-order outer optimization after
+    /// [`cost_gated_outer_order`] has downgraded the realized scale.
     fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         false
     }
@@ -1424,16 +1445,10 @@ impl Default for BlockwiseFitOptions {
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: true,
-            // Default ON: families that ship a matrix-free joint Hessian
-            // workspace (CTN, GAMLSS location-scale, marginal-slope) absorb
-            // the per-eval cost via Hv operators, so the OUTER planner should
-            // get an Analytic Hessian capability and route to ARC / operator
-            // trust-region instead of falling back to BFGS+BfgsApprox.  The
-            // dense-vs-operator strategy is decided at evaluation time by
-            // `use_joint_matrix_free_path`; the legacy default-false setting
-            // collapsed the capability before that decision could fire and
-            // sent biobank-scale CTN through gradient-only BFGS where each
-            // line-search probe was a full-data PIRLS evaluation.
+            // Default ON: families may expose exact outer Hessians when the
+            // realized cost gate says second-order work is affordable. Matrix-
+            // free support is only a storage/apply representation; it does not
+            // override cost-driven first-order routing.
             use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
@@ -6705,24 +6720,10 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     } else {
         Derivative::Unavailable
     };
-    // The analytic outer Hessian is routed to ARC (adaptive cubic
-    // regularization), which handles indefinite Hessians natively via
-    // cubic regularization + trust region. We intentionally do NOT gate on
-    // `exact_newton_outer_geometry_supports_second_order_solver` here: the
-    // only consumer of the resulting Hessian is ARC, and ARC does not require
-    // the Hessian to be SPD. Previously this gate forced RidgedQuadraticReml
-    // families (binomial+ps custom family) onto BFGS+BfgsApprox, which stalls
-    // at iter 0 with Strong Wolfe failures because the rank-2 BFGS update is
-    // directionally wrong for the ridged surrogate surface. The fix is to
-    // expose the analytic Hessian and let ARC drive the outer iteration.
-    //
-    // Availability is a property of the family's second-derivative form, not
-    // of the inner problem size. The K×K affordability gate (16M element cap)
-    // still lives inside `order.has_hessian()` via
-    // `cost_gated_outer_order_with_matrix_free`. The combined `K² · n·p²`
-    // cost gate is now suppressed when the family supplies a matrix-free Hv
-    // workspace: the evaluator picks dense vs operator at evaluation time, so
-    // expensive dense assembly no longer disables the operator path.
+    // The analytic outer Hessian is routed to ARC only after
+    // `exact_outer_derivative_order` confirms the realized problem can afford
+    // second-order work. Matrix-free Hessian support is a representation
+    // capability, not a reason to override the cost gate.
     let hessian = if options.use_outer_hessian
         && include_exact_newton_logdet_h(family, options)
         && order.has_hessian()
@@ -12027,22 +12028,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
 
     let n_rho = rho0.len();
-    let (cap_gradient, mut cap_hessian) =
+    let (cap_gradient, cap_hessian) =
         custom_family_outer_derivatives(family, specs, &outer_options);
-    // Cost selects representation (dense vs Hv operator), not capability.
-    // When the family supplies a matrix-free joint Hessian and the runtime
-    // dimension predicate fires, the Hessian capability is unconditionally
-    // Analytic — the operator path absorbs the per-evaluation cost via
-    // O(n·p) HVPs.
-    {
-        let total_p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
-        let n_obs_joint = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
-        if family.supports_matrix_free_joint_hessian(specs)
-            && use_joint_matrix_free_path(total_p_joint, n_obs_joint)
-        {
-            cap_hessian = Derivative::Analytic;
-        }
-    }
     let hessian = cap_hessian;
     let need_outer_hessian = matches!(hessian, Derivative::Analytic);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a

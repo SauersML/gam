@@ -7856,11 +7856,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // flex path produces a
         // `BernoulliMarginalSlopeExactNewtonJointHessianWorkspace`. Both
         // route the joint Hessian through Hv operators rather than dense
-        // assembly, so when the unified evaluator's `use_joint_matrix_free_path`
-        // predicate fires the eval will return `JointHessianSource::Operator`
-        // and ARC's `run_operator_trust_region` absorbs the per-iteration
-        // cost. The cost-driven `prefer_gradient_only` downgrade in
-        // `OuterProblem` is therefore suppressed for this family.
+        // assembly. This advertises representation support only; the realized
+        // custom-family cost gate still decides whether exact second-order
+        // outer work is affordable.
         true
     }
 
