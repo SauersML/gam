@@ -4331,6 +4331,149 @@ fn binomial_location_scale_core(
     })
 }
 
+/// Pure row-coefficient builder for the binomial location-scale joint
+/// directional derivative `D_β H_L[u]`. Returns `(c_tt, c_tl, c_ll)` such
+/// that the resulting matrix is
+///
+///   X_t^T diag(c_tt) X_t + X_t^T diag(c_tl) X_ls (+ symmetric)
+///   + X_ls^T diag(c_ll) X_ls.
+///
+/// Inputs `d_eta_t = X_t · u_t`, `d_eta_ls = X_ls · u_ls` are the linear
+/// predictor perturbations along the joint direction `u = (u_t, u_ls)`.
+fn binomial_location_scale_first_directional_coefficients(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    core: &BinomialLocationScaleCore,
+    d_eta_t: &Array1<f64>,
+    d_eta_ls: &Array1<f64>,
+    link_kind: &InverseLink,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let n = y.len();
+    let mut c_tt_v = vec![0.0_f64; n];
+    let mut c_tl_v = vec![0.0_f64; n];
+    let mut c_ll_v = vec![0.0_f64; n];
+    let y_slice = y.as_slice().expect("y must be contiguous");
+    let w_slice = weights.as_slice().expect("weights must be contiguous");
+    let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
+    let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
+    let dsigma_slice = core
+        .dsigma_deta
+        .as_slice()
+        .expect("dsigma_deta must be contiguous");
+    let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
+    let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+    let d2mu_slice = core
+        .d2mu_dq2
+        .as_slice()
+        .expect("d2mu_dq2 must be contiguous");
+    let d3mu_slice = core
+        .d3mu_dq3
+        .as_slice()
+        .expect("d3mu_dq3 must be contiguous");
+    let det_slice = d_eta_t.as_slice().expect("d_eta_t must be contiguous");
+    let del_slice = d_eta_ls.as_slice().expect("d_eta_ls must be contiguous");
+    c_tt_v
+        .par_iter_mut()
+        .zip(c_tl_v.par_iter_mut())
+        .zip(c_ll_v.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, ((c_tt, c_tl), c_ll))| {
+            let q = q0_slice[i];
+            let r = 1.0 / sigma_slice[i];
+            let s = dsigma_slice[i] / sigma_slice[i];
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                y_slice[i],
+                w_slice[i],
+                q,
+                mu_slice[i],
+                dmu_slice[i],
+                d2mu_slice[i],
+                d3mu_slice[i],
+                link_kind,
+            );
+            let a = det_slice[i];
+            let b = del_slice[i];
+            let sb = s * b;
+            let du = -r * a - q * sb;
+            *c_tt = r * r * (m3 * du - 2.0 * m2 * sb);
+            *c_tl = s * r * (q * m3 * du + m2 * (2.0 * du - q * sb) - m1 * sb);
+            *c_ll = s * s * (m1 + 3.0 * q * m2 + q * q * m3) * du;
+        });
+    (
+        Array1::from_vec(c_tt_v),
+        Array1::from_vec(c_tl_v),
+        Array1::from_vec(c_ll_v),
+    )
+}
+
+/// Pure row-coefficient builder for the binomial location-scale joint
+/// second directional derivative `D²_β H_L[u, v]`. Returns
+/// `(c_tt, c_tl, c_ll)` analogous to the first-order helper but built from
+/// the four predictor perturbations `(d_eta_t_u, d_eta_ls_u, d_eta_t_v,
+/// d_eta_ls_v)`.
+fn binomial_location_scalesecond_directional_coefficients(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    core: &BinomialLocationScaleCore,
+    d_eta_t_u: &Array1<f64>,
+    d_eta_ls_u: &Array1<f64>,
+    d_eta_t_v: &Array1<f64>,
+    d_eta_ls_v: &Array1<f64>,
+    link_kind: &InverseLink,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    let n = y.len();
+    let mut coeff_tt = Array1::<f64>::zeros(n);
+    let mut coeff_tl = Array1::<f64>::zeros(n);
+    let mut coeff_ll = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let q = core.q0[i];
+        let r = 1.0 / core.sigma[i];
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+            y[i],
+            weights[i],
+            q,
+            core.mu[i],
+            core.dmu_dq[i],
+            core.d2mu_dq2[i],
+            core.d3mu_dq3[i],
+            link_kind,
+        );
+        let m4 = binomial_neglog_q_fourth_derivative_dispatch(
+            y[i],
+            weights[i],
+            q,
+            core.mu[i],
+            core.dmu_dq[i],
+            core.d2mu_dq2[i],
+            core.d3mu_dq3[i],
+            link_kind,
+        )?;
+        let s = core.dsigma_deta[i] / core.sigma[i];
+        let a = d_eta_t_u[i];
+        let b = s * d_eta_ls_u[i];
+        let c = d_eta_t_v[i];
+        let d = s * d_eta_ls_v[i];
+        let du = -r * a - q * b;
+        let dv = -r * c - q * d;
+        let d2 = r * (a * d + b * c) + q * b * d;
+        coeff_tt[i] =
+            r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
+        coeff_tl[i] = s
+            * r
+            * (q * m4 * du * dv
+                + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
+                + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
+                + m1 * b * d);
+        coeff_ll[i] = s
+            * s
+            * (q * q * m4 * du * dv
+                + m3 * (q * q * d2 + 5.0 * q * du * dv)
+                + m2 * (3.0 * q * d2 + 4.0 * du * dv)
+                + m1 * d2);
+    }
+    Ok((coeff_tt, coeff_tl, coeff_ll))
+}
+
 /// Built-in Gaussian location-scale family:
 /// - Block 0: location μ(·) with identity link
 /// - Block 1: log-scale log σ(·) with log link
@@ -13794,8 +13937,8 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
 struct BinomialLocationScaleHessianWorkspace {
     family: BinomialLocationScaleFamily,
     block_states: Vec<ParameterBlockState>,
-    x_t: Array2<f64>,
-    x_ls: Array2<f64>,
+    x_t: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
     coeff_tt: Array1<f64>,
     coeff_tl: Array1<f64>,
     coeff_ll: Array1<f64>,
@@ -13814,8 +13957,8 @@ impl BinomialLocationScaleHessianWorkspace {
         Ok(Self {
             family,
             block_states,
-            x_t,
-            x_ls,
+            x_t: Arc::new(x_t),
+            x_ls: Arc::new(x_ls),
             coeff_tt,
             coeff_tl,
             coeff_ll,
@@ -13836,14 +13979,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             ));
         }
         // u_t = X_t v_t, u_ls = X_ls v_ls
-        let u_t = fast_av(&self.x_t, &v.slice(s![0..pt]));
-        let u_ls = fast_av(&self.x_ls, &v.slice(s![pt..total]));
+        let u_t = fast_av(self.x_t.as_ref(), &v.slice(s![0..pt]));
+        let u_ls = fast_av(self.x_ls.as_ref(), &v.slice(s![pt..total]));
         // r_t = D_tt .* u_t + D_tl .* u_ls; r_ls = D_tl .* u_t + D_ll .* u_ls
         let r_t = &self.coeff_tt * &u_t + &self.coeff_tl * &u_ls;
         let r_ls = &self.coeff_tl * &u_t + &self.coeff_ll * &u_ls;
         // (X_t^T r_t, X_ls^T r_ls)
-        let out_t = fast_atv(&self.x_t, &r_t);
-        let out_ls = fast_atv(&self.x_ls, &r_ls);
+        let out_t = fast_atv(self.x_t.as_ref(), &r_t);
+        let out_ls = fast_atv(self.x_ls.as_ref(), &r_ls);
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pt]).assign(&out_t);
         out.slice_mut(s![pt..total]).assign(&out_ls);
@@ -13884,10 +14027,56 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         self.family
             .exact_newton_joint_hessian_directional_derivative_from_designs(
                 &self.block_states,
-                &self.x_t,
-                &self.x_ls,
+                self.x_t.as_ref(),
+                self.x_ls.as_ref(),
                 d_beta_flat,
             )
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        let n = self.x_t.nrows();
+        let pt = self.x_t.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pt + pls;
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "BinomialLocationScale dH operator: d_beta length {} != {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let eta_t = &self.block_states[BinomialLocationScaleFamily::BLOCK_T].eta;
+        let eta_ls = &self.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+        let core = binomial_location_scale_core(
+            &self.family.y,
+            &self.family.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.family.link_kind,
+        )?;
+        let d_eta_t = fast_av(self.x_t.as_ref(), &d_beta_flat.slice(s![0..pt]));
+        let d_eta_ls = fast_av(self.x_ls.as_ref(), &d_beta_flat.slice(s![pt..total]));
+        let (c_tt, c_tl, c_ll) = binomial_location_scale_first_directional_coefficients(
+            &self.family.y,
+            &self.family.weights,
+            &core,
+            &d_eta_t,
+            &d_eta_ls,
+            &self.family.link_kind,
+        );
+        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
+            self.x_t.clone(),
+            self.x_ls.clone(),
+            c_tt,
+            c_tl,
+            c_ll,
+            n,
+        ))))
     }
 
     fn second_directional_derivative(
@@ -13898,11 +14087,63 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
                 &self.block_states,
-                &self.x_t,
-                &self.x_ls,
+                self.x_t.as_ref(),
+                self.x_ls.as_ref(),
                 d_beta_u_flat,
                 d_beta_v_flat,
             )
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        let n = self.x_t.nrows();
+        let pt = self.x_t.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pt + pls;
+        if d_beta_u.len() != total || d_beta_v.len() != total {
+            return Err(format!(
+                "BinomialLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
+                d_beta_u.len(),
+                d_beta_v.len(),
+                total
+            ));
+        }
+        let eta_t = &self.block_states[BinomialLocationScaleFamily::BLOCK_T].eta;
+        let eta_ls = &self.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+        let core = binomial_location_scale_core(
+            &self.family.y,
+            &self.family.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.family.link_kind,
+        )?;
+        let d_eta_t_u = fast_av(self.x_t.as_ref(), &d_beta_u.slice(s![0..pt]));
+        let d_eta_ls_u = fast_av(self.x_ls.as_ref(), &d_beta_u.slice(s![pt..total]));
+        let d_eta_t_v = fast_av(self.x_t.as_ref(), &d_beta_v.slice(s![0..pt]));
+        let d_eta_ls_v = fast_av(self.x_ls.as_ref(), &d_beta_v.slice(s![pt..total]));
+        let (c_tt, c_tl, c_ll) = binomial_location_scalesecond_directional_coefficients(
+            &self.family.y,
+            &self.family.weights,
+            &core,
+            &d_eta_t_u,
+            &d_eta_ls_u,
+            &d_eta_t_v,
+            &d_eta_ls_v,
+            &self.family.link_kind,
+        )?;
+        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
+            self.x_t.clone(),
+            self.x_ls.clone(),
+            c_tt,
+            c_tl,
+            c_ll,
+            n,
+        ))))
     }
 }
 
