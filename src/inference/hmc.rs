@@ -282,34 +282,82 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
 /// Solve L^T * X = I where L is lower triangular.
 ///
 /// Returns X = L^{-T} (the inverse transpose of L).
-/// Uses back-substitution since L^T is upper triangular.
 ///
 /// This is the correct way to compute the whitening transform matrix:
 /// Given H = L L^T (Cholesky), we need W where W W^T = H^{-1}
-/// Since H^{-1} = L^{-T} L^{-1}, we have W = L^{-T}
+/// Since H^{-1} = L^{-T} L^{-1}, we have W = L^{-T}.
+///
+/// Implementation strategy (math-equivalent to back-substitution on L^T):
+/// We compute L^{-1} column-wise via forward substitution on L, then the
+/// result is `L^{-1}` transposed. Forward-substituting column `c` of L^{-1}
+/// uses `L`'s rows (which are contiguous in row-major `Array2`), giving
+/// stride-1 inner loops instead of the strided `l[[j, i]]` (column-major
+/// access pattern) and double-indexed writes of the original. We also
+/// exploit the triangular structure of `L^{-1}` (entries above the diagonal
+/// are zero), skipping ~half of the inner work compared to the previous
+/// version which traversed `i = (0..dim).rev()` for every column.
+///
+/// Total cost: ~dim^3 / 6 multiply-adds (down from dim^3 / 2), with all
+/// inner loops on contiguous slices.
 fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> {
-    // L^T is upper triangular, so we solve L^T * X = I via back-substitution
     let mut result = Array2::<f64>::zeros((dim, dim));
+    if dim == 0 {
+        return result;
+    }
 
-    // For each column of the identity (each column of result)
+    // Pull contiguous row slice access from L (row-major standard layout).
+    // Falls back to a one-time owned copy if `l` is not standard-layout
+    // (e.g. a transposed view); both branches feed the same inner loop.
+    let l_owned;
+    let l_rows: &[f64] = if let Some(s) = l.as_slice() {
+        s
+    } else {
+        l_owned = l.to_owned();
+        l_owned
+            .as_slice()
+            .expect("owned standard-layout Array2 has contiguous storage")
+    };
+
+    // Scratch column for L^{-1}[:, col]; reused across columns.
+    let mut y = vec![0.0_f64; dim];
+
     for col in 0..dim {
-        // Solve L^T * x = e_col (unit vector)
-        // Back-substitution: start from last row, work up
-        for i in (0..dim).rev() {
-            let mut sum = if i == col { 1.0 } else { 0.0 }; // e_col[i]
+        // Forward-substitute L * y = e_col. y[i] = 0 for i < col.
+        // Diagonal term:
+        let d_col = l_rows[col * dim + col];
+        let inv_d_col = if d_col.abs() > 1e-15 { 1.0 / d_col } else { 0.0 };
+        y[col] = inv_d_col;
 
-            // Subtract contributions from already-solved entries
-            for j in (i + 1)..dim {
-                sum -= l[[j, i]] * result[[j, col]]; // L^T[i,j] = L[j,i]
+        // Below-diagonal entries: y[i] = -(sum_{j=col..i} L[i,j] * y[j]) / L[i,i].
+        // Each inner loop is a stride-1 dot product on row `i` of L (contiguous).
+        for i in (col + 1)..dim {
+            let row_off = i * dim;
+            let l_row = &l_rows[row_off + col..row_off + i];
+            let y_seg = &y[col..i];
+            // Both operands are contiguous slices of equal length; the loop
+            // is a straight-line stride-1 reduction the optimizer can
+            // auto-vectorize.
+            let mut sum = 0.0_f64;
+            for k in 0..l_row.len() {
+                sum += l_row[k] * y_seg[k];
             }
+            let d = l_rows[row_off + i];
+            y[i] = if d.abs() > 1e-15 { -sum / d } else { 0.0 };
+        }
 
-            // Divide by diagonal (L^T[i,i] = L[i,i])
-            let diag = l[[i, i]];
-            if diag.abs() < 1e-15 {
-                result[[i, col]] = 0.0; // Regularize near-zero diagonal
-            } else {
-                result[[i, col]] = sum / diag;
-            }
+        // Write the column into result transposed: result[col, i] = y[i] for i >= col.
+        // result[i, col] is left at zero for i < col (upper-triangular L^{-T}).
+        // That matches `result[col, i]` filling row `col` from column `col` rightward.
+        let res_row_start = col * dim + col;
+        let res_row = &mut result.as_slice_mut().expect("owned Array2 contiguous")
+            [res_row_start..res_row_start + (dim - col)];
+        for (k, slot) in res_row.iter_mut().enumerate() {
+            *slot = y[col + k];
+        }
+
+        // Clear scratch positions we wrote, so the next column starts clean above.
+        for slot in &mut y[col..dim] {
+            *slot = 0.0;
         }
     }
 
