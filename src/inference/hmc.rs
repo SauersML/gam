@@ -809,17 +809,20 @@ fn joint_family_logp_and_grad(
 /// log p(y|η) = y·η − log(1 + exp(η)), gradient = X'(w ⊙ (y − μ))
 fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
-    let mut ll = 0.0;
     let mut residual = Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let eta_i = eta[i];
-        let y_i = data.y[i];
-        let w_i = data.weights[i];
-        ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
-        let mu = NutsPosterior::sigmoid_stable(eta_i);
-        residual[i] = w_i * (y_i - mu);
-    }
+    // Zip-based fused fill-and-fold avoids per-element bounds checks
+    // (vs `eta[i]` / `data.y[i]` / `data.weights[i]`) and lets LLVM vectorize
+    // the dominant exp/log1p kernel across contiguous slices.
+    let mut ll = 0.0_f64;
+    ndarray::Zip::from(&mut residual)
+        .and(eta)
+        .and(&**data.y)
+        .and(&**data.weights)
+        .for_each(|r, &eta_i, &y_i, &w_i| {
+            ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
+            let mu = NutsPosterior::sigmoid_stable(eta_i);
+            *r = w_i * (y_i - mu);
+        });
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -833,33 +836,24 @@ fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64
 /// Uses erfc-based log Φ for numerical stability.
 fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
-    let mut ll = 0.0;
     let mut residual = Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let eta_i = eta[i];
-        let y_i = data.y[i];
-        let w_i = data.weights[i];
-
-        // log Φ(η) and log(1−Φ(η)) = log Φ(−η)
-        let log_phi_pos = log_ndtr(eta_i);
-        let log_phi_neg = log_ndtr(-eta_i);
-
-        ll += w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg);
-
-        // Gradient: y · φ/Φ − (1−y) · φ/(1−Φ)
-        // Compute ratios via exp(log φ − log Φ) for stability.
-        // log φ(x) = −x²/2 − 0.5·ln(2π)
-        let log_phi_val = standard_normal_log_pdf(eta_i);
-
-        // Inverse Mills ratio: φ(η)/Φ(η) = exp(log φ − log Φ)
-        let ratio_pos = (log_phi_val - log_phi_pos).exp();
-        // φ(η)/(1−Φ(η)) = exp(log φ − log Φ(−η))
-        let ratio_neg = (log_phi_val - log_phi_neg).exp();
-
-        let grad_i = y_i * ratio_pos - (1.0 - y_i) * ratio_neg;
-        residual[i] = w_i * grad_i;
-    }
+    let mut ll = 0.0_f64;
+    ndarray::Zip::from(&mut residual)
+        .and(eta)
+        .and(&**data.y)
+        .and(&**data.weights)
+        .for_each(|r, &eta_i, &y_i, &w_i| {
+            // log Φ(η) and log(1−Φ(η)) = log Φ(−η)
+            let log_phi_pos = log_ndtr(eta_i);
+            let log_phi_neg = log_ndtr(-eta_i);
+            ll += w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg);
+            // Inverse Mills ratios via exp(log φ − log Φ) for stability.
+            let log_phi_val = standard_normal_log_pdf(eta_i);
+            let ratio_pos = (log_phi_val - log_phi_pos).exp();
+            let ratio_neg = (log_phi_val - log_phi_neg).exp();
+            let grad_i = y_i * ratio_pos - (1.0 - y_i) * ratio_neg;
+            *r = w_i * grad_i;
+        });
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -872,51 +866,33 @@ fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f6
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
 fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
-    let mut ll = 0.0;
     let mut residual = Array1::<f64>::zeros(n);
+    let mut ll = 0.0_f64;
+    ndarray::Zip::from(&mut residual)
+        .and(eta)
+        .and(&**data.y)
+        .and(&**data.weights)
+        .for_each(|r, &eta_raw, &y_i, &w_i| {
+            let eta_i = eta_raw.clamp(-700.0, 700.0);
+            let exp_eta = eta_i.exp();
+            // −exp(η) clamped to avoid overflow in exp(−exp(η))
+            let neg_exp_eta = (-exp_eta).clamp(-700.0, 0.0);
+            let exp_neg_exp_eta = neg_exp_eta.exp(); // exp(−exp(η))
+            let log_mu = (-exp_neg_exp_eta).ln_1p();
+            // log(1−μ) = log(exp(−exp(η))) = −exp(η)
+            let log_one_minus_mu = -exp_eta;
+            ll += w_i * (y_i * log_mu + (1.0 - y_i) * log_one_minus_mu);
 
-    for i in 0..n {
-        let eta_i = eta[i].clamp(-700.0, 700.0);
-        let y_i = data.y[i];
-        let w_i = data.weights[i];
-
-        let exp_eta = eta_i.exp();
-        // −exp(η) clamped to avoid overflow in exp(−exp(η))
-        let neg_exp_eta = (-exp_eta).clamp(-700.0, 0.0);
-
-        // log(1 − exp(−exp(η))): use log1p(−exp(−exp(η))) = log1p(exp(−exp(η))·(−1))
-        // For small exp(η), exp(−exp(η)) ≈ 1 − exp(η), so 1−exp(−exp(η)) ≈ exp(η)
-        // and log(1−exp(−exp(η))) ≈ η
-        let exp_neg_exp_eta = neg_exp_eta.exp(); // exp(−exp(η))
-        let log_mu = if exp_eta < 1e-6 {
-            // Small exp(η): log(1 - exp(-exp(η))) ≈ log(exp(η) - exp(η)²/2)
-            // ≈ η + log(1 - exp(η)/2) ≈ η for very small
-            (-exp_neg_exp_eta).ln_1p()
-        } else {
-            (-exp_neg_exp_eta).ln_1p()
-        };
-
-        // log(1−μ) = log(exp(−exp(η))) = −exp(η)
-        let log_one_minus_mu = -exp_eta;
-
-        ll += w_i * (y_i * log_mu + (1.0 - y_i) * log_one_minus_mu);
-
-        // Gradient: d/dη [y·log(μ) + (1-y)·log(1-μ)]
-        // = y · exp(η)·exp(−exp(η)) / (1−exp(−exp(η))) + (1-y)·(−exp(η))
-        //
-        // The ratio exp(η)·exp(−exp(η)) / (1−exp(−exp(η))) can be computed as
-        // exp(η) · exp(log(exp(−exp(η))) − log(1−exp(−exp(η))))
-        // = exp(η) · exp(−exp(η) − log_mu)
-        let grad_y1 = if log_mu.is_finite() && log_mu > -700.0 {
-            exp_eta * (neg_exp_eta - log_mu).exp()
-        } else {
-            // Fallback for extreme values: μ ≈ 0, ratio → 1
-            1.0
-        };
-        let grad_y0 = -exp_eta;
-
-        residual[i] = w_i * (y_i * grad_y1 + (1.0 - y_i) * grad_y0);
-    }
+            // Gradient: y · exp(η)·exp(−exp(η)) / (1−exp(−exp(η))) − (1-y)·exp(η).
+            // Ratio computed as exp(η)·exp(−exp(η) − log_mu) for stability.
+            let grad_y1 = if log_mu.is_finite() && log_mu > -700.0 {
+                exp_eta * (neg_exp_eta - log_mu).exp()
+            } else {
+                1.0
+            };
+            let grad_y0 = -exp_eta;
+            *r = w_i * (y_i * grad_y1 + (1.0 - y_i) * grad_y0);
+        });
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -927,15 +903,17 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
 /// log p(y|η) = −½ w·(y − η)², gradient = X'(w ⊙ (y − η))
 fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
-    let mut ll = 0.0;
     let mut weighted_residual = Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let residual = data.y[i] - eta[i];
-        let w_i = data.weights[i];
-        ll -= 0.5 * w_i * residual * residual;
-        weighted_residual[i] = w_i * residual;
-    }
+    let mut ll = 0.0_f64;
+    ndarray::Zip::from(&mut weighted_residual)
+        .and(eta)
+        .and(&**data.y)
+        .and(&**data.weights)
+        .for_each(|wr, &eta_i, &y_i, &w_i| {
+            let residual = y_i - eta_i;
+            ll -= 0.5 * w_i * residual * residual;
+            *wr = w_i * residual;
+        });
 
     let grad_ll = fast_atv(&data.x, &weighted_residual);
     (ll, grad_ll)
@@ -946,17 +924,18 @@ fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<
 /// log p(y|η) = y·η − exp(η), gradient = X'(w ⊙ (y − μ))
 fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
-    let mut ll = 0.0;
     let mut residual = Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let eta_i = eta[i].clamp(-700.0, 700.0);
-        let mu_i = eta_i.exp();
-        let y_i = data.y[i];
-        let w_i = data.weights[i];
-        ll += w_i * (y_i * eta_i - mu_i);
-        residual[i] = w_i * (y_i - mu_i);
-    }
+    let mut ll = 0.0_f64;
+    ndarray::Zip::from(&mut residual)
+        .and(eta)
+        .and(&**data.y)
+        .and(&**data.weights)
+        .for_each(|r, &eta_raw, &y_i, &w_i| {
+            let eta_i = eta_raw.clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp();
+            ll += w_i * (y_i * eta_i - mu_i);
+            *r = w_i * (y_i - mu_i);
+        });
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -964,21 +943,29 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
 
 fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
-    let mut ll = 0.0;
     let mut residual = Array1::<f64>::zeros(n);
     let shape = data.gamma_shape.max(1e-10);
-
-    for i in 0..n {
-        let eta_i = eta[i].clamp(-700.0, 700.0);
-        let mu_i = eta_i.exp();
-        let y_i = data.y[i];
-        let w_i = data.weights[i];
-        ll += w_i
-            * (shape * shape.ln() - statrs::function::gamma::ln_gamma(shape) - shape * eta_i
-                + (shape - 1.0) * y_i.max(1e-12).ln()
-                - shape * y_i / mu_i);
-        residual[i] = w_i * shape * (y_i / mu_i - 1.0);
-    }
+    // Hoist shape-only constants out of the per-sample loop: ln Γ(shape) and
+    // shape · ln(shape) are independent of i, so previously each sample paid
+    // an extra `ln_gamma` and `ln` plus a multiply. n is typically biobank-
+    // scale, so this collapses Θ(n) gamma-function evaluations to one.
+    let shape_ln_shape = shape * shape.ln();
+    let log_gamma_shape = statrs::function::gamma::ln_gamma(shape);
+    let shape_minus_one = shape - 1.0;
+    let mut ll = 0.0_f64;
+    ndarray::Zip::from(&mut residual)
+        .and(eta)
+        .and(&**data.y)
+        .and(&**data.weights)
+        .for_each(|r, &eta_raw, &y_i, &w_i| {
+            let eta_i = eta_raw.clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp();
+            ll += w_i
+                * (shape_ln_shape - log_gamma_shape - shape * eta_i
+                    + shape_minus_one * y_i.max(1e-12).ln()
+                    - shape * y_i / mu_i);
+            *r = w_i * shape * (y_i / mu_i - 1.0);
+        });
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
