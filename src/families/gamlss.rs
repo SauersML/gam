@@ -9403,8 +9403,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 struct GaussianLocationScaleWiggleHessianWorkspace {
     family: GaussianLocationScaleWiggleFamily,
     block_states: Vec<ParameterBlockState>,
-    xmu: Array2<f64>,
-    x_ls: Array2<f64>,
+    xmu: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
     pieces: GaussianLocationScaleWiggleHessianRowPieces,
 }
 
@@ -9420,8 +9420,8 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
         Ok(Self {
             family,
             block_states,
-            xmu,
-            x_ls,
+            xmu: Arc::new(xmu),
+            x_ls: Arc::new(x_ls),
             pieces,
         })
     }
@@ -9444,8 +9444,8 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         let v_ls = v.slice(s![pmu..pmu + p_ls]);
         let v_w = v.slice(s![pmu + p_ls..total]);
 
-        let u_mu = fast_av(&self.xmu, &v_mu);
-        let u_ls = fast_av(&self.x_ls, &v_ls);
+        let u_mu = fast_av(self.xmu.as_ref(), &v_mu);
+        let u_ls = fast_av(self.x_ls.as_ref(), &v_ls);
         let u_b = fast_av(&self.pieces.basis, &v_w);
         let u_d = fast_av(&self.pieces.basis_d1, &v_w);
 
@@ -9461,8 +9461,8 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
             + &self.pieces.coeff_ww * &u_b;
         let r_d = &self.pieces.coeff_mw_d * &u_mu;
 
-        let out_mu = fast_atv(&self.xmu, &r_mu);
-        let out_ls = fast_atv(&self.x_ls, &r_ls);
+        let out_mu = fast_atv(self.xmu.as_ref(), &r_mu);
+        let out_ls = fast_atv(self.x_ls.as_ref(), &r_ls);
         let out_w = fast_atv(&self.pieces.basis, &r_b) + &fast_atv(&self.pieces.basis_d1, &r_d);
 
         let mut out = Array1::<f64>::zeros(total);
@@ -9516,10 +9516,23 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         self.family
             .exact_newton_joint_hessian_directional_derivative_from_designs(
                 &self.block_states,
-                &self.xmu,
-                &self.x_ls,
+                self.xmu.as_ref(),
+                self.x_ls.as_ref(),
                 d_beta_flat,
             )
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        self.family.gls_wiggle_directional_operator(
+            &self.block_states,
+            self.xmu.clone(),
+            self.x_ls.clone(),
+            d_beta_flat,
+        )
     }
 
     fn second_directional_derivative(
@@ -9530,8 +9543,8 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
                 &self.block_states,
-                &self.xmu,
-                &self.x_ls,
+                self.xmu.as_ref(),
+                self.x_ls.as_ref(),
                 d_beta_u_flat,
                 d_beta_v_flat,
             )
@@ -17601,8 +17614,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 struct BinomialLocationScaleWiggleHessianWorkspace {
     family: BinomialLocationScaleWiggleFamily,
     block_states: Vec<ParameterBlockState>,
-    x_t: Array2<f64>,
-    x_ls: Array2<f64>,
+    x_t: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
     pieces: BinomialLocationScaleWiggleHessianRowPieces,
 }
 
@@ -17618,8 +17631,8 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
         Ok(Self {
             family,
             block_states,
-            x_t,
-            x_ls,
+            x_t: Arc::new(x_t),
+            x_ls: Arc::new(x_ls),
             pieces,
         })
     }
