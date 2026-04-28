@@ -1784,6 +1784,13 @@ pub struct ImplicitHyperOperator {
     pub s_psi: Array2<f64>,
     /// Total basis dimension p.
     pub p: usize,
+    /// Non-Gaussian fixed-β third-derivative correction: c ⊙ (X_{ψ_d} β̂),
+    /// length n. When present, the operator additionally applies
+    /// `Xᵀ diag(c_x_psi_beta) X v` so that the full B_d formula
+    /// `B_d v = (∂X/∂ψ_d)ᵀ W X v + Xᵀ W (∂X/∂ψ_d) v + Xᵀ diag(c ⊙ X_{ψ_d} β̂) X v + S_{ψ_d} v`
+    /// is matrix-free for non-Gaussian likelihoods. `None` for Gaussian
+    /// identity (c ≡ 0 there).
+    pub c_x_psi_beta: Option<std::sync::Arc<Array1<f64>>>,
 }
 
 impl HyperOperator for ImplicitHyperOperator {
@@ -1809,7 +1816,17 @@ impl HyperOperator for ImplicitHyperOperator {
         // Term 3: S_{ψ_d} · v
         let term3 = self.s_psi.dot(v); // (p,)
 
-        term1 + term2 + term3
+        let mut out = term1 + term2 + term3;
+
+        // Term 4 (non-Gaussian only): X^T diag(c ⊙ X_{ψ_d} β̂) X v.
+        // Streams O(n p): one X·v matvec (already computed as x_v above),
+        // one elementwise product, one X^T matvec.
+        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
+            let weighted = c_x_psi_beta.as_ref() * &x_v;
+            out += &self.x_design.transpose_vector_multiply(&weighted);
+        }
+
+        out
     }
 
     fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
@@ -1876,6 +1893,22 @@ impl HyperOperator for ImplicitHyperOperator {
                 term.view_mut(),
             );
             out_col += &term;
+
+            // Non-Gaussian fixed-β third-derivative correction column j:
+            //   X^T (c ⊙ X_{ψ_d} β̂ ⊙ X e_j) = X^T (c_x_psi_beta ⊙ x_col).
+            if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
+                let c = c_x_psi_beta.as_ref();
+                Zip::from(weighted.view_mut())
+                    .and(c.view())
+                    .and(x_col.view())
+                    .for_each(|dst, &c_i, &x_i| *dst = c_i * x_i);
+                design_matrix_transpose_apply_view_into(
+                    &self.x_design,
+                    weighted.view(),
+                    term.view_mut(),
+                );
+                out_col += &term;
+            }
         }
     }
 
@@ -2016,7 +2049,16 @@ impl ImplicitHyperOperator {
         // Term 3: S_{ψ_d} · z
         let term3 = self.s_psi.dot(z);
 
-        term1 + term2 + term3
+        let mut out = term1 + term2 + term3;
+
+        // Term 4 (non-Gaussian only): X^T diag(c ⊙ X_{ψ_d} β̂) · x_vec
+        // (`x_vec` is already X·z, supplied by the caller).
+        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
+            let weighted = c_x_psi_beta.as_ref() * x_vec;
+            out += &self.x_design.transpose_vector_multiply(&weighted);
+        }
+
+        out
     }
 
     pub fn matvec_with_shared_xz_into(
@@ -2054,6 +2096,20 @@ impl ImplicitHyperOperator {
 
         dense_matvec_into(&self.s_psi, z, p_work.view_mut());
         out += &p_work;
+
+        // Non-Gaussian fixed-β third-derivative correction.
+        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
+            let c = c_x_psi_beta.as_ref();
+            for i in 0..w.len() {
+                n_work[i] = c[i] * x_vec[i];
+            }
+            design_matrix_transpose_apply_view_into(
+                &self.x_design,
+                n_work.view(),
+                p_work.view_mut(),
+            );
+            out += &p_work;
+        }
     }
 }
 

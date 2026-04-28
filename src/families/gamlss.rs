@@ -7947,6 +7947,122 @@ impl GaussianLocationScaleWiggleFamily {
         )))
     }
 
+    /// Build a matrix-free `RowCoeffOperator` for the GLS Wiggle joint
+    /// directional derivative `D_β H_L[u]`. Output dimension is
+    /// `pmu + p_ls + pw`. Channels (in order): X_mu, X_ls, B, B', B''.
+    fn gls_wiggle_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        xmu_arc: Arc<Array2<f64>>,
+        x_ls_arc: Arc<Array2<f64>>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        if block_states.len() != 3 {
+            return Err(format!(
+                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let pmu = xmu_arc.ncols();
+        let p_ls = x_ls_arc.ncols();
+        let q0_eta = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        let layout = GamlssBetaLayout::withwiggle(pmu, p_ls, betaw.len());
+        let (umu, u_ls, uw) = layout.split_three(
+            d_beta_flat,
+            "GLS Wiggle joint dH operator d_beta",
+        )?;
+        if q0_eta.len() != n
+            || eta_ls.len() != n
+            || etaw.len() != n
+            || self.weights.len() != n
+        {
+            return Err("GaussianLocationScaleWiggleFamily input size mismatch".to_string());
+        }
+        let q = q0_eta + etaw;
+        let geom = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
+        let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
+        let xi = fast_av(xmu_arc.as_ref(), &umu);
+        let zeta = fast_av(x_ls_arc.as_ref(), &u_ls);
+        let szeta = &rows.kappa * &zeta;
+        let phi = fast_av(&geom.basis, &uw);
+        let mut q_u = &geom.dq_dq0 * &xi;
+        q_u += &phi;
+        let mut s1_u = &geom.d2q_dq02 * &xi;
+        s1_u += &fast_av(&geom.basis_d1, &uw);
+        let mut g2_u = &geom.d3q_dq03 * &xi;
+        g2_u += &fast_av(&geom.basis_d2, &uw);
+        let dw_u = -2.0 * &rows.w * &szeta;
+        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
+        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
+        let amn = &rows.obs_weight - &rows.n;
+
+        let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
+            + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
+            - &(&dm_u * &geom.d2q_dq02)
+            - &(&rows.m * &g2_u);
+        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
+            + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
+        let coeff_ll_u = 2.0 * &rows.kappa * &rows.kappa * &dn_u
+            + 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.n)
+            + &rows.kappa_dprime * &(&zeta * &amn)
+            - &rows.kappa_prime * &dn_u;
+        let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
+        let c_u = -&dm_u;
+        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&rows.m * &zeta);
+
+        // Pair-coefficient bundles. For (0=X_mu, 3=B'): combine
+        // `xt_diag_y_dense(xmu, &(w·dq_dq0), &basis_u=diag(xi)·B')`
+        // (giving coeff `w·dq_dq0·xi`) with `xt_diag_y_dense(xmu, &c_u, &B')`
+        // (coeff `c_u`).
+        let coeff_m_b1 = &(&rows.w * &geom.dq_dq0 * &xi) + &c_u;
+        // (0=X_mu, 4=B''): from `xt_diag_y_dense(xmu, &(-m), &basis1_u=diag(xi)·B'')`.
+        let coeff_m_b2 = -(&rows.m * &xi);
+        // (1=X_ls, 3=B'): `xt_diag_y_dense(x_ls, &(2κm), &basis_u=diag(xi)·B')`.
+        let coeff_ls_b1 = 2.0 * &rows.kappa * &rows.m * &xi;
+        // (2=B, 3=B'): a_ww + a_ww^T where a_ww = (diag(xi)·B')^T diag(w) B
+        // = B'^T diag(w·xi) B. The symmetric pair contribution in
+        // `RowCoeffOperator` reproduces a_ww + a_ww^T with c = w·xi.
+        let coeff_b_b1 = &rows.w * &xi;
+
+        let xmu_design: Arc<Array2<f64>> = xmu_arc;
+        let x_ls_design: Arc<Array2<f64>> = x_ls_arc;
+        let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
+        let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
+        let basis_d2: Arc<Array2<f64>> = Arc::new(geom.basis_d2.clone());
+        let pw = basis.ncols();
+
+        let channels = vec![
+            RowCoeffChannel { block: 0, design: xmu_design },
+            RowCoeffChannel { block: 1, design: x_ls_design },
+            RowCoeffChannel { block: 2, design: basis },
+            RowCoeffChannel { block: 2, design: basis_d1 },
+            RowCoeffChannel { block: 2, design: basis_d2 },
+        ];
+        let pair_coeffs = vec![
+            RowCoeffPair { a: 0, b: 0, coeff: coeff_mm_u },
+            RowCoeffPair { a: 0, b: 1, coeff: coeff_ml_u },
+            RowCoeffPair { a: 1, b: 1, coeff: coeff_ll_u },
+            RowCoeffPair { a: 0, b: 2, coeff: a_u },
+            RowCoeffPair { a: 0, b: 3, coeff: coeff_m_b1 },
+            RowCoeffPair { a: 0, b: 4, coeff: coeff_m_b2 },
+            RowCoeffPair { a: 1, b: 2, coeff: l_u },
+            RowCoeffPair { a: 1, b: 3, coeff: coeff_ls_b1 },
+            RowCoeffPair { a: 2, b: 2, coeff: dw_u },
+            RowCoeffPair { a: 2, b: 3, coeff: coeff_b_b1 },
+        ];
+        Ok(Some(Arc::new(RowCoeffOperator::new(
+            channels,
+            vec![pmu, p_ls, pw],
+            pair_coeffs,
+            n,
+        ))))
+    }
+
     fn exact_newton_joint_hessiansecond_directional_derivative_from_designs(
         &self,
         block_states: &[ParameterBlockState],
@@ -17096,6 +17212,179 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(d_h))
     }
 
+    /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
+    /// directional derivative `D_β H_L[u]`. Channels (in order):
+    /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the
+    /// joint coefficient vector `(β_t, β_ls, β_w)`.
+    fn bls_wiggle_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t_arc: Arc<Array2<f64>>,
+        x_ls_arc: Arc<Array2<f64>>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        if block_states.len() != 3 {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleWiggleFamily input size mismatch".to_string());
+        }
+        let pt = x_t_arc.ncols();
+        let pls = x_ls_arc.ncols();
+        let betaw0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
+        let core0 = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            Some(etaw),
+            &self.link_kind,
+        )?;
+        let b0 = self.wiggle_design(core0.q0.view())?;
+        let pw = b0.ncols();
+        let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
+        let total = beta_layout.total();
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "BLS wiggle dH operator: d_beta length {} != {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_flat, "wiggle joint dH operator d_beta")?;
+        let d_eta_t = fast_av(x_t_arc.as_ref(), &u_t);
+        let d_eta_ls = fast_av(x_ls_arc.as_ref(), &u_ls);
+
+        let d0 = self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
+        let dd0 = self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
+        let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
+        if d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
+            return Err(format!(
+                "wiggle derivative/beta mismatch in dH operator: B'={} B''={} betaw={}",
+                d0.ncols(),
+                dd0.ncols(),
+                betaw0.len()
+            ));
+        }
+        let m = d0.dot(&betaw0) + 1.0;
+        let g2 = dd0.dot(&betaw0);
+        let g3 = d3q;
+        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
+
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
+        let mut coeffww_bb = Array1::<f64>::zeros(n);
+        let mut coeffww_db = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q_i = core0.q0[i] + etaw[i];
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                self.y[i],
+                self.weights[i],
+                q_i,
+                core0.mu[i],
+                core0.dmu_dq[i],
+                core0.d2mu_dq2[i],
+                core0.d3mu_dq3[i],
+                &self.link_kind,
+            );
+            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
+            let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
+
+            let br = b0.row(i);
+            let dr = d0.row(i);
+            let ddr = dd0.row(i);
+            let duw_i = dr.dot(&uw);
+            let dduw_i = ddr.dot(&uw);
+
+            let delta_m = g2[i] * dq0.delta_q + duw_i;
+            let delta_g2 = g3[i] * dq0.delta_q + dduw_i;
+
+            let q_t = m[i] * q0.q_t;
+            let q_ls = m[i] * q0.q_ls;
+            let q_tt = g2[i] * q0.q_t * q0.q_t;
+            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
+            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
+
+            let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
+            let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
+            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
+            let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
+                + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
+                + delta_m * q0.q_tl
+                + m[i] * dq0.delta_q_tl;
+            let delta_q_ll = delta_g2 * q0.q_ls * q0.q_ls
+                + g2[i] * 2.0 * q0.q_ls * dq0.delta_q_ls
+                + delta_m * q0.q_ll
+                + m[i] * dq0.delta_q_ll;
+
+            let delta_q = m[i] * dq0.delta_q + br.dot(&uw);
+
+            coeff_tt[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
+            );
+            coeff_tl[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
+            );
+            coeff_ll[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
+            );
+            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
+            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
+            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
+            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
+            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
+            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
+            coeffww_bb[i] = m3 * delta_q;
+            coeffww_db[i] = m2 * dq0.delta_q;
+        }
+
+        let basis: Arc<Array2<f64>> = Arc::new(b0);
+        let basis_d1: Arc<Array2<f64>> = Arc::new(d0);
+        let basis_d2: Arc<Array2<f64>> = Arc::new(dd0);
+
+        let channels = vec![
+            RowCoeffChannel { block: 0, design: x_t_arc },
+            RowCoeffChannel { block: 1, design: x_ls_arc },
+            RowCoeffChannel { block: 2, design: basis },
+            RowCoeffChannel { block: 2, design: basis_d1 },
+            RowCoeffChannel { block: 2, design: basis_d2 },
+        ];
+        let pair_coeffs = vec![
+            RowCoeffPair { a: 0, b: 0, coeff: coeff_tt },
+            RowCoeffPair { a: 0, b: 1, coeff: coeff_tl },
+            RowCoeffPair { a: 1, b: 1, coeff: coeff_ll },
+            RowCoeffPair { a: 0, b: 2, coeff: coeff_tw_b },
+            RowCoeffPair { a: 0, b: 3, coeff: coeff_tw_d },
+            RowCoeffPair { a: 0, b: 4, coeff: coeff_tw_dd },
+            RowCoeffPair { a: 1, b: 2, coeff: coeff_lw_b },
+            RowCoeffPair { a: 1, b: 3, coeff: coeff_lw_d },
+            RowCoeffPair { a: 1, b: 4, coeff: coeff_lw_dd },
+            RowCoeffPair { a: 2, b: 2, coeff: coeffww_bb },
+            RowCoeffPair { a: 2, b: 3, coeff: coeffww_db },
+        ];
+        Ok(Some(Arc::new(RowCoeffOperator::new(
+            channels,
+            vec![pt, pls, pw],
+            pair_coeffs,
+            n,
+        ))))
+    }
+
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -17673,8 +17962,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             + &self.pieces.coeffww * &u_b;
         let r_d = &self.pieces.coeff_tw_d * &u_t + &self.pieces.coeff_lw_d * &u_ls;
 
-        let out_t = fast_atv(&self.x_t, &r_t);
-        let out_ls = fast_atv(&self.x_ls, &r_ls);
+        let out_t = fast_atv(self.x_t.as_ref(), &r_t);
+        let out_ls = fast_atv(self.x_ls.as_ref(), &r_ls);
         let out_w = self.pieces.b0.t().dot(&r_b) + &self.pieces.d0.t().dot(&r_d);
 
         let mut out = Array1::<f64>::zeros(total);
@@ -17727,6 +18016,19 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
     ) -> Result<Option<Array2<f64>>, String> {
         self.family
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        self.family.bls_wiggle_directional_operator(
+            &self.block_states,
+            self.x_t.clone(),
+            self.x_ls.clone(),
+            d_beta_flat,
+        )
     }
 
     fn second_directional_derivative(
