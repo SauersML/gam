@@ -6583,7 +6583,16 @@ fn strict_logdet_spd_with_semidefinite_option(
             .sum();
         return Ok(logdet);
     }
-    strict_logdet_spd(matrix)
+    let (logdet, stats) = strict_logdet_spd_with_lm_continuation(matrix)?;
+    if stats.escalations > 0 {
+        log::debug!(
+            "[strict-spd] logdet δ-ridge continuation: δ={:.3e}, escalations={}, p={}",
+            stats.delta_used,
+            stats.escalations,
+            matrix.nrows(),
+        );
+    }
+    Ok(logdet)
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
