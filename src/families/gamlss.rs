@@ -19185,6 +19185,219 @@ mod tests {
         }
     }
 
+    /// Helper: build a BLS Wiggle family + states + specs fixture
+    /// (mirrors the inline structure of
+    /// `binomial_location_scale_wiggle_workspace_matvec_matches_dense`).
+    fn bls_wiggle_workspace_fixture() -> (
+        BinomialLocationScaleWiggleFamily,
+        Vec<ParameterBlockState>,
+        Vec<ParameterBlockSpec>,
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+    ) {
+        let n = 10usize;
+        let pt = 3usize;
+        let pls = 2usize;
+        let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+            ((i as f64) * 0.17 + (j as f64) * 0.29).sin() * 0.4
+        });
+        let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+            ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.3
+        });
+        let beta_t = array![0.20, -0.10, 0.05];
+        let beta_ls = array![0.30, -0.15];
+        let eta_t = xt.dot(&beta_t);
+        let eta_ls = xls.dot(&beta_ls);
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
+            Some(d) => d.clone(),
+            None => panic!("wiggle design must be dense for this test fixture"),
+        };
+        let pw = wiggle_design_dense.ncols();
+        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
+        let eta_w = wiggle_design_dense.dot(&beta_w);
+        let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let family = BinomialLocationScaleWiggleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t,
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: eta_w,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
+                design: threshold_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: log_sigma_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: wiggle_block.design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        (family, states, specs, xt, xls, wiggle_design_dense)
+    }
+
+    #[test]
+    fn binomial_location_scale_wiggle_workspace_dh_operator_matches_dense() {
+        let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let d_beta = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
+
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &d_beta)
+            .expect("dense dH build")
+            .expect("dense dH present");
+        assert_eq!(dense_dh.nrows(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH op call")
+            .expect("dH op present");
+
+        let probes = vec![
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == states[0].beta.len() { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| {
+                if i == states[0].beta.len() + states[1].beta.len() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }),
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin()),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            let want = dense_dh.dot(w);
+            let got = dh_op.mul_vec(w);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "BLSW dH op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_wiggle_workspace_dh_operator_finite_difference() {
+        let (family, states, specs, xt, xls, xw) = bls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
+        let v = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin());
+        let pt = states[0].beta.len();
+        let pls = states[1].beta.len();
+        let eps = 1e-5;
+        let perturb = |sign: f64| -> Vec<ParameterBlockState> {
+            let mut out = states.clone();
+            for j in 0..pt {
+                out[0].beta[j] += sign * eps * u[j];
+            }
+            for j in 0..pls {
+                out[1].beta[j] += sign * eps * u[pt + j];
+            }
+            for j in 0..(p - pt - pls) {
+                out[2].beta[j] += sign * eps * u[pt + pls + j];
+            }
+            out[0].eta = xt.dot(&out[0].beta);
+            out[1].eta = xls.dot(&out[1].beta);
+            // Wiggle eta uses the q-evaluated basis at fixed q0 from xt/xls;
+            // for FD purposes we hold the basis fixed at the unperturbed q0
+            // and just update etaw = X_w β_w with the static basis sample
+            // already cached in xw above. This is consistent with how the
+            // dense `exact_newton_joint_hessian` samples B at the current q0.
+            out[2].eta = xw.dot(&out[2].beta);
+            out
+        };
+        let states_plus = perturb(1.0);
+        let states_minus = perturb(-1.0);
+        let h_plus = family
+            .exact_newton_joint_hessian(&states_plus)
+            .expect("dense H+")
+            .expect("dense H+ present");
+        let h_minus = family
+            .exact_newton_joint_hessian(&states_minus)
+            .expect("dense H-")
+            .expect("dense H- present");
+        let fd = (h_plus.dot(&v) - h_minus.dot(&v)) / (2.0 * eps);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&u)
+            .expect("dH op call")
+            .expect("dH op present");
+        let analytic = dh_op.mul_vec(&v);
+
+        for i in 0..p {
+            let tol = 5e-5 * fd[i].abs().max(1.0) + 5e-5;
+            assert!(
+                (fd[i] - analytic[i]).abs() <= tol,
+                "BLSW dH FD mismatch at {i}: fd={:.6e}, analytic={:.6e}",
+                fd[i],
+                analytic[i]
+            );
+        }
+    }
+
     #[test]
     fn gaussian_location_scale_wiggle_workspace_matvec_matches_dense() {
         let n = 10usize;
@@ -19310,6 +19523,209 @@ mod tests {
                     got[i]
                 );
             }
+        }
+    }
+
+    /// Helper: build a GLS Wiggle family + states + specs fixture
+    /// (mirrors the inline structure of
+    /// `gaussian_location_scale_wiggle_workspace_matvec_matches_dense`).
+    fn gls_wiggle_workspace_fixture() -> (
+        GaussianLocationScaleWiggleFamily,
+        Vec<ParameterBlockState>,
+        Vec<ParameterBlockSpec>,
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+    ) {
+        let n = 10usize;
+        let p_mu = 3usize;
+        let p_ls = 2usize;
+        let xmu = Array2::from_shape_fn((n, p_mu), |(i, j)| {
+            ((i as f64) * 0.13 + (j as f64) * 0.31).sin() * 0.4
+        });
+        let xls = Array2::from_shape_fn((n, p_ls), |(i, j)| {
+            ((i as f64) * 0.21 + (j as f64) * 0.47).cos() * 0.3
+        });
+        let beta_mu = array![0.10, -0.20, 0.30];
+        let beta_ls = array![0.40, -0.10];
+        let eta_mu = xmu.dot(&beta_mu);
+        let eta_ls = xls.dot(&beta_ls);
+        let q_seed = Array1::linspace(-1.0, 1.0, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
+            Some(d) => d.clone(),
+            None => panic!("wiggle design must be dense for this test fixture"),
+        };
+        let pw = wiggle_design_dense.ncols();
+        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).sin());
+        let eta_w = wiggle_design_dense.dot(&beta_w);
+        let y = Array1::from_shape_fn(n, |i| 0.5 + 0.1 * (i as f64).cos());
+        let weights = Array1::from_elem(n, 1.0);
+        let mu_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xmu.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let family = GaussianLocationScaleWiggleFamily {
+            y,
+            weights,
+            mu_design: Some(mu_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cached_row_scalars: std::sync::RwLock::new(None),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_mu,
+                eta: eta_mu,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: eta_w,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "mu".to_string(),
+                design: mu_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: log_sigma_design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "wiggle".to_string(),
+                design: wiggle_block.design,
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        (family, states, specs, xmu, xls, wiggle_design_dense)
+    }
+
+    #[test]
+    fn gaussian_location_scale_wiggle_workspace_dh_operator_matches_dense() {
+        let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let d_beta = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).sin());
+
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &d_beta)
+            .expect("dense dH build")
+            .expect("dense dH present");
+        assert_eq!(dense_dh.nrows(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH op call")
+            .expect("dH op present");
+
+        let pmu = states[0].beta.len();
+        let pls = states[1].beta.len();
+        let probes = vec![
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == pmu { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == pmu + pls { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).cos()),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            let want = dense_dh.dot(w);
+            let got = dh_op.mul_vec(w);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "GLSW dH op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_wiggle_workspace_dh_operator_finite_difference() {
+        let (family, states, specs, xmu, xls, xw) = gls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
+        let v = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin());
+        let pmu = states[0].beta.len();
+        let pls = states[1].beta.len();
+        let eps = 1e-5;
+        let perturb = |sign: f64| -> Vec<ParameterBlockState> {
+            let mut out = states.clone();
+            for j in 0..pmu {
+                out[0].beta[j] += sign * eps * u[j];
+            }
+            for j in 0..pls {
+                out[1].beta[j] += sign * eps * u[pmu + j];
+            }
+            for j in 0..(p - pmu - pls) {
+                out[2].beta[j] += sign * eps * u[pmu + pls + j];
+            }
+            out[0].eta = xmu.dot(&out[0].beta);
+            out[1].eta = xls.dot(&out[1].beta);
+            out[2].eta = xw.dot(&out[2].beta);
+            out
+        };
+        let states_plus = perturb(1.0);
+        let states_minus = perturb(-1.0);
+        let h_plus = family
+            .exact_newton_joint_hessian(&states_plus)
+            .expect("dense H+")
+            .expect("dense H+ present");
+        let h_minus = family
+            .exact_newton_joint_hessian(&states_minus)
+            .expect("dense H-")
+            .expect("dense H- present");
+        let fd = (h_plus.dot(&v) - h_minus.dot(&v)) / (2.0 * eps);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&u)
+            .expect("dH op call")
+            .expect("dH op present");
+        let analytic = dh_op.mul_vec(&v);
+
+        for i in 0..p {
+            let tol = 5e-5 * fd[i].abs().max(1.0) + 5e-5;
+            assert!(
+                (fd[i] - analytic[i]).abs() <= tol,
+                "GLSW dH FD mismatch at {i}: fd={:.6e}, analytic={:.6e}",
+                fd[i],
+                analytic[i]
+            );
         }
     }
 

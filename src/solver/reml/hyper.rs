@@ -1462,16 +1462,23 @@ impl<'a> RemlState<'a> {
             // design derivative, we build an ImplicitHyperOperator that computes
             // B_j · v without materializing the full (p × p) matrix.
             //
-            // Note: the ImplicitHyperOperator covers the three dominant terms:
-            //   (∂X/∂ψ_d)^T (W · (X · v)) + X^T (W · ((∂X/∂ψ_d) · v)) + S_{ψ_d} · v
-            // Third-derivative corrections (non-Gaussian) and Firth drifts are NOT
-            // included in the implicit operator — they are small relative to the
-            // dominant terms and would require additional storage. For problems large
-            // enough to trigger implicit operators, these corrections contribute
-            // negligibly to the stochastic trace estimate.
+            // The ImplicitHyperOperator covers all four terms of B_j matrix-free:
+            //   1. (∂X/∂ψ_d)ᵀ W X v
+            //   2. Xᵀ W (∂X/∂ψ_d) v
+            //   3. Xᵀ diag(c ⊙ X_{ψ_d} β̂) X v   (non-Gaussian only, via c_x_psi_beta)
+            //   4. S_{ψ_d} v
+            // Firth Hessian drifts are NOT included (small for biobank-scale problems
+            // where implicit operators are activated).
             let b_operator: Option<std::sync::Arc<dyn super::unified::HyperOperator>> =
                 if use_implicit {
                     if let Some((implicit_deriv, axis)) = implicit_first {
+                        // Non-Gaussian: c ⊙ (X_{ψ_d} β̂), length n. `x_tau_beta_j`
+                        // was already computed above as X_{ψ_d} β̂.
+                        let c_x_psi_beta = if !is_gaussian_identity {
+                            Some(std::sync::Arc::new(c_array * &x_tau_beta_j))
+                        } else {
+                            None
+                        };
                         Some(std::sync::Arc::new(super::unified::ImplicitHyperOperator {
                             implicit_deriv,
                             axis,
@@ -1479,6 +1486,7 @@ impl<'a> RemlState<'a> {
                             w_diag: w_diag_shared.clone().unwrap(),
                             s_psi: s_tau_j.clone(),
                             p: p_dim,
+                            c_x_psi_beta,
                         }))
                     } else {
                         None
