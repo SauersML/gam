@@ -13484,8 +13484,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
                 // Drift trace: Σ_i tr(C_i(u_k) · L_i).
                 let u_k_t = u_k.slice(s![0..pt]).to_owned();
                 let u_k_ls = u_k.slice(s![pt..total]).to_owned();
-                let d_eta_t = fast_av(x_t, &u_k_t);
-                let d_eta_ls = fast_av(x_ls, &u_k_ls);
+                let d_eta_t = fast_av(&x_t, &u_k_t);
+                let d_eta_ls = fast_av(&x_ls, &u_k_ls);
                 let mut drift_trace = 0.0;
                 for i in 0..n {
                     let q = row_q[i];
@@ -16572,8 +16572,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let total = beta_layout.total();
         let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_flat, "wiggle joint d_beta")?;
-        let d_eta_t = fast_av(x_t, &u_t);
-        let d_eta_ls = fast_av(x_ls, &u_ls);
+        let d_eta_t = fast_av(&x_t, &u_t);
+        let d_eta_ls = fast_av(&x_ls, &u_ls);
 
         let d0 =
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
@@ -16771,10 +16771,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
         let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_u_flat, "wiggle joint d_beta_u")?;
         let (v_t, v_ls, vw) = beta_layout.split_three(d_betav_flat, "wiggle joint d_betav")?;
-        let d_eta_t_u = fast_av(x_t, &u_t);
-        let d_eta_ls_u = fast_av(x_ls, &u_ls);
-        let d_eta_tv = fast_av(x_t, &v_t);
-        let d_eta_lsv = fast_av(x_ls, &v_ls);
+        let d_eta_t_u = fast_av(&x_t, &u_t);
+        let d_eta_ls_u = fast_av(&x_ls, &u_ls);
+        let d_eta_tv = fast_av(&x_t, &v_t);
+        let d_eta_lsv = fast_av(&x_ls, &v_ls);
 
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
