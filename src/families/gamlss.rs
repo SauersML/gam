@@ -7,14 +7,14 @@ use crate::custom_family::{
     CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
-    CustomFamilyWarmStart, ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
-    ExactNewtonJointGradientEvaluation, ExactNewtonJointPsiSecondOrderTerms,
+    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, PsiDesignMap,
-    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
-    shared_dense_arc, weighted_crossprod_psi_maps,
+    PenaltyMatrix, PsiDesignMap, build_block_spatial_psi_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi_map,
+    resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc,
+    weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
@@ -7231,11 +7231,7 @@ fn make_two_block_design_row_coeff_operator(
     c_bb: Array1<f64>,
 ) -> Result<DesignTwoBlockRowCoeffOperator, String> {
     let nrows = x_a.nrows();
-    if x_b.nrows() != nrows
-        || c_aa.len() != nrows
-        || c_ab.len() != nrows
-        || c_bb.len() != nrows
-    {
+    if x_b.nrows() != nrows || c_aa.len() != nrows || c_ab.len() != nrows || c_bb.len() != nrows {
         return Err(format!(
             "two-block row coefficient operator dimension mismatch: rows a={}, b={}, coeffs={}/{}/{}",
             nrows,
@@ -12086,9 +12082,10 @@ impl BinomialLocationScaleFamily {
         &self,
         specs: Option<&[ParameterBlockSpec]>,
     ) -> Result<Option<(DesignMatrix, DesignMatrix)>, String> {
-        let designs = if let (Some(x_t), Some(x_ls)) =
-            (self.threshold_design.as_ref(), self.log_sigma_design.as_ref())
-        {
+        let designs = if let (Some(x_t), Some(x_ls)) = (
+            self.threshold_design.as_ref(),
+            self.log_sigma_design.as_ref(),
+        ) {
             Some((x_t.clone(), x_ls.clone()))
         } else if let Some(specs) = specs {
             if specs.len() != 2 {
@@ -12140,7 +12137,9 @@ impl BinomialLocationScaleFamily {
             || x_t.nrows() != n
             || x_ls.nrows() != n
         {
-            return Err("BinomialLocationScaleFamily joint gradient input size mismatch".to_string());
+            return Err(
+                "BinomialLocationScaleFamily joint gradient input size mismatch".to_string(),
+            );
         }
 
         let core = binomial_location_scale_core(
@@ -14225,8 +14224,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             return false;
         }
         let n = self.y.len();
-        specs[Self::BLOCK_T].design.nrows() == n
-            && specs[Self::BLOCK_LOG_SIGMA].design.nrows() == n
+        specs[Self::BLOCK_T].design.nrows() == n && specs[Self::BLOCK_LOG_SIGMA].design.nrows() == n
     }
 
     /// Batched analytic-gradient hook (Fix #8).
@@ -14645,7 +14643,9 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             ));
         }
         // u_t = X_t v_t, u_ls = X_ls v_ls
-        let u_t = self.x_t.matrixvectormultiply(&v.slice(s![0..pt]).to_owned());
+        let u_t = self
+            .x_t
+            .matrixvectormultiply(&v.slice(s![0..pt]).to_owned());
         let u_ls = self
             .x_ls
             .matrixvectormultiply(&v.slice(s![pt..total]).to_owned());
@@ -19523,6 +19523,149 @@ mod tests {
                     got[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_operator_workspace_never_densifies_specs() {
+        let n = 8usize;
+        let pt = 3usize;
+        let pls = 2usize;
+        let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+            ((i as f64) * 0.17 + (j as f64) * 0.29).sin()
+        });
+        let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+            ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.5
+        });
+        let beta_t = array![0.20, -0.10, 0.05];
+        let beta_ls = array![0.30, -0.15];
+        let eta_t = xt.dot(&beta_t);
+        let eta_ls = xls.dot(&beta_ls);
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })),
+            weights: Array1::from_elem(n, 1.0),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t,
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+        ];
+        let specs = vec![
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
+                design: no_densify_design(xt.clone()),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: no_densify_design(xls.clone()),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            },
+        ];
+        assert!(family.supports_matrix_free_joint_hessian(&specs));
+
+        let dense_h = family
+            .exact_newton_joint_hessian_from_designs(&states, &xt, &xls)
+            .expect("dense reference Hessian")
+            .expect("dense Hessian present");
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("operator workspace build")
+            .expect("operator workspace present");
+        let v = array![0.30, -0.70, 0.50, -0.20, 0.15];
+        let got_hv = workspace
+            .hessian_matvec(&v)
+            .expect("operator matvec")
+            .expect("operator matvec present");
+        let want_hv = dense_h.dot(&v);
+        for i in 0..v.len() {
+            let tol = 1e-10 * want_hv[i].abs().max(1.0) + 1e-10;
+            assert!(
+                (want_hv[i] - got_hv[i]).abs() <= tol,
+                "lazy BLS Hv mismatch at {i}: dense={:.6e}, op={:.6e}",
+                want_hv[i],
+                got_hv[i]
+            );
+        }
+
+        let got_diag = workspace
+            .hessian_diagonal()
+            .expect("operator diagonal")
+            .expect("operator diagonal present");
+        for i in 0..v.len() {
+            let want = dense_h[[i, i]];
+            let tol = 1e-10 * want.abs().max(1.0) + 1e-10;
+            assert!(
+                (want - got_diag[i]).abs() <= tol,
+                "lazy BLS diagonal mismatch at {i}: dense={:.6e}, op={:.6e}",
+                want,
+                got_diag[i]
+            );
+        }
+
+        let dense_xt = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
+        let dense_xls = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let want_grad = family
+            .exact_newton_joint_gradient_from_designs(&states, &dense_xt, &dense_xls)
+            .expect("dense reference gradient");
+        let got_grad = family
+            .exact_newton_joint_gradient_evaluation(&states, &specs)
+            .expect("operator gradient")
+            .expect("operator gradient present");
+        assert!(
+            (want_grad.log_likelihood - got_grad.log_likelihood).abs() <= 1e-12,
+            "operator gradient log-likelihood mismatch"
+        );
+        for i in 0..v.len() {
+            let want = want_grad.gradient[i];
+            let got = got_grad.gradient[i];
+            let tol = 1e-10 * want.abs().max(1.0) + 1e-10;
+            assert!(
+                (want - got).abs() <= tol,
+                "lazy BLS gradient mismatch at {i}: dense={:.6e}, op={:.6e}",
+                want,
+                got
+            );
+        }
+
+        let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let dense_dh = family
+            .exact_newton_joint_hessian_directional_derivative_from_designs(
+                &states, &xt, &xls, &d_beta,
+            )
+            .expect("dense dH")
+            .expect("dense dH present");
+        let got_dh_v = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("operator dH")
+            .expect("operator dH present")
+            .mul_vec(&v);
+        let want_dh_v = dense_dh.dot(&v);
+        for i in 0..v.len() {
+            let tol = 1e-9 * want_dh_v[i].abs().max(1.0) + 1e-9;
+            assert!(
+                (want_dh_v[i] - got_dh_v[i]).abs() <= tol,
+                "lazy BLS dH*v mismatch at {i}: dense={:.6e}, op={:.6e}",
+                want_dh_v[i],
+                got_dh_v[i]
+            );
         }
     }
 
