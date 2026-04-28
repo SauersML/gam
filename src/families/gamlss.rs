@@ -17211,7 +17211,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         mirror_upper_to_lower(&mut d_h);
         Ok(Some(d_h))
     }
+}
 
+impl BinomialLocationScaleWiggleFamily {
     /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
     /// directional derivative `D_β H_L[u]`. Channels (in order):
     /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the
@@ -17384,7 +17386,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             n,
         ))))
     }
+}
 
+impl CustomFamily for BinomialLocationScaleWiggleFamily {
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
