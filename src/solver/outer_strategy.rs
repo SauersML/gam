@@ -38,14 +38,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///   column-by-column `matvec`. Implementors override this when they can
 ///   amortize per-Hv-apply overhead (cached factorizations, parallel matvecs)
 ///   across many right-hand-sides.
+/// - [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) — an explicit
+///   work-model hint for callers deciding whether probing every column is
+///   affordable.
 /// - [`materialize_dense`](Self::materialize_dense) — the special case
 ///   `mul_mat(I_dim)` followed by a symmetric average of the off-diagonals to
-///   absorb round-off asymmetry. Used by the small-K planner path
-///   (see [`OUTER_HVP_MATERIALIZE_MAX_DIM`]) and by post-fit posterior code
-///   paths that need a concrete matrix.
+///   absorb round-off asymmetry. Callers should only use this for planning
+///   when [`is_cheap_to_materialize`](Self::is_cheap_to_materialize) is true,
+///   or for post-fit code paths that explicitly need a concrete matrix.
 pub trait OuterHessianOperator: Send + Sync {
     fn dim(&self) -> usize;
     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String>;
+
+    /// Whether probing all basis columns is cheap enough for dense ARC.
+    ///
+    /// The default is deliberately conservative. For operator-backed Duchon,
+    /// CTN, survival, or other row-streaming kernels, `dim <= 64` does not
+    /// imply cheap materialization: each column may trigger a full data pass.
+    fn is_cheap_to_materialize(&self) -> bool {
+        false
+    }
 
     /// Apply the operator to all `m` columns of `factor`, returning a
     /// `dim × m` matrix whose `j`th column is `H · factor[:, j]`.
@@ -165,51 +177,16 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
         }
         Ok(out)
     }
+
+    fn is_cheap_to_materialize(&self) -> bool {
+        self.base.is_cheap_to_materialize()
+    }
 }
 
-/// Maximum outer-Hessian operator dimension at which the planner materializes
-/// the `K × K` dense matrix (via [`OuterHessianOperator::mul_mat`]`(I_K)`)
-/// before handing it to the dense ARC/Newton path.
-///
-/// # Cost model
-///
-/// Matrix-free operator trust-region runs Steihaug-Toint CG inside each outer
-/// step; CG converges in at most `K` iterations on a `K × K` SPD operator,
-/// so its per-outer-step cost is bounded above by `K · cost(matvec)`.
-/// Materializing the operator into a dense matrix costs the same: one
-/// `mul_mat(I_K)` is exactly `K` Hv applies (modulo the per-eval cache
-/// amortization implementors can put behind [`mul_mat`](OuterHessianOperator::mul_mat)).
-///
-/// At the same per-iteration cost the dense path additionally:
-///
-/// - factors `H` *exactly* (Cholesky / eigendecomp) and reuses the
-///   factorization across the trust-region's polynomial-step search, where
-///   CG would have to restart from `g`;
-/// - delivers the unmodified Newton step instead of CG's truncated step;
-/// - lets the existing ARC trust-region implementation (`ArcOptimizer`) take
-///   over the entire policy with all its cubic-regularization machinery
-///   instead of re-implementing it for the operator path.
-///
-/// At small `K` (this regime — typical for spatial smoothing fits with a few
-/// dozen smoothing parameters) the dense path therefore wins at every layer:
-/// fewer total Hv applies (CG often takes more than `K` iterations across the
-/// full trust-region search), fewer policy bugs, fewer numerics. At large
-/// `K` the `O(K²)` materialization storage and `O(K³)` factorization cost
-/// dominate and operator-CG's truncated approximation pays off.
-///
-/// Crossover is empirical and conservative: 64 is well below the regime where
-/// the `K × K` dense factorization could become a bottleneck (it's
-/// microseconds at this scale) and well above the `K ≤ 16` regime where
-/// every realistic GAM smoothing-parameter count lands.
-///
-/// # Single source of truth
-///
-/// This constant only governs *planner-side* representation choice. The
-/// *eval-side* operator-vs-dense gate lives in
-/// [`crate::solver::reml::unified::prefer_outer_hessian_operator`] and
-/// considers `(n, p, K)` jointly. Don't add a duplicate `K`-only check on the
-/// eval side; if you need to tune the materialization threshold, change this
-/// constant.
+/// Upper safety bound for operator materialization after the operator has
+/// explicitly declared that dense probing is cheap. Dimension alone is never
+/// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
+/// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
 
 /// Hv-apply counter wrapping an `OuterHessianOperator`.
@@ -1509,6 +1486,9 @@ fn validate_second_order_seed_hessian(
     if layout.n_params > SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS || !eval.hessian.is_analytic() {
         return Ok(());
     }
+    if matches!(&eval.hessian, HessianResult::Operator(op) if !op.is_cheap_to_materialize()) {
+        return Ok(());
+    }
 
     let Some(hessian) = eval.hessian.materialize_dense().map_err(|message| {
         ObjectiveEvalError::recoverable(format!(
@@ -1636,12 +1616,12 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             HessianSource::Analytic => match eval.hessian {
                 HessianResult::Analytic(h) => Some(h),
                 HessianResult::Operator(ref op)
-                    if op.dim() <= self.materialize_operator_max_dim =>
+                    if op.is_cheap_to_materialize()
+                        && op.dim() <= self.materialize_operator_max_dim =>
                 {
-                    // Small-K outer Hessian: basis-probe the Hv operator into a
-                    // dense K×K matrix so the dense ARC path can run an exact
-                    // factorization instead of inexact operator-CG. See
-                    // `OUTER_HVP_MATERIALIZE_MAX_DIM` for the rationale.
+                    // Work-model-approved operator: basis-probe the Hv
+                    // operator into a dense K×K matrix so the dense ARC path
+                    // can run an exact factorization.
                     Some(op.materialize_dense().map_err(|message| {
                         ObjectiveEvalError::Fatal {
                             message: format!(
@@ -3021,18 +3001,16 @@ fn run_outer_with_plan(
                 started_seeds += 1;
                 seed_slot = started_seeds;
 
-                let small_k_operator = matches!(
+                let cheap_materializable_operator = matches!(
                     seed_eval.hessian,
-                    HessianResult::Operator(ref op) if op.dim() <= OUTER_HVP_MATERIALIZE_MAX_DIM
+                    HessianResult::Operator(ref op)
+                        if op.is_cheap_to_materialize()
+                            && op.dim() <= OUTER_HVP_MATERIALIZE_MAX_DIM
                 );
-                if small_k_operator {
-                    // K is small enough that a one-shot K×K basis-probe of the
-                    // Hv operator is cheaper end-to-end than running
-                    // Steihaug-Toint CG inside operator trust-region. Convert
-                    // the seed Hessian to dense in-place; the dense ARC path
-                    // and the bridge's `materialize_operator_max_dim` field
-                    // ensure subsequent outer evaluations are also
-                    // materialized.
+                if cheap_materializable_operator {
+                    // The operator's own work model says probing every column
+                    // is cheap; convert the seed Hessian to dense in-place.
+                    // Subsequent bridge evaluations apply the same predicate.
                     if let HessianResult::Operator(op) = &seed_eval.hessian {
                         match op.materialize_dense() {
                             Ok(dense) => {
@@ -3554,6 +3532,10 @@ mod tests {
 
         fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
             Ok(v.clone())
+        }
+
+        fn is_cheap_to_materialize(&self) -> bool {
+            true
         }
 
         fn materialize_dense(&self) -> Result<Array2<f64>, String> {
