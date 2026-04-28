@@ -1252,7 +1252,7 @@ pub fn parse_link_choice(
     let Some(v) = raw else {
         return Ok(Some(LinkChoice {
             mode: LinkMode::Flexible,
-            link: LinkFunction::Logit,
+            link: LinkFunction::Probit,
             mixture_components: None,
         }));
     };

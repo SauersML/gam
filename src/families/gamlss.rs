@@ -35,7 +35,7 @@ use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_pdf, standard_normal_quantile};
+use crate::probability::{normal_logcdf, normal_logsf, normal_pdf, standard_normal_quantile};
 use crate::smooth::{
     BlockwisePenalty, ExactJointHyperSetup, PenaltyBlockInfo,
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
@@ -4180,6 +4180,24 @@ fn binomial_location_scale_q0(eta_t: f64, sigma: f64) -> f64 {
     -eta_t / sigma
 }
 
+#[inline]
+fn binomial_location_scale_log_likelihood(
+    y: f64,
+    weight: f64,
+    q: f64,
+    link_kind: &InverseLink,
+    mu: f64,
+) -> f64 {
+    if weight == 0.0 {
+        return 0.0;
+    }
+    if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        return weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q));
+    }
+    let (mu_clamped, _) = clamped_binomial_probability(mu);
+    weight * (y * mu_clamped.ln() + (1.0_f64 - y) * (1.0_f64 - mu_clamped).ln())
+}
+
 fn binomial_location_scalerow(
     y: f64,
     weight: f64,
@@ -4196,6 +4214,7 @@ fn binomial_location_scalerow(
     let q = q0 + etawiggle;
     let mut jet = inverse_link_jet_for_inverse_link(link_kind, q)
         .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+    let raw_mu = jet.mu;
     let (mu_clamped, clamp_active) = clamped_binomial_probability(jet.mu);
     jet.mu = mu_clamped;
     if clamp_active {
@@ -4204,7 +4223,7 @@ fn binomial_location_scalerow(
         jet.d3 = 0.0;
     }
     let inverse_link = inverse_linkrow(jet);
-    let ll = weight * (y * inverse_link.mu.ln() + (1.0_f64 - y) * (1.0_f64 - inverse_link.mu).ln());
+    let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu);
     Ok(BinomialLocationScaleRow {
         sigma,
         dsigma_deta,
@@ -4239,13 +4258,18 @@ fn binomial_location_scale_ll_only(
                 let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(el_slice[i]);
                 let q0 = binomial_location_scale_q0(et_slice[i], sigma);
                 let q = q0 + ew_slice.map_or(0.0, |w| w[i]);
+                if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+                    return Ok(acc
+                        + binomial_location_scale_log_likelihood(
+                            y_slice[i], w_slice[i], q, link_kind, 0.5,
+                        ));
+                }
                 let jet = inverse_link_jet_for_inverse_link(link_kind, q)
                     .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-                let (mu_clamped, _) = clamped_binomial_probability(jet.mu);
                 Ok(acc
-                    + w_slice[i]
-                        * (y_slice[i] * mu_clamped.ln()
-                            + (1.0 - y_slice[i]) * (1.0 - mu_clamped).ln()))
+                    + binomial_location_scale_log_likelihood(
+                        y_slice[i], w_slice[i], q, link_kind, jet.mu,
+                    ))
             },
         )
         .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))

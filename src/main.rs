@@ -14831,6 +14831,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_link_choice_flexible_shorthand_defaults_to_probit() {
+        let choice = parse_link_choice(None, true)
+            .expect("parse flexible shorthand")
+            .expect("link choice");
+        assert!(matches!(choice.mode, LinkMode::Flexible));
+        assert!(matches!(choice.link, LinkFunction::Probit));
+        assert!(choice.mixture_components.is_none());
+    }
+
+    #[test]
     fn parse_survival_inverse_link_accepts_sas_init() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
