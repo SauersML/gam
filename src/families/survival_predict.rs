@@ -276,8 +276,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 saved_likelihood_mode,
             )?;
 
-            let cov_row = cov_design.design.as_dense_cow().row(i).to_owned();
-
             let (eta_t, cum_t, haz_t) = match saved_likelihood_mode {
                 SurvivalLikelihoodMode::MarginalSlope => {
                     let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
@@ -294,6 +292,8 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     )?
                 }
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                    let cov_row =
+                        design_row_owned(&cov_design.design, i, "survival predict covariate row")?;
                     evaluate_rp_row(
                         model,
                         &row_time,
@@ -341,7 +341,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 &baseline_cfg,
                 saved_likelihood_mode,
             )?;
-            let cov_row = cov_design.design.as_dense_cow().row(i).to_owned();
             let (eta_t, _, _) = match saved_likelihood_mode {
                 SurvivalLikelihoodMode::MarginalSlope => {
                     let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
@@ -358,6 +357,8 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     )?
                 }
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                    let cov_row =
+                        design_row_owned(&cov_design.design, i, "survival predict covariate row")?;
                     evaluate_rp_row(
                         model,
                         &row_time,
@@ -407,12 +408,10 @@ struct MarginalSlopePredictContext {
     /// Covariate (marginal) coefficients.
     beta_marginal: Array1<f64>,
     saved_timewiggle: Option<SavedBaselineTimeWiggleRuntime>,
-    /// Dense covariate design (n × p_marginal). Stored once so per-row eta
-    /// assembly can copy the row without re-building the design.
-    cov_design_dense: Array2<f64>,
-    /// Dense logslope design (n × p_logslope), built once from the saved
-    /// `resolved_termspec_logslope`.
-    logslope_design_dense: Array2<f64>,
+    /// Covariate design (n × p_marginal), kept operator-backed when possible.
+    cov_design: DesignMatrix,
+    /// Logslope design (n × p_logslope), kept operator-backed when possible.
+    logslope_design: DesignMatrix,
     /// Per-row covariate eta = `cov_design[i] · beta_marginal`. Used to
     /// pre-compute `q_exit_base`.
     cov_eta: Array1<f64>,
@@ -422,6 +421,17 @@ struct MarginalSlopePredictContext {
     /// Per-row noise offset, mirroring the `pred_input.offset_noise` slice
     /// used by the CLI.
     noise_offset: Array1<f64>,
+}
+
+fn design_row_owned(
+    design: &DesignMatrix,
+    row: usize,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    let chunk = design
+        .try_row_chunk(row..row + 1)
+        .map_err(|e| format!("{context}: {e}"))?;
+    Ok(chunk.row(0).to_owned())
 }
 
 fn build_marginal_slope_predict_context(
@@ -483,9 +493,6 @@ fn build_marginal_slope_predict_context(
     let saved_runtime = model.saved_prediction_runtime()?;
     let saved_timewiggle = saved_runtime.baseline_time_wiggle.clone();
 
-    let cov_design_dense = cov_design.to_dense();
-    let logslope_design_dense = logslope_design.design.to_dense();
-
     // cov_eta is time-independent so doing it here avoids `O(n × T)`
     // re-multiplications inside the per-cell loop.
     let cov_eta = cov_design.dot(&beta_marginal);
@@ -495,8 +502,8 @@ fn build_marginal_slope_predict_context(
         beta_time,
         beta_marginal,
         saved_timewiggle,
-        cov_design_dense,
-        logslope_design_dense,
+        cov_design: cov_design.clone(),
+        logslope_design: logslope_design.design.clone(),
         cov_eta,
         z_raw,
         noise_offset: noise_offset.clone(),
@@ -604,10 +611,15 @@ fn evaluate_marginal_slope_row(
             .assign(exit_w);
     }
     if cov_dim > 0 {
+        let cov_row = design_row_owned(
+            &ctx.cov_design,
+            row_index,
+            "survival marginal covariate row",
+        )?;
         q_design_full
             .slice_mut(s![.., p_time_base + p_timewiggle..])
             .row_mut(0)
-            .assign(&ctx.cov_design_dense.row(row_index));
+            .assign(&cov_row);
     }
 
     // Logslope design row + offset chosen so that the predictor's logslope_eta
@@ -616,7 +628,11 @@ fn evaluate_marginal_slope_row(
     //                  + offset_noise.
     // We feed the actual saved logslope row + the row's noise offset, matching
     // exactly the CLI's `pred_input.design_noise` / `offset_noise` slice.
-    let logslope_row = ctx.logslope_design_dense.row(row_index).to_owned();
+    let logslope_row = design_row_owned(
+        &ctx.logslope_design,
+        row_index,
+        "survival marginal logslope row",
+    )?;
     let mut logslope_design_2d = Array2::<f64>::zeros((1, logslope_row.len()));
     logslope_design_2d.row_mut(0).assign(&logslope_row);
 

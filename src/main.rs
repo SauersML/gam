@@ -10296,8 +10296,8 @@ fn write_survival_binary_prediction_csv(
 mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
-        FAMILY_GAUSSIAN_LOCATION_SCALE, FittedFamily, LikelihoodFamily, LinkChoice, LinkMode,
-        MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
+        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
+        LinkMode, MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error,
@@ -10308,7 +10308,7 @@ mod tests {
         linkname, load_dataset_projected, parse_formula, parse_link_choice,
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_baseline_config,
         parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
-        pretty_familyname, required_columns_for_fit, summarizewiggle_domain,
+        pretty_familyname, required_columns_for_fit, resolve_family, summarizewiggle_domain,
         validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
         write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
