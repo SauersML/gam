@@ -19485,10 +19485,6 @@ mod tests {
             Some(d) => d.clone(),
             None => panic!("wiggle design must be dense for this test fixture"),
         };
-        let pw = wiggle_design_dense.ncols();
-        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
-        let eta_w = wiggle_design_dense.dot(&beta_w);
-
         let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let threshold_design =
@@ -19505,6 +19501,20 @@ mod tests {
             wiggle_degree: 2,
             policy: crate::resource::ResourcePolicy::default_library(),
         };
+        let q0 = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(eta_ls.iter())
+                .map(|(&eta_t_i, &eta_ls_i)| {
+                    binomial_location_scale_q0(eta_t_i, exp_sigma_from_eta_scalar(eta_ls_i))
+                }),
+        );
+        let wiggle_design_current = family
+            .wiggle_design(q0.view())
+            .expect("current wiggle basis");
+        let pw = wiggle_design_current.ncols();
+        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
+        let eta_w = wiggle_design_current.dot(&beta_w);
         let states = vec![
             ParameterBlockState {
                 beta: beta_t,
@@ -19624,9 +19634,6 @@ mod tests {
             Some(d) => d.clone(),
             None => panic!("wiggle design must be dense for this test fixture"),
         };
-        let pw = wiggle_design_dense.ncols();
-        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
-        let eta_w = wiggle_design_dense.dot(&beta_w);
         let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let threshold_design =
@@ -19643,6 +19650,20 @@ mod tests {
             wiggle_degree: 2,
             policy: crate::resource::ResourcePolicy::default_library(),
         };
+        let q0 = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(eta_ls.iter())
+                .map(|(&eta_t_i, &eta_ls_i)| {
+                    binomial_location_scale_q0(eta_t_i, exp_sigma_from_eta_scalar(eta_ls_i))
+                }),
+        );
+        let wiggle_design_current = family
+            .wiggle_design(q0.view())
+            .expect("current wiggle basis");
+        let pw = wiggle_design_current.ncols();
+        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
+        let eta_w = wiggle_design_current.dot(&beta_w);
         let states = vec![
             ParameterBlockState {
                 beta: beta_t,
@@ -19686,7 +19707,7 @@ mod tests {
                 initial_beta: None,
             },
         ];
-        (family, states, specs, xt, xls, wiggle_design_dense)
+        (family, states, specs, xt, xls, wiggle_design_current)
     }
 
     #[test]
