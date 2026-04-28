@@ -336,6 +336,10 @@ struct RowKernelDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {
 impl<const K: usize, T: RowKernel<K>> HyperOperator
     for RowKernelDirectionalDerivativeOperator<K, T>
 {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let direction = v
             .as_slice()
@@ -394,6 +398,10 @@ struct RowKernelSecondDirectionalDerivativeOperator<const K: usize, T: RowKernel
 impl<const K: usize, T: RowKernel<K>> HyperOperator
     for RowKernelSecondDirectionalDerivativeOperator<K, T>
 {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let direction = v
             .as_slice()

@@ -3816,6 +3816,10 @@ impl CustomFamilyJointPsiOperator {
 }
 
 impl HyperOperator for CustomFamilyJointPsiOperator {
+    fn dim(&self) -> usize {
+        self.total_dim
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         assert_eq!(v.len(), self.total_dim);
         let base_vals: Vec<Array1<f64>> = self
@@ -8281,6 +8285,10 @@ struct ScaledHyperOperator {
 }
 
 impl HyperOperator for ScaledHyperOperator {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         self.inner.mul_vec(v).mapv(|value| self.scale * value)
     }

@@ -1552,6 +1552,10 @@ impl BlockLocalDrift {
 }
 
 impl HyperOperator for BlockLocalDrift {
+    fn dim(&self) -> usize {
+        self.end
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::zeros(v.len());
         self.mul_vec_into(v.view(), out.view_mut());
@@ -1808,6 +1812,10 @@ pub struct ImplicitHyperOperator {
 }
 
 impl HyperOperator for ImplicitHyperOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         // Single canonical path: route every matvec through `mul_vec_into`,
         // which routes through `matvec_with_shared_xz_into`. The four terms of
@@ -2131,6 +2139,10 @@ pub struct SparseDirectionalHyperOperator {
 }
 
 impl HyperOperator for SparseDirectionalHyperOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p);
 
@@ -2689,6 +2701,10 @@ pub struct PenaltyHyperOperator<'a> {
 }
 
 impl HyperOperator for PenaltyHyperOperator<'_> {
+    fn dim(&self) -> usize {
+        self.coord.dim()
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v.view(), out.view_mut());
@@ -3390,6 +3406,10 @@ fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn Hy
     }
 
     impl HyperOperator for OwnedPenaltyHyperOperator {
+        fn dim(&self) -> usize {
+            self.coord.dim()
+        }
+
         fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
             let mut out = Array1::<f64>::zeros(v.len());
             self.mul_vec_into(v.view(), out.view_mut());
@@ -5466,6 +5486,10 @@ pub(crate) struct WeightedHyperOperator {
 }
 
 impl HyperOperator for WeightedHyperOperator {
+    fn dim(&self) -> usize {
+        self.dim_hint
+    }
+
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(v.len());
         self.mul_vec_into(v.view(), out.view_mut());
