@@ -2167,6 +2167,21 @@ pub fn should_use_implicit_operators_with_policy(
     dense_bytes > policy.max_single_materialization_bytes
 }
 
+fn implicit_radial_cache_bytes(n: usize, k: usize, n_axes: usize) -> usize {
+    n.saturating_mul(k)
+        .saturating_mul(n_axes.saturating_add(3))
+        .saturating_mul(8)
+}
+
+fn should_cache_implicit_radial_components(
+    n: usize,
+    k: usize,
+    n_axes: usize,
+    policy: &crate::resource::ResourcePolicy,
+) -> bool {
+    implicit_radial_cache_bytes(n, k, n_axes) <= policy.max_operator_cache_bytes
+}
+
 pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
     let first = dense_design_bytes(n, p).saturating_mul(d_pc);
     let second = dense_design_bytes(n, p).saturating_mul(d_pc.saturating_mul(d_pc));
@@ -4363,20 +4378,20 @@ fn build_aniso_design_psi_derivatives_shared(
         )));
     }
 
+    let policy = crate::resource::ResourcePolicy::default_library();
     let force_operator = radial_kind.is_duchon_family();
-    let use_implicit = force_operator
-        || should_use_implicit_operators_with_policy(
-            n,
-            p_final,
-            dim,
-            &crate::resource::ResourcePolicy::default_library(),
-        );
+    let dense_derivatives_exceed_budget =
+        should_use_implicit_operators_with_policy(n, p_final, dim, &policy);
+    let operator_only = force_operator || dense_derivatives_exceed_budget;
+    let cache_radial_components = should_cache_implicit_radial_components(n, k, dim, &policy);
 
     // ── Streaming path: biobank scale ─────────────────────────────────────
-    // When dense materialization would exceed the memory threshold, build a
-    // streaming operator that stores only data/centers/eta/radial_kind and
-    // recomputes (q, t, s_a) on the fly during every matvec.
-    if use_implicit {
+    // When even the compact radial cache would exceed the operator-cache
+    // budget, store only data/centers/eta/radial_kind and recompute
+    // (q, t, s_a) chunkwise during each matvec. Otherwise the operator-only
+    // path below caches phi/q/t/s_a without materializing dense derivative
+    // matrices.
+    if operator_only && !cache_radial_components {
         let op = ImplicitDesignPsiDerivative::new_streaming(
             shared_owned_data_matrix_from_view(data),
             shared_owned_centers_matrix_from_view(centers),
@@ -4399,7 +4414,7 @@ fn build_aniso_design_psi_derivatives_shared(
         });
     }
 
-    // ── Materialized path: small-to-medium non-Duchon problems ────────────
+    // ── Materialized radial-cache path ────────────────────────────────────
     // Allocate O(n*k) arrays up front and fill with parallel chunks that
     // write directly into preallocated storage via raw pointers. No
     // intermediate Vec<(i, q_row, t_row, s_row)> collection.
@@ -4473,6 +4488,21 @@ fn build_aniso_design_psi_derivatives_shared(
         dim,
     )
     .with_psi_scale_share(psi_scale_share);
+
+    if operator_only {
+        return Ok(AnisoBasisPsiDerivatives {
+            design_first: Vec::new(),
+            design_second_diag: Vec::new(),
+            design_second_cross: Vec::new(),
+            design_second_cross_pairs: Vec::new(),
+            penalties_first: vec![Vec::new(); dim],
+            penalties_second_diag: vec![Vec::new(); dim],
+            penalties_cross_pairs: Vec::new(),
+            penalties_cross_provider: None,
+            implicit_operator: Some(op),
+        });
+    }
+
     let design_first = (0..dim)
         .map(|a| op.materialize_first(a))
         .collect::<Result<Vec<_>, _>>()?;
@@ -4523,15 +4553,13 @@ fn build_scalar_design_psi_derivatives_shared(
         )));
     }
 
+    let policy = crate::resource::ResourcePolicy::default_library();
     let force_operator = radial_kind.is_duchon_family();
-    if force_operator
-        || should_use_implicit_operators_with_policy(
-            n,
-            p_final,
-            1,
-            &crate::resource::ResourcePolicy::default_library(),
-        )
-    {
+    let dense_derivatives_exceed_budget =
+        should_use_implicit_operators_with_policy(n, p_final, 1, &policy);
+    let operator_only = force_operator || dense_derivatives_exceed_budget;
+    let cache_radial_components = should_cache_implicit_radial_components(n, k, 1, &policy);
+    if operator_only && !cache_radial_components {
         let metric_eta = fixed_eta
             .map(|eta| eta.to_vec())
             .unwrap_or_else(|| vec![0.0; dim]);
@@ -4626,6 +4654,14 @@ fn build_scalar_design_psi_derivatives_shared(
         1,
     )
     .with_psi_scale_share(psi_scale_share);
+
+    if operator_only {
+        return Ok(ScalarDesignPsiDerivatives {
+            design_first: Array2::<f64>::zeros((0, 0)),
+            design_second_diag: Array2::<f64>::zeros((0, 0)),
+            implicit_operator: Some(op),
+        });
+    }
 
     Ok(ScalarDesignPsiDerivatives {
         design_first: op.materialize_first(0)?,
