@@ -6030,22 +6030,35 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     const OPERATOR_LAMBDA_LOG_WINDOW: f64 = 6.0;
     const OPERATOR_LAMBDA_LOG_LOWER_FLOOR: f64 = -10.0;
     const OPERATOR_LAMBDA_LOG_UPPER_CAP: f64 = 30.0;
+    // Box bounds must satisfy `lower ≤ upper` per slot (the downstream
+    // `f64::clamp` panics on inverted bounds). The natural ±WINDOW interval
+    // around `initial_theta[idx]` is non-decreasing, so clamping BOTH
+    // endpoints into the same `[floor, cap]` range preserves order. A
+    // separate one-sided floor on the lower endpoint (without a matching
+    // cap on the upper) is what produced the inverted-bound panic when a
+    // pathological baseline pushed `initial_theta[idx] + WINDOW` below the
+    // floor: the lower endpoint snapped up to the floor while the upper
+    // stayed beneath it.
     let eps_lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
         if idx < rho_dim {
             -30.0_f64
         } else if idx < operator_slots_end {
-            (initial_theta[idx] - OPERATOR_LAMBDA_LOG_WINDOW).max(OPERATOR_LAMBDA_LOG_LOWER_FLOOR)
+            (initial_theta[idx] - OPERATOR_LAMBDA_LOG_WINDOW)
+                .clamp(OPERATOR_LAMBDA_LOG_LOWER_FLOOR, OPERATOR_LAMBDA_LOG_UPPER_CAP)
         } else {
-            (initial_theta[idx] - EPSILON_LOG_WINDOW).max(adaptive_opts.min_epsilon.max(1e-12).ln())
+            let eps_floor = adaptive_opts.min_epsilon.max(1e-12).ln();
+            (initial_theta[idx] - EPSILON_LOG_WINDOW).max(eps_floor)
         }
     }));
     let eps_upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
         if idx < rho_dim {
             30.0_f64
         } else if idx < operator_slots_end {
-            (initial_theta[idx] + OPERATOR_LAMBDA_LOG_WINDOW).min(OPERATOR_LAMBDA_LOG_UPPER_CAP)
+            (initial_theta[idx] + OPERATOR_LAMBDA_LOG_WINDOW)
+                .clamp(OPERATOR_LAMBDA_LOG_LOWER_FLOOR, OPERATOR_LAMBDA_LOG_UPPER_CAP)
         } else {
-            initial_theta[idx] + EPSILON_LOG_WINDOW
+            let eps_floor = adaptive_opts.min_epsilon.max(1e-12).ln();
+            (initial_theta[idx] + EPSILON_LOG_WINDOW).max(eps_floor)
         }
     }));
     let blockspec = ParameterBlockSpec {
