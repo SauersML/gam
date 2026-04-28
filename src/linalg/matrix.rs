@@ -3828,19 +3828,42 @@ pub fn xt_diag_x_symmetric(
     match design {
         DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(x.diag_xtw_x(diag)?)),
         DesignMatrix::Sparse(xs) => {
-            // Assemble X^T diag(w) X directly into a banded upper-triangle CSC
-            // via SparseHessianAccumulator.  Compared to the triplet-roundtrip
-            // this avoids the O(nnz) Triplet vector, the implicit sort+merge,
-            // and the per-row (a,b) canonicalization.
+            // The macOS sample profile of matern60 fingered this function as
+            // 58% of main-thread cycles, all in
+            // `SparseHessianAccumulator::from_multi_csr → BTreeSet::insert`:
+            // every PIRLS Newton iteration was rebuilding the symbolic upper
+            // pattern from scratch via O(nnz²·log) BTreeSet insertions, even
+            // though the symbolic pattern depends only on X (not on the
+            // weights). For a Matern radial design at n=10K it dominates over
+            // the actual numeric assembly.
             //
-            // Row-parallel via rayon: each thread accumulates into a local
-            // values buffer that shares the symbolic pattern (Arc), then we
-            // reduce the per-thread buffers element-wise.  This is the
-            // dominant inner cost for fully-dense bases stored sparsely
-            // (Matern radial / Duchon), where the per-row add_upper inner
-            // loop is `O(nnz_row²)` and previously ran serially.  Reduce
-            // cost is O(nnz · threads) — at p ~ 100 with nnz ~ 5K and 16
-            // threads, ~80K scalar adds, negligible.
+            // Two regimes:
+            //   (A) Numerically dense — Matern / Duchon: every column has a
+            //       nonzero, so XᵀWX fills in completely. Densify via the
+            //       cached `to_dense_arc` and dispatch to the
+            //       `streaming_blas_xt_diag_x` path (faer parallel matmul,
+            //       SIMD GEMM). This avoids both the symbolic build and the
+            //       scalar accumulate entirely.
+            //   (B) Genuinely sparse — B-spline / banded: per-row work is
+            //       O(nnz_row²) at small constant factor; the sparse
+            //       row-parallel accumulator is the right tool.
+            // Heuristic: avg_nnz_per_row · 4 ≥ p picks (A). The sparse-native
+            // PIRLS path upstream already routes truly-sparse Hessians around
+            // this function, so (A) is the dominant call site we have today.
+            let n = xs.nrows();
+            let p = xs.ncols();
+            let nnz_x = xs.val().len();
+            let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
+            let dense_regime = 4 * avg_nnz_row >= p;
+            if dense_regime {
+                let xd = xs.to_dense_arc();
+                let mut xtwx = Array2::<f64>::zeros((p, p));
+                streaming_blas_xt_diag_x(xd.as_ref(), diag, &mut xtwx);
+                return Ok(SymmetricMatrix::Dense(xtwx));
+            }
+            // Genuinely-sparse fallback: row-parallel accumulator that
+            // shares the symbolic pattern via Arc, so the BTreeSet build
+            // happens once and the values buffers are zero-init per chunk.
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let csr = xs
                 .to_csr_arc()
@@ -3849,11 +3872,7 @@ pub fn xt_diag_x_symmetric(
             let row_ptr = sym.row_ptr();
             let col_idx = sym.col_idx();
             let vals = csr.val();
-            let acc_template = SparseHessianAccumulator::from_single_csr(&*csr, xs.ncols());
-            let n = xs.nrows();
-            // Row-chunk size: aim for ~16 chunks per thread of work so the
-            // last few stragglers don't tail-out the parallel region. Cap
-            // by a minimum chunk to amortize the empty_clone+merge overhead.
+            let acc_template = SparseHessianAccumulator::from_single_csr(&*csr, p);
             let n_threads = rayon::current_num_threads().max(1);
             let target_chunks = (n_threads * 16).max(n_threads);
             let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
@@ -3883,7 +3902,6 @@ pub fn xt_diag_x_symmetric(
                     local
                 })
                 .collect();
-            // Reduce: take the first as the destination and add the rest.
             let mut acc = if let Some(first) = local_accs.pop() {
                 first
             } else {
