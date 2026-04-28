@@ -865,21 +865,22 @@ fn mat_mul_flat(a: &[f64], b_mat: &[f64], out: &mut [f64], b: usize) {
     }
 }
 
-/// LU-decompose a B × B row-major matrix in place with partial pivoting.
-/// Returns false if the matrix is detected singular (any pivot |a_kk| < 1e-12).
-/// On success, `m` holds L (strict lower) and U (upper incl diag); `perm` is the
-/// row permutation. Pivot threshold matches the original `det_small < 1e-12` path
-/// so the regularization branch fires under equivalent conditions.
+/// LU-decompose a B × B row-major matrix in place with partial pivoting and
+/// physical row swaps. Returns false if any pivot |a_kk| < 1e-12 (singular).
+/// On success, `m` holds L (strict lower, unit diag implicit) and U (upper, diag
+/// included); `perm[k]` records the original-row index that ended up in physical
+/// row k after pivoting. Pivot threshold matches the original `det_small < 1e-12`
+/// path so the regularization branch fires under equivalent conditions.
 fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize) -> bool {
     for i in 0..b {
         perm[i] = i;
     }
     for col in 0..b {
-        // Partial pivot on column `col` over rows `[col..b]`.
-        let mut max_val = m[perm[col] * b + col].abs();
+        // Partial pivot on column `col` over physical rows `[col..b]`.
+        let mut max_val = m[col * b + col].abs();
         let mut max_idx = col;
         for row in (col + 1)..b {
-            let v = m[perm[row] * b + col].abs();
+            let v = m[row * b + col].abs();
             if v > max_val {
                 max_val = v;
                 max_idx = row;
@@ -888,43 +889,45 @@ fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize) -> bool {
         if max_val < 1e-12 {
             return false;
         }
-        perm.swap(col, max_idx);
-        let pivot_row = perm[col];
-        let pivot = m[pivot_row * b + col];
+        if max_idx != col {
+            // Physically swap rows `col` and `max_idx` (full row, all columns).
+            for k in 0..b {
+                m.swap(col * b + k, max_idx * b + k);
+            }
+            perm.swap(col, max_idx);
+        }
+        let pivot = m[col * b + col];
         for row in (col + 1)..b {
-            let r_idx = perm[row];
-            let factor = m[r_idx * b + col] / pivot;
-            m[r_idx * b + col] = factor; // store L below diag
+            let factor = m[row * b + col] / pivot;
+            m[row * b + col] = factor; // store L below diag
             for k in (col + 1)..b {
-                let upd = factor * m[pivot_row * b + k];
-                m[r_idx * b + k] -= upd;
+                let upd = factor * m[col * b + k];
+                m[row * b + k] -= upd;
             }
         }
     }
     true
 }
 
-/// Solve L U x = P rhs using a previously factored matrix (perm + LU in `m`).
+/// Solve L U x = P rhs using a previously factored matrix (LU in `m`, perm).
 /// Writes the solution back into `rhs`. `scratch` must have length ≥ b.
 fn lu_solve_in_place(m: &[f64], perm: &[usize], rhs: &mut [f64], scratch: &mut [f64], b: usize) {
-    // Forward substitution Ly = P rhs (L has unit diag, stored strict lower in permuted rows).
+    // Forward substitution Ly = P rhs (L is unit-diag, strict lower of m).
     let y = &mut scratch[..b];
     for row in 0..b {
-        let r_idx = perm[row];
         let mut s = rhs[perm[row]];
         for k in 0..row {
-            s -= m[r_idx * b + k] * y[k];
+            s -= m[row * b + k] * y[k];
         }
         y[row] = s;
     }
-    // Back substitution U x = y.
+    // Back substitution U x = y.  Write into rhs[].
     for row in (0..b).rev() {
-        let r_idx = perm[row];
         let mut s = y[row];
         for k in (row + 1)..b {
-            s -= m[r_idx * b + k] * rhs[k];
+            s -= m[row * b + k] * rhs[k];
         }
-        rhs[row] = s / m[r_idx * b + row];
+        rhs[row] = s / m[row * b + row];
     }
 }
 
