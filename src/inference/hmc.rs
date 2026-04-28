@@ -572,7 +572,7 @@ impl NutsPosterior {
         let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
         // === Step 2: Compute η = X @ β ===
-        let eta = self.data.x.dot(&beta);
+        let eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
 
         // === Step 3: Compute log-likelihood and gradient ===
         let (ll, mut grad_ll_beta) = self.family_logp_and_grad(&eta);
@@ -3961,7 +3961,7 @@ impl JointBetaRhoPosterior {
         let beta = self.data.mode.as_ref() + &self.chol.dot(&z);
 
         // η = X β
-        let eta = self.data.x.dot(&beta);
+        let eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
         let (ll, mut grad_ll_beta) = match joint_family_logp_and_grad(
