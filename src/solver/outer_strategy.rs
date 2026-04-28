@@ -533,7 +533,7 @@ fn rank_seeds_with_screening(
         rejected = 0;
         for (idx, seed) in seeds.iter().enumerate() {
             obj.reset();
-            match obj.eval_cost(seed) {
+            match obj.eval_screening_proxy(seed) {
                 Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
                 Ok(_) | Err(_) => rejected += 1,
             }
@@ -1131,6 +1131,25 @@ pub trait OuterObjective {
     /// Evaluate cost only for cost-based optimization paths.
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError>;
 
+    /// Evaluate the seed-screening ranking proxy at this `rho`.
+    ///
+    /// Used exclusively by the `rank_seeds_with_screening` cascade. The
+    /// default delegates to [`OuterObjective::eval_cost`], which preserves
+    /// behavior for non-REML objectives.
+    ///
+    /// Concrete REML-state objectives override this to return the per-seed
+    /// minimum penalized deviance observed during the inner P-IRLS solve
+    /// (a monotonically descending quantity that remains a meaningful
+    /// quality signal even at a 3-iteration screening cap), instead of the
+    /// V_LAML criterion (which is dominated by a poorly-conditioned
+    /// `0.5·log|H|` term at partial-fit β̂ and ranks seeds little better
+    /// than random). The proxy fires *only* in screening mode; outside
+    /// screening it must return the regular V_LAML cost so the optimization
+    /// objective is unchanged.
+    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.eval_cost(rho)
+    }
+
     /// Evaluate cost + gradient + (if capable) Hessian.
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError>;
 
@@ -1175,6 +1194,7 @@ pub struct ClosureObjective<
     Fr = fn(&mut S),
     Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo = fn(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+    Fsp = fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
 > {
     pub(crate) state: S,
     pub(crate) cap: OuterCapability,
@@ -1188,15 +1208,21 @@ pub struct ClosureObjective<
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
     pub(crate) efs_fn: Option<Fefs>,
+    /// Optional seed-screening ranking proxy closure. When `None`,
+    /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
+    /// default), preserving legacy behavior for non-REML objectives.
+    pub(crate) screening_proxy_fn: Option<Fsp>,
 }
 
-impl<S, Fc, Fe, Fr, Fefs, Feo> OuterObjective for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo>
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> OuterObjective
+    for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
     Fr: FnMut(&mut S),
     Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+    Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
 {
     fn capability(&self) -> OuterCapability {
         self.cap.clone()
@@ -1204,6 +1230,13 @@ where
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         (self.cost_fn)(&mut self.state, rho)
+    }
+
+    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        match self.screening_proxy_fn.as_mut() {
+            Some(f) => f(&mut self.state, rho),
+            None => (self.cost_fn)(&mut self.state, rho),
+        }
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
@@ -2295,6 +2328,9 @@ impl OuterProblem {
             eval_order_fn: None,
             reset_fn,
             efs_fn,
+            screening_proxy_fn: None::<
+                fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
         }
     }
 
@@ -2328,6 +2364,45 @@ impl OuterProblem {
             eval_order_fn: Some(eval_order_fn),
             reset_fn,
             efs_fn,
+            screening_proxy_fn: None::<
+                fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
+        }
+    }
+
+    /// Construct a [`ClosureObjective`] with both an order-aware evaluation
+    /// hook and a custom seed-screening ranking proxy. The proxy fires only
+    /// when the cascade in `rank_seeds_with_screening` calls it; outside
+    /// screening the regular cost path is unaffected.
+    pub fn build_objective_with_screening_proxy<S, Fc, Fe, Feo, Fr, Fefs, Fsp>(
+        &self,
+        state: S,
+        cost_fn: Fc,
+        eval_fn: Fe,
+        eval_order_fn: Feo,
+        reset_fn: Option<Fr>,
+        efs_fn: Option<Fefs>,
+        screening_proxy_fn: Fsp,
+    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
+    where
+        Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+        Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
+        Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+        Fr: FnMut(&mut S),
+        Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+        Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+    {
+        let mut cap = self.capability();
+        cap.fixed_point_available = efs_fn.is_some();
+        ClosureObjective {
+            state,
+            cap,
+            cost_fn,
+            eval_fn,
+            eval_order_fn: Some(eval_order_fn),
+            reset_fn,
+            efs_fn,
+            screening_proxy_fn: Some(screening_proxy_fn),
         }
     }
 
@@ -4043,6 +4118,9 @@ mod tests {
                 *st = 42;
             }),
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+            screening_proxy_fn: None::<
+                fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
@@ -4096,6 +4174,9 @@ mod tests {
                     psi_indices: Some(vec![11]),
                 })
             }),
+            screening_proxy_fn: None::<
+                fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
         };
         let mut bridge = OuterFixedPointBridge {
             obj: &mut obj,
