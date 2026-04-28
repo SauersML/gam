@@ -2425,7 +2425,7 @@ pub fn run_logit_polya_gamma_gibbs(
         }
 
         for iter in 0..n_iter {
-            eta.assign(&x.dot(&beta));
+            eta.assign(&crate::faer_ndarray::fast_av(&x, &beta));
             for i in 0..n {
                 omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
             }
@@ -2580,7 +2580,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
         }
 
         for iter in 0..n_iter {
-            eta.assign(&x.dot(&beta));
+            eta.assign(&crate::faer_ndarray::fast_av(&x, &beta));
             for i in 0..n {
                 omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
             }
@@ -3139,7 +3139,10 @@ impl LinkWigglePosterior {
                 }
             }
         }
-        (basis.clone(), u + &basis.dot(theta))
+        (
+            basis.clone(),
+            u + &crate::faer_ndarray::fast_av(&basis, theta),
+        )
     }
 
     /// Compute dη/dq₀ = 1 + B'(q₀)·θ / range_width (chain-rule factor for β_eta gradient).
@@ -3162,7 +3165,7 @@ impl LinkWigglePosterior {
         if b_prime_constrained.ncols() != theta.len() {
             return g;
         }
-        let dwiggle_dz = b_prime_constrained.dot(theta);
+        let dwiggle_dz = crate::faer_ndarray::fast_av(&b_prime_constrained, theta);
         for i in 0..n {
             g[i] = 1.0 + dwiggle_dz[i] / rw;
         }
@@ -3184,7 +3187,7 @@ impl LinkWigglePosterior {
         let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
 
         // Compute η = q₀ + B(q₀)·θ where q₀ = X·β
-        let u = self.x.dot(&beta);
+        let u = crate::faer_ndarray::fast_av(self.x.as_ref(), &beta);
         let (bwiggle, eta) = self.evaluate_link(&u, &theta);
 
         // Log-likelihood and residuals via family dispatch
@@ -3271,7 +3274,7 @@ impl LinkWigglePosterior {
         }
 
         // Gradient w.r.t. θ (wiggle): ∂ℓ/∂θ = B(q₀)^T · residual − S_link · θ
-        let grad_theta = &bwiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
+        let grad_theta = &fast_atv(&bwiggle, &residual) - &self.penalty_link.dot(&theta);
 
         // Gradient w.r.t. β_eta: ∂ℓ/∂β = X^T · (residual ⊙ g'(q₀)) − S_base · β
         // where g'(q₀) = dη/dq₀ is the chain-rule factor
