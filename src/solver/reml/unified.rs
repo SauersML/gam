@@ -2908,6 +2908,32 @@ impl PenaltySubspaceTrace {
         }
         trace
     }
+
+    /// Reduce a `HyperOperator` `A` to its `r × r` projection
+    /// `U_Sᵀ · A · U_S` without materializing the dense `p × p` block.
+    /// Uses `A.mul_mat(U_S)` so an Hv-only operator is probed in `r` matvecs
+    /// (each `O(work_of_A)`), then a single `r × p × r` reduction.
+    pub fn reduce_operator(&self, a: &dyn HyperOperator) -> Array2<f64> {
+        let au = a.mul_mat(&self.u_s);
+        self.u_s.t().dot(&au)
+    }
+
+    /// `tr(K · A)` for `A` exposed only as a `HyperOperator`.  Mirrors
+    /// [`Self::trace_projected_logdet`] without forcing dense materialization
+    /// of `A`.
+    pub fn trace_operator(&self, a: &dyn HyperOperator) -> f64 {
+        self.trace_projected_logdet_reduced(&self.reduce_operator(a))
+    }
+
+    /// `−tr(K · A · K · B)` cross-trace for `A`, `B` exposed only as
+    /// `HyperOperator`s.  The minus sign matches the
+    /// `trace_logdet_hessian_cross` convention used by the dense path so
+    /// callers can drop in the operator variant without sign flips.
+    pub fn cross_operator(&self, a: &dyn HyperOperator, b: &dyn HyperOperator) -> f64 {
+        let ra = self.reduce_operator(a);
+        let rb = self.reduce_operator(b);
+        -self.trace_projected_logdet_cross_reduced(&ra, &rb)
+    }
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
