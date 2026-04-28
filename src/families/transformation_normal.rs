@@ -1277,10 +1277,13 @@ impl CustomFamily for TransformationNormalFamily {
             .forward_mul_deriv(axis, beta)
             .map_err(|e| format!("tensor psi derivative forward_mul failed: {e}"))?;
 
-        let mut obj_psi = 0.0;
-        for i in 0..n {
-            obj_psi += self.weights[i] * (h[i] * v_val[i] - inv_h_prime[i] * v_deriv[i]);
-        }
+        let obj_psi = {
+            let weights = self.weights.as_ref();
+            (0..n)
+                .into_par_iter()
+                .map(|i| weights[i] * (h[i] * v_val[i] - inv_h_prime[i] * v_deriv[i]))
+                .sum::<f64>()
+        };
 
         let score_psi = {
             let term1 = op
@@ -1393,32 +1396,15 @@ impl CustomFamily for TransformationNormalFamily {
             })?;
 
         let objective_psi_psi = {
-            use rayon::prelude::*;
-            let _ = n;
             let weights = self.weights.as_ref();
-            (
-                weights.as_slice().unwrap(),
-                h.as_slice().unwrap(),
-                v_i_val.as_slice().unwrap(),
-                v_j_val.as_slice().unwrap(),
-                v_ij_val.as_slice().unwrap(),
-            )
+            (0..n)
                 .into_par_iter()
-                .zip(
-                    (
-                        inv_h_prime.as_slice().unwrap(),
-                        inv_h_prime_sq.as_slice().unwrap(),
-                        v_ij_deriv.as_slice().unwrap(),
-                        v_i_deriv.as_slice().unwrap(),
-                        v_j_deriv.as_slice().unwrap(),
-                    )
-                        .into_par_iter(),
-                )
-                .map(
-                    |((wi, hi, vi, vj, vij), (ihp, ihp2, vijd, vid, vjd))| {
-                        wi * (vi * vj + hi * vij - ihp * vijd + ihp2 * vid * vjd)
-                    },
-                )
+                .map(|row| {
+                    weights[row]
+                        * (v_i_val[row] * v_j_val[row] + h[row] * v_ij_val[row]
+                            - inv_h_prime[row] * v_ij_deriv[row]
+                            + inv_h_prime_sq[row] * v_i_deriv[row] * v_j_deriv[row])
+                })
                 .sum::<f64>()
         };
 
@@ -2482,16 +2468,27 @@ fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let pa = a.ncols();
     let pb = b.ncols();
     let mut out = Array2::<f64>::zeros((n, pa * pb));
-    for i in 0..n {
-        for j in 0..pa {
-            let a_ij = a[[i, j]];
-            if a_ij == 0.0 {
-                continue;
-            }
-            for k in 0..pb {
-                out[[i, j * pb + k]] = a_ij * b[[i, k]];
-            }
-        }
+    {
+        use rayon::prelude::*;
+        out.axis_chunks_iter_mut(ndarray::Axis(0), 1024)
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(chunk_idx, mut out_chunk)| {
+                let start = chunk_idx * 1024;
+                let rows = out_chunk.nrows();
+                for local in 0..rows {
+                    let i = start + local;
+                    for j in 0..pa {
+                        let a_ij = a[[i, j]];
+                        if a_ij == 0.0 {
+                            continue;
+                        }
+                        for k in 0..pb {
+                            out_chunk[[local, j * pb + k]] = a_ij * b[[i, k]];
+                        }
+                    }
+                }
+            });
     }
     out
 }
@@ -2725,13 +2722,16 @@ impl KroneckerDesign {
                 let mut result = Array1::zeros(n);
                 if let Some(right_dense) = right.as_dense_ref() {
                     let right_beta = fast_ab(right_dense, &beta_mat.t().to_owned());
-                    for i in 0..n {
-                        let mut acc = 0.0;
-                        for j in 0..pa {
-                            acc += left[[i, j]] * right_beta[[i, j]];
-                        }
-                        result[i] = acc;
-                    }
+                    ndarray::Zip::from(&mut result)
+                        .and(left.rows())
+                        .and(right_beta.rows())
+                        .par_for_each(|r, l_row, rb_row| {
+                            let mut acc = 0.0;
+                            for j in 0..pa {
+                                acc += l_row[j] * rb_row[j];
+                            }
+                            *r = acc;
+                        });
                     return result;
                 }
                 for j in 0..pa {
@@ -2980,12 +2980,15 @@ impl KroneckerDesign {
                 }
                 let p = covariate.ncols();
                 if let Some(dense) = covariate.as_dense_ref() {
-                    let mut m = 0.0_f64;
-                    for i in 0..n {
-                        let row = dense.row(i);
-                        let s2: f64 = row.iter().map(|v| v * v).sum();
-                        m = m.max(s2.sqrt());
-                    }
+                    use rayon::prelude::*;
+                    let m = dense
+                        .axis_iter(ndarray::Axis(0))
+                        .into_par_iter()
+                        .map(|row| {
+                            let s2: f64 = row.iter().map(|v| v * v).sum();
+                            s2.sqrt()
+                        })
+                        .reduce(|| 0.0_f64, f64::max);
                     return Some(m);
                 }
                 let chunk_rows =
@@ -3148,29 +3151,39 @@ impl KroneckerDesign {
         let tau = (slack.abs() * 1e-3 + 1e-12).max(dh_eps * scale);
 
         let r_t = response_grid.t();
-        let mut active_pairs: Vec<(usize, usize)> = Vec::new();
-        let mut min_inactive = f64::INFINITY;
-        let mut start = 0usize;
-        while start < n {
-            let end = (start + CHUNK_ROWS).min(n);
-            let m = end - start;
-            let c_chunk = c.slice(s![start..end, ..]);
-            let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
-            fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
-            for i_local in 0..m {
-                let i = start + i_local;
-                for g in 0..n_grid {
-                    let h = h_chunk[[i_local, g]];
-                    let margin = h - slack;
-                    if margin <= tau {
-                        active_pairs.push((i, g));
-                    } else if margin < min_inactive {
-                        min_inactive = margin;
+        let n_chunks = n.div_ceil(CHUNK_ROWS);
+        let (active_pairs, min_inactive): (Vec<(usize, usize)>, f64) = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK_ROWS;
+                let end = (start + CHUNK_ROWS).min(n);
+                let m = end - start;
+                let c_chunk = c.slice(s![start..end, ..]);
+                let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
+                fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
+                let mut local_active: Vec<(usize, usize)> = Vec::new();
+                let mut local_min = f64::INFINITY;
+                for i_local in 0..m {
+                    let i = start + i_local;
+                    for g in 0..n_grid {
+                        let h = h_chunk[[i_local, g]];
+                        let margin = h - slack;
+                        if margin <= tau {
+                            local_active.push((i, g));
+                        } else if margin < local_min {
+                            local_min = margin;
+                        }
                     }
                 }
-            }
-            start = end;
-        }
+                (local_active, local_min)
+            })
+            .reduce(
+                || (Vec::new(), f64::INFINITY),
+                |(mut a, am), (b, bm)| {
+                    a.extend(b);
+                    (a, am.min(bm))
+                },
+            );
 
         cache.active_pairs = active_pairs;
         cache.min_inactive_margin = min_inactive;
@@ -3205,9 +3218,10 @@ impl KroneckerDesign {
                 let mut out = Array1::<f64>::zeros(pa * pb);
                 for j in 0..pa {
                     let mut weighted_v = Array1::<f64>::zeros(n);
-                    for i in 0..n {
-                        weighted_v[i] = v[i] * left[[i, j]];
-                    }
+                    ndarray::Zip::from(&mut weighted_v)
+                        .and(v)
+                        .and(left.column(j))
+                        .par_for_each(|w, &vi, &li| *w = vi * li);
                     let cov_block = right.apply_transpose(&weighted_v);
                     out.slice_mut(s![j * pb..(j + 1) * pb]).assign(&cov_block);
                 }
@@ -3528,12 +3542,17 @@ fn compute_warm_start(
     }
     let mut target_intercept = Array1::zeros(n);
     let mut target_slope = Array1::zeros(n);
-    for i in 0..n {
-        let tau = ws.scale[i].max(1e-12);
-        let inv_tau = 1.0 / tau;
-        target_intercept[i] = -ws.location[i] * inv_tau - offset[i];
-        target_slope[i] = inv_tau;
-    }
+    ndarray::Zip::from(&mut target_intercept)
+        .and(&mut target_slope)
+        .and(&ws.scale)
+        .and(&ws.location)
+        .and(offset)
+        .par_for_each(|ti, ts, &sc, &lc, &of| {
+            let tau = sc.max(1e-12);
+            let inv_tau = 1.0 / tau;
+            *ti = -lc * inv_tau - of;
+            *ts = inv_tau;
+        });
 
     let projection_log_lambdas = Array1::zeros(covariate_penalties.len());
     let zero_offset = Array1::zeros(n);
@@ -3640,12 +3659,14 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     let p = x.ncols();
     debug_assert_eq!(n, w.len());
     let mut out = Array2::zeros((n, p));
-    for i in 0..n {
-        let wi = w[i];
-        for j in 0..p {
-            out[[i, j]] = x[[i, j]] * wi;
-        }
-    }
+    ndarray::Zip::from(out.rows_mut())
+        .and(x.rows())
+        .and(w)
+        .par_for_each(|mut o_row, x_row, &wi| {
+            for j in 0..p {
+                o_row[j] = x_row[j] * wi;
+            }
+        });
     out
 }
 
@@ -3854,9 +3875,10 @@ impl TensorKroneckerPsiOperator {
         let mut out = Array1::<f64>::zeros(n);
         for j in 0..p_resp {
             let cov_part = self.cov_forward_first(axis, &beta.row(j))?;
-            for i in 0..n {
-                out[i] += resp_basis[[i, j]] * cov_part[i];
-            }
+            ndarray::Zip::from(&mut out)
+                .and(&cov_part)
+                .and(resp_basis.column(j))
+                .par_for_each(|o, &c, &r| *o += r * c);
         }
         Ok(out)
     }
@@ -3873,9 +3895,10 @@ impl TensorKroneckerPsiOperator {
         let mut out = Array1::<f64>::zeros(p_resp * p_cov);
         for j in 0..p_resp {
             let mut weighted_v = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                weighted_v[i] = resp_basis[[i, j]] * v[i];
-            }
+            ndarray::Zip::from(&mut weighted_v)
+                .and(resp_basis.column(j))
+                .and(v)
+                .par_for_each(|w, &r, &vi| *w = r * vi);
             let cov_block = self.cov_transpose_first(axis, &weighted_v.view())?;
             out.slice_mut(s![j * p_cov..(j + 1) * p_cov])
                 .assign(&cov_block);
@@ -3904,9 +3927,10 @@ impl TensorKroneckerPsiOperator {
         let mut out = Array1::<f64>::zeros(n);
         for j in 0..p_resp {
             let cov_part = self.cov_forward_second(axis_d, axis_e, &beta.row(j))?;
-            for i in 0..n {
-                out[i] += resp_basis[[i, j]] * cov_part[i];
-            }
+            ndarray::Zip::from(&mut out)
+                .and(&cov_part)
+                .and(resp_basis.column(j))
+                .par_for_each(|o, &c, &r| *o += r * c);
         }
         Ok(out)
     }
@@ -3924,9 +3948,10 @@ impl TensorKroneckerPsiOperator {
         let mut out = Array1::<f64>::zeros(p_resp * p_cov);
         for j in 0..p_resp {
             let mut weighted_v = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                weighted_v[i] = resp_basis[[i, j]] * v[i];
-            }
+            ndarray::Zip::from(&mut weighted_v)
+                .and(resp_basis.column(j))
+                .and(v)
+                .par_for_each(|w, &r, &vi| *w = r * vi);
             let cov_block = self.cov_transpose_second(axis_d, axis_e, &weighted_v.view())?;
             out.slice_mut(s![j * p_cov..(j + 1) * p_cov])
                 .assign(&cov_block);
@@ -3973,10 +3998,11 @@ impl TensorKroneckerPsiOperator {
         for a in 0..p_left_resp {
             for b in 0..p_right_resp {
                 let mut pair_weights = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    pair_weights[i] =
-                        weights[i] * left_resp_basis[[i, a]] * right_resp_basis[[i, b]];
-                }
+                ndarray::Zip::from(&mut pair_weights)
+                    .and(weights)
+                    .and(left_resp_basis.column(a))
+                    .and(right_resp_basis.column(b))
+                    .par_for_each(|p, &w, &la, &rb| *p = w * la * rb);
                 let block = if let (Some(cov_design), Some(cov_psi)) =
                     (cov_design_dense, cov_psi_dense)
                 {
