@@ -22200,4 +22200,130 @@ mod tests {
             Err(_) => {}
         }
     }
+
+    /// The batched outer-gradient override on `BinomialLocationScaleFamily`
+    /// must produce a gradient that agrees with the central finite
+    /// difference of the same family's outer cost. This is the strongest
+    /// available correctness property: it does not depend on whether the
+    /// generic per-coordinate path is reachable in this build, only on the
+    /// scale-invariant identity `g_k = (V(ρ + h e_k) − V(ρ − h e_k)) / (2h)`
+    /// at converged β̂. Because the unified evaluator already routes
+    /// `ValueAndGradient` calls through the batched override (custom_family.rs
+    /// at the `batched_outer_gradient_terms` call site), this also pins the
+    /// wiring: any future regression that detaches the override from the
+    /// dispatcher will trip the FD check via stale (zero) gradients.
+    #[test]
+    fn binomial_location_scale_batched_gradient_matches_finite_difference() {
+        use crate::families::custom_family::{
+            BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix,
+        };
+
+        // 7-row, two-block intercept-only problem with a unit-Identity
+        // penalty per block. Larger n risks PIRLS taking many iterations and
+        // amplifying FD round-off; small p keeps the leverage-block sizes
+        // (p_t = 1, p_ls = 1) tiny so the manual reference is trivial to
+        // sanity-check.
+        let n = 7usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
+        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
+        let thresholdspec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: threshold_design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.2]),
+        };
+        let log_sigmaspec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: log_sigma_design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![-0.2],
+            initial_beta: Some(array![-0.1]),
+        };
+        let family = BinomialLocationScaleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+
+        let specs = vec![thresholdspec, log_sigmaspec];
+        let penalty_counts = vec![1usize, 1usize];
+        let rho = array![0.05, -0.15];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (f0, g0) = crate::families::custom_family::test_outerobjective_andgradient(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho,
+        )
+        .expect("objective+gradient at rho");
+        assert!(f0.is_finite(), "outer cost must be finite at rho");
+        assert_eq!(g0.len(), rho.len());
+
+        let h = 1e-5;
+        // Same noise-floor convention as the existing wiggle-family FD test
+        // (custom_family.rs `outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`):
+        // below floor `EPS·|cost|/h`, the FD estimator can't resolve the
+        // true gradient.
+        let cost_magnitude = f0.abs().max(1.0);
+        let noise_floor = (10.0 * f64::EPSILON * cost_magnitude / h).max(1e-9);
+
+        for k in 0..rho.len() {
+            let mut rho_p = rho.clone();
+            let mut rho_m = rho.clone();
+            rho_p[k] += h;
+            rho_m[k] -= h;
+            let (fp, _) = crate::families::custom_family::test_outerobjective_andgradient(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_p,
+            )
+            .expect("objective at rho+h");
+            let (fm, _) = crate::families::custom_family::test_outerobjective_andgradient(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_m,
+            )
+            .expect("objective at rho-h");
+            let gfd = (fp - fm) / (2.0 * h);
+            let both_in_noise = g0[k].abs() < noise_floor && gfd.abs() < noise_floor;
+            if !both_in_noise {
+                let abs_err = (g0[k] - gfd).abs();
+                let rel_err = abs_err / gfd.abs().max(g0[k].abs()).max(1e-12);
+                assert!(
+                    rel_err < 1e-3 || abs_err < 1e-6,
+                    "batched gradient mismatch at coord {k}: \
+                     batched={:.6e}, fd={:.6e}, abs_err={:.3e}, rel_err={:.3e}",
+                    g0[k],
+                    gfd,
+                    abs_err,
+                    rel_err,
+                );
+            }
+        }
+    }
 }
