@@ -4354,7 +4354,17 @@ pub fn reml_laml_evaluate(
         // analytic `compute_outer_hessian` path (which does apply the
         // projection) whenever a `penalty_subspace_trace` is installed, so
         // the outer Hessian stays consistent with the projected cost.
-        let use_operator = hop.dim() >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD
+        // Use the operator path whenever EITHER the coefficient dimension is
+        // large (dense p×p assembly is the cost) OR n·p is large (per-eval
+        // O(k·n·p²) dense assembly is the cost).  The latter is the biobank
+        // case the user diagnosis flagged: at p=101 we are far below 512 but
+        // n=320 K makes per-evaluation dense Hessian assembly 10¹⁰ FLOPs.
+        let n_times_p = effective_deriv
+            .scalar_glm_ingredients()
+            .map(|ing| ing.x.nrows().saturating_mul(hop.dim()))
+            .unwrap_or(0);
+        let use_operator = (hop.dim() >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD
+            || n_times_p >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD)
             && hessian_kernel.is_some()
             && solution.penalty_subspace_trace.is_none();
         if use_operator {
@@ -4410,13 +4420,20 @@ const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 
 /// Minimum coefficient dimension at which the unified evaluator returns the
 /// outer Hessian as a matrix-free `HessianResult::Operator` instead of a dense
-/// matrix. Below this threshold the dense path is cheaper end-to-end (the
-/// O(p²) materialization cost is small and ARC's per-iteration linear solves
-/// become bandwidth-bound rather than FLOP-bound). The planner mirrors this
-/// threshold via [`RemlState::matrix_free_outer_hessian_likely_available`] so
-/// it can advertise matrix-free availability and suppress the cost-driven
-/// BFGS downgrade in `OuterProblem`.
+/// matrix.  Below this threshold AND below the n·p threshold the dense path
+/// is cheaper end-to-end.  The planner mirrors these thresholds via
+/// [`RemlState::matrix_free_outer_hessian_likely_available`] so it can
+/// advertise matrix-free availability and suppress the cost-driven BFGS
+/// downgrade in `OuterProblem`.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD: usize = 512;
+
+/// Minimum `n · p` at which the matrix-free operator path beats the dense
+/// path even though `p < MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD`.  At biobank
+/// scale (n=320 K, p≈100) the per-evaluation dense Hessian assembly is
+/// O(k · n · p²) ≈ 10¹⁰ FLOPs and dominates wall-clock; the matrix-free Hv
+/// path absorbs it via O(n · p) HVPs.  At small-data (n≤2 K) the dense path
+/// is cheaper end-to-end.  The 1 M cutoff captures the crossover.
+pub(crate) const MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD: usize = 1_000_000;
 
 fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
