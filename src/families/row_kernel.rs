@@ -104,17 +104,31 @@ pub struct RowKernelCache<const K: usize> {
     pub hessians: Vec<[[f64; K]; K]>,
 }
 
-/// Build the cache by evaluating all row kernels.
+/// Build the cache by evaluating all row kernels in parallel.
+///
+/// Rayon's `into_par_iter().map().collect()` over a `0..n` range preserves
+/// row-index order, so the resulting vectors satisfy `nll[i] = nll_i`,
+/// `gradients[i] = ∇_i`, `hessians[i] = H_i`. Errors short-circuit via
+/// `Result` collection — the first failing row's `Err` is returned and
+/// remaining work is dropped.
+///
+/// At biobank scale (n ≳ 3·10⁵) the per-row kernels for survival/GAMLSS
+/// families dominate this build (multiple `exp`/`erf`/special calls per
+/// row); serial evaluation was the last sequential step in the otherwise
+/// fully-parallel row-kernel framework.
 pub fn build_row_kernel_cache<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
 ) -> Result<RowKernelCache<K>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
+    let rows: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)
+        .into_par_iter()
+        .map(|row| kern.row_kernel(row))
+        .collect::<Result<Vec<_>, String>>()?;
     let mut nll = Vec::with_capacity(n);
     let mut gradients = Vec::with_capacity(n);
     let mut hessians = Vec::with_capacity(n);
-    for row in 0..n {
-        let (l, g, h) = kern.row_kernel(row)?;
+    for (l, g, h) in rows {
         nll.push(l);
         gradients.push(g);
         hessians.push(h);
