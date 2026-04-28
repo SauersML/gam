@@ -1938,6 +1938,15 @@ impl HyperOperator for ImplicitHyperOperator {
             design += dx_u[i] * w[i] * x_v[i];
         }
 
+        // Non-Gaussian fixed-β third-derivative correction:
+        //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X v  =  Σ_i (X u)_i · c_x_psi_beta_i · (X v)_i
+        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
+            let c = c_x_psi_beta.as_ref();
+            for i in 0..w.len() {
+                design += x_u[i] * c[i] * x_v[i];
+            }
+        }
+
         let penalty = dense_bilinear(&self.s_psi, v, u);
 
         design + penalty
@@ -2013,6 +2022,16 @@ impl ImplicitHyperOperator {
             let wi = w[i];
             design += dx_z[i] * wi * y_vec[i];
             design += dx_u[i] * wi * x_vec[i];
+        }
+
+        // Non-Gaussian fixed-β third-derivative correction:
+        //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X z = Σ_i (X u)_i · c_x_psi_beta_i · (X z)_i
+        //   = Σ_i y_vec[i] · c_x_psi_beta[i] · x_vec[i]
+        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
+            let c = c_x_psi_beta.as_ref();
+            for i in 0..x_vec.len() {
+                design += y_vec[i] * c[i] * x_vec[i];
+            }
         }
 
         // Penalty part: u^T S_psi z
@@ -9526,6 +9545,16 @@ impl StochasticTraceEstimator {
                             design_val += w_y[i] * dx_re[i];
                         }
 
+                        // Non-Gaussian fixed-β third-derivative correction:
+                        //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r_e
+                        //   = Σ_i y_vec[i] · c_x_psi_beta_i · x_re[i]
+                        if let Some(c_x_psi_beta) = implicit_ops[oi].c_x_psi_beta.as_ref() {
+                            let c = c_x_psi_beta.as_ref();
+                            for i in 0..w_dx_u.len() {
+                                design_val += y_vec[i] * c[i] * x_re[i];
+                            }
+                        }
+
                         // Penalty: u^T S_psi r_e = (S_psi^T u)^T r_e
                         let penalty_val = implicit_u_s[oi].dot(&r_e);
 
@@ -9551,6 +9580,18 @@ impl StochasticTraceEstimator {
                             for i in 0..w_dx_u.len() {
                                 design_val += w_dx_u[i] * x_rd[i];
                                 design_val += w_y[i] * dx_rd[i];
+                            }
+
+                            // Non-Gaussian fixed-β third-derivative correction:
+                            //   uᵀ Xᵀ diag(c ⊙ X_{ψ_e} β̂) X r_d
+                            //   = Σ_i y_vec[i] · c_x_psi_beta_i · x_rd[i]
+                            if let Some(c_x_psi_beta) =
+                                implicit_ops[oi].c_x_psi_beta.as_ref()
+                            {
+                                let c = c_x_psi_beta.as_ref();
+                                for i in 0..w_dx_u.len() {
+                                    design_val += y_vec[i] * c[i] * x_rd[i];
+                                }
                             }
 
                             let penalty_val = implicit_u_s[oi].dot(&r_d);
@@ -9739,6 +9780,14 @@ impl StochasticTraceEstimator {
                 let wi = w[i];
                 value += dx_u[i] * wi * x_r[i];
                 value += x_u[i] * wi * dx_r[i];
+            }
+            // Non-Gaussian fixed-β third-derivative correction:
+            //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X r = Σ_i (X u)_i · c_x_psi_beta_i · (X r)_i
+            if let Some(c_x_psi_beta) = op.c_x_psi_beta.as_ref() {
+                let c = c_x_psi_beta.as_ref();
+                for i in 0..w.len() {
+                    value += x_u[i] * c[i] * x_r[i];
+                }
             }
             value += dense_bilinear(&op.s_psi, r.view(), u.view());
 
