@@ -14080,9 +14080,22 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_laplace_exact_newton_rejects_non_spdhessian() {
+    fn pseudo_laplace_exact_newton_lm_continuation_recovers_marginal_indefiniteness() {
+        // Marginally-indefinite Hessian (here a 1×1 block with H=-1) used to
+        // be rejected outright by the strict pseudo-Laplace path; the
+        // adaptive-seed pilot would lose its entire seed budget and the
+        // controller fall-opened into an unguarded full-data path. With
+        // `strict_logdet_spd_with_lm_continuation` the strict-mode logdet
+        // factors `H + δI` along the same δ-ridge schedule the strict solve
+        // already uses, so a marginally-indefinite block is saved by a
+        // small, principled regularization and the seed proceeds.
+        //
+        // For the 1×1 H=[[-1]] family below: trace_scale=1, δ₀=1e-12,
+        // δ grows ×10 per escalation, so δ=10 (escalation 14) lifts H to
+        // H+δI=[[9]] which Cholesky factors cleanly (logdet=log 9≈2.197).
+        // The fit therefore succeeds where it formerly errored.
         let spec = ParameterBlockSpec {
-            name: "indefinite".to_string(),
+            name: "marginally_indefinite".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
@@ -14090,7 +14103,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
         };
-        let msg = match fit_custom_family(
+        let result = fit_custom_family(
             &OneBlockIndefinitePseudoLaplaceFamily,
             &[spec],
             &BlockwiseFitOptions {
@@ -14098,15 +14111,53 @@ mod tests {
                 compute_covariance: false,
                 ..BlockwiseFitOptions::default()
             },
-        ) {
-            Ok(_) => panic!("indefinite pseudo-laplace Hessian should be rejected"),
-            Err(err) => err.to_string(),
-        };
-        assert!(
-            msg.contains("strict pseudo-laplace SPD")
-                || msg.contains("strict pseudo-laplace SPD logdet"),
-            "unexpected error message: {msg}"
         );
+        assert!(
+            result.is_ok(),
+            "LM δ-ridge continuation should save the marginally-indefinite \
+             Hessian H=[[-1]]; got error: {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn strict_logdet_lm_continuation_accepts_marginal_indefiniteness() {
+        // Direct test of the continuation primitive: H=[[-1]] is rejected
+        // by bare Cholesky but the LM δ-ridge schedule lifts it to
+        // H+δI=[[9]] at δ=10, yielding logdet=log(9). The reported stats
+        // must show a non-trivial escalation count so a recurring need
+        // for nontrivial ridges is detectable by the controller.
+        let h = array![[-1.0_f64]];
+        let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
+            .expect("LM continuation must save 1×1 marginally-indefinite H");
+        assert!(
+            (logdet - (9.0_f64).ln()).abs() < 1e-12,
+            "logdet={logdet}, expected log(9)={}",
+            (9.0_f64).ln(),
+        );
+        assert!(stats.escalations > 0, "δ-ridge escalation must have fired");
+        assert!(
+            stats.delta_used >= 1.0,
+            "δ_used={} must exceed |min_eig|=1",
+            stats.delta_used,
+        );
+    }
+
+    #[test]
+    fn strict_logdet_lm_continuation_passes_through_when_h_is_already_spd() {
+        // When H is already SPD the bare strict logdet succeeds and the
+        // continuation must report no escalation (δ_used=0) — i.e. callers
+        // pay no extra cost on the well-conditioned hot path.
+        let h = array![[2.0_f64, 0.5], [0.5, 3.0]];
+        let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
+            .expect("strict logdet must succeed on SPD H");
+        let expected = (2.0_f64 * 3.0 - 0.5 * 0.5).ln();
+        assert!(
+            (logdet - expected).abs() < 1e-12,
+            "logdet={logdet}, expected={expected}",
+        );
+        assert_eq!(stats.escalations, 0);
+        assert_eq!(stats.delta_used, 0.0);
     }
 
     #[test]
