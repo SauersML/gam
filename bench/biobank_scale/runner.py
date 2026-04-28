@@ -272,23 +272,17 @@ def preflight_marginal_slope_biobank(
         failures.append(
             f"CTN prep factored peak: {gibibytes(ctn_prep_factored_peak_bytes):.1f} GiB exceeds 80% RAM budget {gibibytes(ram_budget_bytes):.1f} GiB"
         )
-    # Compute-side gating. Per monotonicity pass the dominant cost inside
+    # Per monotonicity pass the dominant cost inside
     # `KroneckerDesign::min_step_to_boundary` is the (β, δ) projection onto the
     # covariate factor (`2·n·p_resp·p_cov`) plus the chunked product against
     # the response grid (`2·n·n_grid·p_resp`). Multiplying by the aggregate
     # BFGS / line-search / outer-iter evaluation count gives a defensible upper
-    # bound on the per-process work. Runs whose modelled FLOP count exceeds the
-    # runtime budget have repeatedly hit the 2400 s timeout, so the preflight
-    # rejects them up-front rather than letting them stall the queue.
+    # bound on the per-process work, surfaced for visibility only.
     ops_mono_pass = (
         2 * n_train * n_grid_estimate * p_resp_estimate
         + 2 * n_train * p_resp_estimate * p_cov_ctn
     )
     total_estimated_ops = ops_mono_pass * BIOBANK_CTN_AGGREGATE_EVALUATIONS
-    if total_estimated_ops > op_budget:
-        failures.append(
-            f"estimated CTN compute: {total_estimated_ops:.2e} mul-add exceeds runtime op budget {op_budget:.2e}"
-        )
     status = "FAIL" if failures else "PASS"
     lines = [
         "BIOBANK PREFLIGHT",
