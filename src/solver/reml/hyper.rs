@@ -1575,7 +1575,7 @@ impl<'a> RemlState<'a> {
                             .clone();
                             Some(std::sync::Arc::new(FirthAugmentedSingleHyperOperator {
                                 base: core,
-                                firth_op: std::sync::Arc::clone(op),
+                                firth_op: std::sync::Arc::new(op.clone()),
                                 tau_kernel: kernel.clone(),
                                 x_tau_dense: x_tau_j_dense_mat,
                                 p: p_dim,
@@ -2811,6 +2811,7 @@ impl<'a> RemlState<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::unified::HyperOperator;
     use super::*;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
