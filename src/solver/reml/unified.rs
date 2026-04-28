@@ -4390,23 +4390,26 @@ pub fn reml_laml_evaluate(
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
+        // Cost selects representation (operator vs dense), not capability.
+        // The (n, p, K) scale rule routes biobank-scale problems through the
+        // matrix-free Hv operator path even when the per-axis thresholds
+        // (`p >= 512` or `K >= 32`) alone do not fire.  At Matern biobank
+        // scale (n=320 000, p=101, K=6) the dense path's per-outer-eval
+        // O(K·n·p²) assembly is ≈ 2·10¹⁰ FLOPs and dominates wall-clock; the
+        // operator path absorbs it via O(n·p) HVPs.
+        //
         // The matrix-free operator path uses the full-space `G_ε(H)` kernel
         // throughout; it does not yet route through the projected kernel
         // that the rank-deficient LAML fix demands.  Fall through to the
         // analytic `compute_outer_hessian` path (which does apply the
-        // projection) whenever a `penalty_subspace_trace` is installed, so
-        // the outer Hessian stays consistent with the projected cost.
-        // Use the operator path whenever EITHER the coefficient dimension is
-        // large (dense p×p assembly is the cost) OR n·p is large (per-eval
-        // O(k·n·p²) dense assembly is the cost).  The latter is the biobank
-        // case the user diagnosis flagged: at p=101 we are far below 512 but
-        // n=320 K makes per-evaluation dense Hessian assembly 10¹⁰ FLOPs.
-        let n_times_p = effective_deriv
+        // projection) whenever a `penalty_subspace_trace` is installed.
+        let n_obs = effective_deriv
             .scalar_glm_ingredients()
-            .map(|ing| ing.x.nrows().saturating_mul(hop.dim()))
+            .map(|ing| ing.x.nrows())
             .unwrap_or(0);
-        let use_operator = (hop.dim() >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD
-            || n_times_p >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD)
+        let p_dim = hop.dim();
+        let k_outer = k + solution.ext_coords.len();
+        let use_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer)
             && hessian_kernel.is_some()
             && solution.penalty_subspace_trace.is_none();
         if use_operator {
