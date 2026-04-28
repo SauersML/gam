@@ -6,7 +6,7 @@ use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
-use faer::sparse::{SparseColMat, Triplet};
+use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -59,18 +59,33 @@ pub fn dense_to_sparse(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
-    let mut triplets = Vec::new();
-    for row in 0..nrows {
-        for col in 0..ncols {
+    // Direct column-major CSC construction.  Two-pass: count nnz per column,
+    // then fill row indices and values.  Skips the O(nnz log nnz) sort/dedup
+    // that `try_new_from_triplets` performs on unsorted input.
+    let mut col_ptr = vec![0usize; ncols + 1];
+    for col in 0..ncols {
+        let mut count = 0usize;
+        for row in 0..nrows {
+            if matrix[[row, col]].abs() > tol {
+                count += 1;
+            }
+        }
+        col_ptr[col + 1] = col_ptr[col] + count;
+    }
+    let nnz = col_ptr[ncols];
+    let mut row_idx = Vec::with_capacity(nnz);
+    let mut values = Vec::with_capacity(nnz);
+    for col in 0..ncols {
+        for row in 0..nrows {
             let value = matrix[[row, col]];
             if value.abs() > tol {
-                triplets.push(Triplet::new(row, col, value));
+                row_idx.push(row);
+                values.push(value);
             }
         }
     }
-    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
-        EstimationError::InvalidInput("failed to convert dense matrix to sparse CSC".to_string())
-    })
+    let symbolic = SymbolicSparseColMat::new_checked(nrows, ncols, col_ptr, None, row_idx);
+    Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
 fn embed_dense_block_to_sparse_symmetric_upper(
@@ -607,7 +622,6 @@ pub fn build_sparse_penalty_blocks_from_canonical(
 
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::cholesky::llt::factor::LltRegularization;
-use faer::sparse::SymbolicSparseColMat;
 use faer::sparse::linalg::amd;
 use faer::sparse::linalg::cholesky::simplicial;
 
