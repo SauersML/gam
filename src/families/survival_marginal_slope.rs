@@ -828,21 +828,20 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
     out
 }
 
-/// Returns a reference to the static unit-direction tables (one Array1<f64>
-/// per primary axis, plus a zero direction at index N_PRIMARY). Reusing these
-/// references avoids per-row heap allocations in third/fourth-order contracted
-/// assemblies, where the inner loop calls into the row-directional kernel
-/// 10 (third-order) or 10 (fourth-order) times per row.
-fn unit_primary_direction_table() -> &'static [Array1<f64>; N_PRIMARY + 1] {
+/// Returns a reference to the static unit-direction table (one Array1<f64>
+/// per primary axis). Reusing these references avoids per-row heap
+/// allocations in third/fourth-order contracted assemblies, where the inner
+/// loop calls into the row-directional kernel 10 (third-order) or 10
+/// (fourth-order) times per row.
+fn unit_primary_direction_table() -> &'static [Array1<f64>; N_PRIMARY] {
     use std::sync::OnceLock;
-    static TABLE: OnceLock<[Array1<f64>; N_PRIMARY + 1]> = OnceLock::new();
+    static TABLE: OnceLock<[Array1<f64>; N_PRIMARY]> = OnceLock::new();
     TABLE.get_or_init(|| {
         [
             unit_primary_direction(0),
             unit_primary_direction(1),
             unit_primary_direction(2),
             unit_primary_direction(3),
-            Array1::<f64>::zeros(N_PRIMARY),
         ]
     })
 }
@@ -850,13 +849,6 @@ fn unit_primary_direction_table() -> &'static [Array1<f64>; N_PRIMARY + 1] {
 #[inline]
 fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
     &unit_primary_direction_table()[idx]
-}
-
-#[inline]
-fn unit_primary_direction_static() -> &'static Array1<f64> {
-    // Used as a placeholder to fill unused slots in fixed-size reference
-    // arrays; the corresponding slot is never read by the implementation.
-    &unit_primary_direction_table()[N_PRIMARY]
 }
 
 fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
@@ -4937,31 +4929,6 @@ impl SurvivalMarginalSlopeFamily {
     /// block_states[0].eta is from the exit design and is NOT used here;
     /// all 3 time-block linear predictors are recomputed from beta_time
     /// because the time block has 3 design matrices sharing one coefficient vector.
-    fn row_neglog_directional(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        dirs: &[Array1<f64>],
-    ) -> Result<f64, String> {
-        // Adapter: borrow the existing Array1 entries without cloning, then
-        // delegate to the zero-allocation hot-path implementation that is
-        // also used directly by the third/fourth-order contracted assemblies.
-        let k = dirs.len();
-        if k > 4 {
-            return Err(format!(
-                "survival marginal-slope row directional expects 0..=4 directions, got {k}"
-            ));
-        }
-        // Stack-allocated reference array; uninitialized slots are never read
-        // because we only pass `&refs[..k]` to the implementation.
-        let dummy = unit_primary_direction_static();
-        let mut refs: [&Array1<f64>; 4] = [dummy, dummy, dummy, dummy];
-        for (i, dir) in dirs.iter().enumerate() {
-            refs[i] = dir;
-        }
-        self.row_neglog_directional_refs(row, block_states, &refs[..k])
-    }
-
     fn row_neglog_directional_refs(
         &self,
         row: usize,
@@ -15710,7 +15677,7 @@ mod tests {
         ];
 
         let err = family
-            .row_neglog_directional(0, &block_states, &[])
+            .row_neglog_directional_refs(0, &block_states, &[])
             .expect_err("censored rows must still enforce the time-derivative domain");
         assert!(
             err.contains("monotonicity violated at row 0"),
@@ -15740,20 +15707,20 @@ mod tests {
             .compute_row_primary_gradient_hessian_uncached(0, &block_states)
             .expect("closed-form row derivatives");
         let nll_exact = family
-            .row_neglog_directional(0, &block_states, &[])
+            .row_neglog_directional_refs(0, &block_states, &[])
             .expect("exact row objective");
         assert_close(nll_closed, nll_exact, 1e-12, "nll");
 
         for a in 0..N_PRIMARY {
             let dir_a = unit_primary_direction(a);
             let grad_exact = family
-                .row_neglog_directional(0, &block_states, &[dir_a.clone()])
+                .row_neglog_directional_refs(0, &block_states, &[&dir_a])
                 .expect("exact row gradient");
             assert_close(grad_closed[a], grad_exact, 1e-10, &format!("grad[{a}]"));
             for b in 0..N_PRIMARY {
                 let dir_b = unit_primary_direction(b);
                 let hess_exact = family
-                    .row_neglog_directional(0, &block_states, &[dir_a.clone(), dir_b])
+                    .row_neglog_directional_refs(0, &block_states, &[&dir_a, &dir_b])
                     .expect("exact row hessian");
                 assert_close(
                     hess_closed[[a, b]],
