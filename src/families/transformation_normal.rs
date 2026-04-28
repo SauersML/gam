@@ -824,21 +824,31 @@ impl CustomFamily for TransformationNormalFamily {
         // that is ~40·n bytes of allocator churn and 2·n divisions per call.
         // Here we allocate three vectors, divide once, and derive the squared
         // quantity by multiplication.
-        let mut log_likelihood = 0.0;
         let mut weighted_h = Array1::<f64>::zeros(n);
         let mut weighted_inv_hp = Array1::<f64>::zeros(n);
         let mut weighted_inv_hp_sq = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let hi = h[i];
-            let hpi = h_prime[i];
-            let wi = self.weights[i];
-            let inv = 1.0 / hpi;
-            let w_inv = wi * inv;
-            log_likelihood += wi * (-0.5 * hi * hi + hpi.ln());
-            weighted_h[i] = wi * hi;
-            weighted_inv_hp[i] = w_inv;
-            weighted_inv_hp_sq[i] = w_inv * inv;
-        }
+        let log_likelihood = {
+            use rayon::prelude::*;
+            let weights = self.weights.as_ref();
+            weighted_h
+                .as_slice_mut()
+                .unwrap()
+                .par_iter_mut()
+                .zip(weighted_inv_hp.as_slice_mut().unwrap().par_iter_mut())
+                .zip(weighted_inv_hp_sq.as_slice_mut().unwrap().par_iter_mut())
+                .zip(h.as_slice().unwrap().par_iter())
+                .zip(h_prime.as_slice().unwrap().par_iter())
+                .zip(weights.as_slice().unwrap().par_iter())
+                .map(|(((((wh, wih), wih2), &hi), &hpi), &wi)| {
+                    let inv = 1.0 / hpi;
+                    let w_inv = wi * inv;
+                    *wh = wi * hi;
+                    *wih = w_inv;
+                    *wih2 = w_inv * inv;
+                    wi * (-0.5 * hi * hi + hpi.ln())
+                })
+                .sum::<f64>()
+        };
 
         // Gradient of log-likelihood: ∇ℓ = -X_val^T (w·h) + X_deriv^T (w/h')
         let grad = {
@@ -872,15 +882,21 @@ impl CustomFamily for TransformationNormalFamily {
             return Err("expected 1 block".to_string());
         }
         let (h, h_prime) = self.compute_h_and_h_prime(&block_states[0].beta);
-        let mut ll = 0.0;
-        for i in 0..h.len() {
-            if h_prime[i] <= 0.0 {
-                // The barrier line search should prevent this, but if reached
-                // return -inf so the backtracking loop rejects the step.
-                return Ok(f64::NEG_INFINITY);
-            }
-            ll += self.weights[i] * (-0.5 * h[i] * h[i] + h_prime[i].ln());
+        let min_hp = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
+        if min_hp <= 0.0 {
+            return Ok(f64::NEG_INFINITY);
         }
+        let ll = {
+            use rayon::prelude::*;
+            let weights = self.weights.as_ref();
+            h.as_slice()
+                .unwrap()
+                .par_iter()
+                .zip(h_prime.as_slice().unwrap().par_iter())
+                .zip(weights.as_slice().unwrap().par_iter())
+                .map(|((&hi, &hpi), &wi)| wi * (-0.5 * hi * hi + hpi.ln()))
+                .sum::<f64>()
+        };
         Ok(ll)
     }
 
@@ -922,18 +938,26 @@ impl CustomFamily for TransformationNormalFamily {
         }
         // Fused single-pass O(n) reduction: log-likelihood + per-row weighted
         // vectors needed for the two transpose_muls below.
-        let mut log_likelihood = 0.0;
         let mut weighted_h = Array1::<f64>::zeros(n);
         let mut weighted_inv_hp = Array1::<f64>::zeros(n);
         let weights = self.weights.as_ref();
-        for i in 0..n {
-            let wi = weights[i];
-            let hi = h[i];
-            let hpi = h_prime[i];
-            log_likelihood += wi * (-0.5 * hi * hi + hpi.ln());
-            weighted_h[i] = wi * hi;
-            weighted_inv_hp[i] = wi / hpi;
-        }
+        let log_likelihood = {
+            use rayon::prelude::*;
+            weighted_h
+                .as_slice_mut()
+                .unwrap()
+                .par_iter_mut()
+                .zip(weighted_inv_hp.as_slice_mut().unwrap().par_iter_mut())
+                .zip(h.as_slice().unwrap().par_iter())
+                .zip(h_prime.as_slice().unwrap().par_iter())
+                .zip(weights.as_slice().unwrap().par_iter())
+                .map(|((((wh, wih), &hi), &hpi), &wi)| {
+                    *wh = wi * hi;
+                    *wih = wi / hpi;
+                    wi * (-0.5 * hi * hi + hpi.ln())
+                })
+                .sum::<f64>()
+        };
         let mut gradient = self.x_deriv_kron.transpose_mul(&weighted_inv_hp);
         gradient -= &self.x_val_kron.transpose_mul(&weighted_h);
         Ok(Some(ExactNewtonJointGradientEvaluation {
@@ -1141,9 +1165,19 @@ impl CustomFamily for TransformationNormalFamily {
         // ∂H/∂β · d_beta = -2 X_deriv^T diag((X_deriv · d_beta) / h'^3) X_deriv
         let n = h_prime.len();
         let mut weight = Array1::zeros(n);
-        for i in 0..n {
-            weight[i] =
-                -2.0 * self.weights[i] * d_h_prime[i] / (h_prime[i] * h_prime[i] * h_prime[i]);
+        {
+            use rayon::prelude::*;
+            let weights = self.weights.as_ref();
+            weight
+                .as_slice_mut()
+                .unwrap()
+                .par_iter_mut()
+                .zip(h_prime.as_slice().unwrap().par_iter())
+                .zip(d_h_prime.as_slice().unwrap().par_iter())
+                .zip(weights.as_slice().unwrap().par_iter())
+                .for_each(|(((w, &hp), &dhp), &wi)| {
+                    *w = -2.0 * wi * dhp / (hp * hp * hp);
+                });
         }
         let dd = self.x_deriv_kron.weighted_gram(&weight, &self.policy);
         Ok(Some(dd))
@@ -1188,10 +1222,20 @@ impl CustomFamily for TransformationNormalFamily {
         // so D²H[u,v] = 6 X_derivᵀ diag(w (X_deriv u)(X_deriv v) / h'⁴) X_deriv.
         let n = h_prime.len();
         let mut weight = Array1::zeros(n);
-        for i in 0..n {
-            let hp = h_prime[i];
-            weight[i] =
-                6.0 * self.weights[i] * d_h_prime_u[i] * d_h_prime_v[i] / (hp * hp * hp * hp);
+        {
+            use rayon::prelude::*;
+            let weights = self.weights.as_ref();
+            weight
+                .as_slice_mut()
+                .unwrap()
+                .par_iter_mut()
+                .zip(h_prime.as_slice().unwrap().par_iter())
+                .zip(d_h_prime_u.as_slice().unwrap().par_iter())
+                .zip(d_h_prime_v.as_slice().unwrap().par_iter())
+                .zip(weights.as_slice().unwrap().par_iter())
+                .for_each(|((((w, &hp), &du), &dv), &wi)| {
+                    *w = 6.0 * wi * du * dv / (hp * hp * hp * hp);
+                });
         }
         Ok(Some(self.x_deriv_kron.weighted_gram(&weight, &self.policy)))
     }
@@ -1348,13 +1392,35 @@ impl CustomFamily for TransformationNormalFamily {
                 format!("tensor psi second-order forward_mul(derivative second) failed: {e}")
             })?;
 
-        let mut objective_psi_psi = 0.0;
-        for row in 0..n {
-            objective_psi_psi += self.weights[row]
-                * (v_i_val[row] * v_j_val[row] + h[row] * v_ij_val[row]
-                    - inv_h_prime[row] * v_ij_deriv[row]
-                    + inv_h_prime_sq[row] * v_i_deriv[row] * v_j_deriv[row]);
-        }
+        let objective_psi_psi = {
+            use rayon::prelude::*;
+            let _ = n;
+            let weights = self.weights.as_ref();
+            (
+                weights.as_slice().unwrap(),
+                h.as_slice().unwrap(),
+                v_i_val.as_slice().unwrap(),
+                v_j_val.as_slice().unwrap(),
+                v_ij_val.as_slice().unwrap(),
+            )
+                .into_par_iter()
+                .zip(
+                    (
+                        inv_h_prime.as_slice().unwrap(),
+                        inv_h_prime_sq.as_slice().unwrap(),
+                        v_ij_deriv.as_slice().unwrap(),
+                        v_i_deriv.as_slice().unwrap(),
+                        v_j_deriv.as_slice().unwrap(),
+                    )
+                        .into_par_iter(),
+                )
+                .map(
+                    |((wi, hi, vi, vj, vij), (ihp, ihp2, vijd, vid, vjd))| {
+                        wi * (vi * vj + hi * vij - ihp * vijd + ihp2 * vid * vjd)
+                    },
+                )
+                .sum::<f64>()
+        };
 
         let score_psi_psi = {
             let term1 = op
