@@ -1549,7 +1549,17 @@ impl Default for BlockwiseFitOptions {
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: true,
-            use_outer_hessian: false,
+            // Default ON: families that ship a matrix-free joint Hessian
+            // workspace (CTN, GAMLSS location-scale, marginal-slope) absorb
+            // the per-eval cost via Hv operators, so the OUTER planner should
+            // get an Analytic Hessian capability and route to ARC / operator
+            // trust-region instead of falling back to BFGS+BfgsApprox.  The
+            // dense-vs-operator strategy is decided at evaluation time by
+            // `use_joint_matrix_free_path`; the legacy default-false setting
+            // collapsed the capability before that decision could fire and
+            // sent biobank-scale CTN through gradient-only BFGS where each
+            // line-search probe was a full-data PIRLS evaluation.
+            use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
         }
