@@ -2435,7 +2435,18 @@ impl<'a> RemlState<'a> {
             );
             let pirls_elapsed = pirls_start.elapsed();
             if let Ok((ref res, ref wm)) = result {
-                log::debug!(
+                // Surface every non-screening PIRLS call at INFO so CI logs
+                // reveal exactly which inner solves dominate wall-clock at
+                // biobank scale — the main signal for "what's the slow path"
+                // when an outer BFGS / line-search step blows past the
+                // 2400 s job budget.
+                let level = if in_screening {
+                    log::Level::Debug
+                } else {
+                    log::Level::Info
+                };
+                log::log!(
+                    level,
                     "[PIRLS-timing] iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
