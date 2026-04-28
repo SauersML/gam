@@ -84,7 +84,8 @@ pub fn dense_to_sparse(
             }
         }
     }
-    let symbolic = SymbolicSparseColMat::new_checked(nrows, ncols, col_ptr, None, row_idx);
+    let symbolic =
+        SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
@@ -94,20 +95,52 @@ fn embed_dense_block_to_sparse_symmetric_upper(
     total_dim: usize,
     tol: f64,
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    let mut triplets = Vec::new();
-    for row in 0..local.nrows() {
-        for col in row..local.ncols() {
-            let value = local[[row, col]];
+    let block_n = local.nrows();
+    if local.ncols() != block_n {
+        return Err(EstimationError::InvalidInput(
+            "embed_dense_block_to_sparse_symmetric_upper requires a square block".to_string(),
+        ));
+    }
+    if offset + block_n > total_dim {
+        return Err(EstimationError::InvalidInput(
+            "embed_dense_block_to_sparse_symmetric_upper offset+block exceeds total_dim"
+                .to_string(),
+        ));
+    }
+    // Direct CSC build over the upper triangle of `local`, embedded at
+    // `(offset, offset)` in a `total_dim x total_dim` matrix.  Columns
+    // outside [offset, offset+block_n) are empty; within-block columns
+    // already iterate rows in increasing order, satisfying CSC sort
+    // invariants without the triplet sort/dedup pass.
+    let mut col_ptr = vec![0usize; total_dim + 1];
+    for c in 0..block_n {
+        let mut count = 0usize;
+        for r in 0..=c {
+            if local[[r, c]].abs() > tol {
+                count += 1;
+            }
+        }
+        col_ptr[offset + c + 1] = col_ptr[offset + c] + count;
+    }
+    let nnz_in_block_end = col_ptr[offset + block_n];
+    for c in (offset + block_n)..total_dim {
+        col_ptr[c + 1] = nnz_in_block_end;
+    }
+    let nnz = col_ptr[total_dim];
+    let mut row_idx = Vec::with_capacity(nnz);
+    let mut values = Vec::with_capacity(nnz);
+    for c in 0..block_n {
+        for r in 0..=c {
+            let value = local[[r, c]];
             if value.abs() > tol {
-                triplets.push(Triplet::new(offset + row, offset + col, value));
+                row_idx.push(offset + r);
+                values.push(value);
             }
         }
     }
-    SparseColMat::try_new_from_triplets(total_dim, total_dim, &triplets).map_err(|_| {
-        EstimationError::InvalidInput(
-            "failed to embed dense symmetric block as sparse upper-triangle CSC".to_string(),
-        )
-    })
+    let symbolic =
+        SymbolicSparseColMat::<usize>::new_checked(total_dim, total_dim, col_ptr, None, row_idx);
+    Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
@@ -121,20 +154,37 @@ pub fn dense_to_sparse_symmetric_upper(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
-    let mut triplets = Vec::new();
-    for row in 0..nrows {
-        for col in row..ncols {
+    // Direct CSC build over the upper triangle.  Iterating `for col { for row in 0..=col }`
+    // naturally produces CSC-sorted (column-major, row-ascending) entries, so we can
+    // populate col_ptr/row_idx/values directly without a triplet sort.
+    let mut col_ptr = vec![0usize; ncols + 1];
+    let row_limit = nrows.min(ncols);
+    for col in 0..ncols {
+        let mut count = 0usize;
+        let row_end = (col + 1).min(row_limit);
+        for row in 0..row_end {
+            if matrix[[row, col]].abs() > tol {
+                count += 1;
+            }
+        }
+        col_ptr[col + 1] = col_ptr[col] + count;
+    }
+    let nnz = col_ptr[ncols];
+    let mut row_idx = Vec::with_capacity(nnz);
+    let mut values = Vec::with_capacity(nnz);
+    for col in 0..ncols {
+        let row_end = (col + 1).min(row_limit);
+        for row in 0..row_end {
             let value = matrix[[row, col]];
             if value.abs() > tol {
-                triplets.push(Triplet::new(row, col, value));
+                row_idx.push(row);
+                values.push(value);
             }
         }
     }
-    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
-        EstimationError::InvalidInput(
-            "failed to convert dense symmetric matrix to sparse upper-triangle CSC".to_string(),
-        )
-    })
+    let symbolic =
+        SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
+    Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
 pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>) -> Array2<f64> {
