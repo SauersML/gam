@@ -1,7 +1,7 @@
 use crate::estimate::EstimationError;
+use crate::faer_ndarray::{FaerArrayView, FaerColView};
 #[cfg(test)]
-use crate::faer_ndarray::FaerEigh;
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerColView};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
@@ -84,8 +84,7 @@ pub fn dense_to_sparse(
             }
         }
     }
-    let symbolic =
-        SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
+    let symbolic = SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
@@ -182,8 +181,7 @@ pub fn dense_to_sparse_symmetric_upper(
             }
         }
     }
-    let symbolic =
-        SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
+    let symbolic = SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
@@ -1277,7 +1275,6 @@ mod tests {
         let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
 
         // Dense inverse for reference via column solves
-        use crate::faer_ndarray::FaerCholesky;
         let chol = h.cholesky(Side::Lower).unwrap();
         let mut h_inv = Array2::<f64>::zeros((4, 4));
         for j in 0..4 {
