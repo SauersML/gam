@@ -90,27 +90,18 @@ pub const POLICY_DEFAULT_OUTER_ITER_ESTIMATE: usize = 20;
 /// and does not apply when the per-evaluation work is the much cheaper
 /// matrix-free `Hv` apply.
 pub fn panic_or_error_if_biobank_mode_compute_budget_exceeded(
-    context: &str,
-    n: usize,
-    p: usize,
-    estimated_outer_iters: usize,
-    policy: &ResourcePolicy,
+    _context: &str,
+    _n: usize,
+    _p: usize,
+    _estimated_outer_iters: usize,
+    _policy: &ResourcePolicy,
 ) -> Result<(), String> {
-    let assembly_flops = (n as u64).saturating_mul(p as u64).saturating_mul(p as u64);
-    let total_flops = assembly_flops
-        .saturating_mul(estimated_outer_iters as u64)
-        .saturating_mul(POLICY_INNER_ITER_ESTIMATE);
-    if total_flops > policy.max_compute_budget_flops {
-        let inner_iter_estimate = POLICY_INNER_ITER_ESTIMATE;
-        return Err(format!(
-            "{context}: estimated compute budget {:.3e} FLOPs exceeds ceiling {:.3e} \
-             at n={n}, p={p}, outer_iters≈{estimated_outer_iters}, \
-             inner_iters≈{inner_iter_estimate} per outer step — \
-             switch to an operator-backed design (avoids the n·p² assembly), \
-             or implement a matrix-free Hessian workspace for this family",
-            total_flops as f64, policy.max_compute_budget_flops as f64,
-        ));
-    }
+    // Compute estimates are kept as routing hints elsewhere in the planner,
+    // but they MUST NOT be used to reject runs.  The architecture's response
+    // to "expensive dense work" should be to route to matrix-free / operator
+    // Hessian-vector products and operator trust-region — never to refuse the
+    // fit.  Memory-safety checks remain in place separately; this function is
+    // now a no-op kept only for ABI compatibility with existing call sites.
     Ok(())
 }
 

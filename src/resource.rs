@@ -6,15 +6,14 @@ pub struct ResourcePolicy {
     pub max_owned_data_cache_bytes: usize,
     pub row_chunk_target_bytes: usize,
     pub derivative_storage_mode: DerivativeStorageMode,
-    /// Maximum estimated compute budget in flop-equivalent units permitted on
-    /// dense materialization paths. Companion to
-    /// `max_single_materialization_bytes`: the byte budget rejects allocations
-    /// that won't fit, while this rejects configurations that *would* fit but
-    /// whose per-fit arithmetic exceeds the wall-clock ceiling. The
-    /// preflight (`panic_or_error_if_biobank_mode_compute_budget_exceeded`)
-    /// estimates `n·p² × outer_iters × inner_iter_estimate` and refuses
-    /// dense paths that exceed this ceiling, directing callers to
-    /// operator-backed designs or matrix-free Hessian workspaces.
+    /// DEPRECATED: compute estimates must NEVER reject runs.  Field is kept
+    /// for ABI compatibility but is ignored — the preflight gate
+    /// `panic_or_error_if_biobank_mode_compute_budget_exceeded` is now a
+    /// no-op.  The architecture's response to "expensive dense work" is to
+    /// route to matrix-free / operator-backed designs and matrix-free
+    /// Hessian-vector products + operator trust-region, never to refuse the
+    /// fit.  Memory-safety checks (`max_single_materialization_bytes`)
+    /// remain as the only rejection criterion.
     pub max_compute_budget_flops: u64,
 }
 
