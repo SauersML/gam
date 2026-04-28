@@ -19481,10 +19481,6 @@ mod tests {
             false,
         )
         .expect("wiggle block");
-        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
-            Some(d) => d.clone(),
-            None => panic!("wiggle design must be dense for this test fixture"),
-        };
         let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let threshold_design =
@@ -19630,10 +19626,6 @@ mod tests {
             false,
         )
         .expect("wiggle block");
-        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
-            Some(d) => d.clone(),
-            None => panic!("wiggle design must be dense for this test fixture"),
-        };
         let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let threshold_design =
