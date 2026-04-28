@@ -249,14 +249,14 @@ pub fn factorize_sparse_spd(
             condition_number: f64::INFINITY,
         }
     })?;
-    let dense = sparse_to_dense_symmetric_upper_public(&h_upper);
-    let chol =
-        dense
-            .cholesky(Side::Lower)
-            .map_err(|_| EstimationError::HessianNotPositiveDefinite {
-                min_eigenvalue: f64::NAN,
-            })?;
-    let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
+    // Compute logdet via a sparse-native simplicial LLᵀ on the same upper-
+    // triangular matrix. Previously we densified `h_upper` and ran a dense
+    // Cholesky purely to read its diagonal — an O(n_input³) detour that
+    // became the dominant cost for biobank-scale penalized Hessians. The
+    // simplicial path uses the same AMD ordering + LLᵀ machinery as the
+    // sp_cholesky factor and runs in O(nnz(L)) once the symbolic structure
+    // is built.
+    let logdet = sparse_spd_logdet_via_simplicial(&h_upper)?;
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     if elapsed_ms > 100.0 {
         log::info!(
@@ -693,6 +693,128 @@ pub struct SimplicialFactor {
     n: usize,
     /// log|H| = 2 * sum(log(L_ii))
     pub logdet: f64,
+}
+
+/// Compute log|H| for a symmetric-positive-definite sparse matrix via a
+/// simplicial LLᵀ factorization, returning only the log-determinant.
+///
+/// The input must already be canonicalized to symmetric-upper storage (the
+/// callers in this module canonicalize before invoking this helper).
+///
+/// This replaces a previous code path that materialized a dense copy of `h`
+/// and called dense Cholesky purely to extract the diagonal. The simplicial
+/// path uses AMD ordering plus faer's `factorize_simplicial_numeric_llt` and
+/// runs in O(nnz(L)) after the symbolic phase, instead of O(n³).
+fn sparse_spd_logdet_via_simplicial(
+    h_upper: &SparseColMat<usize, f64>,
+) -> Result<f64, EstimationError> {
+    let n = h_upper.ncols();
+    if n == 0 {
+        return Ok(0.0);
+    }
+    let a_nnz = h_upper.compute_nnz();
+
+    // 1. AMD ordering on the symbolic structure.
+    let mut perm_fwd = vec![0usize; n];
+    let mut perm_inv = vec![0usize; n];
+    {
+        let mut mem = MemBuffer::new(amd::order_scratch::<usize>(n, a_nnz));
+        amd::order(
+            &mut perm_fwd,
+            &mut perm_inv,
+            h_upper.symbolic(),
+            amd::Control::default(),
+            MemStack::new(&mut mem),
+        )
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    }
+    let perm = unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
+
+    // 2. Permute to P A Pᵀ (upper-triangular, unsorted).
+    let a_perm_upper = {
+        let mut col_ptrs = vec![0usize; n + 1];
+        let mut row_indices = vec![0usize; a_nnz];
+        let mut values = vec![0.0f64; a_nnz];
+        let mut mem = MemBuffer::new(faer::sparse::utils::permute_self_adjoint_scratch::<usize>(
+            n,
+        ));
+        faer::sparse::utils::permute_self_adjoint_to_unsorted(
+            &mut values,
+            &mut col_ptrs,
+            &mut row_indices,
+            h_upper.as_ref(),
+            perm,
+            Side::Upper,
+            Side::Upper,
+            MemStack::new(&mut mem),
+        );
+        SparseColMat::<usize, f64>::new(
+            unsafe { SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices) },
+            values,
+        )
+    };
+
+    // 3. Symbolic analysis.
+    let symbolic = {
+        let mut mem = MemBuffer::new(StackReq::any_of(&[
+            simplicial::prefactorize_symbolic_cholesky_scratch::<usize>(n, a_nnz),
+            simplicial::factorize_simplicial_symbolic_cholesky_scratch::<usize>(n),
+        ]));
+        let stack = MemStack::new(&mut mem);
+        let mut etree = vec![0isize; n];
+        let mut col_counts = vec![0usize; n];
+        simplicial::prefactorize_symbolic_cholesky(
+            &mut etree,
+            &mut col_counts,
+            a_perm_upper.symbolic(),
+            stack,
+        );
+        simplicial::factorize_simplicial_symbolic_cholesky(
+            a_perm_upper.symbolic(),
+            unsafe { simplicial::EliminationTreeRef::from_inner(&etree) },
+            &col_counts,
+            stack,
+        )
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?
+    };
+
+    // 4. Numeric LLᵀ factorization.
+    let mut l_values = vec![0.0f64; symbolic.len_val()];
+    {
+        let mut mem = MemBuffer::new(simplicial::factorize_simplicial_numeric_llt_scratch::<
+            usize,
+            f64,
+        >(n));
+        simplicial::factorize_simplicial_numeric_llt::<usize, f64>(
+            &mut l_values,
+            a_perm_upper.as_ref(),
+            LltRegularization::default(),
+            &symbolic,
+            MemStack::new(&mut mem),
+        )
+        .map_err(|_| EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: f64::NAN,
+        })?;
+    }
+
+    // 5. logdet(H) = 2 * sum_j ln(L_jj). The diagonal of L lives at the
+    //    first stored entry of each column in CSC.
+    let l_col_ptr = symbolic.col_ptr();
+    let mut logdet = 0.0f64;
+    for j in 0..n {
+        let diag = l_values[l_col_ptr[j]];
+        if diag <= 0.0 {
+            return Err(EstimationError::HessianNotPositiveDefinite {
+                min_eigenvalue: f64::NAN,
+            });
+        }
+        logdet += diag.ln();
+    }
+    Ok(2.0 * logdet)
 }
 
 /// Build a [`SimplicialFactor`] from a symmetric CSC matrix (upper, lower, or
