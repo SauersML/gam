@@ -4508,21 +4508,83 @@ impl LinearOperator for DesignMatrix {
         match self {
             Self::Dense(x) => x.diag_xtw_x(weights),
             Self::Sparse(xs) => {
-                // For nominally-sparse designs whose XᵀWX is dense (Matern /
-                // Duchon radial bases store one nonzero per knot per row, so
-                // the Hessian fills in completely), the row-by-row scalar
-                // assembly was the dominant PIRLS inner cost at biobank
-                // scale — single-threaded, ~1 s/iter on n=320 K · p=101.
-                // Densify once via the cached `to_dense_arc` and dispatch to
-                // the existing chunked-streaming faer matmul path; that
-                // routes through faer's parallel matmul (`get_global_par
-                // allelism`), which is exactly what `streaming_blas_xt_diag_x`
-                // already does for Dense designs.  For genuinely sparse
-                // designs whose XᵀWX stays sparse the sparse-native PIRLS
-                // path is selected upstream and this branch is not hit.
-                let xd = xs.as_ref().to_dense_arc();
+                // Two regimes for sparse-stored designs:
+                //
+                //   (A) Numerically dense — Matern / Duchon radial bases place
+                //       a nonzero in every column for every row, so XᵀWX has
+                //       O(p²) fills and the scalar row-loop is dominated by
+                //       memory traffic over O(n·nnz_row²) ≈ O(n·p²) ops.  Faer
+                //       hand-tuned BLAS3 in `streaming_blas_xt_diag_x` runs
+                //       parallel + SIMD over the densified design and beats
+                //       any scalar rayon sparse loop by an order of magnitude.
+                //
+                //   (B) Genuinely sparse — B-spline / banded bases keep
+                //       nnz_row at a small constant (4–6), so the per-row
+                //       O(nnz_row²) work is ~25× fewer FLOPs than the dense
+                //       matmul and densification is a regression.  Run a
+                //       row-parallel scalar accumulation in that regime.
+                //
+                // Heuristic: average nnz_per_row >= p/4 picks (A).  In practice
+                // the upstream `should_use_sparse_native_pirls` already routes
+                // banded sparse XᵀWX designs to a separate sparse-native PIRLS
+                // path that does NOT call this function, so the (A) branch
+                // covers every actual call site we have today; the (B) branch
+                // is a correctness-preserving safety net for future callers.
+                let n = self.nrows();
+                let nnz_x = xs.as_ref().val().len();
+                let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
+                let dense_regime = 4 * avg_nnz_row >= p;
+                if dense_regime {
+                    let xd = xs.as_ref().to_dense_arc();
+                    let mut xtwx = Array2::<f64>::zeros((p, p));
+                    streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+                    return Ok(xtwx);
+                }
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                let n_threads = rayon::current_num_threads().max(1);
+                let target_chunks = (n_threads * 16).max(n_threads);
+                let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
+                let chunk_starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+                let partials: Vec<Array2<f64>> = chunk_starts
+                    .into_par_iter()
+                    .map(|start| {
+                        let end = (start + chunk_rows).min(n);
+                        let mut local = Array2::<f64>::zeros((p, p));
+                        let sym = csr.symbolic();
+                        let row_ptr = sym.row_ptr();
+                        let col_idx = sym.col_idx();
+                        let vals = csr.val();
+                        for i in start..end {
+                            let wi = weights[i].max(0.0);
+                            if wi == 0.0 {
+                                continue;
+                            }
+                            let r_start = row_ptr[i];
+                            let r_end = row_ptr[i + 1];
+                            for a_ptr in r_start..r_end {
+                                let a = col_idx[a_ptr];
+                                let wxa = wi * vals[a_ptr];
+                                for b_ptr in a_ptr..r_end {
+                                    let b = col_idx[b_ptr];
+                                    let v = wxa * vals[b_ptr];
+                                    local[[a, b]] += v;
+                                    if a != b {
+                                        local[[b, a]] += v;
+                                    }
+                                }
+                            }
+                        }
+                        local
+                    })
+                    .collect();
                 let mut xtwx = Array2::<f64>::zeros((p, p));
-                streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+                for partial in partials.iter() {
+                    xtwx += partial;
+                }
                 Ok(xtwx)
             }
         }
