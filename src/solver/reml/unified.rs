@@ -4369,7 +4369,7 @@ pub fn reml_laml_evaluate(
             );
             match drift {
                 DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
-                DriftDerivResult::Operator(op) => kernel.trace_projected_logdet(&op.to_dense()),
+                DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
             }
         } else if coord.is_block_local() && rho_corrections[idx].is_none() {
             let (block, start, end) = coord.scaled_block_local(1.0);
@@ -4447,7 +4447,7 @@ pub fn reml_laml_evaluate(
                     kernel.trace_projected_logdet(&matrix)
                 }
                 (Some(kernel), DriftDerivResult::Operator(op)) => {
-                    kernel.trace_projected_logdet(&op.to_dense())
+                    kernel.trace_operator(op.as_ref())
                 }
                 (None, DriftDerivResult::Dense(matrix)) => hop.trace_logdet_h_k(&matrix, None),
                 (None, DriftDerivResult::Operator(op)) => hop.trace_logdet_operator(op.as_ref()),
@@ -4706,9 +4706,7 @@ fn compute_ift_correction_trace(
                 // matrix for the projected trace.
                 match correction {
                     DriftDerivResult::Dense(matrix) => Ok(kernel.trace_projected_logdet(&matrix)),
-                    DriftDerivResult::Operator(op) => {
-                        Ok(kernel.trace_projected_logdet(&op.to_dense()))
-                    }
+                    DriftDerivResult::Operator(op) => Ok(kernel.trace_operator(op.as_ref())),
                 }
             } else {
                 Ok(correction.trace_logdet(hop))
@@ -4742,7 +4740,7 @@ fn compute_drift_deriv_traces(
         if let Some(kernel) = subspace {
             match result {
                 DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
-                DriftDerivResult::Operator(op) => kernel.trace_projected_logdet(&op.to_dense()),
+                DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
             }
         } else {
             match result {
@@ -4784,7 +4782,7 @@ fn compute_base_h2_trace(
 ) -> f64 {
     if let Some(kernel) = subspace {
         if let Some(op) = b_operator {
-            kernel.trace_projected_logdet(&op.to_dense())
+            kernel.trace_operator(op)
         } else if b_mat.nrows() > 0 {
             kernel.trace_projected_logdet(b_mat)
         } else {
