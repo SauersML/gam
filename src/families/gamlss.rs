@@ -11473,8 +11473,8 @@ impl BinomialLocationScaleFamily {
                 pt + pls
             ));
         }
-        let d_eta_t = x_t.dot(&d_beta_flat.slice(s![0..pt]));
-        let d_eta_ls = x_ls.dot(&d_beta_flat.slice(s![pt..pt + pls]));
+        let d_eta_t = fast_av(x_t, &d_beta_flat.slice(s![0..pt]));
+        let d_eta_ls = fast_av(x_ls, &d_beta_flat.slice(s![pt..pt + pls]));
         let core = binomial_location_scale_core(
             &self.y,
             &self.weights,
@@ -11633,10 +11633,10 @@ impl BinomialLocationScaleFamily {
                 total
             ));
         }
-        let d_eta_t_u = x_t.dot(&d_beta_u_flat.slice(s![0..pt]));
-        let d_eta_ls_u = x_ls.dot(&d_beta_u_flat.slice(s![pt..total]));
-        let d_eta_tv = x_t.dot(&d_betav_flat.slice(s![0..pt]));
-        let d_eta_lsv = x_ls.dot(&d_betav_flat.slice(s![pt..total]));
+        let d_eta_t_u = fast_av(x_t, &d_beta_u_flat.slice(s![0..pt]));
+        let d_eta_ls_u = fast_av(x_ls, &d_beta_u_flat.slice(s![pt..total]));
+        let d_eta_tv = fast_av(x_t, &d_betav_flat.slice(s![0..pt]));
+        let d_eta_lsv = fast_av(x_ls, &d_betav_flat.slice(s![pt..total]));
         let core = binomial_location_scale_core(
             &self.y,
             &self.weights,
@@ -12030,16 +12030,23 @@ impl BinomialLocationScaleFamily {
         };
         let (z_t, z_ls) = (&dir_a.z_t_psi, &dir_a.z_ls_psi);
 
-        let mut r_t_v = vec![0.0_f64; n];
-        let mut r_ls_v = vec![0.0_f64; n];
-        let mut dr_t_v = vec![0.0_f64; n];
-        let mut dr_ls_v = vec![0.0_f64; n];
-        let mut h_tt_v = vec![0.0_f64; n];
-        let mut h_tl_v = vec![0.0_f64; n];
-        let mut h_ll_v = vec![0.0_f64; n];
-        let mut dh_tt_v = vec![0.0_f64; n];
-        let mut dh_tl_v = vec![0.0_f64; n];
-        let mut dh_ll_v = vec![0.0_f64; n];
+        // Per-row scalars assembled in parallel. The probit/inverse-link
+        // derivatives are O(n) at biobank scale and are called O(K) times per
+        // outer REML gradient (K = number of psi coords), so a parallel pass is
+        // worthwhile here.
+        struct PsiTermsRow {
+            r_t: f64,
+            r_ls: f64,
+            dr_t: f64,
+            dr_ls: f64,
+            h_tt: f64,
+            h_tl: f64,
+            h_ll: f64,
+            dh_tt: f64,
+            dh_tl: f64,
+            dh_ll: f64,
+            obj: f64,
+        }
         let y_p = self.y.as_slice().expect("y must be contiguous");
         let w_p = self.weights.as_slice().expect("weights must be contiguous");
         let q0_p = core.q0.as_slice().expect("q0 must be contiguous");
@@ -12061,84 +12068,65 @@ impl BinomialLocationScaleFamily {
         let z_t_p = z_t.as_slice().expect("z_t must be contiguous");
         let z_ls_p = z_ls.as_slice().expect("z_ls must be contiguous");
         let link_kind_p = &self.link_kind;
-        // SAFETY: each parallel iteration writes a unique index i; raw pointer
-        // sends are needed because rayon does not directly support a 10-way
-        // par_iter_mut zip. Buffers are freshly allocated and not aliased.
-        struct PsiTermsPtrs {
-            r_t: *mut f64,
-            r_ls: *mut f64,
-            dr_t: *mut f64,
-            dr_ls: *mut f64,
-            h_tt: *mut f64,
-            h_tl: *mut f64,
-            h_ll: *mut f64,
-            dh_tt: *mut f64,
-            dh_tl: *mut f64,
-            dh_ll: *mut f64,
-        }
-        unsafe impl Send for PsiTermsPtrs {}
-        unsafe impl Sync for PsiTermsPtrs {}
-        let ptrs = PsiTermsPtrs {
-            r_t: r_t_v.as_mut_ptr(),
-            r_ls: r_ls_v.as_mut_ptr(),
-            dr_t: dr_t_v.as_mut_ptr(),
-            dr_ls: dr_ls_v.as_mut_ptr(),
-            h_tt: h_tt_v.as_mut_ptr(),
-            h_tl: h_tl_v.as_mut_ptr(),
-            h_ll: h_ll_v.as_mut_ptr(),
-            dh_tt: dh_tt_v.as_mut_ptr(),
-            dh_tl: dh_tl_v.as_mut_ptr(),
-            dh_ll: dh_ll_v.as_mut_ptr(),
-        };
-        let objective_psi: f64 = (0..n)
+        let rows: Vec<PsiTermsRow> = (0..n)
             .into_par_iter()
-            .with_min_len(1024)
-            .fold(
-                || 0.0_f64,
-                |acc, i| {
-                    let q = q0_p[i];
-                    let r = 1.0 / sigma_p[i];
-                    let s = dsigma_p[i] / sigma_p[i];
-                    let sz = s * z_ls_p[i];
-                    let q_psi = -r * z_t_p[i] - q * sz;
-                    let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
-                        y_p[i],
-                        w_p[i],
-                        q,
-                        mu_p[i],
-                        dmu_p[i],
-                        d2mu_p[i],
-                        d3mu_p[i],
-                        link_kind_p,
-                    );
-                    let r_t_i = -a * r;
-                    let r_ls_i = -a * q * s;
-                    unsafe {
-                        *ptrs.r_t.add(i) = r_t_i;
-                        *ptrs.r_ls.add(i) = r_ls_i;
-                        *ptrs.dr_t.add(i) = -b * q_psi * r + a * r * sz;
-                        *ptrs.dr_ls.add(i) = -(a + q * b) * q_psi;
-                        *ptrs.h_tt.add(i) = b * r * r;
-                        *ptrs.h_tl.add(i) = r * (a + q * b);
-                        *ptrs.h_ll.add(i) = q * (a + q * b);
-                        *ptrs.dh_tt.add(i) = r * r * (c * q_psi - 2.0 * b * sz);
-                        *ptrs.dh_tl.add(i) = r * ((2.0 * b + c * q) * q_psi - (a + q * b) * sz);
-                        *ptrs.dh_ll.add(i) = (a + 3.0 * q * b + q * q * c) * q_psi;
-                    }
-                    acc + r_t_i * z_t_p[i] + r_ls_i * z_ls_p[i]
-                },
-            )
-            .sum();
-        let r_t = Array1::from_vec(r_t_v);
-        let r_ls = Array1::from_vec(r_ls_v);
-        let dr_t = Array1::from_vec(dr_t_v);
-        let dr_ls = Array1::from_vec(dr_ls_v);
-        let h_tt = Array1::from_vec(h_tt_v);
-        let h_tl = Array1::from_vec(h_tl_v);
-        let h_ll = Array1::from_vec(h_ll_v);
-        let dh_tt = Array1::from_vec(dh_tt_v);
-        let dh_tl = Array1::from_vec(dh_tl_v);
-        let dh_ll = Array1::from_vec(dh_ll_v);
+            .map(|i| {
+                let q = q0_p[i];
+                let r = 1.0 / sigma_p[i];
+                let s = dsigma_p[i] / sigma_p[i];
+                let sz = s * z_ls_p[i];
+                let q_psi = -r * z_t_p[i] - q * sz;
+                let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
+                    y_p[i],
+                    w_p[i],
+                    q,
+                    mu_p[i],
+                    dmu_p[i],
+                    d2mu_p[i],
+                    d3mu_p[i],
+                    link_kind_p,
+                );
+                let r_t = -a * r;
+                let r_ls = -a * q * s;
+                PsiTermsRow {
+                    r_t,
+                    r_ls,
+                    dr_t: -b * q_psi * r + a * r * sz,
+                    dr_ls: -(a + q * b) * q_psi,
+                    h_tt: b * r * r,
+                    h_tl: r * (a + q * b),
+                    h_ll: q * (a + q * b),
+                    dh_tt: r * r * (c * q_psi - 2.0 * b * sz),
+                    dh_tl: r * ((2.0 * b + c * q) * q_psi - (a + q * b) * sz),
+                    dh_ll: (a + 3.0 * q * b + q * q * c) * q_psi,
+                    obj: r_t * z_t_p[i] + r_ls * z_ls_p[i],
+                }
+            })
+            .collect();
+        let mut r_t = Array1::<f64>::zeros(n);
+        let mut r_ls = Array1::<f64>::zeros(n);
+        let mut dr_t = Array1::<f64>::zeros(n);
+        let mut dr_ls = Array1::<f64>::zeros(n);
+        let mut h_tt = Array1::<f64>::zeros(n);
+        let mut h_tl = Array1::<f64>::zeros(n);
+        let mut h_ll = Array1::<f64>::zeros(n);
+        let mut dh_tt = Array1::<f64>::zeros(n);
+        let mut dh_tl = Array1::<f64>::zeros(n);
+        let mut dh_ll = Array1::<f64>::zeros(n);
+        let mut objective_psi = 0.0_f64;
+        for (i, row) in rows.into_iter().enumerate() {
+            r_t[i] = row.r_t;
+            r_ls[i] = row.r_ls;
+            dr_t[i] = row.dr_t;
+            dr_ls[i] = row.dr_ls;
+            h_tt[i] = row.h_tt;
+            h_tl[i] = row.h_tl;
+            h_ll[i] = row.h_ll;
+            dh_tt[i] = row.dh_tt;
+            dh_tl[i] = row.dh_tl;
+            dh_ll[i] = row.dh_ll;
+            objective_psi += row.obj;
+        }
 
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
             dir_a.x_t_psi.cloned_first_action(),
@@ -12156,8 +12144,8 @@ impl BinomialLocationScaleFamily {
         )?;
         let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
-        let score_t = x_t_map.transpose_mul(r_t.view()) + x_t.t().dot(&dr_t);
-        let score_ls = x_ls_map.transpose_mul(r_ls.view()) + x_ls.t().dot(&dr_ls);
+        let score_t = x_t_map.transpose_mul(r_t.view()) + fast_atv(x_t, &dr_t);
+        let score_ls = x_ls_map.transpose_mul(r_ls.view()) + fast_atv(x_ls, &dr_ls);
         let mut score_psi = Array1::<f64>::zeros(total);
         score_psi.slice_mut(s![0..pt]).assign(&score_t);
         score_psi.slice_mut(s![pt..pt + pls]).assign(&score_ls);
@@ -12513,13 +12501,13 @@ impl BinomialLocationScaleFamily {
             &(x_t_ab_map.transpose_mul(r_t.view())
                 + x_t_i_map.transpose_mul(dr_t_j.view())
                 + x_t_j_map.transpose_mul(dr_t_i.view())
-                + x_t.t().dot(&d2r_t)),
+                + fast_atv(x_t, &d2r_t)),
         );
         score_psi_psi.slice_mut(s![pt..pt + pls]).assign(
             &(x_ls_ab_map.transpose_mul(r_ls.view())
                 + x_ls_i_map.transpose_mul(dr_ls_j.view())
                 + x_ls_j_map.transpose_mul(dr_ls_i.view())
-                + x_ls.t().dot(&d2r_ls)),
+                + fast_atv(x_ls, &d2r_ls)),
         );
 
         let h_tt_block = weighted_crossprod_psi_maps(
@@ -12699,8 +12687,8 @@ impl BinomialLocationScaleFamily {
                 total
             ));
         }
-        let xi_t = x_t.dot(&d_beta_flat.slice(s![0..pt]));
-        let xi_ls = x_ls.dot(&d_beta_flat.slice(s![pt..pt + pls]));
+        let xi_t = fast_av(x_t, &d_beta_flat.slice(s![0..pt]));
+        let xi_ls = fast_av(x_ls, &d_beta_flat.slice(s![pt..pt + pls]));
         let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
 
@@ -13510,8 +13498,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
                 // Drift trace: Σ_i tr(C_i(u_k) · L_i).
                 let u_k_t = u_k.slice(s![0..pt]).to_owned();
                 let u_k_ls = u_k.slice(s![pt..total]).to_owned();
-                let d_eta_t = x_t.dot(&u_k_t);
-                let d_eta_ls = x_ls.dot(&u_k_ls);
+                let d_eta_t = fast_av(x_t, &u_k_t);
+                let d_eta_ls = fast_av(x_ls, &u_k_ls);
                 let mut drift_trace = 0.0;
                 for i in 0..n {
                     let q = row_q[i];
@@ -13644,14 +13632,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             ));
         }
         // u_t = X_t v_t, u_ls = X_ls v_ls
-        let u_t = self.x_t.dot(&v.slice(s![0..pt]));
-        let u_ls = self.x_ls.dot(&v.slice(s![pt..total]));
+        let u_t = fast_av(&self.x_t, &v.slice(s![0..pt]));
+        let u_ls = fast_av(&self.x_ls, &v.slice(s![pt..total]));
         // r_t = D_tt .* u_t + D_tl .* u_ls; r_ls = D_tl .* u_t + D_ll .* u_ls
         let r_t = &self.coeff_tt * &u_t + &self.coeff_tl * &u_ls;
         let r_ls = &self.coeff_tl * &u_t + &self.coeff_ll * &u_ls;
         // (X_t^T r_t, X_ls^T r_ls)
-        let out_t = self.x_t.t().dot(&r_t);
-        let out_ls = self.x_ls.t().dot(&r_ls);
+        let out_t = fast_atv(&self.x_t, &r_t);
+        let out_ls = fast_atv(&self.x_ls, &r_ls);
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pt]).assign(&out_t);
         out.slice_mut(s![pt..total]).assign(&out_ls);
@@ -14426,8 +14414,8 @@ impl BinomialLocationScaleWiggleFamily {
         }
         let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
-        let score_t = x_t_map.transpose_mul(score_t_xa.view()) + x_t.t().dot(&score_t_x);
-        let score_ls = x_ls_map.transpose_mul(score_ls_xa.view()) + x_ls.t().dot(&score_ls_x);
+        let score_t = x_t_map.transpose_mul(score_t_xa.view()) + fast_atv(x_t, &score_t_x);
+        let score_ls = x_ls_map.transpose_mul(score_ls_xa.view()) + fast_atv(x_ls, &score_ls_x);
         let score_w = b0.t().dot(&score_w_b) + d0.t().dot(&score_w_d1);
         let mut score_psi = Array1::<f64>::zeros(total);
         score_psi.slice_mut(s![0..pt]).assign(&score_t);
@@ -16598,8 +16586,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let total = beta_layout.total();
         let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_flat, "wiggle joint d_beta")?;
-        let d_eta_t = x_t.dot(&u_t);
-        let d_eta_ls = x_ls.dot(&u_ls);
+        let d_eta_t = fast_av(x_t, &u_t);
+        let d_eta_ls = fast_av(x_ls, &u_ls);
 
         let d0 =
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
@@ -16797,10 +16785,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
         let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_u_flat, "wiggle joint d_beta_u")?;
         let (v_t, v_ls, vw) = beta_layout.split_three(d_betav_flat, "wiggle joint d_betav")?;
-        let d_eta_t_u = x_t.dot(&u_t);
-        let d_eta_ls_u = x_ls.dot(&u_ls);
-        let d_eta_tv = x_t.dot(&v_t);
-        let d_eta_lsv = x_ls.dot(&v_ls);
+        let d_eta_t_u = fast_av(x_t, &u_t);
+        let d_eta_ls_u = fast_av(x_ls, &u_ls);
+        let d_eta_tv = fast_av(x_t, &v_t);
+        let d_eta_lsv = fast_av(x_ls, &v_ls);
 
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
@@ -17314,8 +17302,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             + &self.pieces.coeffww * &u_b;
         let r_d = &self.pieces.coeff_tw_d * &u_t + &self.pieces.coeff_lw_d * &u_ls;
 
-        let out_t = self.x_t.t().dot(&r_t);
-        let out_ls = self.x_ls.t().dot(&r_ls);
+        let out_t = fast_atv(&self.x_t, &r_t);
+        let out_ls = fast_atv(&self.x_ls, &r_ls);
         let out_w = self.pieces.b0.t().dot(&r_b) + &self.pieces.d0.t().dot(&r_d);
 
         let mut out = Array1::<f64>::zeros(total);
