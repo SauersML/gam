@@ -13,7 +13,6 @@ use crate::custom_family::{
     shared_dense_arc, weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
 use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv, fast_av, fast_xt_diag_x};
-use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
 use crate::families::gamlss::{
     SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
     monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
@@ -33,6 +32,7 @@ use crate::mixture_link::{
     inverse_link_pdfthird_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
+use crate::probability::erfcx_nonnegative;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,

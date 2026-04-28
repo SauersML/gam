@@ -16,7 +16,9 @@ use crate::families::row_kernel::{
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
+use crate::probability::{
+    normal_cdf, normal_pdf, signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
+};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
@@ -25,7 +27,6 @@ use crate::smooth::{
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use statrs::function::erf::erfc;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -939,56 +940,6 @@ fn joint_setup(
         log_kappa_lower,
         log_kappa_upper,
     )
-}
-
-#[inline]
-pub(crate) fn erfcx_nonnegative(x: f64) -> f64 {
-    if !x.is_finite() {
-        return if x.is_sign_positive() {
-            0.0
-        } else {
-            f64::INFINITY
-        };
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < 26.0 {
-        ((x * x).min(700.0)).exp() * erfc(x)
-    } else {
-        let inv = 1.0 / x;
-        let inv2 = inv * inv;
-        let poly = 1.0
-            + 0.5 * inv2
-            + 0.75 * inv2 * inv2
-            + 1.875 * inv2 * inv2 * inv2
-            + 6.5625 * inv2 * inv2 * inv2 * inv2;
-        inv * poly / std::f64::consts::PI.sqrt()
-    }
-}
-
-#[inline]
-pub(crate) fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
-    if x == f64::INFINITY {
-        return (0.0, 0.0);
-    }
-    if x == f64::NEG_INFINITY {
-        return (f64::NEG_INFINITY, f64::INFINITY);
-    }
-    if x.is_nan() {
-        return (f64::NAN, f64::NAN);
-    }
-    if x < 0.0 {
-        let u = -x / std::f64::consts::SQRT_2;
-        let ex = erfcx_nonnegative(u).max(1e-300);
-        let log_cdf = -u * u + (0.5 * ex).ln();
-        let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
-        (log_cdf, lambda)
-    } else {
-        let cdf = normal_cdf(x).clamp(1e-300, 1.0);
-        let lambda = normal_pdf(x) / cdf;
-        (cdf.ln(), lambda)
-    }
 }
 
 #[inline]

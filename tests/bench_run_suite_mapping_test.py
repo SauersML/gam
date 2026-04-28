@@ -417,6 +417,11 @@ class RunSuiteMappingTests(unittest.TestCase):
             ],
         )
 
+    def test_binomial_formula_link_defaults_to_probit(self) -> None:
+        self.assertEqual(
+            _RUN_SUITE._default_rust_formula_link_for_family("binomial"), "probit"
+        )
+
     def test_survival_benchmark_fit_options_require_structural_ispline_basis(self) -> None:
         expected = {
             "icu_survival_death": 10,
