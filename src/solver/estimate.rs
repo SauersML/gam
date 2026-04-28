@@ -955,6 +955,16 @@ pub enum EstimationError {
         elapsed_seconds: f64,
         max_seconds: f64,
     },
+
+    #[error(
+        "outer ARC iteration exceeded its wall-clock budget after {elapsed_seconds:.1}s \
+         (limit {max_seconds:.1}s, configurable via GAM_ARC_MAX_SECONDS_PER_ITER); \
+         the outer fallback cascade should degrade to a cheaper plan."
+    )]
+    OuterTimeBudgetExceeded {
+        elapsed_seconds: f64,
+        max_seconds: f64,
+    },
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
