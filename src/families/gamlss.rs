@@ -6603,6 +6603,130 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
     }
 }
 
+/// One channel of a `RowCoeffOperator`: a row-major `Arc<Array2<f64>>`
+/// design matrix indexed by row coefficient pairs. Channels with the same
+/// `block` value contribute their `X^T r` outputs into the same coefficient
+/// block of the joint vector (e.g. wiggle's basis B and basis_d1 are two
+/// channels that both contribute to the wiggle output block).
+struct RowCoeffChannel {
+    block: usize,
+    design: Arc<Array2<f64>>,
+}
+
+/// Matrix-free operator for two-block-style joint-Hessian directional
+/// derivatives that decompose as `H = sum_{a,b} X_a^T diag(c_{ab}) X_b`
+/// with each `X_a` an `n × p_a` design and `c_{ab}` an `n` row coefficient
+/// vector. `mul_vec` applies the operator in O(n · sum_a p_a) per call.
+///
+/// `block_offsets` gives the starting column of each output block; the
+/// operator dimension is the sum of all block widths. Each channel's
+/// `mul_vec` contribution is added into the slice for its output block.
+struct RowCoeffOperator {
+    channels: Vec<RowCoeffChannel>,
+    block_offsets: Vec<usize>,
+    block_widths: Vec<usize>,
+    dim: usize,
+    /// Symmetric pair coefficients `c_{ab}` for `a ≤ b`. The operator
+    /// adds `X_a^T diag(c_{ab}) X_b` to block `block_a`'s output and the
+    /// transpose contribution `X_b^T diag(c_{ab}) X_a` to `block_b` when
+    /// `a != b`.
+    pair_coeffs: Vec<RowCoeffPair>,
+    nrows: usize,
+}
+
+struct RowCoeffPair {
+    a: usize,
+    b: usize,
+    coeff: Array1<f64>,
+}
+
+impl RowCoeffOperator {
+    fn new(
+        channels: Vec<RowCoeffChannel>,
+        block_widths: Vec<usize>,
+        pair_coeffs: Vec<RowCoeffPair>,
+        nrows: usize,
+    ) -> Self {
+        let mut block_offsets = Vec::with_capacity(block_widths.len());
+        let mut acc = 0;
+        for w in &block_widths {
+            block_offsets.push(acc);
+            acc += *w;
+        }
+        Self {
+            channels,
+            block_offsets,
+            block_widths,
+            dim: acc,
+            pair_coeffs,
+            nrows,
+        }
+    }
+}
+
+impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.dim);
+        // 1) For each channel, compute u_a = X_a · v[block_a slice].
+        let n = self.nrows;
+        let mut u: Vec<Array1<f64>> = Vec::with_capacity(self.channels.len());
+        for ch in &self.channels {
+            let start = self.block_offsets[ch.block];
+            let width = self.block_widths[ch.block];
+            // Each channel must provide its own design indexed by ch.block's
+            // beta slice; if multiple channels share a block their designs
+            // share the same column count.
+            debug_assert_eq!(ch.design.ncols(), width);
+            let v_slice = v.slice(s![start..start + width]);
+            u.push(fast_av(ch.design.as_ref(), &v_slice));
+        }
+        // 2) For each channel a, accumulate r_a = sum_b c_{ab} ⊙ u_b.
+        let mut r: Vec<Array1<f64>> = (0..self.channels.len())
+            .map(|_| Array1::<f64>::zeros(n))
+            .collect();
+        for pair in &self.pair_coeffs {
+            let a = pair.a;
+            let b = pair.b;
+            // r_a += c_ab ⊙ u_b
+            for i in 0..n {
+                r[a][i] += pair.coeff[i] * u[b][i];
+            }
+            if a != b {
+                for i in 0..n {
+                    r[b][i] += pair.coeff[i] * u[a][i];
+                }
+            }
+        }
+        // 3) For each channel, contribute X_a^T r_a into output block.
+        let mut out = Array1::<f64>::zeros(self.dim);
+        for (idx, ch) in self.channels.iter().enumerate() {
+            let start = self.block_offsets[ch.block];
+            let width = self.block_widths[ch.block];
+            let contrib = fast_atv(ch.design.as_ref(), &r[idx]);
+            let mut block = out.slice_mut(s![start..start + width]);
+            block += &contrib;
+        }
+        out
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        // Build by basis-vector probing — small-K materialization path.
+        let mut out = Array2::<f64>::zeros((self.dim, self.dim));
+        let mut basis = Array1::<f64>::zeros(self.dim);
+        for j in 0..self.dim {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
 /// Matrix-free joint-Hessian operator for the two-block Gaussian
 /// location-scale family. The dense Hessian decomposes as
 ///
@@ -6616,8 +6740,8 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
 struct GaussianLocationScaleHessianWorkspace {
     family: GaussianLocationScaleFamily,
     block_states: Vec<ParameterBlockState>,
-    xmu: Array2<f64>,
-    x_ls: Array2<f64>,
+    xmu: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
     coeff_mm: Array1<f64>,
     coeff_ml: Array1<f64>,
     coeff_ll: Array1<f64>,
@@ -6640,8 +6764,8 @@ impl GaussianLocationScaleHessianWorkspace {
         Ok(Self {
             family,
             block_states,
-            xmu,
-            x_ls,
+            xmu: Arc::new(xmu),
+            x_ls: Arc::new(x_ls),
             coeff_mm,
             coeff_ml,
             coeff_ll,
@@ -6661,12 +6785,12 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
                 total
             ));
         }
-        let u_mu = fast_av(&self.xmu, &v.slice(s![0..pmu]));
-        let u_ls = fast_av(&self.x_ls, &v.slice(s![pmu..total]));
+        let u_mu = fast_av(self.xmu.as_ref(), &v.slice(s![0..pmu]));
+        let u_ls = fast_av(self.x_ls.as_ref(), &v.slice(s![pmu..total]));
         let r_mu = &self.coeff_mm * &u_mu + &self.coeff_ml * &u_ls;
         let r_ls = &self.coeff_ml * &u_mu + &self.coeff_ll * &u_ls;
-        let out_mu = fast_atv(&self.xmu, &r_mu);
-        let out_ls = fast_atv(&self.x_ls, &r_ls);
+        let out_mu = fast_atv(self.xmu.as_ref(), &r_mu);
+        let out_ls = fast_atv(self.x_ls.as_ref(), &r_ls);
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pmu]).assign(&out_mu);
         out.slice_mut(s![pmu..total]).assign(&out_ls);
@@ -6707,10 +6831,43 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         self.family
             .exact_newton_joint_hessian_directional_derivative_from_designs(
                 &self.block_states,
-                &DenseOrOperator::Borrowed(&self.xmu),
-                &DenseOrOperator::Borrowed(&self.x_ls),
+                &DenseOrOperator::Borrowed(self.xmu.as_ref()),
+                &DenseOrOperator::Borrowed(self.x_ls.as_ref()),
                 d_beta_flat,
             )
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        let n = self.xmu.nrows();
+        let pmu = self.xmu.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pmu + pls;
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "GaussianLocationScale dH operator: d_beta length {} != {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+        let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+        let rows = self.family.get_or_compute_row_scalars(etamu, eta_ls)?;
+        let ximu = fast_av(self.xmu.as_ref(), &d_beta_flat.slice(s![0..pmu]));
+        let xi_ls = fast_av(self.x_ls.as_ref(), &d_beta_flat.slice(s![pmu..total]));
+        let (c_mm, c_ml, c_ll) =
+            gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
+        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
+            self.xmu.clone(),
+            self.x_ls.clone(),
+            c_mm,
+            c_ml,
+            c_ll,
+            n,
+        ))))
     }
 
     fn second_directional_derivative(
@@ -6721,12 +6878,73 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
                 &self.block_states,
-                &DenseOrOperator::Borrowed(&self.xmu),
-                &DenseOrOperator::Borrowed(&self.x_ls),
+                &DenseOrOperator::Borrowed(self.xmu.as_ref()),
+                &DenseOrOperator::Borrowed(self.x_ls.as_ref()),
                 d_beta_u_flat,
                 d_beta_v_flat,
             )
     }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        let n = self.xmu.nrows();
+        let pmu = self.xmu.ncols();
+        let pls = self.x_ls.ncols();
+        let total = pmu + pls;
+        if d_beta_u.len() != total || d_beta_v.len() != total {
+            return Err(format!(
+                "GaussianLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
+                d_beta_u.len(),
+                d_beta_v.len(),
+                total
+            ));
+        }
+        let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+        let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+        let rows = self.family.get_or_compute_row_scalars(etamu, eta_ls)?;
+        let ximu_u = fast_av(self.xmu.as_ref(), &d_beta_u.slice(s![0..pmu]));
+        let xi_ls_u = fast_av(self.x_ls.as_ref(), &d_beta_u.slice(s![pmu..total]));
+        let ximu_v = fast_av(self.xmu.as_ref(), &d_beta_v.slice(s![0..pmu]));
+        let xi_ls_v = fast_av(self.x_ls.as_ref(), &d_beta_v.slice(s![pmu..total]));
+        let (c_mm, c_ml, c_ll) =
+            gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximu_v, &xi_ls_v);
+        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
+            self.xmu.clone(),
+            self.x_ls.clone(),
+            c_mm,
+            c_ml,
+            c_ll,
+            n,
+        ))))
+    }
+}
+
+/// Build a `RowCoeffOperator` for the standard two-block GAMLSS structure
+/// with one design per block and three pair coefficients (a,a), (a,b), (b,b).
+fn make_two_block_row_coeff_operator(
+    x_a: Arc<Array2<f64>>,
+    x_b: Arc<Array2<f64>>,
+    c_aa: Array1<f64>,
+    c_ab: Array1<f64>,
+    c_bb: Array1<f64>,
+    nrows: usize,
+) -> RowCoeffOperator {
+    let pa = x_a.ncols();
+    let pb = x_b.ncols();
+    let channels = vec![
+        RowCoeffChannel { block: 0, design: x_a },
+        RowCoeffChannel { block: 1, design: x_b },
+    ];
+    let pair_coeffs = vec![
+        RowCoeffPair { a: 0, b: 0, coeff: c_aa },
+        RowCoeffPair { a: 0, b: 1, coeff: c_ab },
+        RowCoeffPair { a: 1, b: 1, coeff: c_bb },
+    ];
+    RowCoeffOperator::new(channels, vec![pa, pb], pair_coeffs, nrows)
 }
 
 struct GaussianLocationScaleWiggleJointPsiDirection {

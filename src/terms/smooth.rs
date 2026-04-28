@@ -6211,14 +6211,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     // exhausts max_iter through every seed instead of surfacing the failure,
     // burning the full job budget on directionally wrong updates. Disable the
     // fallback so the optimizer commits to its principled plan.
-    // Cost-aware downgrade: in addition to the existing dense-design heuristic
-    // above, hand the planner the standard-GAM problem dimensions so both the
-    // per-inner-solve (n·p²) and per-outer-eval (k²·n·p²) cost models can
-    // divert to gradient-only optimization when a single Newton iteration or
-    // the LAML pairwise Hessian assembly would dominate wall-clock time.
-    let n_obs_baseline = baseline.design.design.nrows();
-    let p_baseline = baseline.design.design.ncols();
-    let dense_baseline = baseline.design.design.as_sparse().is_none();
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -6227,7 +6219,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Derivative::Unavailable
         })
         .with_prefer_gradient_only(prefer_gradient_only)
-        .with_standard_gam_dimensions(n_obs_baseline, p_baseline, dense_baseline)
         // Re-enable the automatic fallback ladder for the spatial-adaptive
         // custom-family path. The original disable was for the geo-bench
         // fallback bug; the ψ-stagnation guard in OuterFixedPointBridge
