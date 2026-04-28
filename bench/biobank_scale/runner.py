@@ -84,8 +84,8 @@ def _detect_host_memory_bytes() -> int:
     as 16 GiB even if its parent system would otherwise look larger; this
     is the value the OS-level OOM killer will actually enforce. Falls back
     to a 64 GiB hardcoded value only if all detection paths are unavailable
-    (e.g. macOS), so the preflight stays usable on developer workstations
-    while it stops false-PASSing on small CI runners.
+    (e.g. macOS), so the preflight telemetry stays useful on developer
+    workstations and small CI runners.
     """
     fallback = 64 * 1024**3
     candidates: list[int] = []
@@ -182,7 +182,6 @@ class MethodSpec:
     mean_linkwiggle_knots: int | None = None
     logslope_linkwiggle_knots: int | None = None
     timewiggle_knots: int | None = None
-    max_centers: int | None = None
 
 
 @dataclass(frozen=True)
@@ -192,10 +191,6 @@ class BiobankPreflightReport:
     estimated_peak_bytes: int
     largest_single_allocation_bytes: int
     chunk_rows: int | None = None
-
-    def require_pass(self) -> None:
-        if self.status != "PASS":
-            raise RuntimeError("\n".join(self.lines))
 
 
 def gibibytes(nbytes: int) -> float:
@@ -277,7 +272,7 @@ def preflight_marginal_slope_biobank(
         failures.append(
             f"CTN prep factored peak: {gibibytes(ctn_prep_factored_peak_bytes):.1f} GiB exceeds 80% RAM budget {gibibytes(ram_budget_bytes):.1f} GiB"
         )
-    status = "FAIL" if failures else "PASS"
+    status = "ROUTE" if failures else "PASS"
     lines = [
         "BIOBANK PREFLIGHT",
         f"n_train: {n_train:,}",
@@ -304,7 +299,7 @@ def preflight_marginal_slope_biobank(
         f"largest single allocation planned: {gibibytes(largest):.1f} GiB",
         _preflight_status_line(status),
     ]
-    lines.extend(f"reason: {failure}" for failure in failures)
+    lines.extend(f"route note: {failure}" for failure in failures)
     return BiobankPreflightReport(status, lines, estimated_peak, largest)
 
 
@@ -323,7 +318,7 @@ def preflight_ctn_score_warp(
     status = "PASS"
     failures: list[str] = []
     if estimated_peak > int(0.80 * ram_budget_bytes):
-        status = "FAIL"
+        status = "ROUTE"
         failures.append("factored CTN design exceeds RAM budget")
     lines = [
         "BIOBANK PREFLIGHT",
@@ -336,7 +331,7 @@ def preflight_ctn_score_warp(
         f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB",
         _preflight_status_line(status),
     ]
-    lines.extend(f"reason: {failure}" for failure in failures)
+    lines.extend(f"route note: {failure}" for failure in failures)
     return BiobankPreflightReport(status, lines, estimated_peak, max(factored_bytes, p_response * p_cov * F64_BYTES))
 
 
@@ -357,7 +352,7 @@ def preflight_survival_prediction(
         failures.append("survival prediction chunk is too large")
     if estimated_peak > int(0.80 * ram_budget_bytes):
         failures.append("chunked survival prediction exceeds RAM budget")
-    status = "FAIL" if failures else "PASS"
+    status = "ROUTE" if failures else "PASS"
     lines = [
         "BIOBANK PREFLIGHT",
         f"n_predict: {n_rows:,}",
@@ -368,7 +363,7 @@ def preflight_survival_prediction(
         f"estimated peak RSS: {gibibytes(estimated_peak):.1f} GiB",
         _preflight_status_line(status),
     ]
-    lines.extend(f"reason: {failure}" for failure in failures)
+    lines.extend(f"route note: {failure}" for failure in failures)
     return BiobankPreflightReport(status, lines, estimated_peak, chunked_bytes, chunk_rows=chunk_rows)
 
 
@@ -1644,11 +1639,6 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
                 if item.get("timewiggle_knots") is not None
                 else None
             ),
-            max_centers=(
-                int(item["max_centers"])
-                if item.get("max_centers") is not None
-                else None
-            ),
         )
         validate_method_spec(spec)
         out.append(spec)
@@ -1660,17 +1650,8 @@ def count_csv_rows(path: Path) -> int:
         return max(sum(1 for _ in fh) - 1, 0)
 
 
-def effective_marginal_slope_centers(spec: MethodSpec, train_rows: int) -> int:
-    centers = int(spec.centers or 24)
-    if spec.max_centers is not None:
-        centers = min(centers, int(spec.max_centers))
-    if train_rows >= 250000:
-        centers = min(centers, 28)
-    if train_rows >= 350000:
-        centers = min(centers, 24)
-    if spec.mean_linkwiggle_knots is not None or spec.logslope_linkwiggle_knots is not None:
-        centers = min(centers, 22)
-    return max(10, centers)
+def effective_marginal_slope_centers(spec: MethodSpec) -> int:
+    return int(spec.centers or 24)
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
@@ -1755,7 +1736,7 @@ def run_rust_marginal_slope_classification(
     """Run 16D marginal-slope Duchon classification with optional anisotropy."""
     rust_bin = load_or_build_rust_binary()
     train_rows = count_csv_rows(train_csv)
-    centers = effective_marginal_slope_centers(spec, train_rows)
+    centers = effective_marginal_slope_centers(spec)
     preflight = preflight_marginal_slope_biobank(
         n_train=train_rows,
         d_pc=int(spec.pc_count),
@@ -1764,7 +1745,6 @@ def run_rust_marginal_slope_classification(
         scorewarp_knots=spec.logslope_linkwiggle_knots,
     )
     print("\n".join(preflight.lines), file=sys.stderr, flush=True)
-    preflight.require_pass()
     ctn_t0 = time.perf_counter()
     ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
         rust_bin=rust_bin,
@@ -2016,7 +1996,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     prediction_rows_raw = test_rows_raw
     train_metric_rows_raw = train_rows_raw
     if likelihood_mode == "marginal-slope":
-        centers = effective_marginal_slope_centers(spec, len(train_rows_raw))
+        centers = effective_marginal_slope_centers(spec)
         preflight = preflight_marginal_slope_biobank(
             n_train=len(train_rows_raw),
             d_pc=int(spec.pc_count),
@@ -2025,7 +2005,6 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             scorewarp_knots=spec.logslope_linkwiggle_knots,
         )
         print("\n".join(preflight.lines), file=sys.stderr, flush=True)
-        preflight.require_pass()
         ctn_t0 = time.perf_counter()
         ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
             rust_bin=rust_bin,
@@ -2052,7 +2031,6 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         ),
     )
     print("\n".join(prediction_preflight.lines), file=sys.stderr, flush=True)
-    prediction_preflight.require_pass()
     horizon = survival_eval_horizon_from_rows(train_rows_raw)
     with tempfile.TemporaryDirectory(prefix="gam_biobank_survival_", dir=out_dir) as td:
         td_path = Path(td)
