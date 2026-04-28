@@ -4186,10 +4186,6 @@ mod tests {
     // and operator-HVPs is independent of the planner; a separate per-family
     // test (in the family's own module) should pin that.
     //
-    // TODO(team-lead): once #4/#7 land and Matern/iso-kappa/marginal-slope
-    // each set their OuterProblem to (Analytic, Analytic), extend these
-    // assertions with a runtime hook that confirms the matrix-free path
-    // is actually taken (e.g. via a counter advertised by the family).
     // ----------------------------------------------------------------------
 
     #[test]
