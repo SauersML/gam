@@ -1906,14 +1906,7 @@ impl HyperOperator for ImplicitHyperOperator {
             design += dx_u[i] * w[i] * x_v[i];
         }
 
-        // Non-Gaussian fixed-β third-derivative correction:
-        //   uᵀ Xᵀ diag(c ⊙ X_{ψ_d} β̂) X v  =  Σ_i (X u)_i · c_x_psi_beta_i · (X v)_i
-        if let Some(c_x_psi_beta) = self.c_x_psi_beta.as_ref() {
-            let c = c_x_psi_beta.as_ref();
-            for i in 0..w.len() {
-                design += x_u[i] * c[i] * x_v[i];
-            }
-        }
+        design += self.c_correction_bilinear(&x_v, &x_u);
 
         let penalty = dense_bilinear(&self.s_psi, v, u);
 
