@@ -12486,6 +12486,53 @@ mod tests {
     }
 
     #[test]
+    fn cost_gated_outer_order_with_matrix_free_keeps_second_at_biobank_scale() {
+        // Same biobank-scale specs as the test above, but the family advertises
+        // a matrix-free Hv workspace. The evaluator will return
+        // `HessianResult::Operator` (so dense assembly is never performed),
+        // and the combined-cost gate must NOT downgrade Hessian availability
+        // — this is the fix for the cost-gating-vs-capability conflation.
+        let mk_spec = |p: usize| ParameterBlockSpec {
+            name: "ctn".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, p,
+            )))),
+            offset: Array1::zeros(1),
+            penalties: (0..22)
+                .map(|_| PenaltyMatrix::Dense(Array2::zeros((1, 1))))
+                .collect(),
+            nullspace_dims: vec![0; 22],
+            initial_log_lambdas: Array1::zeros(22),
+            initial_beta: None,
+        };
+        let specs = vec![mk_spec(300)];
+        let cost = joint_coupled_coefficient_hessian_cost(400_000, &specs);
+        assert_eq!(
+            cost_gated_outer_order_with_matrix_free(&specs, cost, true),
+            ExactOuterDerivativeOrder::Second
+        );
+        // The hard K² element cap is still enforced even with matrix-free
+        // (the K×K outer Hessian itself must remain allocatable).
+        let huge_k_spec = ParameterBlockSpec {
+            name: "x".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, 1,
+            )))),
+            offset: Array1::zeros(1),
+            penalties: (0..5_000)
+                .map(|_| PenaltyMatrix::Dense(Array2::zeros((1, 1))))
+                .collect(),
+            nullspace_dims: vec![0; 5_000],
+            initial_log_lambdas: Array1::zeros(5_000),
+            initial_beta: None,
+        };
+        assert_eq!(
+            cost_gated_outer_order_with_matrix_free(&[huge_k_spec], 0, true),
+            ExactOuterDerivativeOrder::First
+        );
+    }
+
+    #[test]
     fn cost_gated_first_order_max_iter_caps_biobank_scale_gamlss_below_request() {
         // GAMLSS Duchon60 scenario from task #9: K=15 outer parameters,
         // n=320_000 observations, p_t + p_ℓ = 64 fully-coupled coefficients.
