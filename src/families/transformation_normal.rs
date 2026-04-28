@@ -1014,7 +1014,11 @@ impl CustomFamily for TransformationNormalFamily {
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        crate::custom_family::cost_gated_outer_order(specs, self.coefficient_hessian_cost(specs))
+        crate::custom_family::cost_gated_outer_order_with_matrix_free(
+            specs,
+            self.coefficient_hessian_cost(specs),
+            self.supports_matrix_free_joint_hessian(specs),
+        )
     }
 
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
