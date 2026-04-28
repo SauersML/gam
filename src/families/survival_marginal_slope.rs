@@ -8,7 +8,7 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::{fast_atv, fast_av};
+use crate::faer_ndarray::fast_av;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     build_link_deviation_block_from_knots_design_seed_and_weights,

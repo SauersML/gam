@@ -4553,7 +4553,7 @@ impl LinearOperator for DesignMatrix {
                 let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
                 let dense_regime = 4 * avg_nnz_row >= p;
                 if dense_regime {
-                    let xd = xs.as_ref().to_dense_arc();
+                    let xd = xs.to_dense_arc();
                     let mut xtwx = Array2::<f64>::zeros((p, p));
                     streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
                     return Ok(xtwx);
