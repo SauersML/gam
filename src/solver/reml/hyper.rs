@@ -297,6 +297,59 @@ fn drift_deriv_result_from_parts(
     }
 }
 
+/// Augments a single-coordinate `HyperOperator` with the fixed-β Firth
+/// (Jeffreys) Hessian-drift action `−Hφ_{τ_j}|β · v`.
+///
+/// Additive on top of a base `dyn HyperOperator` (typically
+/// `ImplicitHyperOperator` for the spatial-ψ first-order drift). Active only
+/// under Firth + Logit when the τ-design admits the dense form required by
+/// `firth_hphi_tau_partial_apply`. The sign convention matches the dense
+/// fallback at `build_tau_hyper_coords` (`B_j -= Hφ_{τ_j}|β`); the operator
+/// computes the same `−Hφ_{τ_j}|β · v` action without materializing the p×p
+/// drift, by composing the base operator's action with a single Firth
+/// matrix-free apply per call.
+///
+/// Mirrors `FirthAugmentedPairHyperOperator` in shape: caller supplies the
+/// base operator, the dense `x_tau`, the prepared single-coordinate kernel,
+/// and an `Arc` to the Firth operator.
+struct FirthAugmentedSingleHyperOperator {
+    base: std::sync::Arc<dyn super::unified::HyperOperator>,
+    firth_op: std::sync::Arc<super::FirthDenseOperator>,
+    tau_kernel: super::FirthTauPartialKernel,
+    x_tau_dense: Array2<f64>,
+    p: usize,
+}
+
+impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p);
+        let base = self.base.mul_vec(v);
+        // `firth_hphi_tau_partial_apply` takes a (p × m) rhs block; wrap v as
+        // a (p × 1) column, run the partial apply, and pull off column 0.
+        let rhs = v.view().insert_axis(Axis(1)).to_owned();
+        let firth_out = self
+            .firth_op
+            .hphi_tau_partial_apply(&self.x_tau_dense, &self.tau_kernel, &rhs);
+        base - firth_out.column(0).to_owned()
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.p, self.p));
+        let mut basis = Array1::<f64>::zeros(self.p);
+        for j in 0..self.p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
+
+    fn is_implicit(&self) -> bool {
+        self.base.is_implicit()
+    }
+}
+
 /// Augments a pair `HyperOperator` with the fixed-β Firth (Jeffreys) pair
 /// Hessian-drift action `Hφ_{τ_iτ_j}|β · v` via Primitive A.
 ///
@@ -1456,13 +1509,17 @@ impl<'a> RemlState<'a> {
             // design derivative, we build an ImplicitHyperOperator that computes
             // B_j · v without materializing the full (p × p) matrix.
             //
-            // The ImplicitHyperOperator covers all four terms of B_j matrix-free:
+            // The ImplicitHyperOperator covers all four core terms of B_j
+            // matrix-free:
             //   1. (∂X/∂ψ_d)ᵀ W X v
             //   2. Xᵀ W (∂X/∂ψ_d) v
             //   3. Xᵀ diag(c ⊙ X_{ψ_d} β̂) X v   (non-Gaussian only, via c_x_psi_beta)
             //   4. S_{ψ_d} v
-            // Firth Hessian drifts are NOT included (small for biobank-scale problems
-            // where implicit operators are activated).
+            // Under Firth + Logit the operator is additionally wrapped in a
+            // `FirthAugmentedSingleHyperOperator` so the fixed-β Firth drift
+            // `−Hφ_{τ_j}|β · v` is applied matrix-free via
+            // `firth_hphi_tau_partial_apply`, matching the dense fallback at
+            // the bottom of this loop.
             let b_operator: Option<std::sync::Arc<dyn super::unified::HyperOperator>> =
                 if use_implicit {
                     if let Some((implicit_deriv, axis)) = implicit_first {
@@ -1473,15 +1530,43 @@ impl<'a> RemlState<'a> {
                         } else {
                             None
                         };
-                        Some(std::sync::Arc::new(super::unified::ImplicitHyperOperator {
-                            implicit_deriv,
-                            axis,
-                            x_design: x_design_shared.clone().unwrap(),
-                            w_diag: w_diag_shared.clone().unwrap(),
-                            s_psi: s_tau_j.clone(),
-                            p: p_dim,
-                            c_x_psi_beta,
-                        }))
+                        let core: std::sync::Arc<dyn super::unified::HyperOperator> =
+                            std::sync::Arc::new(super::unified::ImplicitHyperOperator {
+                                implicit_deriv,
+                                axis,
+                                x_design: x_design_shared.clone().unwrap(),
+                                w_diag: w_diag_shared.clone().unwrap(),
+                                s_psi: s_tau_j.clone(),
+                                p: p_dim,
+                                c_x_psi_beta,
+                            });
+                        // Firth augmentation: when the Firth operator is active
+                        // and `firth_tau_kernel_j` was prepared above (only when
+                        // `x_tau_j` has any non-zero rows), wrap `core` so the
+                        // `−Hφ_{τ_j}|β · v` action is applied matrix-free. The
+                        // kernel apply requires a dense `x_tau`, which is
+                        // already materialized here for the `a_j` / `g_j`
+                        // construction earlier in scope.
+                        if let (Some(op), Some(kernel)) =
+                            (firth_op.as_ref(), firth_tau_kernel_j.as_ref())
+                        {
+                            let x_tau_j_dense_mat = Self::ensure_transformed_x_tau_dense(
+                                &mut x_tau_j_dense,
+                                &hyper_dirs[j],
+                                &reparam_result.qs,
+                                free_basis_opt.as_ref(),
+                            )?
+                            .clone();
+                            Some(std::sync::Arc::new(FirthAugmentedSingleHyperOperator {
+                                base: core,
+                                firth_op: std::sync::Arc::clone(op),
+                                tau_kernel: kernel.clone(),
+                                x_tau_dense: x_tau_j_dense_mat,
+                                p: p_dim,
+                            }))
+                        } else {
+                            Some(core)
+                        }
                     } else {
                         None
                     }
@@ -1515,6 +1600,15 @@ impl<'a> RemlState<'a> {
                 }
 
                 // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
+                //
+                // This dense fallback fires only when there is no implicit
+                // operator path available (`b_operator.is_none()` — i.e.
+                // `use_implicit = false` or `implicit_first = None`). The
+                // operator-form equivalent is the
+                // `FirthAugmentedSingleHyperOperator` wrap above, which
+                // carries the same `−Hφ_{τ_j}|β · v` contribution matrix-free
+                // for the implicit-axis case.
+                //
                 // The D(H_φ)[β_{τ_j}] part is NOT included here because it
                 // depends on β_{τ_j} (the IFT solve result), which the unified
                 // evaluator computes itself. Only the fixed-β partial goes in B_j.
