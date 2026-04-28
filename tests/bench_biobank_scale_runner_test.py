@@ -186,12 +186,58 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
         text = "\n".join(report.lines)
         self.assertIn("status: PASS", text)
-        # The routing token format is documented in
-        # src/solver/outer_strategy.rs::OuterPlan::routing_log_line. When the
-        # bench runner gains a `--emit-routing-log` flag (post-#7 wiring),
-        # extend this test to invoke the runner and assert
-        # `solver=Arc;hessian=Analytic;matrix-free=true` in stderr for the
-        # marginal-slope, Matern, iso-kappa, and GAMLSS lanes.
+
+    def test_run_method_subparser_exposes_emit_routing_log_flag(self) -> None:
+        # The `--emit-routing-log` flag is the user-facing handle that turns
+        # on routing-token capture for biobank lane runs. Removing it would
+        # make the bench-level routing regressions (per the
+        # OuterPlan::routing_log_line contract) silently impossible.
+        parser = _RUNNER.build_parser()
+        args = parser.parse_args(
+            [
+                "run-method",
+                "--prep-dir",
+                "/tmp/p",
+                "--method",
+                "x",
+                "--out-dir",
+                "/tmp/o",
+                "--out-json",
+                "/tmp/o.json",
+                "--emit-routing-log",
+            ]
+        )
+        self.assertTrue(getattr(args, "emit_routing_log", False))
+
+    def test_routing_log_scraper_captures_outer_plan_lines_only(self) -> None:
+        # `_append_routing_lines` is the predicate that decides which captured
+        # stderr lines reach the routing-log sidecar. It must accept the
+        # `[OUTER]` log marker emitted by `log_plan` and reject unrelated
+        # noise so test scrapers aren't fooled by a heartbeat line that
+        # happens to contain `solver=`.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            tmp = Path(raw_dir) / "lane.routing.log"
+            stderr = (
+                "[HEARTBEAT] elapsed=1.2s cmd='gam ...' pid=42 cpu=10% mem=2%\n"
+                "[OUTER] reml outer: n_params=6, gradient=Analytic, hessian=Analytic"
+                " -> solver=Arc, hessian_source=Analytic"
+                " [solver=Arc;hessian=Analytic;matrix-free=true]\n"
+                "some unrelated stderr noise mentioning solver=Cheese\n"
+                "[OUTER] aux outer: n_params=2, gradient=Analytic, hessian=Unavailable"
+                " -> solver=Bfgs, hessian_source=BfgsApprox"
+                " [solver=Bfgs;hessian=BfgsApprox;matrix-free=false] [no Hessian: BFGS approximation]\n"
+            )
+            _RUNNER._append_routing_lines(tmp, stderr)
+            captured = tmp.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(captured), 2, captured)
+            self.assertIn(
+                "solver=Arc;hessian=Analytic;matrix-free=true", captured[0]
+            )
+            self.assertIn(
+                "solver=Bfgs;hessian=BfgsApprox;matrix-free=false", captured[1]
+            )
+            self.assertNotIn("HEARTBEAT", "\n".join(captured))
+            self.assertNotIn("Cheese", "\n".join(captured))
 
     def test_build_method_specs_rejects_pc_count_above_generated_columns(self) -> None:
         cfg = {
