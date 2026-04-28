@@ -1223,9 +1223,7 @@ mod tests {
 
     // --- Multi-block ALO tests ---
 
-    use super::{
-        MultiBlockAloInput, compute_multiblock_alo, compute_multiblock_alo_leverages,
-    };
+    use super::{MultiBlockAloInput, compute_multiblock_alo, compute_multiblock_alo_leverages};
     use ndarray::{Array1, Array2};
 
     #[test]
