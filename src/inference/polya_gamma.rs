@@ -13,10 +13,14 @@ use statrs::distribution::{ContinuousCDF, Normal};
 use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
 
 const PI_SQ: f64 = PI * PI;
-// 1 / sqrt(pi) — used in the inverse-gamma PDF coefficient
-// f(x; α=0.5, β=2k²) = sqrt(2k²/π) · x^{-3/2} · exp(-2k²/x)
-//                    = k · sqrt(2)/sqrt(π) · x^{-3/2} · exp(-2k²/x).
-const SQRT_2_OVER_SQRT_PI: f64 = 1.128_379_167_095_512_57; // sqrt(2 / pi)
+// sqrt(2 / pi) — the InverseGamma(α=0.5, β=2k²) PDF coefficient is
+//   (β^α / Γ(α)) = sqrt(2k²) / sqrt(π) = k · sqrt(2) / sqrt(π)
+//                = k · sqrt(2 / π),
+// so the n-th series term in the small-x arm is
+//   2 · InverseGamma(α=0.5, β=2k²) PDF
+//     = 2 · k · sqrt(2 / π) · x^{-3/2} · exp(-2k²/x).
+// Multiplied by 2 below so `coeff` is the full `2k · sqrt(2/π)` factor.
+const SQRT_2_OVER_SQRT_PI: f64 = 0.797_884_560_802_865_4;
 
 /// Sampler for the Pólya-Gamma PG(1, c) distribution.
 #[derive(Debug, Clone)]
