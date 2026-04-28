@@ -120,21 +120,7 @@ fn dense_block_or_operator<'a>(
     }
 
     let dense_bytes = 8usize.saturating_mul(n).saturating_mul(p);
-    let compute_ok =
-        match crate::linalg::matrix::panic_or_error_if_biobank_mode_compute_budget_exceeded(
-            "gamlss dense_block_or_operator",
-            n,
-            p,
-            crate::linalg::matrix::POLICY_DEFAULT_OUTER_ITER_ESTIMATE,
-            policy,
-        ) {
-            Ok(()) => true,
-            Err(msg) => {
-                log::info!("{msg}; falling back to operator path");
-                false
-            }
-        };
-    if compute_ok && dense_bytes <= budget_bytes {
+    if dense_bytes <= budget_bytes {
         if let Ok(arc) = design
             .try_to_dense_with_policy(&policy.material_policy(), "gamlss dense_block_or_operator")
         {
