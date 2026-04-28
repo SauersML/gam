@@ -2736,9 +2736,10 @@ impl KroneckerDesign {
                 }
                 for j in 0..pa {
                     let cov_part = right.apply(&beta_mat.row(j).to_owned());
-                    for i in 0..n {
-                        result[i] += left[[i, j]] * cov_part[i];
-                    }
+                    ndarray::Zip::from(&mut result)
+                        .and(&cov_part)
+                        .and(left.column(j))
+                        .par_for_each(|r, &c, &l| *r += l * c);
                 }
                 result
             }
@@ -2804,21 +2805,21 @@ impl KroneckerDesign {
     ) -> f64 {
         match self {
             KroneckerDesign::KhatriRao { .. } => {
-                // n observation rows: a single forward_mul pair fits in cache,
-                // and the tight serial scan dominates.
                 let h = self.forward_mul(beta);
                 let dh = self.forward_mul(delta);
-                let mut alpha = f64::INFINITY;
-                for i in 0..h.len() {
-                    let dval = dh[i];
-                    if dval < -dh_eps {
-                        let hit = (h[i] - slack) / (-dval);
-                        if hit < alpha {
-                            alpha = hit;
+                use rayon::prelude::*;
+                h.as_slice()
+                    .unwrap()
+                    .par_iter()
+                    .zip(dh.as_slice().unwrap().par_iter())
+                    .map(|(&hi, &dval)| {
+                        if dval < -dh_eps {
+                            (hi - slack) / (-dval)
+                        } else {
+                            f64::INFINITY
                         }
-                    }
-                }
-                alpha
+                    })
+                    .reduce(|| f64::INFINITY, f64::min)
             }
             KroneckerDesign::Kronecker {
                 response_grid,
