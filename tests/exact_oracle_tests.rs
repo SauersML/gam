@@ -116,8 +116,13 @@ fn test_lamlgradient_finite_difference_self_consistency() {
     // n=3 well-conditioned (non-separable) toy logit. FD self-consistency
     // is a pure implementation check; the fixture size doesn't affect the
     // FD-vs-analytic agreement so we keep this small for speed.
+    //
+    // Non-separability is essential for the non-Firth path: with no
+    // Jeffreys-prior correction, separable data has no finite MLE and the
+    // PIRLS inner loop diverges on η. We pick a non-monotone y on a
+    // monotone x so no single linear cut on x[1] can perfectly classify.
     let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
-    let y = array![0.0, 1.0, 1.0];
+    let y = array![0.0, 1.0, 0.0];
     let opts = logit_opts(false);
     // δ = 1e-4: small enough that O(δ²) FD truncation error stays below
     // ~1e-8 on the cost (smooth in ρ), large enough that the cost
