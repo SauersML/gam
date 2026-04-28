@@ -27,6 +27,12 @@ use gam::types::LikelihoodFamily;
 /// Build the standard Logit options the FD tests use. `firth` toggles the
 /// Firth bias-reduction path so we exercise the Jeffreys-prior addition to
 /// V_LAML.
+///
+/// Note that `firth_bias_reduction: Some(firth)` is set EXPLICITLY in both
+/// branches.  Passing `None` here would silently route through the
+/// `resolve_external_family` default — `family.supports_firth()` is `true`
+/// for `BinomialLogit`, so `logit_opts(false)` would otherwise still run
+/// the Firth path and the "non-Firth" test name would be a lie.
 fn logit_opts(firth: bool) -> ExternalOptimOptions {
     ExternalOptimOptions {
         latent_cloglog: None,
@@ -43,7 +49,7 @@ fn logit_opts(firth: bool) -> ExternalOptimOptions {
         tol: 1e-12,
         nullspace_dims: vec![0],
         linear_constraints: None,
-        firth_bias_reduction: if firth { Some(true) } else { None },
+        firth_bias_reduction: Some(firth),
         penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
