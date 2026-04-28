@@ -1106,6 +1106,15 @@ pub struct WorkingModelPirlsResult {
     pub last_step_halving: usize,
     pub max_abs_eta: f64,
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
+    /// Minimum penalized deviance (`state.deviance + state.penalty_term`)
+    /// observed across all iterations whose state was computed during the
+    /// inner P-IRLS loop. Penalized deviance is monotonically decreasing
+    /// along any descent path the inner solver takes, so this minimum is a
+    /// principled seed-screening proxy that remains meaningful even when the
+    /// solver hit its iteration cap before reaching the mode. `f64::INFINITY`
+    /// when no state was ever computed (paths that synthesize a result
+    /// without iterating, e.g. zero-iteration warm-only paths).
+    pub min_penalized_deviance: f64,
 }
 
 // Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
@@ -3523,6 +3532,7 @@ where
     // — virtually free when the optimizer has truly settled, and a
     // principled defence against false positives otherwise.
     let mut plateau_streak = 0usize;
+    let mut min_penalized_deviance = f64::INFINITY;
     let mut final_state: Option<WorkingState> = None;
     let mut newton_direction = Array1::<f64>::zeros(beta.len());
     let mut linear_active_hint: Option<Vec<usize>> =
@@ -3612,6 +3622,9 @@ where
             Err(err) => return Err(err),
         };
         let current_penalized = penalizedobjective(&state);
+        if current_penalized.is_finite() && current_penalized < min_penalized_deviance {
+            min_penalized_deviance = current_penalized;
+        }
         #[cfg(test)]
         test_support::record_penalized_deviance(current_penalized);
 
@@ -3841,6 +3854,11 @@ where
                             candidate_state
                         };
                         let candidate_penalized = penalizedobjective(&accepted_state);
+                        if candidate_penalized.is_finite()
+                            && candidate_penalized < min_penalized_deviance
+                        {
+                            min_penalized_deviance = candidate_penalized;
+                        }
                         let actual_reduction = current_penalized - candidate_penalized;
                         let rho = if predicted_reduction > noise_floor {
                             actual_reduction / predicted_reduction
