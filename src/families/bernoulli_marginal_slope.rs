@@ -7101,17 +7101,17 @@ impl BernoulliMarginalSlopeFamily {
             let n = cache.n;
             let p_marginal = slices.marginal.len();
             let p_logslope = slices.logslope.len();
+            let make_pair = || {
+                (
+                    Array2::<f64>::zeros((p_marginal, p_marginal)),
+                    Array2::<f64>::zeros((p_logslope, p_logslope)),
+                )
+            };
             let (hess_marginal, hess_logslope) = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
-                    || -> Result<(Array2<f64>, Array2<f64>), String> {
-                        Ok((
-                            Array2::<f64>::zeros((p_marginal, p_marginal)),
-                            Array2::<f64>::zeros((p_logslope, p_logslope)),
-                        ))
-                    },
-                    |acc, chunk_idx| -> Result<(Array2<f64>, Array2<f64>), String> {
-                        let (mut hm, mut hl) = acc?;
+                    make_pair,
+                    |(mut hm, mut hl), chunk_idx| -> Result<(Array2<f64>, Array2<f64>), String> {
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
                         let rows = end - start;
@@ -7136,20 +7136,13 @@ impl BernoulliMarginalSlopeFamily {
                     },
                 )
                 .try_reduce(
-                    || -> Result<(Array2<f64>, Array2<f64>), String> {
-                        Ok((
-                            Array2::<f64>::zeros((p_marginal, p_marginal)),
-                            Array2::<f64>::zeros((p_logslope, p_logslope)),
-                        ))
-                    },
-                    |left, right| -> Result<(Array2<f64>, Array2<f64>), String> {
-                        let (mut lhm, mut lhl) = left?;
-                        let (rhm, rhl) = right?;
+                    make_pair,
+                    |(mut lhm, mut lhl), (rhm, rhl)| -> Result<(Array2<f64>, Array2<f64>), String> {
                         lhm += &rhm;
                         lhl += &rhl;
                         Ok((lhm, lhl))
                     },
-                )??;
+                )?;
 
             let hess_marginal =
                 Self::exact_newton_observed_information_from_objective_hessian(hess_marginal);
@@ -7339,50 +7332,77 @@ impl BernoulliMarginalSlopeFamily {
         let primary = cache.primary.clone();
 
         if !flex_active {
-            let mut ll = 0.0;
-            let mut grad_marginal = Array1::<f64>::zeros(slices.marginal.len());
-            let mut grad_logslope = Array1::<f64>::zeros(slices.logslope.len());
-            let mut hess_marginal =
-                Array2::<f64>::zeros((slices.marginal.len(), slices.marginal.len()));
-            let mut hess_logslope =
-                Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
+            let n = self.y.len();
+            let p_marginal = slices.marginal.len();
+            let p_logslope = slices.logslope.len();
             let probit_scale = self.probit_frailty_scale();
-            for row in 0..self.y.len() {
-                let marginal = self.marginal_link_map(block_states[0].eta[row])?;
-                let g = block_states[1].eta[row];
-                let kern = RigidProbitKernel::new(
-                    marginal.q,
-                    g,
-                    self.z[row],
-                    self.y[row],
-                    self.weights[row],
-                    probit_scale,
-                )?;
-                ll += self.weights[row] * kern.logcdf;
-                let grad = rigid_transformed_gradient(marginal, &kern);
-                let h = rigid_transformed_hessian(marginal, &kern);
-
-                {
-                    let mut marginal = grad_marginal.view_mut();
-                    self.marginal_design.axpy_row_into(
-                        row,
-                        Self::exact_newton_score_component_from_objective_gradient(grad[0]),
-                        &mut marginal,
+            let make_acc = || {
+                (
+                    0.0_f64,
+                    Array1::<f64>::zeros(p_marginal),
+                    Array1::<f64>::zeros(p_logslope),
+                    Array2::<f64>::zeros((p_marginal, p_marginal)),
+                    Array2::<f64>::zeros((p_logslope, p_logslope)),
+                )
+            };
+            let (ll, grad_marginal, grad_logslope, hess_marginal, hess_logslope) =
+                (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+                    .into_par_iter()
+                    .try_fold(
+                        make_acc,
+                        |(mut ll, mut gm, mut gl, mut hm, mut hl), chunk_idx| -> Result<_, String> {
+                            let start = chunk_idx * ROW_CHUNK_SIZE;
+                            let end = (start + ROW_CHUNK_SIZE).min(n);
+                            let rows = end - start;
+                            let marginal_chunk = self.marginal_design.try_row_chunk(start..end)
+                                .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                            let logslope_chunk = self.logslope_design.try_row_chunk(start..end)
+                                .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                            let mut gm_w = Array1::<f64>::zeros(rows);
+                            let mut gl_w = Array1::<f64>::zeros(rows);
+                            let mut hm_w = Array1::<f64>::zeros(rows);
+                            let mut hl_w = Array1::<f64>::zeros(rows);
+                            for local_row in 0..rows {
+                                let row = start + local_row;
+                                let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                                let g = block_states[1].eta[row];
+                                let kern = RigidProbitKernel::new(
+                                    marginal.q,
+                                    g,
+                                    self.z[row],
+                                    self.y[row],
+                                    self.weights[row],
+                                    probit_scale,
+                                )?;
+                                ll += self.weights[row] * kern.logcdf;
+                                let grad = rigid_transformed_gradient(marginal, &kern);
+                                let h = rigid_transformed_hessian(marginal, &kern);
+                                gm_w[local_row] =
+                                    Self::exact_newton_score_component_from_objective_gradient(grad[0]);
+                                gl_w[local_row] =
+                                    Self::exact_newton_score_component_from_objective_gradient(grad[1]);
+                                hm_w[local_row] = h[0][0];
+                                hl_w[local_row] = h[1][1];
+                            }
+                            add_weighted_chunk_gradient(&marginal_chunk, &gm_w, &mut gm);
+                            add_weighted_chunk_gradient(&logslope_chunk, &gl_w, &mut gl);
+                            add_weighted_chunk_gram(&marginal_chunk, &hm_w, &mut hm);
+                            add_weighted_chunk_gram(&logslope_chunk, &hl_w, &mut hl);
+                            Ok((ll, gm, gl, hm, hl))
+                        },
+                    )
+                    .try_reduce(
+                        make_acc,
+                        |(lll, mut lgm, mut lgl, mut lhm, mut lhl),
+                         (rll, rgm, rgl, rhm, rhl)|
+                         -> Result<_, String> {
+                            lgm += &rgm;
+                            lgl += &rgl;
+                            lhm += &rhm;
+                            lhl += &rhl;
+                            Ok((lll + rll, lgm, lgl, lhm, lhl))
+                        },
                     )?;
-                }
-                {
-                    let mut logslope = grad_logslope.view_mut();
-                    self.logslope_design.axpy_row_into(
-                        row,
-                        Self::exact_newton_score_component_from_objective_gradient(grad[1]),
-                        &mut logslope,
-                    )?;
-                }
-                self.marginal_design
-                    .syr_row_into(row, h[0][0], &mut hess_marginal)?;
-                self.logslope_design
-                    .syr_row_into(row, h[1][1], &mut hess_logslope)?;
-            }
 
             return Ok(FamilyEvaluation {
                 log_likelihood: ll,
