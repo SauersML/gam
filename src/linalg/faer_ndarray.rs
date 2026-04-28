@@ -142,7 +142,7 @@ fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
 }
 
 #[inline]
-fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
+pub(crate) fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     // Prefer a work-based policy over per-dimension thresholds.
     // Tall/skinny products (e.g. N x p with large N, modest p) should still
     // parallelize when total work is high.

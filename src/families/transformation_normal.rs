@@ -612,31 +612,63 @@ fn factored_weighted_cross(
 
 /// Chunked weighted B^T diag(w) D product without materializing any
 /// full rowwise-Kronecker intermediate.
+///
+/// Each chunk weights `D` rows in-place, then accumulates `B[chunk]^T · DW`
+/// directly into `out` via a faer SIMD matmul with `Accum::Add`. This
+/// eliminates the per-chunk `Array2` from the previous `out += &bl.t().dot(&dw)`
+/// pattern (one allocation + one element-wise `+=` pass per chunk) and uses
+/// the multi-threaded faer kernel instead of ndarray's serial dot.
 fn chunked_weighted_bt_d(
     b: &Array2<f64>,
     weights: ndarray::ArrayView1<'_, f64>,
     d: &Array2<f64>,
     policy: &ResourcePolicy,
 ) -> Array2<f64> {
+    use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+
     let n = weights.len();
     let pb = b.ncols();
     let pd = d.ncols();
     let rows_per_chunk =
         crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
     let mut out = Array2::<f64>::zeros((pb, pd));
+    if n == 0 || pb == 0 || pd == 0 {
+        return out;
+    }
+    let mut out_view = array2_to_matmut(&mut out);
+    let mut dw_buf = Array2::<f64>::zeros((rows_per_chunk.min(n), pd));
     for start in (0..n).step_by(rows_per_chunk) {
         let end = (start + rows_per_chunk).min(n);
+        let rows = end - start;
         let bl = b.slice(s![start..end, ..]);
         let dl = d.slice(s![start..end, ..]);
-        let mut dw = dl.to_owned();
-        for local in 0..(end - start) {
-            let w = weights[start + local];
-            for j in 0..pd {
-                dw[[local, j]] *= w;
+        {
+            let mut dw_slice = dw_buf.slice_mut(s![..rows, ..]);
+            for local in 0..rows {
+                let w = weights[start + local];
+                let drow = dl.row(local);
+                let mut wrow = dw_slice.row_mut(local);
+                ndarray::Zip::from(&mut wrow)
+                    .and(&drow)
+                    .for_each(|dst, &src| *dst = w * src);
             }
         }
-        out += &bl.t().dot(&dw);
+        let bl_view = FaerArrayView::new(&bl);
+        let dw_slice = dw_buf.slice(s![..rows, ..]);
+        let dw_view = FaerArrayView::new(&dw_slice);
+        let par = matmul_parallelism(pb, pd, rows);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            bl_view.as_ref().transpose(),
+            dw_view.as_ref(),
+            1.0,
+            par,
+        );
     }
+    drop(out_view);
     out
 }
 
@@ -644,33 +676,56 @@ fn chunked_weighted_bt_d(
 /// operator-backed `DesignMatrix` instances. Materializes only one row chunk
 /// at a time using the operator's `row_chunk` primitive, so neither factor's
 /// full dense form ever lives in memory.
+///
+/// Each chunk's contribution accumulates into `out` via a faer SIMD matmul
+/// with `Accum::Add` rather than `out += &bl.t().dot(&dw)`. This drops one
+/// `Array2` allocation per chunk and routes the inner GEMM through faer's
+/// multi-threaded kernel with a work-aware parallelism choice.
 fn chunked_weighted_bt_d_designmatrix(
     b: &DesignMatrix,
     weights: ndarray::ArrayView1<'_, f64>,
     d: &DesignMatrix,
     policy: &ResourcePolicy,
 ) -> Result<Array2<f64>, String> {
+    use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+
     let n = weights.len();
     let pb = b.ncols();
     let pd = d.ncols();
     let rows_per_chunk =
         crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
     let mut out = Array2::<f64>::zeros((pb, pd));
+    if n == 0 || pb == 0 || pd == 0 {
+        return Ok(out);
+    }
+    let mut out_view = array2_to_matmut(&mut out);
     for start in (0..n).step_by(rows_per_chunk) {
         let end = (start + rows_per_chunk).min(n);
+        let rows = end - start;
         let bl = b.try_row_chunk(start..end).map_err(|e| e.to_string())?;
-        let dl = d.try_row_chunk(start..end).map_err(|e| e.to_string())?;
-        let mut dw = dl;
-        for local in 0..(end - start) {
+        let mut dw = d.try_row_chunk(start..end).map_err(|e| e.to_string())?;
+        for local in 0..rows {
             let w = weights[start + local];
             if w != 1.0 {
-                for j in 0..pd {
-                    dw[[local, j]] *= w;
-                }
+                let mut wrow = dw.row_mut(local);
+                wrow.mapv_inplace(|v| w * v);
             }
         }
-        out += &bl.t().dot(&dw);
+        let bl_view = FaerArrayView::new(&bl);
+        let dw_view = FaerArrayView::new(&dw);
+        let par = matmul_parallelism(pb, pd, rows);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            bl_view.as_ref().transpose(),
+            dw_view.as_ref(),
+            1.0,
+            par,
+        );
     }
+    drop(out_view);
     Ok(out)
 }
 
@@ -710,17 +765,25 @@ fn fused_khatri_rao_weighted_gram_apply(
         .view()
         .into_shape_with_order((p_resp, p_cov))
         .expect("v reshape to (p_resp, p_cov) — caller validates length");
-    // Forward phase: buf = B · V^T.
-    let mut buf = fast_ab(right, &v_mat.t().to_owned());
+    // Forward phase: buf = B · V^T. Pass V^T as a view directly into the faer
+    // matmul: faer accepts arbitrary positive strides, so the (p_cov × p_resp)
+    // transpose view doesn't need to be copied to a contiguous Array2 first.
+    // This eliminates a `p_resp · p_cov · 8`-byte allocation per matvec.
+    let v_t = v_mat.t();
+    let mut buf = fast_ab(right, &v_t);
     // Inner pass: overwrite buf row-by-row to U[i, :] = w_i · xv_i · A[i, :].
+    // Fuse the previous `assign(left_row); buf_row *= factor` two-pass into a
+    // single elementwise write `U[i,a] = factor · A[i,a]`, halving the pass
+    // count over the (n × p_resp) buffer.
     ndarray::Zip::from(buf.rows_mut())
         .and(left.rows())
         .and(weights.view())
         .for_each(|mut buf_row, left_row, &w| {
             let xv_i = left_row.dot(&buf_row);
             let factor = w * xv_i;
-            buf_row.assign(&left_row);
-            buf_row *= factor;
+            ndarray::Zip::from(&mut buf_row)
+                .and(&left_row)
+                .for_each(|dst, &src| *dst = factor * src);
         });
     // Transpose phase: result_mat = U^T · B → (p_resp × p_cov).
     let result_mat = fast_atb(&buf, right);
