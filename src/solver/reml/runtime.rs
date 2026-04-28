@@ -29,7 +29,9 @@ fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
 /// in `execute_pirls_if_needed`; this helper turns the partial cost into a
 /// finite ranking score
 ///
-///     C_screen(s) = C_approx(s) + ½ · r_g(s)² ,
+/// ```text
+/// C_screen(s) = C_approx(s) + ½ · r_g(s)² ,
+/// ```
 ///
 /// where r_g = ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖) is the scale-invariant
 /// relative gradient residual. Using r_g rather than the absolute ‖g‖ keeps
