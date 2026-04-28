@@ -23,7 +23,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
 };
 use crate::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ab, fast_ab_into, fast_atb, rrqr_nullspace_basis,
+    default_rrqr_rank_alpha, fast_ab, fast_ab_into, fast_atb, fast_av, rrqr_nullspace_basis,
 };
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -773,7 +773,7 @@ fn fused_khatri_rao_weighted_gram_apply(
     ndarray::Zip::from(buf.rows_mut())
         .and(left.rows())
         .and(weights.view())
-        .for_each(|mut buf_row, left_row, &w| {
+        .par_for_each(|mut buf_row, left_row, &w| {
             let xv_i = left_row.dot(&buf_row);
             let factor = w * xv_i;
             ndarray::Zip::from(&mut buf_row)
@@ -1674,16 +1674,24 @@ impl CustomFamily for TransformationNormalFamily {
         // positive on observed rows, so the only way to land here with a
         // non-positive value is an upstream invariant break worth surfacing
         // loudly.
-        let mut weighted_inv_hp_sq = Array1::<f64>::zeros(h_prime.len());
-        for i in 0..h_prime.len() {
-            let hp = h_prime[i];
-            if !hp.is_finite() || hp <= 0.0 {
-                return Err(format!(
-                    "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
-                ));
-            }
-            weighted_inv_hp_sq[i] = self.weights[i] / (hp * hp);
+        let bad: Option<(usize, f64)> = {
+            use rayon::prelude::*;
+            h_prime
+                .as_slice()
+                .unwrap()
+                .par_iter()
+                .enumerate()
+                .find_any(|(_, &hp)| !hp.is_finite() || hp <= 0.0)
+                .map(|(i, &hp)| (i, hp))
+        };
+        if let Some((i, hp)) = bad {
+            return Err(format!(
+                "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
+            ));
         }
+        let weighted_inv_hp_sq = ndarray::Zip::from(&h_prime)
+            .and(self.weights.as_ref())
+            .par_map_collect(|&hp, &w| w / (hp * hp));
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
             h_prime,
@@ -1765,11 +1773,8 @@ impl TransformationNormalJointHessianWorkspace {
         //
         // The val gram is constant in β (the weights are the family's row
         // weights, not the β-dependent 1/h'² kernel), so the family caches it
-        // once at construction. A dense gemv on the cached p×p matrix is
-        // O(p²) ≈ 9·10⁴ FLOPs at biobank scale — strictly cheaper than the
-        // factored apply (~10⁷ FLOPs) and the only term whose constant
-        // structure the workspace can exploit.
-        let mut out = self.family.x_val_weighted_gram.dot(v);
+        // once at construction. Dense gemv via faer on the cached p×p matrix.
+        let mut out = fast_av(&self.family.x_val_weighted_gram, v);
 
         // Term 2: factored (X_deriv^T diag(w/h'²) X_deriv) · v.
         //
@@ -1998,7 +2003,7 @@ impl TransformationNormalDhMatrixFreeOperator {
         let weight_kernel = ndarray::Zip::from(weights.view())
             .and(&*h_prime)
             .and(&d_h_prime)
-            .map_collect(|&w, &hp, &dhp| -2.0 * w * dhp / (hp * hp * hp));
+            .par_map_collect(|&w, &hp, &dhp| -2.0 * w * dhp / (hp * hp * hp));
         Self {
             family,
             weight_kernel,
@@ -2084,7 +2089,7 @@ impl TransformationNormalD2hMatrixFreeOperator {
             .and(&*h_prime)
             .and(&d_h_prime_u)
             .and(&d_h_prime_v)
-            .map_collect(|&w, &hp, &dhp_u, &dhp_v| {
+            .par_map_collect(|&w, &hp, &dhp_u, &dhp_v| {
                 let hp2 = hp * hp;
                 6.0 * w * dhp_u * dhp_v / (hp2 * hp2)
             });

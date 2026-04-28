@@ -2727,6 +2727,17 @@ fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
     base_tol * (1.0 + seed_cost.abs())
 }
 
+fn time_budget_exceeded(elapsed: f64, limit: f64, iter: usize) -> EstimationError {
+    log::warn!(
+        "[ARC-timing] time-budget exceeded at iter={iter}: elapsed={elapsed:.1}s > \
+         limit={limit:.1}s; returning OuterTimeBudgetExceeded so the outer cascade degrades"
+    );
+    EstimationError::OuterTimeBudgetExceeded {
+        elapsed_seconds: elapsed,
+        max_seconds: limit,
+    }
+}
+
 fn run_operator_trust_region(
     obj: &mut dyn OuterObjective,
     seed: &Array1<f64>,
@@ -2741,7 +2752,19 @@ fn run_operator_trust_region(
     let mut eval_k = initial_eval;
     let mut trust_radius = OPERATOR_TRUST_RADIUS_INIT;
 
+    // Per-iteration wall-clock budget. Mirrors GAM_PIRLS_MAX_SECONDS: when an
+    // ARC iteration's matrix-free Hv solve and trial evaluation together
+    // exceed the budget, return a dedicated `OuterTimeBudgetExceeded` so the
+    // outer fallback cascade can degrade to a cheaper plan rather than hang.
+    const DEFAULT_ARC_MAX_SECONDS_PER_ITER: f64 = 60.0;
+    let arc_max_seconds_per_iter = std::env::var("GAM_ARC_MAX_SECONDS_PER_ITER")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_ARC_MAX_SECONDS_PER_ITER);
+
     for iter in 0..max_iter {
+        let iter_start = std::time::Instant::now();
         let g_proj = projected_gradient(&x_k, &eval_k.gradient, bounds);
         let g_norm = g_proj.dot(&g_proj).sqrt();
         // Scale-invariant outer KKT certificate via `outer_scaled_tolerance`,
@@ -2750,6 +2773,14 @@ fn run_operator_trust_region(
         // the inner-PIRLS fix; see the helper's doc comment for derivation.
         let scaled_tol = outer_scaled_tolerance(tolerance, eval_k.cost);
         if g_norm.is_finite() && g_norm <= scaled_tol {
+            log::info!(
+                "[ARC-timing] iter={iter} converged cost={:.6e} grad_norm={:.3e} \
+                 trust_radius={:.3e} tol={:.3e}",
+                eval_k.cost,
+                g_norm,
+                trust_radius,
+                scaled_tol,
+            );
             return Ok(OuterResult {
                 rho: x_k,
                 final_value: eval_k.cost,
@@ -2767,11 +2798,24 @@ fn run_operator_trust_region(
                 "operator trust-region received a non-operator Hessian".to_string(),
             ));
         };
+        let counter = HvApplyCounter::new(op_arc.as_ref());
         let active = active_mask(&x_k, &eval_k.gradient, bounds);
-        let Some((trial_step, pred_dec_free)) =
-            steihaug_toint_step_operator(op_arc.as_ref(), &g_proj, trust_radius, &active)
-                .map_err(EstimationError::RemlOptimizationFailed)?
-        else {
+        let cg_result = steihaug_toint_step_operator(&counter, &g_proj, trust_radius, &active)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let Some((trial_step, pred_dec_free)) = cg_result else {
+            let elapsed = iter_start.elapsed().as_secs_f64();
+            log::info!(
+                "[ARC-timing] iter={iter} status=cg_no_step cost={:.6e} grad_norm={:.3e} \
+                 trust_radius={:.3e} hv_applies={} elapsed={:.3}s",
+                eval_k.cost,
+                g_norm,
+                trust_radius,
+                counter.count(),
+                elapsed,
+            );
+            if elapsed > arc_max_seconds_per_iter {
+                return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+            }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
         };
@@ -2781,6 +2825,19 @@ fn run_operator_trust_region(
         let s_trial = &x_trial - &x_k;
         let s_norm = s_trial.dot(&s_trial).sqrt();
         if !s_norm.is_finite() || s_norm <= 1e-16 {
+            let elapsed = iter_start.elapsed().as_secs_f64();
+            log::info!(
+                "[ARC-timing] iter={iter} status=zero_step cost={:.6e} grad_norm={:.3e} \
+                 trust_radius={:.3e} hv_applies={} elapsed={:.3}s",
+                eval_k.cost,
+                g_norm,
+                trust_radius,
+                counter.count(),
+                elapsed,
+            );
+            if elapsed > arc_max_seconds_per_iter {
+                return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+            }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
         }
@@ -2790,12 +2847,25 @@ fn run_operator_trust_region(
             .sqrt()
             > 1e-8 * (1.0 + trial_step.dot(&trial_step).sqrt())
         {
-            predicted_decrease_from_operator(op_arc.as_ref(), &g_proj, &s_trial, &active)
+            predicted_decrease_from_operator(&counter, &g_proj, &s_trial, &active)
                 .map_err(EstimationError::RemlOptimizationFailed)?
         } else {
             pred_dec_free
         };
         if !pred_dec.is_finite() || pred_dec <= 0.0 {
+            let elapsed = iter_start.elapsed().as_secs_f64();
+            log::info!(
+                "[ARC-timing] iter={iter} status=bad_pred_dec cost={:.6e} grad_norm={:.3e} \
+                 trust_radius={:.3e} hv_applies={} elapsed={:.3}s",
+                eval_k.cost,
+                g_norm,
+                trust_radius,
+                counter.count(),
+                elapsed,
+            );
+            if elapsed > arc_max_seconds_per_iter {
+                return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
+            }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
         }
@@ -2812,13 +2882,40 @@ fn run_operator_trust_region(
             )?;
         let act_dec = eval_k.cost - eval_trial.cost;
         let rho = act_dec / pred_dec;
-        if rho > 0.75 && s_norm > 0.99 * trust_radius {
-            trust_radius = (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX);
+        let accepted = rho > OPERATOR_ETA_ACCEPT;
+        let new_trust_radius = if rho > 0.75 && s_norm > 0.99 * trust_radius {
+            (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX)
         } else if rho < 0.25 {
-            trust_radius = (trust_radius * 0.5).max(1e-12);
+            (trust_radius * 0.5).max(1e-12)
+        } else {
+            trust_radius
+        };
+        let hv_applies = counter.count();
+        let elapsed = iter_start.elapsed().as_secs_f64();
+        let next_cost = if accepted { eval_trial.cost } else { eval_k.cost };
+        log::info!(
+            "[ARC-timing] iter={iter} status={} cost={:.6e}->{:.6e} grad_norm={:.3e} \
+             rho={:.3} pred_dec={:.3e} act_dec={:.3e} trust_radius={:.3e}->{:.3e} \
+             hv_applies={} elapsed={:.3}s",
+            if accepted { "accepted" } else { "rejected" },
+            eval_k.cost,
+            next_cost,
+            g_norm,
+            rho,
+            pred_dec,
+            act_dec,
+            trust_radius,
+            new_trust_radius,
+            hv_applies,
+            elapsed,
+        );
+
+        if elapsed > arc_max_seconds_per_iter {
+            return Err(time_budget_exceeded(elapsed, arc_max_seconds_per_iter, iter));
         }
 
-        if rho > OPERATOR_ETA_ACCEPT {
+        trust_radius = new_trust_radius;
+        if accepted {
             x_k = x_trial;
             eval_k = eval_trial;
         }
