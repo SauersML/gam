@@ -12704,22 +12704,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
     }
 
-    fn exact_outer_derivative_order(
-        &self,
-        specs: &[ParameterBlockSpec],
-        _: &BlockwiseFitOptions,
-    ) -> ExactOuterDerivativeOrder {
-        if crate::custom_family::cost_gated_outer_order_with_matrix_free(
-            specs,
-            self.coefficient_hessian_cost(specs),
-            self.supports_matrix_free_joint_hessian(specs),
-        ) == ExactOuterDerivativeOrder::First
-        {
-            return ExactOuterDerivativeOrder::First;
-        }
-        survival_row_work_order(self, specs)
-    }
-
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         true
     }
