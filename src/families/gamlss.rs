@@ -17727,6 +17727,181 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 }
 
+impl BinomialLocationScaleWiggleFamily {
+    /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
+    /// directional derivative `D_β H_L[u]`. Channels (in order):
+    /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the
+    /// joint coefficient vector `(β_t, β_ls, β_w)`.
+    fn bls_wiggle_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t_arc: Arc<Array2<f64>>,
+        x_ls_arc: Arc<Array2<f64>>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    {
+        if block_states.len() != 3 {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleWiggleFamily input size mismatch".to_string());
+        }
+        let pt = x_t_arc.ncols();
+        let pls = x_ls_arc.ncols();
+        let betaw0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
+        let core0 = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            Some(etaw),
+            &self.link_kind,
+        )?;
+        let b0 = self.wiggle_design(core0.q0.view())?;
+        let pw = b0.ncols();
+        let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
+        let total = beta_layout.total();
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "BLS wiggle dH operator: d_beta length {} != {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_flat, "wiggle joint dH operator d_beta")?;
+        let d_eta_t = fast_av(x_t_arc.as_ref(), &u_t);
+        let d_eta_ls = fast_av(x_ls_arc.as_ref(), &u_ls);
+
+        let d0 = self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
+        let dd0 = self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
+        let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
+        if d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
+            return Err(format!(
+                "wiggle derivative/beta mismatch in dH operator: B'={} B''={} betaw={}",
+                d0.ncols(),
+                dd0.ncols(),
+                betaw0.len()
+            ));
+        }
+        let m = d0.dot(&betaw0) + 1.0;
+        let g2 = dd0.dot(&betaw0);
+        let g3 = d3q;
+        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
+
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
+        let mut coeffww_bb = Array1::<f64>::zeros(n);
+        let mut coeffww_db = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q_i = core0.q0[i] + etaw[i];
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                self.y[i],
+                self.weights[i],
+                q_i,
+                core0.mu[i],
+                core0.dmu_dq[i],
+                core0.d2mu_dq2[i],
+                core0.d3mu_dq3[i],
+                &self.link_kind,
+            );
+            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
+            let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
+
+            let br = b0.row(i);
+            let dr = d0.row(i);
+            let ddr = dd0.row(i);
+            let duw_i = dr.dot(&uw);
+            let dduw_i = ddr.dot(&uw);
+
+            let delta_m = g2[i] * dq0.delta_q + duw_i;
+            let delta_g2 = g3[i] * dq0.delta_q + dduw_i;
+
+            let q_t = m[i] * q0.q_t;
+            let q_ls = m[i] * q0.q_ls;
+            let q_tt = g2[i] * q0.q_t * q0.q_t;
+            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
+            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
+
+            let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
+            let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
+            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
+            let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
+                + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
+                + delta_m * q0.q_tl
+                + m[i] * dq0.delta_q_tl;
+            let delta_q_ll = delta_g2 * q0.q_ls * q0.q_ls
+                + g2[i] * 2.0 * q0.q_ls * dq0.delta_q_ls
+                + delta_m * q0.q_ll
+                + m[i] * dq0.delta_q_ll;
+
+            let delta_q = m[i] * dq0.delta_q + br.dot(&uw);
+
+            coeff_tt[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
+            );
+            coeff_tl[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
+            );
+            coeff_ll[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
+            );
+            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
+            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
+            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
+            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
+            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
+            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
+            coeffww_bb[i] = m3 * delta_q;
+            coeffww_db[i] = m2 * dq0.delta_q;
+        }
+
+        let basis: Arc<Array2<f64>> = Arc::new(b0);
+        let basis_d1: Arc<Array2<f64>> = Arc::new(d0);
+        let basis_d2: Arc<Array2<f64>> = Arc::new(dd0);
+
+        let channels = vec![
+            RowCoeffChannel { block: 0, design: x_t_arc },
+            RowCoeffChannel { block: 1, design: x_ls_arc },
+            RowCoeffChannel { block: 2, design: basis },
+            RowCoeffChannel { block: 2, design: basis_d1 },
+            RowCoeffChannel { block: 2, design: basis_d2 },
+        ];
+        let pair_coeffs = vec![
+            RowCoeffPair { a: 0, b: 0, coeff: coeff_tt },
+            RowCoeffPair { a: 0, b: 1, coeff: coeff_tl },
+            RowCoeffPair { a: 1, b: 1, coeff: coeff_ll },
+            RowCoeffPair { a: 0, b: 2, coeff: coeff_tw_b },
+            RowCoeffPair { a: 0, b: 3, coeff: coeff_tw_d },
+            RowCoeffPair { a: 0, b: 4, coeff: coeff_tw_dd },
+            RowCoeffPair { a: 1, b: 2, coeff: coeff_lw_b },
+            RowCoeffPair { a: 1, b: 3, coeff: coeff_lw_d },
+            RowCoeffPair { a: 1, b: 4, coeff: coeff_lw_dd },
+            RowCoeffPair { a: 2, b: 2, coeff: coeffww_bb },
+            RowCoeffPair { a: 2, b: 3, coeff: coeffww_db },
+        ];
+        Ok(Some(Arc::new(RowCoeffOperator::new(
+            channels,
+            vec![pt, pls, pw],
+            pair_coeffs,
+            n,
+        ))))
+    }
+}
+
 /// Matrix-free joint-Hessian operator for the 3-block binomial
 /// location-scale wiggle family. See `BinomialLocationScaleWiggleHessianRowPieces`
 /// for the per-row weight structure.
