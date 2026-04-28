@@ -1784,10 +1784,9 @@ impl CustomFamily for TransformationNormalFamily {
         // block (the `block_states.len() != 1` guard surfaces a panic, never a
         // `None`), so the unified outer evaluator will see
         // `JointHessianSource::Operator` rather than a dense matrix as soon as
-        // `use_joint_matrix_free_path` fires on `(p, n)`. Returning `true` here
-        // tells the outer planner to suppress the cost-driven
-        // `prefer_gradient_only` downgrade — ARC's `run_operator_trust_region`
-        // path will absorb the per-iteration cost via O(n·p) HVPs.
+        // `use_joint_matrix_free_path` fires on `(p, n)`. Returning `true`
+        // advertises that representation only; the custom-family cost gate
+        // still decides whether second-order outer work is affordable.
         true
     }
 }
