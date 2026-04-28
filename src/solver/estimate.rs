@@ -1885,7 +1885,7 @@ where
             problem
         };
 
-        let mut obj = problem.build_objective_with_eval_order(
+        let mut obj = problem.build_objective_with_screening_proxy(
             &mut reml_state,
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
@@ -1911,6 +1911,9 @@ where
                     state.compute_efs_steps(rho)
                 },
             ),
+            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+                state.compute_screening_proxy(rho)
+            },
         );
 
         let strategy_result = problem.run(&mut obj, "standard REML")?;
