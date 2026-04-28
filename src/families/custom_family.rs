@@ -1,5 +1,5 @@
 use crate::faer_ndarray::FaerEigh;
-use crate::faer_ndarray::{FaerCholesky, fast_atb};
+use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
 use crate::linalg::utils::{
     StableSolver, default_slq_parameters, stochastic_lanczos_logdet_spd,
     stochastic_lanczos_logdet_spd_operator,
@@ -9355,7 +9355,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                         if let Some(geom_dir) = geom {
                             d_eta += &geom_dir.d_offset;
                             if let Some(dx) = geom_dir.d_design {
-                                d_eta += &dx.dot(&beta_flat);
+                                d_eta += &fast_av(&dx, &beta_flat);
                                 let mut wx = x_dense.clone();
                                 let mut wdx = dx.clone();
                                 for i in 0..n {
@@ -9365,8 +9365,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         wdx.row_mut(i).mapv_inplace(|v| v * wi);
                                     }
                                 }
-                                correction_mat += &dx.t().dot(&wx);
-                                correction_mat += &x_dense.t().dot(&wdx);
+                                correction_mat += &fast_atb(&dx, &wx);
+                                correction_mat += &fast_atb(&x_dense, &wdx);
                             }
                         }
 
@@ -9392,7 +9392,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                         for i in 0..n {
                             scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
                         }
-                        correction_mat += &x_dense.t().dot(&scaled_x);
+                        correction_mat += &fast_atb(&x_dense, &scaled_x);
 
                         Ok(Some(DriftDerivResult::Dense(correction_mat)))
                     }
