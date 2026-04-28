@@ -546,10 +546,7 @@ pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
 /// gradient cost is zero (degenerate / unspecified). Always returns at least
 /// [`FIRST_ORDER_OUTER_MIN_MAX_ITER`] so a problem cannot be capped down to
 /// trivially-few iterations.
-pub fn cost_gated_first_order_max_iter(
-    requested_max_iter: usize,
-    gradient_cost: u64,
-) -> usize {
+pub fn cost_gated_first_order_max_iter(requested_max_iter: usize, gradient_cost: u64) -> usize {
     if gradient_cost == 0 {
         return requested_max_iter;
     }
@@ -1045,10 +1042,7 @@ pub trait CustomFamily {
     /// the eval will return `HessianResult::Operator`, ARC will route to
     /// `run_operator_trust_region`, and the work-cost downgrade should be
     /// suppressed (BFGS is no longer faster per outer iteration).
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         false
     }
 

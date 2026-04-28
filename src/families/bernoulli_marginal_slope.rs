@@ -7138,14 +7138,10 @@ impl BernoulliMarginalSlopeFamily {
                 Array2::<f64>::zeros((slices.logslope.len(), slices.logslope.len()));
             let mut grad_h: Option<Array1<f64>> = slices.h.as_ref().map(|r| Array1::zeros(r.len()));
             let mut grad_w: Option<Array1<f64>> = slices.w.as_ref().map(|r| Array1::zeros(r.len()));
-            let mut hess_h: Option<Array2<f64>> = slices
-                .h
-                .as_ref()
-                .map(|r| Array2::zeros((r.len(), r.len())));
-            let mut hess_w: Option<Array2<f64>> = slices
-                .w
-                .as_ref()
-                .map(|r| Array2::zeros((r.len(), r.len())));
+            let mut hess_h: Option<Array2<f64>> =
+                slices.h.as_ref().map(|r| Array2::zeros((r.len(), r.len())));
+            let mut hess_w: Option<Array2<f64>> =
+                slices.w.as_ref().map(|r| Array2::zeros((r.len(), r.len())));
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
             for row in 0..n {
                 let row_ctx = Self::row_ctx(&cache, row);
@@ -7770,10 +7766,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn supports_matrix_free_joint_hessian(
-        &self,
-        _specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
