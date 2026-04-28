@@ -176,7 +176,20 @@ impl<'a> RemlState<'a> {
         } else {
             0.0
         };
-        let highgrad = grad_norm > 1e-3;
+        // Scale-invariant "high gradient" certificate. The first-order
+        // smoothing correction is the local linearization at ρ̂; cubature
+        // upgrades it when the linearization is suspect (boundary contact, or
+        // the outer gradient is genuinely large). An absolute ‖g‖>1e-3 gate
+        // is wrong at every scale: biobank deviance ≈ 10⁵–10⁶ makes ‖g‖≈1
+        // perfectly fine but trips the gate unconditionally, while tiny CI
+        // problems with deviance ≈ 10–100 stay under 1e-3 even when actually
+        // unconverged. Use the same `τ·(1+|F|)` rescaling the OUTER paths use
+        // (BFGS / ARC / trust-region via `outer_scaled_tolerance`); deviance
+        // is the dominant term in the REML cost at every scale and is the
+        // natural cost proxy reachable from `PirlsResult`.
+        const HIGHGRAD_REL_TOL: f64 = 1e-3;
+        let cost_scale = 1.0 + final_fit.deviance.abs();
+        let highgrad = grad_norm > HIGHGRAD_REL_TOL * cost_scale;
         if !near_boundary && !highgrad {
             // Keep the hot path cheap when the local linearization is likely sufficient.
             return first_order_correction;
