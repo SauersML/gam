@@ -4255,6 +4255,7 @@ where
         last_step_size,
         last_step_halving,
         max_abs_eta,
+        min_penalized_deviance,
     })
 }
 
@@ -4448,6 +4449,13 @@ pub struct PirlsResult {
     /// cold artifacts (for example `x_transformed`) rehydrated before exact
     /// bundle construction.
     pub cache_compacted: bool,
+    /// Minimum penalized deviance observed across the inner P-IRLS loop.
+    /// Mirrors `WorkingModelPirlsResult::min_penalized_deviance`. Used as the
+    /// seed-screening ranking proxy: penalized deviance descends monotonically
+    /// along any inner descent path, so the per-seed minimum tells the outer
+    /// cascade "how good a fit this rho's neighbourhood can support" even
+    /// when the inner solver was capped before reaching the mode.
+    pub min_penalized_deviance: f64,
 }
 
 impl PirlsResult {
@@ -4506,6 +4514,7 @@ impl PirlsResult {
             )),
             coordinate_frame: self.coordinate_frame.clone(),
             cache_compacted: true,
+            min_penalized_deviance: self.min_penalized_deviance,
         }
     }
 
@@ -4590,6 +4599,7 @@ impl PirlsResult {
             ))),
             coordinate_frame: self.coordinate_frame.clone(),
             cache_compacted: false,
+            min_penalized_deviance: self.min_penalized_deviance,
         })
     }
 }
@@ -4658,6 +4668,7 @@ fn assemble_pirls_result(
         x_transformed,
         coordinate_frame,
         cache_compacted: false,
+        min_penalized_deviance: working_summary.min_penalized_deviance,
     }
 }
 
@@ -5226,6 +5237,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             gradient_natural_scale: score_norm + s_beta_norm + ridge_grad_norm,
         };
 
+        let zero_iter_penalized = deviance + penalty_term;
         let working_summary = WorkingModelPirlsResult {
             beta: beta_transformed.clone(),
             state: working_state,
@@ -5239,6 +5251,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             constraint_kkt: linear_constraints.as_ref().map(|lin| {
                 compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)
             }),
+            min_penalized_deviance: if zero_iter_penalized.is_finite() {
+                zero_iter_penalized
+            } else {
+                f64::INFINITY
+            },
         };
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
@@ -5290,6 +5307,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             x_transformed: make_reparam_operator(&x_original, &qs_arc_final, use_sparse_native),
             coordinate_frame: coordinate_frame.clone(),
             cache_compacted: false,
+            min_penalized_deviance: working_summary.min_penalized_deviance,
         };
 
         return Ok((pirls_result, working_summary));
