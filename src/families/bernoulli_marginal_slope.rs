@@ -2,10 +2,9 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    fit_custom_family,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
+    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
@@ -7137,7 +7136,9 @@ impl BernoulliMarginalSlopeFamily {
                 )
                 .try_reduce(
                     make_pair,
-                    |(mut lhm, mut lhl), (rhm, rhl)| -> Result<(Array2<f64>, Array2<f64>), String> {
+                    |(mut lhm, mut lhl),
+                     (rhm, rhl)|
+                     -> Result<(Array2<f64>, Array2<f64>), String> {
                         lhm += &rhm;
                         lhl += &rhl;
                         Ok((lhm, lhl))
@@ -7345,64 +7346,70 @@ impl BernoulliMarginalSlopeFamily {
                     Array2::<f64>::zeros((p_logslope, p_logslope)),
                 )
             };
-            let (ll, grad_marginal, grad_logslope, hess_marginal, hess_logslope) =
-                (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
-                    .into_par_iter()
-                    .try_fold(
-                        make_acc,
-                        |(mut ll, mut gm, mut gl, mut hm, mut hl), chunk_idx| -> Result<_, String> {
-                            let start = chunk_idx * ROW_CHUNK_SIZE;
-                            let end = (start + ROW_CHUNK_SIZE).min(n);
-                            let rows = end - start;
-                            let marginal_chunk = self.marginal_design.try_row_chunk(start..end)
-                                .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
-                            let logslope_chunk = self.logslope_design.try_row_chunk(start..end)
-                                .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
-                            let mut gm_w = Array1::<f64>::zeros(rows);
-                            let mut gl_w = Array1::<f64>::zeros(rows);
-                            let mut hm_w = Array1::<f64>::zeros(rows);
-                            let mut hl_w = Array1::<f64>::zeros(rows);
-                            for local_row in 0..rows {
-                                let row = start + local_row;
-                                let marginal = self.marginal_link_map(block_states[0].eta[row])?;
-                                let g = block_states[1].eta[row];
-                                let kern = RigidProbitKernel::new(
-                                    marginal.q,
-                                    g,
-                                    self.z[row],
-                                    self.y[row],
-                                    self.weights[row],
-                                    probit_scale,
-                                )?;
-                                ll += self.weights[row] * kern.logcdf;
-                                let grad = rigid_transformed_gradient(marginal, &kern);
-                                let h = rigid_transformed_hessian(marginal, &kern);
-                                gm_w[local_row] =
-                                    Self::exact_newton_score_component_from_objective_gradient(grad[0]);
-                                gl_w[local_row] =
-                                    Self::exact_newton_score_component_from_objective_gradient(grad[1]);
-                                hm_w[local_row] = h[0][0];
-                                hl_w[local_row] = h[1][1];
-                            }
-                            add_weighted_chunk_gradient(&marginal_chunk, &gm_w, &mut gm);
-                            add_weighted_chunk_gradient(&logslope_chunk, &gl_w, &mut gl);
-                            add_weighted_chunk_gram(&marginal_chunk, &hm_w, &mut hm);
-                            add_weighted_chunk_gram(&logslope_chunk, &hl_w, &mut hl);
-                            Ok((ll, gm, gl, hm, hl))
-                        },
-                    )
-                    .try_reduce(
-                        make_acc,
-                        |(lll, mut lgm, mut lgl, mut lhm, mut lhl),
-                         (rll, rgm, rgl, rhm, rhl)|
-                         -> Result<_, String> {
-                            lgm += &rgm;
-                            lgl += &rgl;
-                            lhm += &rhm;
-                            lhl += &rhl;
-                            Ok((lll + rll, lgm, lgl, lhm, lhl))
-                        },
-                    )?;
+            let (ll, grad_marginal, grad_logslope, hess_marginal, hess_logslope) = (0..((n
+                + ROW_CHUNK_SIZE
+                - 1)
+                / ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    make_acc,
+                    |(mut ll, mut gm, mut gl, mut hm, mut hl), chunk_idx| -> Result<_, String> {
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        let rows = end - start;
+                        let marginal_chunk = self
+                            .marginal_design
+                            .try_row_chunk(start..end)
+                            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                        let logslope_chunk = self
+                            .logslope_design
+                            .try_row_chunk(start..end)
+                            .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                        let mut gm_w = Array1::<f64>::zeros(rows);
+                        let mut gl_w = Array1::<f64>::zeros(rows);
+                        let mut hm_w = Array1::<f64>::zeros(rows);
+                        let mut hl_w = Array1::<f64>::zeros(rows);
+                        for local_row in 0..rows {
+                            let row = start + local_row;
+                            let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                            let g = block_states[1].eta[row];
+                            let kern = RigidProbitKernel::new(
+                                marginal.q,
+                                g,
+                                self.z[row],
+                                self.y[row],
+                                self.weights[row],
+                                probit_scale,
+                            )?;
+                            ll += self.weights[row] * kern.logcdf;
+                            let grad = rigid_transformed_gradient(marginal, &kern);
+                            let h = rigid_transformed_hessian(marginal, &kern);
+                            gm_w[local_row] =
+                                Self::exact_newton_score_component_from_objective_gradient(grad[0]);
+                            gl_w[local_row] =
+                                Self::exact_newton_score_component_from_objective_gradient(grad[1]);
+                            hm_w[local_row] = h[0][0];
+                            hl_w[local_row] = h[1][1];
+                        }
+                        add_weighted_chunk_gradient(&marginal_chunk, &gm_w, &mut gm);
+                        add_weighted_chunk_gradient(&logslope_chunk, &gl_w, &mut gl);
+                        add_weighted_chunk_gram(&marginal_chunk, &hm_w, &mut hm);
+                        add_weighted_chunk_gram(&logslope_chunk, &hl_w, &mut hl);
+                        Ok((ll, gm, gl, hm, hl))
+                    },
+                )
+                .try_reduce(
+                    make_acc,
+                    |(lll, mut lgm, mut lgl, mut lhm, mut lhl),
+                     (rll, rgm, rgl, rhm, rhl)|
+                     -> Result<_, String> {
+                        lgm += &rgm;
+                        lgl += &rgl;
+                        lhm += &rhm;
+                        lhl += &rhl;
+                        Ok((lll + rll, lgm, lgl, lhm, lhl))
+                    },
+                )?;
 
             return Ok(FamilyEvaluation {
                 log_likelihood: ll,

@@ -29,10 +29,10 @@ use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, FamilyEvaluation,
-    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -4888,8 +4888,14 @@ mod tests {
             )
             .expect("minus workspace")
             .expect("minus workspace present");
-        let hv_plus = plus.hessian_matvec(&v).expect("plus matvec").expect("plus matvec");
-        let hv_minus = minus.hessian_matvec(&v).expect("minus matvec").expect("minus matvec");
+        let hv_plus = plus
+            .hessian_matvec(&v)
+            .expect("plus matvec")
+            .expect("plus matvec");
+        let hv_minus = minus
+            .hessian_matvec(&v)
+            .expect("minus matvec")
+            .expect("minus matvec");
         let fd: Array1<f64> = (&hv_plus - &hv_minus).mapv(|x| x / (2.0 * eps));
 
         for i in 0..p {
