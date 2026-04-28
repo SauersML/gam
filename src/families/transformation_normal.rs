@@ -744,6 +744,96 @@ fn chunked_weighted_bt_d_designmatrix(
 /// one `O(n · p_resp)` row pass); peak transient memory drops by
 /// `n · p_resp · 8` bytes — at biobank scale that is ~33 MiB saved per
 /// matvec, multiplied across the inner-PCG and outer-trace matvec budgets.
+/// Batched form of `fused_khatri_rao_weighted_gram_apply`: apply
+/// `X_deriv^T diag(weights) X_deriv` to ALL columns of `factor` at once.
+///
+/// `factor` is `(p_resp · p_cov) × k`. Each column is a vector that, when
+/// reshaped to `(p_resp, p_cov)`, plays the role of `V` in the single-vector
+/// helper above. We reshape the entire batch to `(p_resp, p_cov, k)`, perform
+/// the forward gemm `BUF = right · V_all` in a SINGLE faer matmul producing
+/// `(n × p_resp · k)`, do the per-row weighted scaling in parallel across
+/// rows AND columns, then reshape back and run the transpose phase as one
+/// `fast_atb`. The two BLAS3 calls replace `k` separate small matmuls.
+fn fused_khatri_rao_weighted_gram_apply_batched(
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    weights: &Array1<f64>,
+    factor: &Array2<f64>,
+) -> Array2<f64> {
+    let n = left.nrows();
+    let p_resp = left.ncols();
+    let p_cov = right.ncols();
+    let k = factor.ncols();
+    debug_assert_eq!(right.nrows(), n);
+    debug_assert_eq!(weights.len(), n);
+    debug_assert_eq!(factor.nrows(), p_resp * p_cov);
+
+    // Reshape factor (p_resp · p_cov, k) → (p_resp, p_cov, k); the k columns
+    // are stacked along axis 2. We need V_stacked of shape (p_cov, p_resp · k)
+    // where column index `p_resp * c + a` is `V_c[a, :]^T = factor[a*p_cov..(a+1)*p_cov, c]`.
+    //
+    // Equivalent: build it column-major in (p_cov × (p_resp · k)) by walking
+    // (c, a) pairs. This is one transpose-style copy of `p_resp · p_cov · k`
+    // doubles. We fuse it with the natural in-memory order to avoid a second
+    // intermediate.
+    // factor.column(c) is non-contiguous when factor is row-major, so we
+    // can't `into_shape_with_order` it directly. Index it as a flat 1D view
+    // and pull out the (a, b) chunk explicitly: V_c[a, b] = factor[a*p_cov+b, c].
+    let mut v_stacked = Array2::<f64>::zeros((p_cov, p_resp * k));
+    for c in 0..k {
+        let factor_col = factor.column(c); // length p_resp * p_cov
+        for a in 0..p_resp {
+            let mut dst = v_stacked.column_mut(p_resp * c + a);
+            for b in 0..p_cov {
+                dst[b] = factor_col[a * p_cov + b];
+            }
+        }
+    }
+
+    // Forward phase: BUF = right · V_stacked → (n × p_resp · k). One BLAS3.
+    let mut buf = fast_ab(right, &v_stacked);
+
+    // Per-row weighted scaling: for each row i and column k_idx = p_resp * c + a,
+    // we want U[i, p_resp * c + a] = w_i · (left[i, :] · BUF[i, p_resp*c..p_resp*(c+1)]) · left[i, a].
+    //
+    // The dot product `xv_{i, c} = left[i, :] · BUF[i, p_resp*c..p_resp*(c+1)]`
+    // depends on row i and column-group c, but not on a. So we compute it once
+    // per (i, c) and broadcast across a.
+    ndarray::Zip::from(buf.rows_mut())
+        .and(left.rows())
+        .and(weights.view())
+        .par_for_each(|mut buf_row, left_row, &w| {
+            for c in 0..k {
+                let mut group = buf_row.slice_mut(ndarray::s![p_resp * c..p_resp * (c + 1)]);
+                let xv = left_row.dot(&group);
+                let factor_w = w * xv;
+                ndarray::Zip::from(&mut group)
+                    .and(&left_row)
+                    .for_each(|dst, &src| *dst = factor_w * src);
+            }
+        });
+
+    // Transpose phase: result_stacked = U^T · right → (p_resp · k × p_cov). One BLAS3.
+    let result_stacked = fast_atb(&buf, right);
+
+    // Unstack into result (p_resp · p_cov × k): row index `p_resp * c + a` of
+    // `result_stacked` is the (a, :) row of column c reshaped to (p_resp, p_cov).
+    let mut out = Array2::<f64>::zeros((p_resp * p_cov, k));
+    for c in 0..k {
+        let mut out_col = out.column_mut(c);
+        let mut out_view = out_col
+            .view_mut()
+            .into_shape_with_order((p_resp, p_cov))
+            .expect("out column reshape to (p_resp, p_cov)");
+        for a in 0..p_resp {
+            out_view
+                .row_mut(a)
+                .assign(&result_stacked.row(p_resp * c + a));
+        }
+    }
+    out
+}
+
 fn fused_khatri_rao_weighted_gram_apply(
     left: &Array2<f64>,
     right: &Array2<f64>,
@@ -2042,6 +2132,37 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
         self.apply(v)
     }
 
+    /// Batched apply: collapses K matvecs into two BLAS3 matmuls when the
+    /// covariate is dense. `projected_operator` calls this with K = `rank`,
+    /// so at biobank scale K ≈ p ≈ 100 and we replace 100 small per-column
+    /// dispatches with one fused row-pass.
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
+            fused_khatri_rao_weighted_gram_apply_batched(
+                &self.family.response_deriv_basis,
+                cov_dense,
+                &self.weight_kernel,
+                factor,
+            )
+        } else {
+            // Sparse / operator covariate: no fused dense path. Fall back
+            // to per-column matvec but still pay for it in parallel.
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let p = factor.nrows();
+            let k = factor.ncols();
+            let cols: Vec<Array1<f64>> = (0..k)
+                .into_par_iter()
+                .map(|c| self.apply(&factor.column(c).to_owned()))
+                .collect();
+            let mut out = Array2::<f64>::zeros((p, k));
+            for (c, bv) in cols.into_iter().enumerate() {
+                out.column_mut(c).assign(&bv);
+            }
+            out
+        }
+    }
+
     /// Materialize `dH` as a dense p×p matrix using the analytic identity
     /// `dH = X_deriv^T diag(weight_kernel) X_deriv`.
     ///
@@ -2127,6 +2248,33 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p_total());
         self.apply(v)
+    }
+
+    /// Batched apply: same Khatri–Rao fused path as `dH`, with the second-order
+    /// `weight_kernel`.
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
+            fused_khatri_rao_weighted_gram_apply_batched(
+                &self.family.response_deriv_basis,
+                cov_dense,
+                &self.weight_kernel,
+                factor,
+            )
+        } else {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let p = factor.nrows();
+            let k = factor.ncols();
+            let cols: Vec<Array1<f64>> = (0..k)
+                .into_par_iter()
+                .map(|c| self.apply(&factor.column(c).to_owned()))
+                .collect();
+            let mut out = Array2::<f64>::zeros((p, k));
+            for (c, bv) in cols.into_iter().enumerate() {
+                out.column_mut(c).assign(&bv);
+            }
+            out
+        }
     }
 
     /// Dense form via `KroneckerDesign::weighted_gram` — see

@@ -1241,6 +1241,28 @@ pub trait HyperOperator: Send + Sync {
         out.assign(&self.mul_vec_view(v));
     }
 
+    /// Compute B · F where F is (p × k). Default dispatches per-column in
+    /// parallel; matrix-free Khatri–Rao operators override this to fuse
+    /// the K applies into two BLAS3 matmuls (`projected_operator` hot path).
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let p = factor.nrows();
+        let k = factor.ncols();
+        let cols: Vec<Array1<f64>> = (0..k)
+            .into_par_iter()
+            .map(|col| {
+                let mut bv = Array1::<f64>::zeros(p);
+                self.mul_vec_into(factor.column(col), bv.view_mut());
+                bv
+            })
+            .collect();
+        let mut out = Array2::<f64>::zeros((p, k));
+        for (col, bv) in cols.into_iter().enumerate() {
+            out.column_mut(col).assign(&bv);
+        }
+        out
+    }
+
     /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
     ///
     /// Sparse exact traces build `B E` in column batches. Operators with
@@ -7351,35 +7373,12 @@ impl DenseSpectralOperator {
 
     #[inline]
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
-        // The macOS sample profile of margslope-duchon16d at smoke n=4800 had
-        // 99.7 % of main-thread cycles in this function: each
-        // `compute_ift_correction_trace` triggers a `projected_operator` call,
-        // which previously did `rank` (= p, ~100 at biobank scale) sequential
-        // matrix-free Hv applies.  At n=320 K, p=101, rank=101 the serial
-        // `for col in 0..rank { op.mul_vec_into(...) }` was the dominant cost
-        // of the OUTER Hessian assembly even though each individual Hv is
-        // already faer-parallelised internally — the inner parallelism is
-        // capped by the matvec's small inner dimension, while the columns
-        // are independent and trivially yield a near-rank× speedup when
-        // pumped through rayon.
-        //
-        // Each column writes its own slice of `op_factor`; we materialise
-        // them with `into_par_iter().map(...).collect()` and then perform
-        // the small `factor^T · op_factor` reduction sequentially.
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let rank = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..rank)
-            .into_par_iter()
-            .map(|col| {
-                let mut bv = Array1::<f64>::zeros(self.n_dim);
-                op.mul_vec_into(factor.column(col), bv.view_mut());
-                bv
-            })
-            .collect();
-        let mut op_factor = Array2::<f64>::zeros((self.n_dim, rank));
-        for (col, bv) in cols.into_iter().enumerate() {
-            op_factor.column_mut(col).assign(&bv);
-        }
+        // Batched form: ask the operator to apply itself to all `rank` columns
+        // at once. Matrix-free Khatri–Rao operators (CTN dH / d²H) override
+        // `mul_mat` to fuse the K applies into two BLAS3 matmuls, replacing
+        // the per-column matvec loop that dominated the macOS profile of
+        // margslope-duchon16d.
+        let op_factor = op.mul_mat(factor);
         factor.t().dot(&op_factor)
     }
 
