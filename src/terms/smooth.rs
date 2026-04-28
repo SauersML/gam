@@ -3186,12 +3186,37 @@ pub fn build_smooth_design_withworkspace(
                     shape_axis_col = Some(feature_cols[0]);
                 }
                 let mut x = select_columns(data, feature_cols)?;
+                // Auto-standardization (per-axis division by σ_a) silently
+                // reinterprets the user's `length_scale` from original data
+                // coordinates into post-standardization coordinates: for
+                // uniform σ_a = σ, `kernel(||x_std − c_std||/L)` equals
+                // `kernel(||x − c||/(σ·L))`, so the effective kernel range
+                // shrinks by σ. For data already on similar per-axis scales
+                // (e.g. all axes uniform [-1,1] → σ ≈ 0.577 across the board),
+                // this collapses the kernel to near-zero for any user-chosen
+                // length_scale and produces a near-trivial fit. Standardize
+                // only when the caller passed explicit `input_scales`, or when
+                // the data's per-axis scales differ enough that an isotropic
+                // kernel in original coords would be dominated by a single
+                // axis. Per-axis anisotropy with similar scales is owned by
+                // `MaternBasisSpec::aniso_log_scales` (auto-initialized via
+                // `maybe_initialize_aniso_contrasts`), which works on the
+                // user's `length_scale` in original units.
                 let scales = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
                     Some(s.clone())
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                    apply_input_standardization(&mut x, &s);
-                    Some(s)
+                    let max_s = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let min_s = s.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let scales_are_similar = min_s > 0.0 && (max_s / min_s) < 2.0;
+                    if scales_are_similar {
+                        // Treat the user's length_scale as a scale in
+                        // original data coordinates; do not rescale.
+                        None
+                    } else {
+                        apply_input_standardization(&mut x, &s);
+                        Some(s)
+                    }
                 } else {
                     None
                 };
