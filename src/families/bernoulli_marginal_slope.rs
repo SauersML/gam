@@ -1836,6 +1836,44 @@ impl BernoulliMarginalSlopeFlexRowScratch {
     }
 }
 
+/// Accumulate a flex-block (h or w) per-row gradient and Hessian
+/// contribution from the primary-space scratch buffer into the
+/// block-local accumulators.
+///
+/// The flex blocks (link wiggle h, time wiggle w) sit at
+/// `primary_range = [start, start+len)` inside the per-row primary-space
+/// gradient `scratch.grad` and Hessian `scratch.hess`. Their primary
+/// scalars equal the block coefficients (no design pull-back), so the
+/// block accumulators are simple sums of the per-row sub-vector and
+/// symmetric sub-matrix.
+///
+/// Mathematical equivalence with the previous index-by-index loop:
+/// * `grad[i] += -scratch.grad[start + i]` — applies the
+///   `exact_newton_score_component_from_objective_gradient` sign
+///   convention (which is just negation) elementwise.
+/// * `hess[r, c] += scratch.hess[start + r, start + c]` — full square
+///   block, identical to the prior nested for-loop.
+///
+/// Implementation uses ndarray slice arithmetic so the loop becomes
+/// vectorisable contiguous memory traffic instead of a doubly-nested
+/// scalar `Array2` `[[r, c]]` index, which was bounds-checked twice
+/// per element.
+#[inline]
+fn accumulate_flex_block_grad_hess(
+    primary_range: &std::ops::Range<usize>,
+    scratch: &BernoulliMarginalSlopeFlexRowScratch,
+    grad: &mut Array1<f64>,
+    hess: &mut Array2<f64>,
+) {
+    let start = primary_range.start;
+    let end = primary_range.end;
+    let src_g = scratch.grad.slice(s![start..end]);
+    // grad += -src_g  (negate to convert objective gradient to score component)
+    grad.scaled_add(-1.0, &src_g);
+    let src_h = scratch.hess.slice(s![start..end, start..end]);
+    *hess += &src_h;
+}
+
 #[inline]
 fn add_scaled_coeff4(target: &mut [f64; 4], source: &[f64; 4], scale: f64) {
     for j in 0..4 {
@@ -7177,32 +7215,12 @@ impl BernoulliMarginalSlopeFamily {
                 if let (Some(ph), Some(gh), Some(hh)) =
                     (primary.h.as_ref(), grad_h.as_mut(), hess_h.as_mut())
                 {
-                    for idx in 0..ph.len() {
-                        gh[idx] += Self::exact_newton_score_component_from_objective_gradient(
-                            scratch.grad[ph.start + idx],
-                        );
-                    }
-                    for row_h in 0..ph.len() {
-                        for col_h in 0..ph.len() {
-                            hh[[row_h, col_h]] +=
-                                scratch.hess[[ph.start + row_h, ph.start + col_h]];
-                        }
-                    }
+                    accumulate_flex_block_grad_hess(ph, &scratch, gh, hh);
                 }
                 if let (Some(pw), Some(gw), Some(hw)) =
                     (primary.w.as_ref(), grad_w.as_mut(), hess_w.as_mut())
                 {
-                    for idx in 0..pw.len() {
-                        gw[idx] += Self::exact_newton_score_component_from_objective_gradient(
-                            scratch.grad[pw.start + idx],
-                        );
-                    }
-                    for row_w in 0..pw.len() {
-                        for col_w in 0..pw.len() {
-                            hw[[row_w, col_w]] +=
-                                scratch.hess[[pw.start + row_w, pw.start + col_w]];
-                        }
-                    }
+                    accumulate_flex_block_grad_hess(pw, &scratch, gw, hw);
                 }
             }
 
@@ -7369,34 +7387,12 @@ impl BernoulliMarginalSlopeFamily {
                     if let (Some(primary_h), Some(grad_h), Some(hess_h)) =
                         (primary.h.as_ref(), acc.grad_h.as_mut(), acc.hess_h.as_mut())
                     {
-                        for idx in 0..primary_h.len() {
-                            grad_h[idx] +=
-                                Self::exact_newton_score_component_from_objective_gradient(
-                                    scratch.grad[primary_h.start + idx],
-                                );
-                        }
-                        for row_h in 0..primary_h.len() {
-                            for col_h in 0..primary_h.len() {
-                                hess_h[[row_h, col_h]] += scratch.hess
-                                    [[primary_h.start + row_h, primary_h.start + col_h]];
-                            }
-                        }
+                        accumulate_flex_block_grad_hess(primary_h, &scratch, grad_h, hess_h);
                     }
                     if let (Some(primary_w), Some(grad_w), Some(hess_w)) =
                         (primary.w.as_ref(), acc.grad_w.as_mut(), acc.hess_w.as_mut())
                     {
-                        for idx in 0..primary_w.len() {
-                            grad_w[idx] +=
-                                Self::exact_newton_score_component_from_objective_gradient(
-                                    scratch.grad[primary_w.start + idx],
-                                );
-                        }
-                        for row_w in 0..primary_w.len() {
-                            for col_w in 0..primary_w.len() {
-                                hess_w[[row_w, col_w]] += scratch.hess
-                                    [[primary_w.start + row_w, primary_w.start + col_w]];
-                            }
-                        }
+                        accumulate_flex_block_grad_hess(primary_w, &scratch, grad_w, hess_w);
                     }
                 }
 
