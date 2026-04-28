@@ -828,6 +828,37 @@ fn unit_primary_direction(idx: usize) -> Array1<f64> {
     out
 }
 
+/// Returns a reference to the static unit-direction tables (one Array1<f64>
+/// per primary axis, plus a zero direction at index N_PRIMARY). Reusing these
+/// references avoids per-row heap allocations in third/fourth-order contracted
+/// assemblies, where the inner loop calls into the row-directional kernel
+/// 10 (third-order) or 10 (fourth-order) times per row.
+fn unit_primary_direction_table() -> &'static [Array1<f64>; N_PRIMARY + 1] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[Array1<f64>; N_PRIMARY + 1]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        [
+            unit_primary_direction(0),
+            unit_primary_direction(1),
+            unit_primary_direction(2),
+            unit_primary_direction(3),
+            Array1::<f64>::zeros(N_PRIMARY),
+        ]
+    })
+}
+
+#[inline]
+fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
+    &unit_primary_direction_table()[idx]
+}
+
+#[inline]
+fn unit_primary_direction_static() -> &'static Array1<f64> {
+    // Used as a placeholder to fill unused slots in fixed-size reference
+    // arrays; the corresponding slot is never read by the implementation.
+    &unit_primary_direction_table()[N_PRIMARY]
+}
+
 fn poly_mul(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
     if lhs.is_empty() || rhs.is_empty() {
         return Vec::new();
@@ -4912,6 +4943,31 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dirs: &[Array1<f64>],
     ) -> Result<f64, String> {
+        // Adapter: borrow the existing Array1 entries without cloning, then
+        // delegate to the zero-allocation hot-path implementation that is
+        // also used directly by the third/fourth-order contracted assemblies.
+        let k = dirs.len();
+        if k > 4 {
+            return Err(format!(
+                "survival marginal-slope row directional expects 0..=4 directions, got {k}"
+            ));
+        }
+        // Stack-allocated reference array; uninitialized slots are never read
+        // because we only pass `&refs[..k]` to the implementation.
+        let dummy = unit_primary_direction_static();
+        let mut refs: [&Array1<f64>; 4] = [dummy, dummy, dummy, dummy];
+        for (i, dir) in dirs.iter().enumerate() {
+            refs[i] = dir;
+        }
+        self.row_neglog_directional_refs(row, block_states, &refs[..k])
+    }
+
+    fn row_neglog_directional_refs(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dirs: &[&Array1<f64>],
+    ) -> Result<f64, String> {
         let k = dirs.len();
         if k > 4 {
             return Err(format!(
@@ -4922,11 +4978,23 @@ impl SurvivalMarginalSlopeFamily {
         let di = self.event[row];
         let zi = self.z[row];
 
-        // Primary scalar jets: q0, q1, qd1, g
-        let q0_first: Vec<f64> = dirs.iter().map(|dir| dir[0]).collect();
-        let q1_first: Vec<f64> = dirs.iter().map(|dir| dir[1]).collect();
-        let qd1_first: Vec<f64> = dirs.iter().map(|dir| dir[2]).collect();
-        let g_first: Vec<f64> = dirs.iter().map(|dir| dir[3]).collect();
+        // Primary scalar jets: q0, q1, qd1, g.
+        // Stack-allocated fixed-capacity buffers (k ≤ 4 by precondition above)
+        // avoid heap allocation in the per-row hot loop.
+        let mut q0_first_buf = [0.0f64; 4];
+        let mut q1_first_buf = [0.0f64; 4];
+        let mut qd1_first_buf = [0.0f64; 4];
+        let mut g_first_buf = [0.0f64; 4];
+        for (i, dir) in dirs.iter().enumerate() {
+            q0_first_buf[i] = dir[0];
+            q1_first_buf[i] = dir[1];
+            qd1_first_buf[i] = dir[2];
+            g_first_buf[i] = dir[3];
+        }
+        let q0_first: &[f64] = &q0_first_buf[..k];
+        let q1_first: &[f64] = &q1_first_buf[..k];
+        let qd1_first: &[f64] = &qd1_first_buf[..k];
+        let g_first: &[f64] = &g_first_buf[..k];
 
         // Reuse the realized q-geometry so exact directional derivatives stay on
         // the same timewiggle-aware/frailty-aware manifold as the closed-form
@@ -4937,10 +5005,10 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_val = q_geom.qd1;
         let g_val = block_states[2].eta[row];
 
-        let q0_jet = MultiDirJet::linear(k, q0_val, &q0_first);
-        let q1_jet = MultiDirJet::linear(k, q1_val, &q1_first);
-        let qd1_jet = MultiDirJet::linear(k, qd1_val, &qd1_first);
-        let g_jet = MultiDirJet::linear(k, g_val, &g_first);
+        let q0_jet = MultiDirJet::linear(k, q0_val, q0_first);
+        let q1_jet = MultiDirJet::linear(k, q1_val, q1_first);
+        let qd1_jet = MultiDirJet::linear(k, qd1_val, qd1_first);
+        let g_jet = MultiDirJet::linear(k, g_val, g_first);
 
         // The observed slope seen by the probit likelihood is the frailty-scaled
         // raw logslope coefficient.
@@ -5611,13 +5679,13 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Array2<f64>, String> {
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
-            let da = unit_primary_direction(a);
+            let da = unit_primary_direction_ref(a);
             for b in a..N_PRIMARY {
-                let db = unit_primary_direction(b);
-                let value = self.row_neglog_directional(
+                let db = unit_primary_direction_ref(b);
+                let value = self.row_neglog_directional_refs(
                     row,
                     block_states,
-                    &[da.clone(), db.clone(), dir.clone()],
+                    &[da, db, dir],
                 )?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
@@ -8339,13 +8407,13 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Array2<f64>, String> {
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
-            let da = unit_primary_direction(a);
+            let da = unit_primary_direction_ref(a);
             for b in a..N_PRIMARY {
-                let db = unit_primary_direction(b);
-                let value = self.row_neglog_directional(
+                let db = unit_primary_direction_ref(b);
+                let value = self.row_neglog_directional_refs(
                     row,
                     block_states,
-                    &[da.clone(), db.clone(), dir_u.clone(), dir_v.clone()],
+                    &[da, db, dir_u, dir_v],
                 )?;
                 out[[a, b]] = value;
                 out[[b, a]] = value;
