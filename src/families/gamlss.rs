@@ -6642,6 +6642,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
         self.exact_newton_joint_hessian_for_specs(block_states, Some(specs))
     }
 
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_block_designs_owned(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_gradient_from_designs(block_states, &x_t, &x_ls)
+            .map(Some)
+    }
+
     fn exact_newton_joint_hessian_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -6937,7 +6949,6 @@ struct DesignTwoBlockRowCoeffOperator {
     dim: usize,
     nrows: usize,
     pa: usize,
-    pb: usize,
 }
 
 impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRowCoeffOperator {
@@ -7257,7 +7268,6 @@ fn make_two_block_design_row_coeff_operator(
         dim: pa + pb,
         nrows,
         pa,
-        pb,
     })
 }
 
@@ -14194,26 +14204,29 @@ impl CustomFamily for BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+        let Some((x_t, x_ls)) = self.exact_joint_block_designs_owned(Some(specs))? else {
             return Ok(None);
         };
         let workspace = BinomialLocationScaleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
             specs.to_vec(),
-            x_t.into_owned(),
-            x_ls.into_owned(),
+            x_t,
+            x_ls,
         )?;
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        // Mirror the workspace gating: matrix-free path is available whenever
-        // `exact_joint_dense_block_designs` returns the threshold + log-σ
-        // designs, which is the same condition `exact_joint_supported`
-        // checks. This advertises representation support only; the cost gate
-        // still decides whether exact second-order outer work is affordable.
-        self.exact_joint_supported()
+    fn supports_matrix_free_joint_hessian(&self, specs: &[ParameterBlockSpec]) -> bool {
+        // Representation support means the realized two-block designs can be
+        // applied as operators. It does not imply that exact second-order outer
+        // work is cheap; the cost gate still owns that decision.
+        if specs.len() != 2 {
+            return false;
+        }
+        let n = self.y.len();
+        specs[Self::BLOCK_T].design.nrows() == n
+            && specs[Self::BLOCK_LOG_SIGMA].design.nrows() == n
     }
 
     /// Batched analytic-gradient hook (Fix #8).
