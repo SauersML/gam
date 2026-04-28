@@ -12416,9 +12416,12 @@ mod tests {
         assert!(!use_joint_matrix_free_path(31, 50_000));
         assert!(!use_joint_matrix_free_path(32, 49_999));
 
-        // n · p ≥ 4_000_000 is the linear-work fallback.
-        assert!(use_joint_matrix_free_path(40, 100_000));
-        assert!(!use_joint_matrix_free_path(40, 99_999));
+        // n · p ≥ 4_000_000 is the linear-work fallback. The fixture must
+        // keep `p < JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N` so the (n ≥ 50_000
+        // ∧ p ≥ 32) threshold cannot fire and the linear-work boundary is
+        // the only predicate under test.
+        assert!(use_joint_matrix_free_path(20, 200_000));
+        assert!(!use_joint_matrix_free_path(20, 199_999));
 
         // Below every threshold: dense path.
         assert!(!use_joint_matrix_free_path(8, 100));
