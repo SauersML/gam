@@ -4505,39 +4505,24 @@ impl LinearOperator for DesignMatrix {
             ));
         }
         let p = self.ncols();
-        let mut xtwx = Array2::<f64>::zeros((p, p));
         match self {
             Self::Dense(x) => x.diag_xtw_x(weights),
             Self::Sparse(xs) => {
-                let csr = xs
-                    .as_ref()
-                    .to_row_major()
-                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
-                let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..self.nrows() {
-                    let wi = weights[i].max(0.0);
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    let start = row_ptr[i];
-                    let end = row_ptr[i + 1];
-                    for a_ptr in start..end {
-                        let a = col_idx[a_ptr];
-                        let xa = vals[a_ptr];
-                        for b_ptr in a_ptr..end {
-                            let b = col_idx[b_ptr];
-                            let xb = vals[b_ptr];
-                            let v = wi * xa * xb;
-                            xtwx[[a, b]] += v;
-                            if a != b {
-                                xtwx[[b, a]] += v;
-                            }
-                        }
-                    }
-                }
+                // For nominally-sparse designs whose XᵀWX is dense (Matern /
+                // Duchon radial bases store one nonzero per knot per row, so
+                // the Hessian fills in completely), the row-by-row scalar
+                // assembly was the dominant PIRLS inner cost at biobank
+                // scale — single-threaded, ~1 s/iter on n=320 K · p=101.
+                // Densify once via the cached `to_dense_arc` and dispatch to
+                // the existing chunked-streaming faer matmul path; that
+                // routes through faer's parallel matmul (`get_global_par
+                // allelism`), which is exactly what `streaming_blas_xt_diag_x`
+                // already does for Dense designs.  For genuinely sparse
+                // designs whose XᵀWX stays sparse the sparse-native PIRLS
+                // path is selected upstream and this branch is not hit.
+                let xd = xs.as_ref().to_dense_arc();
+                let mut xtwx = Array2::<f64>::zeros((p, p));
+                streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
                 Ok(xtwx)
             }
         }
