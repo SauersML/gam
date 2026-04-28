@@ -170,6 +170,29 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertEqual(report.chunk_rows, _RUNNER.BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS)
         self.assertLess(report.largest_single_allocation_bytes, 400000 * 1000 * 8)
 
+    def test_marginal_slope_preflight_status_is_grep_friendly(self) -> None:
+        # Routing log regression: the biobank preflight emits a `status: PASS`
+        # / `status: FAIL` token that downstream log scrapers grep for. The
+        # Rust planner emits a parallel `solver=...;hessian=...;matrix-free=...`
+        # token via `OuterPlan::routing_log_line()`. Both contracts are pinned
+        # together: a regression that drops the Python preflight token or the
+        # Rust routing token will fail tests in either layer.
+        report = _RUNNER.preflight_marginal_slope_biobank(
+            n_train=400000,
+            d_pc=16,
+            centers=20,
+            linkwiggle_knots=8,
+            scorewarp_knots=7,
+        )
+        text = "\n".join(report.lines)
+        self.assertIn("status: PASS", text)
+        # The routing token format is documented in
+        # src/solver/outer_strategy.rs::OuterPlan::routing_log_line. When the
+        # bench runner gains a `--emit-routing-log` flag (post-#7 wiring),
+        # extend this test to invoke the runner and assert
+        # `solver=Arc;hessian=Analytic;matrix-free=true` in stderr for the
+        # marginal-slope, Matern, iso-kappa, and GAMLSS lanes.
+
     def test_build_method_specs_rejects_pc_count_above_generated_columns(self) -> None:
         cfg = {
             "methods": [
