@@ -145,6 +145,12 @@ where
             ));
         }
         let rows_in_chunk = end - start;
+        // Pack RHS by transposing each gradient block in one shot:
+        //   rhs[:, component*R .. (component+1)*R] = gradients[component].t()
+        // This replaces the per-row `rhs.slice_mut(...).assign(grad.row(r).t())`
+        // loop with O(local_dim) ndarray block assignments — same memory motion
+        // but with contiguous column-block destinations and a single bounds
+        // check per component.
         let mut rhs = Array2::<f64>::zeros((parameter_dim, rows_in_chunk * local_dim));
         for (component, grad) in gradients.iter().enumerate() {
             if grad.nrows() != rows_in_chunk || grad.ncols() != parameter_dim {
@@ -156,10 +162,9 @@ where
                     parameter_dim
                 ));
             }
-            for local_row in 0..rows_in_chunk {
-                rhs.slice_mut(s![.., component * rows_in_chunk + local_row])
-                    .assign(&grad.row(local_row).t());
-            }
+            let col_start = component * rows_in_chunk;
+            let col_end = col_start + rows_in_chunk;
+            rhs.slice_mut(s![.., col_start..col_end]).assign(&grad.t());
         }
 
         let solved = backend.apply_columns(&rhs)?;
@@ -173,21 +178,44 @@ where
             ));
         }
 
+        // Build the per-row local covariance entries.
+        //
+        // For each (a, b) the value at row r is
+        //   v_ab[r] = gradients[a][r, :]  ·  solved[:, b*R + r]
+        // which is the diagonal of  G_a · S_b  where
+        //   G_a = gradients[a]                     (R × P)
+        //   S_b = solved[:, b*R .. (b+1)*R]        (P × R)
+        // We hoist the per-component slice of `solved` once per outer index
+        // rather than re-deriving the column for each `local_row`, and the
+        // off-diagonal symmetrization (0.5 * (v_ab + v_ba)) is preserved
+        // exactly: `solved` is generally non-symmetric for factorized backends
+        // due to floating-point round-off, so we keep the explicit average to
+        // match the original numerics.
         for a in 0..local_dim {
+            let g_a = gradients[a].view();
             for b in a..local_dim {
-                for local_row in 0..rows_in_chunk {
-                    let lhs = gradients[a].row(local_row);
-                    let rhs_ab = solved.column(b * rows_in_chunk + local_row);
-                    let value_ab = lhs.dot(&rhs_ab);
-                    let value = if a == b {
-                        value_ab
-                    } else {
-                        let lhs_b = gradients[b].row(local_row);
-                        let rhs_ba = solved.column(a * rows_in_chunk + local_row);
-                        0.5 * (value_ab + lhs_b.dot(&rhs_ba))
-                    };
-                    out[a][b][start + local_row] = value;
-                    out[b][a][start + local_row] = value;
+                let s_b = solved.slice(s![.., b * rows_in_chunk..(b + 1) * rows_in_chunk]);
+                if a == b {
+                    let mut col = out[a][b].slice_mut(s![start..end]);
+                    for local_row in 0..rows_in_chunk {
+                        col[local_row] = g_a.row(local_row).dot(&s_b.column(local_row));
+                    }
+                } else {
+                    let g_b = gradients[b].view();
+                    let s_a = solved.slice(s![.., a * rows_in_chunk..(a + 1) * rows_in_chunk]);
+                    {
+                        let mut col_ab = out[a][b].slice_mut(s![start..end]);
+                        for local_row in 0..rows_in_chunk {
+                            let v_ab = g_a.row(local_row).dot(&s_b.column(local_row));
+                            let v_ba = g_b.row(local_row).dot(&s_a.column(local_row));
+                            col_ab[local_row] = 0.5 * (v_ab + v_ba);
+                        }
+                    }
+                    // Mirror to the (b, a) entry; disjoint from out[a][b]
+                    // because a != b here.
+                    let copy = out[a][b].slice(s![start..end]).to_owned();
+                    let mut col_ba = out[b][a].slice_mut(s![start..end]);
+                    col_ba.assign(&copy);
                 }
             }
         }
