@@ -17,7 +17,7 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
-    fast_ab, fast_atb, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
+    fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
 };
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
@@ -7805,9 +7805,9 @@ impl GaussianLocationScaleWiggleFamily {
 
         let objective_psi = (-&rows.m * &q_a + &s_ls * e_a).sum();
         let score_psi = gaussian_pack_wiggle_joint_score(
-            &(xmu_map.transpose_mul(s_mu.view()) + xmu.t().dot(&s_mu_a)),
-            &(x_ls_map.transpose_mul(s_ls.view()) + x_ls.t().dot(&s_ls_a)),
-            &(basis_a.t().dot(&s_w) + geom.basis.t().dot(&s_w_a)),
+            &(xmu_map.transpose_mul(s_mu.view()) + fast_atv(xmu, &s_mu_a)),
+            &(x_ls_map.transpose_mul(s_ls.view()) + fast_atv(x_ls, &s_ls_a)),
+            &(fast_atv(&basis_a, &s_w) + fast_atv(&geom.basis, &s_w_a)),
         );
 
         // Static blocks under logb: coeff_ml = 2κmD; coeff_ll = 2κ²n + κ'(a−n); l = 2κm.
@@ -8053,15 +8053,15 @@ impl GaussianLocationScaleWiggleFamily {
             &(xmu_ab_map.transpose_mul(s_mu.view())
                 + xmu_a_map.transpose_mul(s_mu_b.view())
                 + xmu_b_map.transpose_mul(s_mu_a.view())
-                + xmu.t().dot(&s_mu_ab)),
+                + fast_atv(xmu, &s_mu_ab)),
             &(x_ls_ab_map.transpose_mul(s_ls.view())
                 + x_ls_a_map.transpose_mul(s_ls_b.view())
                 + x_ls_b_map.transpose_mul(s_ls_a.view())
-                + x_ls.t().dot(&s_ls_ab)),
-            &(basis_ab.t().dot(&s_w)
-                + basis_a.t().dot(&s_w_b)
-                + basis_b.t().dot(&s_w_a)
-                + geom.basis.t().dot(&s_w_ab)),
+                + fast_atv(x_ls, &s_ls_ab)),
+            &(fast_atv(&basis_ab, &s_w)
+                + fast_atv(&basis_a, &s_w_b)
+                + fast_atv(&basis_b, &s_w_a)
+                + fast_atv(&geom.basis, &s_w_ab)),
         );
 
         // Static blocks under logb. coeff_mm has no κ; coeff_ml = 2κmD;
@@ -8382,15 +8382,15 @@ impl GaussianLocationScaleWiggleFamily {
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
 
-        let xi = xmu.dot(&umu);
-        let zeta = x_ls.dot(&u_ls);
+        let xi = fast_av(xmu, &umu);
+        let zeta = fast_av(x_ls, &u_ls);
         let zmu_a_u = xmu_map.forward_mul(umu.view());
         let zls_a_u = x_ls_map.forward_mul(u_ls.view());
-        let b1u = geom.basis_d1.dot(&uw);
-        let b2u = geom.basis_d2.dot(&uw);
-        let b3u = geom.basis_d3.dot(&uw);
+        let b1u = fast_av(&geom.basis_d1, &uw);
+        let b2u = fast_av(&geom.basis_d2, &uw);
+        let b3u = fast_av(&geom.basis_d3, &uw);
 
-        let q_u = &(&geom.dq_dq0 * &xi) + &geom.basis.dot(&uw);
+        let q_u = &(&geom.dq_dq0 * &xi) + &fast_av(&geom.basis, &uw);
         let s1_u = &(&geom.d2q_dq02 * &xi) + &b1u;
         let g2_u = &(&geom.d3q_dq03 * &xi) + &b2u;
         let g3_u = &(&geom.d4q_dq04 * &xi) + &b3u;
@@ -9070,10 +9070,10 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         let v_ls = v.slice(s![pmu..pmu + p_ls]);
         let v_w = v.slice(s![pmu + p_ls..total]);
 
-        let u_mu = self.xmu.dot(&v_mu);
-        let u_ls = self.x_ls.dot(&v_ls);
-        let u_b = self.pieces.basis.dot(&v_w);
-        let u_d = self.pieces.basis_d1.dot(&v_w);
+        let u_mu = fast_av(&self.xmu, &v_mu);
+        let u_ls = fast_av(&self.x_ls, &v_ls);
+        let u_b = fast_av(&self.pieces.basis, &v_w);
+        let u_d = fast_av(&self.pieces.basis_d1, &v_w);
 
         let r_mu = &self.pieces.coeff_mm * &u_mu
             + &self.pieces.coeff_ml * &u_ls
@@ -9087,9 +9087,9 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
             + &self.pieces.coeff_ww * &u_b;
         let r_d = &self.pieces.coeff_mw_d * &u_mu;
 
-        let out_mu = self.xmu.t().dot(&r_mu);
-        let out_ls = self.x_ls.t().dot(&r_ls);
-        let out_w = self.pieces.basis.t().dot(&r_b) + &self.pieces.basis_d1.t().dot(&r_d);
+        let out_mu = fast_atv(&self.xmu, &r_mu);
+        let out_ls = fast_atv(&self.x_ls, &r_ls);
+        let out_w = fast_atv(&self.pieces.basis, &r_b) + &fast_atv(&self.pieces.basis_d1, &r_d);
 
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pmu]).assign(&out_mu);
