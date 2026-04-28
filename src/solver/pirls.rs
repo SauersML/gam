@@ -3470,6 +3470,38 @@ where
     F: FnMut(&WorkingModelIterationInfo),
 {
     const LM_MAX_LAMBDA: f64 = 1e12;
+    // Wall-clock budget for a single inner PIRLS solve. A single inner solve
+    // that exceeds this budget at biobank n is empirically a "bad
+    // smoothing-parameter point" signal: surface it as
+    // `PirlsTimeBudgetExceeded` so the outer line search treats it as a
+    // recoverable evaluation failure and shrinks the step (see
+    // `into_objective_error` in `outer_strategy.rs`).
+    //
+    // This is principled, not a bandaid: the alternative is the line search
+    // sitting blind for tens of minutes on a single PIRLS call that will
+    // never converge at the proposed log-λ. Returning an error tells the
+    // outer optimizer the truth — the step was too aggressive.
+    const DEFAULT_PIRLS_MAX_SECONDS: f64 = 60.0;
+    let pirls_max_seconds = std::env::var("GAM_PIRLS_MAX_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_PIRLS_MAX_SECONDS);
+    let pirls_deadline_start = std::time::Instant::now();
+    let check_time_budget = |attempt_label: &str| -> Result<(), EstimationError> {
+        let elapsed = pirls_deadline_start.elapsed().as_secs_f64();
+        if elapsed > pirls_max_seconds {
+            log::warn!(
+                "[PIRLS] time-budget exceeded at {attempt_label}: elapsed={elapsed:.1}s > limit={pirls_max_seconds:.1}s; \
+                 returning PirlsTimeBudgetExceeded so the outer line search shrinks the step"
+            );
+            return Err(EstimationError::PirlsTimeBudgetExceeded {
+                elapsed_seconds: elapsed,
+                max_seconds: pirls_max_seconds,
+            });
+        }
+        Ok(())
+    };
 
     fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
@@ -3592,6 +3624,7 @@ where
     // changes the approximation itself --- it becomes a PQL-type surrogate.
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
+        check_time_budget(&format!("pirls iter {iter} start"))?;
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
         // if the process is killed during `update_with_curvature` or the LM solve.
@@ -3666,6 +3699,7 @@ where
 
         loop {
             attempts += 1;
+            check_time_budget(&format!("pirls iter {iter} LM attempt {attempts}"))?;
 
             // 1. Solve (H + λI)δ = -g
             // Update diagonal in-place: add (loop_lambda - applied_lambda) to diagonal

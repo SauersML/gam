@@ -12,7 +12,7 @@ use crate::custom_family::{
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
     shared_dense_arc, weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
 };
-use crate::faer_ndarray::{FaerEigh, fast_xt_diag_x};
+use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::erfcx_nonnegative;
 use crate::families::gamlss::{
     SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
@@ -1548,9 +1548,9 @@ impl SurvivalLocationScaleFamily {
                 beta_w.len()
             ));
         }
-        let dq_dq0 = basis_d1.dot(&beta_w) + 1.0;
-        let d2q_dq02 = basis_d2.dot(&beta_w);
-        let d3q_dq03 = basis_d3.dot(&beta_w);
+        let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
+        let d2q_dq02 = fast_av(&basis_d2, &beta_w);
+        let d3q_dq03 = fast_av(&basis_d3, &beta_w);
         let d4q_dq04 = survival_wiggle_fourth_q(q0, knots, degree, beta_w)?;
         Ok(Some(SurvivalWiggleGeometry {
             basis,
@@ -1591,9 +1591,9 @@ impl SurvivalLocationScaleFamily {
                 beta_w.len()
             ));
         }
-        let dq = basis_d1.dot(&beta_w) + 1.0;
-        let d2 = basis_d2.dot(&beta_w);
-        let d3 = basis_d3.dot(&beta_w);
+        let dq = fast_av(&basis_d1, &beta_w) + 1.0;
+        let d2 = fast_av(&basis_d2, &beta_w);
+        let d3 = fast_av(&basis_d3, &beta_w);
         Ok(Some(SurvivalWiggleGeometry {
             basis,
             basis_d1,
@@ -1918,8 +1918,8 @@ impl SurvivalLocationScaleFamily {
                                         t_time_varying,
                                         "SurvivalLocationScaleFamily threshold",
                                     )?;
-                                    z_t_exit_psi = exit.dot(beta_t);
-                                    z_t_entry_psi = entry.dot(beta_t);
+                                    z_t_exit_psi = fast_av(&exit, beta_t);
+                                    z_t_entry_psi = fast_av(&entry, beta_t);
                                     x_t_exit_psi = Some(exit);
                                     x_t_entry_psi = Some(entry);
                                 }
@@ -1964,8 +1964,8 @@ impl SurvivalLocationScaleFamily {
                                         ls_time_varying,
                                         "SurvivalLocationScaleFamily log-sigma",
                                     )?;
-                                    z_ls_exit_psi = exit.dot(beta_ls);
-                                    z_ls_entry_psi = entry.dot(beta_ls);
+                                    z_ls_exit_psi = fast_av(&exit, beta_ls);
+                                    z_ls_entry_psi = fast_av(&entry, beta_ls);
                                     x_ls_exit_psi = Some(exit);
                                     x_ls_entry_psi = Some(entry);
                                 }
@@ -3469,8 +3469,8 @@ fn structural_time_initial_beta_guess(
         target[i] = (desired - derivative_offset_exit[i]).max(0.0);
     }
 
-    let xtx = design_derivative_exit.t().dot(design_derivative_exit);
-    let xty = design_derivative_exit.t().dot(&target);
+    let xtx = crate::faer_ndarray::fast_ata(design_derivative_exit);
+    let xty = fast_atv(design_derivative_exit, &target);
     let eps = 1e-6 * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
     let mut lhs = xtx;
     for i in 0..p {
@@ -3486,7 +3486,7 @@ fn structural_time_initial_beta_guess(
         }
     }
 
-    let d_raw_init = design_derivative_exit.dot(&beta_init) + derivative_offset_exit;
+    let d_raw_init = fast_av(design_derivative_exit, &beta_init) + derivative_offset_exit;
     if d_raw_init
         .iter()
         .all(|v| v.is_finite() && *v >= derivative_guard)
@@ -4958,8 +4958,8 @@ impl SurvivalLocationScaleFamily {
             time_wiggle_exit.as_ref(),
             beta_time_w,
         ) {
-            h_entry = &h_entry_base + &wig_entry.basis.dot(&beta_w);
-            h_exit = &h_exit_base + &wig_exit.basis.dot(&beta_w);
+            h_entry = &h_entry_base + &fast_av(&wig_entry.basis, &beta_w);
+            h_exit = &h_exit_base + &fast_av(&wig_exit.basis, &beta_w);
             hdot_exit = &wig_exit.dq_dq0 * &d_base;
             time_jac_entry = scale_dense_rows(self.x_time_entry.as_ref(), &wig_entry.dq_dq0)?;
             time_jac_exit = scale_dense_rows(self.x_time_exit.as_ref(), &wig_exit.dq_dq0)?;
@@ -5221,7 +5221,7 @@ fn prediction_linear_predictors(
     {
         return Err("predict_survival_location_scale: row mismatch across inputs".to_string());
     }
-    let h_base = input.x_time_exit.dot(&beta_time) + &input.eta_time_offset_exit;
+    let h_base = fast_av(&input.x_time_exit, &beta_time) + &input.eta_time_offset_exit;
     let mut h = h_base.clone();
     let mut time_jac = input.x_time_exit.clone();
     if input.time_wiggle_ncols > 0 {
@@ -5251,8 +5251,8 @@ fn prediction_linear_predictors(
                 beta_time_w.len()
             ));
         }
-        let dq = time_basis_d1.dot(&beta_time_w) + 1.0;
-        h = &h_base + &time_basis.dot(&beta_time_w);
+        let dq = fast_av(&time_basis_d1, &beta_time_w) + 1.0;
+        h = &h_base + &fast_av(&time_basis, &beta_time_w);
         time_jac = scale_dense_rows(&input.x_time_exit, &dq)?;
         time_jac
             .slice_mut(s![.., time_tail.start..time_tail.end])
@@ -5299,8 +5299,8 @@ fn prediction_linear_predictors(
             degree,
             BasisOptions::first_derivative(),
         )?;
-        let dq = Some(basis_d1.dot(betaw) + 1.0);
-        let etaw = design.dot(betaw);
+        let dq = Some(fast_av(&basis_d1, betaw) + 1.0);
+        let etaw = fast_av(&design, betaw);
         (Some(design), dq, Some(etaw))
     } else {
         (None, None, None)

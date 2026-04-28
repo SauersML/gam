@@ -8,6 +8,7 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
 };
 use crate::estimate::UnifiedFitResult;
+use crate::faer_ndarray::{fast_atv, fast_av};
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     build_link_deviation_block_from_knots_design_seed_and_weights,
@@ -3473,11 +3474,11 @@ impl SurvivalMarginalSlopeFamily {
                 beta_w.len()
             ));
         }
-        let dq_dq0 = basis_d1.dot(&beta_w) + 1.0;
-        let d2q_dq02 = basis_d2.dot(&beta_w);
-        let d3q_dq03 = basis_d3.dot(&beta_w);
-        let d4q_dq04 = basis_d4.dot(&beta_w);
-        let d5q_dq05 = basis_d5.dot(&beta_w);
+        let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
+        let d2q_dq02 = fast_av(&basis_d2, &beta_w);
+        let d3q_dq03 = fast_av(&basis_d3, &beta_w);
+        let d4q_dq04 = fast_av(&basis_d4, &beta_w);
+        let d5q_dq05 = fast_av(&basis_d5, &beta_w);
         Ok(Some(SurvivalTimeWiggleGeometry {
             basis,
             basis_d1,
