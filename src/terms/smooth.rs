@@ -12969,14 +12969,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         let offset_pilot: Array1<f64> = indices.iter().map(|&i| offset[i]).collect();
         let mut pilot_kappa = kappa_options.clone();
         pilot_kappa.pilot_subsample_threshold = 0;
-        // Mark this entry into the optimizer as a pilot recursion so the
-        // joint-anisotropy refinement step inside it can degrade gracefully:
-        // a small-n pseudo-Laplace inverse failure (Matérn-60 + 10 K hits
-        // "strict pseudo-laplace SPD inverse failed" routinely) should leave
-        // us with the pilot REML geometry as the full-data initializer
-        // rather than dropping every byte of pilot work on the floor.
-        // Outside the pilot the strict path is unchanged.
-        let _pilot_guard = PilotRecursionGuard::enter();
         match fit_term_collectionwith_spatial_length_scale_optimization(
             data_pilot.view(),
             y_pilot,
@@ -13011,7 +13003,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 );
             }
         }
-        drop(_pilot_guard);
     }
 
     let best = fit_term_collection_forspec(
