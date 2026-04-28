@@ -5,7 +5,7 @@ use crate::faer_ndarray::{
     factorize_symmetricwith_fallback,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, Zip};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
@@ -329,10 +329,25 @@ where
     let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
     let mut r = rhs.clone();
+
+    // Precompute reciprocal preconditioner once. Each PCG iteration applies
+    // M^{-1} via a single elementwise multiply (z = inv_m * r), avoiding the
+    // per-element `.abs().max(1e-12)` and division on every iteration. The
+    // floor mirrors the previous guard against zero/negative diagonals.
+    let mut inv_m = Array1::<f64>::zeros(p);
+    Zip::from(&mut inv_m)
+        .and(preconditioner_diag)
+        .for_each(|inv, &m| {
+            *inv = 1.0 / m.abs().max(1e-12);
+        });
+
     let mut z = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
-    }
+    Zip::from(&mut z)
+        .and(&r)
+        .and(&inv_m)
+        .for_each(|zi, &ri, &im| {
+            *zi = ri * im;
+        });
     let mut p_dir = z.clone();
     let mut rz_old = r.dot(&z);
     if !rz_old.is_finite() || rz_old <= 0.0 {
@@ -341,6 +356,9 @@ where
 
     for iter in 0..max_iter {
         let ap = apply(&p_dir);
+        if ap.len() != p {
+            return None;
+        }
         let denom = p_dir.dot(&ap);
         if !denom.is_finite() || denom <= 0.0 {
             return None;
@@ -352,8 +370,15 @@ where
         x.scaled_add(alpha, &p_dir);
         r.scaled_add(-alpha, &ap);
         if (iter + 1) % 32 == 0 {
+            // Periodic residual refresh: r <- rhs - A x. Done in-place via
+            // assign + scaled_add to avoid the prior fresh-allocation pattern
+            // (`r = rhs - &ax;`) inside the hot loop.
             let ax = apply(&x);
-            r = rhs - &ax;
+            if ax.len() != p {
+                return None;
+            }
+            r.assign(rhs);
+            r.scaled_add(-1.0, &ax);
         }
         let r_norm = r.dot(&r).sqrt();
         if r_norm.is_finite() && r_norm <= tol {
@@ -366,9 +391,12 @@ where
                 },
             ));
         }
-        for i in 0..p {
-            z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
-        }
+        Zip::from(&mut z)
+            .and(&r)
+            .and(&inv_m)
+            .for_each(|zi, &ri, &im| {
+                *zi = ri * im;
+            });
         let rz_new = r.dot(&z);
         if !rz_new.is_finite() || rz_new <= 0.0 {
             return None;
@@ -377,9 +405,10 @@ where
         if !beta.is_finite() {
             return None;
         }
-        for i in 0..p {
-            p_dir[i] = z[i] + beta * p_dir[i];
-        }
+        // p <- z + beta * p (fused, SIMD-friendly via ndarray::Zip).
+        Zip::from(&mut p_dir).and(&z).for_each(|pi, &zi| {
+            *pi = zi + beta * *pi;
+        });
         rz_old = rz_new;
     }
     None
@@ -457,6 +486,8 @@ fn orthogonal_rademacher_probes(dim: usize, probes: usize, rng: &mut StdRng) -> 
         let remaining = probes - out.len();
         let take = remaining.min(block);
         let mut local = Vec::<Array1<f64>>::with_capacity(take);
+        // Hoist the target-norm scalar out of the inner-row hot path.
+        let target_norm = (dim as f64).sqrt();
         for _ in 0..take {
             let mut z = Array1::<f64>::zeros(dim);
             for i in 0..dim {
@@ -470,7 +501,11 @@ fn orthogonal_rademacher_probes(dim: usize, probes: usize, rng: &mut StdRng) -> 
             }
             let norm = z.dot(&z).sqrt();
             if norm > 1e-12 {
-                z.mapv_inplace(|v| v * (dim as f64).sqrt() / norm);
+                // Single multiply by precomputed scale replaces per-element
+                // `v * sqrt(dim) / norm` (one division+sqrt was being JITted
+                // per element by the optimizer at best).
+                let scale = target_norm / norm;
+                z.mapv_inplace(|v| v * scale);
                 local.push(z);
             }
         }
@@ -492,17 +527,19 @@ where
     F: Fn(&Array1<f64>) -> Array1<f64>,
 {
     let mut matrix = Array2::<f64>::zeros((dim, dim));
+    let mut basis = Array1::<f64>::zeros(dim);
     for j in 0..dim {
-        let mut basis = Array1::<f64>::zeros(dim);
         basis[j] = 1.0;
         let col = apply(&basis);
         if col.len() != dim {
             return Err("operator returned wrong output dimension".to_string());
         }
-        for i in 0..dim {
-            matrix[[i, j]] = col[i];
-        }
+        // Single contiguous column write replaces a scalar `[[i, j]]`-indexed
+        // copy loop; ndarray emits a tight memcpy/strided copy.
+        matrix.column_mut(j).assign(&col);
+        basis[j] = 0.0;
     }
+    // Symmetrize the upper/lower triangles in one symmetric pass.
     for i in 0..dim {
         for j in (i + 1)..dim {
             let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
@@ -534,7 +571,11 @@ where
     // with substantially better cache locality and SIMD throughput.
     let mut q_basis = Array2::<f64>::zeros((p, max_steps));
     let mut q_prev = Array1::<f64>::zeros(p);
-    let mut q = probe.mapv(|v| v / probe_norm_sq.sqrt());
+    // Hoist the per-element division into a single multiply by a precomputed
+    // reciprocal norm, avoiding `dim` calls to `sqrt` from the previous
+    // `mapv(|v| v / probe_norm_sq.sqrt())` form.
+    let inv_probe_norm = 1.0 / probe_norm_sq.sqrt();
+    let mut q = probe.mapv(|v| v * inv_probe_norm);
     let mut alphas = Vec::<f64>::with_capacity(max_steps);
     let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
     let mut beta_prev = 0.0_f64;
@@ -583,7 +624,9 @@ where
         }
         betas.push(beta);
         q_prev = q;
-        q = v.mapv(|x| x / beta);
+        // Precomputed reciprocal beta replaces a per-element division.
+        let inv_beta = 1.0 / beta;
+        q = v.mapv(|x| x * inv_beta);
         beta_prev = beta;
     }
 
