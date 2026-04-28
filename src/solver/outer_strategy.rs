@@ -1911,108 +1911,7 @@ pub struct OuterProblem {
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     solver_class: SolverClass,
-    /// Caller-supplied estimate of the floating-point work required to
-    /// assemble one dense exact joint Hessian, in FLOPs.  When `Some(work)`
-    /// and `work` exceeds [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`], the
-    /// planner downgrades `(Analytic, Analytic)` to BFGS+gradient even
-    /// though an analytic Hessian is declared.  This is the arithmetic-cost
-    /// counterpart to the memory-budget preflight: a "memory-PASS" plan
-    /// whose per-iteration work would dominate wall-clock time should be
-    /// routed away from the dense-Hessian path automatically.
-    ///
-    /// Typical formula: `work ≈ n · p²` for standard GLM curvature
-    /// assembly; family-specific scalings (Khatri–Rao, GAMLSS block tri-up)
-    /// can be folded into the same scalar.
-    dense_hessian_work_hint: Option<f64>,
-    /// Caller-supplied estimate of the aggregate per-outer-iteration
-    /// Hessian-pair assembly cost (`k² · n · p²` in the standard GLM model).
-    /// Independent of [`Self::dense_hessian_work_hint`]: the hint above
-    /// captures one-inner-solve cost, this captures the aggregate
-    /// across all `k²` LAML pairwise terms within one outer iteration.
-    /// Either crossing the threshold triggers the cost-driven downgrade.
-    aggregate_hessian_pair_work_hint: Option<f64>,
-    /// True when the family's joint Hessian can be applied as a Hv
-    /// operator (`HessianResult::Operator`) rather than materialized as a
-    /// dense matrix.  When true, the cost-driven downgrade does NOT fire:
-    /// ARC's matrix-free trust-region CG path (`run_operator_trust_region`
-    /// at the dispatch site) absorbs the per-iteration cost via O(n·p)
-    /// HVPs instead of O(n·p²) dense Gram assembly, so the work-budget
-    /// argument that justified switching to BFGS no longer applies.
-    /// Explicit `with_prefer_gradient_only(true)` from the caller is still
-    /// preserved — the matrix-free flag only suppresses *cost-driven*
-    /// downgrades, not deliberate ones.
-    matrix_free_hessian_available: bool,
 }
-
-/// Per-Hessian work above which the outer planner prefers gradient-only
-/// optimization even when an analytic Hessian is available.
-///
-/// At biobank scale the outer Newton step performs O(20) iterations, each
-/// of which assembles a dense exact joint Hessian.  Once a single assembly
-/// exceeds ~5 GFLOPs, the second-order step's superior local convergence
-/// no longer compensates for the per-evaluation cost vs. L-BFGS, which
-/// only needs O(n·p) gradient work per step.  The threshold is intentionally
-/// generous: we keep ARC active for the common biobank regime (n=3·10⁵,
-/// p≈100 → 3·10⁹ FLOPs ≪ threshold) and only divert when the dense path
-/// would dominate wall-clock time.
-pub const DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD: f64 = 5.0e9;
-
-/// Per-outer-evaluation FLOP budget above which the analytic LAML outer
-/// Hessian's assembly cost is judged too expensive for ARC's super-linear
-/// convergence to amortize, and the planner switches to gradient-only
-/// BFGS instead.
-///
-/// The cost model gated here is the **truthful** per-outer-evaluation
-/// Hessian-assembly cost:
-///
-/// ```text
-///   C_assembly  =  k · n·p²   +   k² · p²
-///                  └────┬───┘     └──┬──┘
-///         per-coord D_β H[v_k]    per-pair cross-trace on
-///         (k builds, O(n·p²)      cached spectral rotation
-///          each)                  (no further n·p² work)
-/// ```
-///
-/// This is independent of [`DENSE_HESSIAN_WORK_DOWNGRADE_THRESHOLD`]:
-/// that constant gates the *single-inner-solve* cost (when one Hessian
-/// assembly is already too slow), while this one gates the *aggregate*
-/// per-outer Hessian-assembly cost (when the per-outer-evaluation work
-/// dominates).  Both can independently trigger the gradient-only
-/// downgrade — they capture different regimes.
-///
-/// **Calibration.** At biobank-Duchon (n=320 000, p=65, k=6):
-/// ```text
-///   C_assembly  =  6 · 320 000 · 65²  +  6² · 65²
-///              ≈  8.10·10⁹  +  1.5·10⁵
-///              ≈  8.10·10⁹
-/// ```
-/// — above the 5·10⁹ threshold, so the biobank case triggers the BFGS
-/// downgrade.  At TPS pilot (n=10 000, p=116, k=6):
-/// ```text
-///   C_assembly  ≈  6 · 10 000 · 116²  +  36 · 116²  ≈  8.10·10⁸
-/// ```
-/// — well under threshold, ARC stays.
-///
-/// **Why the cost model has no `I_expected` factor.** The user's original
-/// prescription named the inner-solve cost as `C_inner ≈ n·p²·I_expected`.
-/// That cost is paid identically by ARC and by BFGS (both must compute
-/// the mode β̂); it does not enter the ARC-vs-BFGS branch decision.  The
-/// branch decision compares only the Hessian-assembly *overhead* that
-/// ARC pays on top of the shared inner solve, so `I_expected` correctly
-/// does not appear here.  Note also that nothing in this gate caps the
-/// number of inner P-IRLS iterations — the inner loop runs to its
-/// configured convergence (strict KKT, or a valid stationary point via
-/// `pirls_soft_acceptance` within 10× the user's `convergence_tolerance`
-/// band).  Model quality is unaffected by this gate.
-pub const STANDARD_GAM_OUTER_HESSIAN_ASSEMBLY_BUDGET_FLOPS: u128 = 5_000_000_000;
-
-/// Minimum smoothing-parameter count below which ARC's super-linear
-/// convergence advantage outweighs any per-iteration Hessian cost.
-///
-/// For `k ≤ 3` the outer Hessian is at most nine entries and the dim-`k`
-/// BFGS history is too thin to approximate curvature well, so ARC wins
-/// regardless of how big `n · p²` is.
-pub const STANDARD_GAM_OUTER_BFGS_MIN_K: usize = 4;
 
 impl OuterProblem {
     pub fn new(n_params: usize) -> Self {
@@ -2034,9 +1933,6 @@ impl OuterProblem {
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             solver_class: SolverClass::Primary,
-            dense_hessian_work_hint: None,
-            aggregate_hessian_pair_work_hint: None,
-            matrix_free_hessian_available: false,
         }
     }
 

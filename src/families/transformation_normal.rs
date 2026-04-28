@@ -1829,6 +1829,14 @@ struct TransformationNormalJointHessianWorkspace {
     h_prime: Arc<Array1<f64>>,
     /// Row weights w / h'^2 for the X_deriv^T diag(·) X_deriv summand.
     weighted_inv_hp_sq: Array1<f64>,
+    /// `1 / h'^3` cached per accepted β. Reused as the per-row factor in the
+    /// matrix-free dH operator kernel `-2 w_i (Du)_i / h'_i^3`. Arc-shared so
+    /// each derived dH operator clones a pointer rather than rebuilding the
+    /// per-row reciprocals.
+    inv_hp_cu: Arc<Array1<f64>>,
+    /// `1 / h'^4` cached per accepted β. Reused by the matrix-free d²H operator
+    /// kernel `6 w_i (Du)_i (Dw)_i / h'_i^4`.
+    inv_hp_qu: Arc<Array1<f64>>,
 }
 
 impl TransformationNormalJointHessianWorkspace {
@@ -1837,10 +1845,17 @@ impl TransformationNormalJointHessianWorkspace {
         h_prime: Array1<f64>,
         weighted_inv_hp_sq: Array1<f64>,
     ) -> Result<Self, String> {
+        let inv_hp_cu = ndarray::Zip::from(&h_prime).par_map_collect(|&hp| 1.0 / (hp * hp * hp));
+        let inv_hp_qu = ndarray::Zip::from(&h_prime).par_map_collect(|&hp| {
+            let hp2 = hp * hp;
+            1.0 / (hp2 * hp2)
+        });
         Ok(Self {
             family,
             h_prime: Arc::new(h_prime),
             weighted_inv_hp_sq,
+            inv_hp_cu: Arc::new(inv_hp_cu),
+            inv_hp_qu: Arc::new(inv_hp_qu),
         })
     }
 
@@ -2021,7 +2036,7 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         let d_h_prime = self.family.x_deriv_kron.forward_mul(d_beta_flat);
         let op = TransformationNormalDhMatrixFreeOperator::new(
             Arc::clone(&self.family),
-            Arc::clone(&self.h_prime),
+            Arc::clone(&self.inv_hp_cu),
             d_h_prime,
         );
         Ok(Some(Arc::new(op) as Arc<dyn HyperOperator>))
@@ -2053,7 +2068,7 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         let d_h_prime_v = self.family.x_deriv_kron.forward_mul(d_beta_v);
         let op = TransformationNormalD2hMatrixFreeOperator::new(
             Arc::clone(&self.family),
-            Arc::clone(&self.h_prime),
+            Arc::clone(&self.inv_hp_qu),
             d_h_prime_u,
             d_h_prime_v,
         );
@@ -2080,17 +2095,19 @@ struct TransformationNormalDhMatrixFreeOperator {
 impl TransformationNormalDhMatrixFreeOperator {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        h_prime: Arc<Array1<f64>>,
+        inv_hp_cu: Arc<Array1<f64>>,
         d_h_prime: Array1<f64>,
     ) -> Self {
-        let n = h_prime.len();
+        let n = inv_hp_cu.len();
         debug_assert_eq!(d_h_prime.len(), n);
         let weights = family.weights.as_ref();
-        // weight_kernel[i] = -2 · w_i · d_h_prime[i] / h_prime[i]³
+        // weight_kernel[i] = -2 · w_i · d_h_prime[i] · inv_hp_cu[i]
+        // (cached `1/h'^3` factor from the workspace; barrier formula
+        // `D(∇²B)[u]v = -2 μ Dᵀ((Du)(Dv)/c³)` with μ = w).
         let weight_kernel = ndarray::Zip::from(weights.view())
-            .and(&*h_prime)
+            .and(&*inv_hp_cu)
             .and(&d_h_prime)
-            .par_map_collect(|&w, &hp, &dhp| -2.0 * w * dhp / (hp * hp * hp));
+            .par_map_collect(|&w, &inv3, &dhp| -2.0 * w * dhp * inv3);
         Self {
             family,
             weight_kernel,
@@ -2194,23 +2211,22 @@ struct TransformationNormalD2hMatrixFreeOperator {
 impl TransformationNormalD2hMatrixFreeOperator {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        h_prime: Arc<Array1<f64>>,
+        inv_hp_qu: Arc<Array1<f64>>,
         d_h_prime_u: Array1<f64>,
         d_h_prime_v: Array1<f64>,
     ) -> Self {
-        let n = h_prime.len();
+        let n = inv_hp_qu.len();
         debug_assert_eq!(d_h_prime_u.len(), n);
         debug_assert_eq!(d_h_prime_v.len(), n);
         let weights = family.weights.as_ref();
-        // weight_kernel[i] = 6 · w_i · d_h_prime_u[i] · d_h_prime_v[i] / h_prime[i]⁴
+        // weight_kernel[i] = 6 · w_i · d_h_prime_u[i] · d_h_prime_v[i] · inv_hp_qu[i]
+        // (cached `1/h'^4` factor; barrier formula
+        // `D²(∇²B)[u,w]v = 6 μ Dᵀ((Du)(Dw)(Dv)/c⁴)` with μ = w).
         let weight_kernel = ndarray::Zip::from(weights.view())
-            .and(&*h_prime)
+            .and(&*inv_hp_qu)
             .and(&d_h_prime_u)
             .and(&d_h_prime_v)
-            .par_map_collect(|&w, &hp, &dhp_u, &dhp_v| {
-                let hp2 = hp * hp;
-                6.0 * w * dhp_u * dhp_v / (hp2 * hp2)
-            });
+            .par_map_collect(|&w, &inv4, &dhp_u, &dhp_v| 6.0 * w * dhp_u * dhp_v * inv4);
         Self {
             family,
             weight_kernel,
