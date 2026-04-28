@@ -6027,7 +6027,7 @@ pub fn fit_transformation_normal(
         kappa0.len(),
         kappa_dims,
     );
-    let mut rho0 = Array1::<f64>::zeros(n_penalties);
+    let rho0 = probe_block.initial_log_lambdas.clone();
     let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let probe_blocks = vec![probe_block];
@@ -6040,49 +6040,21 @@ pub fn fit_transformation_normal(
         );
 
     log::info!(
-        "[transformation-normal] starting baseline custom-family fit before exact joint optimization \
-         (rho_dim={}, log_kappa_dim={})",
+        "[transformation-normal] skipping baseline custom-family prefit before exact joint optimization \
+         (rho_dim={}, log_kappa_dim={}); using CTN warm start and initial penalty scales",
         n_penalties,
         kappa0.len(),
     );
-    let baseline_start = std::time::Instant::now();
-    let baseline_fit = fit_custom_family(&probe_family, &probe_blocks, &options).ok();
-    log::info!(
-        "[transformation-normal] baseline fit {} in {:.2}s",
-        if baseline_fit.is_some() {
-            "succeeded"
-        } else {
-            "failed (continuing with default rho seed)"
-        },
-        baseline_start.elapsed().as_secs_f64(),
-    );
-    if let Some(fit) = baseline_fit.as_ref() {
-        if fit.log_lambdas.len() == n_penalties {
-            rho0 = fit.log_lambdas.clone();
-        }
-    }
 
     if !analytic_psi_available {
-        let fit = baseline_fit.ok_or_else(|| {
-            "transformation fit failed before scale-dimensions optimization and analytic spatial psi derivatives are unavailable"
-                .to_string()
-        })?;
-        let mut cov_spec_resolved = boot_spec.clone();
-        sync_aniso_contrasts_from_metadata(&mut cov_spec_resolved, &boot_design.smooth);
-        return Ok(TransformationNormalFitResult {
-            family: probe_family,
-            fit,
-            covariate_spec_resolved: cov_spec_resolved,
-            covariate_design: boot_design,
-        });
+        return Err(
+            "transformation-normal spatial length-scale optimization requires analytic spatial psi derivatives"
+                .to_string(),
+        );
     }
 
     // Shared mutable state for warm-starting across optimizer iterations.
-    let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(
-        baseline_fit
-            .as_ref()
-            .and_then(|fit| fit.block_states.first().map(|block| block.beta.clone())),
-    );
+    let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);
     let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
 
     let joint_setup =
