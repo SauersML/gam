@@ -1120,18 +1120,6 @@ impl CustomFamily for TransformationNormalFamily {
         inner.saturating_add(monotonicity_pass)
     }
 
-    fn exact_outer_derivative_order(
-        &self,
-        specs: &[ParameterBlockSpec],
-        _: &BlockwiseFitOptions,
-    ) -> ExactOuterDerivativeOrder {
-        crate::custom_family::cost_gated_outer_order_with_matrix_free(
-            specs,
-            self.coefficient_hessian_cost(specs),
-            self.supports_matrix_free_joint_hessian(specs),
-        )
-    }
-
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
         crate::seeding::SeedConfig {
             bounds: (-12.0, 12.0),
