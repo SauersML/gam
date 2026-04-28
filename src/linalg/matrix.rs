@@ -3829,12 +3829,19 @@ pub fn xt_diag_x_symmetric(
         DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(x.diag_xtw_x(diag)?)),
         DesignMatrix::Sparse(xs) => {
             // Assemble X^T diag(w) X directly into a banded upper-triangle CSC
-            // via SparseHessianAccumulator.  Compared to the previous
-            // triplet-roundtrip path this avoids:
-            //   * O(nnz) heap-allocated Triplet vector,
-            //   * the implicit sort+merge inside try_new_from_triplets,
-            //   * the per-row branch reordering (a,b) → (row,col).
-            // For B-spline / banded patterns the inner add is O(1) arithmetic.
+            // via SparseHessianAccumulator.  Compared to the triplet-roundtrip
+            // this avoids the O(nnz) Triplet vector, the implicit sort+merge,
+            // and the per-row (a,b) canonicalization.
+            //
+            // Row-parallel via rayon: each thread accumulates into a local
+            // values buffer that shares the symbolic pattern (Arc), then we
+            // reduce the per-thread buffers element-wise.  This is the
+            // dominant inner cost for fully-dense bases stored sparsely
+            // (Matern radial / Duchon), where the per-row add_upper inner
+            // loop is `O(nnz_row²)` and previously ran serially.  Reduce
+            // cost is O(nnz · threads) — at p ~ 100 with nnz ~ 5K and 16
+            // threads, ~80K scalar adds, negligible.
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let csr = xs
                 .to_csr_arc()
                 .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
@@ -3842,28 +3849,48 @@ pub fn xt_diag_x_symmetric(
             let row_ptr = sym.row_ptr();
             let col_idx = sym.col_idx();
             let vals = csr.val();
-            let mut acc = SparseHessianAccumulator::from_single_csr(&*csr, xs.ncols());
-            for i in 0..xs.nrows() {
-                let wi = diag[i];
-                if wi == 0.0 {
-                    continue;
-                }
-                let start = row_ptr[i];
-                let end = row_ptr[i + 1];
-                for a_ptr in start..end {
-                    let a = col_idx[a_ptr];
-                    let wxa = wi * vals[a_ptr];
-                    // Diagonal first (a == b → row == col == a).
-                    acc.add_upper(a, a, wxa * vals[a_ptr]);
-                    // Strictly upper-triangle entries.  Within row i the column
-                    // indices in CSR are sorted ascending, so for b_ptr > a_ptr
-                    // we have b > a and the (row, col) = (a, b) ordering is
-                    // already canonical.
-                    for b_ptr in (a_ptr + 1)..end {
-                        let b = col_idx[b_ptr];
-                        acc.add_upper(a, b, wxa * vals[b_ptr]);
+            let acc_template = SparseHessianAccumulator::from_single_csr(&*csr, xs.ncols());
+            let n = xs.nrows();
+            // Row-chunk size: aim for ~16 chunks per thread of work so the
+            // last few stragglers don't tail-out the parallel region. Cap
+            // by a minimum chunk to amortize the empty_clone+merge overhead.
+            let n_threads = rayon::current_num_threads().max(1);
+            let target_chunks = (n_threads * 16).max(n_threads);
+            let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
+            let chunk_starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+            let mut local_accs: Vec<SparseHessianAccumulator> = chunk_starts
+                .into_par_iter()
+                .map(|start| {
+                    let end = (start + chunk_rows).min(n);
+                    let mut local = acc_template.empty_clone();
+                    for i in start..end {
+                        let wi = diag[i];
+                        if wi == 0.0 {
+                            continue;
+                        }
+                        let r_start = row_ptr[i];
+                        let r_end = row_ptr[i + 1];
+                        for a_ptr in r_start..r_end {
+                            let a = col_idx[a_ptr];
+                            let wxa = wi * vals[a_ptr];
+                            local.add_upper(a, a, wxa * vals[a_ptr]);
+                            for b_ptr in (a_ptr + 1)..r_end {
+                                let b = col_idx[b_ptr];
+                                local.add_upper(a, b, wxa * vals[b_ptr]);
+                            }
+                        }
                     }
-                }
+                    local
+                })
+                .collect();
+            // Reduce: take the first as the destination and add the rest.
+            let mut acc = if let Some(first) = local_accs.pop() {
+                first
+            } else {
+                acc_template.empty_clone()
+            };
+            for other in local_accs.into_iter() {
+                acc.add_values(&other.values);
             }
             Ok(SymmetricMatrix::Sparse(acc.into_sparse_col_mat()))
         }
