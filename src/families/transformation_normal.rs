@@ -47,7 +47,6 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, get_spatial_aniso_log_scales, get_spatial_length_scale,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
-    sync_aniso_contrasts_from_metadata,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;

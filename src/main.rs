@@ -856,7 +856,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if link_choice.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
-                "Inferred binomial-logit family for response '{}' because all values are binary {{0,1}}. Override with link(type=...).",
+                "Inferred binomial-probit family for response '{}' because all values are binary {{0,1}}. Override with link(type=...).",
                 parsed.response
             ));
         } else {
@@ -8967,7 +8967,7 @@ fn resolve_family(
         FamilyArg::TransformationNormal => LikelihoodFamily::GaussianIdentity,
         FamilyArg::Auto => {
             if is_binary_response(y) {
-                LikelihoodFamily::BinomialLogit
+                LikelihoodFamily::BinomialProbit
             } else {
                 LikelihoodFamily::GaussianIdentity
             }
@@ -10897,6 +10897,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_family_auto_uses_probit_for_binary_response() {
+        let y = array![0.0, 1.0, 1.0, 0.0];
+
+        let family = resolve_family(FamilyArg::Auto, None, y.view()).expect("resolve family");
+
+        assert_eq!(family, LikelihoodFamily::BinomialProbit);
+    }
+
+    #[test]
     fn cli_firth_validation_allows_flexible_logit_base_link() {
         let choice = LinkChoice {
             mode: LinkMode::Flexible,
@@ -10931,7 +10940,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_predict_noise_without_explicit_link_keeps_binomial_logit_base_link() {
+    fn cli_predict_noise_without_explicit_link_uses_binomial_probit_base_link() {
         let td = tempdir().expect("tempdir");
         let train_path = td.path().join("train.csv");
         let model_path = td.path().join("model.json");
@@ -10946,16 +10955,16 @@ mod tests {
         .expect("location-scale fit should succeed");
 
         let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
-        assert_eq!(saved.link.as_deref(), Some("logit"));
+        assert_eq!(saved.link.as_deref(), Some("probit"));
         match &saved.family_state {
             FittedFamily::LocationScale {
                 likelihood,
                 base_link,
             } => {
-                assert_eq!(*likelihood, LikelihoodFamily::BinomialLogit);
+                assert_eq!(*likelihood, LikelihoodFamily::BinomialProbit);
                 assert!(matches!(
                     base_link.as_ref(),
-                    Some(InverseLink::Standard(LinkFunction::Logit))
+                    Some(InverseLink::Standard(LinkFunction::Probit))
                 ));
             }
             other => panic!("expected location-scale family state, got {other:?}"),
