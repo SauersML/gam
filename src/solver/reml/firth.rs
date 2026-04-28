@@ -567,7 +567,7 @@ impl FirthDenseOperator {
         //   ∂/∂β_j [0.5 log|I|]
         //   = 0.5 Σ_i h_i w_i'(η_i) x_{ij},
         // where h_i = [A^{1/2} X I^{-1} Xᵀ A^{1/2}]_{ii}.
-        0.5 * self.x_dense_t.dot(&(&self.w1 * &self.h_diag))
+        0.5 * crate::faer_ndarray::fast_av(&self.x_dense_t, &(&self.w1 * &self.h_diag))
     }
 
     #[inline]
@@ -623,8 +623,10 @@ impl FirthDenseOperator {
 
     #[inline]
     fn left_scaled_xt(&self, scale: &Array1<f64>, mat: &Array2<f64>) -> Array2<f64> {
-        self.x_dense_t
-            .dot(&(mat * &scale.view().insert_axis(Axis(1))))
+        fast_ab(
+            &self.x_dense_t,
+            &(mat * &scale.view().insert_axis(Axis(1))),
+        )
     }
 
     #[inline]
@@ -657,7 +659,7 @@ impl FirthDenseOperator {
         //       - B_uᵀ P (B V) - Bᵀ P (B_u V) - Bᵀ P_u (B V) ].
         // This avoids dense p×p materialization and is used by sparse exact
         // trace contractions through tr(H^{-1} ·).
-        let etav = self.x_dense.dot(rhs);
+        let etav = fast_ab(&self.x_dense, rhs);
         let qv = &etav * &self.w1.view().insert_axis(Axis(1));
         let m_qv = RemlState::apply_hadamard_gram_to_matrix(
             &self.z_reduced,
@@ -756,10 +758,11 @@ impl FirthDenseOperator {
             + &(&self.w3 * &(&v.deta * &u.dh))
             + &(&self.w2 * &d2h);
 
-        let eta_rhs = self.x_dense.dot(rhs);
-        let diag_term = self
-            .x_dense_t
-            .dot(&(&eta_rhs * &c_uv.view().insert_axis(Axis(1))));
+        let eta_rhs = fast_ab(&self.x_dense, rhs);
+        let diag_term = fast_ab(
+            &self.x_dense_t,
+            &(&eta_rhs * &c_uv.view().insert_axis(Axis(1))),
+        );
 
         let b_uvvec = &self.w3 * &deta_uv;
         let b_uv_base = &self.x_dense * &b_uvvec.view().insert_axis(Axis(1));
@@ -929,17 +932,17 @@ impl FirthDenseOperator {
         // Phi_beta,tau is unchanged by the -0.5 log|S_r| term because S_r does
         // not depend on beta. Only Phi_tau gets the explicit basis-drift
         // subtraction.
-        let deta_partial = x_tau.dot(beta);
+        let deta_partial = crate::faer_ndarray::fast_av(x_tau, beta);
         let x_tau_reduced = self.reduce_explicit_design(x_tau);
         let (dot_i_partial, dot_h_partial) =
             self.dot_i_and_h_from_reduced(&x_tau_reduced, &deta_partial);
         let dot_s_partial =
             fast_atb(&x_tau_reduced, &self.x_reduced) + fast_atb(&self.x_reduced, &x_tau_reduced);
 
-        let first = 0.5 * x_tau.t().dot(&(&self.w1 * &self.h_diag));
+        let first = 0.5 * crate::faer_ndarray::fast_atv(x_tau, &(&self.w1 * &self.h_diag));
         let secondvec =
             &(&(&self.w2 * &deta_partial) * &self.h_diag) + &(&self.w1 * &dot_h_partial);
-        let second = 0.5 * self.x_dense.t().dot(&secondvec);
+        let second = 0.5 * crate::faer_ndarray::fast_atv(&self.x_dense, &secondvec);
         let gphi_tau = first + second;
         let phi_tau_partial = 0.5 * RemlState::trace_product(&self.k_reduced, &dot_i_partial)
             - 0.5 * Self::trace_diag_product(&self.x_metric_reduced_inv_diag, &dot_s_partial);
@@ -996,8 +999,9 @@ impl FirthDenseOperator {
         }
         let tau_bundle = self.exact_tau_kernel(x_tau, beta, true);
         let tau_kernel = tau_bundle.tau_kernel?;
-        let firth_direction = self.direction_from_deta(self.x_dense.dot(beta_direction));
-        let x_tau_v = x_tau.dot(beta_direction);
+        let firth_direction =
+            self.direction_from_deta(crate::faer_ndarray::fast_av(&self.x_dense, beta_direction));
+        let x_tau_v = crate::faer_ndarray::fast_av(x_tau, beta_direction);
         let kernel = self.d_beta_hphi_tau_partial_prepare_from_partials(
             &tau_kernel,
             &tau_kernel.deta_partial,
@@ -1092,8 +1096,8 @@ impl FirthDenseOperator {
         //     ].
         // This routine evaluates that form in reduced coordinates without forming
         // dense 3rd-order tensors explicitly.
-        let etav = self.x_dense.dot(rhs);
-        let etav_tau = x_tau.dot(rhs);
+        let etav = fast_ab(&self.x_dense, rhs);
+        let etav_tau = fast_ab(x_tau, rhs);
         let qv = &etav * &self.w1.view().insert_axis(Axis(1));
         let qv_tau = &etav * &kernel.dotw1.view().insert_axis(Axis(1))
             + &etav_tau * &self.w1.view().insert_axis(Axis(1));
@@ -1109,7 +1113,7 @@ impl FirthDenseOperator {
                 * &kernel.dot_h_partial.view().insert_axis(Axis(1))
             - &(&m_qv * &kernel.dotw1.view().insert_axis(Axis(1))
                 + &m_qv_tau * &self.w1.view().insert_axis(Axis(1)));
-        0.5 * (x_tau.t().dot(&rv) + self.x_dense.t().dot(&rv_tau))
+        0.5 * (fast_atb(x_tau, &rv) + fast_atb(&self.x_dense, &rv_tau))
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -2450,8 +2454,8 @@ impl FirthDenseOperator {
         //
         // D_β[v] leaves X, X_τ fixed and acts on r, r_τ:
         //   D_β((H_φ)_τ|_β)[v](V) = 0.5 [X_τᵀ D_β r(V)[v] + Xᵀ D_β r_τ(V)[v]].
-        let etav = self.x_dense.dot(rhs);
-        let etav_tau = x_tau.dot(rhs);
+        let etav = fast_ab(&self.x_dense, rhs);
+        let etav_tau = fast_ab(x_tau, rhs);
         let deta_v = &kernel.deta_v;
         let deta_tau_v = &kernel.deta_tau_v;
         let eta_tau = &kernel.deta_partial;

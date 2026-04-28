@@ -4035,7 +4035,7 @@ fn design_cross_relative_residual(
         let rhs_chunk = rhs
             .try_row_chunk(start..end)
             .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
-        cross += &lhs_chunk.t().dot(&rhs_chunk);
+        cross += &crate::faer_ndarray::fast_atb(&lhs_chunk, &rhs_chunk);
         lhs_sumsq += lhs_chunk.iter().map(|v| v * v).sum::<f64>();
         rhs_sumsq += rhs_chunk.iter().map(|v| v * v).sum::<f64>();
     }
@@ -4467,7 +4467,7 @@ fn design_constraint_cross(
             .try_row_chunk(start..end)
             .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
         let constraint_chunk = constraint_matrix.slice(s![start..end, ..]).to_owned();
-        cross += &design_chunk.t().dot(&constraint_chunk);
+        cross += &crate::faer_ndarray::fast_atb(&design_chunk, &constraint_chunk);
     }
     Ok(cross)
 }
@@ -7187,7 +7187,7 @@ impl SpatialAdaptiveExactFamily {
     }
 
     fn total_eta(&self, beta: &Array1<f64>) -> Array1<f64> {
-        self.design.dot(beta) + self.offset.as_ref()
+        crate::faer_ndarray::fast_av(self.design.as_ref(), beta) + self.offset.as_ref()
     }
 
     fn fixed_quadratic_terms(&self, beta: &Array1<f64>) -> (f64, Array1<f64>) {
@@ -8059,7 +8059,7 @@ impl SpatialAdaptiveExactFamily {
         eval: &SpatialAdaptiveExactEvaluation,
         direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        let d_eta = self.design.dot(direction);
+        let d_eta = crate::faer_ndarray::fast_av(self.design.as_ref(), direction);
         let mut total = xt_diag_x_dense(
             self.design.view(),
             (&eval.obs.neghessian_eta_derivative * &d_eta).view(),

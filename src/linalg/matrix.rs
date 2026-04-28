@@ -60,51 +60,6 @@ pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
     Ok(())
 }
 
-/// Per-fit estimate of inner P-IRLS iterations used in the compute-budget
-/// preflight. Five iterations is an empirical median across well-conditioned
-/// biobank-scale fits and intentionally on the optimistic side: the gate is
-/// meant to reject configurations that would blow the budget even *under*
-/// favorable convergence.
-pub const POLICY_INNER_ITER_ESTIMATE: u64 = 5;
-
-/// Default outer iteration estimate for the compute-budget preflight when
-/// the caller has no better signal. Conservative for second-order outer
-/// optimizers (BFGS / unified Newton); first-order callers may pass a
-/// larger value.
-pub const POLICY_DEFAULT_OUTER_ITER_ESTIMATE: usize = 20;
-
-/// Compute-budget companion to
-/// [`panic_or_error_if_biobank_mode_and_to_dense_called_with_policy`].
-///
-/// The byte gate alone permits configurations that fit in memory but whose
-/// `n·p² × outer_iters × inner_iter_estimate` arithmetic still exceeds the
-/// wall-clock ceiling — these silently hit the eventual timeout with no
-/// useful diagnostic. This preflight estimates the per-fit FLOP count on the
-/// dense materialization path and refuses to proceed past
-/// `policy.max_compute_budget_flops`, redirecting callers to
-/// (a) operator-backed designs and
-/// (b) matrix-free Hessian workspaces (where the family exposes one).
-///
-/// Skip this check when the caller has already routed to a matrix-free
-/// workspace path: the FLOP estimate models dense `n·p²` Hessian assembly
-/// and does not apply when the per-evaluation work is the much cheaper
-/// matrix-free `Hv` apply.
-pub fn panic_or_error_if_biobank_mode_compute_budget_exceeded(
-    _context: &str,
-    _n: usize,
-    _p: usize,
-    _estimated_outer_iters: usize,
-    _policy: &ResourcePolicy,
-) -> Result<(), String> {
-    // Compute estimates are kept as routing hints elsewhere in the planner,
-    // but they MUST NOT be used to reject runs.  The architecture's response
-    // to "expensive dense work" should be to route to matrix-free / operator
-    // Hessian-vector products and operator trust-region — never to refuse the
-    // fit.  Memory-safety checks remain in place separately; this function is
-    // now a no-op kept only for ABI compatibility with existing call sites.
-    Ok(())
-}
-
 fn weighted_crossprod_dense(
     left: &Array2<f64>,
     weights: &Array1<f64>,
@@ -737,13 +692,6 @@ impl DenseDesignMatrix {
                     context,
                     op.nrows(),
                     op.ncols(),
-                    &policy,
-                )?;
-                panic_or_error_if_biobank_mode_compute_budget_exceeded(
-                    context,
-                    op.nrows(),
-                    op.ncols(),
-                    POLICY_DEFAULT_OUTER_ITER_ESTIMATE,
                     &policy,
                 )?;
                 Ok(op.to_dense_arc())
