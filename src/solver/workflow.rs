@@ -1221,11 +1221,17 @@ fn add_workflow_survival_time_derivative_guard_offset(
     {
         return Err("workflow survival derivative-guard offset lengths must match".to_string());
     }
-    for i in 0..n {
-        eta_offset_entry[i] += derivative_guard * (age_entry[i] - anchor_time);
-        eta_offset_exit[i] += derivative_guard * (age_exit[i] - anchor_time);
-        derivative_offset_exit[i] += derivative_guard;
-    }
+    // Parallel per-row update — each component is independent across i.
+    ndarray::Zip::from(&mut *eta_offset_entry)
+        .and(&mut *eta_offset_exit)
+        .and(&mut *derivative_offset_exit)
+        .and(age_entry)
+        .and(age_exit)
+        .par_for_each(|e_entry, e_exit, d_exit, &t_entry, &t_exit| {
+            *e_entry += derivative_guard * (t_entry - anchor_time);
+            *e_exit += derivative_guard * (t_exit - anchor_time);
+            *d_exit += derivative_guard;
+        });
     Ok(())
 }
 
@@ -1657,16 +1663,23 @@ fn materialize_survival<'a>(
     let event_idx = *col_map
         .get(event_col)
         .ok_or_else(|| format!("event column '{event_col}' not found"))?;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.values.nrows();
+    let event = data.values.column(event_idx).to_owned();
+    let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            normalize_survival_time_pair(
+                data.values[[i, entry_idx]],
+                data.values[[i, exit_idx]],
+                i,
+            )
+        })
+        .collect();
+    let pairs = pairs?;
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
-    let event = data.values.column(event_idx).to_owned();
-    for i in 0..n {
-        let (e, x) = normalize_survival_time_pair(
-            data.values[[i, entry_idx]],
-            data.values[[i, exit_idx]],
-            i,
-        )?;
+    for (i, (e, x)) in pairs.into_iter().enumerate() {
         age_entry[i] = e;
         age_exit[i] = x;
     }
