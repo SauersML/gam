@@ -13,7 +13,8 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, SparsePrimaryCoeffJetView,
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
-    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, scale_coeff4,
+    is_sigma_aux_index as shared_is_sigma_aux_index, probit_frailty_scale,
+    probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -2161,21 +2162,7 @@ impl BernoulliMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> bool {
-        let total = derivative_blocks.iter().map(Vec::len).sum::<usize>();
-        if self.gaussian_frailty_sd.is_none() || total == 0 || psi_index != total - 1 {
-            return false;
-        }
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
-        else {
-            return false;
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
-        deriv.penalty_index.is_none()
-            && deriv.x_psi.is_empty()
-            && deriv.s_psi.is_empty()
-            && deriv.s_psi_components.is_none()
-            && deriv.x_psi_psi.is_none()
-            && deriv.s_psi_psi.is_none()
+        shared_is_sigma_aux_index(self.gaussian_frailty_sd, derivative_blocks, psi_index)
     }
 
     fn sigma_scale_jet(
@@ -2986,21 +2973,6 @@ impl BernoulliMarginalSlopeFamily {
                 .assign(&d_beta_flat.slice(s![block_range.clone()]).to_owned());
         }
         Ok(out)
-    }
-
-    fn resolve_psi_location(
-        &self,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-    ) -> Option<(usize, usize)> {
-        let mut cursor = 0usize;
-        for (block_idx, block) in derivative_blocks.iter().enumerate() {
-            if psi_index < cursor + block.len() {
-                return Some((block_idx, psi_index - cursor));
-            }
-            cursor += block.len();
-        }
-        None
     }
 
     fn row_primary_psi_direction_from_map(
@@ -5552,7 +5524,7 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };
@@ -5685,10 +5657,10 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_i, local_i)) = self.resolve_psi_location(derivative_blocks, psi_i) else {
+        let Some((block_i, local_i)) = psi_derivative_location(derivative_blocks, psi_i) else {
             return Ok(None);
         };
-        let Some((block_j, local_j)) = self.resolve_psi_location(derivative_blocks, psi_j) else {
+        let Some((block_j, local_j)) = psi_derivative_location(derivative_blocks, psi_j) else {
             return Ok(None);
         };
         let idx_i = if block_i == 0 { 0 } else { 1 };
@@ -5963,7 +5935,7 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };
@@ -6086,7 +6058,7 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };

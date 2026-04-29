@@ -1,5 +1,6 @@
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
+use crate::custom_family::CustomFamilyBlockPsiDerivative;
 use ndarray::Array1;
 use std::ops::Range;
 
@@ -106,6 +107,41 @@ pub(crate) fn build_denested_partition_cells(
         }
     }
     Ok(cells)
+}
+
+pub(crate) fn psi_derivative_location(
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    psi_index: usize,
+) -> Option<(usize, usize)> {
+    let mut cursor = 0usize;
+    for (block_idx, block) in derivative_blocks.iter().enumerate() {
+        if psi_index < cursor + block.len() {
+            return Some((block_idx, psi_index - cursor));
+        }
+        cursor += block.len();
+    }
+    None
+}
+
+pub(crate) fn is_sigma_aux_index(
+    gaussian_frailty_sd: Option<f64>,
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    psi_index: usize,
+) -> bool {
+    let total = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+    if gaussian_frailty_sd.is_none() || total == 0 || psi_index != total - 1 {
+        return false;
+    }
+    let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index) else {
+        return false;
+    };
+    let deriv = &derivative_blocks[block_idx][local_idx];
+    deriv.penalty_index.is_none()
+        && deriv.x_psi.is_empty()
+        && deriv.s_psi.is_empty()
+        && deriv.s_psi_components.is_none()
+        && deriv.x_psi_psi.is_none()
+        && deriv.s_psi_psi.is_none()
 }
 
 #[derive(Clone, Copy)]

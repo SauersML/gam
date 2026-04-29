@@ -1529,6 +1529,26 @@ impl HyperOperator for CompositeHyperOperator {
         out
     }
 
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            return self.operators[0].trace_projected_factor(factor);
+        }
+
+        let mut trace = 0.0;
+        if let Some(dense) = self.dense.as_ref() {
+            let dense_factor = dense.dot(factor);
+            trace += factor
+                .iter()
+                .zip(dense_factor.iter())
+                .map(|(&f, &bf)| f * bf)
+                .sum::<f64>();
+        }
+        for op in &self.operators {
+            trace += op.trace_projected_factor(factor);
+        }
+        trace
+    }
+
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let mut total = 0.0;
         if let Some(dense) = self.dense.as_ref() {
@@ -5797,6 +5817,14 @@ impl HyperOperator for WeightedHyperOperator {
             .iter()
             .filter(|(weight, _)| *weight != 0.0)
             .map(|(weight, op)| weight * op.bilinear_view(v, u))
+            .sum()
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        self.terms
+            .iter()
+            .filter(|(weight, _)| *weight != 0.0)
+            .map(|(weight, op)| weight * op.trace_projected_factor(factor))
             .sum()
     }
 
