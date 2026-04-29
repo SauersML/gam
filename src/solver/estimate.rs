@@ -4953,19 +4953,23 @@ mod estimate_policy_tests {
             "sas du / d raw epsilon at fixed eta",
         );
         let rhs = x_t.transpose_vector_multiply(&du_by_eps);
-        let mut neg_du_deta = Array1::<f64>::zeros(eta.len());
-        for i in 0..eta.len() {
-            let jets = sas_inverse_link_jetwith_param_partials(
-                eta[i].clamp(-30.0, 30.0),
-                sas_state.epsilon,
-                sas_state.log_delta,
-            );
-            let mu = jets.jet.mu;
-            let d1 = jets.jet.d1;
-            let d2 = jets.jet.d2;
-            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
-            neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
-        }
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let neg_du_deta_vec: Vec<f64> = (0..eta.len())
+            .into_par_iter()
+            .map(|i| {
+                let jets = sas_inverse_link_jetwith_param_partials(
+                    eta[i].clamp(-30.0, 30.0),
+                    sas_state.epsilon,
+                    sas_state.log_delta,
+                );
+                let mu = jets.jet.mu;
+                let d1 = jets.jet.d1;
+                let d2 = jets.jet.d2;
+                let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+                -(aux.a2 * d1 * d1 + aux.a1 * d2)
+            })
+            .collect();
+        let neg_du_deta = Array1::from_vec(neg_du_deta_vec);
         let score_beta_jacobian = {
             let x_dense = x_t.to_dense();
             let diag_v = Array2::from_diag(&neg_du_deta);
