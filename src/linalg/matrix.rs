@@ -663,6 +663,14 @@ impl DenseDesignMatrix {
         }
     }
 
+    pub fn is_materialized_dense(&self) -> bool {
+        matches!(self, Self::Materialized(_))
+    }
+
+    pub fn is_operator_backed(&self) -> bool {
+        matches!(self, Self::Lazy(_))
+    }
+
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Materialized(matrix) => matrix.as_ref().clone(),
@@ -5689,6 +5697,17 @@ impl DesignMatrix {
         }
     }
 
+    pub fn is_materialized_dense(&self) -> bool {
+        matches!(self, Self::Dense(DenseDesignMatrix::Materialized(_)))
+    }
+
+    pub fn is_operator_backed(&self) -> bool {
+        match self {
+            Self::Dense(matrix) => matrix.is_operator_backed(),
+            Self::Sparse(_) => false,
+        }
+    }
+
     /// Zero-copy borrow when `Dense`, materialized conversion when `Sparse`.
     ///
     /// This avoids the unconditional clone that `to_dense()` performs on dense
@@ -5696,14 +5715,13 @@ impl DesignMatrix {
     /// then call `Cow::as_ref()` or `&*cow`.
     pub fn as_dense_cow(&self) -> Cow<'_, Array2<f64>> {
         match self {
-            Self::Dense(matrix) => match matrix.as_dense_ref() {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => Cow::Borrowed(matrix.as_ref()),
+            Self::Dense(DenseDesignMatrix::Lazy(op)) => match op.as_dense_ref() {
                 Some(dense) => Cow::Borrowed(dense),
-                None => Cow::Owned(
-                    matrix
-                        .try_to_dense_arc("DesignMatrix::as_dense_cow")
-                        .unwrap_or_else(|msg| panic!("{msg}"))
-                        .as_ref()
-                        .clone(),
+                None => panic!(
+                    "DesignMatrix::as_dense_cow called on operator-backed design ({}x{}); use row chunks or matrix-vector products",
+                    op.nrows(),
+                    op.ncols()
                 ),
             },
             Self::Sparse(matrix) => Cow::Owned(
