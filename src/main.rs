@@ -10914,7 +10914,7 @@ mod tests {
         assert!(!advice.contains("Shape mismatch detected"));
     }
 
-    fn cindex_uncensored_risk(time: &[f64], score: &[f64]) -> f64 {
+    fn cindex_uncensored(time: &[f64], score: &[f64], higher_score_is_higher_risk: bool) -> f64 {
         let mut concordant = 0.0;
         let mut total = 0.0;
         for i in 0..time.len() {
@@ -10923,11 +10923,13 @@ mod tests {
                     continue;
                 }
                 total += 1.0;
-                let correct = (time[i] < time[j] && score[i] > score[j])
-                    || (time[j] < time[i] && score[j] > score[i]);
-                if correct {
-                    concordant += 1.0;
-                }
+                let (early, late) = if time[i] < time[j] { (i, j) } else { (j, i) };
+                let score_ordered = if higher_score_is_higher_risk {
+                    score[early] > score[late]
+                } else {
+                    score[early] < score[late]
+                };
+                concordant += f64::from(score_ordered);
             }
         }
         if total == 0.0 {
@@ -10937,27 +10939,12 @@ mod tests {
         }
     }
 
+    fn cindex_uncensored_risk(time: &[f64], score: &[f64]) -> f64 {
+        cindex_uncensored(time, score, true)
+    }
+
     fn cindex_uncensored_survival(time: &[f64], score: &[f64]) -> f64 {
-        let mut concordant = 0.0;
-        let mut total = 0.0;
-        for i in 0..time.len() {
-            for j in (i + 1)..time.len() {
-                if (time[i] - time[j]).abs() < 1e-12 {
-                    continue;
-                }
-                total += 1.0;
-                let correct = (time[i] < time[j] && score[i] < score[j])
-                    || (time[j] < time[i] && score[j] < score[i]);
-                if correct {
-                    concordant += 1.0;
-                }
-            }
-        }
-        if total == 0.0 {
-            0.0
-        } else {
-            concordant / total
-        }
+        cindex_uncensored(time, score, false)
     }
 
     #[test]

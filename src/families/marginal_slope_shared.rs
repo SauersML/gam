@@ -1,7 +1,7 @@
 use crate::custom_family::CustomFamilyBlockPsiDerivative;
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
-use ndarray::Array1;
+use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 
 #[inline]
@@ -167,6 +167,46 @@ pub(crate) fn observed_denested_cell_partials(
         dc_dabb: scale_coeff4(dc_dabb, scale),
         dc_dbbb: scale_coeff4(dc_dbbb, scale),
     })
+}
+
+pub(crate) fn add_two_surface_psi_outer(
+    block_i: usize,
+    psi_row_i: &Array1<f64>,
+    block_j: usize,
+    psi_row_j: &Array1<f64>,
+    alpha: f64,
+    marginal_block: usize,
+    logslope_block: usize,
+    h_mm: &mut Array2<f64>,
+    h_gg: &mut Array2<f64>,
+    h_mg: &mut Array2<f64>,
+) {
+    if alpha == 0.0 {
+        return;
+    }
+    let col_i = psi_row_i.view().insert_axis(Axis(1));
+    let row_j = psi_row_j.view().insert_axis(Axis(0));
+
+    if block_i == block_j {
+        let col_j = psi_row_j.view().insert_axis(Axis(1));
+        let row_i = psi_row_i.view().insert_axis(Axis(0));
+        let target = match block_i {
+            b if b == marginal_block => h_mm,
+            b if b == logslope_block => h_gg,
+            _ => return,
+        };
+        ndarray::linalg::general_mat_mul(alpha, &col_i, &row_j, 1.0, target);
+        ndarray::linalg::general_mat_mul(alpha, &col_j, &row_i, 1.0, target);
+    } else {
+        let (marginal_row, logslope_row) = if block_i == marginal_block {
+            (psi_row_i, psi_row_j)
+        } else {
+            (psi_row_j, psi_row_i)
+        };
+        let m_col = marginal_row.view().insert_axis(Axis(1));
+        let g_row = logslope_row.view().insert_axis(Axis(0));
+        ndarray::linalg::general_mat_mul(alpha, &m_col, &g_row, 1.0, h_mg);
+    }
 }
 
 pub(crate) fn psi_derivative_location(
