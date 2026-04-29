@@ -187,6 +187,36 @@ pub struct TransformationNormalFamily {
     /// the prior `RefCell` semantics (single-threaded interior mutability)
     /// while satisfying the trait bound.
     active_set_cache: Arc<Mutex<KroneckerActiveSetCache>>,
+    /// Last row-space transformation quantities for an exact beta vector.
+    ///
+    /// CTN line searches and exact-Newton workspace construction frequently ask
+    /// for likelihood, gradient, and Hessian row factors at the same candidate
+    /// coefficients. This cache keeps the expensive Khatri-Rao forward products
+    /// and reciprocal powers behind a single exact-keyed entry instead of
+    /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
+    row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
+}
+
+#[derive(Clone)]
+struct TransformationNormalRowQuantityCache {
+    beta: Arc<Array1<f64>>,
+    h: Arc<Array1<f64>>,
+    h_prime: Arc<Array1<f64>>,
+    inv_h_prime: Arc<Array1<f64>>,
+    inv_h_prime_sq: Arc<Array1<f64>>,
+    inv_h_prime_cu: Arc<Array1<f64>>,
+    inv_h_prime_qu: Arc<Array1<f64>>,
+}
+
+impl TransformationNormalRowQuantityCache {
+    fn matches_beta(&self, beta: &Array1<f64>) -> bool {
+        self.beta.len() == beta.len()
+            && self
+                .beta
+                .iter()
+                .zip(beta.iter())
+                .all(|(&cached, &candidate)| cached.to_bits() == candidate.to_bits())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +375,7 @@ impl TransformationNormalFamily {
             response_median: resp_median,
             policy,
             active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
+            row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -495,6 +526,7 @@ impl TransformationNormalFamily {
             response_median: resp_median,
             policy,
             active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
+            row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
 
