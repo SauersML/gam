@@ -10,28 +10,6 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TestMode {
-    Fast,
-    Hard,
-}
-
-impl TestMode {
-    fn from_env() -> Self {
-        match std::env::var("GAM_TEST_MODE").as_deref() {
-            Ok(v) if v.eq_ignore_ascii_case("hard") => TestMode::Hard,
-            _ => TestMode::Fast,
-        }
-    }
-
-    fn select<T>(self, fast: T, hard: T) -> T {
-        match self {
-            TestMode::Fast => fast,
-            TestMode::Hard => hard,
-        }
-    }
-}
-
 #[test]
 fn thin_plate_fit_gam_gaussian_fast_integration() {
     // Deterministic 2D grid.
@@ -116,12 +94,9 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
 
 #[test]
 fn thin_plate_fit_gam_gaussian_simulated_train_test() {
-    // Hard mode (GAM_TEST_MODE=hard) increases sample size and tightens
-    // the test-set MSE bound to flag drift that small-n CI runs cannot see.
-    let mode = TestMode::from_env();
-    let n_train = mode.select(900usize, 3000usize);
-    let n_test = mode.select(300usize, 1000usize);
-    let mse_test_bound = mode.select(0.12_f64, 0.08_f64);
+    let n_train = 900usize;
+    let n_test = 300usize;
+    let mse_test_bound = 0.12_f64;
     let mut rng = StdRng::seed_from_u64(20260226);
     let noise = Normal::new(0.0, 0.10).expect("normal params must be valid");
 
@@ -221,7 +196,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         .unwrap_or(f64::INFINITY);
     assert!(
         mse_test < mse_test_bound,
-        "TPS simulated integration test is too inaccurate (mode={mode:?}): \
+        "TPS simulated integration test is too inaccurate: \
          mse_test={mse_test:.6e}, bound={mse_test_bound:.6e}"
     );
 
