@@ -4511,8 +4511,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
             payload.survival_noise_non_intercept_start =
                 Some(survival_noise_transform.non_intercept_start);
-            payload.survival_distribution =
-                Some(fitted_inverse_link.saved_string());
+            payload.survival_distribution = Some(fitted_inverse_link.saved_string());
             payload.training_headers = Some(ds.headers.clone());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
