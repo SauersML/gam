@@ -7561,8 +7561,38 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         }
     };
 
-    let d0 = project_operator(&d0_raw, p);
-    let d1 = project_operator(&d1_raw, p * d);
+    let d0 = {
+        let kernel_cols = d0_raw.ncols();
+        let total_cols = kernel_cols + poly_cols;
+        let mut padded = Array2::<f64>::zeros((p, total_cols));
+        padded.slice_mut(s![.., 0..kernel_cols]).assign(&d0_raw);
+        if poly_cols > 0 {
+            let poly_values = polynomial_block_from_order(centers, nullspace_order);
+            padded
+                .slice_mut(s![.., kernel_cols..])
+                .assign(&poly_values);
+        }
+        if let Some(z) = identifiability_transform {
+            fast_ab(&padded, z)
+        } else {
+            padded
+        }
+    };
+    let d1 = {
+        let kernel_cols = d1_raw.ncols();
+        let total_cols = kernel_cols + poly_cols;
+        let mut padded = Array2::<f64>::zeros((p * d, total_cols));
+        padded.slice_mut(s![.., 0..kernel_cols]).assign(&d1_raw);
+        if poly_cols > 0 {
+            let poly_grad = polynomial_gradient_operator_block(centers, nullspace_order);
+            padded.slice_mut(s![.., kernel_cols..]).assign(&poly_grad);
+        }
+        if let Some(z) = identifiability_transform {
+            fast_ab(&padded, z)
+        } else {
+            padded
+        }
+    };
     let d2 = {
         let kernel_cols = d2_raw.ncols();
         let total_cols = kernel_cols + poly_cols;
@@ -8374,12 +8404,16 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     }
     let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
-    if poly_cols > 1 {
-        for k in 0..p_colloc {
+    if poly_cols > 0 {
+        let mut poly_grad = polynomial_gradient_operator_block(centers, nullspace_order);
+        for (k, &scale_k) in row_scales.iter().enumerate() {
             for axis in 0..dim {
-                d1[[k * dim + axis, kernel_cols + 1 + axis]] = row_scales[k];
+                poly_grad
+                    .row_mut(k * dim + axis)
+                    .mapv_inplace(|v| scale_k * v);
             }
         }
+        d1.slice_mut(s![.., kernel_cols..]).assign(&poly_grad);
     }
     let mut d2 = Array2::<f64>::zeros((p_colloc * dim * dim, total_cols));
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
@@ -11268,15 +11302,10 @@ fn build_duchon_operator_penalty_psi_derivatives(
         .assign(&d2_raw_psi_psi);
     if poly_cols > 0 {
         d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
+        let poly_grad = polynomial_gradient_operator_block(centers, effective_nullspace_order);
+        d1.slice_mut(s![.., kernel_cols..]).assign(&poly_grad);
         let poly_hessian = polynomial_hessian_operator_block(centers, effective_nullspace_order);
         d2.slice_mut(s![.., kernel_cols..]).assign(&poly_hessian);
-        if poly_cols > 1 {
-            for k in 0..p {
-                for axis in 0..d {
-                    d1[[k * d + axis, kernel_cols + 1 + axis]] = 1.0;
-                }
-            }
-        }
     }
 
     let project = |mat: Array2<f64>| {
@@ -13980,6 +14009,50 @@ fn polynomial_hessian_operator_block(
         )),
         DuchonNullspaceOrder::Degree(degree) => monomial_hessian_operator_block(points, degree),
     }
+}
+
+/// Polynomial-monomial gradient operator block: (n·d, num_monomials) matrix
+/// whose row (k·d + axis) holds ∂_axis(monomial) evaluated at points[k]. For
+/// `Zero` (constants only) every gradient is zero. For `Linear` only the
+/// {x_1, …, x_d} columns get a unit gradient at the corresponding axis.
+/// For `Degree(p)` with p ≥ 2 the higher-order monomials need a real
+/// gradient — without it `tension = D_1^T D_1` leaves quadratic and higher
+/// polynomial-null-space coefficients unpenalised, allowing them to grow
+/// without bound on near-noiseless data.
+fn polynomial_gradient_operator_block(
+    points: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Array2<f64> {
+    let n = points.nrows();
+    let d = points.ncols();
+    let exponents: Vec<Vec<usize>> = match order {
+        DuchonNullspaceOrder::Zero => monomial_exponents(d, 0),
+        DuchonNullspaceOrder::Linear => monomial_exponents(d, 1),
+        DuchonNullspaceOrder::Degree(degree) => monomial_exponents(d, degree),
+    };
+    let mut block = Array2::<f64>::zeros((n * d, exponents.len()));
+    if d == 0 {
+        return block;
+    }
+    for (col, alpha) in exponents.iter().enumerate() {
+        for row in 0..n {
+            for axis in 0..d {
+                let exponent = alpha[axis];
+                if exponent == 0 {
+                    continue;
+                }
+                let mut value = exponent as f64;
+                for other in 0..d {
+                    let e = if other == axis { exponent - 1 } else { alpha[other] };
+                    if e != 0 {
+                        value *= points[[row, other]].powi(e as i32);
+                    }
+                }
+                block[[row * d + axis, col]] = value;
+            }
+        }
+    }
+    block
 }
 
 #[inline(always)]
