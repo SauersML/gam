@@ -21,7 +21,7 @@ use crate::faer_ndarray::{
     fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
 };
 use crate::families::scale_design::{
-    apply_scale_deviation_transform, build_scale_deviation_transform,
+    build_scale_deviation_operator, build_scale_deviation_transform_design,
 };
 use crate::families::sigma_link::{
     LOGB_SIGMA_FLOOR, SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar,
@@ -1207,25 +1207,10 @@ fn gaussian_location_scalewarm_start(
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
 
-fn prepared_scale_design(
-    primary_design: &Array2<f64>,
-    noise_design: &Array2<f64>,
-    weights: &Array1<f64>,
-    non_intercept_start: usize,
-) -> Result<Array2<f64>, String> {
-    let transform = build_scale_deviation_transform(
-        primary_design,
-        noise_design,
-        weights,
-        non_intercept_start,
-    )?;
-    apply_scale_deviation_transform(primary_design, noise_design, &transform)
-}
-
 fn prepared_gaussian_log_sigma_design(
-    mu_design: &Array2<f64>,
-    log_sigma_design: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
+    mu_design: &DesignMatrix,
+    log_sigma_design: &DesignMatrix,
+) -> Result<DesignMatrix, String> {
     if mu_design.nrows() != log_sigma_design.nrows() {
         return Err(format!(
             "gaussian log-sigma design row mismatch: mean rows={}, log_sigma rows={}",
@@ -1250,17 +1235,21 @@ fn identified_binomial_log_sigma_design(
     threshold_design: &TermCollectionDesign,
     log_sigma_design: &TermCollectionDesign,
     weights: &Array1<f64>,
-) -> Result<Array2<f64>, String> {
-    let threshold_dense = threshold_design.design.as_dense_cow();
-    let log_sigma_dense = log_sigma_design.design.as_dense_cow();
-    prepared_scale_design(
-        &threshold_dense,
-        &log_sigma_dense,
+) -> Result<DesignMatrix, String> {
+    let non_intercept_start = log_sigma_design
+        .intercept_range
+        .end
+        .min(log_sigma_design.design.ncols());
+    let transform = build_scale_deviation_transform_design(
+        &threshold_design.design,
+        &log_sigma_design.design,
         weights,
-        log_sigma_design
-            .intercept_range
-            .end
-            .min(log_sigma_design.design.ncols()),
+        non_intercept_start,
+    )?;
+    build_scale_deviation_operator(
+        threshold_design.design.clone(),
+        log_sigma_design.design.clone(),
+        &transform,
     )
 }
 
@@ -1490,9 +1479,15 @@ fn validate_term_collection_design(
     design: &TermCollectionDesign,
 ) -> Result<(), String> {
     let p = design.design.ncols();
-    let design_dense = design.design.as_dense_cow();
-    validate_all_finite_estimation(&format!("{label}.design"), design_dense.iter().copied())
-        .map_err(|e| e.to_string())?;
+    let n = design.design.nrows();
+    for rows in exact_design_row_chunks(n, p) {
+        let chunk = design
+            .design
+            .try_row_chunk(rows)
+            .map_err(|e| format!("{label}.design row chunk materialization failed: {e}"))?;
+        validate_all_finite_estimation(&format!("{label}.design"), chunk.iter().copied())
+            .map_err(|e| e.to_string())?;
+    }
     if design.nullspace_dims.len() != design.penalties.len() {
         return Err(format!(
             "{label}.nullspace_dims length mismatch: got {}, expected {}",
@@ -2117,13 +2112,9 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
         };
-        let mean_dense = mean_design.design.as_dense_cow();
-        let noise_dense = noise_design.design.as_dense_cow();
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)?,
-            )),
+            design: prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
             offset: self.noise_offset.clone(),
             penalties: noise_design.penalties_as_penalty_matrix(),
             nullspace_dims: noise_design.nullspace_dims.clone(),
@@ -2155,17 +2146,14 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let mean_dense = mean_design.design.as_dense_cow();
-        let noise_dense = noise_design.design.as_dense_cow();
-        let preparednoise_design = prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)
-            .expect("prepared Gaussian log-sigma design should match block construction");
+        let preparednoise_design =
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("prepared Gaussian log-sigma design should match block construction");
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                preparednoise_design,
-            ))),
+            log_sigma_design: Some(preparednoise_design),
             policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
@@ -2270,13 +2258,9 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
         };
-        let mean_dense = mean_design.design.as_dense_cow();
-        let noise_dense = noise_design.design.as_dense_cow();
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)?,
-            )),
+            design: prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
             offset: self.noise_offset.clone(),
             penalties: noise_design.penalties_as_penalty_matrix(),
             nullspace_dims: vec![],
@@ -2340,17 +2324,14 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let mean_dense = mean_design.design.as_dense_cow();
-        let noise_dense = noise_design.design.as_dense_cow();
-        let preparednoise_design = prepared_gaussian_log_sigma_design(&mean_dense, &noise_dense)
-            .expect("prepared Gaussian log-sigma design should match wiggle block construction");
+        let preparednoise_design =
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("prepared Gaussian log-sigma design should match wiggle block construction");
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                preparednoise_design,
-            ))),
+            log_sigma_design: Some(preparednoise_design),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -2469,9 +2450,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                identifiednoise_design,
-            )),
+            design: identifiednoise_design,
             offset: self.noise_offset.clone(),
             penalties: log_sigma_penalty_matrices,
             nullspace_dims: vec![],
@@ -2511,9 +2490,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                identifiednoise_design,
-            ))),
+            log_sigma_design: Some(identifiednoise_design),
             policy: crate::resource::ResourcePolicy::default_library(),
         }
     }
@@ -2634,9 +2611,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                identifiednoise_design,
-            )),
+            design: identifiednoise_design,
             offset: self.noise_offset.clone(),
             penalties: log_sigma_penalty_matrices,
             nullspace_dims: vec![],
@@ -2708,9 +2683,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                identifiednoise_design,
-            ))),
+            log_sigma_design: Some(identifiednoise_design),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -6853,50 +6826,6 @@ impl RowCoeffOperator {
         pair_coeffs: Vec<RowCoeffPair>,
         nrows: usize,
     ) -> Self {
-        let mut block_offsets = Vec::with_capacity(block_widths.len());
-        let mut acc = 0;
-        for w in &block_widths {
-            block_offsets.push(acc);
-            acc += *w;
-        }
-        let scratch = RowCoeffScratch {
-            u: (0..channels.len())
-                .map(|_| Array1::<f64>::zeros(nrows))
-                .collect(),
-            r: (0..channels.len())
-                .map(|_| Array1::<f64>::zeros(nrows))
-                .collect(),
-        };
-        Self {
-            channels,
-            block_offsets,
-            block_widths,
-            dim: acc,
-            pair_coeffs,
-            nrows,
-            scratch: std::sync::Mutex::new(scratch),
-        }
-    }
-
-    /// One-line constructor for the standard (channels, pair-coeffs)
-    /// recipe used by every GAMLSS LS workspace: pass the block widths,
-    /// the channel list as `(block_id, design)` tuples, and the pair
-    /// list as `(a, b, coeff)` tuples. The constructor builds the
-    /// scratch buffers once.
-    fn from_directions(
-        block_widths: Vec<usize>,
-        channels: Vec<(usize, Arc<Array2<f64>>)>,
-        pairs: Vec<(usize, usize, Array1<f64>)>,
-        nrows: usize,
-    ) -> Self {
-        let channels: Vec<RowCoeffChannel> = channels
-            .into_iter()
-            .map(|(block, design)| RowCoeffChannel { block, design })
-            .collect();
-        let pair_coeffs: Vec<RowCoeffPair> = pairs
-            .into_iter()
-            .map(|(a, b, coeff)| RowCoeffPair { a, b, coeff })
-            .collect();
         let mut block_offsets = Vec::with_capacity(block_widths.len());
         let mut acc = 0;
         for w in &block_widths {
@@ -21164,13 +21093,8 @@ mod tests {
             false,
         )
         .expect("wiggle block");
-        let wiggle_design_dense = match wiggle_block.design.as_dense_ref() {
-            Some(d) => d.clone(),
-            None => panic!("wiggle design must be dense for this test fixture"),
-        };
-        let pw = wiggle_design_dense.ncols();
+        let pw = wiggle_block.design.ncols();
         let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).sin());
-        let eta_w = wiggle_design_dense.dot(&beta_w);
         let y = Array1::from_shape_fn(n, |i| 0.5 + 0.1 * (i as f64).cos());
         let weights = Array1::from_elem(n, 1.0);
         let mu_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xmu.clone()));
@@ -21186,6 +21110,15 @@ mod tests {
             policy: crate::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
+        // The wiggle block has dynamic geometry (q0-dependent basis): the
+        // model is q = q0 + B(q0)·β_w, so η_w must be evaluated at the
+        // *current* q0, not at the spec's static seed grid. Mirror what
+        // `refresh_all_block_etas` does at fit time so the fixture state
+        // satisfies the analytical formula's invariant.
+        let xw_at_q0 = family
+            .wiggle_design(eta_mu.view())
+            .expect("wiggle basis at q0");
+        let eta_w = xw_at_q0.dot(&beta_w);
         let states = vec![
             ParameterBlockState {
                 beta: beta_mu,
@@ -21229,7 +21162,7 @@ mod tests {
                 initial_beta: None,
             },
         ];
-        (family, states, specs, xmu, xls, wiggle_design_dense)
+        (family, states, specs, xmu, xls, xw_at_q0)
     }
 
     #[test]
@@ -21278,7 +21211,7 @@ mod tests {
 
     #[test]
     fn gaussian_location_scale_wiggle_workspace_dh_operator_finite_difference() {
-        let (family, states, specs, xmu, xls, xw) = gls_wiggle_workspace_fixture();
+        let (family, states, specs, xmu, xls, _xw) = gls_wiggle_workspace_fixture();
         let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
         let u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
         let v = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin());
@@ -21298,7 +21231,15 @@ mod tests {
             }
             out[0].eta = xmu.dot(&out[0].beta);
             out[1].eta = xls.dot(&out[1].beta);
-            out[2].eta = xw.dot(&out[2].beta);
+            // Wiggle geometry is dynamic: η_w = B(q0)·β_w at the perturbed
+            // q0, matching what `refresh_all_block_etas` would produce. Using
+            // a static spec design here would compute the FD of a different
+            // model than the analytical dH formula assumes (which carries
+            // dq/dq0 = 1 + B'(q0)·β_w through the chain rule).
+            let xw_perturbed = family
+                .wiggle_design(out[0].eta.view())
+                .expect("wiggle basis at perturbed q0");
+            out[2].eta = xw_perturbed.dot(&out[2].beta);
             out
         };
         let states_plus = perturb(1.0);
@@ -21381,7 +21322,7 @@ mod tests {
 
     #[test]
     fn gaussian_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
-        let (family, states, specs, xmu, xls, xw) = gls_wiggle_workspace_fixture();
+        let (family, states, specs, xmu, xls, _xw) = gls_wiggle_workspace_fixture();
         let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
         let u_fd = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
         let u = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin());
@@ -21402,7 +21343,11 @@ mod tests {
             }
             out[0].eta = xmu.dot(&out[0].beta);
             out[1].eta = xls.dot(&out[1].beta);
-            out[2].eta = xw.dot(&out[2].beta);
+            // Wiggle geometry is dynamic: η_w = B(q0)·β_w at the perturbed q0.
+            let xw_perturbed = family
+                .wiggle_design(out[0].eta.view())
+                .expect("wiggle basis at perturbed q0");
+            out[2].eta = xw_perturbed.dot(&out[2].beta);
             out
         };
         let states_plus = perturb(1.0);
@@ -21727,15 +21672,18 @@ mod tests {
     #[test]
     fn gaussian_log_sigma_design_keeps_shared_mean_basis() {
         let shared = array![[1.0, -1.5], [1.0, -0.25], [1.0, 0.75], [1.0, 2.0],];
-        let prepared = prepared_gaussian_log_sigma_design(&shared, &shared)
+        let shared_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(shared.clone()));
+        let prepared = prepared_gaussian_log_sigma_design(&shared_design, &shared_design)
             .expect("gaussian log-sigma design should accept shared columns");
+        let prepared_dense = prepared.as_dense_cow();
 
         for i in 0..shared.nrows() {
             for j in 0..shared.ncols() {
                 assert!(
-                    (prepared[[i, j]] - shared[[i, j]]).abs() < 1e-12,
+                    (prepared_dense[[i, j]] - shared[[i, j]]).abs() < 1e-12,
                     "gaussian log-sigma design should preserve shared basis at ({i}, {j}): got {}, expected {}",
-                    prepared[[i, j]],
+                    prepared_dense[[i, j]],
                     shared[[i, j]]
                 );
             }
