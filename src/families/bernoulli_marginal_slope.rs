@@ -10,6 +10,9 @@ use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
 use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::marginal_slope_shared::{
+    add_scaled_coeff4, eval_coeff4_at, probit_frailty_scale, scale_coeff4,
+};
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
@@ -1828,38 +1831,7 @@ fn accumulate_flex_block_grad_hess(
     *hess += &src_h;
 }
 
-#[inline]
-fn add_scaled_coeff4(target: &mut [f64; 4], source: &[f64; 4], scale: f64) {
-    for j in 0..4 {
-        target[j] += scale * source[j];
-    }
-}
-
-#[inline]
-fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
-    [
-        source[0] * scale,
-        source[1] * scale,
-        source[2] * scale,
-        source[3] * scale,
-    ]
-}
-
-fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
-    let sigma = gaussian_frailty_sd.unwrap_or(0.0);
-    if sigma <= 0.0 {
-        1.0
-    } else {
-        crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()).s
-    }
-}
-
 use crate::families::jet_partitions::MultiDirJet;
-
-#[inline]
-fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
-    ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
-}
 
 struct ObservedDenestedCellPartials {
     coeff: [f64; 4],
