@@ -1340,17 +1340,26 @@ fn run_fit_bernoulli_marginal_slope(
 
     progress.set_stage("fit", "building marginal/logslope term specifications");
     progress.start_secondary_workflow("Marginal/Slope Terms", 2);
+    // Marginal-slope formulas may reference the literal placeholder `z` to
+    // bind to the auxiliary score supplied via --z-column. Alias `z` in the
+    // column map to the actual `z_column` index so build_termspec can resolve
+    // it without the user having to rename their data column.
+    let mut col_map_with_z_alias: HashMap<String, usize> = col_map.clone();
+    if let Some(idx) = col_map.get(z_column.as_str()).copied() {
+        col_map_with_z_alias.entry("z".to_string()).or_insert(idx);
+    }
+    let col_map_for_termspec: &HashMap<String, usize> = &col_map_with_z_alias;
     let mut marginalspec = build_termspec(
         &parsed.terms,
         ds,
-        col_map,
+        col_map_for_termspec,
         inference_notes,
         &gam::resource::ResourcePolicy::default_library(),
     )?;
     let mut logslopespec = build_termspec(
         &parsed_logslope.terms,
         ds,
-        col_map,
+        col_map_for_termspec,
         inference_notes,
         &gam::resource::ResourcePolicy::default_library(),
     )?;
