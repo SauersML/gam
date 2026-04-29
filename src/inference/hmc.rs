@@ -2295,7 +2295,7 @@ impl NutsResult {
     /// Returns 0.0 if samples is empty to avoid divide-by-zero.
     pub fn posterior_mean_of<F>(&self, f: F) -> f64
     where
-        F: Fn(ArrayView1<f64>) -> f64,
+        F: Fn(ArrayView1<f64>) -> f64 + Sync,
     {
         let n = self.samples.nrows();
         if n == 0 {
