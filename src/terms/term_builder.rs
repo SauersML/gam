@@ -32,10 +32,43 @@ use crate::smooth::{
 // ---------------------------------------------------------------------------
 
 pub fn resolve_col(col_map: &HashMap<String, usize>, name: &str) -> Result<usize, String> {
-    col_map
-        .get(name)
-        .copied()
-        .ok_or_else(|| format!("column '{name}' not found in data"))
+    col_map.get(name).copied().ok_or_else(|| {
+        // Suggest similar names. Cheap Damerau-style match: case-insensitive
+        // substring or shared-prefix length.
+        let target_lower = name.to_lowercase();
+        let mut similar: Vec<&str> = col_map
+            .keys()
+            .filter(|k| {
+                let k_lower = k.to_lowercase();
+                k_lower.contains(&target_lower)
+                    || target_lower.contains(&k_lower)
+                    || shared_prefix(&k_lower, &target_lower) >= 3
+            })
+            .map(String::as_str)
+            .collect();
+        similar.sort_unstable();
+        let mut all: Vec<&str> = col_map.keys().map(String::as_str).collect();
+        all.sort_unstable();
+        if similar.is_empty() {
+            format!(
+                "column '{name}' not found in data. Available columns: [{}]",
+                all.join(", ")
+            )
+        } else {
+            format!(
+                "column '{name}' not found in data. Did you mean one of [{}]? Full list: [{}]",
+                similar.join(", "),
+                all.join(", ")
+            )
+        }
+    })
+}
+
+fn shared_prefix(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(ca, cb)| ca == cb)
+        .count()
 }
 
 // ---------------------------------------------------------------------------
