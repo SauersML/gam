@@ -4879,8 +4879,7 @@ impl CharbonnierScalarBlockState {
     }
 
     fn log_epsilon_betagradient_coeff(&self) -> Array1<f64> {
-        let epsilon = self.epsilon;
-        let eps2 = epsilon * epsilon;
+        let eps2 = self.epsilon * self.epsilon;
         Array1::from_iter(
             self.signal
                 .iter()
@@ -4991,8 +4990,7 @@ impl CharbonnierScalarBlockState {
     }
 
     fn log_epsilon_beta_mixed_second_coeff(&self) -> Array1<f64> {
-        let epsilon = self.epsilon;
-        let eps2 = epsilon * epsilon;
+        let eps2 = self.epsilon * self.epsilon;
         Array1::from_iter(
             self.signal
                 .iter()
@@ -5022,7 +5020,9 @@ impl CharbonnierScalarBlockState {
                 .iter()
                 .zip(direction_signal.iter())
                 .zip(self.radius.iter())
-                .map(|((t, q), r)| (-6.0 * eps2 * t / r.powi(5) + 15.0 * eps4 * t / r.powi(7)) * q),
+                .map(|((t, q), r)| {
+                    (-6.0 * eps2 * t / r.powi(5) + 15.0 * eps4 * t / r.powi(7)) * q
+                }),
         )
     }
 }
@@ -5094,8 +5094,7 @@ impl CharbonnierGroupedBlockState {
 
     fn log_epsilon_betagradient_blocks(&self) -> Array2<f64> {
         let mut out = self.signal_blocks.clone();
-        let epsilon = self.epsilon;
-        let eps2 = epsilon * epsilon;
+        let eps2 = self.epsilon * self.epsilon;
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
             let scale = -eps2 / self.radius[k].powi(3);
             row.mapv_inplace(|v| v * scale);
@@ -5137,8 +5136,7 @@ impl CharbonnierGroupedBlockState {
         //   = (1 / r_k) I - (1 / r_k^3) v_k v_k^T,
         //   r_k = sqrt(||v_k||^2 + eps_g^2).
         //
-        // The current adaptive path does not use that exact Hessian directly.
-        // Instead it uses the grouped MM majorizer
+        // The legacy surrogate path uses the grouped MM majorizer
         //
         //   psi(g; eps_g) <= 0.5 * w(g0) * g^2 + const(g0),
         //   w(g0) = 1 / sqrt(g0^2 + eps_g^2),
@@ -5148,11 +5146,9 @@ impl CharbonnierGroupedBlockState {
         //   K_g = D1^T (diag(w_g) \kron I_d) D1.
         //
         // These weights are therefore the grouped analogue of the scalar MM
-        // majorizer above: they are not the exact slope Hessian, they are the
-        // tangent quadratic envelope used by the existing iterative reweighting
-        // scheme. The exact grouped Hessian and third-derivative maps live in the
-        // neighboring methods and are what the direct pseudo-Laplace solver will
-        // ultimately use.
+        // majorizer above. The exact grouped Hessian and third-derivative maps
+        // live in the neighboring methods and drive the direct pseudo-Laplace
+        // solver.
         let weight = self
             .radius
             .mapv(|r| (1.0 / r).clamp(weight_floor, weight_ceiling));
@@ -5217,7 +5213,6 @@ impl CharbonnierGroupedBlockState {
             let r3 = self.radius[k].powi(3);
             let r5 = self.radius[k].powi(5);
             let mut block = Array2::<f64>::eye(dim);
-            let norm2 = self.norm[k] * self.norm[k];
             let eps2 = self.epsilon * self.epsilon;
             block.mapv_inplace(|v| -eps2 * v / r3);
             for i in 0..dim {
@@ -5232,8 +5227,7 @@ impl CharbonnierGroupedBlockState {
 
     fn log_epsilon_beta_mixed_second_blocks(&self) -> Array2<f64> {
         let mut out = self.signal_blocks.clone();
-        let epsilon = self.epsilon;
-        let eps2 = epsilon * epsilon;
+        let eps2 = self.epsilon * self.epsilon;
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
             let norm2 = self.norm[k] * self.norm[k];
             let scale = eps2 * (eps2 - 2.0 * norm2) / self.radius[k].powi(5);
@@ -5244,9 +5238,7 @@ impl CharbonnierGroupedBlockState {
 
     fn log_epsilon_betahessian_second_blocks(&self) -> Vec<Array2<f64>> {
         let mut out = Vec::with_capacity(self.signal_blocks.nrows());
-        let epsilon = self.epsilon;
-        let eps2 = epsilon * epsilon;
-        let eps4 = eps2 * eps2;
+        let eps2 = self.epsilon * self.epsilon;
         for (k, row) in self.signal_blocks.rows().into_iter().enumerate() {
             let dim = row.len();
             let norm2 = self.norm[k] * self.norm[k];
@@ -5256,8 +5248,9 @@ impl CharbonnierGroupedBlockState {
             block.mapv_inplace(|v| eps2 * (eps2 - 2.0 * norm2) * v / r5);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] +=
-                        3.0 * eps2 * (2.0 * norm2 - 3.0 * eps2) * row[i] * row[j] / r7;
+                    block[[i, j]] += 3.0 * eps2 * (2.0 * norm2 - 3.0 * eps2) * row[i]
+                        * row[j]
+                        / r7;
                 }
             }
             out.push(block);
@@ -5270,8 +5263,7 @@ impl CharbonnierGroupedBlockState {
         direction_blocks: &Array2<f64>,
     ) -> Vec<Array2<f64>> {
         let mut out = Vec::with_capacity(self.signal_blocks.nrows());
-        let epsilon = self.epsilon;
-        let eps2 = epsilon * epsilon;
+        let eps2 = self.epsilon * self.epsilon;
         for (k, (v, q)) in self
             .signal_blocks
             .rows()
