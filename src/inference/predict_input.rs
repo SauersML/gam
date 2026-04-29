@@ -5,6 +5,7 @@ use ndarray::Array1;
 use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use crate::estimate::{BlockRole, PredictInput};
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
+use crate::families::transformation_normal::TRANSFORMATION_TAIL_GUARD_FRACTION;
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
@@ -270,7 +271,7 @@ pub fn build_predict_input_for_model(
                     derivative_grid.push(left + frac * width);
                 }
             }
-            let grid_guard = 0.25 * grid_span;
+            let grid_guard = TRANSFORMATION_TAIL_GUARD_FRACTION * grid_span;
             derivative_grid.push(min_grid - grid_guard);
             derivative_grid.push(max_grid + grid_guard);
             derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

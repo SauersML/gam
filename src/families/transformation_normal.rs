@@ -96,7 +96,14 @@ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
 const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
 const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
-const TRANSFORMATION_TAIL_GUARD_FRACTION: f64 = 0.25;
+/// Fraction of the response span by which fit-time monotonicity grids and
+/// predict-time monotonicity scans extend past the observed `[min, max]`.
+/// Re-exported because the predict-time guard in `inference::predict_input`
+/// must match the fit-time barrier grid; if these ever diverge, the fit
+/// would enforce monotonicity on one grid while predict would scan a
+/// different one and silently report violations on points the fit never
+/// constrained.
+pub const TRANSFORMATION_TAIL_GUARD_FRACTION: f64 = 0.25;
 const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
 const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
 
