@@ -1,4 +1,4 @@
-use crate::probability::normal_cdf;
+use crate::probability::{binomial_coefficient_f64, normal_cdf};
 
 // De-nested cubic transport kernel.
 //
@@ -216,22 +216,6 @@ pub fn interval_probe_point(left: f64, right: f64) -> Result<f64, String> {
             "interval probe requires finite bounds or full infinities, got [{left}, {right}]"
         ))
     }
-}
-
-#[inline]
-fn binomial_coefficient(n: usize, k: usize) -> f64 {
-    if k > n {
-        return 0.0;
-    }
-    if k == 0 || k == n {
-        return 1.0;
-    }
-    let k_eff = k.min(n - k);
-    let mut out = 1.0;
-    for j in 0..k_eff {
-        out *= (n - j) as f64 / (j + 1) as f64;
-    }
-    out
 }
 
 #[inline]
@@ -772,16 +756,11 @@ pub fn denested_cell_coefficient_partials(
 }
 
 #[inline]
-pub fn denested_cell_second_partials(
-    score_span: LocalSpanCubic,
+fn link_cubic_second_partials(
     link_span: LocalSpanCubic,
     a: f64,
     b: f64,
 ) -> ([f64; 4], [f64; 4], [f64; 4]) {
-    let score_left = score_span.left;
-    if !score_left.is_finite() {
-        return ([f64::NAN; 4], [f64::NAN; 4], [f64::NAN; 4]);
-    }
     let shift = a - link_span.left;
     let alpha2 = link_span.c2;
     let alpha3 = link_span.c3;
@@ -807,7 +786,21 @@ pub fn denested_cell_second_partials(
 }
 
 #[inline]
-pub fn denested_cell_third_partials(
+pub fn denested_cell_second_partials(
+    score_span: LocalSpanCubic,
+    link_span: LocalSpanCubic,
+    a: f64,
+    b: f64,
+) -> ([f64; 4], [f64; 4], [f64; 4]) {
+    let score_left = score_span.left;
+    if !score_left.is_finite() {
+        return ([f64::NAN; 4], [f64::NAN; 4], [f64::NAN; 4]);
+    }
+    link_cubic_second_partials(link_span, a, b)
+}
+
+#[inline]
+fn link_cubic_third_partials(
     link_span: LocalSpanCubic,
 ) -> ([f64; 4], [f64; 4], [f64; 4], [f64; 4]) {
     let alpha3 = link_span.c3;
@@ -817,6 +810,13 @@ pub fn denested_cell_third_partials(
         [0.0, 0.0, 6.0 * alpha3, 0.0],
         [0.0, 0.0, 0.0, 6.0 * alpha3],
     )
+}
+
+#[inline]
+pub fn denested_cell_third_partials(
+    link_span: LocalSpanCubic,
+) -> ([f64; 4], [f64; 4], [f64; 4], [f64; 4]) {
+    link_cubic_third_partials(link_span)
 }
 
 #[inline]
@@ -862,41 +862,14 @@ pub fn link_basis_cell_second_partials(
     a: f64,
     b: f64,
 ) -> ([f64; 4], [f64; 4], [f64; 4]) {
-    let shift = a - link_basis_span.left;
-    let alpha2 = link_basis_span.c2;
-    let alpha3 = link_basis_span.c3;
-    let dc_daa = [
-        2.0 * alpha2 + 6.0 * alpha3 * shift,
-        6.0 * alpha3 * b,
-        0.0,
-        0.0,
-    ];
-    let dc_dab = [
-        0.0,
-        2.0 * alpha2 + 6.0 * alpha3 * shift,
-        6.0 * alpha3 * b,
-        0.0,
-    ];
-    let dc_dbb = [
-        0.0,
-        0.0,
-        2.0 * (alpha2 + 3.0 * alpha3 * shift),
-        6.0 * alpha3 * b,
-    ];
-    (dc_daa, dc_dab, dc_dbb)
+    link_cubic_second_partials(link_basis_span, a, b)
 }
 
 #[inline]
 pub fn link_basis_cell_third_partials(
     link_basis_span: LocalSpanCubic,
 ) -> ([f64; 4], [f64; 4], [f64; 4], [f64; 4]) {
-    let alpha3 = link_basis_span.c3;
-    (
-        [6.0 * alpha3, 0.0, 0.0, 0.0],
-        [0.0, 6.0 * alpha3, 0.0, 0.0],
-        [0.0, 0.0, 6.0 * alpha3, 0.0],
-        [0.0, 0.0, 0.0, 6.0 * alpha3],
-    )
+    link_cubic_third_partials(link_basis_span)
 }
 
 pub fn build_denested_partition_cells<FS, FL>(
@@ -1227,8 +1200,10 @@ pub fn affine_anchor_moment_vector(
     for n in 0..=max_degree {
         let mut acc = 0.0;
         for k in 0..=n {
-            acc +=
-                binomial_coefficient(n, k) * mu.powi((n - k) as i32) * s.powi(-(k as i32)) * t[k];
+            acc += binomial_coefficient_f64(n, k)
+                * mu.powi((n - k) as i32)
+                * s.powi(-(k as i32))
+                * t[k];
         }
         out[n] = anchor * acc;
     }

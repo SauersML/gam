@@ -2894,15 +2894,21 @@ impl SurvivalPredictor {
         eta_threshold: &Array1<f64>,
         eta_log_sigma: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let n = eta_threshold.len();
-        let mut survival_prob = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let (q0, _) = survival_q0_and_inverse_sigma(eta_threshold[i], eta_log_sigma[i]);
-            let (survival, _) =
-                inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q0)?;
-            survival_prob[i] = survival;
-        }
-        Ok(survival_prob)
+        let survival_prob: Result<Vec<f64>, EstimationError> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let (q0, _) =
+                    survival_q0_and_inverse_sigma(eta_threshold[i], eta_log_sigma[i]);
+                let (survival, _) = inverse_link_survival_tail_value_and_failure_density(
+                    &self.inverse_link,
+                    q0,
+                )?;
+                Ok(survival)
+            })
+            .collect();
+        Ok(Array1::from_vec(survival_prob?))
     }
 }
 
