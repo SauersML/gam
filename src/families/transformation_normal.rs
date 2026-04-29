@@ -1577,6 +1577,7 @@ impl CustomFamily for TransformationNormalFamily {
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
+        let psi_first_start = std::time::Instant::now();
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta)?;
@@ -1655,6 +1656,13 @@ impl CustomFamily for TransformationNormalFamily {
             sym_val + &sym_deriv + &cubic_term
         };
 
+        log::info!(
+            "[STAGE] CTN psi first-order terms axis={} psi_index={} elapsed={:.3}s",
+            deriv.implicit_axis,
+            psi_index,
+            psi_first_start.elapsed().as_secs_f64(),
+        );
+
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi: obj_psi,
             score_psi,
@@ -1674,6 +1682,7 @@ impl CustomFamily for TransformationNormalFamily {
         if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
             return Ok(None);
         }
+        let psi_pair_start = std::time::Instant::now();
         let deriv_i = &psi_derivs[0][psi_i];
         let deriv_j = &psi_derivs[0][psi_j];
         let beta = &block_states[0].beta;
@@ -1932,6 +1941,15 @@ impl CustomFamily for TransformationNormalFamily {
                 hessian_psi_psi.iter().all(|v| v.is_finite()),
             ));
         }
+
+        log::info!(
+            "[STAGE] CTN psi-psi pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
+            psi_i,
+            psi_j,
+            deriv_i.implicit_axis,
+            deriv_j.implicit_axis,
+            psi_pair_start.elapsed().as_secs_f64(),
+        );
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
