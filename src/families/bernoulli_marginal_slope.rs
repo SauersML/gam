@@ -1854,27 +1854,7 @@ fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     }
 }
 
-fn jet_subset_partitions(mask: usize) -> Vec<Vec<usize>> {
-    if mask == 0 {
-        return vec![Vec::new()];
-    }
-    let first = mask & mask.wrapping_neg();
-    let rest = mask ^ first;
-    let mut out = Vec::new();
-    let mut subset = rest;
-    loop {
-        let block = first | subset;
-        for mut remainder in jet_subset_partitions(rest ^ subset) {
-            remainder.push(block);
-            out.push(remainder);
-        }
-        if subset == 0 {
-            break;
-        }
-        subset = (subset - 1) & rest;
-    }
-    out
-}
+use crate::families::jet_partitions::partitions as jet_subset_partitions;
 
 #[derive(Clone)]
 struct MultiDirJet {
@@ -1963,7 +1943,7 @@ impl MultiDirJet {
                     continue;
                 }
                 let mut prod = 1.0;
-                for block in partition {
+                for &block in partition {
                     prod *= self.coeffs[block];
                 }
                 total += derivs[order] * prod;
