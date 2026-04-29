@@ -1031,7 +1031,7 @@ impl PirlsWorkspace {
         }
         Zip::from(&mut self.sqrtw)
             .and(weights)
-            .for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
+            .par_for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
@@ -2265,6 +2265,7 @@ impl DenseOuterState {
         n: usize,
         p: usize,
     ) {
+        let xtwx_start = std::time::Instant::now();
         debug_assert_eq!(self.xtwx_dense.dim(), (p, p));
         self.xtwx_dense.fill(0.0);
         if n == 0 || p == 0 {
@@ -2286,6 +2287,13 @@ impl DenseOuterState {
 
         if !parallelize {
             accumulate_outer_upper(&mut self.xtwx_dense, x_t, weights, 0..n);
+            log::info!(
+                "[STAGE] PIRLS dense XᵀWX assembly (serial) n={} p={} flops~{} elapsed={:.3}s",
+                n,
+                p,
+                (n as u64).saturating_mul((p as u64).saturating_mul(p as u64)),
+                xtwx_start.elapsed().as_secs_f64(),
+            );
             return;
         }
 
@@ -2313,6 +2321,14 @@ impl DenseOuterState {
         for buf in &self.thread_buffers {
             self.xtwx_dense += buf;
         }
+        log::info!(
+            "[STAGE] PIRLS dense XᵀWX assembly (parallel, threads={}) n={} p={} flops~{} elapsed={:.3}s",
+            rayon::current_num_threads(),
+            n,
+            p,
+            (n as u64).saturating_mul((p as u64).saturating_mul(p as u64)),
+            xtwx_start.elapsed().as_secs_f64(),
+        );
     }
 }
 
