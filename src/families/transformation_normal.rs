@@ -119,8 +119,12 @@ pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 /// different one and silently report violations on points the fit never
 /// constrained.
 pub const TRANSFORMATION_TAIL_GUARD_FRACTION: f64 = 0.25;
-const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
-const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
+/// Maximum number of response quantiles drawn into the monotonicity grid.
+/// Shared between fit and predict so the grid construction is identical.
+pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
+/// Number of equal subdivisions inserted between consecutive grid points
+/// (knots + quantiles). Shared between fit and predict.
+pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
 
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
