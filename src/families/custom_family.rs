@@ -5204,14 +5204,11 @@ struct BlockUpdateResult {
 
 #[inline]
 fn floor_positiveworking_weights(working_weights: &Array1<f64>, minweight: f64) -> Array1<f64> {
-    let n = working_weights.len();
-    let mut out = Array1::<f64>::uninit(n);
-    for i in 0..n {
-        let wi = working_weights[i];
-        out[i].write(if wi <= 0.0 { 0.0 } else { wi.max(minweight) });
-    }
-    // SAFETY: all elements written in the loop above.
-    unsafe { out.assume_init() }
+    let mut out = Array1::<f64>::zeros(working_weights.len());
+    ndarray::Zip::from(&mut out)
+        .and(working_weights)
+        .par_for_each(|o, &wi| *o = if wi <= 0.0 { 0.0 } else { wi.max(minweight) });
+    out
 }
 
 trait ParameterBlockUpdater {
@@ -9549,13 +9546,15 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 d_eta += &fast_av(&dx, &beta_flat);
                                 let mut wx = x_dense.clone();
                                 let mut wdx = dx.clone();
-                                for i in 0..n {
-                                    let wi = wwork[i];
-                                    if wi != 1.0 {
-                                        wx.row_mut(i).mapv_inplace(|v| v * wi);
-                                        wdx.row_mut(i).mapv_inplace(|v| v * wi);
-                                    }
-                                }
+                                ndarray::Zip::from(wx.rows_mut())
+                                    .and(wdx.rows_mut())
+                                    .and(wwork.view())
+                                    .par_for_each(|mut wxr, mut wdxr, &wi| {
+                                        if wi != 1.0 {
+                                            wxr.mapv_inplace(|v| v * wi);
+                                            wdxr.mapv_inplace(|v| v * wi);
+                                        }
+                                    });
                                 correction_mat += &fast_atb(&dx, &wx);
                                 correction_mat += &fast_atb(&x_dense, &wdx);
                             }
@@ -9580,9 +9579,9 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                             ));
                         }
                         let mut scaled_x = x_dense.clone();
-                        for i in 0..n {
-                            scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
-                        }
+                        ndarray::Zip::from(scaled_x.rows_mut())
+                            .and(&dw)
+                            .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
                         correction_mat += &fast_atb(&x_dense, &scaled_x);
 
                         Ok(Some(DriftDerivResult::Dense(correction_mat)))
@@ -10921,13 +10920,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         d_eta += &dx.dot(&beta_flat);
                         let mut wx = x_dense.clone();
                         let mut wdx = dx.clone();
-                        for i in 0..n {
-                            let wi = wwork[i];
-                            if wi != 1.0 {
-                                wx.row_mut(i).mapv_inplace(|v| v * wi);
-                                wdx.row_mut(i).mapv_inplace(|v| v * wi);
-                            }
-                        }
+                        ndarray::Zip::from(wx.rows_mut())
+                            .and(wdx.rows_mut())
+                            .and(wwork.view())
+                            .par_for_each(|mut wxr, mut wdxr, &wi| {
+                                if wi != 1.0 {
+                                    wxr.mapv_inplace(|v| v * wi);
+                                    wdxr.mapv_inplace(|v| v * wi);
+                                }
+                            });
                         correction_mat += &dx.t().dot(&wx);
                         correction_mat += &x_dense.t().dot(&wdx);
                     }
@@ -10952,9 +10953,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     ));
                 }
                 let mut scaled_x = x_dense.clone();
-                for i in 0..n {
-                    scaled_x.row_mut(i).mapv_inplace(|v| v * dw[i]);
-                }
+                ndarray::Zip::from(scaled_x.rows_mut())
+                    .and(&dw)
+                    .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
                 correction_mat += &x_dense.t().dot(&scaled_x);
 
                 Ok(Some(DriftDerivResult::Dense(correction_mat)))

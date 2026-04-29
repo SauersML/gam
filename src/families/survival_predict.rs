@@ -97,7 +97,14 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         col_map,
         "resolved_termspec",
     )?;
-    let cov_design = build_term_collection_design(data, &termspec)
+    // Clip continuous covariate columns to the training range before basis
+    // assembly so polyharmonic / spline terms cannot extrapolate outside the
+    // data envelope. Times (`entry_col` / `exit_col`) are read from the
+    // original `data` view further down so the hazard integration stays on
+    // the raw timestamps the user supplied.
+    let cov_clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let cov_input = cov_clipped.as_ref().map_or(data, |arr| arr.view());
+    let cov_design = build_term_collection_design(cov_input, &termspec)
         .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
 
     let n = data.nrows();
@@ -467,7 +474,9 @@ fn build_marginal_slope_predict_context(
         col_map,
         "resolved_termspec_logslope",
     )?;
-    let logslope_design = build_term_collection_design(data, &logslopespec)
+    let logslope_clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let logslope_input = logslope_clipped.as_ref().map_or(data, |arr| arr.view());
+    let logslope_design = build_term_collection_design(logslope_input, &logslopespec)
         .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
@@ -818,8 +827,11 @@ fn predict_survival_location_scale_batch(
         col_map,
         "resolved_termspec_noise",
     )?;
-    let raw_sigma_design = crate::terms::smooth::build_term_collection_design(data, &log_sigmaspec)
-        .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
+    let sigma_clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let sigma_input = sigma_clipped.as_ref().map_or(data, |arr| arr.view());
+    let raw_sigma_design =
+        crate::terms::smooth::build_term_collection_design(sigma_input, &log_sigmaspec)
+            .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
     let survival_noise_transform = scale_transform_from_payload(
         &model.survival_noise_projection,
         &model.survival_noise_center,
@@ -883,17 +895,15 @@ fn predict_survival_location_scale_batch(
     // hazard/cumulative-hazard derived from the same scalar.
     let mut survival = Array2::<f64>::zeros((n, 1));
     let mut cumulative_hazard = Array2::<f64>::zeros((n, 1));
-    let mut hazard = Array2::<f64>::zeros((n, 1));
-    for i in 0..n {
-        let surv = pred.survival_prob[i].clamp(1e-300, 1.0);
-        survival[[i, 0]] = surv;
-        cumulative_hazard[[i, 0]] = -surv.ln();
-        // Hazard requires an exit-time derivative path that the CLI's
-        // run_predict_survival branch derives from the inverse-link slope; the
-        // library batch path doesn't compute it. Surface NaN so consumers can
-        // detect missing hazard rather than acting on a zero placeholder.
-        hazard[[i, 0]] = f64::NAN;
-    }
+    let hazard = Array2::<f64>::from_elem((n, 1), f64::NAN);
+    ndarray::Zip::from(survival.column_mut(0))
+        .and(cumulative_hazard.column_mut(0))
+        .and(&pred.survival_prob)
+        .par_for_each(|s, ch, &raw| {
+            let surv = raw.clamp(1e-300, 1.0);
+            *s = surv;
+            *ch = -surv.ln();
+        });
 
     Ok(SurvivalPredictResult {
         times: age_exit.to_vec(),

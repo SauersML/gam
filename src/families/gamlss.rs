@@ -29,7 +29,6 @@ use crate::families::sigma_link::{
     logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
-use crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle;
 use crate::linalg::utils::solve_spd_pcg_with_info;
 use crate::matrix::SymmetricMatrix;
 use crate::matrix::{DenseDesignOperator, DesignMatrix};
@@ -925,7 +924,10 @@ fn validate_binomial_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    require_binomial_inverse_link_supports_joint_wiggle(&spec.link_kind, context)?;
+    crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
+        &spec.link_kind,
+        context,
+    )?;
     if spec.wiggle_degree < 2 {
         return Err(format!(
             "{context}: wiggle_degree must be >= 2, got {}",
@@ -1693,7 +1695,7 @@ fn fit_binomial_mean_wiggle(
     ) {
         return Err("fit_binomial_mean_wiggle does not support identity link".to_string());
     }
-    require_binomial_inverse_link_supports_joint_wiggle(
+    crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
         &spec.link_kind,
         "fit_binomial_mean_wiggle",
     )?;
