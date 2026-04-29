@@ -3284,15 +3284,18 @@ fn eta_standard_errors_from_backend(
 fn delta_method_mean_se(
     eta: &Array1<f64>,
     eta_se: &Array1<f64>,
-    strategy: &dyn FamilyStrategy,
+    strategy: &(dyn FamilyStrategy + Sync),
 ) -> Result<Array1<f64>, EstimationError> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = eta.len();
-    let mut mean_se = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let jet = strategy.inverse_link_jet(eta[i])?;
-        mean_se[i] = (jet.d1 * eta_se[i]).abs();
-    }
-    Ok(mean_se)
+    let values: Result<Vec<f64>, EstimationError> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let jet = strategy.inverse_link_jet(eta[i])?;
+            Ok((jet.d1 * eta_se[i]).abs())
+        })
+        .collect();
+    Ok(Array1::from_vec(values?))
 }
 
 pub struct PredictPosteriorMeanResult {
