@@ -4,6 +4,7 @@ use crate::faer_ndarray::{
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix};
+use crate::probability::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
 use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
@@ -5807,30 +5808,6 @@ pub fn build_thin_plate_basiswithworkspace(
         },
         kronecker_factored: None,
     })
-}
-
-#[inline(always)]
-fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
-    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
-}
-
-#[inline(always)]
-fn stable_nonnegative_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
-    if coeffs.is_empty() || !x.is_finite() {
-        return 0.0;
-    }
-    if x <= 600.0 {
-        return horner_polynomial(x, coeffs) * (-x).exp();
-    }
-
-    let inv_x = x.recip();
-    let mut tail = 0.0;
-    for &c in coeffs {
-        tail = tail * inv_x + c;
-    }
-    let degree = (coeffs.len() - 1) as f64;
-    let scale = (degree * x.ln() - x).exp();
-    scale * tail
 }
 
 #[inline(always)]
