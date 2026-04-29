@@ -1346,7 +1346,8 @@ impl CustomFamily for TransformationNormalFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
         let mut xtx_deriv = self
@@ -1371,7 +1372,8 @@ impl CustomFamily for TransformationNormalFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         let d_h_prime_u = self.x_deriv_kron.forward_mul(d_beta_u_flat);
         let d_h_prime_v = self.x_deriv_kron.forward_mul(d_beta_v_flat);
 
@@ -1411,7 +1413,6 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta);
         let h = row.h.as_ref();
-        let h_prime = row.h_prime.as_ref();
         let n = h.len();
         let inv_h_prime = row.inv_h_prime.as_ref();
         let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
@@ -1510,7 +1511,6 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta);
         let h = row.h.as_ref();
-        let h_prime = row.h_prime.as_ref();
         let n = h.len();
         let inv_h_prime = row.inv_h_prime.as_ref();
         let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
@@ -1606,7 +1606,7 @@ impl CustomFamily for TransformationNormalFamily {
             let term8 = self
                 .x_deriv_kron
                 .transpose_mul(&(&v_ij_deriv * &weighted_inv_h_prime_sq));
-            let cubic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_cu * self.weights.as_ref())
+            let cubic = ((&v_i_deriv * &v_j_deriv) * inv_h_prime_cu * self.weights.as_ref())
                 .mapv(|v| -2.0 * v);
             let term9 = self.x_deriv_kron.transpose_mul(&cubic);
             term1 + &term2 + &term3 + &term4 + &term5 + &term6 + &term7 + &term8 + &term9
@@ -1690,7 +1690,7 @@ impl CustomFamily for TransformationNormalFamily {
             )?;
 
             let cubic_i =
-                ((&v_j_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+                ((&v_j_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
                 resp_deriv,
                 &cov_i,
@@ -1709,7 +1709,7 @@ impl CustomFamily for TransformationNormalFamily {
             )?;
 
             let cubic_j =
-                ((&v_i_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+                ((&v_i_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
                 resp_deriv,
                 &cov_j,
@@ -1728,10 +1728,10 @@ impl CustomFamily for TransformationNormalFamily {
             )?;
 
             let cubic_second =
-                ((&v_ij_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+                ((&v_ij_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &self.x_deriv_kron.weighted_gram(&cubic_second, policy);
 
-            let quartic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_qu * self.weights.as_ref())
+            let quartic = ((&v_i_deriv * &v_j_deriv) * inv_h_prime_qu * self.weights.as_ref())
                 .mapv(|v| 6.0 * v);
             hess += &self.x_deriv_kron.weighted_gram(&quartic, policy);
             0.5 * (&hess + &hess.t())
@@ -1829,7 +1829,8 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         // Build weighted_inv_hp_sq[i] = w_i / h'_i² and validate h' > 0 in one
         // pass — the inner solver's barrier line search keeps h' strictly
         // positive on observed rows, so the only way to land here with a
