@@ -216,6 +216,15 @@ pub struct FittedModelPayload {
     pub survival_distribution: Option<String>,
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
+    /// Per-column (min, max) of the training input matrix, parallel to
+    /// `training_headers`. At predict time, inputs are axis-clipped to these
+    /// ranges so that out-of-distribution points evaluate at the nearest face
+    /// of the training bounding box rather than extrapolating polynomial
+    /// trends from polyharmonic / spline bases beyond the data envelope. Old
+    /// model JSONs that pre-date this field load with `None`, in which case
+    /// the predict path falls through unchanged (no clipping).
+    #[serde(default)]
+    pub training_feature_ranges: Option<Vec<(f64, f64)>>,
     /// Transformation-normal: B-spline knots for the response-direction basis.
     #[serde(default)]
     pub transformation_response_knots: Option<Vec<f64>>,
@@ -319,6 +328,7 @@ impl FittedModelPayload {
             survival_noise_non_intercept_start: None,
             survival_distribution: None,
             training_headers: None,
+            training_feature_ranges: None,
             transformation_response_knots: None,
             transformation_response_transform: None,
             transformation_response_degree: None,

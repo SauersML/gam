@@ -506,6 +506,19 @@ pub fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     )
 }
 
+pub fn require_inverse_link_supports_joint_wiggle(
+    link: &InverseLink,
+    context: &str,
+) -> Result<(), String> {
+    if inverse_link_supports_joint_wiggle(link) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Option-map helpers (shared by formula parsing and term construction)
 // ---------------------------------------------------------------------------

@@ -29,6 +29,37 @@ impl EncodedDataset {
             .map(|(index, header)| (header.clone(), index))
             .collect()
     }
+
+    /// Per-column finite (min, max) of the training values, parallel to
+    /// `headers`. Columns with no finite values default to (0.0, 0.0) so that
+    /// downstream clipping is a no-op for them. Used to populate
+    /// `training_feature_ranges` so prediction can clip out-of-hull inputs
+    /// to the training bounding box.
+    pub fn feature_ranges(&self) -> Vec<(f64, f64)> {
+        let n_cols = self.headers.len();
+        let mut ranges = Vec::with_capacity(n_cols);
+        for col in 0..n_cols {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for row in 0..self.values.nrows() {
+                let v = self.values[[row, col]];
+                if v.is_finite() {
+                    if v < lo {
+                        lo = v;
+                    }
+                    if v > hi {
+                        hi = v;
+                    }
+                }
+            }
+            if !lo.is_finite() || !hi.is_finite() {
+                ranges.push((0.0, 0.0));
+            } else {
+                ranges.push((lo, hi));
+            }
+        }
+        ranges
+    }
 }
 
 // ---------------------------------------------------------------------------
