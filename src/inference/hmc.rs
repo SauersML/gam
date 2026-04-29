@@ -3544,7 +3544,7 @@ fn directional_cubic_contraction(
             cubic
         }
         None => {
-            let x_dense = design.as_dense_cow();
+            let x_dense = design.to_dense_cow();
             let x_dense = x_dense.as_ref();
             let mut cubic = 0.0_f64;
             for i in 0..x_dense.nrows().min(c_weights.len()) {
@@ -3594,7 +3594,7 @@ fn directional_cubic_gradient(
             grad
         }
         None => {
-            let x_dense = design.as_dense_cow();
+            let x_dense = design.to_dense_cow();
             let x_dense = x_dense.as_ref();
             let n = x_dense.nrows();
             let mut grad = Array1::<f64>::zeros(p);

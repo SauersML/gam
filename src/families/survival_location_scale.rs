@@ -3197,12 +3197,12 @@ fn build_survival_covariate_block_psi_derivatives(
                                     crate::matrix::DenseDesignMatrix::from(base.clone()),
                                 );
                                 let exit_dm = rowwise_kronecker(&base_dm, time_basis_exit);
-                                let exit_cow = exit_dm.as_dense_cow();
+                                let exit_cow = exit_dm.to_dense_cow();
                                 let entry_dm = rowwise_kronecker(&base_dm, time_basis_entry);
-                                let entry_cow = entry_dm.as_dense_cow();
+                                let entry_cow = entry_dm.to_dense_cow();
                                 let deriv_dm =
                                     rowwise_kronecker(&base_dm, time_basis_derivative_exit);
-                                let deriv_cow = deriv_dm.as_dense_cow();
+                                let deriv_cow = deriv_dm.to_dense_cow();
                                 let n = exit_cow.nrows();
                                 let p = exit_cow.ncols();
                                 let mut stacked = Array2::<f64>::zeros((3 * n, p));
@@ -5796,33 +5796,33 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Vec<Array2<f64>>, String> {
         let dynamic = self.build_dynamic_geometry(block_states)?;
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow
             .as_ref()
             .map_or(x_threshold_exit, |c| &**c);
         let x_threshold_deriv_cow = self
             .x_threshold_deriv
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_deriv = x_threshold_deriv_cow.as_ref().map(|c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow
             .as_ref()
             .map_or(x_log_sigma_exit, |c| &**c);
         let x_log_sigma_deriv_cow = self
             .x_log_sigma_deriv
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_deriv = x_log_sigma_deriv_cow.as_ref().map(|c| &**c);
 
         // Time-time block (mirrors line 5846-5849 in the joint assembly).
@@ -5923,33 +5923,33 @@ impl SurvivalLocationScaleFamily {
         let p_total = *offsets
             .last()
             .ok_or_else(|| "missing joint block offsets".to_string())?;
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow
             .as_ref()
             .map_or(x_threshold_exit, |c| &**c);
         let x_threshold_deriv_cow = self
             .x_threshold_deriv
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_deriv = x_threshold_deriv_cow.as_ref().map(|c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow
             .as_ref()
             .map_or(x_log_sigma_exit, |c| &**c);
         let x_log_sigma_deriv_cow = self
             .x_log_sigma_deriv
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_deriv = x_log_sigma_deriv_cow.as_ref().map(|c| &**c);
         let mut joint = Array2::<f64>::zeros((p_total, p_total));
         let add_cross = |acc: &mut Array2<f64>,
@@ -6318,21 +6318,21 @@ impl SurvivalLocationScaleFamily {
         let d_d1_q_exit = &q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1;
         let d_d2_q_exit = &q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1;
 
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow.as_ref().map(|c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow.as_ref().map(|c| &**c);
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::as_dense_cow);
+        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
         let xw = xw_cow.as_ref().map(|c| &**c);
         let mut joint = Array2::<f64>::zeros((p_total, p_total));
 
@@ -6656,25 +6656,25 @@ impl SurvivalLocationScaleFamily {
             .last()
             .ok_or_else(|| "missing joint block offsets".to_string())?;
 
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow
             .as_ref()
             .map_or(x_threshold_exit, |c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow
             .as_ref()
             .map_or(x_log_sigma_exit, |c| &**c);
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::as_dense_cow);
+        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_i_map = first_psi_linear_map(
             dir_i.x_t_exit_action.as_ref(),
@@ -7439,25 +7439,25 @@ impl SurvivalLocationScaleFamily {
             }
         };
 
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow
             .as_ref()
             .map_or(x_threshold_exit, |c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow
             .as_ref()
             .map_or(x_log_sigma_exit, |c| &**c);
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::as_dense_cow);
+        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_map = first_psi_linear_map(
             dir.x_t_exit_action.as_ref(),
@@ -8013,25 +8013,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             .last()
             .ok_or_else(|| "missing joint block offsets".to_string())?;
 
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow
             .as_ref()
             .map_or(x_threshold_exit, |c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow
             .as_ref()
             .map_or(x_log_sigma_exit, |c| &**c);
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::as_dense_cow);
+        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
         let xw = xw_cow.as_ref().map(|c| &**c);
         let x_t_exit_map = first_psi_linear_map(
             dir.x_t_exit_action.as_ref(),
@@ -8730,21 +8730,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d_d1_q_exit_v = &q.d2_q1 * &delta_q_exit_v + &q.h_time_h1 * &delta_h1_v;
         let d_d2_q_exit_v = &q.d3_q1 * &delta_q_exit_v + &q.d_h_h1 * &delta_h1_v;
 
-        let x_threshold_exit_cow = self.x_threshold.as_dense_cow();
+        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
         let x_threshold_entry_cow = self
             .x_threshold_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_threshold_entry = x_threshold_entry_cow.as_ref().map(|c| &**c);
-        let x_log_sigma_exit_cow = self.x_log_sigma.as_dense_cow();
+        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
         let x_log_sigma_exit = &*x_log_sigma_exit_cow;
         let x_log_sigma_entry_cow = self
             .x_log_sigma_entry
             .as_ref()
-            .map(DesignMatrix::as_dense_cow);
+            .map(DesignMatrix::to_dense_cow);
         let x_log_sigma_entry = x_log_sigma_entry_cow.as_ref().map(|c| &**c);
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::as_dense_cow);
+        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
         let xw = xw_cow.as_ref().map(|c| &**c);
         let mut joint = Array2::<f64>::zeros((p_total, p_total));
 
