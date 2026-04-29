@@ -62,13 +62,16 @@ pub trait OuterHessianOperator: Send + Sync {
     /// Apply the operator to all `m` columns of `factor`, returning a
     /// `dim × m` matrix whose `j`th column is `H · factor[:, j]`.
     ///
-    /// The default implementation calls [`matvec`](Self::matvec) once per
-    /// column. Implementors override when batching is cheaper (cached
-    /// factorizations, parallel matvecs over independent columns, BLAS-3
-    /// kernels). All [`materialize_dense`](Self::materialize_dense) callers
-    /// route through this method, so an override automatically accelerates
-    /// any work-model-approved materialization path used by the planner.
+    /// The default implementation runs the per-column matvecs in parallel
+    /// over rayon — each matvec is independent and the K×K basis-probe used
+    /// by [`materialize_dense`](Self::materialize_dense) issues exactly `dim`
+    /// such calls.  Implementors override when batching is cheaper (cached
+    /// factorizations, BLAS-3 kernels). All
+    /// [`materialize_dense`](Self::materialize_dense) callers route through
+    /// this method, so an override automatically accelerates any
+    /// work-model-approved materialization path used by the planner.
     fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let dim = self.dim();
         if factor.nrows() != dim {
             return Err(format!(
@@ -78,17 +81,24 @@ pub trait OuterHessianOperator: Send + Sync {
             ));
         }
         let m = factor.ncols();
+        let cols: Result<Vec<Array1<f64>>, String> = (0..m)
+            .into_par_iter()
+            .map(|j| {
+                let col = factor.column(j).to_owned();
+                let hv = self.matvec(&col)?;
+                if hv.len() != dim {
+                    return Err(format!(
+                        "outer Hessian operator matvec length mismatch: got {}, expected {}",
+                        hv.len(),
+                        dim
+                    ));
+                }
+                Ok(hv)
+            })
+            .collect();
+        let cols = cols?;
         let mut out = Array2::<f64>::zeros((dim, m));
-        for j in 0..m {
-            let col = factor.column(j).to_owned();
-            let hv = self.matvec(&col)?;
-            if hv.len() != dim {
-                return Err(format!(
-                    "outer Hessian operator matvec length mismatch: got {}, expected {}",
-                    hv.len(),
-                    dim
-                ));
-            }
+        for (j, hv) in cols.into_iter().enumerate() {
             out.column_mut(j).assign(&hv);
         }
         Ok(out)

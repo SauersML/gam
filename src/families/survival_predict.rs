@@ -39,6 +39,23 @@ use crate::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
 };
 
+fn design_to_dense_by_chunks(design: &DesignMatrix, context: &str) -> Result<Array2<f64>, String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * std::mem::size_of::<f64>()))
+        .max(1)
+        .min(n.max(1));
+    let mut out = Array2::<f64>::zeros((n, p));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
+        out.slice_mut(s![start..end, ..]).assign(&chunk);
+    }
+    Ok(out)
+}
+
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
@@ -835,7 +852,10 @@ fn predict_survival_location_scale_batch(
         model.survival_noise_non_intercept_start,
     )?;
 
-    let x_time_exit_dense = time_build.x_exit_time.to_dense();
+    let x_time_exit_dense = design_to_dense_by_chunks(
+        &time_build.x_exit_time,
+        "survival location-scale prediction time-exit design",
+    )?;
     let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
         let mut full = Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
         full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])

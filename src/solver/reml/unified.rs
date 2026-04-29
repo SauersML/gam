@@ -1771,11 +1771,10 @@ impl HyperCoordDrift {
             return d.nrows();
         }
         if let Some(op) = &self.operator {
-            return op.to_dense().nrows();
+            return op.dim();
         }
         if let Some(bl) = &self.block_local {
-            // Can't know total dim from block-local alone; return end as estimate
-            return bl.end;
+            return bl.total_dim;
         }
         0
     }
@@ -11120,6 +11119,7 @@ mod tests {
             local: array![[1.2, 0.2], [0.2, 0.7]],
             start: 1,
             end: 3,
+            total_dim: 3,
         };
         let composite = CompositeHyperOperator {
             dense: Some(array![[0.4, 0.1, 0.0], [0.1, 0.8, -0.2], [0.0, -0.2, 0.6],]),
@@ -11161,6 +11161,7 @@ mod tests {
             local: array![[1.2, 0.2], [0.2, 0.7]],
             start: 1,
             end: 3,
+            total_dim: 3,
         };
         let composite = CompositeHyperOperator {
             dense: Some(array![[0.4, 0.1, 0.0], [0.1, 0.8, -0.2], [0.0, -0.2, 0.6],]),

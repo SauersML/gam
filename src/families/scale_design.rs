@@ -5,8 +5,8 @@ use faer::Unbind;
 use faer::prelude::ReborrowMut;
 use faer::{Conj, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
-use std::sync::Arc;
 use std::ops::Range;
+use std::sync::Arc;
 
 const COLUMN_TOL: f64 = 1e-12;
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -208,7 +208,10 @@ impl LinearOperator for ScaleDeviationOperator {
     }
 
     fn uses_matrix_free_pcg(&self) -> bool {
-        self.primary_design.nrows().saturating_mul(self.rawnoise_design.ncols()) > 1_000_000
+        self.primary_design
+            .nrows()
+            .saturating_mul(self.rawnoise_design.ncols())
+            > 1_000_000
     }
 }
 
@@ -218,11 +221,11 @@ impl DenseDesignOperator for ScaleDeviationOperator {
         rows: Range<usize>,
         mut out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), crate::resource::MatrixMaterializationError> {
-        let chunk = self
-            .row_chunk(rows)
-            .map_err(|_| crate::resource::MatrixMaterializationError::MissingRowChunk {
+        let chunk = self.row_chunk(rows).map_err(|_| {
+            crate::resource::MatrixMaterializationError::MissingRowChunk {
                 context: "ScaleDeviationOperator::row_chunk_into",
-            })?;
+            }
+        })?;
         out.assign(&chunk);
         Ok(())
     }
