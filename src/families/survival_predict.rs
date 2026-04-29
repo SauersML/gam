@@ -15,12 +15,13 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
-    build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
-    build_survival_time_basis, build_survival_timewiggle_derivative_design,
+    add_survival_time_derivative_guard_offset, build_survival_time_basis,
+    build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
-    parse_survival_likelihood_mode, require_structural_survival_time_basis,
-    resolved_survival_time_basis_config_from_build, survival_likelihood_modename,
+    normalize_survival_time_pair, parse_survival_baseline_config,
+    parse_survival_distribution, parse_survival_likelihood_mode,
+    require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
+    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 use crate::families::survival_location_scale::residual_distribution_inverse_link;
 use crate::gamlss::buildwiggle_block_input_from_knots;
@@ -226,11 +227,12 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         // build the predictor's `pred_input` (which we discard) — the actual
         // per-(row, t) offset is rebuilt inside `evaluate_marginal_slope_row`.
         let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-            build_baseline_offsets_by_mode(
+            build_survival_time_offsets_for_likelihood(
                 &age_entry,
                 &age_exit,
                 &baseline_cfg,
                 saved_likelihood_mode,
+                None,
             )?;
         Some(build_marginal_slope_predict_context(
             model,
@@ -274,12 +276,14 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     anchor_row,
                 )?;
             }
-            let (_r_eta_entry, r_eta_exit, r_deriv_exit) = build_baseline_offsets_by_mode(
-                &single_entry,
-                &single_exit,
-                &baseline_cfg,
-                saved_likelihood_mode,
-            )?;
+            let (_r_eta_entry, r_eta_exit, r_deriv_exit) =
+                build_survival_time_offsets_for_likelihood(
+                    &single_entry,
+                    &single_exit,
+                    &baseline_cfg,
+                    saved_likelihood_mode,
+                    None,
+                )?;
 
             let (eta_t, cum_t, haz_t) = match saved_likelihood_mode {
                 SurvivalLikelihoodMode::MarginalSlope => {
@@ -340,11 +344,12 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     anchor_row,
                 )?;
             }
-            let (_, r_eta_exit, r_deriv_exit) = build_baseline_offsets_by_mode(
+            let (_, r_eta_exit, r_deriv_exit) = build_survival_time_offsets_for_likelihood(
                 &single_entry,
                 &single_exit,
                 &baseline_cfg,
                 saved_likelihood_mode,
+                None,
             )?;
             let (eta_t, _, _) = match saved_likelihood_mode {
                 SurvivalLikelihoodMode::MarginalSlope => {
