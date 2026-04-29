@@ -1706,18 +1706,18 @@ impl<'a> RemlState<'a> {
                 let mut c_x_u = x_u.clone();
                 Zip::from(&mut c_x_u)
                     .and(c_array.as_ref())
-                    .for_each(|value, &c| *value *= c);
+                    .par_for_each(|value, &c| *value *= c);
 
                 let mut c_x_tau_u_plus_d_cross = x_tau_u.clone();
                 Zip::from(&mut c_x_tau_u_plus_d_cross)
                     .and(c_array.as_ref())
-                    .for_each(|value, &c| *value *= c);
+                    .par_for_each(|value, &c| *value *= c);
 
                 Zip::from(&mut c_x_tau_u_plus_d_cross)
                     .and(d_array.as_ref())
                     .and(&x_u)
                     .and(x_tau_beta)
-                    .for_each(|value, &d, &xu, &xtb| *value += d * xu * xtb);
+                    .par_for_each(|value, &d, &xu, &xtb| *value += d * xu * xtb);
 
                 let mut dense = firth_op.as_ref().and_then(|op| {
                     op.d_beta_hphi_tau_partial_dense(x_tau, beta_eval.as_ref(), direction)
