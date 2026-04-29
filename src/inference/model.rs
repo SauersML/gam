@@ -416,6 +416,20 @@ pub enum PredictModelClass {
     TransformationNormal,
 }
 
+impl PredictModelClass {
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::GaussianLocationScale => "gaussian location-scale",
+            Self::BinomialLocationScale => "binomial location-scale",
+            Self::BernoulliMarginalSlope => "bernoulli marginal-slope",
+            Self::Survival => "survival",
+            Self::TransformationNormal => "transformation-normal",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SavedLinkWiggleRuntime {
     pub knots: Vec<f64>,
