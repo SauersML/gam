@@ -128,12 +128,14 @@ fn compute_alo_diagnostics_from_pirls_impl(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => 1.0,
         LinkFunction::Identity => {
-            let mut rss = 0.0;
-            for i in 0..n {
-                let r = y[i] - base.finalmu[i];
-                let wi = base.finalweights[i];
-                rss += wi * r * r;
-            }
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let rss: f64 = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let r = y[i] - base.finalmu[i];
+                    base.finalweights[i] * r * r
+                })
+                .sum();
             let dof = (n as f64) - base.edf;
             let denom = dof.max(1.0);
             rss / denom
