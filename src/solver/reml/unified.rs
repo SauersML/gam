@@ -5154,13 +5154,29 @@ fn compute_outer_hessian(
     });
     let exact_logdet_cross_traces = if incl_logdet_h && stochastic_cross_traces.is_none() {
         if let (Some(kernel), Some(reduced)) = (subspace, reduced_h_drifts.as_ref()) {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let n = reduced.len();
-            let mut out = Array2::<f64>::zeros((n, n));
-            for i in 0..n {
-                for j in i..n {
+            // Each `(i, j)` upper-triangular pair is an independent cross
+            // trace `−tr(K · A_i · K · A_j)` over the projected kernel
+            // `K = U_S (U_Sᵀ H U_S)⁻¹ U_Sᵀ`; the kernel and `reduced` slice
+            // are both read-only borrows so the K(K+1)/2 pairs dispatch in
+            // parallel, then we stitch the symmetric `n × n` Array2
+            // sequentially.
+            let pairs: Vec<(usize, usize)> = (0..n)
+                .flat_map(|i| (i..n).map(move |j| (i, j)))
+                .collect();
+            let pair_values: Vec<(usize, usize, f64)> = pairs
+                .into_par_iter()
+                .map(|(i, j)| {
                     let value =
                         -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
-                    out[[i, j]] = value;
+                    (i, j, value)
+                })
+                .collect();
+            let mut out = Array2::<f64>::zeros((n, n));
+            for (i, j, value) in pair_values {
+                out[[i, j]] = value;
+                if i != j {
                     out[[j, i]] = value;
                 }
             }
