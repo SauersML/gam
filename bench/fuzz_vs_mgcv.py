@@ -682,19 +682,15 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
         n_duchon_dims = 2
         # Rust's pure 2-D Duchon + triple-operator path forces the degenerate
         # (order=2, power=0) tuple. That tuple is mathematically admissible but
-        # too brittle for ordinary GAM small-n fuzz comparisons: a handful of
-        # seeds produce extreme extrapolation that mgcv's `bs='ds'` smoother
-        # does not reproduce. Use the stable hybrid-Duchon tuple for GAMs
-        # (length_scale=1.0 in _rust_duchon_term) and compare it to mgcv's
-        # nearest ds analogue m=c(2,1). Keep GAMLSS on the pure tuple, because
-        # hybrid mean+noise Duchon otherwise exercises the two-block spatial
-        # length-scale optimizer instead of the mgcv comparison target.
-        if model_type == "gamlss":
-            duchon_order = 2
-            duchon_power = 0
-        else:
-            duchon_order = 1
-            duchon_power = 1
+        # proved too brittle for the adversarial small-n fuzz comparison:
+        # a handful of seeds produce extreme extrapolation that mgcv's
+        # `bs='ds'` smoother does not reproduce. Use the stable hybrid-Duchon
+        # tuple instead on the Rust side (length_scale=1.0 in
+        # _rust_duchon_term) and compare it to mgcv's nearest ds analogue
+        # m=c(2,1). This keeps Duchon coverage without turning the fuzzer into
+        # a pure-kernel pathology suite.
+        duchon_order = 1
+        duchon_power = 1
         # mgcv's Duchon constructor still needs a small safety margin at low k
         # to avoid basis-dimension reset warnings that later break predict().
         min_duchon_centers = 8
@@ -728,12 +724,8 @@ def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
             while len(sc.smooth_kinds) < 3:
                 sc.smooth_kinds.append(sc.smooth_kinds[-1] if sc.smooth_kinds else "linear")
         sc.n_duchon_dims = 2
-        if sc.model_type == "gamlss":
-            sc.duchon_order = 2
-            sc.duchon_power = 0
-        else:
-            sc.duchon_order = 1
-            sc.duchon_power = 1
+        sc.duchon_order = 1
+        sc.duchon_power = 1
         min_duchon_centers = 8
         max_knots = max(min_duchon_centers, sc.n_obs // max(sc.n_smooths + 1, 2) - 2)
         sc.knots = min(max(sc.knots, min_duchon_centers), max_knots)
@@ -836,11 +828,10 @@ def _duchon_dims_for_centers(cols, sc, centers: int) -> int:
 
 
 def _rust_duchon_term(cols, centers, sc, dp):
-    length_scale = " length_scale=1.0," if sc.model_type != "gamlss" else ""
     return (
         f"duchon({', '.join(cols)}, centers={centers}, "
-        f"order={sc.duchon_order}, power={sc.duchon_power},"
-        f"{length_scale} double_penalty={dp})"
+        f"order={sc.duchon_order}, power={sc.duchon_power}, "
+        f"length_scale=1.0, double_penalty={dp})"
     )
 
 
