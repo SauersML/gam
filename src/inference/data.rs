@@ -62,6 +62,52 @@ impl EncodedDataset {
     }
 }
 
+pub fn missing_column_message(
+    col_map: &HashMap<String, usize>,
+    name: &str,
+    role: Option<&str>,
+) -> String {
+    // Suggest similar names. Cheap Damerau-style match: case-insensitive
+    // substring or shared-prefix length.
+    let target_lower = name.to_lowercase();
+    let mut similar: Vec<&str> = col_map
+        .keys()
+        .filter(|k| {
+            let k_lower = k.to_lowercase();
+            k_lower.contains(&target_lower)
+                || target_lower.contains(&k_lower)
+                || shared_prefix(&k_lower, &target_lower) >= 3
+        })
+        .map(String::as_str)
+        .collect();
+    similar.sort_unstable();
+    let mut all: Vec<&str> = col_map.keys().map(String::as_str).collect();
+    all.sort_unstable();
+    let label = role.map_or_else(
+        || format!("column '{name}'"),
+        |role| format!("{role} column '{name}'"),
+    );
+    if similar.is_empty() {
+        format!(
+            "{label} not found in data. Available columns: [{}]",
+            all.join(", ")
+        )
+    } else {
+        format!(
+            "{label} not found in data. Did you mean one of [{}]? Full list: [{}]",
+            similar.join(", "),
+            all.join(", ")
+        )
+    }
+}
+
+fn shared_prefix(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(ca, cb)| ca == cb)
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // Format detection
 // ---------------------------------------------------------------------------
@@ -172,16 +218,17 @@ fn resolve_requested_columns(
     }
 
     if selected.len() != requested_set.len() {
-        let available: HashSet<&str> = all_headers.iter().map(String::as_str).collect();
+        let available_map: HashMap<String, usize> = all_headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| (header.clone(), index))
+            .collect();
         let missing = requested_columns
             .iter()
-            .filter(|name| !available.contains(name.as_str()))
-            .cloned()
+            .filter(|name| !available_map.contains_key(name.as_str()))
+            .map(|name| missing_column_message(&available_map, name, Some("requested")))
             .collect::<Vec<_>>();
-        return Err(format!(
-            "requested column(s) not found in data: {}",
-            missing.join(", ")
-        ));
+        return Err(missing.join("; "));
     }
 
     Ok(selected)
