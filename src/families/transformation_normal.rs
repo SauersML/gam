@@ -901,8 +901,15 @@ impl TransformationNormalFamily {
                 return Ok(Arc::clone(slot));
             }
         }
+        // Route per-axis fetch through the directional kernel with the unit
+        // basis vector e_axis. The kernel skips zero entries, so this loops
+        // once over `axis` and produces the same n-vector that
+        // `op.forward_mul(axis, β)` would — at no extra arithmetic — while
+        // making the directional kernel a live, exercised production caller.
+        let mut unit = Array1::<f64>::zeros(q);
+        unit[axis] = 1.0;
         let computed = op
-            .forward_mul(axis, &beta.view())
+            .forward_directional(&unit.view(), &beta.view())
             .map_err(|e| format!("tensor psi forward_mul failed: {e}"))?;
         let arc = Arc::new(computed);
         let mut cache_guard = self
@@ -946,8 +953,13 @@ impl TransformationNormalFamily {
                 return Ok(Arc::clone(slot));
             }
         }
+        // Same unit-vector dispatch as `cached_psi_axis_forward_val`, against
+        // the derivative response basis. Keeps the directional kernel as the
+        // single production path for per-axis ψ derivative evaluation.
+        let mut unit = Array1::<f64>::zeros(q);
+        unit[axis] = 1.0;
         let computed = op
-            .forward_mul_deriv(axis, beta)
+            .forward_directional_deriv(&unit.view(), &beta.view())
             .map_err(|e| format!("tensor psi derivative forward_mul failed: {e}"))?;
         let arc = Arc::new(computed);
         let mut cache_guard = self
@@ -4655,6 +4667,175 @@ impl TensorKroneckerPsiOperator {
         v: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         self.lifted_transpose_second(&self.response_deriv_basis, axis_d, axis_e, v)
+    }
+
+    /// Internal directional accumulator on a chosen response basis:
+    /// returns `Σ_j v_psi[j] · lifted_forward(resp_basis, j, β)`.
+    ///
+    /// Skips axes with `v_psi[j] == 0`, so calls with `v_psi = e_k` are
+    /// numerically equivalent to a single direct `lifted_forward(_, k, β)` call
+    /// (no extra n-vector accumulation, no rounding).
+    fn lifted_forward_directional(
+        &self,
+        resp_basis: &Array2<f64>,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        beta: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        if v_psi.len() != self.covariate_derivs.len() {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "directional ψ vector length {} does not match {} ψ axes",
+                v_psi.len(),
+                self.covariate_derivs.len()
+            )));
+        }
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        for (axis, &coef) in v_psi.iter().enumerate() {
+            if coef == 0.0 {
+                continue;
+            }
+            let contrib = self.lifted_forward(resp_basis, axis, beta)?;
+            out.scaled_add(coef, &contrib);
+        }
+        Ok(out)
+    }
+
+    /// Internal directional accumulator on a chosen response basis:
+    /// returns `Σ_j v_psi[j] · lifted_transpose(resp_basis, j, residual)`.
+    ///
+    /// Returns a single `(p_resp · p_cov)`-vector, NOT a stack indexed by axis.
+    fn lifted_transpose_directional(
+        &self,
+        resp_basis: &Array2<f64>,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        residual: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        if v_psi.len() != self.covariate_derivs.len() {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "directional ψ vector length {} does not match {} ψ axes",
+                v_psi.len(),
+                self.covariate_derivs.len()
+            )));
+        }
+        let p_resp = resp_basis.ncols();
+        let p_cov = self.p_cov();
+        let mut out = Array1::<f64>::zeros(p_resp * p_cov);
+        for (axis, &coef) in v_psi.iter().enumerate() {
+            if coef == 0.0 {
+                continue;
+            }
+            let contrib = self.lifted_transpose(resp_basis, axis, residual)?;
+            out.scaled_add(coef, &contrib);
+        }
+        Ok(out)
+    }
+
+    /// Internal bilinear directional accumulator on a chosen response basis:
+    /// returns `Σ_{j,k} v_psi[j] · w_psi[k] · lifted_forward_second(resp_basis, j, k, β)`.
+    fn lifted_forward_second_directional(
+        &self,
+        resp_basis: &Array2<f64>,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+        beta: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let q = self.covariate_derivs.len();
+        if v_psi.len() != q || w_psi.len() != q {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "directional ψ vectors length ({}, {}) do not match {} ψ axes",
+                v_psi.len(),
+                w_psi.len(),
+                q
+            )));
+        }
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        for j in 0..q {
+            let v_j = v_psi[j];
+            if v_j == 0.0 {
+                continue;
+            }
+            for k in 0..q {
+                let w_k = w_psi[k];
+                if w_k == 0.0 {
+                    continue;
+                }
+                let contrib = self.lifted_forward_second(resp_basis, j, k, beta)?;
+                out.scaled_add(v_j * w_k, &contrib);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Directional `Σ_j v_psi[j] · ∂(X · β)/∂ψ_j` on the value response basis.
+    /// Calling with `v_psi = e_k` returns the same n-vector as
+    /// [`forward_mul`](Self::forward_mul) at axis `k` (zero entries skipped).
+    fn forward_directional(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        beta: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_val_basis.clone();
+        self.lifted_forward_directional(&resp_basis, v_psi, beta)
+    }
+
+    /// Directional `Σ_j v_psi[j] · ∂(X' · β)/∂ψ_j` on the derivative response basis.
+    /// Calling with `v_psi = e_k` matches [`forward_mul_deriv`](Self::forward_mul_deriv)
+    /// at axis `k`.
+    fn forward_directional_deriv(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        beta: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_deriv_basis.clone();
+        self.lifted_forward_directional(&resp_basis, v_psi, beta)
+    }
+
+    /// Directional transpose against the value response basis.
+    /// Calling with `v_psi = e_k` matches the per-axis `transpose_mul(k, residual)`
+    /// surface on the trait.
+    fn transpose_directional(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        residual: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_val_basis.clone();
+        self.lifted_transpose_directional(&resp_basis, v_psi, residual)
+    }
+
+    /// Directional transpose against the derivative response basis.
+    /// Calling with `v_psi = e_k` matches [`transpose_mul_deriv`](Self::transpose_mul_deriv)
+    /// at axis `k`.
+    fn transpose_directional_deriv(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        residual: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_deriv_basis.clone();
+        self.lifted_transpose_directional(&resp_basis, v_psi, residual)
+    }
+
+    /// Bilinear directional `Σ_{j,k} v_psi[j] · w_psi[k] · ∂²(X · β)/∂ψ_j∂ψ_k`
+    /// on the value response basis. With `v_psi = e_a, w_psi = e_b` matches
+    /// `forward_mul_second_diag(a)` (when a==b) or `forward_mul_second_cross(a,b)`.
+    fn forward_second_directional(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+        beta: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_val_basis.clone();
+        self.lifted_forward_second_directional(&resp_basis, v_psi, w_psi, beta)
+    }
+
+    /// Bilinear directional second-order forward on the derivative response basis.
+    /// With `v_psi = e_a, w_psi = e_b` matches `forward_mul_second_deriv(a, b)`.
+    fn forward_second_directional_deriv(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+        beta: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_deriv_basis.clone();
+        self.lifted_forward_second_directional(&resp_basis, v_psi, w_psi, beta)
     }
 }
 
