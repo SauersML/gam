@@ -5734,6 +5734,39 @@ impl DesignMatrix {
         }
     }
 
+    /// Borrow when already-materialized dense, otherwise materialize via
+    /// chunks (or via the sparse conversion path) and return an owned `Cow`.
+    ///
+    /// Use this when a code path genuinely needs a contiguous `Array2<f64>`
+    /// view of an operator-backed design (e.g. legacy dense linear-algebra
+    /// helpers that the operator-aware code paths have not yet replaced).
+    /// Prefer `try_row_chunk` / `matrixvectormultiply` when chunked or
+    /// matrix-free access suffices.
+    pub fn to_dense_cow(&self) -> Cow<'_, Array2<f64>> {
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => Cow::Borrowed(matrix.as_ref()),
+            Self::Dense(DenseDesignMatrix::Lazy(op)) => {
+                if let Some(dense) = op.as_dense_ref() {
+                    Cow::Borrowed(dense)
+                } else {
+                    Cow::Owned(
+                        self.try_to_dense_arc("DesignMatrix::to_dense_cow")
+                            .unwrap_or_else(|msg| panic!("{msg}"))
+                            .as_ref()
+                            .clone(),
+                    )
+                }
+            }
+            Self::Sparse(matrix) => Cow::Owned(
+                matrix
+                    .try_to_dense_arc("DesignMatrix::to_dense_cow")
+                    .unwrap_or_else(|msg| panic!("{msg}"))
+                    .as_ref()
+                    .clone(),
+            ),
+        }
+    }
+
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(matrix) => matrix
