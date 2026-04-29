@@ -1253,8 +1253,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedLinkState::LatentCLogLog { .. } => {}
             FittedLinkState::Standard(_) => {}
         }
-        payload.training_headers = Some(ds.headers.clone());
-        payload.training_feature_ranges = Some(ds.feature_ranges());
+        set_training_feature_metadata_from_dataset(&mut payload, &ds);
         payload.resolved_termspec = Some(saved_termspec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
         set_saved_offset_columns(
@@ -1487,6 +1486,7 @@ fn run_fit_bernoulli_marginal_slope(
             logslope_formula,
             z_column.clone(),
             ds.headers.clone(),
+            ds.feature_ranges(),
             frozen_marginal,
             frozen_logslope,
             solved.fit,
@@ -1615,6 +1615,7 @@ fn run_fit_transformation_normal(
             formula_text.to_string(),
             ds.schema.clone(),
             ds.headers.clone(),
+            ds.feature_ranges(),
             frozen_covariate,
             solved.fit,
             &solved.family,
@@ -1792,6 +1793,7 @@ fn run_fitwith_predict_noise(
                 ds.schema.clone(),
                 noise_formula.clone(),
                 ds.headers.clone(),
+                ds.feature_ranges(),
                 frozen_meanspec,
                 frozen_noisespec,
                 fit_result,
@@ -1968,6 +1970,7 @@ fn run_fitwith_predict_noise(
             ds.schema.clone(),
             noise_formula,
             ds.headers.clone(),
+            ds.feature_ranges(),
             frozen_meanspec,
             frozen_noisespec,
             fit_result,
@@ -4291,8 +4294,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_noise_non_intercept_start =
                 Some(survival_noise_transform.non_intercept_start);
             payload.survival_distribution = Some(fitted_inverse_link.saved_string());
-            payload.training_headers = Some(ds.headers.clone());
-            payload.training_feature_ranges = Some(ds.feature_ranges());
+            set_training_feature_metadata_from_dataset(&mut payload, &ds);
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
                     &fit.fit.resolved_thresholdspec,
@@ -4586,8 +4588,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
-            payload.training_headers = Some(ds.headers.clone());
-            payload.training_feature_ranges = Some(ds.feature_ranges());
+            set_training_feature_metadata_from_dataset(&mut payload, &ds);
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
                     &fit.marginalspec_resolved,
@@ -4882,8 +4883,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 args.noise_offset_column.clone(),
             );
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
-            payload.training_headers = Some(ds.headers.clone());
-            payload.training_feature_ranges = Some(ds.feature_ranges());
+            set_training_feature_metadata_from_dataset(&mut payload, &ds);
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(&termspec, &cov_design)
                     .map_err(|e| e.to_string())?,
@@ -5316,8 +5316,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
         payload.survival_likelihood =
             Some(survival_likelihood_modename(likelihood_mode).to_string());
-        payload.training_headers = Some(ds.headers.clone());
-        payload.training_feature_ranges = Some(ds.feature_ranges());
+        set_training_feature_metadata_from_dataset(&mut payload, &ds);
         set_saved_offset_columns(
             &mut payload,
             args.offset_column.clone(),
@@ -6726,6 +6725,19 @@ fn summarizewiggle_domain(
     })
 }
 
+fn set_training_feature_metadata(
+    payload: &mut FittedModelPayload,
+    headers: Vec<String>,
+    feature_ranges: Vec<(f64, f64)>,
+) {
+    payload.training_headers = Some(headers);
+    payload.training_feature_ranges = Some(feature_ranges);
+}
+
+fn set_training_feature_metadata_from_dataset(payload: &mut FittedModelPayload, ds: &Dataset) {
+    set_training_feature_metadata(payload, ds.headers.clone(), ds.feature_ranges());
+}
+
 fn build_location_scale_saved_model(
     formula: String,
     family: String,
@@ -6733,6 +6745,7 @@ fn build_location_scale_saved_model(
     data_schema: DataSchema,
     noise_formula: String,
     training_headers: Vec<String>,
+    training_feature_ranges: Vec<(f64, f64)>,
     resolved_termspec: TermCollectionSpec,
     resolved_termspec_noise: TermCollectionSpec,
     fit_result: UnifiedFitResult,
@@ -6774,7 +6787,7 @@ fn build_location_scale_saved_model(
         payload.noise_scale = Some(transform.rescale.to_vec());
         payload.noise_non_intercept_start = Some(transform.non_intercept_start);
     }
-    payload.training_headers = Some(training_headers);
+    set_training_feature_metadata(&mut payload, training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_termspec);
     payload.resolved_termspec_noise = Some(resolved_termspec_noise);
     SavedModel::from_payload(payload)
@@ -7022,6 +7035,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     logslope_formula: String,
     z_column: String,
     training_headers: Vec<String>,
+    training_feature_ranges: Vec<(f64, f64)>,
     resolved_marginalspec: TermCollectionSpec,
     resolved_logslopespec: TermCollectionSpec,
     fit_result: UnifiedFitResult,
@@ -7053,7 +7067,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
     payload.link = Some(base_link.saved_string());
-    payload.training_headers = Some(training_headers);
+    set_training_feature_metadata(&mut payload, training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_logslope = Some(resolved_logslopespec);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
@@ -7101,6 +7115,7 @@ fn build_transformation_normal_saved_model(
     formula: String,
     data_schema: DataSchema,
     training_headers: Vec<String>,
+    training_feature_ranges: Vec<(f64, f64)>,
     resolved_covariate_spec: TermCollectionSpec,
     fit_result: UnifiedFitResult,
     family: &gam::families::transformation_normal::TransformationNormalFamily,
@@ -7117,7 +7132,7 @@ fn build_transformation_normal_saved_model(
     payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
-    payload.training_headers = Some(training_headers);
+    set_training_feature_metadata(&mut payload, training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_covariate_spec);
     payload.transformation_response_knots = Some(family.response_knots().to_vec());
     payload.transformation_response_transform = Some(
@@ -11735,6 +11750,7 @@ mod tests {
             "y ~ 1".to_string(),
             "z".to_string(),
             vec![],
+            vec![],
             empty_termspec(),
             empty_termspec(),
             core_saved_fit_result(
@@ -11813,6 +11829,7 @@ mod tests {
             "y ~ 1".to_string(),
             "z".to_string(),
             vec!["z".to_string()],
+            vec![(0.0, 4.0)],
             empty_termspec(),
             empty_termspec(),
             fit_result,
@@ -11856,6 +11873,7 @@ mod tests {
             DataSchema { columns: vec![] },
             "y ~ 1".to_string(),
             "z".to_string(),
+            vec![],
             vec![],
             empty_termspec(),
             empty_termspec(),

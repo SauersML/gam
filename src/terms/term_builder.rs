@@ -61,7 +61,11 @@ pub fn column_map_with_alias(
     aliased
 }
 
-fn missing_column_message(col_map: &HashMap<String, usize>, name: &str, role: Option<&str>) -> String {
+fn missing_column_message(
+    col_map: &HashMap<String, usize>,
+    name: &str,
+    role: Option<&str>,
+) -> String {
     // Suggest similar names. Cheap Damerau-style match: case-insensitive
     // substring or shared-prefix length.
     let target_lower = name.to_lowercase();

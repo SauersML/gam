@@ -951,10 +951,11 @@ impl PirlsWorkspace {
                             let mut chunk = chunk_buf.slice_mut(s![0..rows, ..]);
                             let x_slice = x.slice(s![start..start + rows, ..]);
                             let w_slice = sqrtw.slice(s![start..start + rows]);
+                            // Parallel per-row sqrt-weight scaling.
                             Zip::from(chunk.rows_mut())
                                 .and(x_slice.rows())
                                 .and(&w_slice)
-                                .for_each(|mut dst, src, &w| {
+                                .par_for_each(|mut dst, src, &w| {
                                     Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
                                 });
                         }
@@ -997,10 +998,12 @@ impl PirlsWorkspace {
                     let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
                     let x_slice = x.slice(s![start..start + rows, ..]);
                     let w_slice = sqrtw.slice(s![start..start + rows]);
+                    // Parallel over chunk rows; the inner per-row column
+                    // copy stays sequential (small p).
                     Zip::from(chunk.rows_mut())
                         .and(x_slice.rows())
                         .and(&w_slice)
-                        .for_each(|mut dst, src, &w| {
+                        .par_for_each(|mut dst, src, &w| {
                             Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
                         });
                 }

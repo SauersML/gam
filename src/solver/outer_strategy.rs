@@ -1701,16 +1701,15 @@ const MAX_PSI_BACKTRACK: usize = 8;
 /// Maximum number of consecutive HybridEFS iterations whose ψ block was
 /// zeroed before the bridge bails out and triggers a solver switch.
 ///
-/// Why 2 and not 1: an isolated ψ-zero iteration is a normal recovery
-/// step (the EFS-suggested ψ direction was too aggressive at this iterate
-/// but the ψ block itself is not pathological). Two in a row, however,
-/// means the ψ stationarity condition ∇_ψ V = 0 is not being enforced —
-/// the solver is making ρ progress while ψ stays frozen, which on
-/// problems with strong ρ–ψ coupling (Duchon60, anisotropic Matérn) can
-/// converge to an interior point that is *not* a joint minimum. Routing
-/// to a gradient-based solver via the fallback ladder restores joint
-/// stationarity in O(1) outer iterations.
-const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 2;
+/// On hard problems (Matérn additive at biobank scale, Duchon60, anisotropic
+/// joint penalties) a single zeroed-ψ iteration after exhausted backtracking
+/// is already strong evidence the EFS ψ direction is not descent-correlated
+/// at the current iterate; continuing on ρ alone with Δψ = 0 cannot enforce
+/// ∇_ψ V = 0 and burns outer iterations on a non-stationary direction.
+/// Bail out immediately so the fallback ladder routes to a joint
+/// gradient-based solver (BFGS / L-BFGS) where ψ stationarity is part of
+/// the optimality condition.
+const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 1;
 
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
@@ -1856,6 +1855,17 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                     // HybridEFS attempt and the fallback ladder routes to a
                     // joint gradient-based solver (BFGS / Arc) where ψ
                     // stationarity is part of the optimality condition.
+                    log::info!(
+                        "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
+                         {} consecutive ψ-zero iterations after exhausted backtracking \
+                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e}); \
+                         warm-starting at current (β, ψ)",
+                        self.consecutive_psi_zero_iters,
+                        self.layout.rho_dim(),
+                        self.layout.psi_dim,
+                        self.layout.n_params,
+                        eval.cost,
+                    );
                     return Err(ObjectiveEvalError::recoverable(format!(
                         "{} HybridEFS ψ stagnation: {} consecutive iterations \
                          exhausted backtracking and zeroed ψ step \
