@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
@@ -13,6 +13,50 @@ use crate::families::transformation_normal::TRANSFORMATION_MONOTONICITY_EPS;
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
+
+/// Clip each new-data column to the (min, max) range observed in training.
+///
+/// The model carries `training_feature_ranges` parallel to `training_headers`;
+/// for each header in the training schema we look up the matching new-data
+/// column via `col_map` and clamp values to the training range. Out-of-hull
+/// inputs evaluate at the nearest face of the training bounding box, so
+/// polyharmonic / spline bases do not extrapolate polynomial trends from a
+/// region with no data support. Returns the original view unchanged when
+/// the model pre-dates the field (legacy JSONs deserialize with `None`).
+fn axis_clip_to_training_ranges(
+    data: ndarray::ArrayView2<'_, f64>,
+    model: &FittedModel,
+    col_map: &HashMap<String, usize>,
+) -> Option<Array2<f64>> {
+    let training_headers = model.training_headers.as_ref()?;
+    let ranges = model.training_feature_ranges.as_ref()?;
+    if training_headers.len() != ranges.len() {
+        return None;
+    }
+    let mut clipped = data.to_owned();
+    for (header, &(lo, hi)) in training_headers.iter().zip(ranges.iter()) {
+        if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
+            continue;
+        }
+        let Some(&col_idx) = col_map.get(header) else {
+            continue;
+        };
+        if col_idx >= clipped.ncols() {
+            continue;
+        }
+        let mut col = clipped.column_mut(col_idx);
+        for v in col.iter_mut() {
+            if v.is_finite() {
+                if *v < lo {
+                    *v = lo;
+                } else if *v > hi {
+                    *v = hi;
+                }
+            }
+        }
+    }
+    Some(clipped)
+}
 
 /// Build a `PredictInput` for model types backed directly by `PredictableModel`.
 ///
@@ -33,7 +77,9 @@ pub fn build_predict_input_for_model(
         col_map,
         "resolved_termspec",
     )?;
-    let design = build_term_collection_design(data, &spec)
+    let clipped = axis_clip_to_training_ranges(data, model, col_map);
+    let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
+    let design = build_term_collection_design(design_input, &spec)
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
     let n = data.nrows();
     if offset.len() != n || offset_noise.len() != n {
