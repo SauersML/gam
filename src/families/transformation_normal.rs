@@ -1086,8 +1086,15 @@ impl CustomFamily for TransformationNormalFamily {
                 block_states.len()
             ));
         }
+        let evaluate_start = std::time::Instant::now();
         let beta = &block_states[0].beta;
+        let row_q_start = std::time::Instant::now();
         let row_quantities = self.row_quantities(beta)?;
+        log::info!(
+            "[STAGE] CTN row_quantities (h, h', 1/h', powers) n={} elapsed={:.3}s",
+            row_quantities.h.len(),
+            row_q_start.elapsed().as_secs_f64(),
+        );
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
@@ -1143,15 +1150,23 @@ impl CustomFamily for TransformationNormalFamily {
         };
 
         // Gradient of log-likelihood: ∇ℓ = -X_val^T (w·h) + X_deriv^T (w/h')
+        let grad_start = std::time::Instant::now();
         let grad = {
             let xdt_inv = self.x_deriv_kron.transpose_mul(&weighted_inv_hp);
             let xvt_h = self.x_val_kron.transpose_mul(&weighted_h);
             xdt_inv - xvt_h
         };
+        log::info!(
+            "[STAGE] CTN gradient terms n={} p={} elapsed={:.3}s",
+            n,
+            grad.len(),
+            grad_start.elapsed().as_secs_f64(),
+        );
 
         // Negative Hessian of log-likelihood:
         //   -∇²ℓ = X_val^T diag(w) X_val + X_deriv^T diag(w/h'²) X_deriv
         // The first term is precomputed once as `x_val_weighted_gram`.
+        let hess_start = std::time::Instant::now();
         let hessian = {
             let mut xtx_deriv = self
                 .x_deriv_kron
@@ -1159,6 +1174,21 @@ impl CustomFamily for TransformationNormalFamily {
             xtx_deriv += &self.x_val_weighted_gram;
             xtx_deriv
         };
+        let p_dim = hessian.nrows() as u64;
+        let n_u64 = n as u64;
+        log::info!(
+            "[STAGE] CTN hessian terms (weighted_gram) n={} p={} flops~{} elapsed={:.3}s",
+            n,
+            p_dim,
+            n_u64.saturating_mul(p_dim).saturating_mul(p_dim),
+            hess_start.elapsed().as_secs_f64(),
+        );
+        log::info!(
+            "[STAGE] CTN evaluate end n={} p={} elapsed={:.3}s",
+            n,
+            p_dim,
+            evaluate_start.elapsed().as_secs_f64(),
+        );
 
         Ok(FamilyEvaluation {
             log_likelihood,
@@ -1353,6 +1383,7 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
+        let scan_start = std::time::Instant::now();
 
         // Fraction-to-boundary: find the largest α ∈ (0, 1] such that
         // h'(β + α · δ) > 0 at every observed row and h'(y_g; x_i) > ε at
@@ -1410,6 +1441,12 @@ impl CustomFamily for TransformationNormalFamily {
             ),
         };
         let alpha_max = 1.0_f64.min(alpha_obs).min(alpha_grid);
+        log::info!(
+            "[STAGE] CTN monotonicity grid scan alpha_obs={:.3e} alpha_grid={:.3e} elapsed={:.3}s",
+            alpha_obs,
+            alpha_grid,
+            scan_start.elapsed().as_secs_f64(),
+        );
 
         let tau = 0.995;
         let alpha_safe = tau * alpha_max;
