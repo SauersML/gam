@@ -5447,15 +5447,19 @@ fn exp_sigma_derivs_up_to_fourth_array(
     Array1<f64>,
     Array1<f64>,
 ) {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = eta.len();
+    let tuples: Vec<(f64, f64, f64, f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| exp_sigma_derivs_up_to_fourth_scalar(eta[i]))
+        .collect();
     let mut sigma = Array1::<f64>::zeros(n);
     let mut d1 = Array1::<f64>::zeros(n);
     let mut d2 = Array1::<f64>::zeros(n);
     let mut d3 = Array1::<f64>::zeros(n);
     let mut d4 = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (sigma_i, d1_i, d2_i, d3_i, d4_i) = exp_sigma_derivs_up_to_fourth_scalar(eta[i]);
-        sigma[i] = sigma_i;
+    for (i, (s_i, d1_i, d2_i, d3_i, d4_i)) in tuples.into_iter().enumerate() {
+        sigma[i] = s_i;
         d1[i] = d1_i;
         d2[i] = d2_i;
         d3[i] = d3_i;
