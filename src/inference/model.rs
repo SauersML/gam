@@ -2655,7 +2655,7 @@ mod tests {
                 levels: vec![],
             }],
         });
-        payload.training_headers = Some(vec!["z".to_string()]);
+        payload.set_training_feature_metadata(vec!["z".to_string()], vec![(0.0, 0.0)]);
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_logslope = Some(empty_termspec());
         payload.formula_logslope = Some("1".to_string());
