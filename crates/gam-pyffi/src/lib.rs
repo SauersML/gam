@@ -1145,9 +1145,10 @@ fn build_survival_marginal_slope_ffi_payload(
     )
     .map_err(|err| format!("failed to freeze survival logslope spec: {err}"))?;
 
-    let logslope_formula = fit_config.logslope_formula.clone().ok_or_else(|| {
-        "survival marginal-slope requires logslope_formula to persist a saved model".to_string()
-    })?;
+    let logslope_formula = fit_config
+        .logslope_formula
+        .clone()
+        .unwrap_or_else(|| "same-as-main".to_string());
     let z_column = fit_config
         .z_column
         .clone()
@@ -1172,7 +1173,7 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survival_likelihood = Some("marginal-slope".to_string());
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
-    payload.resolved_termspec_noise = Some(frozen_logslope);
+    payload.resolved_termspec_logslope = Some(frozen_logslope);
     payload.formula_logslope = Some(logslope_formula);
     payload.z_column = Some(z_column);
     payload.latent_z_normalization = Some(SavedLatentZNormalization {

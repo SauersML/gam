@@ -1147,6 +1147,17 @@ fn build_col_map(data: &Dataset) -> HashMap<String, usize> {
         .collect()
 }
 
+fn marginal_slope_col_map_with_z_alias(
+    col_map: &HashMap<String, usize>,
+    z_column: &str,
+) -> HashMap<String, usize> {
+    let mut aliased = col_map.clone();
+    if let Some(idx) = col_map.get(z_column).copied() {
+        aliased.entry("z".to_string()).or_insert(idx);
+    }
+    aliased
+}
+
 fn build_termspec_with_geometry(
     terms: &[ParsedTerm],
     data: &Dataset,
@@ -1574,10 +1585,11 @@ fn materialize_bernoulli_marginal_slope<'a>(
 
     let mut inference_notes = Vec::new();
     let policy = resolved_resource_policy(config);
+    let aliased_col_map = marginal_slope_col_map_with_z_alias(col_map, z_column);
     let marginalspec = build_termspec_with_geometry(
         &parsed.terms,
         data,
-        col_map,
+        &aliased_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
@@ -1585,7 +1597,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
     let logslopespec = build_termspec_with_geometry(
         &parsed_logslope.terms,
         data,
-        col_map,
+        &aliased_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
@@ -1750,10 +1762,21 @@ fn materialize_survival<'a>(
     }
 
     let policy = resolved_resource_policy(config);
+    let marginal_slope_aliased_col_map = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        Some(marginal_slope_col_map_with_z_alias(
+            col_map,
+            config.z_column.as_deref().ok_or_else(|| {
+                "marginal-slope survival requires z_column in FitConfig".to_string()
+            })?,
+        ))
+    } else {
+        None
+    };
+    let termspec_col_map = marginal_slope_aliased_col_map.as_ref().unwrap_or(col_map);
     let termspec = build_termspec_with_geometry(
         &parsed.terms,
         data,
-        col_map,
+        termspec_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
@@ -1868,7 +1891,9 @@ fn materialize_survival<'a>(
                 Some(build_termspec_with_geometry(
                     &ls_parsed.terms,
                     data,
-                    col_map,
+                    marginal_slope_aliased_col_map
+                        .as_ref()
+                        .expect("marginal-slope column map should be available"),
                     &mut inference_notes,
                     config.scale_dimensions,
                     &policy,
