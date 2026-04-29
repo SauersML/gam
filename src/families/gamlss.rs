@@ -6803,10 +6803,35 @@ struct RowCoeffChannel {
     design: Arc<Array2<f64>>,
 }
 
+/// Symmetric pair coefficients `c_{ab}` for `a ≤ b`. The operator adds
+/// `X_a^T diag(c_{ab}) X_b` to block `block_a`'s output and the transpose
+/// contribution `X_b^T diag(c_{ab}) X_a` to block `block_b` when `a != b`.
+struct RowCoeffPair {
+    a: usize,
+    b: usize,
+    coeff: Array1<f64>,
+}
+
+/// Per-call scratch buffers for `RowCoeffOperator::mul_vec`. Held under a
+/// `Mutex` so the operator stays `Send + Sync` while reusing the
+/// per-channel allocations across `mul_vec` calls. At biobank scale
+/// (`n ≈ 4·10⁵`, up to 8 channels) this saves `2 · n_ch · n` floats of
+/// allocation per call (≈6 MB for `n_ch = 8`).
+///
+/// **Invariant**: `u[k].len() == nrows` and `r[k].len() == nrows` for
+/// every channel `k` after construction. `mul_vec` overwrites `u` (via
+/// `fast_av_into`) and zeroes-then-accumulates `r`, leaving both buffers
+/// in any state on return — callers must not depend on residual content.
+struct RowCoeffScratch {
+    u: Vec<Array1<f64>>,
+    r: Vec<Array1<f64>>,
+}
+
 /// Matrix-free operator for two-block-style joint-Hessian directional
 /// derivatives that decompose as `H = sum_{a,b} X_a^T diag(c_{ab}) X_b`
 /// with each `X_a` an `n × p_a` design and `c_{ab}` an `n` row coefficient
-/// vector. `mul_vec` applies the operator in O(n · sum_a p_a) per call.
+/// vector. `mul_vec` applies the operator in O(n · sum_a p_a) per call,
+/// reusing pre-sized scratch buffers for `u`, `r`.
 ///
 /// `block_offsets` gives the starting column of each output block; the
 /// operator dimension is the sum of all block widths. Each channel's
@@ -6816,18 +6841,9 @@ struct RowCoeffOperator {
     block_offsets: Vec<usize>,
     block_widths: Vec<usize>,
     dim: usize,
-    /// Symmetric pair coefficients `c_{ab}` for `a ≤ b`. The operator
-    /// adds `X_a^T diag(c_{ab}) X_b` to block `block_a`'s output and the
-    /// transpose contribution `X_b^T diag(c_{ab}) X_a` to `block_b` when
-    /// `a != b`.
     pair_coeffs: Vec<RowCoeffPair>,
     nrows: usize,
-}
-
-struct RowCoeffPair {
-    a: usize,
-    b: usize,
-    coeff: Array1<f64>,
+    scratch: std::sync::Mutex<RowCoeffScratch>,
 }
 
 impl RowCoeffOperator {
@@ -6843,6 +6859,14 @@ impl RowCoeffOperator {
             block_offsets.push(acc);
             acc += *w;
         }
+        let scratch = RowCoeffScratch {
+            u: (0..channels.len())
+                .map(|_| Array1::<f64>::zeros(nrows))
+                .collect(),
+            r: (0..channels.len())
+                .map(|_| Array1::<f64>::zeros(nrows))
+                .collect(),
+        };
         Self {
             channels,
             block_offsets,
@@ -6850,6 +6874,51 @@ impl RowCoeffOperator {
             dim: acc,
             pair_coeffs,
             nrows,
+            scratch: std::sync::Mutex::new(scratch),
+        }
+    }
+
+    /// One-line constructor for the standard (channels, pair-coeffs)
+    /// recipe used by every GAMLSS LS workspace: pass the block widths,
+    /// the channel list as `(block_id, design)` tuples, and the pair
+    /// list as `(a, b, coeff)` tuples. The constructor builds the
+    /// scratch buffers once.
+    fn from_directions(
+        block_widths: Vec<usize>,
+        channels: Vec<(usize, Arc<Array2<f64>>)>,
+        pairs: Vec<(usize, usize, Array1<f64>)>,
+        nrows: usize,
+    ) -> Self {
+        let channels: Vec<RowCoeffChannel> = channels
+            .into_iter()
+            .map(|(block, design)| RowCoeffChannel { block, design })
+            .collect();
+        let pair_coeffs: Vec<RowCoeffPair> = pairs
+            .into_iter()
+            .map(|(a, b, coeff)| RowCoeffPair { a, b, coeff })
+            .collect();
+        let mut block_offsets = Vec::with_capacity(block_widths.len());
+        let mut acc = 0;
+        for w in &block_widths {
+            block_offsets.push(acc);
+            acc += *w;
+        }
+        let scratch = RowCoeffScratch {
+            u: (0..channels.len())
+                .map(|_| Array1::<f64>::zeros(nrows))
+                .collect(),
+            r: (0..channels.len())
+                .map(|_| Array1::<f64>::zeros(nrows))
+                .collect(),
+        };
+        Self {
+            channels,
+            block_offsets,
+            block_widths,
+            dim: acc,
+            pair_coeffs,
+            nrows,
+            scratch: std::sync::Mutex::new(scratch),
         }
     }
 }
@@ -6861,43 +6930,85 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.dim);
-        // 1) For each channel, compute u_a = X_a · v[block_a slice].
         let n = self.nrows;
-        let mut u: Vec<Array1<f64>> = Vec::with_capacity(self.channels.len());
-        for ch in &self.channels {
+        let mut scratch = self
+            .scratch
+            .lock()
+            .expect("RowCoeffOperator scratch lock poisoned");
+        let RowCoeffScratch { u, r } = &mut *scratch;
+
+        // 1) u_a = X_a · v[block_a slice]. `fast_av` returns an owned
+        //    Array1; we `assign` into the pre-sized scratch buffer to
+        //    keep the buffer's capacity stable across calls (the old
+        //    contents are overwritten in place).
+        for (k, ch) in self.channels.iter().enumerate() {
             let start = self.block_offsets[ch.block];
             let width = self.block_widths[ch.block];
-            // Each channel must provide its own design indexed by ch.block's
-            // beta slice; if multiple channels share a block their designs
-            // share the same column count.
             debug_assert_eq!(ch.design.ncols(), width);
             let v_slice = v.slice(s![start..start + width]);
-            u.push(fast_av(ch.design.as_ref(), &v_slice));
+            let prod = fast_av(ch.design.as_ref(), &v_slice);
+            u[k].assign(&prod);
         }
-        // 2) For each channel a, accumulate r_a = sum_b c_{ab} ⊙ u_b.
-        let mut r: Vec<Array1<f64>> = (0..self.channels.len())
-            .map(|_| Array1::<f64>::zeros(n))
-            .collect();
+
+        // 2) r_a = sum_b c_{ab} ⊙ u_b. Zero-then-accumulate; pair coeffs
+        //    contribute symmetrically when `a != b`.
+        for slot in r.iter_mut() {
+            slot.fill(0.0);
+        }
         for pair in &self.pair_coeffs {
             let a = pair.a;
             let b = pair.b;
-            // r_a += c_ab ⊙ u_b
-            for i in 0..n {
-                r[a][i] += pair.coeff[i] * u[b][i];
-            }
-            if a != b {
+            let coeff = pair
+                .coeff
+                .as_slice()
+                .expect("RowCoeffOperator pair coeff must be contiguous");
+            // r[a] += coeff ⊙ u[b]; if a != b also r[b] += coeff ⊙ u[a].
+            // Split the borrow so r[a] and r[b] (or u[a] and u[b]) can be
+            // accessed simultaneously when a != b.
+            if a == b {
+                let u_a = u[a]
+                    .as_slice()
+                    .expect("RowCoeffOperator u must be contiguous");
+                let r_a = r[a]
+                    .as_slice_mut()
+                    .expect("RowCoeffOperator r must be contiguous");
                 for i in 0..n {
-                    r[b][i] += pair.coeff[i] * u[a][i];
+                    r_a[i] += coeff[i] * u_a[i];
+                }
+            } else {
+                let (r_a_slice, r_b_slice) = if a < b {
+                    let (left, right) = r.split_at_mut(b);
+                    (
+                        left[a].as_slice_mut().expect("contiguous"),
+                        right[0].as_slice_mut().expect("contiguous"),
+                    )
+                } else {
+                    let (left, right) = r.split_at_mut(a);
+                    (
+                        right[0].as_slice_mut().expect("contiguous"),
+                        left[b].as_slice_mut().expect("contiguous"),
+                    )
+                };
+                let u_a = u[a].as_slice().expect("contiguous");
+                let u_b = u[b].as_slice().expect("contiguous");
+                for i in 0..n {
+                    let c = coeff[i];
+                    r_a_slice[i] += c * u_b[i];
+                    r_b_slice[i] += c * u_a[i];
                 }
             }
         }
-        // 3) For each channel, contribute X_a^T r_a into output block.
+
+        // 3) Output[block] += X_a^T r_a per channel. Single output alloc.
         let mut out = Array1::<f64>::zeros(self.dim);
-        for (idx, ch) in self.channels.iter().enumerate() {
+        for (k, ch) in self.channels.iter().enumerate() {
             let start = self.block_offsets[ch.block];
             let width = self.block_widths[ch.block];
-            let contrib = fast_atv(ch.design.as_ref(), &r[idx]);
             let mut block = out.slice_mut(s![start..start + width]);
+            // Atv into a temporary, then accumulate; `fast_atv` allocates
+            // a `width`-sized array, which is bounded and small relative
+            // to the n-sized u/r buffers we already reuse.
+            let contrib = fast_atv(ch.design.as_ref(), &r[k]);
             block += &contrib;
         }
         out

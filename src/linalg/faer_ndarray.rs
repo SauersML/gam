@@ -322,9 +322,9 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 /// Compute A * v into a pre-allocated output buffer.
 /// `out` must be length n where A is (n, p) and v is length p.
 #[inline]
-pub fn fast_av_into<S: Data<Elem = f64>>(
-    a: &ArrayBase<S, Ix2>,
-    v: &Array1<f64>,
+pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
     out: &mut Array1<f64>,
 ) {
     use faer::Accum;

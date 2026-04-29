@@ -6439,6 +6439,8 @@ mod tests {
         let stacked = DesignMatrix::hstack(vec![left, right]).expect("stacked design");
 
         assert!(stacked.as_dense_ref().is_none());
+        assert!(!stacked.is_materialized_dense());
+        assert!(stacked.is_operator_backed());
         assert_eq!(stacked.nrows(), 2);
         assert_eq!(stacked.ncols(), 3);
 
@@ -6453,6 +6455,58 @@ mod tests {
             .try_row_chunk(0..2)
             .expect("stacked.try_row_chunk must succeed");
         assert_eq!(chunk, array![[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "DesignMatrix::as_dense_cow called on operator-backed design")]
+    fn design_matrix_as_dense_cow_rejects_operator_backed_designs() {
+        #[derive(Clone)]
+        struct NoDensifyOperator {
+            dense: Array2<f64>,
+        }
+
+        impl LinearOperator for NoDensifyOperator {
+            fn nrows(&self) -> usize {
+                self.dense.nrows()
+            }
+
+            fn ncols(&self) -> usize {
+                self.dense.ncols()
+            }
+
+            fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+                self.dense.dot(vector)
+            }
+
+            fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+                self.dense.t().dot(vector)
+            }
+
+            fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+                let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
+                Ok(self.dense.t().dot(&weighted))
+            }
+        }
+
+        impl DenseDesignOperator for NoDensifyOperator {
+            fn row_chunk_into(
+                &self,
+                rows: Range<usize>,
+                mut out: ndarray::ArrayViewMut2<'_, f64>,
+            ) -> Result<(), crate::resource::MatrixMaterializationError> {
+                out.assign(&self.dense.slice(s![rows, ..]));
+                Ok(())
+            }
+
+            fn to_dense(&self) -> Array2<f64> {
+                panic!("as_dense_cow must reject before to_dense")
+            }
+        }
+
+        let design = DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
+            dense: array![[1.0, 2.0], [3.0, 4.0]],
+        })));
+        let _ = design.as_dense_cow();
     }
 
     #[test]
