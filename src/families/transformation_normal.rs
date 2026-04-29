@@ -6292,7 +6292,24 @@ pub fn fit_transformation_normal(
         kappa_dims,
     );
     let rho0 = probe_block.initial_log_lambdas.clone();
-    let rho_lower = Array1::<f64>::from_elem(n_penalties, -12.0);
+    // Data-aware floor on the outer search range. For small-n / large-p
+    // configurations, log_lambda < 0 (i.e. λ < 1) drops the regularization
+    // below the data's information capacity and the inner solve admits
+    // wild β with predict-time monotonicity blowups (h' = ±1e15 spikes).
+    // Seed clamp `[0, 12]` already prevents COLD-starting in that regime;
+    // this floor prevents the outer BFGS from stepping there during search.
+    // For well-determined problems (n ≥ 5·p_total) the floor relaxes to the
+    // historical -12 so the optimizer can find genuinely small-λ optima.
+    let total_param_count = probe_block.design.ncols();
+    let n_obs_for_bound = response.len();
+    let rho_floor = if total_param_count > 0
+        && n_obs_for_bound < 5usize.saturating_mul(total_param_count)
+    {
+        0.0
+    } else {
+        -12.0
+    };
+    let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let probe_blocks = vec![probe_block];
     let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
