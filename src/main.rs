@@ -91,8 +91,7 @@ use gam::term_builder::{build_termspec, enable_scale_dimensions};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
-    LogLikelihoodNormalization, MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
-    WigglePenaltyConfig,
+    LogLikelihoodNormalization, MixtureLinkSpec, SasLinkSpec, WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -9566,41 +9565,6 @@ fn array2_to_nestedvec(a: &Array2<f64>) -> Vec<Vec<f64>> {
     a.axis_iter(Axis(0)).map(|row| row.to_vec()).collect()
 }
 
-fn nestedvec_to_array2(rows: &[Vec<f64>]) -> Result<Array2<f64>, String> {
-    if rows.is_empty() {
-        return Err("covariance matrix is empty".to_string());
-    }
-    let n = rows.len();
-    let p = rows[0].len();
-    if p == 0 {
-        return Err("covariance matrix has zero columns".to_string());
-    }
-    for (i, row) in rows.iter().enumerate() {
-        if row.len() != p {
-            return Err(format!(
-                "covariance matrix row {} length mismatch: got {}, expected {}",
-                i,
-                row.len(),
-                p
-            ));
-        }
-    }
-    let flat = rows
-        .iter()
-        .flat_map(|r| r.iter().copied())
-        .collect::<Vec<_>>();
-    Array2::from_shape_vec((n, p), flat)
-        .map_err(|e| format!("failed to build covariance matrix: {e}"))
-}
-
-fn parse_optional_covariance(
-    rows: Option<&Vec<Vec<f64>>>,
-    label: &str,
-) -> Result<Option<Array2<f64>>, String> {
-    rows.map(|mat| nestedvec_to_array2(mat).map_err(|e| format!("invalid {label}: {e}")))
-        .transpose()
-}
-
 fn covariance_from_model(
     model: &SavedModel,
     mode: CovarianceModeArg,
@@ -10126,8 +10090,8 @@ mod tests {
         write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
-        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg,
-        needs_special_predict_handling, run_fit, run_predict, write_model_json,
+        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
+        run_predict, write_model_json,
     };
     use clap::Parser;
     use csv::StringRecord;
@@ -14239,11 +14203,6 @@ mod tests {
             model.training_headers.as_ref(),
             &Array1::zeros(data.nrows()),
             &Array1::zeros(data.nrows()),
-            None,
-            None,
-            None,
-            None,
-            None,
         )
         .expect("survival predict with timewiggle");
         let (_, exit_w, _) = super::saved_baseline_timewiggle_components(
@@ -14386,11 +14345,6 @@ mod tests {
             model.training_headers.as_ref(),
             &Array1::zeros(data.nrows()),
             &Array1::zeros(data.nrows()),
-            None,
-            None,
-            None,
-            None,
-            None,
         )
         .expect("latent survival predict should succeed");
 
@@ -16366,7 +16320,7 @@ mod tests {
             Some(vec![-3.0, -3.0, -3.0, -3.0, 0.0, 3.0, 3.0, 3.0, 3.0]),
             Some(3),
         );
-        assert!(!needs_special_predict_handling(&model));
+        assert!(model.predictor().is_some());
         let data = ndarray::Array2::<f64>::zeros((2, 0));
         let headers = vec![];
         let col_map = HashMap::new();
