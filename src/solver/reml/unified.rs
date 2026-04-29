@@ -1396,11 +1396,14 @@ pub struct ProjectedFactorKey {
     cols: usize,
     row_stride: isize,
     col_stride: isize,
+    value_hash: u64,
+    value_hash2: u64,
 }
 
 impl ProjectedFactorKey {
     pub fn from_factor_view(design_id: usize, factor: ArrayView2<'_, f64>) -> Self {
         let strides = factor.strides();
+        let (value_hash, value_hash2) = projected_factor_value_fingerprint(factor);
         Self {
             design_id,
             factor_ptr: factor.as_ptr() as usize,
@@ -1408,8 +1411,24 @@ impl ProjectedFactorKey {
             cols: factor.ncols(),
             row_stride: strides[0],
             col_stride: strides[1],
+            value_hash,
+            value_hash2,
         }
     }
+}
+
+fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64) {
+    let mut h1 = 0xcbf2_9ce4_8422_2325_u64;
+    let mut h2 = 0x9e37_79b1_85eb_ca87_u64;
+    for (idx, value) in factor.iter().enumerate() {
+        let bits = value.to_bits();
+        let mixed = bits.wrapping_add((idx as u64).wrapping_mul(0x517c_c1b7_2722_0a95));
+        h1 ^= mixed;
+        h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+        h2 ^= bits.rotate_left((idx & 63) as u32);
+        h2 = h2.wrapping_mul(0x94d0_49bb_1331_11eb).rotate_left(27);
+    }
+    (h1, h2)
 }
 
 #[derive(Default)]
