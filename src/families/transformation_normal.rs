@@ -117,7 +117,6 @@ pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
 /// Number of equal subdivisions inserted between consecutive grid points
 /// (knots + quantiles). Shared between fit and predict.
 pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
-const HPRIME_RECIPROCAL_FLOOR: f64 = 1.0e-12;
 
 fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
     cached.len() == candidate.len()
@@ -293,7 +292,7 @@ fn build_transformation_row_derived(
     h: &Array1<f64>,
     h_prime: &Array1<f64>,
     weights: &Array1<f64>,
-) -> TransformationNormalRowDerived {
+) -> Result<TransformationNormalRowDerived, String> {
     let n = h_prime.len();
     debug_assert_eq!(h.len(), n);
     debug_assert_eq!(weights.len(), n);
@@ -365,12 +364,12 @@ fn build_transformation_row_derived(
                 |(((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp), &wi)| {
                     let inv_v = 1.0 / hp;
                     let inv_sq_v = inv_v * inv_v;
-                    let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
-                    let hp_safe_sq = hp_safe * hp_safe;
+                    let inv_cu_v = inv_sq_v * inv_v;
+                    let inv_qu_v = inv_sq_v * inv_sq_v;
                     *inv = inv_v;
                     *inv_sq = inv_sq_v;
-                    *inv_cu = 1.0 / (hp_safe_sq * hp_safe);
-                    *inv_qu = 1.0 / (hp_safe_sq * hp_safe_sq);
+                    *inv_cu = inv_cu_v;
+                    *inv_qu = inv_qu_v;
                     *wh = wi * hi;
                     *wih = wi * inv_v;
                     *wih2 = wi * inv_sq_v;
@@ -380,7 +379,52 @@ fn build_transformation_row_derived(
             .sum::<f64>()
     };
 
-    TransformationNormalRowDerived {
+    if let Some((i, value)) = h
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "TransformationNormalFamily row_quantities: h[{i}] = {value} is not finite"
+        ));
+    }
+    if let Some((i, value)) = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "TransformationNormalFamily row_quantities: weight[{i}] = {value} is not finite"
+        ));
+    }
+    if !log_likelihood.is_finite() {
+        return Err(format!(
+            "TransformationNormalFamily row_quantities: log-likelihood is not finite ({log_likelihood})"
+        ));
+    }
+    for i in 0..n {
+        let derived_values = [
+            ("1/h'", inv_h_prime[i]),
+            ("1/h'^2", inv_h_prime_sq[i]),
+            ("1/h'^3", inv_h_prime_cu[i]),
+            ("1/h'^4", inv_h_prime_qu[i]),
+            ("w*h", weighted_h[i]),
+            ("w/h'", weighted_inv_h_prime[i]),
+            ("w/h'^2", weighted_inv_h_prime_sq[i]),
+        ];
+        for (name, value) in derived_values {
+            if !value.is_finite() {
+                return Err(format!(
+                    "TransformationNormalFamily row_quantities: {name} at row {i} is not finite ({value}); h'={} is outside the finite exact-derivative range",
+                    h_prime[i],
+                ));
+            }
+        }
+    }
+
+    Ok(TransformationNormalRowDerived {
         inv_h_prime,
         inv_h_prime_sq,
         inv_h_prime_cu,
@@ -389,7 +433,7 @@ fn build_transformation_row_derived(
         weighted_inv_h_prime,
         weighted_inv_h_prime_sq,
         log_likelihood,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -796,32 +840,11 @@ impl TransformationNormalFamily {
                  Monotonicity constraint may be violated."
             ));
         }
-        // Numerical-safety floor for the higher reciprocal powers `1/h'^3`
-        // and `1/h'^4` consumed by the analytic ψ-ψ second-order Hessian
-        // (`exact_newton_joint_psisecond_order_terms` lines 1649-1772) and
-        // ψ-Hessian-drift (`exact_newton_joint_psihessian_directional_derivative`).
-        // For `h' < ~1e-77` the IEEE f64 division `1.0 / (hp² · hp²)`
-        // overflows to +∞ because `(1e-77)^4 ≈ 1e-308` is denormal; +∞ then
-        // collides with zero entries of `v_*_deriv` (and zero rows of the
-        // derivative basis) inside `factored_weighted_cross` / `weighted_gram`
-        // to produce NaN that poisons the entire dense `hessian_psi_psi`
-        // block. Observed: 238×238 NaN dense `b_mat` on the κ_i-κ_i diagonals
-        // of the 16-axis aniso Duchon margslope CTN run.
-        //
-        // The clamp `hp_safe = max(hp, EPS_FLOOR)` is mathematically equivalent
-        // for `hp ≫ EPS_FLOOR` and bounded for tiny `hp`. The floor is set
-        // conservatively to `1e-12` — far above the IEEE overflow threshold
-        // and small enough that any physically meaningful h' is unaffected
-        // (CTN typically has h' on the order of unity at converged β̂). When
-        // `min_hp < EPS_FLOOR`, the clamped reciprocal still overestimates
-        // the "true" `1/h'^k` magnitude only at those few infeasible rows,
-        // and the resulting Hessian remains finite so the outer REML can
-        // take a meaningful step (toward feasibility) instead of consuming
-        // a NaN block. The likelihood path itself only consumes 1/h' and
-        // 1/h'² (which stay finite well below the floor), so the clamp is
-        // localized to the higher powers and does not perturb the main
-        // gradient/Hessian pipeline.
-        let derived = build_transformation_row_derived(&h, &h_prime, self.weights.as_ref());
+        // Compute exact f64 row derivatives. If any required reciprocal power
+        // is outside the finite representable range, surface an evaluation
+        // error so the outer solver can retreat; do not clamp or approximate
+        // the analytic Hessian terms.
+        let derived = build_transformation_row_derived(&h, &h_prime, self.weights.as_ref())?;
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
@@ -4756,10 +4779,8 @@ mod tests {
             let hp = direct_h_prime[i];
             let inv = 1.0 / hp;
             let inv_sq = inv * inv;
-            let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
-            let hp_safe_sq = hp_safe * hp_safe;
-            let inv_cu = 1.0 / (hp_safe_sq * hp_safe);
-            let inv_qu = 1.0 / (hp_safe_sq * hp_safe_sq);
+            let inv_cu = inv_sq * inv;
+            let inv_qu = inv_sq * inv_sq;
             expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln());
 
             let tol = 1.0e-14;
