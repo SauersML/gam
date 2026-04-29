@@ -5455,6 +5455,74 @@ fn compute_outer_hessian(
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
+        // NaN bisection: report which intermediate inputs were already
+        // non-finite before the entry-builder summed them. This pinpoints the
+        // original source (penalty drift, drift correction, cross-trace, ...)
+        // instead of just flagging the final outer-Hessian entry.
+        let report_finite = |name: &str, value: f64, ii: usize, jj: usize| {
+            if !value.is_finite() {
+                log::warn!(
+                    "[OUTER non-finite] {} at ({}, {}) = {}",
+                    name,
+                    ii,
+                    jj,
+                    value,
+                );
+            }
+        };
+        for kk in 0..k {
+            report_finite("rho_a_vals[kk]", rho_a_vals[kk], kk, kk);
+            for entry in penalty_a_k_betas[kk].iter() {
+                if !entry.is_finite() {
+                    log::warn!(
+                        "[OUTER non-finite] penalty_a_k_betas[{}] has non-finite",
+                        kk
+                    );
+                    break;
+                }
+            }
+            for entry in v_ks[kk].iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
+                    break;
+                }
+            }
+        }
+        if let Some(ref exact) = exact_logdet_cross_traces {
+            for ii in 0..exact.nrows() {
+                for jj in 0..exact.ncols() {
+                    report_finite("exact_logdet_cross_traces", exact[[ii, jj]], ii, jj);
+                }
+            }
+        }
+        if let Some(ref sct) = stochastic_cross_traces {
+            for ii in 0..sct.nrows() {
+                for jj in 0..sct.ncols() {
+                    report_finite("stochastic_cross_traces", sct[[ii, jj]], ii, jj);
+                }
+            }
+        }
+        if let Some(ref h_g) = leverage {
+            for entry in h_g.iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] leverage h^G has non-finite entries");
+                    break;
+                }
+            }
+        }
+        if let Some(ref z_c) = adjoint_z_c {
+            for entry in z_c.iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] adjoint_z_c has non-finite entries");
+                    break;
+                }
+            }
+        }
+        for ii in 0..total {
+            for jj in 0..total {
+                report_finite("hess", hess[[ii, jj]], ii, jj);
+            }
+        }
         return Err(
             "Outer Hessian contains non-finite entries; exact higher-order derivatives are invalid"
                 .to_string(),
@@ -6248,6 +6316,14 @@ fn build_outer_hessian_operator(
             .collect();
         let mut ct = Array2::<f64>::zeros((total, total));
         for ((ii, jj), value) in pair_values {
+            if !value.is_finite() {
+                log::warn!(
+                    "[OPERATOR cross_trace non-finite] cross_trace[{}, {}] = {}",
+                    ii,
+                    jj,
+                    value,
+                );
+            }
             ct[[ii, jj]] = value;
             if ii != jj {
                 ct[[jj, ii]] = value;
@@ -8786,7 +8862,7 @@ impl HessianOperator for BlockCoupledOperator {
 pub struct MatrixFreeSpdOperator {
     apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
     preconditioner_diag: Array1<f64>,
-    cached_logdet: f64,
+    cached_logdet: OnceLock<f64>,
     n_dim: usize,
     solve_rel_tol: f64,
     max_iter: usize,
@@ -8811,23 +8887,34 @@ impl MatrixFreeSpdOperator {
         }
 
         let apply = Arc::new(apply);
-        let (probes, steps) = default_slq_parameters(dim);
-        let cached_logdet = stochastic_lanczos_logdet_spd_operator(
-            dim,
-            |v| apply(v),
-            probes,
-            steps,
-            Self::DEFAULT_LOGDET_SEED,
-        )?;
 
         Ok(Self {
             apply,
             preconditioner_diag,
-            cached_logdet,
+            cached_logdet: OnceLock::new(),
             n_dim: dim,
             solve_rel_tol: Self::DEFAULT_SOLVE_REL_TOL,
             max_iter: Self::DEFAULT_MAX_ITER_MULTIPLIER * dim.max(1),
             dense_fallback: OnceLock::new(),
+        })
+    }
+
+    fn compute_logdet_slq(&self) -> f64 {
+        let (probes, steps) = default_slq_parameters(self.n_dim);
+        stochastic_lanczos_logdet_spd_operator(
+            self.n_dim,
+            |v| (self.apply)(v),
+            probes,
+            steps,
+            Self::DEFAULT_LOGDET_SEED,
+        )
+        .unwrap_or_else(|err| {
+            log::warn!("MatrixFreeSpdOperator SLQ logdet failed: {err}");
+            if let Some(fallback) = self.dense_fallback() {
+                fallback.logdet()
+            } else {
+                0.0
+            }
         })
     }
 
@@ -8878,7 +8965,7 @@ impl MatrixFreeSpdOperator {
 
 impl HessianOperator for MatrixFreeSpdOperator {
     fn logdet(&self) -> f64 {
-        self.cached_logdet
+        *self.cached_logdet.get_or_init(|| self.compute_logdet_slq())
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
@@ -9286,6 +9373,65 @@ impl StochasticTraceEstimator {
         means
     }
 
+    fn estimate_matrix_from_probe_batch<F>(
+        &self,
+        hop: &dyn HessianOperator,
+        n_coords: usize,
+        mut evaluate_probe: F,
+    ) -> Array2<f64>
+    where
+        F: FnMut(&Array1<f64>, &mut Array2<f64>),
+    {
+        if n_coords == 0 {
+            return Array2::zeros((0, 0));
+        }
+        let p = hop.dim();
+        if p == 0 {
+            return Array2::zeros((n_coords, n_coords));
+        }
+
+        let mut means = Array2::<f64>::zeros((n_coords, n_coords));
+        let mut m2s = Array2::<f64>::zeros((n_coords, n_coords));
+        let mut probe_values = Array2::<f64>::zeros((n_coords, n_coords));
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let check_interval = 4;
+        let mut z = Array1::<f64>::zeros(p);
+
+        for m in 0..self.config.n_probes_max {
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
+            probe_values.fill(0.0);
+            evaluate_probe(&z, &mut probe_values);
+
+            let count = (m + 1) as f64;
+            for d in 0..n_coords {
+                for e in 0..n_coords {
+                    let q = probe_values[[d, e]];
+                    let delta = q - means[[d, e]];
+                    means[[d, e]] += delta / count;
+                    let delta2 = q - means[[d, e]];
+                    m2s[[d, e]] += delta * delta2;
+                }
+            }
+
+            let n_done = m + 1;
+            if n_done >= self.config.n_probes_min
+                && n_done % check_interval == 0
+                && self.check_matrix_convergence(n_done, &means, &m2s)
+            {
+                break;
+            }
+        }
+
+        for d in 0..n_coords {
+            for e in (d + 1)..n_coords {
+                let avg = 0.5 * (means[[d, e]] + means[[e, d]]);
+                means[[d, e]] = avg;
+                means[[e, d]] = avg;
+            }
+        }
+        means
+    }
+
     fn estimate_hinv_traces(
         &self,
         hop: &dyn HessianOperator,
@@ -9501,9 +9647,6 @@ impl StochasticTraceEstimator {
             return Array2::from_elem((1, 1), value);
         }
 
-        let mut t_sum = Array2::zeros((total, total));
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-
         // Get the shared X reference from the first implicit operator.
         let x_design = if n_ops > 0 {
             Some(implicit_ops[0].x_design.clone())
@@ -9529,16 +9672,9 @@ impl StochasticTraceEstimator {
         let mut implicit_n_work = Array1::<f64>::zeros(n_obs);
         let mut implicit_p_work = Array1::<f64>::zeros(p);
 
-        // NOTE: uses a fixed probe count (no adaptive stopping) because
-        // monitoring convergence of a D x D matrix of estimates is more
-        // complex than for a scalar trace. The symmetrization at the end
-        // effectively doubles the sample count for variance reduction.
-        let mut z = Array1::<f64>::zeros(p);
-        for _ in 0..self.config.n_probes_max {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-
+        self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
             // Step 1: u = H⁻¹ z (shared solve)
-            let u = hop.solve(&z);
+            let u = hop.solve(z);
 
             if let Some(ref x) = x_design {
                 design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
@@ -9651,7 +9787,7 @@ impl StochasticTraceEstimator {
                         design_val + penalty_val
                     };
 
-                    t_sum[[d, e]] += val;
+                    probe_values[[d, e]] = val;
                     if d != e {
                         // For the symmetric entry, compute u^T A_e r_d
                         let r_d = r.column(d);
@@ -9686,24 +9822,11 @@ impl StochasticTraceEstimator {
                             design_val + penalty_val
                         };
 
-                        t_sum[[e, d]] += val_sym;
+                        probe_values[[e, d]] = val_sym;
                     }
                 }
             }
-        }
-
-        // Average over probes and symmetrize.
-        let n_probes = self.config.n_probes_max as f64;
-        t_sum /= n_probes;
-
-        for d in 0..total {
-            for e in (d + 1)..total {
-                let avg = 0.5 * (t_sum[[d, e]] + t_sum[[e, d]]);
-                t_sum[[d, e]] = avg;
-                t_sum[[e, d]] = avg;
-            }
-        }
-        t_sum
+        })
     }
 
     /// Estimate the full D×D matrix of second-order traces `tr(H⁻¹ A_d H⁻¹ A_e)`
@@ -9735,16 +9858,11 @@ impl StochasticTraceEstimator {
             return Array2::from_elem((1, 1), value);
         }
 
-        let mut t_sum = Array2::zeros((total, total));
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-
         let mut q_columns = Array2::zeros((p, total));
         let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
 
-        let mut z = Array1::<f64>::zeros(p);
-        for _ in 0..self.config.n_probes_max {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let u = hop.solve(&z);
+        self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
+            let u = hop.solve(z);
 
             for e in 0..n_dense {
                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
@@ -9768,7 +9886,7 @@ impl StochasticTraceEstimator {
                     } else {
                         operators[d - n_dense].bilinear_view(r_e, u.view())
                     };
-                    t_sum[[d, e]] += val;
+                    probe_values[[d, e]] = val;
                     if d != e {
                         let r_d = r.column(d);
                         let val_sym = if e < n_dense {
@@ -9776,22 +9894,11 @@ impl StochasticTraceEstimator {
                         } else {
                             operators[e - n_dense].bilinear_view(r_d, u.view())
                         };
-                        t_sum[[e, d]] += val_sym;
+                        probe_values[[e, d]] = val_sym;
                     }
                 }
             }
-        }
-
-        let n_probes = self.config.n_probes_max as f64;
-        t_sum /= n_probes;
-        for d in 0..total {
-            for e in (d + 1)..total {
-                let avg = 0.5 * (t_sum[[d, e]] + t_sum[[e, d]]);
-                t_sum[[d, e]] = avg;
-                t_sum[[e, d]] = avg;
-            }
-        }
-        t_sum
+        })
     }
 
     fn estimate_second_order_single_dense(
@@ -9804,18 +9911,13 @@ impl StochasticTraceEstimator {
             return 0.0;
         }
 
-        let mut total = 0.0;
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-        let mut z = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
-        for _ in 0..self.config.n_probes_max {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let u = hop.solve(&z);
+        self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
+            let u = hop.solve(z);
             dense_matvec_into(matrix, z.view(), q.view_mut());
             let r = hop.solve(&q);
-            total += dense_bilinear(matrix, u.view(), r.view());
-        }
-        total / self.config.n_probes_max as f64
+            probe_values[[0, 0]] = dense_bilinear(matrix, u.view(), r.view());
+        })[[0, 0]]
     }
 
     fn estimate_second_order_single_implicit(
@@ -9828,19 +9930,15 @@ impl StochasticTraceEstimator {
             return 0.0;
         }
 
-        let mut total = 0.0;
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
         let n_obs = op.w_diag.len();
         let mut x_z = Array1::<f64>::zeros(n_obs);
         let mut x_u = Array1::<f64>::zeros(n_obs);
         let mut x_r = Array1::<f64>::zeros(n_obs);
         let mut n_work = Array1::<f64>::zeros(n_obs);
         let mut p_work = Array1::<f64>::zeros(p);
-        let mut z = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
-        for _ in 0..self.config.n_probes_max {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let u = hop.solve(&z);
+        self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
+            let u = hop.solve(z);
             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
             op.matvec_with_shared_xz_into(
                 &x_z,
@@ -9879,9 +9977,8 @@ impl StochasticTraceEstimator {
             }
             value += dense_bilinear(&op.s_psi, r.view(), u.view());
 
-            total += value;
-        }
-        total / self.config.n_probes_max as f64
+            probe_values[[0, 0]] = value;
+        })[[0, 0]]
     }
 
     fn estimate_second_order_single_operator(
@@ -9894,18 +9991,13 @@ impl StochasticTraceEstimator {
             return 0.0;
         }
 
-        let mut total = 0.0;
-        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
-        let mut z = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
-        for _ in 0..self.config.n_probes_max {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let u = hop.solve(&z);
+        self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
+            let u = hop.solve(z);
             op.mul_vec_into(z.view(), q.view_mut());
             let r = hop.solve(&q);
-            total += op.bilinear_view(r.view(), u.view());
-        }
-        total / self.config.n_probes_max as f64
+            probe_values[[0, 0]] = op.bilinear_view(r.view(), u.view());
+        })[[0, 0]]
     }
 
     /// Check the adaptive stopping criterion.
@@ -9925,6 +10017,24 @@ impl StochasticTraceEstimator {
             let variance = m2s[k] / (n_f - 1.0);
             let std_dev = variance.max(0.0).sqrt();
             let denom = sqrt_n * means[k].abs().max(self.config.tau_rel);
+            let rel_err = std_dev / denom;
+            if rel_err > self.config.relative_tol {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn check_matrix_convergence(&self, n: usize, means: &Array2<f64>, m2s: &Array2<f64>) -> bool {
+        if n < 2 {
+            return false;
+        }
+        let sqrt_n = (n as f64).sqrt();
+        let n_f = n as f64;
+        for ((d, e), &mean) in means.indexed_iter() {
+            let variance = m2s[[d, e]] / (n_f - 1.0);
+            let std_dev = variance.max(0.0).sqrt();
+            let denom = sqrt_n * mean.abs().max(self.config.tau_rel);
             let rel_err = std_dev / denom;
             if rel_err > self.config.relative_tol {
                 return false;

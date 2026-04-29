@@ -2802,13 +2802,10 @@ fn estimate_sparse_native_decision(
                 let end = (start + chunk).min(n);
                 match x_original.try_row_chunk(start..end) {
                     Ok(rows) => {
-                        nnz = nnz.saturating_add(
-                            rows.iter().filter(|v| v.abs() > 1e-12).count(),
-                        );
+                        nnz = nnz.saturating_add(rows.iter().filter(|v| v.abs() > 1e-12).count());
                     }
                     Err(_) => {
-                        nnz = nnz
-                            .saturating_add((end - start).saturating_mul(x_original.ncols()));
+                        nnz = nnz.saturating_add((end - start).saturating_mul(x_original.ncols()));
                     }
                 }
                 start = end;
@@ -3513,23 +3510,18 @@ where
     // sitting blind for tens of minutes on a single PIRLS call that will
     // never converge at the proposed log-λ. Returning an error tells the
     // outer optimizer the truth — the step was too aggressive.
-    const DEFAULT_PIRLS_MAX_SECONDS: f64 = 60.0;
-    let pirls_max_seconds = std::env::var("GAM_PIRLS_MAX_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(DEFAULT_PIRLS_MAX_SECONDS);
+    const PIRLS_MAX_SECONDS: f64 = 60.0;
     let pirls_deadline_start = std::time::Instant::now();
     let check_time_budget = |attempt_label: &str| -> Result<(), EstimationError> {
         let elapsed = pirls_deadline_start.elapsed().as_secs_f64();
-        if elapsed > pirls_max_seconds {
+        if elapsed > PIRLS_MAX_SECONDS {
             log::warn!(
-                "[PIRLS] time-budget exceeded at {attempt_label}: elapsed={elapsed:.1}s > limit={pirls_max_seconds:.1}s; \
+                "[PIRLS] time-budget exceeded at {attempt_label}: elapsed={elapsed:.1}s > limit={PIRLS_MAX_SECONDS:.1}s; \
                  returning PirlsTimeBudgetExceeded so the outer line search shrinks the step"
             );
             return Err(EstimationError::PirlsTimeBudgetExceeded {
                 elapsed_seconds: elapsed,
-                max_seconds: pirls_max_seconds,
+                max_seconds: PIRLS_MAX_SECONDS,
             });
         }
         Ok(())

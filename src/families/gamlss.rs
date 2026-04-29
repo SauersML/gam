@@ -2325,8 +2325,9 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
         let preparednoise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)
-                .expect("prepared Gaussian log-sigma design should match wiggle block construction");
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design).expect(
+                "prepared Gaussian log-sigma design should match wiggle block construction",
+            );
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
@@ -6785,16 +6786,16 @@ struct RowCoeffPair {
     coeff: Array1<f64>,
 }
 
-/// Per-call scratch buffers for `RowCoeffOperator::mul_vec`. Held under a
-/// `Mutex` so the operator stays `Send + Sync` while reusing the
-/// per-channel allocations across `mul_vec` calls. At biobank scale
-/// (`n ≈ 4·10⁵`, up to 8 channels) this saves `2 · n_ch · n` floats of
-/// allocation per call (≈6 MB for `n_ch = 8`).
+/// Pooled per-call scratch for `RowCoeffOperator::mul_vec`. Each call
+/// pops a buffer set; if the pool is empty (parallel callers exhausted
+/// it) we allocate fresh — the alloc is amortized as concurrent callers
+/// recycle. The pool's `Mutex` is taken only for `pop`/`push` (constant
+/// time), never during the matmul.
 ///
-/// **Invariant**: `u[k].len() == nrows` and `r[k].len() == nrows` for
-/// every channel `k` after construction. `mul_vec` overwrites `u` (via
-/// `fast_av_into`) and zeroes-then-accumulates `r`, leaving both buffers
-/// in any state on return — callers must not depend on residual content.
+/// **Invariant**: every buffer in `pool[k].u[ch]` and `pool[k].r[ch]` has
+/// length `nrows`. `mul_vec` overwrites `u` via `fast_av_into` and
+/// zeroes-then-accumulates `r`, leaving both buffers in any state on
+/// return — callers must not depend on residual content.
 struct RowCoeffScratch {
     u: Vec<Array1<f64>>,
     r: Vec<Array1<f64>>,
@@ -6804,7 +6805,8 @@ struct RowCoeffScratch {
 /// derivatives that decompose as `H = sum_{a,b} X_a^T diag(c_{ab}) X_b`
 /// with each `X_a` an `n × p_a` design and `c_{ab}` an `n` row coefficient
 /// vector. `mul_vec` applies the operator in O(n · sum_a p_a) per call,
-/// reusing pre-sized scratch buffers for `u`, `r`.
+/// reusing pre-sized scratch buffers for `u`, `r` from a small lock-pool
+/// so concurrent `mul_vec` callers do not serialize on the same scratch.
 ///
 /// `block_offsets` gives the starting column of each output block; the
 /// operator dimension is the sum of all block widths. Each channel's
@@ -6816,29 +6818,39 @@ struct RowCoeffOperator {
     dim: usize,
     pair_coeffs: Vec<RowCoeffPair>,
     nrows: usize,
-    scratch: std::sync::Mutex<RowCoeffScratch>,
+    scratch_pool: std::sync::Mutex<Vec<RowCoeffScratch>>,
 }
 
 impl RowCoeffOperator {
-    fn new(
-        channels: Vec<RowCoeffChannel>,
+    /// One-line constructor for the standard (channels, pair-coeffs)
+    /// recipe used by every GAMLSS LS workspace: pass the block widths,
+    /// the channel list as `(block_id, design)` tuples, and the pair
+    /// list as `(a, b, coeff)` tuples. Pre-allocates one scratch in the
+    /// pool so the first warm `mul_vec` call skips allocation.
+    fn from_directions(
         block_widths: Vec<usize>,
-        pair_coeffs: Vec<RowCoeffPair>,
+        channels: Vec<(usize, Arc<Array2<f64>>)>,
+        pairs: Vec<(usize, usize, Array1<f64>)>,
         nrows: usize,
     ) -> Self {
+        let channels: Vec<RowCoeffChannel> = channels
+            .into_iter()
+            .map(|(block, design)| RowCoeffChannel { block, design })
+            .collect();
+        let pair_coeffs: Vec<RowCoeffPair> = pairs
+            .into_iter()
+            .map(|(a, b, coeff)| RowCoeffPair { a, b, coeff })
+            .collect();
         let mut block_offsets = Vec::with_capacity(block_widths.len());
         let mut acc = 0;
         for w in &block_widths {
             block_offsets.push(acc);
             acc += *w;
         }
-        let scratch = RowCoeffScratch {
-            u: (0..channels.len())
-                .map(|_| Array1::<f64>::zeros(nrows))
-                .collect(),
-            r: (0..channels.len())
-                .map(|_| Array1::<f64>::zeros(nrows))
-                .collect(),
+        let n_ch = channels.len();
+        let initial = RowCoeffScratch {
+            u: (0..n_ch).map(|_| Array1::<f64>::zeros(nrows)).collect(),
+            r: (0..n_ch).map(|_| Array1::<f64>::zeros(nrows)).collect(),
         };
         Self {
             channels,
@@ -6847,8 +6859,33 @@ impl RowCoeffOperator {
             dim: acc,
             pair_coeffs,
             nrows,
-            scratch: std::sync::Mutex::new(scratch),
+            scratch_pool: std::sync::Mutex::new(vec![initial]),
         }
+    }
+
+    fn acquire_scratch(&self) -> RowCoeffScratch {
+        self.scratch_pool
+            .lock()
+            .expect("RowCoeffOperator scratch pool poisoned")
+            .pop()
+            .unwrap_or_else(|| {
+                let n_ch = self.channels.len();
+                RowCoeffScratch {
+                    u: (0..n_ch)
+                        .map(|_| Array1::<f64>::zeros(self.nrows))
+                        .collect(),
+                    r: (0..n_ch)
+                        .map(|_| Array1::<f64>::zeros(self.nrows))
+                        .collect(),
+                }
+            })
+    }
+
+    fn release_scratch(&self, scratch: RowCoeffScratch) {
+        self.scratch_pool
+            .lock()
+            .expect("RowCoeffOperator scratch pool poisoned")
+            .push(scratch);
     }
 }
 
@@ -6860,23 +6897,18 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.dim);
         let n = self.nrows;
-        let mut scratch = self
-            .scratch
-            .lock()
-            .expect("RowCoeffOperator scratch lock poisoned");
-        let RowCoeffScratch { u, r } = &mut *scratch;
+        let mut scratch = self.acquire_scratch();
+        let RowCoeffScratch { u, r } = &mut scratch;
 
-        // 1) u_a = X_a · v[block_a slice]. `fast_av` returns an owned
-        //    Array1; we `assign` into the pre-sized scratch buffer to
-        //    keep the buffer's capacity stable across calls (the old
-        //    contents are overwritten in place).
+        // 1) u_a = X_a · v[block_a slice]. `fast_av_into` writes directly
+        //    into the pre-sized scratch buffer — no per-call n-sized
+        //    allocation.
         for (k, ch) in self.channels.iter().enumerate() {
             let start = self.block_offsets[ch.block];
             let width = self.block_widths[ch.block];
             debug_assert_eq!(ch.design.ncols(), width);
             let v_slice = v.slice(s![start..start + width]);
-            let prod = fast_av(ch.design.as_ref(), &v_slice);
-            u[k].assign(&prod);
+            crate::faer_ndarray::fast_av_into(ch.design.as_ref(), &v_slice, &mut u[k]);
         }
 
         // 2) r_a = sum_b c_{ab} ⊙ u_b. Zero-then-accumulate; pair coeffs
@@ -6940,6 +6972,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
             let contrib = fast_atv(ch.design.as_ref(), &r[k]);
             block += &contrib;
         }
+        self.release_scratch(scratch);
         out
     }
 
@@ -7223,6 +7256,10 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
 
 /// Build a `RowCoeffOperator` for the standard two-block GAMLSS structure
 /// with one design per block and three pair coefficients (a,a), (a,b), (b,b).
+/// The resulting matrix mirrors the dense
+/// `X_a^T diag(c_aa) X_a + X_a^T diag(c_ab) X_b + X_b^T diag(c_ab) X_a + X_b^T diag(c_bb) X_b`
+/// assembly emitted by `gaussian_joint_hessian_from_designs` (Gaussian path)
+/// and the `xt_diag_*` block writers (binomial path).
 fn make_two_block_row_coeff_operator(
     x_a: Arc<Array2<f64>>,
     x_b: Arc<Array2<f64>>,
@@ -7233,34 +7270,12 @@ fn make_two_block_row_coeff_operator(
 ) -> RowCoeffOperator {
     let pa = x_a.ncols();
     let pb = x_b.ncols();
-    let channels = vec![
-        RowCoeffChannel {
-            block: 0,
-            design: x_a,
-        },
-        RowCoeffChannel {
-            block: 1,
-            design: x_b,
-        },
-    ];
-    let pair_coeffs = vec![
-        RowCoeffPair {
-            a: 0,
-            b: 0,
-            coeff: c_aa,
-        },
-        RowCoeffPair {
-            a: 0,
-            b: 1,
-            coeff: c_ab,
-        },
-        RowCoeffPair {
-            a: 1,
-            b: 1,
-            coeff: c_bb,
-        },
-    ];
-    RowCoeffOperator::new(channels, vec![pa, pb], pair_coeffs, nrows)
+    RowCoeffOperator::from_directions(
+        vec![pa, pb],
+        vec![(0, x_a), (1, x_b)],
+        vec![(0, 0, c_aa), (0, 1, c_ab), (1, 1, c_bb)],
+        nrows,
+    )
 }
 
 fn make_two_block_design_row_coeff_operator(
@@ -8228,91 +8243,42 @@ impl GaussianLocationScaleWiggleFamily {
         // `RowCoeffOperator` reproduces a_ww + a_ww^T with c = w·xi.
         let coeff_b_b1 = &rows.w * &xi;
 
-        let xmu_design: Arc<Array2<f64>> = xmu_arc;
-        let x_ls_design: Arc<Array2<f64>> = x_ls_arc;
         let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
         let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
         let basis_d2: Arc<Array2<f64>> = Arc::new(geom.basis_d2.clone());
         let pw = basis.ncols();
 
-        let channels = vec![
-            RowCoeffChannel {
-                block: 0,
-                design: xmu_design,
-            },
-            RowCoeffChannel {
-                block: 1,
-                design: x_ls_design,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d1,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d2,
-            },
-        ];
-        let pair_coeffs = vec![
-            RowCoeffPair {
-                a: 0,
-                b: 0,
-                coeff: coeff_mm_u,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 1,
-                coeff: coeff_ml_u,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 1,
-                coeff: coeff_ll_u,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 2,
-                coeff: a_u,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 3,
-                coeff: coeff_m_b1,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 4,
-                coeff: coeff_m_b2,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 2,
-                coeff: l_u,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 3,
-                coeff: coeff_ls_b1,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 2,
-                coeff: dw_u,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 3,
-                coeff: coeff_b_b1,
-            },
-        ];
-        Ok(Some(Arc::new(RowCoeffOperator::new(
-            channels,
+        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pmu, p_ls, pw],
-            pair_coeffs,
+            vec![
+                (0, xmu_arc),
+                (1, x_ls_arc),
+                (2, basis),
+                (2, basis_d1),
+                (2, basis_d2),
+            ],
+            vec![
+                // (X_mu, X_mu) ← `xt_diag_x_dense(xmu, &coeff_mm_u)`
+                (0, 0, coeff_mm_u),
+                // (X_mu, X_ls) ← `xt_diag_y_dense(xmu, &coeff_ml_u, x_ls)`
+                (0, 1, coeff_ml_u),
+                // (X_ls, X_ls) ← `xt_diag_x_dense(x_ls, &coeff_ll_u)`
+                (1, 1, coeff_ll_u),
+                // (X_mu, B) ← `xt_diag_y_dense(xmu, &a_u, &geom.basis)`
+                (0, 2, a_u),
+                // (X_mu, B') ← `xt_diag_y_dense(xmu, w·dq_dq0, basis_u=diag(ξ)·B') + xt_diag_y_dense(xmu, c_u, B')`
+                (0, 3, coeff_m_b1),
+                // (X_mu, B'') ← `xt_diag_y_dense(xmu, -m, basis1_u=diag(ξ)·B'')`
+                (0, 4, coeff_m_b2),
+                // (X_ls, B) ← `xt_diag_y_dense(x_ls, &l_u, &geom.basis)`
+                (1, 2, l_u),
+                // (X_ls, B') ← `xt_diag_y_dense(x_ls, 2κm, basis_u=diag(ξ)·B')`
+                (1, 3, coeff_ls_b1),
+                // (B, B) ← `xt_diag_x_dense(&geom.basis, &dw_u)`
+                (2, 2, dw_u),
+                // (B, B') ← a_ww + a_ww^T = B^T diag(w·ξ) B' + B'^T diag(w·ξ) B
+                (2, 3, coeff_b_b1),
+            ],
             n,
         ))))
     }
@@ -8462,116 +8428,63 @@ impl GaussianLocationScaleWiggleFamily {
         let coeff_b_b2 = &rows.w * &xi_u_xi_v;
         let coeff_b1_b1 = 2.0 * &(&rows.w * &xi_u_xi_v);
 
-        let xmu_design: Arc<Array2<f64>> = xmu_arc;
-        let x_ls_design: Arc<Array2<f64>> = x_ls_arc;
         let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
         let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
         let basis_d2: Arc<Array2<f64>> = Arc::new(geom.basis_d2.clone());
         let basis_d3: Arc<Array2<f64>> = Arc::new(geom.basis_d3.clone());
         let pw = basis.ncols();
 
-        let channels = vec![
-            RowCoeffChannel {
-                block: 0,
-                design: xmu_design,
-            },
-            RowCoeffChannel {
-                block: 1,
-                design: x_ls_design,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d1,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d2,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d3,
-            },
-        ];
-        let pair_coeffs = vec![
-            RowCoeffPair {
-                a: 0,
-                b: 0,
-                coeff: coeff_mm_uv,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 1,
-                coeff: coeff_ml_uv,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 1,
-                coeff: coeff_ll_uv,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 2,
-                coeff: a_uv,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 3,
-                coeff: coeff_m_b1,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 4,
-                coeff: coeff_m_b2,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 5,
-                coeff: coeff_m_b3,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 2,
-                coeff: l_uv,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 3,
-                coeff: coeff_ls_b1,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 4,
-                coeff: coeff_ls_b2,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 2,
-                coeff: dw_uv,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 3,
-                coeff: coeff_b_b1,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 4,
-                coeff: coeff_b_b2,
-            },
-            RowCoeffPair {
-                a: 3,
-                b: 3,
-                coeff: coeff_b1_b1,
-            },
-        ];
-        Ok(Some(Arc::new(RowCoeffOperator::new(
-            channels,
+        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pmu, p_ls, pw],
-            pair_coeffs,
+            vec![
+                (0, xmu_arc),
+                (1, x_ls_arc),
+                (2, basis),
+                (2, basis_d1),
+                (2, basis_d2),
+                (2, basis_d3),
+            ],
+            vec![
+                // (X_mu, X_mu) ← `xt_diag_x_dense(xmu, &coeff_mm_uv)`
+                (0, 0, coeff_mm_uv),
+                // (X_mu, X_ls) ← `xt_diag_y_dense(xmu, &coeff_ml_uv, x_ls)`
+                (0, 1, coeff_ml_uv),
+                // (X_ls, X_ls) ← `xt_diag_x_dense(x_ls, &coeff_ll_uv)`
+                (1, 1, coeff_ll_uv),
+                // (X_mu, B) ← `xt_diag_y_dense(xmu, &a_uv, &geom.basis)`
+                (0, 2, a_uv),
+                // (X_mu, B') ← combined `a_u·ξ_v + a_v·ξ_u + c_uv` from
+                // `xt_diag_y_dense(xmu, a_u, basis_v) + xt_diag_y_dense(xmu,
+                // a_v, basis_u) + xt_diag_y_dense(xmu, c_uv, B')`
+                (0, 3, coeff_m_b1),
+                // (X_mu, B'') ← `xt_diag_y_dense(xmu, w·dq_dq0, basis_uv) +
+                // xt_diag_y_dense(xmu, c_u, basis1_v) + xt_diag_y_dense(xmu,
+                // c_v, basis1_u)` (basis_uv = diag(ξ_uξ_v)·B'';
+                // basis1_{u,v} = diag(ξ_{u,v})·B'')
+                (0, 4, coeff_m_b2),
+                // (X_mu, B''') ← `xt_diag_y_dense(xmu, -m, basis1_uv)`
+                // with basis1_uv = diag(ξ_uξ_v)·B'''
+                (0, 5, coeff_m_b3),
+                // (X_ls, B) ← `xt_diag_y_dense(x_ls, &l_uv, &geom.basis)`
+                (1, 2, l_uv),
+                // (X_ls, B') ← combined from `xt_diag_y_dense(x_ls, l_u,
+                // basis_v) + xt_diag_y_dense(x_ls, l_v, basis_u)` =
+                // `l_u·ξ_v + l_v·ξ_u`
+                (1, 3, coeff_ls_b1),
+                // (X_ls, B'') ← `xt_diag_y_dense(x_ls, 2κm, basis_uv)` =
+                // 2κm·ξ_uξ_v
+                (1, 4, coeff_ls_b2),
+                // (B, B) ← `xt_diag_x_dense(&geom.basis, &dw_uv)`
+                (2, 2, dw_uv),
+                // (B, B') ← combined `a_iwj + a_iwj^T + a_jwi + a_jwi^T` =
+                // B^T diag(dw_u·ξ_v + dw_v·ξ_u) B' + B'^T diag(...) B
+                (2, 3, coeff_b_b1),
+                // (B, B'') ← `a_ab + a_ab^T` with a_ab = B''^T diag(w·ξ_uξ_v) B
+                (2, 4, coeff_b_b2),
+                // (B', B') ← `a_ij + a_ij^T = 2·B'^T diag(w·ξ_uξ_v) B'`;
+                // diagonal pair coeff doubles to absorb the factor of 2
+                (3, 3, coeff_b1_b1),
+            ],
             n,
         ))))
     }
@@ -18518,89 +18431,39 @@ impl BinomialLocationScaleWiggleFamily {
         let basis_d1: Arc<Array2<f64>> = Arc::new(d0);
         let basis_d2: Arc<Array2<f64>> = Arc::new(dd0);
 
-        let channels = vec![
-            RowCoeffChannel {
-                block: 0,
-                design: x_t_arc,
-            },
-            RowCoeffChannel {
-                block: 1,
-                design: x_ls_arc,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d1,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d2,
-            },
-        ];
-        let pair_coeffs = vec![
-            RowCoeffPair {
-                a: 0,
-                b: 0,
-                coeff: coeff_tt,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 1,
-                coeff: coeff_tl,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 1,
-                coeff: coeff_ll,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 2,
-                coeff: coeff_tw_b,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 3,
-                coeff: coeff_tw_d,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 4,
-                coeff: coeff_tw_dd,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 2,
-                coeff: coeff_lw_b,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 3,
-                coeff: coeff_lw_d,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 4,
-                coeff: coeff_lw_dd,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 2,
-                coeff: coeffww_bb,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 3,
-                coeff: coeffww_db,
-            },
-        ];
-        Ok(Some(Arc::new(RowCoeffOperator::new(
-            channels,
+        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
-            pair_coeffs,
+            vec![
+                (0, x_t_arc),
+                (1, x_ls_arc),
+                (2, basis),
+                (2, basis_d1),
+                (2, basis_d2),
+            ],
+            vec![
+                // (X_t, X_t)  ← `xt_diag_x_dense(&x_t, &coeff_tt)`
+                (0, 0, coeff_tt),
+                // (X_t, X_ls) ← `xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)`
+                (0, 1, coeff_tl),
+                // (X_ls, X_ls) ← `xt_diag_x_dense(&x_ls, &coeff_ll)`
+                (1, 1, coeff_ll),
+                // (X_t, B / B' / B'') ← three sub-blocks of d_h_tw =
+                // `xt_diag_y_dense(x_t, coeff_tw_b, b0) + xt_diag_y_dense(
+                //  x_t, coeff_tw_d, d0) + xt_diag_y_dense(x_t, coeff_tw_dd, dd0)`
+                (0, 2, coeff_tw_b),
+                (0, 3, coeff_tw_d),
+                (0, 4, coeff_tw_dd),
+                // (X_ls, B / B' / B'') ← analogous d_h_lw triple
+                (1, 2, coeff_lw_b),
+                (1, 3, coeff_lw_d),
+                (1, 4, coeff_lw_dd),
+                // (B, B) ← `xt_diag_x_dense(&b0, &coeffww_bb)`
+                (2, 2, coeffww_bb),
+                // (B, B') ← `xt_diag_y_dense(&d0, &coeffww_db, &b0) +
+                // xt_diag_y_dense(&b0, &coeffww_db, &d0)` =
+                // d0^T diag(c) b0 + b0^T diag(c) d0 (symmetric pair)
+                (2, 3, coeffww_db),
+            ],
             n,
         ))))
     }
@@ -18976,120 +18839,49 @@ impl BinomialLocationScaleWiggleFamily {
         let basis_d2: Arc<Array2<f64>> = Arc::new(dd0);
         let basis_d3: Arc<Array2<f64>> = Arc::new(d3_basis);
 
-        let channels = vec![
-            RowCoeffChannel {
-                block: 0,
-                design: x_t_arc,
-            },
-            RowCoeffChannel {
-                block: 1,
-                design: x_ls_arc,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d1,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d2,
-            },
-            RowCoeffChannel {
-                block: 2,
-                design: basis_d3,
-            },
-        ];
-        let pair_coeffs = vec![
-            // (X_t, X_t)  ← d2_h[a, b] += coeff_tt · xtr[a] · xtr[b]
-            RowCoeffPair {
-                a: 0,
-                b: 0,
-                coeff: coeff_tt,
-            },
-            // (X_t, X_ls) ← d2_h[a, pt+b] += coeff_tl · xtr[a] · xlsr[b]
-            RowCoeffPair {
-                a: 0,
-                b: 1,
-                coeff: coeff_tl,
-            },
-            // (X_ls, X_ls) ← d2_h[pt+a, pt+b] += coeff_ll · xlsr[a] · xlsr[b]
-            RowCoeffPair {
-                a: 1,
-                b: 1,
-                coeff: coeff_ll,
-            },
-            // (X_t, B / B' / B'' / B''') ← coeff_tw(i,j) decomposition
-            RowCoeffPair {
-                a: 0,
-                b: 2,
-                coeff: alpha_tw_b,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 3,
-                coeff: alpha_tw_d,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 4,
-                coeff: alpha_tw_dd,
-            },
-            RowCoeffPair {
-                a: 0,
-                b: 5,
-                coeff: alpha_tw_d3,
-            },
-            // (X_ls, B / B' / B'' / B''') ← coeff_lw(i,j) decomposition
-            RowCoeffPair {
-                a: 1,
-                b: 2,
-                coeff: alpha_lw_b,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 3,
-                coeff: alpha_lw_d,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 4,
-                coeff: alpha_lw_dd,
-            },
-            RowCoeffPair {
-                a: 1,
-                b: 5,
-                coeff: alpha_lw_d3,
-            },
-            // (B, B / B' / B'') ← coeff_ww(i,j,k) bilinear decomposition
-            RowCoeffPair {
-                a: 2,
-                b: 2,
-                coeff: c_ww_bb,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 3,
-                coeff: c_ww_bd,
-            },
-            RowCoeffPair {
-                a: 2,
-                b: 4,
-                coeff: c_ww_bdd,
-            },
-            // (B', B') diagonal — see formula above for the factor of 2.
-            RowCoeffPair {
-                a: 3,
-                b: 3,
-                coeff: c_ww_dd_pair,
-            },
-        ];
-        Ok(Some(Arc::new(RowCoeffOperator::new(
-            channels,
+        Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
-            pair_coeffs,
+            vec![
+                (0, x_t_arc),
+                (1, x_ls_arc),
+                (2, basis),
+                (2, basis_d1),
+                (2, basis_d2),
+                (2, basis_d3),
+            ],
+            vec![
+                // (X_t, X_t)   ← `d2_h[a, b] += coeff_tt · xtr[a] · xtr[b]`
+                (0, 0, coeff_tt),
+                // (X_t, X_ls)  ← `d2_h[a, pt+b] += coeff_tl · xtr[a] · xlsr[b]`
+                (0, 1, coeff_tl),
+                // (X_ls, X_ls) ← `d2_h[pt+a, pt+b] += coeff_ll · xlsr[a] · xlsr[b]`
+                (1, 1, coeff_ll),
+                // (X_t, B/B'/B''/B''') ← per-row α_tw_{b,d,dd,d3} decomposition of
+                // `d2_h[a, pt+pls+j] += coeff_tw(i,j) · xtr[a]` (coeff_tw is
+                // linear in br[j], dr[j], ddr[j], d3r[j])
+                (0, 2, alpha_tw_b),
+                (0, 3, alpha_tw_d),
+                (0, 4, alpha_tw_dd),
+                (0, 5, alpha_tw_d3),
+                // (X_ls, B/B'/B''/B''') ← analogous α_lw_{b,d,dd,d3} decomposition
+                // of `d2_h[pt+a, pt+pls+j] += coeff_lw(i,j) · xlsr[a]`
+                (1, 2, alpha_lw_b),
+                (1, 3, alpha_lw_d),
+                (1, 4, alpha_lw_dd),
+                (1, 5, alpha_lw_d3),
+                // (B, B/B'/B'') ← bilinear decomposition of
+                // `d2_h[pt+pls+j, pt+pls+k] += coeff_ww(i,j,k)` in
+                // (br, dr, ddr) ⊗ (br, dr, ddr); no d3r entry — coeff_ww is
+                // at most degree 2 in any single basis derivative.
+                (2, 2, c_ww_bb),
+                (2, 3, c_ww_bd),
+                (2, 4, c_ww_bdd),
+                // (B', B') diagonal — coefficient absorbs a factor of 2 to
+                // match the symmetric `dr[j]·dq0u·dr[k]·dq0v + dr[j]·dq0v·
+                // dr[k]·dq0u` cross product (the diagonal pair only
+                // accumulates once in `RowCoeffOperator::mul_vec`).
+                (3, 3, c_ww_dd_pair),
+            ],
             n,
         ))))
     }

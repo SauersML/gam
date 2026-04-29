@@ -65,11 +65,35 @@ pub(crate) struct TauTauHessianPolicy {
 }
 
 impl TauTauHessianPolicy {
+    /// True when the τ-τ exact-Hessian path cannot be assembled at all and the
+    /// eval must fall back to value-and-gradient mode (forcing
+    /// `HessianResult::Unavailable`).
+    ///
+    /// This is the *only* remaining capability gate: the previous
+    /// implementation also forced gradient-only when the design used implicit
+    /// multi-dim Duchon storage or when the dense τ-cache plan would exceed
+    /// the budget.  Both of those are now *cost* gates, not capability gates
+    /// — the unified evaluator's `prefer_outer_hessian_operator(n, p, k)`
+    /// selects the matrix-free `HessianResult::Operator` representation in
+    /// exactly the regimes where the dense cache would be unaffordable, and
+    /// the planner routes operator returns through `run_operator_trust_region`
+    /// (or basis-probes them when `dim ≤ OUTER_HVP_MATERIALIZE_MAX_DIM`).
+    /// Forcing gradient-only would have prevented the operator representation
+    /// from ever being requested, defeating that routing; hence the
+    /// `implicit_multidim_duchon` and cost-bytes clauses are deliberately
+    /// gone.
+    ///
+    /// Firth-pair-terms-unavailability remains a capability gate: when the
+    /// Firth-aware derivative provider cannot produce the τ-τ pair
+    /// corrections at all, no representation choice can substitute.  At every
+    /// production call site this flag is hardcoded `false` (the
+    /// `hphi_tau_tau_partial_apply` + `d_beta_hphi_tau_partial_apply`
+    /// primitives now cover the gap), so this method effectively returns
+    /// `false` in production.  We retain the field and method signature
+    /// unchanged so future Firth corner cases have a single, surfaced place
+    /// to land.
     pub(crate) fn prefer_gradient_only(self) -> bool {
-        self.implicit_multidim_duchon
-            || self.estimated_dense_tau_cache_bytes > self.budget_bytes
-            || self.hessian_plan.total_bytes() > self.budget_bytes
-            || self.firth_pair_terms_unavailable
+        self.firth_pair_terms_unavailable
     }
 }
 
@@ -260,7 +284,14 @@ mod tests {
     }
 
     #[test]
-    fn tau_tau_hessian_policy_prefers_gradient_only_for_implicit_multidim_duchon() {
+    fn tau_tau_hessian_policy_does_not_force_gradient_only_for_implicit_multidim_duchon() {
+        // Multi-dim Duchon implicit storage used to force gradient-only,
+        // because the τ-cache materialization plan was infeasible.  The
+        // unified evaluator now elects the matrix-free
+        // `HessianResult::Operator` representation in this regime via
+        // `prefer_outer_hessian_operator`, so the planner can route to the
+        // operator trust-region (or basis-probe to dense for small K) — the
+        // capability is preserved and gradient-only must NOT engage.
         let operator = ImplicitDesignPsiDerivative::new_streaming(
             Arc::new(array![[0.0, 0.0], [1.0, 0.2]]),
             Arc::new(array![[0.0, 0.0], [1.0, 1.0]]),
@@ -290,11 +321,16 @@ mod tests {
         let policy = super::exact_tau_tau_hessian_policy(10, 5, &[dir]);
         assert!(policy.any_has_implicit);
         assert!(policy.implicit_multidim_duchon);
-        assert!(policy.prefer_gradient_only());
+        assert!(!policy.prefer_gradient_only());
     }
 
     #[test]
-    fn tau_tau_hessian_policy_prefers_gradient_only_when_cache_budget_is_exceeded() {
+    fn tau_tau_hessian_policy_does_not_force_gradient_only_when_cache_budget_is_exceeded() {
+        // The dense τ-cache plan exceeds the budget, but cost is no longer a
+        // capability gate: the eval-side selects the matrix-free operator
+        // representation in exactly this regime, and the planner routes
+        // accordingly.  `prefer_gradient_only` must NOT force `Unavailable`
+        // here.
         let dirs = (0..16)
             .map(|_| {
                 DirectionalHyperParam::new_compact(
@@ -310,7 +346,7 @@ mod tests {
         assert!(!policy.any_has_implicit);
         assert!(policy.hessian_plan.total_bytes() > policy.budget_bytes);
         assert!(policy.hessian_plan.total_bytes() > policy.gradient_plan.total_bytes());
-        assert!(policy.prefer_gradient_only());
+        assert!(!policy.prefer_gradient_only());
     }
 
     #[test]
