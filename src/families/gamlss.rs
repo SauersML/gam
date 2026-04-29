@@ -9775,6 +9775,29 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         }
         let q = eta_mu + etaw;
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
+        // Per-row kernel emits 6 outputs (ll contribution + 5 working
+        // arrays). Independent across rows.
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let rows: Vec<(f64, f64, f64, f64, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let row = gaussian_diagonal_row_kernel(
+                    self.y[i],
+                    q[i],
+                    eta_ls[i],
+                    self.weights[i],
+                    ln2pi,
+                );
+                (
+                    row.log_likelihood,
+                    row.location_working_weight,
+                    eta_mu[i] + row.location_working_shift,
+                    etaw[i] + row.location_working_shift,
+                    row.log_sigma_working_weight,
+                    row.log_sigma_working_response,
+                )
+            })
+            .collect();
         let mut ll = 0.0;
         let mut zmu = Array1::<f64>::zeros(n);
         let mut wmu = Array1::<f64>::zeros(n);
@@ -9782,16 +9805,14 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut wls = Array1::<f64>::zeros(n);
         let mut zw = Array1::<f64>::zeros(n);
         let mut ww = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let row =
-                gaussian_diagonal_row_kernel(self.y[i], q[i], eta_ls[i], self.weights[i], ln2pi);
-            ll += row.log_likelihood;
-            wmu[i] = row.location_working_weight;
-            ww[i] = row.location_working_weight;
-            zmu[i] = eta_mu[i] + row.location_working_shift;
-            zw[i] = etaw[i] + row.location_working_shift;
-            wls[i] = row.log_sigma_working_weight;
-            zls[i] = row.log_sigma_working_response;
+        for (i, (ll_i, w_i, zmu_i, zw_i, wls_i, zls_i)) in rows.into_iter().enumerate() {
+            ll += ll_i;
+            wmu[i] = w_i;
+            ww[i] = w_i;
+            zmu[i] = zmu_i;
+            zw[i] = zw_i;
+            wls[i] = wls_i;
+            zls[i] = zls_i;
         }
 
         Ok(FamilyEvaluation {
