@@ -164,12 +164,14 @@ pub trait HessianOperator: Send + Sync {
 
     /// diag(X · G_ε(H) · Xᵀ) — the leverage corresponding to `trace_logdet_gradient`.
     /// `trace_logdet_gradient(Xᵀ diag(w) X) = Σᵢ wᵢ · h^G[i]`.
+    ///
+    /// Streams the rows of `X` through the design's `try_row_chunk` so
+    /// operator-backed (Lazy) designs never materialize the full (n×p)
+    /// block at biobank scale.
     fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
         debug_assert!(self.logdet_traces_match_hinv_kernel());
         let n = x.nrows();
         let p = x.ncols();
-        let xd = x.to_dense_arc();
-        let x_ref = xd.as_ref();
 
         let block = {
             const TARGET_CHUNK_FLOATS: usize = 1 << 16;
@@ -180,7 +182,9 @@ pub trait HessianOperator: Send + Sync {
         let mut start = 0usize;
         while start < n {
             let end = (start + block).min(n);
-            let rows = x_ref.slice(ndarray::s![start..end, ..]);
+            let rows = x.try_row_chunk(start..end).unwrap_or_else(|err| {
+                panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
+            });
             let chunk_t = rows.t().to_owned();
             let z_chunk = self.solve_multi(&chunk_t);
             for i in 0..(end - start) {
@@ -589,9 +593,10 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // where c = dW_H/dη (the Hessian-side third-derivative weight array).
         //
         // This method returns the correction (dH/dρₖ − Aₖ), which is NEGATIVE.
-        let x = self.x_transformed.to_dense_arc();
-        let x_ref = x.as_ref();
-        let x_v = crate::faer_ndarray::fast_av(x_ref, v_k); // X vₖ: n-vector
+        // Stays matrix-free: `matrixvectormultiply` and `compute_xtwx` route
+        // through the operator-backed design's chunked kernels at biobank
+        // scale, so we never materialize the full (n×p) dense block.
+        let x_v = self.x_transformed.matrixvectormultiply(v_k); // X vₖ: n-vector
 
         // Elementwise: −c ⊙ (X vₖ)
         let mut neg_c_xv = x_v;
@@ -599,8 +604,11 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
             .and(&self.c_array)
             .for_each(|xv_i, &c_i| *xv_i *= -c_i);
 
-        // −Xᵀ diag(c ⊙ Xvₖ) X via parallel SIMD GEMM
-        let result = crate::faer_ndarray::fast_xt_diag_y(x_ref, &neg_c_xv, x_ref);
+        // −Xᵀ diag(c ⊙ Xvₖ) X via the design's matrix-free weighted gram.
+        let result = self
+            .x_transformed
+            .compute_xtwx(&neg_c_xv)
+            .map_err(|e| format!("hessian_derivative_correction xtwx: {e}"))?;
 
         Ok(Some(result))
     }
@@ -614,13 +622,14 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // Second-order correction for the outer Hessian.
         // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
         //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
-        let x = self.x_transformed.to_dense_arc();
-        let x_ref = x.as_ref();
-        let x_vk = crate::faer_ndarray::fast_av(x_ref, v_k);
-        let x_vl = crate::faer_ndarray::fast_av(x_ref, v_l);
-        let x_ukl = crate::faer_ndarray::fast_av(x_ref, u_kl);
+        // Stays matrix-free via the design's `matrixvectormultiply` and
+        // `compute_xtwx` so biobank-scale designs never densify the (n×p)
+        // block.
+        let x_vk = self.x_transformed.matrixvectormultiply(v_k);
+        let x_vl = self.x_transformed.matrixvectormultiply(v_l);
+        let x_ukl = self.x_transformed.matrixvectormultiply(u_kl);
 
-        let n = x_ref.nrows();
+        let n = self.x_transformed.nrows();
         let mut weights = Array1::zeros(n);
 
         // c ⊙ X u_{kl}
@@ -638,8 +647,11 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
                 .for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
         }
 
-        // Xᵀ diag(weights) X via parallel SIMD GEMM
-        let result = crate::faer_ndarray::fast_xt_diag_y(x_ref, &weights, x_ref);
+        // Xᵀ diag(weights) X via the design's matrix-free weighted gram.
+        let result = self
+            .x_transformed
+            .compute_xtwx(&weights)
+            .map_err(|e| format!("hessian_second_derivative_correction xtwx: {e}"))?;
 
         Ok(Some(result))
     }
@@ -4668,14 +4680,14 @@ fn compute_adjoint_z_c(
     hop: &dyn HessianOperator,
     leverage: &Array1<f64>,
 ) -> Result<Array1<f64>, String> {
-    let xd = ing.x.to_dense_arc();
-    let x_ref = xd.as_ref();
     let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
     Zip::from(&mut weighted)
         .and(ing.c_array)
         .and(leverage)
         .for_each(|w, &c, &h| *w = c * h);
-    let v = crate::faer_ndarray::fast_atv(x_ref, &weighted);
+    // Matrix-free Xᵀ · weighted via DesignMatrix transpose-apply, so
+    // operator-backed (Lazy) designs at biobank scale never densify.
+    let v = ing.x.transpose_vector_multiply(&weighted);
     Ok(hop.solve(&v))
 }
 
@@ -4692,10 +4704,11 @@ fn compute_fourth_derivative_trace(
     let Some(d_array) = ing.d_array else {
         return Ok(None);
     };
-    let xd = ing.x.to_dense_arc();
-    let x_ref = xd.as_ref();
-    let x_vk = crate::faer_ndarray::fast_av(x_ref, v_k);
-    let x_vl = crate::faer_ndarray::fast_av(x_ref, v_l);
+    // Matrix-free X·v via DesignMatrix matvec; operator-backed (Lazy)
+    // designs at biobank scale stream through their chunked kernels
+    // instead of materializing the full (n×p) block.
+    let x_vk = ing.x.matrixvectormultiply(v_k);
+    let x_vl = ing.x.matrixvectormultiply(v_l);
 
     let mut acc = 0.0;
     Zip::from(d_array)
@@ -7883,14 +7896,36 @@ impl HessianOperator for DenseSpectralOperator {
         // The dominant cost at biobank scale is the (n × p)·(p × rank) matmul
         // — for matern60 with n=320K, p=101 that's ~3.3 GFLOPs and the
         // ndarray default `.dot()` runs single-threaded (no BLAS feature
-        // enabled in this crate's build), so per-eval gradient at full data
-        // spends ~600 ms here on one core. faer's matmul parallelizes across
-        // the 320K-row dimension at zero accuracy cost.
-        let xd = x.to_dense_arc();
-        let xg = crate::faer_ndarray::fast_ab(xd.as_ref(), &self.g_factor);
-        xg.outer_iter()
-            .map(|r| r.iter().map(|v| v * v).sum())
-            .collect()
+        // enabled in this crate's build), so we route through faer's parallel
+        // SIMD GEMM. For operator-backed (Lazy) designs we additionally
+        // stream by row chunk so we never materialize the full (n×p) block
+        // at biobank scale.
+        let n = x.nrows();
+        let p = x.ncols();
+        let rank = self.g_factor.ncols();
+        let mut h = Array1::<f64>::zeros(n);
+        if n == 0 || p == 0 || rank == 0 {
+            return h;
+        }
+        let chunk_rows = {
+            const TARGET_BYTES: usize = 8 * 1024 * 1024;
+            (TARGET_BYTES / ((p + rank).max(1) * 8))
+                .max(512)
+                .min(n)
+        };
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + chunk_rows).min(n);
+            let rows = x.try_row_chunk(start..end).unwrap_or_else(|err| {
+                panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
+            });
+            let xg = crate::faer_ndarray::fast_ab(&rows, &self.g_factor);
+            for (local, row) in xg.outer_iter().enumerate() {
+                h[start + local] = row.iter().map(|v| v * v).sum();
+            }
+            start = end;
+        }
+        h
     }
 
     fn trace_logdet_block_local(
