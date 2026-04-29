@@ -946,15 +946,6 @@ pub enum EstimationError {
 
     #[error("Prediction error")]
     PredictionError,
-
-    #[error(
-        "outer ARC iteration exceeded its wall-clock budget after {elapsed_seconds:.1}s \
-         (limit {max_seconds:.1}s); the outer fallback cascade should degrade to a cheaper plan."
-    )]
-    OuterTimeBudgetExceeded {
-        elapsed_seconds: f64,
-        max_seconds: f64,
-    },
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
@@ -4916,7 +4907,6 @@ mod estimate_policy_tests {
                 initial_log_delta: theta[2],
             })
             .expect("score sas state");
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let out_vec: Vec<f64> = (0..eta.len())
                 .into_par_iter()
                 .map(|i| {
@@ -4944,7 +4934,6 @@ mod estimate_policy_tests {
             "sas du / d raw epsilon at fixed eta",
         );
         let rhs = x_t.transpose_vector_multiply(&du_by_eps);
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let neg_du_deta_vec: Vec<f64> = (0..eta.len())
             .into_par_iter()
             .map(|i| {

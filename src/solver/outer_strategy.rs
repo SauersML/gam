@@ -2585,17 +2585,6 @@ fn outer_scaled_tolerance(base_tol: f64, seed_cost: f64) -> f64 {
     base_tol * (1.0 + seed_cost.abs())
 }
 
-fn time_budget_exceeded(elapsed: f64, limit: f64, iter: usize) -> EstimationError {
-    log::warn!(
-        "[ARC-timing] time-budget exceeded at iter={iter}: elapsed={elapsed:.1}s > \
-         limit={limit:.1}s; returning OuterTimeBudgetExceeded so the outer cascade degrades"
-    );
-    EstimationError::OuterTimeBudgetExceeded {
-        elapsed_seconds: elapsed,
-        max_seconds: limit,
-    }
-}
-
 fn run_operator_trust_region(
     obj: &mut dyn OuterObjective,
     seed: &Array1<f64>,
@@ -2609,12 +2598,6 @@ fn run_operator_trust_region(
     let mut x_k = project_to_bounds(seed, bounds);
     let mut eval_k = initial_eval;
     let mut trust_radius = OPERATOR_TRUST_RADIUS_INIT;
-
-    // Per-iteration wall-clock budget. When an ARC iteration's matrix-free Hv
-    // solve and trial evaluation together exceed the budget, return a dedicated
-    // `OuterTimeBudgetExceeded` so the outer fallback cascade can degrade to a
-    // cheaper plan rather than hang.
-    const ARC_MAX_SECONDS_PER_ITER: f64 = 60.0;
 
     for iter in 0..max_iter {
         let iter_start = std::time::Instant::now();
@@ -2666,13 +2649,6 @@ fn run_operator_trust_region(
                 counter.count(),
                 elapsed,
             );
-            if elapsed > ARC_MAX_SECONDS_PER_ITER {
-                return Err(time_budget_exceeded(
-                    elapsed,
-                    ARC_MAX_SECONDS_PER_ITER,
-                    iter,
-                ));
-            }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
         };
@@ -2692,13 +2668,6 @@ fn run_operator_trust_region(
                 counter.count(),
                 elapsed,
             );
-            if elapsed > ARC_MAX_SECONDS_PER_ITER {
-                return Err(time_budget_exceeded(
-                    elapsed,
-                    ARC_MAX_SECONDS_PER_ITER,
-                    iter,
-                ));
-            }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
         }
@@ -2724,13 +2693,6 @@ fn run_operator_trust_region(
                 counter.count(),
                 elapsed,
             );
-            if elapsed > ARC_MAX_SECONDS_PER_ITER {
-                return Err(time_budget_exceeded(
-                    elapsed,
-                    ARC_MAX_SECONDS_PER_ITER,
-                    iter,
-                ));
-            }
             trust_radius = (trust_radius * 0.5).max(1e-12);
             continue;
         }
@@ -2778,14 +2740,6 @@ fn run_operator_trust_region(
             hv_applies,
             elapsed,
         );
-
-        if elapsed > ARC_MAX_SECONDS_PER_ITER {
-            return Err(time_budget_exceeded(
-                elapsed,
-                ARC_MAX_SECONDS_PER_ITER,
-                iter,
-            ));
-        }
 
         trust_radius = new_trust_radius;
         if accepted {
