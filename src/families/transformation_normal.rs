@@ -4584,7 +4584,10 @@ impl TensorKroneckerPsiOperator {
         axis: usize,
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_forward(&self.response_deriv_basis, axis, &u.view())
+        // Route through directional kernel with unit basis vector e_axis.
+        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
+        unit[axis] = 1.0;
+        self.forward_directional_deriv(&unit.view(), &u.view())
     }
 
     fn transpose_mul_deriv(
@@ -4592,7 +4595,9 @@ impl TensorKroneckerPsiOperator {
         axis: usize,
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_transpose(&self.response_deriv_basis, axis, &v.view())
+        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
+        unit[axis] = 1.0;
+        self.transpose_directional_deriv(&unit.view(), &v.view())
     }
 
     fn weighted_cross_with_cov_first(
@@ -4657,7 +4662,12 @@ impl TensorKroneckerPsiOperator {
         axis_e: usize,
         u: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_forward_second(&self.response_deriv_basis, axis_d, axis_e, u)
+        let q = self.covariate_derivs.len();
+        let mut unit_d = Array1::<f64>::zeros(q);
+        let mut unit_e = Array1::<f64>::zeros(q);
+        unit_d[axis_d] = 1.0;
+        unit_e[axis_e] = 1.0;
+        self.forward_second_directional_deriv(&unit_d.view(), &unit_e.view(), u)
     }
 
     fn transpose_mul_second_deriv(
@@ -4666,7 +4676,12 @@ impl TensorKroneckerPsiOperator {
         axis_e: usize,
         v: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_transpose_second(&self.response_deriv_basis, axis_d, axis_e, v)
+        let q = self.covariate_derivs.len();
+        let mut unit_d = Array1::<f64>::zeros(q);
+        let mut unit_e = Array1::<f64>::zeros(q);
+        unit_d[axis_d] = 1.0;
+        unit_e[axis_e] = 1.0;
+        self.transpose_second_directional_deriv(&unit_d.view(), &unit_e.view(), v)
     }
 
     /// Internal directional accumulator on a chosen response basis:
@@ -4725,6 +4740,45 @@ impl TensorKroneckerPsiOperator {
             }
             let contrib = self.lifted_transpose(resp_basis, axis, residual)?;
             out.scaled_add(coef, &contrib);
+        }
+        Ok(out)
+    }
+
+    /// Internal bilinear directional accumulator on a chosen response basis:
+    /// returns `Σ_{j,k} v_psi[j] · w_psi[k] · lifted_transpose_second(resp_basis, j, k, residual)`.
+    /// Mirror of [`lifted_forward_second_directional`] for the transpose direction.
+    fn lifted_transpose_second_directional(
+        &self,
+        resp_basis: &Array2<f64>,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+        residual: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let q = self.covariate_derivs.len();
+        if v_psi.len() != q || w_psi.len() != q {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "directional ψ vectors length ({}, {}) do not match {} ψ axes",
+                v_psi.len(),
+                w_psi.len(),
+                q
+            )));
+        }
+        let p_resp = resp_basis.ncols();
+        let p_cov = self.p_cov();
+        let mut out = Array1::<f64>::zeros(p_resp * p_cov);
+        for j in 0..q {
+            let v_j = v_psi[j];
+            if v_j == 0.0 {
+                continue;
+            }
+            for k in 0..q {
+                let w_k = w_psi[k];
+                if w_k == 0.0 {
+                    continue;
+                }
+                let contrib = self.lifted_transpose_second(resp_basis, j, k, residual)?;
+                out.scaled_add(v_j * w_k, &contrib);
+            }
         }
         Ok(out)
     }
@@ -4836,6 +4890,31 @@ impl TensorKroneckerPsiOperator {
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let resp_basis = self.response_deriv_basis.clone();
         self.lifted_forward_second_directional(&resp_basis, v_psi, w_psi, beta)
+    }
+
+    /// Bilinear directional second-order transpose on the value response basis.
+    /// With `v_psi = e_a, w_psi = e_b` matches the per-axis-pair
+    /// `transpose_mul_second_diag(a)` (when a==b) or `transpose_mul_second_cross(a,b)`.
+    fn transpose_second_directional(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+        residual: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_val_basis.clone();
+        self.lifted_transpose_second_directional(&resp_basis, v_psi, w_psi, residual)
+    }
+
+    /// Bilinear directional second-order transpose on the derivative response basis.
+    /// With `v_psi = e_a, w_psi = e_b` matches `transpose_mul_second_deriv(a, b)`.
+    fn transpose_second_directional_deriv(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+        residual: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        let resp_basis = self.response_deriv_basis.clone();
+        self.lifted_transpose_second_directional(&resp_basis, v_psi, w_psi, residual)
     }
 }
 
@@ -6348,7 +6427,14 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
         v: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_transpose(&self.response_val_basis, axis, v)
+        // Per-axis trait method routes through the directional accumulator with
+        // a unit basis vector e_axis. The accumulator skips zero entries, so
+        // this loops once over `axis` and yields the same p-vector that
+        // `lifted_transpose(_, axis, v)` would, while keeping the directional
+        // kernel as a live production caller (substrate for the future HVP).
+        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
+        unit[axis] = 1.0;
+        self.transpose_directional(&unit.view(), v)
     }
 
     fn forward_mul(
@@ -6356,7 +6442,9 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
         u: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_forward(&self.response_val_basis, axis, u)
+        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
+        unit[axis] = 1.0;
+        self.forward_directional(&unit.view(), u)
     }
 
     fn transpose_mul_second_diag(
@@ -6364,7 +6452,10 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
         v: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_transpose_second(&self.response_val_basis, axis, axis, v)
+        let q = self.covariate_derivs.len();
+        let mut unit = Array1::<f64>::zeros(q);
+        unit[axis] = 1.0;
+        self.transpose_second_directional(&unit.view(), &unit.view(), v)
     }
 
     fn transpose_mul_second_cross(
@@ -6373,7 +6464,12 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis_e: usize,
         v: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_transpose_second(&self.response_val_basis, axis_d, axis_e, v)
+        let q = self.covariate_derivs.len();
+        let mut unit_d = Array1::<f64>::zeros(q);
+        let mut unit_e = Array1::<f64>::zeros(q);
+        unit_d[axis_d] = 1.0;
+        unit_e[axis_e] = 1.0;
+        self.transpose_second_directional(&unit_d.view(), &unit_e.view(), v)
     }
 
     fn forward_mul_second_diag(
@@ -6381,7 +6477,13 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis: usize,
         u: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_forward_second(&self.response_val_basis, axis, axis, u)
+        // Bilinear directional accumulator with `v_psi = w_psi = e_axis` skips
+        // every (j,k) pair except (axis, axis), so this is numerically equivalent
+        // to `lifted_forward_second(_, axis, axis, u)`.
+        let q = self.covariate_derivs.len();
+        let mut unit = Array1::<f64>::zeros(q);
+        unit[axis] = 1.0;
+        self.forward_second_directional(&unit.view(), &unit.view(), u)
     }
 
     fn forward_mul_second_cross(
@@ -6390,7 +6492,12 @@ impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
         axis_e: usize,
         u: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_forward_second(&self.response_val_basis, axis_d, axis_e, u)
+        let q = self.covariate_derivs.len();
+        let mut unit_d = Array1::<f64>::zeros(q);
+        let mut unit_e = Array1::<f64>::zeros(q);
+        unit_d[axis_d] = 1.0;
+        unit_e[axis_e] = 1.0;
+        self.forward_second_directional(&unit_d.view(), &unit_e.view(), u)
     }
 
     fn row_chunk_first(
