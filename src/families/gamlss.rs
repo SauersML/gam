@@ -4445,55 +4445,69 @@ fn binomial_location_scalesecond_directional_coefficients(
     d_eta_ls_v: &Array1<f64>,
     link_kind: &InverseLink,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
+    // Per-row second-directional coefficient computation. m4 dispatch
+    // can fail (Result), so collect a Result<Vec<(tt, tl, ll)>>.
+    let triples: Result<Vec<(f64, f64, f64)>, _> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(f64, f64, f64), _> {
+            let q = core.q0[i];
+            let r = 1.0 / core.sigma[i];
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                y[i],
+                weights[i],
+                q,
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+                link_kind,
+            );
+            let m4 = binomial_neglog_q_fourth_derivative_dispatch(
+                y[i],
+                weights[i],
+                q,
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+                link_kind,
+            )?;
+            let s = core.dsigma_deta[i] / core.sigma[i];
+            let a = d_eta_t_u[i];
+            let b = s * d_eta_ls_u[i];
+            let c = d_eta_t_v[i];
+            let d = s * d_eta_ls_v[i];
+            let du = -r * a - q * b;
+            let dv = -r * c - q * d;
+            let d2 = r * (a * d + b * c) + q * b * d;
+            let tt = r
+                * r
+                * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
+            let tl = s
+                * r
+                * (q * m4 * du * dv
+                    + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
+                    + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
+                    + m1 * b * d);
+            let ll = s
+                * s
+                * (q * q * m4 * du * dv
+                    + m3 * (q * q * d2 + 5.0 * q * du * dv)
+                    + m2 * (3.0 * q * d2 + 4.0 * du * dv)
+                    + m1 * d2);
+            Ok((tt, tl, ll))
+        })
+        .collect();
+    let triples = triples?;
     let mut coeff_tt = Array1::<f64>::zeros(n);
     let mut coeff_tl = Array1::<f64>::zeros(n);
     let mut coeff_ll = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let q = core.q0[i];
-        let r = 1.0 / core.sigma[i];
-        let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-            y[i],
-            weights[i],
-            q,
-            core.mu[i],
-            core.dmu_dq[i],
-            core.d2mu_dq2[i],
-            core.d3mu_dq3[i],
-            link_kind,
-        );
-        let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-            y[i],
-            weights[i],
-            q,
-            core.mu[i],
-            core.dmu_dq[i],
-            core.d2mu_dq2[i],
-            core.d3mu_dq3[i],
-            link_kind,
-        )?;
-        let s = core.dsigma_deta[i] / core.sigma[i];
-        let a = d_eta_t_u[i];
-        let b = s * d_eta_ls_u[i];
-        let c = d_eta_t_v[i];
-        let d = s * d_eta_ls_v[i];
-        let du = -r * a - q * b;
-        let dv = -r * c - q * d;
-        let d2 = r * (a * d + b * c) + q * b * d;
-        coeff_tt[i] =
-            r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
-        coeff_tl[i] = s
-            * r
-            * (q * m4 * du * dv
-                + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
-                + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
-                + m1 * b * d);
-        coeff_ll[i] = s
-            * s
-            * (q * q * m4 * du * dv
-                + m3 * (q * q * d2 + 5.0 * q * du * dv)
-                + m2 * (3.0 * q * d2 + 4.0 * du * dv)
-                + m1 * d2);
+    for (i, (tt, tl, ll)) in triples.into_iter().enumerate() {
+        coeff_tt[i] = tt;
+        coeff_tl[i] = tl;
+        coeff_ll[i] = ll;
     }
     Ok((coeff_tt, coeff_tl, coeff_ll))
 }
