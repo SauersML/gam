@@ -8782,11 +8782,7 @@ fn load_prediction_id_values(
             projected.values.nrows()
         ));
     }
-    let col_idx = projected
-        .headers
-        .iter()
-        .position(|name| name == id_column)
-        .ok_or_else(|| format!("id column '{id_column}' not found in prediction data"))?;
+    let col_idx = resolve_role_col(&projected.column_map(), id_column, "id")?;
     let schema_col = projected
         .schema
         .columns
