@@ -213,6 +213,44 @@ pub struct TransformationNormalFamily {
     /// and reciprocal powers behind a single exact-keyed entry instead of
     /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
     row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
+
+    /// Per-axis ψ first-derivative n-vectors `v_val[axis] = ∂(Xβ)/∂ψ[axis]` and
+    /// `v_deriv[axis] = ∂(X'β)/∂ψ[axis]`, lazily populated and reused across
+    /// the q first-order calls and q² second-order pair calls within a single
+    /// outer evaluation. Each pair call currently re-evaluates `forward_mul`
+    /// and `forward_mul_deriv` for both its axes; sharing the slots collapses
+    /// the per-axis cost from O(q²) (= 256 calls at q=16) back to O(q) (= 16).
+    /// The cache is keyed on β bit-pattern so it invalidates atomically when
+    /// the line search advances.
+    psi_axis_vector_cache: Arc<Mutex<Option<PsiAxisVectorCache>>>,
+}
+
+#[derive(Clone)]
+struct PsiAxisVectorCache {
+    beta: Arc<Array1<f64>>,
+    /// Per-axis `forward_mul(axis, β)` (value-basis). `None` slot ⇒ not yet evaluated.
+    forward_val: Vec<Option<Arc<Array1<f64>>>>,
+    /// Per-axis `forward_mul_deriv(axis, β)` (derivative-basis).
+    forward_deriv: Vec<Option<Arc<Array1<f64>>>>,
+}
+
+impl PsiAxisVectorCache {
+    fn new(beta: &Array1<f64>, q: usize) -> Self {
+        Self {
+            beta: Arc::new(beta.clone()),
+            forward_val: vec![None; q],
+            forward_deriv: vec![None; q],
+        }
+    }
+
+    fn matches_beta(&self, beta: &Array1<f64>) -> bool {
+        self.beta.len() == beta.len()
+            && self
+                .beta
+                .iter()
+                .zip(beta.iter())
+                .all(|(&cached, &candidate)| cached.to_bits() == candidate.to_bits())
+    }
 }
 
 #[derive(Clone)]
@@ -395,6 +433,7 @@ impl TransformationNormalFamily {
             policy,
             active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
             row_quantity_cache: Arc::new(Mutex::new(None)),
+            psi_axis_vector_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -547,6 +586,7 @@ impl TransformationNormalFamily {
             policy,
             active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
             row_quantity_cache: Arc::new(Mutex::new(None)),
+            psi_axis_vector_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -692,6 +732,101 @@ impl TransformationNormalFamily {
             .expect("CTN row quantity cache mutex poisoned");
         *cache = Some(row_quantities.clone());
         Ok(row_quantities)
+    }
+
+    /// Cached per-axis `forward_mul(axis, β)` against the value response basis.
+    ///
+    /// First call for a given β allocates a `PsiAxisVectorCache` with `q` empty
+    /// slots; subsequent calls for the same β bit-pattern reuse the per-slot
+    /// `Arc<Array1<f64>>`. Calls with a different β invalidate the cache and
+    /// re-allocate (the new β is the new accepted iterate or a fresh
+    /// line-search probe).
+    fn cached_psi_axis_forward_val(
+        &self,
+        op: &TensorKroneckerPsiOperator,
+        axis: usize,
+        beta: &Array1<f64>,
+    ) -> Result<Arc<Array1<f64>>, String> {
+        let q = op.covariate_derivs.len();
+        {
+            let mut cache_guard = self
+                .psi_axis_vector_cache
+                .lock()
+                .expect("CTN psi axis vector cache mutex poisoned");
+            let needs_init = match cache_guard.as_ref() {
+                Some(c) => !c.matches_beta(beta) || c.forward_val.len() != q,
+                None => true,
+            };
+            if needs_init {
+                *cache_guard = Some(PsiAxisVectorCache::new(beta, q));
+            }
+            let cache = cache_guard
+                .as_ref()
+                .expect("PsiAxisVectorCache initialized above");
+            if let Some(slot) = cache.forward_val.get(axis).and_then(|s| s.as_ref()) {
+                return Ok(Arc::clone(slot));
+            }
+        }
+        let computed = op
+            .forward_mul(axis, &beta.view())
+            .map_err(|e| format!("tensor psi forward_mul failed: {e}"))?;
+        let arc = Arc::new(computed);
+        let mut cache_guard = self
+            .psi_axis_vector_cache
+            .lock()
+            .expect("CTN psi axis vector cache mutex poisoned");
+        if let Some(cache) = cache_guard.as_mut()
+            && cache.matches_beta(beta)
+            && cache.forward_val.len() == q
+        {
+            cache.forward_val[axis] = Some(Arc::clone(&arc));
+        }
+        Ok(arc)
+    }
+
+    /// Cached per-axis `forward_mul_deriv(axis, β)` against the derivative
+    /// response basis. See [`cached_psi_axis_forward_val`] for the cache contract.
+    fn cached_psi_axis_forward_deriv(
+        &self,
+        op: &TensorKroneckerPsiOperator,
+        axis: usize,
+        beta: &Array1<f64>,
+    ) -> Result<Arc<Array1<f64>>, String> {
+        let q = op.covariate_derivs.len();
+        {
+            let mut cache_guard = self
+                .psi_axis_vector_cache
+                .lock()
+                .expect("CTN psi axis vector cache mutex poisoned");
+            let needs_init = match cache_guard.as_ref() {
+                Some(c) => !c.matches_beta(beta) || c.forward_deriv.len() != q,
+                None => true,
+            };
+            if needs_init {
+                *cache_guard = Some(PsiAxisVectorCache::new(beta, q));
+            }
+            let cache = cache_guard
+                .as_ref()
+                .expect("PsiAxisVectorCache initialized above");
+            if let Some(slot) = cache.forward_deriv.get(axis).and_then(|s| s.as_ref()) {
+                return Ok(Arc::clone(slot));
+            }
+        }
+        let computed = op
+            .forward_mul_deriv(axis, beta)
+            .map_err(|e| format!("tensor psi derivative forward_mul failed: {e}"))?;
+        let arc = Arc::new(computed);
+        let mut cache_guard = self
+            .psi_axis_vector_cache
+            .lock()
+            .expect("CTN psi axis vector cache mutex poisoned");
+        if let Some(cache) = cache_guard.as_mut()
+            && cache.matches_beta(beta)
+            && cache.forward_deriv.len() == q
+        {
+            cache.forward_deriv[axis] = Some(Arc::clone(&arc));
+        }
+        Ok(arc)
     }
 }
 
