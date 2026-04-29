@@ -614,9 +614,12 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
     # small-data behavior) AND ensure n>=2000 has weight too: that's where
     # bugs like the fast_xt_diag_x sign bug only surfaced after the faer
     # dense threshold.
+    # Bias toward small n where p / n ratio is high — under-determined
+    # regime where overfitting and predict-time monotonicity blowups
+    # surface (e.g. CTN h' = -1e15 spikes only happen below ~5*p_total).
     n_obs = choice([
-        50, 50, 50, 100, 100, 200, 200, 500, 500,
-        1000, 1000, 2000, 2000, 5000, 10000,
+        20, 25, 30, 40, 50, 50, 50, 64, 80, 100, 100, 150, 200, 200,
+        500, 500, 1000, 1000, 2000, 2000, 5000, 10000,
     ])
     n_smooths = choice([1, 1, 2, 2, 3, 3, 5, 7, 10])
     # Knot grid spans both very-low (k=3, under-smoothed) and very-high
@@ -1554,10 +1557,10 @@ def print_leaderboard(results, top_n=25):
 # ═══════════════════════════════════════════════════════════════════════════
 
 _DEPTH_DEFAULTS = {
-    "lean": 100,
-    "default": 200,
-    "deep": 500,
-    "heavy": 1000,
+    "lean": 150,
+    "default": 300,
+    "deep": 750,
+    "heavy": 1500,
 }
 
 
