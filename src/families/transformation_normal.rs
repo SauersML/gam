@@ -32,7 +32,8 @@ use crate::families::custom_family::{
     ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -6448,7 +6449,7 @@ pub fn fit_transformation_normal(
                 0.0,
                 true,
             )
-                .map_err(|e| format!("transformation fit_fn: {e}"))?;
+            .map_err(|e| format!("transformation fit_fn: {e}"))?;
             // Update warm start hints.
             if let Some(block) = fit.block_states.first() {
                 *beta_hint.borrow_mut() = Some(block.beta.clone());

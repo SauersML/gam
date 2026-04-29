@@ -84,6 +84,13 @@ use gam::survival_location_scale::{
     SurvivalLocationScalePredictInput, SurvivalLocationScaleTermSpec, TimeBlockInput,
     TimeWiggleBlockInput, predict_survival_location_scale, residual_distribution_inverse_link,
 };
+use gam::survival_predict::{
+    apply_inverse_link_state_to_fit_result, build_saved_survival_marginal_slope_predictor,
+    fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
+    resolve_survival_inverse_link_from_saved, resolve_termspec_for_prediction,
+    saved_baseline_timewiggle_components, saved_survival_location_scale_fit_result,
+    saved_survival_runtime_baseline_config,
+};
 use gam::survival_marginal_slope::{
     DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
 };
@@ -2422,40 +2429,6 @@ fn effective_predict_offset_columns<'a>(
     )
 }
 
-fn require_saved_survival_likelihood_mode(
-    model: &SavedModel,
-) -> Result<SurvivalLikelihoodMode, String> {
-    if matches!(&model.family_state, FittedFamily::LatentSurvival { .. }) {
-        return match model.survival_likelihood.as_deref() {
-            Some("latent") => Ok(SurvivalLikelihoodMode::Latent),
-            Some(other) => Err(format!(
-                "saved latent survival model has contradictory survival_likelihood metadata: expected 'latent', got '{other}'"
-            )),
-            None => Err(
-                "saved latent survival model is missing survival_likelihood=latent metadata; refit with current CLI"
-                    .to_string(),
-            ),
-        };
-    }
-    if matches!(&model.family_state, FittedFamily::LatentBinary { .. }) {
-        return match model.survival_likelihood.as_deref() {
-            Some("latent-binary") => Ok(SurvivalLikelihoodMode::LatentBinary),
-            Some(other) => Err(format!(
-                "saved latent binary model has contradictory survival_likelihood metadata: expected 'latent-binary', got '{other}'"
-            )),
-            None => Err(
-                "saved latent binary model is missing survival_likelihood=latent-binary metadata; refit with current CLI"
-                    .to_string(),
-            ),
-        };
-    }
-    let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
-        "saved survival model is missing survival_likelihood metadata; refit with current CLI"
-            .to_string()
-    })?;
-    parse_survival_likelihood_mode(raw)
-}
-
 fn resolve_predict_offsets(
     model: &SavedModel,
     data: &Dataset,
@@ -4244,17 +4217,6 @@ fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
 }
 
-fn saved_survival_runtime_baseline_config(
-    model: &SavedModel,
-    likelihood_mode: SurvivalLikelihoodMode,
-) -> Result<SurvivalBaselineConfig, String> {
-    if likelihood_mode == SurvivalLikelihoodMode::Weibull && !baseline_timewiggle_is_present(model)
-    {
-        return parse_survival_baseline_config("linear", None, None, None, None);
-    }
-    survival_baseline_config_from_model(model)
-}
-
 fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
 ) -> Result<Option<LinkWiggleFormulaSpec>, String> {
@@ -4266,22 +4228,6 @@ fn saved_baseline_timewiggle_spec(
             double_penalty: saved.double_penalty,
         })
     })
-}
-
-fn saved_baseline_timewiggle_components(
-    eta_entry: &Array1<f64>,
-    eta_exit: &Array1<f64>,
-    derivative_exit: &Array1<f64>,
-    model: &SavedModel,
-) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
-    // Delegate to the library-side helper (single source of truth for the
-    // timewiggle-design rebuild).
-    gam::survival_predict::saved_baseline_timewiggle_components(
-        eta_entry,
-        eta_exit,
-        derivative_exit,
-        model,
-    )
 }
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
@@ -7417,67 +7363,6 @@ fn summarizewiggle_domain(
     })
 }
 
-fn remap_term_collectionspec_columns(
-    spec: &TermCollectionSpec,
-    training_headers: &[String],
-    pred_col_map: &HashMap<String, usize>,
-) -> Result<TermCollectionSpec, String> {
-    let mut out = spec.clone();
-    let resolve_training_index = |idx: usize| -> Result<usize, String> {
-        let name = training_headers
-            .get(idx)
-            .ok_or_else(|| format!("saved training column index {idx} is out of bounds"))?;
-        pred_col_map
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("prediction data is missing required column '{name}'"))
-    };
-
-    for lt in &mut out.linear_terms {
-        lt.feature_col = resolve_training_index(lt.feature_col)?;
-    }
-    for rt in &mut out.random_effect_terms {
-        rt.feature_col = resolve_training_index(rt.feature_col)?;
-    }
-    for st in &mut out.smooth_terms {
-        match &mut st.basis {
-            SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                *feature_col = resolve_training_index(*feature_col)?;
-            }
-            SmoothBasisSpec::ThinPlate { feature_cols, .. }
-            | SmoothBasisSpec::Matern { feature_cols, .. }
-            | SmoothBasisSpec::Duchon { feature_cols, .. }
-            | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
-                for c in feature_cols.iter_mut() {
-                    *c = resolve_training_index(*c)?;
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn resolve_termspec_for_prediction(
-    modelspec: &Option<TermCollectionSpec>,
-    training_headers: Option<&Vec<String>>,
-    col_map: &HashMap<String, usize>,
-    spec_label: &str,
-) -> Result<TermCollectionSpec, String> {
-    let saved = modelspec.as_ref().ok_or_else(|| {
-        format!(
-            "model is missing {spec_label}; refit with the current CLI to guarantee train/predict design consistency"
-        )
-    })?;
-    validate_frozen_term_collectionspec(saved, spec_label)?;
-    let headers = training_headers.ok_or_else(|| {
-        "model is missing training_headers; refit with the current CLI to guarantee stable feature mapping at prediction time"
-            .to_string()
-    })?;
-    let remapped = remap_term_collectionspec_columns(saved, headers, col_map)?;
-    validate_frozen_term_collectionspec(&remapped, spec_label)?;
-    Ok(remapped)
-}
-
 fn build_location_scale_saved_model(
     formula: String,
     family: String,
@@ -7766,47 +7651,6 @@ fn fixed_hazard_multiplier_from_saved_family(
                 .to_string(),
         ),
     }
-}
-
-fn build_saved_survival_marginal_slope_predictor(
-    model: &SavedModel,
-    fit_saved: &UnifiedFitResult,
-    z_name: &str,
-    z: &Array1<f64>,
-    cov_design: &DesignMatrix,
-    logslope_design: &DesignMatrix,
-    time_build: &SurvivalTimeBuildOutput,
-    eta_offset_entry: &Array1<f64>,
-    eta_offset_exit: &Array1<f64>,
-    derivative_offset_exit: &Array1<f64>,
-    primary_offset: &Array1<f64>,
-    noise_offset: &Array1<f64>,
-) -> Result<
-    (
-        gam::predict::BernoulliMarginalSlopePredictor,
-        PredictInput,
-        UnifiedFitResult,
-    ),
-    String,
-> {
-    // Delegate to the library-side helper so the CLI's `gam predict` and the
-    // library's `predict_survival` share bit-identical predictor / pred_input
-    // assembly (link-deviation + score-warp blocks plumbed through the same
-    // code path).
-    gam::survival_predict::build_saved_survival_marginal_slope_predictor(
-        model,
-        fit_saved,
-        z_name,
-        z,
-        cov_design,
-        logslope_design,
-        time_build,
-        eta_offset_entry,
-        eta_offset_exit,
-        derivative_offset_exit,
-        primary_offset,
-        noise_offset,
-    )
 }
 
 fn build_bernoulli_marginal_slope_saved_model(
@@ -9098,138 +8942,6 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
         let dist = parse_survival_distribution(&args.survival_distribution)?;
         Ok(residual_distribution_inverse_link(dist))
     }
-}
-
-fn apply_inverse_link_state_to_fit_result(
-    fit_result: &mut UnifiedFitResult,
-    inverse_link: &InverseLink,
-) {
-    let link = match inverse_link {
-        InverseLink::LatentCLogLog(state) => FittedLinkState::LatentCLogLog { state: *state },
-        InverseLink::Sas(state) => FittedLinkState::Sas {
-            state: state.clone(),
-            covariance: None,
-        },
-        InverseLink::BetaLogistic(state) => FittedLinkState::BetaLogistic {
-            state: state.clone(),
-            covariance: None,
-        },
-        InverseLink::Mixture(state) => FittedLinkState::Mixture {
-            state: state.clone(),
-            covariance: None,
-        },
-        InverseLink::Standard(_) => FittedLinkState::Standard(None),
-    };
-    fit_result.fitted_link = link;
-}
-
-fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, String> {
-    let raw = model
-        .link
-        .as_deref()
-        .or(model.survival_distribution.as_deref())
-        .ok_or_else(|| "saved survival model is missing link/distribution metadata".to_string())?;
-    let name = raw.trim().to_ascii_lowercase();
-    if name == "loglog" || name == "cauchit" {
-        let component = if name == "loglog" {
-            LinkComponent::LogLog
-        } else {
-            LinkComponent::Cauchit
-        };
-        return state_fromspec(&MixtureLinkSpec {
-            components: vec![component],
-            initial_rho: Array1::zeros(0),
-        })
-        .map(InverseLink::Mixture)
-        .map_err(|e| format!("invalid saved survival {name} link state: {e}"));
-    }
-    let choice = match parse_link_choice(Some(raw), false) {
-        Ok(v) => v,
-        Err(_) => {
-            let dist = parse_survival_distribution(raw)?;
-            return Ok(residual_distribution_inverse_link(dist));
-        }
-    };
-    let fit = model
-        .fit_result
-        .as_ref()
-        .ok_or_else(|| "saved survival model is missing fit_result".to_string())?;
-    let Some(choice) = choice else {
-        let dist = parse_survival_distribution(raw)?;
-        return Ok(residual_distribution_inverse_link(dist));
-    };
-    if let Some(components) = choice.mixture_components {
-        let rho = match &fit.fitted_link {
-            FittedLinkState::Mixture { state, .. } => state.rho.clone(),
-            _ => {
-                return Err(
-                    "saved survival blended-link model missing fitted mixture link parameters"
-                        .to_string(),
-                );
-            }
-        };
-        return state_fromspec(&MixtureLinkSpec {
-            components,
-            initial_rho: rho,
-        })
-        .map(InverseLink::Mixture)
-        .map_err(|e| format!("invalid saved survival blended link state: {e}"));
-    }
-    match choice.link {
-        LinkFunction::Sas => {
-            let (epsilon, log_delta) = match &fit.fitted_link {
-                FittedLinkState::Sas { state, .. } => (state.epsilon, state.log_delta),
-                _ => {
-                    return Err(
-                        "saved survival SAS model missing fitted SAS link parameters".to_string(),
-                    );
-                }
-            };
-            state_from_sasspec(SasLinkSpec {
-                initial_epsilon: epsilon,
-                initial_log_delta: log_delta,
-            })
-            .map(InverseLink::Sas)
-            .map_err(|e| format!("invalid saved survival SAS state: {e}"))
-        }
-        LinkFunction::BetaLogistic => {
-            let (epsilon, delta) = match &fit.fitted_link {
-                FittedLinkState::BetaLogistic { state, .. } => {
-                    (state.epsilon, state.log_delta)
-                }
-                _ => {
-                    return Err(
-                        "saved survival beta-logistic model missing fitted beta-logistic link parameters"
-                            .to_string(),
-                    )
-                }
-            };
-            state_from_beta_logisticspec(SasLinkSpec {
-                initial_epsilon: epsilon,
-                initial_log_delta: delta,
-            })
-            .map(InverseLink::BetaLogistic)
-            .map_err(|e| format!("invalid saved survival beta-logistic state: {e}"))
-        }
-        other => Ok(InverseLink::Standard(other)),
-    }
-}
-
-fn saved_survival_location_scale_fit_result(
-    model: &SavedModel,
-) -> Result<UnifiedFitResult, String> {
-    model.saved_prediction_runtime()?;
-    let mut fit = model
-        .fit_result
-        .as_ref()
-        .ok_or_else(|| {
-            "saved location-scale survival model is missing canonical fit_result payload"
-                .to_string()
-        })?
-        .clone();
-    let inverse_link = resolve_survival_inverse_link_from_saved(model)?;
-    apply_inverse_link_state_to_fit_result(&mut fit, &inverse_link);
-    Ok(fit)
 }
 
 fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
