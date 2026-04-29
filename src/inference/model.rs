@@ -1744,8 +1744,8 @@ impl FittedModel {
 
     /// Build a validated predictor for the saved model shape and runtime.
     ///
-    /// Survival models still go through specialised top-level prediction
-    /// assembly because they need time-basis construction from saved metadata.
+    /// Survival callers build the time-basis design from saved metadata before
+    /// handing prediction to the same trait-level machinery.
     pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
         let runtime = self.saved_prediction_runtime().ok()?;
         match self.predict_model_class() {

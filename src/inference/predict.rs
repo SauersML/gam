@@ -3073,10 +3073,9 @@ impl PredictableModel for SurvivalPredictor {
         fit: &UnifiedFitResult,
         confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        // Survival models are routed through run_predict_survival, not the
-        // unified path, so bounds are computed there.  The eta_se here covers
-        // only the threshold block and cannot produce correct survival-
-        // probability intervals without also propagating sigma uncertainty.
+        // The eta_se here covers only the threshold block. Response-scale
+        // survival intervals also need sigma uncertainty, which is propagated
+        // by the caller when it requests full interval output.
         //
         // Validation target for this survival posterior-mean path:
         // compare against 50K Monte Carlo draws from N(beta_hat, V) for a
