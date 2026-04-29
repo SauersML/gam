@@ -6219,14 +6219,33 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
+    let exact_spatial_adaptive_fixed_point_disabled = !analytic_outer_hessian_available;
+    let outer_max_iter = crate::custom_family::cost_gated_first_order_max_iter(
+        options.max_iter,
+        base_family.coefficient_gradient_cost(std::slice::from_ref(&blockspec)),
+        analytic_outer_hessian_available,
+    );
+    if exact_spatial_adaptive_fixed_point_disabled {
+        log::info!(
+            "[OUTER] exact spatial adaptive regularization: exact outer Hessian unavailable; \
+             using analytic-gradient BFGS directly instead of HybridEFS"
+        );
+    }
+    if outer_max_iter < options.max_iter {
+        log::info!(
+            "[OUTER] exact spatial adaptive regularization: first-order work gate reduced outer_max_iter {} -> {}",
+            options.max_iter,
+            outer_max_iter,
+        );
+    }
     // Keep the exact outer Hessian whenever the adaptive family can provide it.
     // The Charbonnier pseudo-Laplace surface mixes ordinary log-lambda
-    // coordinates with adaptive λ/ε coordinates; downgrading dense designs to
-    // BFGS throws away the only curvature information that keeps those blocks
-    // synchronized. On small dense Duchon fits the rank-2 BFGS approximation can
-    // accept a flat/stalled point with near-zero operator lambdas, producing the
-    // catastrophic holdout R² gaps caught by the fuzzer. Cost control belongs in
-    // the Hessian representation, not in a solver downgrade at this call site.
+    // coordinates with adaptive λ/ε coordinates; exact curvature is the best
+    // route when available. When the Hessian is cost-gated away, do not use
+    // HybridEFS as a substitute: its ψ fixed-point direction can stagnate on
+    // the adaptive λ/ε block, and this call site intentionally keeps the
+    // fallback ladder disabled. Route directly to the analytic-gradient solver
+    // under the same work gate used by the custom-family path.
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -6234,10 +6253,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         } else {
             Derivative::Unavailable
         })
+        .with_disable_fixed_point(exact_spatial_adaptive_fixed_point_disabled)
         .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
-        .with_max_iter(options.max_iter)
+        .with_max_iter(outer_max_iter)
         .with_seed_config(crate::seeding::SeedConfig::default())
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(initial_theta.clone());
