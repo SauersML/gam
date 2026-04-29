@@ -1734,12 +1734,10 @@ impl CustomFamily for TransformationNormalFamily {
                     .to_string()
             })?;
         let axis = deriv.implicit_axis;
-        let v_val = op
-            .forward_mul(axis, &beta.view())
-            .map_err(|e| format!("tensor psi forward_mul failed: {e}"))?;
-        let v_deriv = op
-            .forward_mul_deriv(axis, beta)
-            .map_err(|e| format!("tensor psi derivative forward_mul failed: {e}"))?;
+        let v_val_arc = self.cached_psi_axis_forward_val(op, axis, beta)?;
+        let v_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis, beta)?;
+        let v_val: &Array1<f64> = v_val_arc.as_ref();
+        let v_deriv: &Array1<f64> = v_deriv_arc.as_ref();
 
         let obj_psi = {
             let weights = self.weights.as_ref();
@@ -1753,13 +1751,13 @@ impl CustomFamily for TransformationNormalFamily {
             let term1 = op
                 .transpose_mul(axis, &weighted_h.view())
                 .map_err(|e| format!("tensor psi transpose_mul failed: {e}"))?;
-            let weighted_v_val = &v_val * self.weights.as_ref();
+            let weighted_v_val = v_val * self.weights.as_ref();
             let term2 = self.x_val_kron.transpose_mul(&weighted_v_val);
             let term3 = op
                 .transpose_mul_deriv(axis, &weighted_inv_h_prime)
                 .map_err(|e| format!("tensor psi derivative transpose_mul failed: {e}"))?
                 .mapv(|v| -v);
-            let w_deriv = &v_deriv * &weighted_inv_h_prime_sq;
+            let w_deriv = v_deriv * &weighted_inv_h_prime_sq;
             let term4 = self.x_deriv_kron.transpose_mul(&w_deriv);
             term1 + &term2 + &term3 + &term4
         };
@@ -1785,7 +1783,7 @@ impl CustomFamily for TransformationNormalFamily {
                 .map_err(|e| format!("tensor psi weighted_cross(derivative) failed: {e}"))?;
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
-            let w_cubic = ((&v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            let w_cubic = ((v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic, &self.policy);
 
             sym_val + &sym_deriv + &cubic_term
@@ -1843,12 +1841,10 @@ impl CustomFamily for TransformationNormalFamily {
         let axis_i = deriv_i.implicit_axis;
         let axis_j = deriv_j.implicit_axis;
 
-        let v_i_val = op
-            .forward_mul(axis_i, &beta.view())
-            .map_err(|e| format!("tensor psi second-order forward_mul(i) failed: {e}"))?;
-        let v_j_val = op
-            .forward_mul(axis_j, &beta.view())
-            .map_err(|e| format!("tensor psi second-order forward_mul(j) failed: {e}"))?;
+        let v_i_val_arc = self.cached_psi_axis_forward_val(op, axis_i, beta)?;
+        let v_j_val_arc = self.cached_psi_axis_forward_val(op, axis_j, beta)?;
+        let v_i_val: &Array1<f64> = v_i_val_arc.as_ref();
+        let v_j_val: &Array1<f64> = v_j_val_arc.as_ref();
         let v_ij_val = if axis_i == axis_j {
             op.forward_mul_second_diag(axis_i, &beta.view())
         } else {
@@ -1856,12 +1852,10 @@ impl CustomFamily for TransformationNormalFamily {
         }
         .map_err(|e| format!("tensor psi second-order forward_mul(value second) failed: {e}"))?;
 
-        let v_i_deriv = op
-            .forward_mul_deriv(axis_i, beta)
-            .map_err(|e| format!("tensor psi second-order forward_mul_deriv(i) failed: {e}"))?;
-        let v_j_deriv = op
-            .forward_mul_deriv(axis_j, beta)
-            .map_err(|e| format!("tensor psi second-order forward_mul_deriv(j) failed: {e}"))?;
+        let v_i_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis_i, beta)?;
+        let v_j_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis_j, beta)?;
+        let v_i_deriv: &Array1<f64> = v_i_deriv_arc.as_ref();
+        let v_j_deriv: &Array1<f64> = v_j_deriv_arc.as_ref();
         let v_ij_deriv = op
             .forward_mul_second_deriv(axis_i, axis_j, &beta.view())
             .map_err(|e| {
@@ -1883,10 +1877,10 @@ impl CustomFamily for TransformationNormalFamily {
 
         let score_psi_psi = {
             let term1 = op
-                .transpose_mul(axis_i, &(&v_j_val * self.weights.as_ref()).view())
+                .transpose_mul(axis_i, &(v_j_val * self.weights.as_ref()).view())
                 .map_err(|e| format!("tensor psi second-order transpose_mul(i) failed: {e}"))?;
             let term2 = op
-                .transpose_mul(axis_j, &(&v_i_val * self.weights.as_ref()).view())
+                .transpose_mul(axis_j, &(v_i_val * self.weights.as_ref()).view())
                 .map_err(|e| format!("tensor psi second-order transpose_mul(j) failed: {e}"))?;
             let term3 = if axis_i == axis_j {
                 op.transpose_mul_second_diag(axis_i, &weighted_h.view())
@@ -1900,12 +1894,12 @@ impl CustomFamily for TransformationNormalFamily {
                 .x_val_kron
                 .transpose_mul(&(&v_ij_val * self.weights.as_ref()));
             let term5 = op
-                .transpose_mul_deriv(axis_i, &(&v_j_deriv * &weighted_inv_h_prime_sq))
+                .transpose_mul_deriv(axis_i, &(v_j_deriv * &weighted_inv_h_prime_sq))
                 .map_err(|e| {
                     format!("tensor psi second-order transpose_mul_deriv(i) failed: {e}")
                 })?;
             let term6 = op
-                .transpose_mul_deriv(axis_j, &(&v_i_deriv * &weighted_inv_h_prime_sq))
+                .transpose_mul_deriv(axis_j, &(v_i_deriv * &weighted_inv_h_prime_sq))
                 .map_err(|e| {
                     format!("tensor psi second-order transpose_mul_deriv(j) failed: {e}")
                 })?;
@@ -1918,7 +1912,7 @@ impl CustomFamily for TransformationNormalFamily {
             let term8 = self
                 .x_deriv_kron
                 .transpose_mul(&(&v_ij_deriv * &weighted_inv_h_prime_sq));
-            let cubic = ((&v_i_deriv * &v_j_deriv) * inv_h_prime_cu * self.weights.as_ref())
+            let cubic = ((v_i_deriv * v_j_deriv) * inv_h_prime_cu * self.weights.as_ref())
                 .mapv(|v| -2.0 * v);
             let term9 = self.x_deriv_kron.transpose_mul(&cubic);
             term1 + &term2 + &term3 + &term4 + &term5 + &term6 + &term7 + &term8 + &term9
@@ -2001,8 +1995,7 @@ impl CustomFamily for TransformationNormalFamily {
                 policy,
             )?;
 
-            let cubic_i =
-                ((&v_j_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            let cubic_i = ((v_j_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
                 resp_deriv,
                 &cov_i,
@@ -2020,8 +2013,7 @@ impl CustomFamily for TransformationNormalFamily {
                 policy,
             )?;
 
-            let cubic_j =
-                ((&v_i_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            let cubic_j = ((v_i_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
                 resp_deriv,
                 &cov_j,
@@ -2043,7 +2035,7 @@ impl CustomFamily for TransformationNormalFamily {
                 ((&v_ij_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &self.x_deriv_kron.weighted_gram(&cubic_second, policy);
 
-            let quartic = ((&v_i_deriv * &v_j_deriv) * inv_h_prime_qu * self.weights.as_ref())
+            let quartic = ((v_i_deriv * v_j_deriv) * inv_h_prime_qu * self.weights.as_ref())
                 .mapv(|v| 6.0 * v);
             hess += &self.x_deriv_kron.weighted_gram(&quartic, policy);
             0.5 * (&hess + &hess.t())
@@ -2122,9 +2114,8 @@ impl CustomFamily for TransformationNormalFamily {
             })?;
         let axis = deriv.implicit_axis;
 
-        let v_deriv = op
-            .forward_mul_deriv(axis, beta)
-            .map_err(|e| format!("tensor psi hessian drift forward_mul_deriv failed: {e}"))?;
+        let v_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis, beta)?;
+        let v_deriv: &Array1<f64> = v_deriv_arc.as_ref();
         let d_v_deriv = op.forward_mul_deriv(axis, d_beta_flat).map_err(|e| {
             format!("tensor psi hessian drift directional forward_mul_deriv failed: {e}")
         })?;
@@ -2160,7 +2151,7 @@ impl CustomFamily for TransformationNormalFamily {
         hess += &self.x_deriv_kron.weighted_gram(&cubic_v, &self.policy);
 
         let quartic =
-            ((&v_deriv * &d_h_prime) * &inv_h_prime_qu * self.weights.as_ref()).mapv(|v| 6.0 * v);
+            ((v_deriv * &d_h_prime) * &inv_h_prime_qu * self.weights.as_ref()).mapv(|v| 6.0 * v);
         hess += &self.x_deriv_kron.weighted_gram(&quartic, &self.policy);
 
         Ok(Some(0.5 * (&hess + &hess.t())))
@@ -2214,7 +2205,7 @@ impl CustomFamily for TransformationNormalFamily {
         ))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // CTN's coefficient-space joint Hessian is supplied as a matrix-free Hv
         // operator: `exact_newton_joint_hessian_workspace` above unconditionally
         // returns a `TransformationNormalJointHessianWorkspace` for any single
@@ -3661,12 +3652,27 @@ impl KroneckerDesign {
             // `ctn_active_set_certificate_matches_full_grid_when_bound_passes`
             // will catch any drift.
             if alpha_active.is_finite() && cache.min_inactive_margin > alpha_active * lipschitz {
+                log::info!(
+                    "[STAGE] CTN monotonicity certificate hit |A|={} m_inactive={:.3e} \
+                     α_A·L={:.3e} → α={:.3e} (skipped n·n_grid={} pair scan)",
+                    cache.active_pairs.len(),
+                    cache.min_inactive_margin,
+                    alpha_active * lipschitz,
+                    alpha_active,
+                    n * n_grid,
+                );
                 return alpha_active;
             }
         }
 
         // Cache stale or certificate failed: refresh the active set in the
         // same full-grid scan that computes the exact boundary step.
+        log::info!(
+            "[STAGE] CTN monotonicity certificate miss (cache_fresh={}) → full grid scan \
+             over {} (i,g) pairs",
+            cache_fresh,
+            n * n_grid,
+        );
         Self::scan_kronecker_boundary_and_refresh_cache(
             response_grid,
             c,
