@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use ndarray::Array1;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use crate::estimate::{BlockRole, PredictInput};
@@ -271,7 +272,6 @@ pub fn build_predict_input_for_model(
             // (β₁(x), γ_j(x), A_k(x), running h'_lb) is fully thread-local —
             // no shared mutable state — so this is a straight rayon
             // par_iter().fold/reduce over min.
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let resp_transform_ref = &resp_transform;
             let beta_mat_ref = &beta_mat;
             let cov_mat_ref = &cov_mat;
@@ -331,21 +331,28 @@ pub fn build_predict_input_for_model(
                 ));
             }
 
-            let mut h = ndarray::Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let resp_row = resp_val.row(i);
-                let cov_row = cov_mat.row(i);
-                let mut val = 0.0;
-                for r in 0..p_resp {
-                    if resp_row[r] == 0.0 {
-                        continue;
+            // h_i = Σ_{r,c} resp_row[i,r] · cov_row[i,c] · β_mat[r,c]
+            //     = resp_row[i] · (β_mat · cov_row[i])
+            // The bilinear form is independent across i, so par_map_collect.
+            let h_vec: Vec<f64> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let resp_row = resp_val.row(i);
+                    let cov_row = cov_mat.row(i);
+                    let mut val = 0.0;
+                    for r in 0..p_resp {
+                        let a = resp_row[r];
+                        if a == 0.0 {
+                            continue;
+                        }
+                        for c in 0..p_cov {
+                            val += a * cov_row[c] * beta_mat[[r, c]];
+                        }
                     }
-                    for c in 0..p_cov {
-                        val += resp_row[r] * cov_row[c] * beta_mat[[r, c]];
-                    }
-                }
-                h[i] = val;
-            }
+                    val
+                })
+                .collect();
+            let h = ndarray::Array1::<f64>::from_vec(h_vec);
             Ok(PredictInput {
                 design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
                 offset: h + offset,
