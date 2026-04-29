@@ -6897,8 +6897,12 @@ impl RowCoeffOperator {
             .unwrap_or_else(|| {
                 let n_ch = self.channels.len();
                 RowCoeffScratch {
-                    u: (0..n_ch).map(|_| Array1::<f64>::zeros(self.nrows)).collect(),
-                    r: (0..n_ch).map(|_| Array1::<f64>::zeros(self.nrows)).collect(),
+                    u: (0..n_ch)
+                        .map(|_| Array1::<f64>::zeros(self.nrows))
+                        .collect(),
+                    r: (0..n_ch)
+                        .map(|_| Array1::<f64>::zeros(self.nrows))
+                        .collect(),
                 }
             })
     }
