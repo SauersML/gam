@@ -13797,6 +13797,14 @@ impl CustomFamily for BinomialLocationScaleFamily {
         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
+    fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        let rho_dim: usize = specs.iter().map(|spec| spec.penalties.len()).sum();
+        if rho_dim > 12 {
+            return 20_000_000_000;
+        }
+        self.coefficient_hessian_cost(specs) / 2
+    }
+
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
@@ -21857,6 +21865,15 @@ mod tests {
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             crate::custom_family::ExactOuterDerivativeOrder::First
+        );
+        assert_eq!(family.coefficient_gradient_cost(&specs), 20_000_000_000);
+        assert_eq!(
+            crate::custom_family::cost_gated_first_order_max_iter(
+                BlockwiseFitOptions::default().outer_max_iter,
+                family.coefficient_gradient_cost(&specs),
+                false,
+            ),
+            4
         );
         let (_gradient, hessian) = crate::custom_family::custom_family_outer_derivatives(
             &family,
