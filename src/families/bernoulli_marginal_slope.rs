@@ -7748,7 +7748,7 @@ fn build_blockspec(
     }
 }
 
-fn build_aux_blockspec(
+pub(crate) fn build_deviation_aux_blockspec(
     name: &str,
     prepared: &DeviationPrepared,
     rho: Array1<f64>,
@@ -7764,6 +7764,41 @@ fn build_aux_blockspec(
         })
         .transpose()?;
     block.intospec(name)
+}
+
+pub(crate) fn push_deviation_aux_blockspecs(
+    blocks: &mut Vec<ParameterBlockSpec>,
+    rho: &Array1<f64>,
+    cursor: &mut usize,
+    score_warp_prepared: Option<&DeviationPrepared>,
+    link_dev_prepared: Option<&DeviationPrepared>,
+    score_warp_beta_hint: Option<Array1<f64>>,
+    link_dev_beta_hint: Option<Array1<f64>>,
+) -> Result<(), String> {
+    if let Some(prepared) = score_warp_prepared {
+        let rho_h = rho
+            .slice(s![*cursor..*cursor + prepared.block.penalties.len()])
+            .to_owned();
+        *cursor += prepared.block.penalties.len();
+        blocks.push(build_deviation_aux_blockspec(
+            "score_warp_dev",
+            prepared,
+            rho_h,
+            score_warp_beta_hint,
+        )?);
+    }
+    if let Some(prepared) = link_dev_prepared {
+        let rho_w = rho
+            .slice(s![*cursor..*cursor + prepared.block.penalties.len()])
+            .to_owned();
+        blocks.push(build_deviation_aux_blockspec(
+            "link_dev",
+            prepared,
+            rho_w,
+            link_dev_beta_hint,
+        )?);
+    }
+    Ok(())
 }
 
 fn inner_fit(
@@ -7929,29 +7964,15 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 hints.logslope_beta.clone(),
             ),
         ];
-        if let Some(ref prepared) = score_warp_prepared {
-            let rho_h = rho
-                .slice(s![cursor..cursor + prepared.block.penalties.len()])
-                .to_owned();
-            cursor += prepared.block.penalties.len();
-            blocks.push(build_aux_blockspec(
-                "score_warp_dev",
-                prepared,
-                rho_h,
-                hints.score_warp_beta.clone(),
-            )?);
-        }
-        if let Some(ref prepared) = link_dev_prepared {
-            let rho_w = rho
-                .slice(s![cursor..cursor + prepared.block.penalties.len()])
-                .to_owned();
-            blocks.push(build_aux_blockspec(
-                "link_dev",
-                prepared,
-                rho_w,
-                hints.link_dev_beta.clone(),
-            )?);
-        }
+        push_deviation_aux_blockspecs(
+            &mut blocks,
+            rho,
+            &mut cursor,
+            score_warp_prepared.as_ref(),
+            link_dev_prepared.as_ref(),
+            hints.score_warp_beta.clone(),
+            hints.link_dev_beta.clone(),
+        )?;
         Ok(blocks)
     };
 

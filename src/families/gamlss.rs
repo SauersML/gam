@@ -7102,6 +7102,47 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         trace
     }
 
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.dim);
+        let cols = factor.ncols();
+        if cols == 0 {
+            return 0.0;
+        }
+
+        let f_a = factor.slice(s![0..self.pa, ..]);
+        let f_b = factor.slice(s![self.pa..self.dim, ..]);
+        let key_a = crate::solver::estimate::reml::unified::ProjectedFactorKey::from_factor_view(
+            Arc::as_ptr(&self.x_a) as usize,
+            f_a,
+        );
+        let key_b = crate::solver::estimate::reml::unified::ProjectedFactorKey::from_factor_view(
+            Arc::as_ptr(&self.x_b) as usize,
+            f_b,
+        );
+        let u_a = cache.get_or_insert_with(key_a, || fast_ab(self.x_a.as_ref(), &f_a));
+        let u_b = cache.get_or_insert_with(key_b, || fast_ab(self.x_b.as_ref(), &f_b));
+
+        let mut trace = 0.0;
+        for row in 0..self.nrows {
+            let mut aa = 0.0;
+            let mut ab = 0.0;
+            let mut bb = 0.0;
+            for col in 0..cols {
+                let ua = u_a[[row, col]];
+                let ub = u_b[[row, col]];
+                aa += ua * ua;
+                ab += ua * ub;
+                bb += ub * ub;
+            }
+            trace += self.c_aa[row] * aa + 2.0 * self.c_ab[row] * ab + self.c_bb[row] * bb;
+        }
+        trace
+    }
+
     fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
         debug_assert!(start + cols <= self.dim);
