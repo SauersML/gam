@@ -2431,12 +2431,16 @@ pub fn run_logit_polya_gamma_gibbs(
             }
 
             // Build Xweighted = diag(sqrt(ω)) X and compute X^T Ω X via faer GEMM.
-            for i in 0..n {
-                let s = omega[i].sqrt();
-                for j in 0..p {
-                    xw[[i, j]] = x[[i, j]] * s;
-                }
-            }
+            // Per-row scaling is fully independent across rows.
+            ndarray::Zip::indexed(xw.rows_mut())
+                .and(x.rows())
+                .and(&omega)
+                .par_for_each(|_idx, mut xw_row, x_row, omega_i| {
+                    let s = omega_i.sqrt();
+                    for j in 0..p {
+                        xw_row[j] = x_row[j] * s;
+                    }
+                });
             fast_ata_into(&xw, &mut xt_omega_x);
 
             q.assign(&penalty);
