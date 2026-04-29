@@ -50,9 +50,9 @@ use gam::inference::formula_dsl::{
     validate_marginal_slope_z_column_exclusion,
 };
 use gam::inference::model::{
-    DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
-    ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
-    load_survival_time_basis_config_from_model,
+    ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
+    SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
@@ -374,6 +374,8 @@ struct PredictArgs {
     offset_column: Option<String>,
     #[arg(long = "noise-offset-column")]
     noise_offset_column: Option<String>,
+    #[arg(long = "id-column")]
+    id_column: Option<String>,
     #[arg(long = "uncertainty", default_value_t = false)]
     uncertainty: bool,
     #[arg(long = "level", default_value_t = 0.95)]
@@ -706,12 +708,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.advance_secondary_workflow(1);
     progress.advance_workflow(1);
 
-    let col_map: HashMap<String, usize> = ds
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
+    let col_map = ds.column_map();
 
     let y_col = *col_map
         .get(&parsed.response)
@@ -2241,13 +2238,16 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let schema = model.require_data_schema()?;
     progress.set_stage("predict", "loading new data");
     let ds = load_datasetwith_schema(&args.new_data, schema)?;
+    let id_values = args
+        .id_column
+        .as_ref()
+        .map(|id_column| {
+            load_prediction_id_values(&args.new_data, id_column, ds.values.nrows())
+                .map(|values| (id_column.clone(), values))
+        })
+        .transpose()?;
     progress.advance_workflow(2);
-    let col_map: HashMap<String, usize> = ds
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
+    let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("predict", "building prediction matrices");
     let (effective_offset_column, effective_noise_offset_column) =
@@ -2271,6 +2271,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         effective_noise_offset_column.is_some(),
     );
     if result.is_ok() {
+        if let Some((id_column, values)) = id_values.as_ref() {
+            prepend_id_column_to_prediction_csv(&args.out, id_column, values)?;
+        }
         progress.advance_workflow(5);
         progress.finish_progress("prediction complete");
     }
@@ -3354,12 +3357,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_schema(&args.data, schema)?;
     progress.advance_workflow(2);
-    let col_map: HashMap<String, usize> = ds
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
+    let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     let y_col = *col_map
         .get(&parsed.response)
@@ -3672,12 +3670,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let requested_columns = required_columns_for_survival(&args, &parsed)?;
     let ds = load_dataset_projected(&args.data, &requested_columns)?;
     progress.advance_workflow(1);
-    let col_map: HashMap<String, usize> = ds
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
+    let col_map = ds.column_map();
 
     let entry_col = *col_map
         .get(&args.entry)
@@ -5373,12 +5366,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     progress.set_stage("sample", "loading sampling data");
     let ds = load_datasetwith_schema(&args.data, schema)?;
     progress.advance_workflow(2);
-    let col_map: HashMap<String, usize> = ds
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
+    let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     let family = model.likelihood();
     let n_base_params = model
@@ -6166,12 +6154,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     progress.set_stage("generate", "loading conditioning data");
     let ds = load_datasetwith_schema(&args.data, schema)?;
     progress.advance_workflow(2);
-    let col_map: HashMap<String, usize> = ds
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
+    let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(&model);
     let (generate_offset, generate_noise_offset) = resolve_predict_offsets(
@@ -6375,12 +6358,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         let ds = load_datasetwith_schema(data_path, schema)?;
         progress.advance_workflow(2);
 
-        let col_map: HashMap<String, usize> = ds
-            .headers
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h.clone(), i))
-            .collect();
+        let col_map = ds.column_map();
         let training_headers = model.training_headers.as_ref();
         let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(&model);
         let parsed = parse_formula(&model.formula)?;
