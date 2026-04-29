@@ -93,6 +93,8 @@ class SurvivalPrediction:
     survival: Any | None = None
     cumulative_hazard: Any | None = None
     linear_predictor: Any | None = None
+    id_column: str | None = None
+    row_ids: Sequence[str] | None = None
 
     def _coerce_times(self, times: Any) -> Any:
         import numpy as np
@@ -295,7 +297,10 @@ class SurvivalPrediction:
         times_arr = self._coerce_times(times)
         with Path(path).open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["row", "time", "survival"])
+            if self.id_column is not None and self.row_ids is not None:
+                writer.writerow(["row", self.id_column, "time", "survival"])
+            else:
+                writer.writerow(["row", "time", "survival"])
             for row_slice, time_slice, block in self.survival_at_chunks(
                 times_arr,
                 people_chunk=people_chunk,
@@ -305,7 +310,17 @@ class SurvivalPrediction:
                 for local_row, values in enumerate(block):
                     row_index = row_slice.start + local_row
                     for time, survival in zip(time_block, values, strict=True):
-                        writer.writerow([row_index, float(time), float(survival)])
+                        if self.id_column is not None and self.row_ids is not None:
+                            writer.writerow(
+                                [
+                                    row_index,
+                                    self.row_ids[row_index],
+                                    float(time),
+                                    float(survival),
+                                ]
+                            )
+                        else:
+                            writer.writerow([row_index, float(time), float(survival)])
         return str(path)
 
     def _survival_block(self, params: Any, times_arr: Any) -> Any:
@@ -329,6 +344,7 @@ class Model:
         *,
         interval: float | None = None,
         return_type: str | None = None,
+        id_column: str | None = None,
     ) -> Any:
         """Predict from ``data``.
 
@@ -348,6 +364,7 @@ class Model:
           grid.
         """
         headers, rows, table_kind = normalize_table(data)
+        row_ids = _extract_row_ids(headers, rows, id_column)
         payload: dict[str, Any] = {"interval": interval}
         # For survival models we auto-supply a default time grid built
         # from the exit/entry columns in the prediction frame so that
@@ -369,7 +386,11 @@ class Model:
 
         # Structured survival payload: dense hazard/survival grid.
         if parsed.get("class") == "survival_prediction":
-            return _survival_prediction_from_ffi_payload(parsed)
+            return _survival_prediction_from_ffi_payload(
+                parsed,
+                id_column=id_column,
+                row_ids=row_ids,
+            )
 
         columns = _ordered_prediction_columns(parsed["columns"])
         model_class = str(parsed.get("model_class") or self._model_class_from_summary())
@@ -377,18 +398,41 @@ class Model:
         if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
             import numpy as np
 
-            return np.asarray(_transformation_normal_z(columns), dtype=float)
+            z = np.asarray(_transformation_normal_z(columns), dtype=float)
+            if id_column is None:
+                return z
+            return restore_output_table(
+                {id_column: row_ids or [], "z": z.tolist()},
+                requested=return_type,
+                input_kind=table_kind,
+                training_kind=self._training_table_kind,
+            )
 
         if model_class == "bernoulli marginal-slope":
             import numpy as np
 
-            return np.clip(
+            probs = np.clip(
                 np.asarray(columns.get("mean", []), dtype=float), 0.0, 1.0
+            )
+            if id_column is None:
+                return probs
+            return restore_output_table(
+                {id_column: row_ids or [], "mean": probs.tolist()},
+                requested=return_type,
+                input_kind=table_kind,
+                training_kind=self._training_table_kind,
             )
 
         if model_class in _SURVIVAL_MODEL_CLASSES:
-            return _survival_prediction_from_columns(model_class, columns)
+            return _survival_prediction_from_columns(
+                model_class,
+                columns,
+                id_column=id_column,
+                row_ids=row_ids,
+            )
 
+        if id_column is not None:
+            columns = {id_column: row_ids or [], **columns}
         return restore_output_table(
             columns,
             requested=return_type,
@@ -660,8 +704,25 @@ def _validate_survival_chunk_size(value: int, name: str) -> int:
     return chunk
 
 
+def _extract_row_ids(
+    headers: list[str],
+    rows: list[list[str]],
+    id_column: str | None,
+) -> list[str] | None:
+    if id_column is None:
+        return None
+    if id_column not in headers:
+        raise ValueError(f"id_column '{id_column}' is missing from prediction data")
+    index = headers.index(id_column)
+    return [row[index] for row in rows]
+
+
 def _survival_prediction_from_columns(
-    model_class: str, columns: dict[str, list[float]]
+    model_class: str,
+    columns: dict[str, list[float]],
+    *,
+    id_column: str | None = None,
+    row_ids: Sequence[str] | None = None,
 ) -> SurvivalPrediction:
     import numpy as np
 
@@ -684,11 +745,16 @@ def _survival_prediction_from_columns(
         parameters=stacked,
         parameter_names=tuple(parameter_names),
         baseline_times=baseline_arr,
+        id_column=id_column,
+        row_ids=row_ids,
     )
 
 
 def _survival_prediction_from_ffi_payload(
     parsed: dict[str, Any],
+    *,
+    id_column: str | None = None,
+    row_ids: Sequence[str] | None = None,
 ) -> SurvivalPrediction:
     """Build a :class:`SurvivalPrediction` from the FFI's dense payload."""
     import numpy as np
@@ -721,6 +787,8 @@ def _survival_prediction_from_ffi_payload(
         survival=survival,
         cumulative_hazard=cumulative,
         linear_predictor=linear_predictor if linear_predictor.size else None,
+        id_column=id_column,
+        row_ids=row_ids,
     )
 
 
