@@ -22,14 +22,14 @@ use crate::families::latent_survival::{
 };
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_location_scale::{
-    DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalLocationScaleTermFitResult,
-    SurvivalLocationScaleTermSpec, fit_survival_location_scale_terms,
+    SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
+    fit_survival_location_scale_terms,
     fit_survival_location_scale_terms_with_selected_wiggle,
     select_survival_link_wiggle_basis_from_pilot,
 };
 use crate::families::survival_marginal_slope::{
-    DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeFitResult,
-    SurvivalMarginalSlopeTermSpec, fit_survival_marginal_slope_terms,
+    SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec,
+    fit_survival_marginal_slope_terms,
 };
 use crate::families::transformation_normal::{
     TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
@@ -877,16 +877,16 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-    append_zero_tail_columns, build_latent_survival_baseline_offsets,
-    build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
-    build_survival_time_basis, build_survival_timewiggle_from_baseline,
+    add_survival_time_derivative_guard_offset, append_zero_tail_columns,
+    build_latent_survival_baseline_offsets, build_survival_time_basis,
+    build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
     marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
     optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
     parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    resolved_survival_time_basis_config_from_build,
+    resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::families::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
@@ -1201,45 +1201,12 @@ struct PreparedWorkflowSurvivalTimeStack {
     timewiggle_block: Option<TimeWiggleBlockInput>,
 }
 
-fn add_workflow_survival_time_derivative_guard_offset(
-    age_entry: &Array1<f64>,
-    age_exit: &Array1<f64>,
-    anchor_time: f64,
-    derivative_guard: f64,
-    eta_offset_entry: &mut Array1<f64>,
-    eta_offset_exit: &mut Array1<f64>,
-    derivative_offset_exit: &mut Array1<f64>,
-) -> Result<(), String> {
-    if derivative_guard <= 0.0 {
-        return Ok(());
-    }
-    let n = age_entry.len();
-    if age_exit.len() != n
-        || eta_offset_entry.len() != n
-        || eta_offset_exit.len() != n
-        || derivative_offset_exit.len() != n
-    {
-        return Err("workflow survival derivative-guard offset lengths must match".to_string());
-    }
-    // Parallel per-row update — each component is independent across i.
-    ndarray::Zip::from(&mut *eta_offset_entry)
-        .and(&mut *eta_offset_exit)
-        .and(&mut *derivative_offset_exit)
-        .and(age_entry)
-        .and(age_exit)
-        .par_for_each(|e_entry, e_exit, d_exit, &t_entry, &t_exit| {
-            *e_entry += derivative_guard * (t_entry - anchor_time);
-            *e_exit += derivative_guard * (t_exit - anchor_time);
-            *d_exit += derivative_guard;
-        });
-    Ok(())
-}
-
 fn prepare_workflow_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,
     likelihood_mode: SurvivalLikelihoodMode,
+    inverse_link: Option<&InverseLink>,
     time_anchor: f64,
     derivative_guard: f64,
     time_build: &crate::families::survival_construction::SurvivalTimeBuildOutput,
@@ -1266,11 +1233,13 @@ fn prepare_workflow_survival_time_stack(
         )
     } else {
         let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-            if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-                build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)?
-            } else {
-                build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)?
-            };
+            build_survival_time_offsets_for_likelihood(
+                age_entry,
+                age_exit,
+                baseline_cfg,
+                likelihood_mode,
+                inverse_link,
+            )?;
         let n = age_entry.len();
         (
             eta_offset_entry,
@@ -1281,7 +1250,7 @@ fn prepare_workflow_survival_time_stack(
             Array1::zeros(n),
         )
     };
-    add_workflow_survival_time_derivative_guard_offset(
+    add_survival_time_derivative_guard_offset(
         age_entry,
         age_exit,
         time_anchor,
