@@ -11,7 +11,7 @@ use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
-    add_scaled_coeff4, eval_coeff4_at, probit_frailty_scale, scale_coeff4,
+    CoeffSupport, SparsePrimaryCoeffJetView, eval_coeff4_at, probit_frailty_scale, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -1846,300 +1846,21 @@ struct ObservedDenestedCellPartials {
     dc_dbbb: [f64; 4],
 }
 
-#[derive(Clone, Copy)]
-struct CoeffSupport {
-    include_b: bool,
-    include_h: bool,
-    include_w: bool,
-}
-
-impl CoeffSupport {
-    #[inline]
-    fn without_b(self) -> Self {
-        Self {
-            include_b: false,
-            ..self
-        }
-    }
-}
-
 const COEFF_SUPPORT_BHW: CoeffSupport = CoeffSupport {
-    include_b: true,
+    include_primary: true,
     include_h: true,
     include_w: true,
 };
 const COEFF_SUPPORT_BW: CoeffSupport = CoeffSupport {
-    include_b: true,
+    include_primary: true,
     include_h: false,
     include_w: true,
 };
 const COEFF_SUPPORT_W: CoeffSupport = CoeffSupport {
-    include_b: false,
+    include_primary: false,
     include_h: false,
     include_w: true,
 };
-
-// Sparse coefficient jet for the flexible primary coordinates `(q, b, h, w)`.
-// Only the `b` axis couples to other primary blocks:
-//   - score-warp coefficients are affine in `b`
-//   - link-deviation coefficients are cubic in `(a, b)`
-// so there are no `hh`, `hw`, or `ww` families to maintain by hand.
-struct SparsePrimaryCoeffJetView<'a> {
-    b_index: usize,
-    h_range: Option<std::ops::Range<usize>>,
-    w_range: Option<std::ops::Range<usize>>,
-    first: &'a [[f64; 4]],
-    a_first: &'a [[f64; 4]],
-    b_first: &'a [[f64; 4]],
-    aa_first: &'a [[f64; 4]],
-    ab_first: &'a [[f64; 4]],
-    bb_first: &'a [[f64; 4]],
-    aaa_first: &'a [[f64; 4]],
-    aab_first: &'a [[f64; 4]],
-    abb_first: &'a [[f64; 4]],
-    bbb_first: &'a [[f64; 4]],
-}
-
-impl<'a> SparsePrimaryCoeffJetView<'a> {
-    fn new(
-        h_range: Option<&std::ops::Range<usize>>,
-        w_range: Option<&std::ops::Range<usize>>,
-        first: &'a [[f64; 4]],
-        a_first: &'a [[f64; 4]],
-        b_first: &'a [[f64; 4]],
-        aa_first: &'a [[f64; 4]],
-        ab_first: &'a [[f64; 4]],
-        bb_first: &'a [[f64; 4]],
-        aaa_first: &'a [[f64; 4]],
-        aab_first: &'a [[f64; 4]],
-        abb_first: &'a [[f64; 4]],
-        bbb_first: &'a [[f64; 4]],
-    ) -> Self {
-        Self {
-            b_index: 1,
-            h_range: h_range.cloned(),
-            w_range: w_range.cloned(),
-            first,
-            a_first,
-            b_first,
-            aa_first,
-            ab_first,
-            bb_first,
-            aaa_first,
-            aab_first,
-            abb_first,
-            bbb_first,
-        }
-    }
-
-    #[inline]
-    fn in_h_range(&self, idx: usize) -> bool {
-        self.h_range
-            .as_ref()
-            .map(|range| range.contains(&idx))
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn in_w_range(&self, idx: usize) -> bool {
-        self.w_range
-            .as_ref()
-            .map(|range| range.contains(&idx))
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn param_supported(&self, idx: usize, support: CoeffSupport) -> bool {
-        (support.include_b && idx == self.b_index)
-            || (support.include_h && self.in_h_range(idx))
-            || (support.include_w && self.in_w_range(idx))
-    }
-
-    fn directional_family(
-        &self,
-        family: &[[f64; 4]],
-        dir: &Array1<f64>,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        let mut out = [0.0; 4];
-        if support.include_b {
-            add_scaled_coeff4(&mut out, &family[self.b_index], dir[self.b_index]);
-        }
-        if support.include_h {
-            if let Some(h_range) = self.h_range.as_ref() {
-                for idx in h_range.clone() {
-                    add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
-                }
-            }
-        }
-        if support.include_w {
-            if let Some(w_range) = self.w_range.as_ref() {
-                for idx in w_range.clone() {
-                    add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
-                }
-            }
-        }
-        out
-    }
-
-    fn mixed_directional_from_b_family(
-        &self,
-        family: &[[f64; 4]],
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        let mut out = [0.0; 4];
-        let dir_u_b = dir_u[self.b_index];
-        let dir_v_b = dir_v[self.b_index];
-        if support.include_b {
-            add_scaled_coeff4(&mut out, &family[self.b_index], dir_u_b * dir_v_b);
-        }
-        if support.include_h {
-            if let Some(h_range) = self.h_range.as_ref() {
-                for idx in h_range.clone() {
-                    add_scaled_coeff4(
-                        &mut out,
-                        &family[idx],
-                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
-                    );
-                }
-            }
-        }
-        if support.include_w {
-            if let Some(w_range) = self.w_range.as_ref() {
-                for idx in w_range.clone() {
-                    add_scaled_coeff4(
-                        &mut out,
-                        &family[idx],
-                        dir_u_b * dir_v[idx] + dir_v_b * dir_u[idx],
-                    );
-                }
-            }
-        }
-        out
-    }
-
-    fn param_directional_from_b_family(
-        &self,
-        family: &[[f64; 4]],
-        param: usize,
-        dir: &Array1<f64>,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        if param == self.b_index {
-            return self.directional_family(family, dir, support);
-        }
-        if self.param_supported(param, support.without_b()) {
-            let mut out = [0.0; 4];
-            add_scaled_coeff4(&mut out, &family[param], dir[self.b_index]);
-            return out;
-        }
-        [0.0; 4]
-    }
-
-    fn param_mixed_from_bb_family(
-        &self,
-        family: &[[f64; 4]],
-        param: usize,
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        if param == self.b_index {
-            return self.mixed_directional_from_b_family(family, dir_u, dir_v, support);
-        }
-        if self.param_supported(param, support.without_b()) {
-            let mut out = [0.0; 4];
-            add_scaled_coeff4(
-                &mut out,
-                &family[param],
-                dir_u[self.b_index] * dir_v[self.b_index],
-            );
-            return out;
-        }
-        [0.0; 4]
-    }
-
-    fn pair_from_b_family(
-        &self,
-        family: &[[f64; 4]],
-        u: usize,
-        v: usize,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        if u == self.b_index && v == self.b_index {
-            if support.include_b {
-                return family[self.b_index];
-            }
-            return [0.0; 4];
-        }
-        if u == self.b_index && self.param_supported(v, support.without_b()) {
-            return family[v];
-        }
-        if v == self.b_index && self.param_supported(u, support.without_b()) {
-            return family[u];
-        }
-        [0.0; 4]
-    }
-
-    fn pair_directional_from_bb_family(
-        &self,
-        family: &[[f64; 4]],
-        u: usize,
-        v: usize,
-        dir: &Array1<f64>,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        if u == self.b_index && v == self.b_index {
-            return self.directional_family(family, dir, support);
-        }
-        if u == self.b_index && self.param_supported(v, support.without_b()) {
-            let mut out = [0.0; 4];
-            add_scaled_coeff4(&mut out, &family[v], dir[self.b_index]);
-            return out;
-        }
-        if v == self.b_index && self.param_supported(u, support.without_b()) {
-            let mut out = [0.0; 4];
-            add_scaled_coeff4(&mut out, &family[u], dir[self.b_index]);
-            return out;
-        }
-        [0.0; 4]
-    }
-
-    fn pair_mixed_from_bbb_family(
-        &self,
-        family: &[[f64; 4]],
-        u: usize,
-        v: usize,
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-        support: CoeffSupport,
-    ) -> [f64; 4] {
-        if u == self.b_index && v == self.b_index {
-            return self.mixed_directional_from_b_family(family, dir_u, dir_v, support);
-        }
-        if u == self.b_index && self.param_supported(v, support.without_b()) {
-            let mut out = [0.0; 4];
-            add_scaled_coeff4(
-                &mut out,
-                &family[v],
-                dir_u[self.b_index] * dir_v[self.b_index],
-            );
-            return out;
-        }
-        if v == self.b_index && self.param_supported(u, support.without_b()) {
-            let mut out = [0.0; 4];
-            add_scaled_coeff4(
-                &mut out,
-                &family[u],
-                dir_u[self.b_index] * dir_v[self.b_index],
-            );
-            return out;
-        }
-        [0.0; 4]
-    }
-}
 
 struct BernoulliExactNewtonAccumulator {
     ll: f64,
@@ -3742,6 +3463,7 @@ impl BernoulliMarginalSlopeFamily {
 
             if need_hessian {
                 let coeff_jet = SparsePrimaryCoeffJetView::new(
+                    1,
                     h_range,
                     w_range,
                     &coeff_u,
@@ -3839,6 +3561,7 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         let g_jet = SparsePrimaryCoeffJetView::new(
+            1,
             h_range,
             w_range,
             &g_u_fixed,
@@ -4154,6 +3877,7 @@ impl BernoulliMarginalSlopeFamily {
             }
 
             let coeff_jet = SparsePrimaryCoeffJetView::new(
+                1,
                 h_range,
                 w_range,
                 &coeff_u,
@@ -4373,6 +4097,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let g_jet = SparsePrimaryCoeffJetView::new(
+            1,
             h_range,
             w_range,
             &g_u_fixed,
@@ -4688,6 +4413,7 @@ impl BernoulliMarginalSlopeFamily {
             }
 
             let coeff_jet = SparsePrimaryCoeffJetView::new(
+                1,
                 h_range,
                 w_range,
                 &coeff_u,
@@ -5144,6 +4870,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let g_jet = SparsePrimaryCoeffJetView::new(
+            1,
             h_range,
             w_range,
             &g_u_fixed,
