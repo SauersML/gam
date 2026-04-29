@@ -6242,17 +6242,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             "[OUTER] spatial-adaptive exact REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
         );
     }
-    // Mirror the policy used for `fit_custom_family` (custom_family.rs:11279)
-    // and the κ-joint outer (smooth.rs:12274). The automatic fallback ladder
-    // degrades to BFGS+BfgsApprox after a Strong-Wolfe iter-0 failure, and
-    // those rank-2 updates are directionally wrong on the Charbonnier-penalized
-    // pseudo-Laplace surface — see the proof sketch in custom_family.rs:11241.
-    // On the second adaptive pass (after κ★ shifts the geometry, with the
-    // pass-1 (λ★, ε★) still serving as the warm start) the primary BFGS plan
-    // can stall on a Wolfe-degenerate first step; a degraded fallback then
-    // exhausts max_iter through every seed instead of surfacing the failure,
-    // burning the full job budget on directionally wrong updates. Disable the
-    // fallback so the optimizer commits to its principled plan.
+    // The automatic fallback ladder degrades to BFGS+BfgsApprox after a
+    // Strong-Wolfe iter-0 failure; those rank-2 updates are directionally
+    // wrong on the Charbonnier-penalized pseudo-Laplace surface, so the
+    // optimizer grinds the BFGS TrustRegion fallback for the full max_iter
+    // budget instead of surfacing failure (geo_disease_matern 42-min hang).
+    // The ψ-stagnation guard in OuterFixedPointBridge only fires on the
+    // HybridEFS path, not on the BFGS-degraded path that this scenario
+    // actually hits.
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -6261,14 +6258,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Derivative::Unavailable
         })
         .with_prefer_gradient_only(prefer_gradient_only)
-        // Re-enable the automatic fallback ladder for the spatial-adaptive
-        // custom-family path. The original disable was for the geo-bench
-        // fallback bug; the ψ-stagnation guard in OuterFixedPointBridge
-        // (`MAX_CONSECUTIVE_PSI_STAGNATION`) now surfaces the
-        // first-order-fallback marker when ψ stationarity cannot be
-        // enforced, so the ladder routes correctly to BFGS instead of
-        // grinding HybridEFS on the Charbonnier surface.
-        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Automatic)
+        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(options.max_iter)
