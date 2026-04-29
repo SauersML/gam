@@ -262,6 +262,10 @@ struct TransformationNormalRowQuantityCache {
     inv_h_prime_sq: Arc<Array1<f64>>,
     inv_h_prime_cu: Arc<Array1<f64>>,
     inv_h_prime_qu: Arc<Array1<f64>>,
+    weighted_h: Arc<Array1<f64>>,
+    weighted_inv_h_prime: Arc<Array1<f64>>,
+    weighted_inv_h_prime_sq: Arc<Array1<f64>>,
+    log_likelihood: f64,
 }
 
 impl TransformationNormalRowQuantityCache {
