@@ -32,8 +32,9 @@
 //! Cholesky-based logdet while gradient uses eigendecomposition-based traces
 //! with a different numerical threshold.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, ArrayViewMut2, Zip};
-use std::sync::{Arc, OnceLock};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
@@ -1307,6 +1308,14 @@ pub trait HyperOperator: Send + Sync {
             .sum()
     }
 
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &ProjectedFactorCache,
+    ) -> f64 {
+        self.trace_projected_factor(factor)
+    }
+
     /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
     ///
     /// Sparse exact traces build `B E` in column batches. Operators with
@@ -1376,6 +1385,60 @@ pub trait HyperOperator: Send + Sync {
     /// computations instead of O(p²).
     fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
         None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectedFactorKey {
+    design_id: usize,
+    factor_ptr: usize,
+    rows: usize,
+    cols: usize,
+    row_stride: isize,
+    col_stride: isize,
+}
+
+impl ProjectedFactorKey {
+    pub fn from_factor_view(design_id: usize, factor: ArrayView2<'_, f64>) -> Self {
+        let strides = factor.strides();
+        Self {
+            design_id,
+            factor_ptr: factor.as_ptr() as usize,
+            rows: factor.nrows(),
+            cols: factor.ncols(),
+            row_stride: strides[0],
+            col_stride: strides[1],
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ProjectedFactorCache {
+    entries: Mutex<HashMap<ProjectedFactorKey, Arc<Array2<f64>>>>,
+}
+
+impl ProjectedFactorCache {
+    pub fn get_or_insert_with(
+        &self,
+        key: ProjectedFactorKey,
+        compute: impl FnOnce() -> Array2<f64>,
+    ) -> Arc<Array2<f64>> {
+        if let Some(value) = self
+            .entries
+            .lock()
+            .expect("projected factor cache lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return value;
+        }
+
+        let computed = Arc::new(compute());
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("projected factor cache lock poisoned");
+        entries.entry(key).or_insert_with(|| computed.clone()).clone()
     }
 }
 
@@ -1545,6 +1608,30 @@ impl HyperOperator for CompositeHyperOperator {
         }
         for op in &self.operators {
             trace += op.trace_projected_factor(factor);
+        }
+        trace
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> f64 {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            return self.operators[0].trace_projected_factor_cached(factor, cache);
+        }
+
+        let mut trace = 0.0;
+        if let Some(dense) = self.dense.as_ref() {
+            let dense_factor = dense.dot(factor);
+            trace += factor
+                .iter()
+                .zip(dense_factor.iter())
+                .map(|(&f, &bf)| f * bf)
+                .sum::<f64>();
+        }
+        for op in &self.operators {
+            trace += op.trace_projected_factor_cached(factor, cache);
         }
         trace
     }
@@ -5828,6 +5915,18 @@ impl HyperOperator for WeightedHyperOperator {
             .sum()
     }
 
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> f64 {
+        self.terms
+            .iter()
+            .filter(|(weight, _)| *weight != 0.0)
+            .map(|(weight, op)| weight * op.trace_projected_factor_cached(factor, cache))
+            .sum()
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.dim_hint, self.dim_hint));
         for (weight, op) in &self.terms {
@@ -7619,6 +7718,7 @@ pub struct DenseSpectralOperator {
     logdet_hessian_kernel: Array2<f64>,
     /// Precomputed log-determinant: Σ ln(r_ε(σ_i)).
     cached_logdet: f64,
+    projected_factor_cache: ProjectedFactorCache,
     /// Full dimension.
     n_dim: usize,
 }
@@ -7775,6 +7875,7 @@ impl DenseSpectralOperator {
             g_factor,
             logdet_hessian_kernel,
             cached_logdet,
+            projected_factor_cache: ProjectedFactorCache::default(),
             n_dim: n,
         })
     }
@@ -7922,7 +8023,7 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
-        op.trace_projected_factor(&self.w_factor)
+        op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache)
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -8059,7 +8160,7 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        op.trace_projected_factor(&self.g_factor)
+        op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache)
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
