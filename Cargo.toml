@@ -62,6 +62,10 @@ ad_trait = "0.2.2"
 name = "gam"
 path = "src/main.rs"
 
+[[example]]
+name = "ctn_pairwise_oracle"
+path = "examples/ctn_pairwise_oracle.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
