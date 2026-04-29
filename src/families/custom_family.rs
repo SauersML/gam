@@ -433,14 +433,40 @@ pub fn cost_gated_outer_order(
 
 /// Capability-aware variant of [`cost_gated_outer_order`].
 ///
-/// Matrix-free availability is only a representation capability. It does not
-/// make repeated Hessian-vector products cheap, so this delegates to the same
-/// cost gate as dense Hessian paths.
+/// Per the user's plan: cost selects representation, never capability. When
+/// the family advertises a matrix-free joint Hessian (`matrix_free_available`)
+/// the per-Hessian-vector-product work is `O(n·p)`, not `O(n·p²)`, so the
+/// `K · coefficient_cost` materialization-work gate that is appropriate for
+/// dense assembly does not apply: the evaluator will return
+/// `HessianResult::Operator` and ARC will route through
+/// `run_operator_trust_region`, which only ever issues HVPs (never assembles
+/// the dense `n·p²` Hessian). Bypass the work gate in that case.
+///
+/// The hard `K² > OUTER_HESSIAN_MAX_ELEMENTS` element cap is always enforced
+/// because it bounds the size of the `K×K` outer Hessian itself, which the
+/// operator path still allocates (it stores the cached pair-trace table
+/// `cross_trace[i,j]` and the materialized matvec result).
 pub fn cost_gated_outer_order_with_matrix_free(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
-    _matrix_free_available: bool,
+    matrix_free_available: bool,
 ) -> ExactOuterDerivativeOrder {
+    const OUTER_HESSIAN_MAX_ELEMENTS: u64 = 16_000_000;
+
+    let outer_dim = specs
+        .iter()
+        .map(|spec| spec.penalties.len() as u64)
+        .fold(0u64, |acc, k| acc.saturating_add(k));
+    if outer_dim == 0 {
+        return ExactOuterDerivativeOrder::Second;
+    }
+    let outer_elements = outer_dim.saturating_mul(outer_dim);
+    if outer_elements > OUTER_HESSIAN_MAX_ELEMENTS {
+        return ExactOuterDerivativeOrder::First;
+    }
+    if matrix_free_available {
+        return ExactOuterDerivativeOrder::Second;
+    }
     cost_gated_outer_order(specs, coefficient_cost)
 }
 

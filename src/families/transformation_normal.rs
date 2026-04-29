@@ -187,6 +187,36 @@ pub struct TransformationNormalFamily {
     /// the prior `RefCell` semantics (single-threaded interior mutability)
     /// while satisfying the trait bound.
     active_set_cache: Arc<Mutex<KroneckerActiveSetCache>>,
+    /// Last row-space transformation quantities for an exact beta vector.
+    ///
+    /// CTN line searches and exact-Newton workspace construction frequently ask
+    /// for likelihood, gradient, and Hessian row factors at the same candidate
+    /// coefficients. This cache keeps the expensive Khatri-Rao forward products
+    /// and reciprocal powers behind a single exact-keyed entry instead of
+    /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
+    row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
+}
+
+#[derive(Clone)]
+struct TransformationNormalRowQuantityCache {
+    beta: Arc<Array1<f64>>,
+    h: Arc<Array1<f64>>,
+    h_prime: Arc<Array1<f64>>,
+    inv_h_prime: Arc<Array1<f64>>,
+    inv_h_prime_sq: Arc<Array1<f64>>,
+    inv_h_prime_cu: Arc<Array1<f64>>,
+    inv_h_prime_qu: Arc<Array1<f64>>,
+}
+
+impl TransformationNormalRowQuantityCache {
+    fn matches_beta(&self, beta: &Array1<f64>) -> bool {
+        self.beta.len() == beta.len()
+            && self
+                .beta
+                .iter()
+                .zip(beta.iter())
+                .all(|(&cached, &candidate)| cached.to_bits() == candidate.to_bits())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +343,9 @@ impl TransformationNormalFamily {
         let policy = ResourcePolicy::default_library();
         let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
 
-        // ----- 5. Initial log-lambdas (one per penalty, start at 0.0) -----
-        let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
+        // ----- 5. CTN-specific smoothing seed from likelihood/penalty scales -----
+        let initial_log_lambdas =
+            ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
 
         // Compute response median for anchoring
         let mut sorted_resp = response.to_vec();
@@ -345,6 +376,7 @@ impl TransformationNormalFamily {
             response_median: resp_median,
             policy,
             active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
+            row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -464,7 +496,8 @@ impl TransformationNormalFamily {
         let policy = ResourcePolicy::default_library();
         let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
 
-        let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
+        let initial_log_lambdas =
+            ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
 
         // Compute response median from column 1 (y values)
         let mut sorted_resp = response_approx.to_vec();
@@ -495,6 +528,7 @@ impl TransformationNormalFamily {
             response_median: resp_median,
             policy,
             active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
+            row_quantity_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -537,14 +571,42 @@ impl TransformationNormalFamily {
 
     // --- Internal helpers ---
 
-    /// Compute h and h' from the current coefficients.
-    ///
-    /// Uses the Kronecker-aware operators directly, avoiding full
-    /// n × p_total matrix-vector products through a materialized tensor product.
-    fn compute_h_and_h_prime(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+    fn row_quantities(&self, beta: &Array1<f64>) -> TransformationNormalRowQuantityCache {
+        {
+            let cache = self
+                .row_quantity_cache
+                .lock()
+                .expect("CTN row quantity cache mutex poisoned");
+            if let Some(cached) = cache.as_ref().filter(|cached| cached.matches_beta(beta)) {
+                return cached.clone();
+            }
+        }
+
         let h = self.x_val_kron.forward_mul(beta) + self.offset.as_ref();
         let h_prime = self.x_deriv_kron.forward_mul(beta);
-        (h, h_prime)
+        let inv_h_prime = h_prime.mapv(|hp| 1.0 / hp);
+        let inv_h_prime_sq = h_prime.mapv(|hp| 1.0 / (hp * hp));
+        let inv_h_prime_cu = h_prime.mapv(|hp| 1.0 / (hp * hp * hp));
+        let inv_h_prime_qu = h_prime.mapv(|hp| {
+            let hp2 = hp * hp;
+            1.0 / (hp2 * hp2)
+        });
+        let row_quantities = TransformationNormalRowQuantityCache {
+            beta: Arc::new(beta.clone()),
+            h: Arc::new(h),
+            h_prime: Arc::new(h_prime),
+            inv_h_prime: Arc::new(inv_h_prime),
+            inv_h_prime_sq: Arc::new(inv_h_prime_sq),
+            inv_h_prime_cu: Arc::new(inv_h_prime_cu),
+            inv_h_prime_qu: Arc::new(inv_h_prime_qu),
+        };
+
+        let mut cache = self
+            .row_quantity_cache
+            .lock()
+            .expect("CTN row quantity cache mutex poisoned");
+        *cache = Some(row_quantities.clone());
+        row_quantities
     }
 }
 
@@ -560,6 +622,50 @@ fn weighted_crossprod_dense(
     // n × right.ncols matrix. At biobank scale (n=300K, p_cov=200) that drops
     // a transient ~480 MiB allocation per call to a few-MiB sliding chunk.
     crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
+}
+
+fn ctn_penalty_scale_log_lambdas(
+    penalties: &[PenaltyMatrix],
+    likelihood_gram: &Array2<f64>,
+) -> Array1<f64> {
+    if penalties.is_empty() {
+        return Array1::zeros(0);
+    }
+
+    let likelihood_scale = matrix_diag_mean_abs(likelihood_gram).max(1.0e-8);
+    Array1::from_iter(penalties.iter().map(|penalty| {
+        let penalty_scale = penalty_diag_scale(penalty).max(1.0e-8);
+        (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
+    }))
+}
+
+fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
+    match penalty {
+        PenaltyMatrix::Dense(matrix) => {
+            matrix_diag_mean_abs(matrix).max(matrix_frobenius_rms(matrix))
+        }
+        PenaltyMatrix::KroneckerFactored { left, right } => {
+            let diag_scale = matrix_diag_mean_abs(left) * matrix_diag_mean_abs(right);
+            let frob_scale = matrix_frobenius_rms(left) * matrix_frobenius_rms(right);
+            diag_scale.max(frob_scale)
+        }
+        PenaltyMatrix::Blockwise { local, .. } => {
+            matrix_diag_mean_abs(local).max(matrix_frobenius_rms(local))
+        }
+    }
+}
+
+fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
+    let d = matrix.nrows().min(matrix.ncols());
+    if d == 0 {
+        return 0.0;
+    }
+    matrix.diag().iter().map(|v| v.abs()).sum::<f64>() / d as f64
+}
+
+fn matrix_frobenius_rms(matrix: &Array2<f64>) -> f64 {
+    let d = matrix.nrows().max(1).min(matrix.ncols().max(1));
+    (matrix.iter().map(|v| v * v).sum::<f64>() / d as f64).sqrt()
 }
 
 /// Weighted cross-product of two rowwise-Kronecker designs, kept strictly
@@ -886,7 +992,9 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
 
         // Hard monotonicity gate: ℓ = -½h² + log h' is only defined for h' > 0,
@@ -925,14 +1033,17 @@ impl CustomFamily for TransformationNormalFamily {
                 .zip(h.as_slice().unwrap().par_iter())
                 .zip(h_prime.as_slice().unwrap().par_iter())
                 .zip(weights.as_slice().unwrap().par_iter())
-                .map(|(((((wh, wih), wih2), &hi), &hpi), &wi)| {
-                    let inv = 1.0 / hpi;
-                    let w_inv = wi * inv;
-                    *wh = wi * hi;
-                    *wih = w_inv;
-                    *wih2 = w_inv * inv;
-                    wi * (-0.5 * hi * hi + hpi.ln())
-                })
+                .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
+                .zip(row_quantities.inv_h_prime_sq.as_slice().unwrap().par_iter())
+                .map(
+                    |(((((((wh, wih), wih2), &hi), &hpi), &wi), &inv), &inv_sq)| {
+                        let w_inv = wi * inv;
+                        *wh = wi * hi;
+                        *wih = w_inv;
+                        *wih2 = wi * inv_sq;
+                        wi * (-0.5 * hi * hi + hpi.ln())
+                    },
+                )
                 .sum::<f64>()
         };
 
@@ -967,7 +1078,9 @@ impl CustomFamily for TransformationNormalFamily {
         if block_states.len() != 1 {
             return Err("expected 1 block".to_string());
         }
-        let (h, h_prime) = self.compute_h_and_h_prime(&block_states[0].beta);
+        let row_quantities = self.row_quantities(&block_states[0].beta);
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
         let min_hp = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
         if min_hp <= 0.0 {
             return Ok(f64::NEG_INFINITY);
@@ -1013,7 +1126,9 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
         let min_h_prime = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
         if min_h_prime <= 0.0 {
@@ -1037,9 +1152,10 @@ impl CustomFamily for TransformationNormalFamily {
                 .zip(h.as_slice().unwrap().par_iter())
                 .zip(h_prime.as_slice().unwrap().par_iter())
                 .zip(weights.as_slice().unwrap().par_iter())
-                .map(|((((wh, wih), &hi), &hpi), &wi)| {
+                .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
+                .map(|(((((wh, wih), &hi), &hpi), &wi), &inv)| {
                     *wh = wi * hi;
-                    *wih = wi / hpi;
+                    *wih = wi * inv;
                     wi * (-0.5 * hi * hi + hpi.ln())
                 })
                 .sum::<f64>()
@@ -1233,7 +1349,8 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         let d_h_prime = self.x_deriv_kron.forward_mul(d_beta);
 
         // ∂H/∂β · d_beta = -2 X_deriv^T diag((X_deriv · d_beta) / h'^3) X_deriv
@@ -1263,7 +1380,8 @@ impl CustomFamily for TransformationNormalFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
         let mut xtx_deriv = self
@@ -1288,7 +1406,8 @@ impl CustomFamily for TransformationNormalFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         let d_h_prime_u = self.x_deriv_kron.forward_mul(d_beta_u_flat);
         let d_h_prime_v = self.x_deriv_kron.forward_mul(d_beta_v_flat);
 
@@ -1326,14 +1445,15 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row = self.row_quantities(beta);
+        let h = row.h.as_ref();
         let n = h.len();
-        let inv_h_prime: Array1<f64> = h_prime.mapv(|v| 1.0 / v);
-        let inv_h_prime_sq: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v));
-        let inv_h_prime_cu: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v * v));
-        let weighted_h = &h * self.weights.as_ref();
-        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
-        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+        let inv_h_prime = row.inv_h_prime.as_ref();
+        let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
+        let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
+        let weighted_h = h * self.weights.as_ref();
+        let weighted_inv_h_prime = inv_h_prime * self.weights.as_ref();
+        let weighted_inv_h_prime_sq = inv_h_prime_sq * self.weights.as_ref();
 
         let op = deriv
             .implicit_operator
@@ -1395,7 +1515,7 @@ impl CustomFamily for TransformationNormalFamily {
                 .map_err(|e| format!("tensor psi weighted_cross(derivative) failed: {e}"))?;
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
-            let w_cubic = ((&v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            let w_cubic = ((&v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic, &self.policy);
 
             sym_val + &sym_deriv + &cubic_term
@@ -1423,15 +1543,16 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv_i = &psi_derivs[0][psi_i];
         let deriv_j = &psi_derivs[0][psi_j];
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row = self.row_quantities(beta);
+        let h = row.h.as_ref();
         let n = h.len();
-        let inv_h_prime = h_prime.mapv(|v| 1.0 / v);
-        let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
-        let inv_h_prime_cu = h_prime.mapv(|v| 1.0 / (v * v * v));
-        let inv_h_prime_qu = h_prime.mapv(|v| 1.0 / (v * v * v * v));
-        let weighted_h = &h * self.weights.as_ref();
-        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
-        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+        let inv_h_prime = row.inv_h_prime.as_ref();
+        let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
+        let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
+        let inv_h_prime_qu = row.inv_h_prime_qu.as_ref();
+        let weighted_h = h * self.weights.as_ref();
+        let weighted_inv_h_prime = inv_h_prime * self.weights.as_ref();
+        let weighted_inv_h_prime_sq = inv_h_prime_sq * self.weights.as_ref();
 
         let op = deriv_i
             .implicit_operator
@@ -1519,7 +1640,7 @@ impl CustomFamily for TransformationNormalFamily {
             let term8 = self
                 .x_deriv_kron
                 .transpose_mul(&(&v_ij_deriv * &weighted_inv_h_prime_sq));
-            let cubic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_cu * self.weights.as_ref())
+            let cubic = ((&v_i_deriv * &v_j_deriv) * inv_h_prime_cu * self.weights.as_ref())
                 .mapv(|v| -2.0 * v);
             let term9 = self.x_deriv_kron.transpose_mul(&cubic);
             term1 + &term2 + &term3 + &term4 + &term5 + &term6 + &term7 + &term8 + &term9
@@ -1603,7 +1724,7 @@ impl CustomFamily for TransformationNormalFamily {
             )?;
 
             let cubic_i =
-                ((&v_j_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+                ((&v_j_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
                 resp_deriv,
                 &cov_i,
@@ -1622,7 +1743,7 @@ impl CustomFamily for TransformationNormalFamily {
             )?;
 
             let cubic_j =
-                ((&v_i_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+                ((&v_i_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &factored_weighted_cross(
                 resp_deriv,
                 &cov_j,
@@ -1641,10 +1762,10 @@ impl CustomFamily for TransformationNormalFamily {
             )?;
 
             let cubic_second =
-                ((&v_ij_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+                ((&v_ij_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             hess += &self.x_deriv_kron.weighted_gram(&cubic_second, policy);
 
-            let quartic = ((&v_i_deriv * &v_j_deriv) * &inv_h_prime_qu * self.weights.as_ref())
+            let quartic = ((&v_i_deriv * &v_j_deriv) * inv_h_prime_qu * self.weights.as_ref())
                 .mapv(|v| 6.0 * v);
             hess += &self.x_deriv_kron.weighted_gram(&quartic, policy);
             0.5 * (&hess + &hess.t())
@@ -1742,7 +1863,8 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         // Build weighted_inv_hp_sq[i] = w_i / h'_i² and validate h' > 0 in one
         // pass — the inner solver's barrier line search keeps h' strictly
         // positive on observed rows, so the only way to land here with a
@@ -1763,13 +1885,14 @@ impl CustomFamily for TransformationNormalFamily {
                 "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
             ));
         }
-        let weighted_inv_hp_sq = ndarray::Zip::from(&h_prime)
+        let weighted_inv_hp_sq = ndarray::Zip::from(row_quantities.inv_h_prime_sq.as_ref())
             .and(self.weights.as_ref())
-            .par_map_collect(|&hp, &w| w / (hp * hp));
+            .par_map_collect(|&inv_hp_sq, &w| w * inv_hp_sq);
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
-            h_prime,
             weighted_inv_hp_sq,
+            Arc::clone(&row_quantities.inv_h_prime_cu),
+            Arc::clone(&row_quantities.inv_h_prime_qu),
         )?;
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
@@ -1824,19 +1947,15 @@ struct TransformationNormalJointHessianWorkspace {
 impl TransformationNormalJointHessianWorkspace {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        h_prime: Array1<f64>,
         weighted_inv_hp_sq: Array1<f64>,
+        inv_hp_cu: Arc<Array1<f64>>,
+        inv_hp_qu: Arc<Array1<f64>>,
     ) -> Result<Self, String> {
-        let inv_hp_cu = ndarray::Zip::from(&h_prime).par_map_collect(|&hp| 1.0 / (hp * hp * hp));
-        let inv_hp_qu = ndarray::Zip::from(&h_prime).par_map_collect(|&hp| {
-            let hp2 = hp * hp;
-            1.0 / (hp2 * hp2)
-        });
         Ok(Self {
             family,
             weighted_inv_hp_sq,
-            inv_hp_cu: Arc::new(inv_hp_cu),
-            inv_hp_qu: Arc::new(inv_hp_qu),
+            inv_hp_cu,
+            inv_hp_qu,
         })
     }
 
@@ -4216,6 +4335,18 @@ mod tests {
     use crate::testing::assert_matrix_derivativefd;
     use ndarray::array;
 
+    #[test]
+    fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
+        let likelihood_gram = array![[8.0, 0.0], [0.0, 8.0]];
+        let penalties = vec![
+            PenaltyMatrix::Dense(array![[2.0, 0.0], [0.0, 2.0]]),
+            PenaltyMatrix::Dense(array![[4.0, 0.0], [0.0, 4.0]]),
+        ];
+        let rho = ctn_penalty_scale_log_lambdas(&penalties, &likelihood_gram);
+        assert!((rho[0] - 4.0_f64.ln()).abs() < 1.0e-12);
+        assert!((rho[1] - 2.0_f64.ln()).abs() < 1.0e-12);
+    }
+
     fn toy_covariate_design_and_derivs(
         psi: &Array1<f64>,
     ) -> (Array2<f64>, Vec<CustomFamilyBlockPsiDerivative>) {
@@ -4408,7 +4539,9 @@ mod tests {
         )
         .expect("transformation family");
 
-        let (h, h_prime) = family.compute_h_and_h_prime(&family.initial_beta);
+        let row = family.row_quantities(&family.initial_beta);
+        let h = row.h.as_ref();
+        let h_prime = row.h_prime.as_ref();
         let expected_h = array![0.5, 2.0];
         let expected_h_prime = array![0.5, 0.5];
 
@@ -6038,11 +6171,21 @@ pub fn fit_transformation_normal(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
+    let (rho0_min, rho0_max) = if rho0.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            rho0.iter().copied().fold(f64::INFINITY, f64::min),
+            rho0.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
     log::info!(
         "[transformation-normal] skipping baseline custom-family prefit before exact joint optimization \
-         (rho_dim={}, log_kappa_dim={}); using CTN warm start and initial penalty scales",
+         (rho_dim={}, log_kappa_dim={}, rho0_range=[{:.3}, {:.3}]); using CTN warm start and penalty-scale rho seed",
         n_penalties,
         kappa0.len(),
+        rho0_min,
+        rho0_max,
     );
 
     if !analytic_psi_available {

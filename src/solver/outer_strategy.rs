@@ -2578,16 +2578,11 @@ fn run_operator_trust_region(
     let mut eval_k = initial_eval;
     let mut trust_radius = OPERATOR_TRUST_RADIUS_INIT;
 
-    // Per-iteration wall-clock budget. Mirrors GAM_PIRLS_MAX_SECONDS: when an
-    // ARC iteration's matrix-free Hv solve and trial evaluation together
-    // exceed the budget, return a dedicated `OuterTimeBudgetExceeded` so the
-    // outer fallback cascade can degrade to a cheaper plan rather than hang.
-    const DEFAULT_ARC_MAX_SECONDS_PER_ITER: f64 = 60.0;
-    let arc_max_seconds_per_iter = std::env::var("GAM_ARC_MAX_SECONDS_PER_ITER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(DEFAULT_ARC_MAX_SECONDS_PER_ITER);
+    // Per-iteration wall-clock budget. When an ARC iteration's matrix-free Hv
+    // solve and trial evaluation together exceed the budget, return a dedicated
+    // `OuterTimeBudgetExceeded` so the outer fallback cascade can degrade to a
+    // cheaper plan rather than hang.
+    const ARC_MAX_SECONDS_PER_ITER: f64 = 60.0;
 
     for iter in 0..max_iter {
         let iter_start = std::time::Instant::now();
@@ -2639,10 +2634,10 @@ fn run_operator_trust_region(
                 counter.count(),
                 elapsed,
             );
-            if elapsed > arc_max_seconds_per_iter {
+            if elapsed > ARC_MAX_SECONDS_PER_ITER {
                 return Err(time_budget_exceeded(
                     elapsed,
-                    arc_max_seconds_per_iter,
+                    ARC_MAX_SECONDS_PER_ITER,
                     iter,
                 ));
             }
@@ -2665,10 +2660,10 @@ fn run_operator_trust_region(
                 counter.count(),
                 elapsed,
             );
-            if elapsed > arc_max_seconds_per_iter {
+            if elapsed > ARC_MAX_SECONDS_PER_ITER {
                 return Err(time_budget_exceeded(
                     elapsed,
-                    arc_max_seconds_per_iter,
+                    ARC_MAX_SECONDS_PER_ITER,
                     iter,
                 ));
             }
@@ -2697,10 +2692,10 @@ fn run_operator_trust_region(
                 counter.count(),
                 elapsed,
             );
-            if elapsed > arc_max_seconds_per_iter {
+            if elapsed > ARC_MAX_SECONDS_PER_ITER {
                 return Err(time_budget_exceeded(
                     elapsed,
-                    arc_max_seconds_per_iter,
+                    ARC_MAX_SECONDS_PER_ITER,
                     iter,
                 ));
             }
@@ -2752,10 +2747,10 @@ fn run_operator_trust_region(
             elapsed,
         );
 
-        if elapsed > arc_max_seconds_per_iter {
+        if elapsed > ARC_MAX_SECONDS_PER_ITER {
             return Err(time_budget_exceeded(
                 elapsed,
-                arc_max_seconds_per_iter,
+                ARC_MAX_SECONDS_PER_ITER,
                 iter,
             ));
         }
