@@ -19,11 +19,14 @@ use crate::families::gamlss::{
 };
 use crate::families::lognormal_kernel::HazardLoading;
 use crate::families::survival_location_scale::{
-    ResidualDistribution, SurvivalCovariateTermBlockTemplate,
+    DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, ResidualDistribution,
+    SurvivalCovariateTermBlockTemplate,
 };
+use crate::families::survival_marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD;
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
+use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
@@ -2124,6 +2127,78 @@ pub fn build_survival_marginal_slope_baseline_offsets(
         derivative_exit[i] = d1;
     }
     Ok((eta_entry, eta_exit, derivative_exit))
+}
+
+pub fn location_scale_uses_probit_survival_baseline(
+    inverse_link: Option<&InverseLink>,
+) -> bool {
+    matches!(
+        inverse_link,
+        Some(
+            InverseLink::Standard(LinkFunction::Probit)
+                | InverseLink::LatentCLogLog(_)
+                | InverseLink::Sas(_)
+                | InverseLink::BetaLogistic(_)
+                | InverseLink::Mixture(_)
+        )
+    )
+}
+
+pub fn survival_derivative_guard_for_likelihood(
+    likelihood_mode: SurvivalLikelihoodMode,
+) -> f64 {
+    match likelihood_mode {
+        SurvivalLikelihoodMode::LocationScale
+        | SurvivalLikelihoodMode::Latent
+        | SurvivalLikelihoodMode::LatentBinary => DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        SurvivalLikelihoodMode::MarginalSlope => DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => 0.0,
+    }
+}
+
+pub fn build_survival_time_offsets_for_likelihood(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    baseline_cfg: &SurvivalBaselineConfig,
+    likelihood_mode: SurvivalLikelihoodMode,
+    inverse_link: Option<&InverseLink>,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope
+        || (likelihood_mode == SurvivalLikelihoodMode::LocationScale
+            && location_scale_uses_probit_survival_baseline(inverse_link))
+    {
+        build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)
+    } else {
+        build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)
+    }
+}
+
+pub fn add_survival_time_derivative_guard_offset(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    anchor_time: f64,
+    derivative_guard: f64,
+    eta_offset_entry: &mut Array1<f64>,
+    eta_offset_exit: &mut Array1<f64>,
+    derivative_offset_exit: &mut Array1<f64>,
+) -> Result<(), String> {
+    if derivative_guard <= 0.0 {
+        return Ok(());
+    }
+    let n = age_entry.len();
+    if age_exit.len() != n
+        || eta_offset_entry.len() != n
+        || eta_offset_exit.len() != n
+        || derivative_offset_exit.len() != n
+    {
+        return Err("survival derivative-guard offset lengths must match".to_string());
+    }
+    for i in 0..n {
+        eta_offset_entry[i] += derivative_guard * (age_entry[i] - anchor_time);
+        eta_offset_exit[i] += derivative_guard * (age_exit[i] - anchor_time);
+        derivative_offset_exit[i] += derivative_guard;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
