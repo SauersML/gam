@@ -6946,7 +6946,12 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
                     log::warn!(
                         "joint exact-newton operator matvec failed during SLQ logdet: {error}"
                     );
-                    Array1::<f64>::zeros(total)
+                    // Surface NaN so the SLQ Lanczos non-finite guards
+                    // (`alpha`/`beta` checks) trip and the surrounding
+                    // `.map_err` propagates a hard error to the outer
+                    // optimizer, instead of silently substituting zeros
+                    // and producing a rank-deficient operator that loops.
+                    Array1::<f64>::from_elem(total, f64::NAN)
                 }
             };
             let penalty = apply_joint_block_penalty(&ranges_vec, &s_lambdas_owned, v, ridge_floor);
@@ -8864,7 +8869,9 @@ fn joint_outer_evaluate(
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during outer trace construction: {error}"
                                 );
-                                Array1::<f64>::zeros(total)
+                                // NaN propagates through SLQ to a non-finite logdet
+                                // so the outer evaluator marks this rho infeasible.
+                                Array1::<f64>::from_elem(total, f64::NAN)
                             }
                         };
                         let penalty = apply_joint_block_penalty(
@@ -9147,7 +9154,7 @@ fn joint_outer_evaluate_efs(
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during fixed-point trace construction: {error}"
                                 );
-                                Array1::<f64>::zeros(total)
+                                Array1::<f64>::from_elem(total, f64::NAN)
                             }
                         };
                         let penalty = apply_joint_block_penalty(
