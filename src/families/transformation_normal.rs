@@ -764,9 +764,17 @@ impl TransformationNormalFamily {
                 )
                 .zip(h_slice.par_iter())
                 .zip(hp_slice.par_iter())
-                .zip(weights.as_slice().expect("CTN weights are contiguous").par_iter())
+                .zip(
+                    weights
+                        .as_slice()
+                        .expect("CTN weights are contiguous")
+                        .par_iter(),
+                )
                 .map(
-                    |(((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp), &wi)| {
+                    |(
+                        ((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp),
+                        &wi,
+                    )| {
                         let inv_v = 1.0 / hp;
                         let inv_sq_v = inv_v * inv_v;
                         let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
@@ -1302,21 +1310,7 @@ impl CustomFamily for TransformationNormalFamily {
             row_q_start.elapsed().as_secs_f64(),
         );
         let h = row_quantities.h.as_ref();
-        let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
-
-        // Hard monotonicity gate: ℓ = -½h² + log h' is only defined for h' > 0,
-        // and the barrier line search in `log_likelihood_only` retreats via
-        // NEG_INFINITY before a step that would push any h' to zero. Reaching
-        // this branch in `evaluate` means the constraint solver handed us an
-        // invalid iterate, so fail loudly instead of silently producing NaNs.
-        let min_h_prime = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
-        if min_h_prime <= 0.0 {
-            return Err(format!(
-                "TransformationNormalFamily: h' has non-positive values (min = {min_h_prime:.6e}). \
-                 Monotonicity constraint may be violated."
-            ));
-        }
 
         let log_likelihood = row_quantities.log_likelihood;
         let weighted_h = row_quantities.weighted_h.as_ref();
@@ -1428,16 +1422,6 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let h = row_quantities.h.as_ref();
-        let h_prime = row_quantities.h_prime.as_ref();
-        let n = h.len();
-        let min_h_prime = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
-        if min_h_prime <= 0.0 {
-            return Err(format!(
-                "TransformationNormalFamily: h' has non-positive values (min = {min_h_prime:.6e}). \
-                 Monotonicity constraint may be violated."
-            ));
-        }
         let log_likelihood = row_quantities.log_likelihood;
         let mut gradient = self
             .x_deriv_kron
@@ -1670,9 +1654,10 @@ impl CustomFamily for TransformationNormalFamily {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let mut xtx_deriv = self
-            .x_deriv_kron
-            .weighted_gram(row_quantities.weighted_inv_h_prime_sq.as_ref(), &self.policy);
+        let mut xtx_deriv = self.x_deriv_kron.weighted_gram(
+            row_quantities.weighted_inv_h_prime_sq.as_ref(),
+            &self.policy,
+        );
         xtx_deriv += &self.x_val_weighted_gram;
         Ok(Some(xtx_deriv))
     }
@@ -1733,9 +1718,6 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta)?;
-        let h = row.h.as_ref();
-        let n = h.len();
-        let inv_h_prime = row.inv_h_prime.as_ref();
         let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
         let weighted_h = row.weighted_h.as_ref();
         let weighted_inv_h_prime = row.weighted_inv_h_prime.as_ref();
@@ -1755,13 +1737,7 @@ impl CustomFamily for TransformationNormalFamily {
         let v_val: &Array1<f64> = v_val_arc.as_ref();
         let v_deriv: &Array1<f64> = v_deriv_arc.as_ref();
 
-        let obj_psi = {
-            let weights = self.weights.as_ref();
-            (0..n)
-                .into_par_iter()
-                .map(|i| weights[i] * (h[i] * v_val[i] - inv_h_prime[i] * v_deriv[i]))
-                .sum::<f64>()
-        };
+        let obj_psi = weighted_h.dot(v_val) - weighted_inv_h_prime.dot(v_deriv);
 
         let score_psi = {
             let term1 = op
@@ -1770,10 +1746,10 @@ impl CustomFamily for TransformationNormalFamily {
             let weighted_v_val = v_val * self.weights.as_ref();
             let term2 = self.x_val_kron.transpose_mul(&weighted_v_val);
             let term3 = op
-                .transpose_mul_deriv(axis, &weighted_inv_h_prime)
+                .transpose_mul_deriv(axis, weighted_inv_h_prime)
                 .map_err(|e| format!("tensor psi derivative transpose_mul failed: {e}"))?
                 .mapv(|v| -v);
-            let w_deriv = v_deriv * &weighted_inv_h_prime_sq;
+            let w_deriv = v_deriv * weighted_inv_h_prime_sq;
             let term4 = self.x_deriv_kron.transpose_mul(&w_deriv);
             term1 + &term2 + &term3 + &term4
         };
@@ -1794,7 +1770,7 @@ impl CustomFamily for TransformationNormalFamily {
                     &self.response_deriv_basis,
                     &self.response_deriv_basis,
                     axis,
-                    &weighted_inv_h_prime_sq,
+                    weighted_inv_h_prime_sq,
                 )
                 .map_err(|e| format!("tensor psi weighted_cross(derivative) failed: {e}"))?;
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
@@ -1910,12 +1886,12 @@ impl CustomFamily for TransformationNormalFamily {
                 .x_val_kron
                 .transpose_mul(&(&v_ij_val * self.weights.as_ref()));
             let term5 = op
-                .transpose_mul_deriv(axis_i, &(v_j_deriv * &weighted_inv_h_prime_sq))
+                .transpose_mul_deriv(axis_i, &(v_j_deriv * weighted_inv_h_prime_sq))
                 .map_err(|e| {
                     format!("tensor psi second-order transpose_mul_deriv(i) failed: {e}")
                 })?;
             let term6 = op
-                .transpose_mul_deriv(axis_j, &(v_i_deriv * &weighted_inv_h_prime_sq))
+                .transpose_mul_deriv(axis_j, &(v_i_deriv * weighted_inv_h_prime_sq))
                 .map_err(|e| {
                     format!("tensor psi second-order transpose_mul_deriv(j) failed: {e}")
                 })?;
@@ -1927,7 +1903,7 @@ impl CustomFamily for TransformationNormalFamily {
                 .mapv(|v| -v);
             let term8 = self
                 .x_deriv_kron
-                .transpose_mul(&(&v_ij_deriv * &weighted_inv_h_prime_sq));
+                .transpose_mul(&(&v_ij_deriv * weighted_inv_h_prime_sq));
             let cubic = ((v_i_deriv * v_j_deriv) * inv_h_prime_cu * self.weights.as_ref())
                 .mapv(|v| -2.0 * v);
             let term9 = self.x_deriv_kron.transpose_mul(&cubic);
@@ -2186,33 +2162,9 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let h_prime = row_quantities.h_prime.as_ref();
-        // Build weighted_inv_hp_sq[i] = w_i / h'_i² and validate h' > 0 in one
-        // pass — the inner solver's barrier line search keeps h' strictly
-        // positive on observed rows, so the only way to land here with a
-        // non-positive value is an upstream invariant break worth surfacing
-        // loudly.
-        let bad: Option<(usize, f64)> = {
-            use rayon::prelude::*;
-            h_prime
-                .as_slice()
-                .unwrap()
-                .par_iter()
-                .enumerate()
-                .find_any(|&(_, hp)| !hp.is_finite() || *hp <= 0.0)
-                .map(|(i, &hp)| (i, hp))
-        };
-        if let Some((i, hp)) = bad {
-            return Err(format!(
-                "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
-            ));
-        }
-        let weighted_inv_hp_sq = ndarray::Zip::from(row_quantities.inv_h_prime_sq.as_ref())
-            .and(self.weights.as_ref())
-            .par_map_collect(|&inv_hp_sq, &w| w * inv_hp_sq);
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
-            weighted_inv_hp_sq,
+            row_quantities.weighted_inv_h_prime_sq.as_ref().clone(),
             Arc::clone(&row_quantities.inv_h_prime_cu),
             Arc::clone(&row_quantities.inv_h_prime_qu),
         )?;
