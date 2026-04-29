@@ -21,8 +21,9 @@ use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
-    CoeffSupport, SparsePrimaryCoeffJetView, add_scaled_coeff4, eval_coeff4_at,
-    probit_frailty_scale, scale_coeff4,
+    CoeffSupport, SparsePrimaryCoeffJetView, add_scaled_coeff4,
+    build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
+    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -2582,17 +2583,13 @@ impl SurvivalMarginalSlopeFamily {
         first_masks: &[usize],
         second_masks: &[usize],
     ) -> Result<MultiDirJet, String> {
-        let sigma = self.gaussian_frailty_sd.ok_or_else(|| {
-            "survival marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
-                .to_string()
-        })?;
-        let jet =
-            crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
-        let mut coeffs = Vec::with_capacity(1 + first_masks.len() + second_masks.len());
-        coeffs.push((0usize, jet.s));
-        coeffs.extend(first_masks.iter().copied().map(|mask| (mask, jet.ds)));
-        coeffs.extend(second_masks.iter().copied().map(|mask| (mask, jet.d2s)));
-        Ok(MultiDirJet::with_coeffs(n_dirs, &coeffs))
+        probit_frailty_scale_multi_dir_jet(
+            self.gaussian_frailty_sd,
+            "survival marginal-slope log-sigma auxiliary requested without GaussianShift sigma",
+            n_dirs,
+            first_masks,
+            second_masks,
+        )
     }
 
     fn row_neglog_directional_with_scale_jet(
@@ -3429,61 +3426,15 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        let score_breaks = self
-            .score_warp
-            .as_ref()
-            .map(|runtime| runtime.breakpoints().to_vec())
-            .unwrap_or_default();
-        let link_breaks = self
-            .link_dev
-            .as_ref()
-            .map(|runtime| runtime.breakpoints().to_vec())
-            .unwrap_or_default();
-
-        let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
+        shared_denested_partition_cells(
             a,
             b,
-            &score_breaks,
-            &link_breaks,
-            |z| {
-                if let (Some(runtime), Some(beta)) = (self.score_warp.as_ref(), beta_h) {
-                    runtime.local_cubic_at(beta, z)
-                } else {
-                    Ok(exact_kernel::LocalSpanCubic {
-                        left: 0.0,
-                        right: 1.0,
-                        c0: 0.0,
-                        c1: 0.0,
-                        c2: 0.0,
-                        c3: 0.0,
-                    })
-                }
-            },
-            |u| {
-                if let (Some(runtime), Some(beta)) = (self.link_dev.as_ref(), beta_w) {
-                    runtime.local_cubic_at(beta, u)
-                } else {
-                    Ok(exact_kernel::LocalSpanCubic {
-                        left: 0.0,
-                        right: 1.0,
-                        c0: 0.0,
-                        c1: 0.0,
-                        c2: 0.0,
-                        c3: 0.0,
-                    })
-                }
-            },
-        )?;
-        let scale = self.probit_frailty_scale();
-        if scale != 1.0 {
-            for partition_cell in &mut cells {
-                partition_cell.cell.c0 *= scale;
-                partition_cell.cell.c1 *= scale;
-                partition_cell.cell.c2 *= scale;
-                partition_cell.cell.c3 *= scale;
-            }
-        }
-        Ok(cells)
+            self.score_warp.as_ref(),
+            beta_h,
+            self.link_dev.as_ref(),
+            beta_w,
+            self.probit_frailty_scale(),
+        )
     }
 
     fn evaluate_denested_survival_calibration(
