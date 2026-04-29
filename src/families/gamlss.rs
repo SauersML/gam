@@ -6500,27 +6500,35 @@ impl CustomFamily for GaussianLocationScaleFamily {
             etamu.as_slice_memory_order(),
             eta_log_sigma.as_slice_memory_order(),
         ) {
-            for i in 0..n {
-                let wi = w_s[i];
-                if wi == 0.0 {
-                    continue;
-                }
-                let sigma_i = logb_sigma_from_eta_scalar(ls_s[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = y_s[i] - mu_s[i];
-                ll += wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
-            }
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            ll += (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let wi = w_s[i];
+                    if wi == 0.0 {
+                        return 0.0;
+                    }
+                    let sigma_i = logb_sigma_from_eta_scalar(ls_s[i]);
+                    let inv_s2 = (sigma_i * sigma_i).recip();
+                    let r = y_s[i] - mu_s[i];
+                    wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+                })
+                .sum::<f64>();
         } else {
-            for i in 0..n {
-                let wi = self.weights[i];
-                if wi == 0.0 {
-                    continue;
-                }
-                let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = self.y[i] - etamu[i];
-                ll += wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
-            }
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            ll += (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let wi = self.weights[i];
+                    if wi == 0.0 {
+                        return 0.0;
+                    }
+                    let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
+                    let inv_s2 = (sigma_i * sigma_i).recip();
+                    let r = self.y[i] - etamu[i];
+                    wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+                })
+                .sum::<f64>();
         }
         Ok(ll)
     }
