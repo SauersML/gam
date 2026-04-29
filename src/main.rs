@@ -44,9 +44,10 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{
     LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
-    effectivelinkwiggle_formulaspec, formula_rhs_text, linkchoice_supports_joint_wiggle, linkname,
-    parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
-    require_inverse_link_supports_joint_wiggle, validate_auxiliary_formula_controls,
+    effectivelinkwiggle_formulaspec, formula_rhs_text, linkname, parse_formula, parse_link_choice,
+    parse_matching_auxiliary_formula, parse_surv_response,
+    require_inverse_link_supports_joint_wiggle, require_likelihood_family_supports_joint_wiggle,
+    require_linkchoice_supports_joint_wiggle, validate_auxiliary_formula_controls,
     validate_marginal_slope_z_column_exclusion,
 };
 use gam::inference::model::{
@@ -72,7 +73,8 @@ use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSp
 use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
-    append_zero_tail_columns, build_latent_survival_baseline_offsets, build_survival_time_basis,
+    append_zero_tail_columns, build_latent_survival_baseline_offsets,
+    build_survival_baseline_offsets, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
@@ -882,28 +884,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), link_choice.as_ref());
     let learn_linkwiggle = effective_linkwiggle.is_some();
-    if learn_linkwiggle
-        && matches!(
-            family,
-            LikelihoodFamily::BinomialMixture
-                | LikelihoodFamily::BinomialSas
-                | LikelihoodFamily::BinomialBetaLogistic
-        )
-    {
-        return Err(
-            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-                .to_string(),
-        );
-    }
-    if learn_linkwiggle
-        && link_choice
-            .as_ref()
-            .is_some_and(|choice| !linkchoice_supports_joint_wiggle(choice))
-    {
-        return Err(
-            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-                .to_string(),
-        );
+    if learn_linkwiggle {
+        require_likelihood_family_supports_joint_wiggle(family, "linkwiggle(...)")?;
+        if let Some(choice) = link_choice.as_ref() {
+            require_linkchoice_supports_joint_wiggle(choice, "linkwiggle(...)")?;
+        }
     }
     let mean_only_flexible_linkwiggle = link_choice
         .as_ref()
@@ -9163,10 +9148,10 @@ mod tests {
         covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel, family_to_string,
         linkname, load_dataset_projected, parse_formula, parse_link_choice,
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_gam, pretty_familyname, required_columns_for_fit,
-        resolve_family, summarizewiggle_domain, validate_cli_firth_configuration,
-        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
-        write_survival_prediction_csv,
+        parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
+        pretty_familyname, required_columns_for_fit, resolve_family, summarizewiggle_domain,
+        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+        write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,

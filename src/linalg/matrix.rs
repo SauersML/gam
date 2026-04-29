@@ -3190,9 +3190,11 @@ impl LinearOperator for RowwiseKroneckerOperator {
                 beta_slice[j] = vector[j * p_time + t];
             }
             let cov_beta_t = self.cov.matrixvectormultiply(&beta_slice);
-            for i in 0..n {
-                out[i] += cov_beta_t[i] * time[[i, t]];
-            }
+            let time_col = time.column(t);
+            ndarray::Zip::from(&mut out)
+                .and(&cov_beta_t)
+                .and(&time_col)
+                .par_for_each(|o, &cb, &tt| *o += cb * tt);
         }
         out
     }
@@ -3211,9 +3213,11 @@ impl LinearOperator for RowwiseKroneckerOperator {
         // For each time column t, form w_t = v ⊙ time[:,t], compute cov' · w_t.
         let mut w_t = Array1::<f64>::zeros(n);
         for t in 0..p_time {
-            for i in 0..n {
-                w_t[i] = vector[i] * time[[i, t]];
-            }
+            let time_col = time.column(t);
+            ndarray::Zip::from(&mut w_t)
+                .and(vector)
+                .and(&time_col)
+                .par_for_each(|o, &v, &tt| *o = v * tt);
             let col_t = self.cov.transpose_vector_multiply(&w_t);
             for j in 0..p_cov {
                 out[j * p_time + t] = col_t[j];
@@ -3255,9 +3259,13 @@ impl LinearOperator for RowwiseKroneckerOperator {
         let mut gamma = Array1::<f64>::zeros(n);
         for t1 in 0..p_time {
             for t2 in 0..=t1 {
-                for i in 0..n {
-                    gamma[i] = weights[i].max(0.0) * time[[i, t1]] * time[[i, t2]];
-                }
+                let time_t1 = time.column(t1);
+                let time_t2 = time.column(t2);
+                ndarray::Zip::from(&mut gamma)
+                    .and(weights)
+                    .and(&time_t1)
+                    .and(&time_t2)
+                    .par_for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
                 let block = self.cov.compute_xtwx(&gamma)?;
                 // Scatter block into xtwx for both (t1, t2) and (t2, t1).
                 for j1 in 0..p_cov {
@@ -3290,9 +3298,11 @@ impl LinearOperator for RowwiseKroneckerOperator {
         let mut out = Array1::<f64>::zeros(p_cov * p_time);
         let mut gamma = Array1::<f64>::zeros(n);
         for t in 0..p_time {
-            for i in 0..n {
-                gamma[i] = weights[i].max(0.0) * time[[i, t]] * time[[i, t]];
-            }
+            let time_col = time.column(t);
+            ndarray::Zip::from(&mut gamma)
+                .and(weights)
+                .and(&time_col)
+                .par_for_each(|g, &w, &tt| *g = w.max(0.0) * tt * tt);
             let cov_diag = <DesignMatrix as LinearOperator>::diag_gram(&self.cov, &gamma)?;
             for j in 0..p_cov {
                 out[j * p_time + t] = cov_diag[j];

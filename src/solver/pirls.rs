@@ -2266,12 +2266,12 @@ impl DenseOuterState {
         n: usize,
         p: usize,
     ) {
-        let xtwx_start = std::time::Instant::now();
         debug_assert_eq!(self.xtwx_dense.dim(), (p, p));
         self.xtwx_dense.fill(0.0);
         if n == 0 || p == 0 {
             return;
         }
+        let xtwx_start = std::time::Instant::now();
 
         // Cost model: per-row outer-product is nnz(xᵢ)². With avg_nnz ≈
         // nnz_total / n, total work ≈ nnz_total² / n. For designs with
@@ -6899,13 +6899,14 @@ fn solver_hessian_weights(
     hessian_weights: &Array1<f64>,
     fisher_weights: &Array1<f64>,
 ) -> Array1<f64> {
-    let n = hessian_weights.len();
-    let mut out = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let w = hessian_weights[i];
-        let floor = solver_hessian_weight_floor(fisher_weights[i]);
-        out[i] = if w.is_finite() && w > floor { w } else { floor };
-    }
+    let mut out = Array1::<f64>::zeros(hessian_weights.len());
+    ndarray::Zip::from(&mut out)
+        .and(hessian_weights)
+        .and(fisher_weights)
+        .par_for_each(|o, &w, &fw| {
+            let floor = solver_hessian_weight_floor(fw);
+            *o = if w.is_finite() && w > floor { w } else { floor };
+        });
     out
 }
 
@@ -7459,22 +7460,25 @@ pub fn compute_observed_weights_dispatched(
             let mut w = Array1::<f64>::zeros(n);
             let mut c = Array1::<f64>::zeros(n);
             let mut d = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let (wi, ci, di) = observed_weight_dispatch(
-                    family,
-                    link,
-                    eta[i],
-                    y[i],
-                    jets[i].mu,
-                    phi,
-                    prior_weights[i],
-                    jets[i].clone(),
-                    h4[i],
-                );
-                w[i] = wi;
-                c[i] = ci;
-                d[i] = di;
-            }
+            ndarray::Zip::indexed(&mut w)
+                .and(&mut c)
+                .and(&mut d)
+                .par_for_each(|i, wo, co, doo| {
+                    let (wi, ci, di) = observed_weight_dispatch(
+                        family,
+                        link,
+                        eta[i],
+                        y[i],
+                        jets[i].mu,
+                        phi,
+                        prior_weights[i],
+                        jets[i].clone(),
+                        h4[i],
+                    );
+                    *wo = wi;
+                    *co = ci;
+                    *doo = di;
+                });
             (w, c, d)
         }
         _ => {
