@@ -13,9 +13,10 @@ use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed, padded_deviation_seed,
-    project_monotone_feasible_beta, signed_probit_neglog_derivatives_up_to_fourth,
-    standardize_latent_z_with_policy, unary_derivatives_log, unary_derivatives_log_normal_pdf,
-    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    project_monotone_feasible_beta, push_deviation_aux_blockspecs,
+    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
+    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
+    unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
@@ -12569,24 +12570,6 @@ fn build_marginal_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
     }
-}
-
-fn build_aux_blockspec(
-    name: &str,
-    prepared: &DeviationPrepared,
-    rho: Array1<f64>,
-    beta_hint: Option<Array1<f64>>,
-) -> Result<ParameterBlockSpec, String> {
-    let mut block = prepared.block.clone();
-    block.initial_log_lambdas = Some(rho);
-    let candidate_beta = beta_hint.or_else(|| Some(Array1::<f64>::zeros(block.design.ncols())));
-    block.initial_beta = candidate_beta
-        .map(|beta| {
-            let zero = Array1::<f64>::zeros(beta.len());
-            project_monotone_feasible_beta(&prepared.runtime, &zero, &beta, name)
-        })
-        .transpose()?;
-    block.intospec(name)
 }
 
 fn inner_fit(
