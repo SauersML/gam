@@ -209,6 +209,18 @@ pub(crate) fn add_two_surface_psi_outer(
     }
 }
 
+pub(crate) fn add_optional_vector(left: &mut Option<Array1<f64>>, right: &Option<Array1<f64>>) {
+    if let (Some(left), Some(right)) = (left.as_mut(), right.as_ref()) {
+        *left += right;
+    }
+}
+
+pub(crate) fn add_optional_matrix(left: &mut Option<Array2<f64>>, right: &Option<Array2<f64>>) {
+    if let (Some(left), Some(right)) = (left.as_mut(), right.as_ref()) {
+        *left += right;
+    }
+}
+
 pub(crate) fn psi_derivative_location(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     psi_index: usize,

@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 import gam
+from gam.pgs import PgsCalibration
 from gam.sklearn import GAMClassifier, GAMRegressor
 
 
@@ -343,6 +344,78 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
         assert abs(corr) < 0.3, f"|corr(z, {pc})| = {abs(corr):.3f} too large"
 
 
+def test_pgs_calibration_predicts_minimal_new_samples_after_fit_on_full_df(
+    synthetic_biobank_factory,
+):
+    _require_extension()
+    df = synthetic_biobank_factory(seed=10, n=64)
+    df["person_id"] = [f"p{i}" for i in range(len(df))]
+    df["batch"] = ["a" if i % 2 == 0 else "b" for i in range(len(df))]
+
+    calibration = PgsCalibration(
+        pc_columns=["pc1", "pc2", "pc3", "pc4"],
+        pgs_column="PGS",
+    ).fit(df)
+
+    minimal = df[["PGS", "pc1", "pc2", "pc3", "pc4"]].copy()
+    z = np.asarray(calibration.predict(minimal), dtype=float)
+
+    assert z.shape == (len(minimal),)
+    assert np.all(np.isfinite(z))
+
+
+def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory):
+    _require_extension()
+    df = synthetic_biobank_factory(seed=11, n=64)
+
+    model = gam.fit(
+        df,
+        f"PGS ~ {_pc_duchon()}",
+        transformation_normal=True,
+        scale_dimensions=True,
+    )
+
+    missing_pgs = df[["pc1", "pc2", "pc3", "pc4"]].copy()
+    check = model.check(missing_pgs)
+
+    assert not check.ok
+    assert any(issue.column == "PGS" for issue in check.issues)
+    with pytest.raises(gam.SchemaMismatchError):
+        model.predict(missing_pgs)
+
+
+def test_pgs_calibration_formula_uses_double_penalty_by_default():
+    calibration = PgsCalibration(pc_columns=["pc1", "pc2"], pgs_column="PGS")
+
+    assert "double_penalty=true" in calibration.formula
+
+
+def test_pgs_calibration_save_load_restores_wrapper_metadata(
+    synthetic_biobank_factory,
+    tmp_path,
+):
+    _require_extension()
+    df = synthetic_biobank_factory(seed=12, n=64)
+    calibration = PgsCalibration(
+        pc_columns=["pc1", "pc2", "pc3", "pc4"],
+        pgs_column="PGS",
+        out_column="pgs_z",
+    ).fit(df)
+
+    path = tmp_path / "stage1.gam"
+    calibration.save(path)
+    loaded = PgsCalibration.load(path)
+    minimal = df[["PGS", "pc1", "pc2", "pc3", "pc4"]]
+
+    assert loaded.pc_columns == ["pc1", "pc2", "pc3", "pc4"]
+    assert loaded.pgs_column == "PGS"
+    assert loaded.out_column == "pgs_z"
+    np.testing.assert_allclose(
+        np.asarray(loaded.predict(minimal), dtype=float),
+        np.asarray(calibration.predict(minimal), dtype=float),
+    )
+
+
 def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
     synthetic_biobank_factory, tmp_path
 ):
@@ -523,6 +596,47 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         f"but survival(low z={z_lo:.3f})={survival_lo[mid]:.4f}; "
         "higher PGS should not be worse than lower PGS in the synthetic data"
     )
+
+
+def test_survival_predict_new_samples_do_not_need_event(synthetic_biobank_factory):
+    _require_extension()
+    df = synthetic_biobank_factory(seed=13, n=64)
+
+    calib = gam.fit(
+        df,
+        f"PGS ~ {_pc_duchon()}",
+        transformation_normal=True,
+        scale_dimensions=True,
+    )
+    df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
+
+    formula = (
+        "Surv(age_entry, age_exit, event) ~ z "
+        f"+ {_pc_duchon()} "
+        "+ linkwiggle(degree=3, internal_knots=3) "
+        "+ timewiggle(degree=3, internal_knots=3)"
+    )
+    model = gam.fit(
+        df,
+        formula,
+        family="survival",
+        survival_likelihood="marginal-slope",
+        baseline_target="gompertz-makeham",
+        scale_dimensions=True,
+        z_column="pgs_ctn_z",
+    )
+
+    new_samples = df[
+        ["age_entry", "age_exit", "PGS", "pc1", "pc2", "pc3", "pc4", "pgs_ctn_z"]
+    ].copy()
+    check = model.check(new_samples)
+
+    assert check.ok, [issue.message for issue in check.issues]
+    pred = model.predict(new_samples)
+    grid = np.array([45.0, 55.0, 65.0], dtype=float)
+    survival = pred.survival_at(grid)
+    assert survival.shape == (len(new_samples), grid.shape[0])
+    assert np.all(np.isfinite(survival))
 
 
 def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path):

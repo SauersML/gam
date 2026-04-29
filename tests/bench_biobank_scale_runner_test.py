@@ -209,6 +209,28 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
         self.assertTrue(getattr(args, "emit_routing_log", False))
 
+    def test_add_standardized_columns_returns_replayable_training_statistics(self) -> None:
+        train_rows: list[dict[str, object]] = []
+        test_rows: list[dict[str, object]] = []
+        for target, base in ((train_rows, 10.0), (test_rows, 20.0)):
+            for idx in range(3):
+                row = {
+                    "age_entry": base + idx,
+                    "lat_final": base + idx + 1.0,
+                    "lon_final": base + idx + 2.0,
+                    "pgs_raw": base + idx + 3.0,
+                }
+                row.update({f"pc{i}": base + idx + i for i in range(1, 17)})
+                target.append(row)
+
+        standardization = _RUNNER.add_standardized_columns(train_rows, test_rows)
+
+        self.assertEqual(set(standardization), {"age_entry", "lat_final", "lon_final", "pgs_raw", *[f"pc{i}" for i in range(1, 17)]})
+        self.assertAlmostEqual(standardization["age_entry"]["mean"], 11.0)
+        self.assertGreater(standardization["age_entry"]["sd"], 0.0)
+        self.assertIn("pgs_std", train_rows[0])
+        self.assertIn("pc16_std", test_rows[0])
+
     def test_routing_log_scraper_captures_outer_plan_lines_only(self) -> None:
         # `_append_routing_lines` is the predicate that decides which captured
         # stderr lines reach the routing-log sidecar. It must accept the
