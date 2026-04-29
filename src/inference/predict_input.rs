@@ -9,7 +9,8 @@ use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
 use crate::families::transformation_normal::{
-    TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_TAIL_GUARD_FRACTION,
+    TRANSFORMATION_GRID_RELATIVE_TOL, TRANSFORMATION_MONOTONICITY_EPS,
+    TRANSFORMATION_TAIL_GUARD_FRACTION,
 };
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
@@ -265,7 +266,7 @@ pub fn build_predict_input_for_model(
                 let left = window[0];
                 let right = window[1];
                 let width = right - left;
-                if width <= 1.0e-12 * grid_span {
+                if width <= TRANSFORMATION_GRID_RELATIVE_TOL * grid_span {
                     continue;
                 }
                 for sidx in 1..4 {
@@ -277,7 +278,7 @@ pub fn build_predict_input_for_model(
             derivative_grid.push(min_grid - grid_guard);
             derivative_grid.push(max_grid + grid_guard);
             derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            derivative_grid.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12 * grid_span);
+            derivative_grid.dedup_by(|a, b| (*a - *b).abs() <= TRANSFORMATION_GRID_RELATIVE_TOL * grid_span);
             let derivative_grid = ndarray::Array1::from_vec(derivative_grid);
             let (raw_deriv_basis, _) = create_basis::<Dense>(
                 derivative_grid.view(),
