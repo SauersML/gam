@@ -11642,7 +11642,12 @@ mod tests {
 
         let fit_args = FitArgs {
             data: train_path.clone(),
-            formula_positional: "y ~ x1 + x2".to_string(),
+            // Firth bias-reduction is only implemented for the binomial logit
+            // likelihood. The auto-detect default for binary responses is
+            // probit (96df9f5/b0590db), so the formula must request logit
+            // explicitly for this CLI Firth-fit smoke to exercise the actual
+            // Firth code path.
+            formula_positional: "y ~ x1 + x2 + link(type=logit)".to_string(),
             predict_noise: None,
             logslope_formula: None,
             z_column: None,
