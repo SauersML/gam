@@ -50,7 +50,7 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=1, power=2, length_scale=1.0, double_penalty=false)",
+            "duchon(x0, x1, centers=5, order=1, power=2, double_penalty=false)",
         )
         self.assertNotIn("~", noise_terms)
 
@@ -114,12 +114,23 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
     def test_generated_duchon_scenarios_use_stable_hybrid_tuple(self) -> None:
         sc = _FUZZ.generate_scenario(1)
+        sc.model_type = "gam"
         _FUZZ._apply_basis_filter(sc, "duchon")
         self.assertEqual((sc.duchon_order, sc.duchon_power), (1, 1))
 
         formula = _FUZZ.rust_mean_formula(["x0", "x1", "x2"], sc)
         self.assertIn("length_scale=1.0", formula)
         self.assertIn("order=1, power=1", formula)
+
+    def test_gamlss_duchon_keeps_pure_tuple(self) -> None:
+        sc = _FUZZ.generate_scenario(1)
+        sc.model_type = "gamlss"
+        _FUZZ._apply_basis_filter(sc, "duchon")
+        self.assertEqual((sc.duchon_order, sc.duchon_power), (2, 0))
+
+        formula = _FUZZ.rust_mean_formula(["x0", "x1", "x2"], sc)
+        self.assertNotIn("length_scale", formula)
+        self.assertIn("order=2, power=0", formula)
 
     def test_tps_scenarios_do_not_use_three_centers(self) -> None:
         sc = _FUZZ.generate_scenario(54)
