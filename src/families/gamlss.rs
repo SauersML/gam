@@ -7049,8 +7049,26 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
     }
 
     fn to_dense(&self) -> Array2<f64> {
+        // The dense joint Hessian decomposes as
+        //   H = [[Aᵀ diag(c_aa) A,  Aᵀ diag(c_ab) B],
+        //        [Bᵀ diag(c_ab) A,  Bᵀ diag(c_bb) B]]
+        // with A = x_a (n × pa) and B = x_b (n × pb). Materialising A and B
+        // once and assembling the four blocks via the streaming faer GEMMs
+        // costs `O(n · max(pa,pb)²)` instead of `O(dim²)` repeated row-chunk
+        // recomputations from the default `mul_basis_columns_into` path.
+        let a = self.x_a.to_dense_cow();
+        let b = self.x_b.to_dense_cow();
+        let h_aa = crate::faer_ndarray::fast_xt_diag_x(a.as_ref(), &self.c_aa);
+        let h_bb = crate::faer_ndarray::fast_xt_diag_x(b.as_ref(), &self.c_bb);
+        let h_ab = crate::faer_ndarray::fast_xt_diag_y(a.as_ref(), &self.c_ab, b.as_ref());
         let mut out = Array2::<f64>::zeros((self.dim, self.dim));
-        self.mul_basis_columns_into(0, out.view_mut());
+        out.slice_mut(s![0..self.pa, 0..self.pa]).assign(&h_aa);
+        out.slice_mut(s![self.pa..self.dim, self.pa..self.dim])
+            .assign(&h_bb);
+        out.slice_mut(s![0..self.pa, self.pa..self.dim])
+            .assign(&h_ab);
+        out.slice_mut(s![self.pa..self.dim, 0..self.pa])
+            .assign(&h_ab.t());
         out
     }
 

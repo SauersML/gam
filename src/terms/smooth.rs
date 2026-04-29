@@ -6235,15 +6235,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
-    let prefer_gradient_only = false;
-    // The automatic fallback ladder degrades to BFGS+BfgsApprox after a
-    // Strong-Wolfe iter-0 failure; those rank-2 updates are directionally
-    // wrong on the Charbonnier-penalized pseudo-Laplace surface, so the
-    // optimizer grinds the BFGS TrustRegion fallback for the full max_iter
-    // budget instead of surfacing failure (geo_disease_matern 42-min hang).
-    // The ψ-stagnation guard in OuterFixedPointBridge only fires on the
-    // HybridEFS path, not on the BFGS-degraded path that this scenario
-    // actually hits.
+    // Keep the exact outer Hessian whenever the adaptive family can provide it.
+    // The Charbonnier pseudo-Laplace surface mixes ordinary log-lambda
+    // coordinates with adaptive λ/ε coordinates; downgrading dense designs to
+    // BFGS throws away the only curvature information that keeps those blocks
+    // synchronized. On small dense Duchon fits the rank-2 BFGS approximation can
+    // accept a flat/stalled point with near-zero operator lambdas, producing the
+    // catastrophic holdout R² gaps caught by the fuzzer. Cost control belongs in
+    // the Hessian representation, not in a solver downgrade at this call site.
     let problem = OuterProblem::new(n_theta)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
@@ -6251,7 +6250,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         } else {
             Derivative::Unavailable
         })
-        .with_prefer_gradient_only(prefer_gradient_only)
         .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)

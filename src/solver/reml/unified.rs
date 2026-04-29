@@ -1262,10 +1262,23 @@ pub trait HyperOperator: Send + Sync {
     /// Compute B · F where F is (p × k). Default dispatches per-column in
     /// parallel; matrix-free Khatri–Rao operators override this to fuse
     /// the K applies into two BLAS3 matmuls (`projected_operator` hot path).
+    ///
+    /// When invoked from inside an existing rayon worker (e.g. the parallel
+    /// cross-trace assembly in `compute_outer_hessian`), dispatch sequentially
+    /// to avoid pool oversubscription that manifested as
+    /// `LockLatch::wait_and_reset` stalls on operator-backed corrections.
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = factor.nrows();
         let k = factor.ncols();
+        let mut out = Array2::<f64>::zeros((p, k));
+        if rayon::current_thread_index().is_some() {
+            for col in 0..k {
+                let bv = out.column_mut(col);
+                self.mul_vec_into(factor.column(col), bv);
+            }
+            return out;
+        }
         let cols: Vec<Array1<f64>> = (0..k)
             .into_par_iter()
             .map(|col| {
@@ -1274,7 +1287,6 @@ pub trait HyperOperator: Send + Sync {
                 bv
             })
             .collect();
-        let mut out = Array2::<f64>::zeros((p, k));
         for (col, bv) in cols.into_iter().enumerate() {
             out.column_mut(col).assign(&bv);
         }
