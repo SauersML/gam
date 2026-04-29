@@ -500,9 +500,10 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
             ));
         }
         let mut wy = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            wy[i] = weights[i].max(0.0) * y[i];
-        }
+        ndarray::Zip::from(&mut wy)
+            .and(weights)
+            .and(y)
+            .par_for_each(|o, &w, &yi| *o = w.max(0.0) * yi);
         Ok(self.apply_transpose(&wy))
     }
 
@@ -529,9 +530,11 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
             let end = (start + chunk_size).min(n);
             let x_chunk = self.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let xm_chunk = fast_ab(&x_chunk, middle);
-            for i in 0..(end - start) {
-                out[start + i] = x_chunk.row(i).dot(&xm_chunk.row(i)).max(0.0);
-            }
+            let mut chunk_out = out.slice_mut(ndarray::s![start..end]);
+            ndarray::Zip::from(&mut chunk_out)
+                .and(x_chunk.rows())
+                .and(xm_chunk.rows())
+                .par_for_each(|o, xr, xmr| *o = xr.dot(&xmr).max(0.0));
             start = end;
         }
         Ok(out)
