@@ -2011,7 +2011,7 @@ fn materialize_survival<'a>(
                 event_target: event.clone(),
                 weights: weights.clone(),
                 inverse_link: survival_inverse_link.clone(),
-                derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+                derivative_guard: exact_derivative_guard,
                 max_iter: 200,
                 tol: 1e-7,
                 time_block,
@@ -2054,7 +2054,7 @@ fn materialize_survival<'a>(
                     frailty: marginal_slope_frailty.clone().ok_or_else(|| {
                         "internal error: marginal-slope frailty validation missing".to_string()
                     })?,
-                    derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+                    derivative_guard: exact_derivative_guard,
                     time_block,
                     timewiggle_block: prepared.timewiggle_block,
                     logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
@@ -2120,7 +2120,7 @@ fn materialize_survival<'a>(
                     age_exit: age_exit.clone(),
                     event_target: event.mapv(|v| if v >= 0.5 { 1 } else { 0 }),
                     weights: weights.clone(),
-                    derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+                    derivative_guard: exact_derivative_guard,
                     time_block,
                     unloaded_mass_entry: prepared.unloaded_mass_entry,
                     unloaded_mass_exit: prepared.unloaded_mass_exit,
@@ -2179,7 +2179,7 @@ fn materialize_survival<'a>(
                     age_exit: age_exit.clone(),
                     event_target: event.mapv(|v| if v >= 0.5 { 1 } else { 0 }),
                     weights: weights.clone(),
-                    derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+                    derivative_guard: exact_derivative_guard,
                     time_block,
                     unloaded_mass_entry: prepared.unloaded_mass_entry,
                     unloaded_mass_exit: prepared.unloaded_mass_exit,
