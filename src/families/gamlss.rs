@@ -6436,28 +6436,57 @@ impl CustomFamily for GaussianLocationScaleFamily {
             z_ls.as_slice_memory_order_mut(),
             w_ls.as_slice_memory_order_mut(),
         ) {
-            for i in 0..n {
-                let row = gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
-                ll += row.log_likelihood;
-                wmu_s[i] = row.location_working_weight;
-                zmu_s[i] = mu_s[i] + row.location_working_shift;
-                wls_s[i] = row.log_sigma_working_weight;
-                zls_s[i] = row.log_sigma_working_response;
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            // Per-row Gaussian LS kernel emits 5 outputs: ll + 4 working
+            // arrays. Independent across rows.
+            let rows: Vec<(f64, f64, f64, f64, f64)> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let row =
+                        gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
+                    (
+                        row.log_likelihood,
+                        row.location_working_weight,
+                        mu_s[i] + row.location_working_shift,
+                        row.log_sigma_working_weight,
+                        row.log_sigma_working_response,
+                    )
+                })
+                .collect();
+            for (i, (ll_i, w_i, z_i, wl_i, zl_i)) in rows.into_iter().enumerate() {
+                ll += ll_i;
+                wmu_s[i] = w_i;
+                zmu_s[i] = z_i;
+                wls_s[i] = wl_i;
+                zls_s[i] = zl_i;
             }
         } else {
-            for i in 0..n {
-                let row = gaussian_diagonal_row_kernel(
-                    self.y[i],
-                    etamu[i],
-                    eta_log_sigma[i],
-                    self.weights[i],
-                    ln2pi,
-                );
-                ll += row.log_likelihood;
-                wmu[i] = row.location_working_weight;
-                zmu[i] = etamu[i] + row.location_working_shift;
-                w_ls[i] = row.log_sigma_working_weight;
-                z_ls[i] = row.log_sigma_working_response;
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let rows: Vec<(f64, f64, f64, f64, f64)> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let row = gaussian_diagonal_row_kernel(
+                        self.y[i],
+                        etamu[i],
+                        eta_log_sigma[i],
+                        self.weights[i],
+                        ln2pi,
+                    );
+                    (
+                        row.log_likelihood,
+                        row.location_working_weight,
+                        etamu[i] + row.location_working_shift,
+                        row.log_sigma_working_weight,
+                        row.log_sigma_working_response,
+                    )
+                })
+                .collect();
+            for (i, (ll_i, w_i, z_i, wl_i, zl_i)) in rows.into_iter().enumerate() {
+                ll += ll_i;
+                wmu[i] = w_i;
+                zmu[i] = z_i;
+                w_ls[i] = wl_i;
+                z_ls[i] = zl_i;
             }
         }
 
