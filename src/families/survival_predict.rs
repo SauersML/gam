@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2, ArrayView2, s};
 
 use crate::families::lognormal_kernel::FrailtySpec;
-use crate::families::scale_design::ScaleDeviationTransform;
+use crate::families::scale_design::scale_transform_from_payload;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
     build_survival_baseline_offsets, build_survival_marginal_slope_baseline_offsets,
@@ -1200,44 +1200,6 @@ pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<In
             .map_err(|e| format!("invalid saved survival beta-logistic state: {e}"))
         }
         other => Ok(InverseLink::Standard(other)),
-    }
-}
-
-/// Build a [`ScaleDeviationTransform`] from saved projection metadata
-/// (returns `None` if no transform was persisted).
-pub fn scale_transform_from_payload(
-    projection: &Option<Vec<Vec<f64>>>,
-    center: &Option<Vec<f64>>,
-    scale: &Option<Vec<f64>>,
-    non_intercept_start: Option<usize>,
-) -> Result<Option<ScaleDeviationTransform>, String> {
-    match (projection, center, scale, non_intercept_start) {
-        (None, None, None, None) => Ok(None),
-        (Some(proj), Some(mean), Some(scale), Some(start)) => {
-            let rows = proj.len();
-            let cols = proj.first().map(|row| row.len()).unwrap_or(0);
-            let mut projection_coef = Array2::<f64>::zeros((rows, cols));
-            for (i, row) in proj.iter().enumerate() {
-                if row.len() != cols {
-                    return Err(
-                        "saved survival noise projection has inconsistent row widths".to_string(),
-                    );
-                }
-                for (j, &value) in row.iter().enumerate() {
-                    projection_coef[[i, j]] = value;
-                }
-            }
-            Ok(Some(ScaleDeviationTransform {
-                projection_coef,
-                weighted_column_mean: Array1::from_vec(mean.clone()),
-                rescale: Array1::from_vec(scale.clone()),
-                non_intercept_start: start,
-            }))
-        }
-        _ => Err(
-            "saved survival noise transform payload is only partially populated; refit with current CLI"
-                .to_string(),
-        ),
     }
 }
 

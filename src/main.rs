@@ -23,6 +23,7 @@ use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator,
     build_scale_deviation_transform_design, infer_non_intercept_start_design,
+    scale_transform_from_payload,
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
@@ -7768,45 +7769,6 @@ fn build_transformation_normal_saved_model(
     payload.transformation_response_degree = Some(family.response_degree());
     payload.transformation_response_median = Some(family.response_median());
     SavedModel::from_payload(payload)
-}
-
-fn scale_transform_from_payload(
-    projection: &Option<Vec<Vec<f64>>>,
-    center: &Option<Vec<f64>>,
-    scale: &Option<Vec<f64>>,
-    non_intercept_start: Option<usize>,
-) -> Result<Option<ScaleDeviationTransform>, String> {
-    let (Some(projection), Some(center), Some(scale), Some(non_intercept_start)) = (
-        projection.as_ref(),
-        center.as_ref(),
-        scale.as_ref(),
-        non_intercept_start,
-    ) else {
-        return Ok(None);
-    };
-    let rows = projection.len();
-    let cols = center.len();
-    if cols != scale.len() {
-        return Err("saved scale transform center/scale length mismatch".to_string());
-    }
-    if rows == 0 && cols > 0 {
-        return Err("saved scale transform projection has zero rows".to_string());
-    }
-    let mut mat = Array2::<f64>::zeros((rows, cols));
-    for (i, row) in projection.iter().enumerate() {
-        if row.len() != cols {
-            return Err("saved scale transform projection width mismatch".to_string());
-        }
-        for (j, &value) in row.iter().enumerate() {
-            mat[[i, j]] = value;
-        }
-    }
-    Ok(Some(ScaleDeviationTransform {
-        projection_coef: mat,
-        weighted_column_mean: Array1::from_vec(center.clone()),
-        rescale: Array1::from_vec(scale.clone()),
-        non_intercept_start,
-    }))
 }
 
 fn core_saved_fit_result(
