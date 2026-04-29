@@ -11,8 +11,8 @@ use crate::estimate::reml::unified::HyperOperator;
 use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
-    CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
-    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
+    add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
     is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials,
