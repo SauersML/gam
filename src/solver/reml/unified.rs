@@ -1415,6 +1415,7 @@ impl ProjectedFactorKey {
 #[derive(Default)]
 pub struct ProjectedFactorCache {
     entries: Mutex<HashMap<ProjectedFactorKey, Arc<Array2<f64>>>>,
+    row_traces: Mutex<HashMap<ProjectedTraceRowsKey, Arc<ProjectedTraceRows>>>,
 }
 
 impl ProjectedFactorCache {
@@ -1438,6 +1439,52 @@ impl ProjectedFactorCache {
             .entries
             .lock()
             .expect("projected factor cache lock poisoned");
+        entries
+            .entry(key)
+            .or_insert_with(|| computed.clone())
+            .clone()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectedTraceRowsKey {
+    left: ProjectedFactorKey,
+    right: ProjectedFactorKey,
+}
+
+impl ProjectedTraceRowsKey {
+    pub fn new(left: ProjectedFactorKey, right: ProjectedFactorKey) -> Self {
+        Self { left, right }
+    }
+}
+
+pub struct ProjectedTraceRows {
+    pub aa: Array1<f64>,
+    pub ab: Array1<f64>,
+    pub bb: Array1<f64>,
+}
+
+impl ProjectedFactorCache {
+    pub fn get_or_insert_trace_rows_with(
+        &self,
+        key: ProjectedTraceRowsKey,
+        compute: impl FnOnce() -> ProjectedTraceRows,
+    ) -> Arc<ProjectedTraceRows> {
+        if let Some(value) = self
+            .row_traces
+            .lock()
+            .expect("projected trace row cache lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return value;
+        }
+
+        let computed = Arc::new(compute());
+        let mut entries = self
+            .row_traces
+            .lock()
+            .expect("projected trace row cache lock poisoned");
         entries
             .entry(key)
             .or_insert_with(|| computed.clone())
