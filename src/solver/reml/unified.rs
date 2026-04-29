@@ -5455,6 +5455,71 @@ fn compute_outer_hessian(
     }
 
     if hess.iter().any(|v| !v.is_finite()) {
+        // NaN bisection: report which intermediate inputs were already
+        // non-finite before the entry-builder summed them. This pinpoints the
+        // original source (penalty drift, drift correction, cross-trace, ...)
+        // instead of just flagging the final outer-Hessian entry.
+        let report_finite = |name: &str, value: f64, ii: usize, jj: usize| {
+            if !value.is_finite() {
+                log::warn!(
+                    "[OUTER non-finite] {} at ({}, {}) = {}",
+                    name,
+                    ii,
+                    jj,
+                    value,
+                );
+            }
+        };
+        for kk in 0..k {
+            report_finite("rho_a_vals[kk]", rho_a_vals[kk], kk, kk);
+            for entry in penalty_a_k_betas[kk].iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] penalty_a_k_betas[{}] has non-finite", kk);
+                    break;
+                }
+            }
+            for entry in v_ks[kk].iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
+                    break;
+                }
+            }
+        }
+        if let Some(ref exact) = exact_logdet_cross_traces {
+            for ii in 0..exact.nrows() {
+                for jj in 0..exact.ncols() {
+                    report_finite("exact_logdet_cross_traces", exact[[ii, jj]], ii, jj);
+                }
+            }
+        }
+        if let Some(ref sct) = stochastic_cross_traces {
+            for ii in 0..sct.nrows() {
+                for jj in 0..sct.ncols() {
+                    report_finite("stochastic_cross_traces", sct[[ii, jj]], ii, jj);
+                }
+            }
+        }
+        if let Some(ref h_g) = leverage {
+            for entry in h_g.iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] leverage h^G has non-finite entries");
+                    break;
+                }
+            }
+        }
+        if let Some(ref z_c) = adjoint_z_c {
+            for entry in z_c.iter() {
+                if !entry.is_finite() {
+                    log::warn!("[OUTER non-finite] adjoint_z_c has non-finite entries");
+                    break;
+                }
+            }
+        }
+        for ii in 0..total {
+            for jj in 0..total {
+                report_finite("hess", hess[[ii, jj]], ii, jj);
+            }
+        }
         return Err(
             "Outer Hessian contains non-finite entries; exact higher-order derivatives are invalid"
                 .to_string(),
@@ -6248,6 +6313,14 @@ fn build_outer_hessian_operator(
             .collect();
         let mut ct = Array2::<f64>::zeros((total, total));
         for ((ii, jj), value) in pair_values {
+            if !value.is_finite() {
+                log::warn!(
+                    "[OPERATOR cross_trace non-finite] cross_trace[{}, {}] = {}",
+                    ii,
+                    jj,
+                    value,
+                );
+            }
             ct[[ii, jj]] = value;
             if ii != jj {
                 ct[[jj, ii]] = value;
