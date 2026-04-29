@@ -1293,6 +1293,20 @@ pub trait HyperOperator: Send + Sync {
         out
     }
 
+    /// Compute `trace(F^T B F)` for a `(p x k)` factor matrix `F`.
+    ///
+    /// The default uses the batched `B F` path, but structured row-coefficient
+    /// operators can override this to avoid materialising the full product when
+    /// callers only need the projected trace.
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        let op_factor = self.mul_mat(factor);
+        factor
+            .iter()
+            .zip(op_factor.iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum()
+    }
+
     /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
     ///
     /// Sparse exact traces build `B E` in column batches. Operators with
@@ -7880,8 +7894,7 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
-        let projected = self.projected_operator(&self.w_factor, op);
-        projected.diag().sum()
+        op.trace_projected_factor(&self.w_factor)
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -8018,8 +8031,7 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        let projected = self.projected_operator(&self.g_factor, op);
-        projected.diag().sum()
+        op.trace_projected_factor(&self.g_factor)
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
