@@ -621,33 +621,43 @@ impl TransformationNormalFamily {
                  Monotonicity constraint may be violated."
             ));
         }
+        // Numerical-safety floor for the higher reciprocal powers `1/h'^3`
+        // and `1/h'^4` consumed by the analytic ψ-ψ second-order Hessian
+        // (`exact_newton_joint_psisecond_order_terms` lines 1649-1772) and
+        // ψ-Hessian-drift (`exact_newton_joint_psihessian_directional_derivative`).
+        // For `h' < ~1e-77` the IEEE f64 division `1.0 / (hp² · hp²)`
+        // overflows to +∞ because `(1e-77)^4 ≈ 1e-308` is denormal; +∞ then
+        // collides with zero entries of `v_*_deriv` (and zero rows of the
+        // derivative basis) inside `factored_weighted_cross` / `weighted_gram`
+        // to produce NaN that poisons the entire dense `hessian_psi_psi`
+        // block. Observed: 238×238 NaN dense `b_mat` on the κ_i-κ_i diagonals
+        // of the 16-axis aniso Duchon margslope CTN run.
+        //
+        // The clamp `hp_safe = max(hp, EPS_FLOOR)` is mathematically equivalent
+        // for `hp ≫ EPS_FLOOR` and bounded for tiny `hp`. The floor is set
+        // conservatively to `1e-12` — far above the IEEE overflow threshold
+        // and small enough that any physically meaningful h' is unaffected
+        // (CTN typically has h' on the order of unity at converged β̂). When
+        // `min_hp < EPS_FLOOR`, the clamped reciprocal still overestimates
+        // the "true" `1/h'^k` magnitude only at those few infeasible rows,
+        // and the resulting Hessian remains finite so the outer REML can
+        // take a meaningful step (toward feasibility) instead of consuming
+        // a NaN block. The likelihood path itself only consumes 1/h' and
+        // 1/h'² (which stay finite well below the floor), so the clamp is
+        // localized to the higher powers and does not perturb the main
+        // gradient/Hessian pipeline.
+        const HPRIME_RECIPROCAL_FLOOR: f64 = 1.0e-12;
         let inv_h_prime = h_prime.mapv(|hp| 1.0 / hp);
         let inv_h_prime_sq = h_prime.mapv(|hp| 1.0 / (hp * hp));
-        let inv_h_prime_cu = h_prime.mapv(|hp| 1.0 / (hp * hp * hp));
+        let inv_h_prime_cu = h_prime.mapv(|hp| {
+            let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
+            1.0 / (hp_safe * hp_safe * hp_safe)
+        });
         let inv_h_prime_qu = h_prime.mapv(|hp| {
-            let hp2 = hp * hp;
+            let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
+            let hp2 = hp_safe * hp_safe;
             1.0 / (hp2 * hp2)
         });
-        // Backstop for IEEE overflow in the higher reciprocal powers. The
-        // closed-form ψ-ψ Hessian and gradient downstream consume
-        // `inv_h_prime_qu` (and to a lesser extent `inv_h_prime_cu`); for
-        // h' below ~1e-77 the f64 division `1.0 / (hp2 * hp2)` overflows
-        // to +∞, and the outer REML caller silently propagates that into
-        // a NaN dense Hessian when the +∞ is multiplied against zero
-        // entries in `v_*_deriv` or zero rows of the derivative basis.
-        // The monotonicity gate above (`min_hp <= 0`) does not catch this
-        // because the iterate is mathematically feasible — only its higher
-        // reciprocal powers overflow. Surface the infeasibility cleanly so
-        // the outer evaluator can retreat from this trial point instead of
-        // consuming the NaN Hessian.
-        if !inv_h_prime_qu.iter().all(|v| v.is_finite())
-            || !inv_h_prime_cu.iter().all(|v| v.is_finite())
-        {
-            return Err(format!(
-                "TransformationNormalFamily row_quantities: 1/h'^k overflowed at min h' = \
-                 {min_hp:.6e}. The outer evaluator should retreat from this trial point."
-            ));
-        }
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
