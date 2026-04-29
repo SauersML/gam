@@ -20301,6 +20301,56 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_projected_trace_cache_matches_dense() {
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let d_beta_u = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let d_beta_v = array![-0.11, 0.13, -0.05, -0.22, 0.09];
+        let factor = Array2::from_shape_fn((p, 3), |(i, j)| {
+            ((i as f64 + 1.0) * 0.19 + (j as f64 + 0.5) * 0.37).sin()
+        });
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta_u)
+            .expect("dH operator call")
+            .expect("dH operator present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&d_beta_u, &d_beta_v)
+            .expect("d2H operator call")
+            .expect("d2H operator present");
+        let cache = crate::solver::estimate::reml::unified::ProjectedFactorCache::default();
+
+        for (name, op) in [("dH", dh_op), ("d2H", d2h_op)] {
+            let dense = op.to_dense();
+            let dense_projected = dense.dot(&factor);
+            let want: f64 = factor
+                .iter()
+                .zip(dense_projected.iter())
+                .map(|(&f, &bf)| f * bf)
+                .sum();
+            let uncached = op.trace_projected_factor(&factor);
+            let cached_first = op.trace_projected_factor_cached(&factor, &cache);
+            let cached_second = op.trace_projected_factor_cached(&factor, &cache);
+
+            for (label, got) in [
+                ("uncached", uncached),
+                ("cached_first", cached_first),
+                ("cached_second", cached_second),
+            ] {
+                let tol = 1e-9 * want.abs().max(1.0) + 1e-9;
+                assert!(
+                    (want - got).abs() <= tol,
+                    "{name} projected trace {label} mismatch: dense={want:.6e}, got={got:.6e}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn binomial_location_scale_workspace_dh_operator_finite_difference() {
         // FD check: [H(β + ε u) v − H(β − ε u) v] / (2ε) ≈ DH[u] v
         // The operator must agree with a centered finite-difference of the
