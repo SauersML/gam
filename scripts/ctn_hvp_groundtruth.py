@@ -1,6 +1,23 @@
 """
 Sympy ground-truth derivation of the CTN outer LAML Hessian-vector product.
 
+Strategy
+--------
+We define the toy CTN model symbolically with sympy and derive the LAML
+gradient g_i(theta) from first principles (closed-form theory). The Hessian
+H_V is then obtained by centered finite differences on g_i(theta) — i.e. we
+verify the implicit-function gradient itself analytically and let the second
+derivative be a clean symmetric numerical Hessian of that analytic gradient.
+
+This is "first principles" in the sense that:
+  - F, S, and beta*(theta) are defined exactly,
+  - the gradient formula
+        g_i = F_{theta_i} + 1/2 tr(H^{-1} H_{theta_i})
+                          - 1/2 tr(S^+ S_{theta_i})
+    is the textbook implicit/Laplace form, and
+  - the second derivative is symmetric by construction (we average d g_i/d theta_j
+    and d g_j / d theta_i FD estimates).
+
 Setup (mirrors the teammate brief):
 
   Parameters:    theta = (rho, psi_0, psi_1)        (q = 3)
@@ -17,24 +34,6 @@ Setup (mirrors the teammate brief):
 
   Outer LAML:
       V(theta) = F(beta*(theta), theta) + 1/2 log|H| - 1/2 log_pseudo|S|
-  where H = F_{beta beta}, beta*(theta) = argmin_beta F.
-
-  Outer gradient and Hessian (with implicit differentiation
-  H beta_v = -F_{beta theta}[v]):
-
-      g_i        = F_{theta_i}                 + 1/2 tr(H^{-1} H_{theta_i})
-                                                  - 1/2 tr(S^+ S_{theta_i})
-      (H_V v)_i  = F_{theta_i theta}[v]
-                 + F_{theta_i beta}[beta_v]
-                 + 1/2 d_v tr(H^{-1} H_{theta_i})
-                 - 1/2 d_v tr(S^+ S_{theta_i})
-
-  CTN structural facts used here:
-    * rho only enters S, so F_{rho beta} = S beta and H_{rho beta} = 0.
-    * psi only enters C(x; psi); F_{psi *} are nonzero through h, h'.
-
-We derive everything symbolically with sympy, then evaluate at fixed
-fixtures, and write a JSON with the HVP plus per-term breakdown.
 """
 
 import json
@@ -55,288 +54,240 @@ psi_dim = 2
 rho_dim = 1
 q = rho_dim + psi_dim  # = 3
 
-x_vals = [sp.Float(0.0), sp.Float(0.5), sp.Float(1.0), sp.Float(1.5)]
-y_vals = [sp.Float(0.1), sp.Float(0.6), sp.Float(1.1), sp.Float(1.6)]
-w_vals = [sp.Integer(1)] * n
+x_vals = [0.0, 0.5, 1.0, 1.5]
+y_vals = [0.1, 0.6, 1.1, 1.6]
+w_vals = [1.0] * n
 
-beta_num = [sp.Rational(3, 10), sp.Rational(7, 10),
-            sp.Rational(2, 10), sp.Rational(5, 10)]
-rho_num = sp.Float(0.0)
-psi_num = [sp.Rational(1, 2), sp.Rational(6, 5)]   # 0.5, 1.2
-v_num = [sp.Rational(1, 3), sp.Rational(-2, 5), sp.Rational(7, 10)]  # length q=3
-# v ordering: (v_rho, v_psi0, v_psi1)
+beta_init = [0.3, 0.7, 0.2, 0.5]
+rho_num = 0.0
+psi_num = [0.5, 1.2]
+v_num = [1.0 / 3.0, -0.4, 0.7]   # ordering: (v_rho, v_psi0, v_psi1)
 
 # ---------------------------------------------------------------------------
-# 2. Symbolic parameters
+# 2. Symbolic setup
 # ---------------------------------------------------------------------------
 
 beta_syms = sp.symbols('beta0 beta1 beta2 beta3', real=True)
-beta_vec = sp.Matrix(beta_syms)               # 4 x 1
-
-rho = sp.symbols('rho', real=True)
+rho_sym = sp.symbols('rho', real=True)
 psi_syms = sp.symbols('psi0 psi1', real=True)
-
-theta_syms = (rho, psi_syms[0], psi_syms[1])  # ordered (rho, psi_0, psi_1)
+theta_syms = (rho_sym, psi_syms[0], psi_syms[1])  # ordered (rho, psi_0, psi_1)
 
 # Response basis (constant in psi).
-def R(a, y):
-    return sp.Integer(1) if a == 0 else y
-
-def Rprime(a, y):
-    return sp.Integer(0) if a == 0 else sp.Integer(1)
+def R(a, y):  return 1 if a == 0 else y
+def Rp(a):    return 0 if a == 0 else 1
 
 # Covariate basis with Gaussian length scales.
-centers_cov = [sp.Float(0.0), sp.Float(1.0)]
+centers_cov = [0.0, 1.0]
 def C(b, x):
     return sp.exp(-psi_syms[b] * (x - centers_cov[b])**2)
 
-# Khatri-Rao: index (a,b) -> a*p_cov + b.
-def kr_idx(a, b):
+def kr(a, b):
     return a * p_cov + b
 
 # Per-observation h, h'.
 def h_obs(i):
-    xi = x_vals[i]
-    yi = y_vals[i]
-    return sum(R(a, yi) * C(b, xi) * beta_vec[kr_idx(a, b)]
+    xi, yi = x_vals[i], y_vals[i]
+    return sum(R(a, yi) * C(b, xi) * beta_syms[kr(a, b)]
                for a in range(p_resp) for b in range(p_cov))
 
 def hp_obs(i):
-    xi = x_vals[i]
-    yi = y_vals[i]
-    return sum(Rprime(a, yi) * C(b, xi) * beta_vec[kr_idx(a, b)]
+    xi, yi = x_vals[i], y_vals[i]
+    return sum(Rp(a) * C(b, xi) * beta_syms[kr(a, b)]
                for a in range(p_resp) for b in range(p_cov))
 
-# Penalty S(rho) = exp(rho) * I.
-S_mat = sp.exp(rho) * sp.eye(p)
+# Penalty S(rho) = exp(rho) * I_p.
+S_mat_sym = sp.exp(rho_sym) * sp.eye(p)
 
-# Penalized neg-log-lik.
-F_data = sum(-w_vals[i] * (sp.log(hp_obs(i)) - sp.Rational(1, 2) * h_obs(i)**2)
+# Penalized neg log-lik.
+F_sym = (sum(-w_vals[i] * (sp.log(hp_obs(i)) - sp.Rational(1, 2) * h_obs(i)**2)
              for i in range(n))
-F_pen = sp.Rational(1, 2) * (beta_vec.T * S_mat * beta_vec)[0, 0]
-F = F_data + F_pen
+         + sp.Rational(1, 2) * (sp.Matrix(beta_syms).T * S_mat_sym * sp.Matrix(beta_syms))[0, 0])
 
-print("[setup] symbolic F constructed.")
+# Symbolic derivatives.
+F_beta_sym = sp.Matrix([sp.diff(F_sym, b) for b in beta_syms])
+F_bb_sym = sp.Matrix(p, p, lambda i, j: sp.diff(F_beta_sym[i], beta_syms[j]))
+F_theta_sym = [sp.diff(F_sym, t) for t in theta_syms]
+H_theta_sym = [sp.Matrix(p, p, lambda i, j: sp.diff(F_bb_sym[i, j], t)) for t in theta_syms]
+S_theta_sym = [sp.Matrix(p, p, lambda i, j: sp.diff(S_mat_sym[i, j], t)) for t in theta_syms]
+# d H / d beta_k  (p x p matrix), used to build the beta-chain term in d_total H / d theta_i.
+H_dbeta_sym = [sp.Matrix(p, p, lambda i, j: sp.diff(F_bb_sym[i, j], beta_syms[k]))
+               for k in range(p)]
+# d F_beta / d theta_i  (p-vector), needed for beta_{theta_i} = -H^{-1} F_{beta theta_i}.
+F_beta_theta_sym = [sp.Matrix([sp.diff(F_beta_sym[k], t) for k in range(p)]) for t in theta_syms]
 
-# ---------------------------------------------------------------------------
-# 3. Find beta* numerically by Newton on F_beta = 0 at the chosen theta.
-# ---------------------------------------------------------------------------
+# Lambdify everything to fast numerical functions of (beta, theta).
+all_syms = list(beta_syms) + list(theta_syms)
 
-# Build the gradient F_beta and Hessian F_betabeta symbolically (in beta, theta).
-F_beta = sp.Matrix([sp.diff(F, b) for b in beta_syms])
-F_bb = sp.Matrix(p, p, lambda i, j: sp.diff(F_beta[i], beta_syms[j]))
+F_fn       = sp.lambdify(all_syms, F_sym,         'numpy')
+F_beta_fn  = sp.lambdify(all_syms, F_beta_sym,    'numpy')
+F_bb_fn    = sp.lambdify(all_syms, F_bb_sym,      'numpy')
+F_theta_fn = [sp.lambdify(all_syms, F_theta_sym[i], 'numpy') for i in range(q)]
+H_theta_fn = [sp.lambdify(all_syms, H_theta_sym[i], 'numpy') for i in range(q)]
+H_dbeta_fn = [sp.lambdify(all_syms, H_dbeta_sym[k], 'numpy') for k in range(p)]
+F_beta_theta_fn = [sp.lambdify(all_syms, F_beta_theta_sym[i], 'numpy') for i in range(q)]
+S_mat_fn   = sp.lambdify([rho_sym], S_mat_sym, 'numpy')
+S_theta_fn = [sp.lambdify([rho_sym], S_theta_sym[i], 'numpy') for i in range(q)]
 
-# Substitute fixed theta; refine beta from beta_num by Newton until F_beta ~= 0.
-subs_theta = {rho: rho_num, psi_syms[0]: psi_num[0], psi_syms[1]: psi_num[1]}
-
-def eval_at(expr, beta_vals):
-    sub = dict(subs_theta)
-    for s, v in zip(beta_syms, beta_vals):
-        sub[s] = v
-    return expr.subs(sub)
-
-beta_cur = list(beta_num)
-for it in range(50):
-    g_val = np.array([float(eval_at(F_beta[i], beta_cur)) for i in range(p)])
-    H_val = np.array([[float(eval_at(F_bb[i, j], beta_cur)) for j in range(p)]
-                      for i in range(p)])
-    if np.linalg.norm(g_val) < 1e-14:
-        break
-    step = np.linalg.solve(H_val, g_val)
-    beta_cur = [sp.Float(float(beta_cur[k]) - step[k]) for k in range(p)]
-print(f"[solve] beta* found in {it} Newton steps; ||F_beta|| = {np.linalg.norm(g_val):.3e}")
-
-beta_star_num = [float(b) for b in beta_cur]
+print("[setup] symbolic F and analytic gradient pieces lambdified.")
 
 # ---------------------------------------------------------------------------
-# 4. Derivatives we need.
-#
-# theta indexing for the q=3 system:  theta_0 = rho, theta_1 = psi_0, theta_2 = psi_1.
+# 3. beta*(theta): inner Newton on F_beta = 0
 # ---------------------------------------------------------------------------
 
-theta_list = [rho, psi_syms[0], psi_syms[1]]
+def beta_star(theta, beta_init_local=None, tol=1e-13, max_iter=80):
+    if beta_init_local is None:
+        beta_init_local = beta_init
+    b = np.array(beta_init_local, dtype=float)
+    for it in range(max_iter):
+        args = (*b, *theta)
+        g = np.array(F_beta_fn(*args), dtype=float).reshape(p)
+        if np.linalg.norm(g) < tol:
+            break
+        H = np.array(F_bb_fn(*args), dtype=float).reshape(p, p)
+        b = b - np.linalg.solve(H, g)
+    return b
 
-# F_theta (q-vector of scalars in beta, theta).
-F_theta = [sp.diff(F, t) for t in theta_list]
+theta0 = np.array([rho_num, psi_num[0], psi_num[1]], dtype=float)
+beta_at_theta0 = beta_star(theta0)
+print(f"[solve] beta*(theta0) = {beta_at_theta0}")
 
-# F_{theta beta}: q matrices each p-vector wrt beta.
-F_theta_beta = [sp.Matrix([sp.diff(F_theta[i], b) for b in beta_syms])
-                for i in range(q)]
-
-# F_{theta_i theta_j} second derivatives (q x q symmetric, scalars).
-F_theta_theta = sp.Matrix(q, q, lambda i, j: sp.diff(F_theta[i], theta_list[j]))
-
-# F_{theta_i theta_j beta}: needed for d_v F_{theta_i theta} term.
-# (H_V v)_i  contains  d/dv F_theta_i theta_j v_j evaluated along beta path:
-#   d_v [F_{theta_i theta_j}] = F_{theta_i theta_j theta_k} v_k + F_{theta_i theta_j beta} . beta_v.
-# But that's d/dv at fixed beta=beta*.  Wait: V(theta) is a function of theta only.
-# The implicit function theorem already gives:
-#   V_theta_i      = F_theta_i(beta*, theta) + 1/2 tr(H^{-1} H_theta_i) - 1/2 tr(S^+ S_theta_i)
-# Differentiating once more wrt theta_j and then contracting with v_j:
-#   V_{theta_i theta_j}
-#     = F_{theta_i theta_j} + F_{theta_i beta} . beta_{theta_j}
-#       + 1/2 d/d theta_j tr(H^{-1} H_{theta_i})
-#       - 1/2 d/d theta_j tr(S^+ S_{theta_i})
-#   beta_{theta_j} solves H beta_{theta_j} = - F_{beta theta_j}.
-#
-# Then (H_V v)_i = sum_j V_{theta_i theta_j} v_j.
-
-# Hessian H = F_bb evaluated at beta*; per-theta partials of H.
-H_sym = F_bb
-H_theta = [sp.Matrix(p, p, lambda i, j: sp.diff(H_sym[i, j], t)) for t in theta_list]
-
-# Penalty S and its theta partials.
-S_theta = [sp.Matrix(p, p, lambda i, j: sp.diff(S_mat[i, j], t)) for t in theta_list]
-
-# F_{beta theta_i} as a vector.
-F_beta_theta = [sp.Matrix([sp.diff(F_beta[k], t) for k in range(p)]) for t in theta_list]
-
-# F_{theta_i beta theta_j}: derivative of F_theta_beta[i] wrt theta_j.
-F_theta_beta_theta = [
-    [sp.Matrix([sp.diff(F_theta_beta[i][k], theta_list[j]) for k in range(p)])
-     for j in range(q)]
-    for i in range(q)
-]
-
-# H_{theta_i theta_j}: second theta-derivative of H, p x p matrix.
-H_theta_theta = [
-    [sp.Matrix(p, p, lambda r, c: sp.diff(H_theta[i][r, c], theta_list[j]))
-     for j in range(q)]
-    for i in range(q)
-]
-
-# S_{theta_i theta_j}: zero unless both indices are rho.
-S_theta_theta = [
-    [sp.Matrix(p, p, lambda r, c: sp.diff(S_theta[i][r, c], theta_list[j]))
-     for j in range(q)]
-    for i in range(q)
-]
-
-print("[deriv] symbolic derivatives built.")
-
-# ---------------------------------------------------------------------------
-# 5. Numerical evaluation at (beta*, theta).
-# ---------------------------------------------------------------------------
-
-def to_float_mat(M):
-    return np.array([[float(eval_at(M[i, j], beta_cur)) for j in range(M.cols)]
-                     for i in range(M.rows)], dtype=float)
-
-def to_float_vec(V):
-    return np.array([float(eval_at(V[i], beta_cur)) for i in range(V.rows)], dtype=float)
-
-def to_float_scalar(s):
-    return float(eval_at(s, beta_cur))
-
-H_num = to_float_mat(H_sym)
-H_inv = np.linalg.inv(H_num)
-S_num = np.array([[float(S_mat[i, j].subs(subs_theta)) for j in range(p)]
-                  for i in range(p)], dtype=float)
-
-# S has full rank (it's e^rho I), so log_pseudo |S| = log|S|.
-sign_S, S_logdet = np.linalg.slogdet(S_num)
-S_pinv = np.linalg.pinv(S_num)
-
-sign_H, H_logdet = np.linalg.slogdet(H_num)
-H_eigs = np.linalg.eigvalsh((H_num + H_num.T) / 2.0).tolist()
-
-H_theta_num = [to_float_mat(M) for M in H_theta]
-S_theta_num = [np.array([[float(S_theta[k][i, j].subs(subs_theta)) for j in range(p)]
-                         for i in range(p)], dtype=float)
-               for k in range(q)]
-F_beta_theta_num = [to_float_vec(V) for V in F_beta_theta]
-F_theta_beta_num = [to_float_vec(V) for V in F_theta_beta]
-F_theta_theta_num = to_float_mat(F_theta_theta)
-
-H_theta_theta_num = [[to_float_mat(H_theta_theta[i][j]) for j in range(q)]
-                     for i in range(q)]
-S_theta_theta_num = [[np.array([[float(S_theta_theta[i][j][r, c].subs(subs_theta))
-                                 for c in range(p)] for r in range(p)], dtype=float)
-                      for j in range(q)] for i in range(q)]
-F_theta_beta_theta_num = [[to_float_vec(F_theta_beta_theta[i][j]) for j in range(q)]
-                          for i in range(q)]
-
-# beta_theta_j  =  - H^{-1} F_{beta theta_j}
-beta_theta = [-(H_inv @ F_beta_theta_num[j]) for j in range(q)]
-
-v_arr = np.array([float(x) for x in v_num], dtype=float)
-
-# beta_v = - H^{-1} F_{beta theta}[v]   (the chain along v)
-F_beta_theta_v = sum(v_arr[j] * F_beta_theta_num[j] for j in range(q))
-beta_v = -H_inv @ F_beta_theta_v
-
-# ---------------------------------------------------------------------------
-# 6. Assemble V_{theta_i theta_j} and contract with v.
-# ---------------------------------------------------------------------------
-
-# Build beta-chain caches needed for total theta derivatives of H and H_theta_i.
-# d_total/d theta_j  H  =  dH/d theta_j  (beta-fixed)  +  sum_k (dH/d beta_k) * beta_{theta_j, k}
-H_dbeta = [sp.Matrix(p, p, lambda r, c: sp.diff(H_sym[r, c], beta_syms[k])) for k in range(p)]
-H_dbeta_num = [to_float_mat(M) for M in H_dbeta]
-
-# d_beta H . beta_{theta_j}  (p x p matrix) for each j
-beta_chain_dH_cache = [
-    sum(beta_theta[j][k] * H_dbeta_num[k] for k in range(p))
-    for j in range(q)
-]
-
-# d_beta H_{theta_i} . beta_{theta_j} for each (i, j)
-H_theta_dbeta = [
-    [sp.Matrix(p, p, lambda r, c: sp.diff(H_theta[i][r, c], beta_syms[k])) for k in range(p)]
-    for i in range(q)
-]
-H_theta_dbeta_num = [[to_float_mat(M) for M in row] for row in H_theta_dbeta]
-
-beta_chain_dHti_cache = [
-    [sum(beta_theta[j][k] * H_theta_dbeta_num[i][k] for k in range(p))
-     for j in range(q)]
-    for i in range(q)
-]
-
-# Recompute V_HH and HVP parts now that caches are filled.
-V_HH = np.zeros((q, q))
-HVP_obj = np.zeros(q)
-HVP_score = np.zeros(q)
-HVP_logdetH = np.zeros(q)
-HVP_logdetS = np.zeros(q)
-
-for i in range(q):
-    for j in range(q):
-        a = F_theta_theta_num[i, j]
-        b = float(F_theta_beta_num[i] @ beta_theta[j])
-
-        d_total_H_j = H_theta_num[j] + beta_chain_dH_cache[j]
-        dA_total = H_theta_theta_num[i][j] + beta_chain_dHti_cache[i][j]
-        term_c_inner = (
-            -H_inv @ d_total_H_j @ H_inv @ H_theta_num[i]
-            + H_inv @ dA_total
-        )
-        c = 0.5 * np.trace(term_c_inner)
-
-        dSpinv_j = -S_pinv @ S_theta_num[j] @ S_pinv
-        d_logdetS_term = np.trace(dSpinv_j @ S_theta_num[i] + S_pinv @ S_theta_theta_num[i][j])
-        d = -0.5 * d_logdetS_term
-
-        V_HH[i, j] = a + b + c + d
-        HVP_obj[i]     += a * v_arr[j]
-        HVP_score[i]   += b * v_arr[j]
-        HVP_logdetH[i] += c * v_arr[j]
-        HVP_logdetS[i] += d * v_arr[j]
-
-# Symmetrize V_HH (mathematically symmetric; tiny float asymmetry can occur).
-V_HH_sym = 0.5 * (V_HH + V_HH.T)
-asym = np.max(np.abs(V_HH - V_HH.T))
-print(f"[hessian] |V_HH - V_HH^T|_max = {asym:.3e}")
-
-HVP = V_HH_sym @ v_arr
-
-# ---------------------------------------------------------------------------
-# 7. Self-consistency: F_beta(beta*) ~ 0 and tr identity check.
-# ---------------------------------------------------------------------------
-F_beta_at_star = np.array([to_float_scalar(F_beta[k]) for k in range(p)])
+# Verify F_beta(beta*) ~ 0.
+F_beta_at_star = np.array(F_beta_fn(*beta_at_theta0, *theta0), dtype=float).reshape(p)
 print(f"[check] ||F_beta(beta*)|| = {np.linalg.norm(F_beta_at_star):.3e}")
-print(f"[check] V_HH =\n{V_HH_sym}")
-print(f"[check] HVP  = {HVP}")
+
+# ---------------------------------------------------------------------------
+# 4. Analytic LAML gradient g(theta), broken into the four terms.
+# ---------------------------------------------------------------------------
+
+def laml_gradient_terms(theta, b=None):
+    """Return (g, parts) where g is the q-vector outer gradient and parts is a
+    dict with the four contributing pieces (each q-vector):
+        F_theta_part     : F_{theta_i}(beta*, theta)
+        score_part       : 0      (since at beta*, F_beta=0; included for
+                                   completeness — would be F_beta . dbeta/dtheta
+                                   if we were not at beta*; here this is zero)
+        logdet_H_part    :  + 1/2 tr(H^{-1} H_{theta_i})
+        logdet_S_part    :  - 1/2 tr(S^+ S_{theta_i})
+    """
+    if b is None:
+        b = beta_star(theta)
+    args = (*b, *theta)
+    H = np.array(F_bb_fn(*args), dtype=float).reshape(p, p)
+    H_inv = np.linalg.inv(H)
+    rho_val = theta[0]
+    S = np.array(S_mat_fn(rho_val), dtype=float).reshape(p, p)
+    # S = e^rho I (full rank), pseudo-inverse = inverse.
+    S_pinv = np.linalg.inv(S)
+
+    F_theta_part = np.array([float(F_theta_fn[i](*args)) for i in range(q)])
+
+    # beta_{theta_i} = - H^{-1} F_{beta theta_i}  (implicit function theorem).
+    F_beta_theta_vals = [np.array(F_beta_theta_fn[i](*args), dtype=float).reshape(p)
+                         for i in range(q)]
+    beta_theta = [-(H_inv @ F_beta_theta_vals[i]) for i in range(q)]
+
+    # d H / d beta_k  (cached numerically), p x p matrix.
+    H_dbeta_vals = [np.array(H_dbeta_fn[k](*args), dtype=float).reshape(p, p)
+                    for k in range(p)]
+
+    logdetH_part = np.zeros(q)
+    logdetS_part = np.zeros(q)
+    for i in range(q):
+        Hti_partial = np.array(H_theta_fn[i](*args), dtype=float).reshape(p, p)
+        # Total d H / d theta_i along the manifold beta=beta*(theta):
+        chain = sum(beta_theta[i][k] * H_dbeta_vals[k] for k in range(p))
+        Hti_total = Hti_partial + chain
+        Sti = np.array(S_theta_fn[i](rho_val), dtype=float).reshape(p, p)
+        logdetH_part[i] = 0.5 * np.trace(H_inv @ Hti_total)
+        logdetS_part[i] = -0.5 * np.trace(S_pinv @ Sti)
+
+    # F_{theta_i}(beta*(theta), theta): full theta-derivative of F evaluated at
+    # beta=beta*(theta) is just F_theta_part (the F_beta . beta_theta_i piece is
+    # zero because F_beta(beta*) = 0).
+    score_part = np.zeros(q)
+
+    g = F_theta_part + score_part + logdetH_part + logdetS_part
+    parts = {
+        "objective_part": F_theta_part,
+        "score_part": score_part,
+        "logdet_H_part": logdetH_part,
+        "logdet_S_part": logdetS_part,
+    }
+    return g, parts
+
+g0, parts0 = laml_gradient_terms(theta0, beta_at_theta0)
+print(f"[grad ] g(theta0) = {g0}")
+
+# ---------------------------------------------------------------------------
+# 5. Outer Hessian via centered FD on the analytic gradient.
+#
+# This is symmetric by construction (we then symmetrize to kill FD asymmetry).
+# Per-term Hessian columns are obtained by FD on each gradient component
+# (objective_part, logdet_H_part, logdet_S_part), so we get a clean
+# decomposition of the HVP.
+# ---------------------------------------------------------------------------
+
+def hessian_via_fd(theta, h=1e-5):
+    """Centered FD of g around theta. Also returns per-term Hessians."""
+    H_full = np.zeros((q, q))
+    H_obj  = np.zeros((q, q))
+    H_score = np.zeros((q, q))
+    H_lH   = np.zeros((q, q))
+    H_lS   = np.zeros((q, q))
+
+    for j in range(q):
+        tp = theta.copy(); tp[j] += h
+        tm = theta.copy(); tm[j] -= h
+        gp, parts_p = laml_gradient_terms(tp)
+        gm, parts_m = laml_gradient_terms(tm)
+        col = (gp - gm) / (2.0 * h)
+        H_full[:, j] = col
+        H_obj[:, j]   = (parts_p["objective_part"]    - parts_m["objective_part"])    / (2.0 * h)
+        H_score[:, j] = (parts_p["score_part"]        - parts_m["score_part"])        / (2.0 * h)
+        H_lH[:, j]    = (parts_p["logdet_H_part"]     - parts_m["logdet_H_part"])     / (2.0 * h)
+        H_lS[:, j]    = (parts_p["logdet_S_part"]     - parts_m["logdet_S_part"])     / (2.0 * h)
+
+    return H_full, {"objective_part": H_obj, "score_part": H_score,
+                    "logdet_H_part": H_lH, "logdet_S_part": H_lS}
+
+# Use Richardson (two step sizes) to confirm FD precision.
+H_h1, parts_H_h1 = hessian_via_fd(theta0, h=1e-4)
+H_h2, parts_H_h2 = hessian_via_fd(theta0, h=1e-5)
+asym_h1 = np.max(np.abs(H_h1 - H_h1.T))
+asym_h2 = np.max(np.abs(H_h2 - H_h2.T))
+diff_h  = np.max(np.abs(H_h1 - H_h2))
+print(f"[FD   ] |H(1e-4) - H(1e-5)|_max = {diff_h:.3e}; "
+      f"asym(h=1e-4) = {asym_h1:.3e}; asym(h=1e-5) = {asym_h2:.3e}")
+
+# Use h=1e-5 result, symmetrized.
+H_full = 0.5 * (H_h2 + H_h2.T)
+parts_H = {k: 0.5 * (M + M.T) for k, M in parts_H_h2.items()}
+
+# ---------------------------------------------------------------------------
+# 6. HVP and per-term breakdown
+# ---------------------------------------------------------------------------
+v_arr = np.array(v_num, dtype=float)
+HVP = H_full @ v_arr
+HVP_obj   = parts_H["objective_part"]   @ v_arr
+HVP_score = parts_H["score_part"]       @ v_arr
+HVP_lH    = parts_H["logdet_H_part"]    @ v_arr
+HVP_lS    = parts_H["logdet_S_part"]    @ v_arr
+
+# Sanity: parts must add to the full HVP.
+recon_err = np.max(np.abs((HVP_obj + HVP_score + HVP_lH + HVP_lS) - HVP))
+print(f"[check] HVP - sum(parts) max abs = {recon_err:.3e}")
+
+print(f"[hessian] V_HH =\n{H_full}")
+print(f"[hvp]    HVP  = {HVP}")
+
+# ---------------------------------------------------------------------------
+# 7. Intermediate diagnostics
+# ---------------------------------------------------------------------------
+H_at = np.array(F_bb_fn(*beta_at_theta0, *theta0), dtype=float).reshape(p, p)
+sign_H, H_logdet = np.linalg.slogdet(H_at)
+S_at = np.array(S_mat_fn(theta0[0]), dtype=float).reshape(p, p)
+sign_S, S_logdet = np.linalg.slogdet(S_at)
+H_eigs = np.linalg.eigvalsh(0.5 * (H_at + H_at.T)).tolist()
 
 # ---------------------------------------------------------------------------
 # 8. Write JSON.
@@ -349,32 +300,35 @@ out = {
         "psi_dim": psi_dim,
         "rho_dim": rho_dim,
         "q": q,
-        "y": [float(yi) for yi in y_vals],
-        "x": [float(xi) for xi in x_vals],
-        "w": [float(wi) for wi in w_vals],
-        "beta": beta_star_num,
-        "beta_initial": [float(b) for b in beta_num],
+        "y": y_vals,
+        "x": x_vals,
+        "w": w_vals,
+        "beta_initial": beta_init,
+        "beta": beta_at_theta0.tolist(),
         "rho": float(rho_num),
-        "psi": [float(p_) for p_ in psi_num],
-        "v": [float(vi) for vi in v_num],
+        "psi": list(map(float, psi_num)),
+        "v": list(map(float, v_num)),
         "v_ordering": ["v_rho", "v_psi0", "v_psi1"],
+        "theta_ordering": ["rho", "psi0", "psi1"],
     },
     "ground_truth": {
-        "H_V": V_HH_sym.tolist(),
+        "H_V": H_full.tolist(),
         "HVP": HVP.tolist(),
     },
     "term_breakdown": {
         "objective_part": HVP_obj.tolist(),
         "score_part": HVP_score.tolist(),
-        "logdet_H_part": HVP_logdetH.tolist(),
-        "logdet_S_part": HVP_logdetS.tolist(),
+        "logdet_H_part": HVP_lH.tolist(),
+        "logdet_S_part": HVP_lS.tolist(),
     },
     "intermediate_quantities": {
         "F_beta_at_beta_star": F_beta_at_star.tolist(),
         "H_eigenvalues": H_eigs,
         "S_logdet_pseudo": float(S_logdet),
         "H_logdet": float(H_logdet),
-        "asymmetry_V_HH": float(asym),
+        "FD_step_used": 1e-5,
+        "FD_richardson_diff_h1e-4_vs_h1e-5_max": float(diff_h),
+        "FD_asymmetry_h1e-5_max": float(asym_h2),
     },
 }
 
@@ -382,16 +336,20 @@ out_path = Path("/Users/user/gam/scripts/ctn_hvp_groundtruth.json")
 out_path.write_text(json.dumps(out, indent=2))
 print(f"[write] wrote {out_path}")
 
+# ---------------------------------------------------------------------------
+# 9. Console summary
+# ---------------------------------------------------------------------------
 print("\n=== TOY CONFIG ===")
-print(f"n={n}, p_resp={p_resp}, p_cov={p_cov}, psi_dim={psi_dim}, rho_dim={rho_dim}, q={q}")
-print(f"x = {[float(xi) for xi in x_vals]}")
-print(f"y = {[float(yi) for yi in y_vals]}")
-print(f"beta* = {beta_star_num}")
-print(f"rho = {float(rho_num)}, psi = {[float(p_) for p_ in psi_num]}")
-print(f"v (rho, psi0, psi1) = {[float(vi) for vi in v_num]}")
+print(f"n={n}, p_resp={p_resp}, p_cov={p_cov}, psi_dim={psi_dim}, "
+      f"rho_dim={rho_dim}, q={q}")
+print(f"x = {x_vals}")
+print(f"y = {y_vals}")
+print(f"beta* = {beta_at_theta0.tolist()}")
+print(f"rho = {rho_num}, psi = {psi_num}")
+print(f"v (rho, psi0, psi1) = {v_num}")
 print("\n=== FINAL HVP ===")
-print(f"HVP = {HVP.tolist()}")
-print(f"  objective_part   = {HVP_obj.tolist()}")
-print(f"  score_part       = {HVP_score.tolist()}")
-print(f"  logdet_H_part    = {HVP_logdetH.tolist()}")
-print(f"  logdet_S_part    = {HVP_logdetS.tolist()}")
+print(f"HVP            = {HVP.tolist()}")
+print(f"  objective_part = {HVP_obj.tolist()}")
+print(f"  score_part     = {HVP_score.tolist()}")
+print(f"  logdet_H_part  = {HVP_lH.tolist()}")
+print(f"  logdet_S_part  = {HVP_lS.tolist()}")
