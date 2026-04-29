@@ -702,7 +702,17 @@ fn ctn_penalty_scale_log_lambdas(
     let likelihood_scale = matrix_diag_mean_abs(likelihood_gram).max(1.0e-8);
     Array1::from_iter(penalties.iter().map(|penalty| {
         let penalty_scale = penalty_diag_scale(penalty).max(1.0e-8);
-        (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
+        // Lower-bound the SEED log-lambda at 0 (i.e., λ ≥ 1) so we never
+        // start the outer optimizer in the under-regularized regime where
+        // the CTN inner is structurally rank-deficient (small-n / p > n).
+        // The outer BFGS is free to step below 0 when there's enough data
+        // to support it; only the cold-start is constrained. Without this
+        // floor, ratios like n=64, p_resp×p_cov ≈ 200 produce a seed of
+        // log_lambda ≈ -12 (λ ≈ 6e-6), which leaves the inner solve to
+        // pick wild β coefficients and cascade into predict-time monotonicity
+        // violations (h' < 0 on the response grid, observed as -1e15 spikes
+        // in CI synthetic-biobank tests).
+        (likelihood_scale / penalty_scale).ln().clamp(0.0, 12.0)
     }))
 }
 

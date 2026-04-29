@@ -9025,21 +9025,30 @@ impl MatrixFreeSpdOperator {
 
     fn compute_logdet_slq(&self) -> f64 {
         let (probes, steps) = default_slq_parameters(self.n_dim);
-        stochastic_lanczos_logdet_spd_operator(
+        match stochastic_lanczos_logdet_spd_operator(
             self.n_dim,
             |v| (self.apply)(v),
             probes,
             steps,
             Self::DEFAULT_LOGDET_SEED,
-        )
-        .unwrap_or_else(|err| {
-            log::warn!("MatrixFreeSpdOperator SLQ logdet failed: {err}");
-            if let Some(fallback) = self.dense_fallback() {
-                fallback.logdet()
-            } else {
-                0.0
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                log::warn!("MatrixFreeSpdOperator SLQ logdet failed: {err}");
+                // If the SLQ estimate failed, attempt a dense materialization
+                // via canonical-basis probes. When the underlying matvec is
+                // structurally broken (e.g. surfacing NaN after escalation),
+                // those probes will be non-finite and `dense_fallback()`
+                // returns None — propagate NaN rather than silently returning
+                // 0.0, so the outer evaluator's `!objective.is_finite()` guard
+                // marks this rho infeasible and contracts the step instead of
+                // looping on a flat objective (icu_survival_los signature).
+                match self.dense_fallback() {
+                    Some(fallback) => fallback.logdet(),
+                    None => f64::NAN,
+                }
             }
-        })
+        }
     }
 
     fn solve_pcg(&self, rhs: &Array1<f64>) -> Option<Array1<f64>> {
