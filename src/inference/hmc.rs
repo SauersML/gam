@@ -761,23 +761,35 @@ fn joint_binomial_logp_and_grad(
     eta: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>), String> {
     let n = data.n_samples;
-    let mut ll = 0.0;
+    // Per-row: compute jet → log-likelihood contribution + residual entry.
+    // Independent across rows; parallel reduce sums + collected residual.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let per_row: Result<Vec<(f64, f64)>, String> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let jet = inverse_link_jet_for_family(
+                family,
+                eta[i],
+                inverse_link.mixture_state(),
+                inverse_link.sas_state(),
+            )
+            .map_err(|err| err.to_string())?;
+            let mu = jet.mu.clamp(1.0e-15, 1.0 - 1.0e-15);
+            let dmu_deta = jet.d1;
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
+            let ll_i = w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
+            let residual_i =
+                w_i * (y_i - mu) * dmu_deta / (mu * (1.0 - mu)).max(1.0e-30);
+            Ok((ll_i, residual_i))
+        })
+        .collect();
+    let per_row = per_row?;
     let mut residual = Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let jet = inverse_link_jet_for_family(
-            family,
-            eta[i],
-            inverse_link.mixture_state(),
-            inverse_link.sas_state(),
-        )
-        .map_err(|err| err.to_string())?;
-        let mu = jet.mu.clamp(1.0e-15, 1.0 - 1.0e-15);
-        let dmu_deta = jet.d1;
-        let y_i = data.y[i];
-        let w_i = data.weights[i];
-        ll += w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
-        residual[i] = w_i * (y_i - mu) * dmu_deta / (mu * (1.0 - mu)).max(1.0e-30);
+    let mut ll = 0.0;
+    for (i, (ll_i, residual_i)) in per_row.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = residual_i;
     }
 
     Ok((ll, fast_atv(&data.x, &residual)))
