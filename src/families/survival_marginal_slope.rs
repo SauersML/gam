@@ -22,10 +22,12 @@ use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
-    CoeffSupport, SparsePrimaryCoeffJetView, add_scaled_coeff4,
+    CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_scaled_coeff4,
     build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
-    is_sigma_aux_index as shared_is_sigma_aux_index, probit_frailty_scale,
-    probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
+    is_sigma_aux_index as shared_is_sigma_aux_index,
+    observed_denested_cell_partials as shared_observed_denested_cell_partials,
+    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
+    scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -382,19 +384,6 @@ impl DynamicQBlockwiseAccumulator {
             blockworking_sets,
         }
     }
-}
-
-struct ObservedDenestedCellPartials {
-    coeff: [f64; 4],
-    dc_da: [f64; 4],
-    dc_db: [f64; 4],
-    dc_daa: [f64; 4],
-    dc_dab: [f64; 4],
-    dc_dbb: [f64; 4],
-    dc_daaa: [f64; 4],
-    dc_daab: [f64; 4],
-    dc_dabb: [f64; 4],
-    dc_dbbb: [f64; 4],
 }
 
 struct DenestedCellPrimaryFixedPartials {
@@ -3624,59 +3613,16 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<ObservedDenestedCellPartials, String> {
-        let scale = self.probit_frailty_scale();
-        let zero_score_span = exact_kernel::LocalSpanCubic {
-            left: 0.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        };
-        let zero_link_span = exact_kernel::LocalSpanCubic {
-            left: 0.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        };
-        let z_obs = self.z[row];
-        let u_obs = a + b * z_obs;
-        let score_span_obs =
-            if let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) {
-                runtime.local_cubic_at(beta_h, z_obs)?
-            } else {
-                zero_score_span
-            };
-        let link_span_obs = if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w)
-        {
-            runtime.local_cubic_at(beta_w, u_obs)?
-        } else {
-            zero_link_span
-        };
-        let coeff = scale_coeff4(
-            exact_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b),
-            scale,
-        );
-        let (dc_da_raw, dc_db_raw) =
-            exact_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
-            exact_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
-        let (dc_daaa, dc_daab, dc_dabb, dc_dbbb) =
-            exact_kernel::denested_cell_third_partials(link_span_obs);
-        Ok(ObservedDenestedCellPartials {
-            coeff,
-            dc_da: scale_coeff4(dc_da_raw, scale),
-            dc_db: scale_coeff4(dc_db_raw, scale),
-            dc_daa: scale_coeff4(dc_daa_raw, scale),
-            dc_dab: scale_coeff4(dc_dab_raw, scale),
-            dc_dbb: scale_coeff4(dc_dbb_raw, scale),
-            dc_daaa: scale_coeff4(dc_daaa, scale),
-            dc_daab: scale_coeff4(dc_daab, scale),
-            dc_dabb: scale_coeff4(dc_dabb, scale),
-            dc_dbbb: scale_coeff4(dc_dbbb, scale),
-        })
+        shared_observed_denested_cell_partials(
+            self.z[row],
+            a,
+            b,
+            self.score_warp.as_ref(),
+            beta_h,
+            self.link_dev.as_ref(),
+            beta_w,
+            self.probit_frailty_scale(),
+        )
     }
 
     fn denested_cell_primary_fixed_partials(

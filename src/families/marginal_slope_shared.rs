@@ -109,6 +109,66 @@ pub(crate) fn build_denested_partition_cells(
     Ok(cells)
 }
 
+pub(crate) struct ObservedDenestedCellPartials {
+    pub(crate) coeff: [f64; 4],
+    pub(crate) dc_da: [f64; 4],
+    pub(crate) dc_db: [f64; 4],
+    pub(crate) dc_daa: [f64; 4],
+    pub(crate) dc_dab: [f64; 4],
+    pub(crate) dc_dbb: [f64; 4],
+    pub(crate) dc_daaa: [f64; 4],
+    pub(crate) dc_daab: [f64; 4],
+    pub(crate) dc_dabb: [f64; 4],
+    pub(crate) dc_dbbb: [f64; 4],
+}
+
+pub(crate) fn observed_denested_cell_partials(
+    z_obs: f64,
+    a: f64,
+    b: f64,
+    score_warp: Option<&crate::families::bernoulli_marginal_slope::DeviationRuntime>,
+    beta_h: Option<&Array1<f64>>,
+    link_dev: Option<&crate::families::bernoulli_marginal_slope::DeviationRuntime>,
+    beta_w: Option<&Array1<f64>>,
+    scale: f64,
+) -> Result<ObservedDenestedCellPartials, String> {
+    let zero_score_span = zero_local_span_cubic();
+    let zero_link_span = zero_local_span_cubic();
+    let u_obs = a + b * z_obs;
+    let score_span_obs = if let (Some(runtime), Some(beta_h)) = (score_warp, beta_h) {
+        runtime.local_cubic_at(beta_h, z_obs)?
+    } else {
+        zero_score_span
+    };
+    let link_span_obs = if let (Some(runtime), Some(beta_w)) = (link_dev, beta_w) {
+        runtime.local_cubic_at(beta_w, u_obs)?
+    } else {
+        zero_link_span
+    };
+    let coeff = scale_coeff4(
+        cubic_cell_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b),
+        scale,
+    );
+    let (dc_da_raw, dc_db_raw) =
+        cubic_cell_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
+    let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
+        cubic_cell_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
+    let (dc_daaa, dc_daab, dc_dabb, dc_dbbb) =
+        cubic_cell_kernel::denested_cell_third_partials(link_span_obs);
+    Ok(ObservedDenestedCellPartials {
+        coeff,
+        dc_da: scale_coeff4(dc_da_raw, scale),
+        dc_db: scale_coeff4(dc_db_raw, scale),
+        dc_daa: scale_coeff4(dc_daa_raw, scale),
+        dc_dab: scale_coeff4(dc_dab_raw, scale),
+        dc_dbb: scale_coeff4(dc_dbb_raw, scale),
+        dc_daaa: scale_coeff4(dc_daaa, scale),
+        dc_daab: scale_coeff4(dc_daab, scale),
+        dc_dabb: scale_coeff4(dc_dabb, scale),
+        dc_dbbb: scale_coeff4(dc_dbbb, scale),
+    })
+}
+
 pub(crate) fn psi_derivative_location(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     psi_index: usize,

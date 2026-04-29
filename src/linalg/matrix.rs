@@ -6183,9 +6183,10 @@ impl From<&DesignMatrix> for DesignBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkedKernelDesignOperator, DenseDesignMatrix, DesignMatrix, EmbeddedColumnBlock,
-        MultiChannelOperator, ReparamOperator, SparseDesignMatrix, SparseHessianAccumulator,
-        dense_matvec, dense_transpose_matvec, dense_transpose_weighted_response,
+        ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
+        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, SparseDesignMatrix,
+        SparseHessianAccumulator, dense_matvec, dense_transpose_matvec,
+        dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
