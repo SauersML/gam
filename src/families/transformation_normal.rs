@@ -641,7 +641,9 @@ fn ctn_penalty_scale_log_lambdas(
 
 fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
     match penalty {
-        PenaltyMatrix::Dense(matrix) => matrix_diag_mean_abs(matrix).max(matrix_frobenius_rms(matrix)),
+        PenaltyMatrix::Dense(matrix) => {
+            matrix_diag_mean_abs(matrix).max(matrix_frobenius_rms(matrix))
+        }
         PenaltyMatrix::KroneckerFactored { left, right } => {
             let diag_scale = matrix_diag_mean_abs(left) * matrix_diag_mean_abs(right);
             let frob_scale = matrix_frobenius_rms(left) * matrix_frobenius_rms(right);
@@ -4333,6 +4335,18 @@ mod tests {
     use crate::testing::assert_matrix_derivativefd;
     use ndarray::array;
 
+    #[test]
+    fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
+        let likelihood_gram = array![[8.0, 0.0], [0.0, 8.0]];
+        let penalties = vec![
+            PenaltyMatrix::Dense(array![[2.0, 0.0], [0.0, 2.0]]),
+            PenaltyMatrix::Dense(array![[4.0, 0.0], [0.0, 4.0]]),
+        ];
+        let rho = ctn_penalty_scale_log_lambdas(&penalties, &likelihood_gram);
+        assert!((rho[0] - 4.0_f64.ln()).abs() < 1.0e-12);
+        assert!((rho[1] - 2.0_f64.ln()).abs() < 1.0e-12);
+    }
+
     fn toy_covariate_design_and_derivs(
         psi: &Array1<f64>,
     ) -> (Array2<f64>, Vec<CustomFamilyBlockPsiDerivative>) {
@@ -6157,11 +6171,21 @@ pub fn fit_transformation_normal(
             crate::solver::outer_strategy::Derivative::Analytic
         );
 
+    let (rho0_min, rho0_max) = if rho0.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            rho0.iter().copied().fold(f64::INFINITY, f64::min),
+            rho0.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
     log::info!(
         "[transformation-normal] skipping baseline custom-family prefit before exact joint optimization \
-         (rho_dim={}, log_kappa_dim={}); using CTN warm start and initial penalty scales",
+         (rho_dim={}, log_kappa_dim={}, rho0_range=[{:.3}, {:.3}]); using CTN warm start and penalty-scale rho seed",
         n_penalties,
         kappa0.len(),
+        rho0_min,
+        rho0_max,
     );
 
     if !analytic_psi_available {
