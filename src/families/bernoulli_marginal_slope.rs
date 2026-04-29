@@ -7233,7 +7233,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -9726,9 +9726,9 @@ mod tests {
         // only the inner coefficient-space Hv operator. That must not upgrade
         // the profiled outer hyper-Hessian back to second order; without a real
         // θ-HVP the K·coefficient-work gate still owns the decision.
-        use crate::custom_family::cost_gated_outer_order_with_matrix_free;
+        use crate::custom_family::cost_gated_outer_order_with_outer_hvp;
         assert_eq!(
-            cost_gated_outer_order_with_matrix_free(&ctn_specs, ctn_cost, false),
+            cost_gated_outer_order_with_outer_hvp(&ctn_specs, ctn_cost, false),
             ExactOuterDerivativeOrder::First,
             "inner matrix-free coefficient Hv must not imply second-order outer hyper-Hessian"
         );
@@ -9746,7 +9746,7 @@ mod tests {
             initial_beta: None,
         }];
         assert_eq!(
-            cost_gated_outer_order_with_matrix_free(&huge_k_specs, 0, true),
+            cost_gated_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
             ExactOuterDerivativeOrder::First,
             "K² > 16M element cap must fire even when a true outer HVP is available"
         );
