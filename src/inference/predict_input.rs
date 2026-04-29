@@ -272,8 +272,9 @@ pub fn build_predict_input_for_model(
                 if width <= TRANSFORMATION_GRID_RELATIVE_TOL * grid_span {
                     continue;
                 }
-                for sidx in 1..4 {
-                    let frac = sidx as f64 / 4.0;
+                for sidx in 1..TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS {
+                    let frac =
+                        sidx as f64 / TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS as f64;
                     derivative_grid.push(left + frac * width);
                 }
             }
