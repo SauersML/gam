@@ -98,7 +98,7 @@ use gam::survival_predict::{
     saved_baseline_timewiggle_components, saved_survival_location_scale_fit_result,
     saved_survival_runtime_baseline_config,
 };
-use gam::term_builder::{build_termspec, enable_scale_dimensions};
+use gam::term_builder::{build_termspec, column_map_with_alias, enable_scale_dimensions};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
@@ -1332,10 +1332,7 @@ fn run_fit_bernoulli_marginal_slope(
     // bind to the auxiliary score supplied via --z-column. Alias `z` in the
     // column map to the actual `z_column` index so build_termspec can resolve
     // it without the user having to rename their data column.
-    let mut col_map_with_z_alias: HashMap<String, usize> = col_map.clone();
-    if let Some(idx) = col_map.get(z_column.as_str()).copied() {
-        col_map_with_z_alias.entry("z".to_string()).or_insert(idx);
-    }
+    let col_map_with_z_alias = column_map_with_alias(col_map, "z", z_column);
     let col_map_for_termspec: &HashMap<String, usize> = &col_map_with_z_alias;
     let mut marginalspec = build_termspec(
         &parsed.terms,
@@ -3876,18 +3873,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     // `z` to bind to the auxiliary score supplied via --z-column. Alias `z`
     // to the actual `z_column` index in a local copy of `col_map` so
     // build_termspec resolves it without the user renaming their data column.
-    let col_map_local: HashMap<String, usize> =
-        if matches!(likelihood_mode, SurvivalLikelihoodMode::MarginalSlope) {
-            let mut m = col_map.clone();
-            if let Some(z_name) = args.z_column.as_deref() {
-                if let Some(idx) = col_map.get(z_name).copied() {
-                    m.entry("z".to_string()).or_insert(idx);
-                }
-            }
-            m
-        } else {
-            col_map.clone()
-        };
+    let col_map_local = if matches!(likelihood_mode, SurvivalLikelihoodMode::MarginalSlope) {
+        args.z_column
+            .as_deref()
+            .map(|z_name| column_map_with_alias(&col_map, "z", z_name))
+            .unwrap_or_else(|| col_map.clone())
+    } else {
+        col_map.clone()
+    };
     let col_map_for_termspec: &HashMap<String, usize> = &col_map_local;
     let mut termspec = build_termspec(
         &parsed.terms,
@@ -8787,6 +8780,133 @@ fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), 
     Ok(())
 }
 
+fn load_prediction_id_values(
+    path: &Path,
+    id_column: &str,
+    expected_rows: usize,
+) -> Result<Vec<String>, String> {
+    if id_column.trim().is_empty() {
+        return Err("--id-column must be a non-empty column name".to_string());
+    }
+    let projected = load_dataset_projected(path, &[id_column.to_string()])?;
+    if projected.values.nrows() != expected_rows {
+        return Err(format!(
+            "id column '{id_column}' row count {} does not match prediction row count {expected_rows}",
+            projected.values.nrows()
+        ));
+    }
+    let col_idx = projected
+        .headers
+        .iter()
+        .position(|name| name == id_column)
+        .ok_or_else(|| format!("id column '{id_column}' not found in prediction data"))?;
+    let schema_col = projected
+        .schema
+        .columns
+        .iter()
+        .find(|column| column.name == id_column)
+        .ok_or_else(|| format!("id column '{id_column}' missing from inferred schema"))?;
+    let mut out = Vec::<String>::with_capacity(projected.values.nrows());
+    for row_idx in 0..projected.values.nrows() {
+        let value = projected.values[[row_idx, col_idx]];
+        if !value.is_finite() {
+            return Err(format!(
+                "id column '{id_column}' contains non-finite value at row {row_idx}"
+            ));
+        }
+        let rendered = match schema_col.kind {
+            ColumnKindTag::Categorical => {
+                let level_idx = value.round() as usize;
+                schema_col.levels.get(level_idx).cloned().ok_or_else(|| {
+                    format!(
+                        "id column '{id_column}' categorical code {level_idx} at row {row_idx} is out of bounds"
+                    )
+                })?
+            }
+            ColumnKindTag::Continuous | ColumnKindTag::Binary => format_id_number(value),
+        };
+        out.push(rendered);
+    }
+    Ok(out)
+}
+
+fn format_id_number(value: f64) -> String {
+    if (value - value.round()).abs() <= 1e-9 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.12}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+fn prepend_id_column_to_prediction_csv(
+    path: &Path,
+    id_column: &str,
+    id_values: &[String],
+) -> Result<(), String> {
+    let mut rdr = csv::Reader::from_path(path)
+        .map_err(|e| format!("failed to read prediction csv '{}': {e}", path.display()))?;
+    let headers = rdr
+        .headers()
+        .map_err(|e| format!("failed to read prediction csv header: {e}"))?
+        .clone();
+    if headers.iter().any(|name| name == id_column) {
+        return Err(format!(
+            "prediction output already contains id column '{id_column}'"
+        ));
+    }
+
+    let tmp_path = path.with_extension("tmp-id-column.csv");
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(&tmp_path)
+        .map_err(|e| {
+            format!(
+                "failed to create temporary prediction csv '{}': {e}",
+                tmp_path.display()
+            )
+        })?;
+    let mut out_headers = Vec::<String>::with_capacity(headers.len() + 1);
+    out_headers.push(id_column.to_string());
+    out_headers.extend(headers.iter().map(str::to_string));
+    wtr.write_record(&out_headers)
+        .map_err(|e| format!("failed writing prediction csv header with id column: {e}"))?;
+
+    let mut row_count = 0usize;
+    for record in rdr.records() {
+        let record = record.map_err(|e| format!("failed reading prediction csv row: {e}"))?;
+        let id = id_values.get(row_count).ok_or_else(|| {
+            format!(
+                "prediction csv has more rows than id column '{id_column}' (first extra row index {row_count})"
+            )
+        })?;
+        let mut out_record = Vec::<String>::with_capacity(record.len() + 1);
+        out_record.push(id.clone());
+        out_record.extend(record.iter().map(str::to_string));
+        wtr.write_record(&out_record)
+            .map_err(|e| format!("failed writing prediction csv row {row_count}: {e}"))?;
+        row_count += 1;
+    }
+    if row_count != id_values.len() {
+        return Err(format!(
+            "prediction csv row count {row_count} does not match id column '{id_column}' row count {}",
+            id_values.len()
+        ));
+    }
+    wtr.flush()
+        .map_err(|e| format!("failed to flush prediction csv with id column: {e}"))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        format!(
+            "failed to replace prediction csv '{}' with id-column version '{}': {e}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Unified CSV prediction writer.  Each column is a `(name, data)` pair;
 /// the function writes a header row from the names and one data row per
 /// element, formatting every value to 12 decimal places.
@@ -9804,6 +9924,7 @@ mod tests {
             out: pred_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -9972,6 +10093,7 @@ mod tests {
             out: pred_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -10334,6 +10456,7 @@ mod tests {
             out: pred_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -10423,6 +10546,7 @@ mod tests {
             out: pred_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -10635,6 +10759,7 @@ mod tests {
             out: out_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -11736,6 +11861,7 @@ mod tests {
             out: out_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -12197,6 +12323,35 @@ mod tests {
             err_upper_only.contains("event_lower missing"),
             "upper-only binary error message wrong: {err_upper_only}"
         );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn prediction_csv_can_prepend_id_column() {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_prediction_id_passthrough_{ts}.csv"));
+
+        let eta = array![0.5, -0.25];
+        let mean = array![0.62, 0.44];
+        write_prediction_csv(&path, eta.view(), mean.view(), None, None, None)
+            .expect("write prediction csv");
+        prepend_id_column_to_prediction_csv(
+            &path,
+            "person_id",
+            &["p1".to_string(), "p2".to_string()],
+        )
+        .expect("prepend id column");
+
+        let text = fs::read_to_string(&path).expect("read prediction csv");
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("person_id,eta,mean"));
+        assert_eq!(lines.next(), Some("p1,0.500000000000,0.620000000000"));
+        assert_eq!(lines.next(), Some("p2,-0.250000000000,0.440000000000"));
 
         fs::remove_file(&path).ok();
     }
@@ -13138,6 +13293,7 @@ mod tests {
             out: out_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
@@ -13279,6 +13435,7 @@ mod tests {
             out: out_path.clone(),
             offset_column: None,
             noise_offset_column: None,
+            id_column: None,
             uncertainty: false,
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,

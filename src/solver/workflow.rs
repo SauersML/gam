@@ -883,7 +883,7 @@ use crate::inference::formula_dsl::{
     parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
     require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
-use crate::term_builder::{build_termspec, enable_scale_dimensions};
+use crate::term_builder::{build_termspec, column_map_with_alias, enable_scale_dimensions};
 
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
 #[derive(Clone, Debug)]
@@ -1123,17 +1123,6 @@ pub fn resolve_family(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-fn marginal_slope_col_map_with_z_alias(
-    col_map: &HashMap<String, usize>,
-    z_column: &str,
-) -> HashMap<String, usize> {
-    let mut aliased = col_map.clone();
-    if let Some(idx) = col_map.get(z_column).copied() {
-        aliased.entry("z".to_string()).or_insert(idx);
-    }
-    aliased
-}
 
 fn build_termspec_with_geometry(
     terms: &[ParsedTerm],
@@ -1537,7 +1526,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
 
     let mut inference_notes = Vec::new();
     let policy = resolved_resource_policy(config);
-    let aliased_col_map = marginal_slope_col_map_with_z_alias(col_map, z_column);
+    let aliased_col_map = column_map_with_alias(col_map, "z", z_column);
     let marginalspec = build_termspec_with_geometry(
         &parsed.terms,
         data,
@@ -1717,8 +1706,9 @@ fn materialize_survival<'a>(
 
     let policy = resolved_resource_policy(config);
     let marginal_slope_aliased_col_map = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        Some(marginal_slope_col_map_with_z_alias(
+        Some(column_map_with_alias(
             col_map,
+            "z",
             config.z_column.as_deref().ok_or_else(|| {
                 "marginal-slope survival requires z_column in FitConfig".to_string()
             })?,

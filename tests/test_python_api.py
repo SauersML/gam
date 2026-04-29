@@ -288,6 +288,22 @@ def test_predict_rejects_schema_mismatch():
         )
 
 
+def test_predict_can_passthrough_id_column():
+    model = gam.fit(training_rows(), "y ~ x")
+
+    pred = model.predict(
+        [
+            {"person_id": "a", "x": 1.5},
+            {"person_id": "b", "x": 2.5},
+        ],
+        id_column="person_id",
+        return_type="dict",
+    )
+
+    assert pred["person_id"] == ["a", "b"]
+    assert set(pred) == {"person_id", "eta", "mean"}
+
+
 # ---------------------------------------------------------------------------
 # Pipeline smoke tests (task #14 / task #17).
 #
