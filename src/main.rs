@@ -21,8 +21,8 @@ use gam::families::family_meta::{
 };
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
-    ScaleDeviationTransform, build_scale_deviation_operator, build_scale_deviation_transform_design,
-    infer_non_intercept_start_design,
+    ScaleDeviationTransform, build_scale_deviation_operator,
+    build_scale_deviation_transform_design, infer_non_intercept_start_design,
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
@@ -1962,11 +1962,9 @@ fn run_fitwith_predict_noise(
             fit.geometry.clone(),
             SavedFitSummary::from_blockwise_fit(&fit)?,
         );
-        let dense_binom_mean = solved.fit.mean_design.design.to_dense();
-        let dense_binom_noise = solved.fit.noise_design.design.to_dense();
-        let binomial_noise_transform = build_scale_deviation_transform(
-            &dense_binom_mean,
-            &dense_binom_noise,
+        let binomial_noise_transform = build_scale_deviation_transform_design(
+            &solved.fit.mean_design.design,
+            &solved.fit.noise_design.design,
             &weights,
             solved
                 .fit
@@ -3054,8 +3052,14 @@ fn run_predict_saved_latent_window_impl(
                 state.fit.beta.len()
             ));
         }
-        let x_time_entry = prepared.time_design_entry.to_dense();
-        let x_time_exit = prepared.time_design_exit.to_dense();
+        let x_time_entry = design_to_dense_by_chunks(
+            &prepared.time_design_entry,
+            "latent survival entry time covariance design",
+        )?;
+        let x_time_exit = design_to_dense_by_chunks(
+            &prepared.time_design_exit,
+            "latent survival exit time covariance design",
+        )?;
         Some(saved_latent_window_local_covariances(
             cov_design,
             &x_time_entry,
@@ -3446,7 +3450,10 @@ fn run_predict_survival(
             &model.survival_noise_scale,
             model.survival_noise_non_intercept_start,
         )?;
-        let x_time_exit_dense = time_build.x_exit_time.to_dense();
+        let x_time_exit_dense = design_to_dense_by_chunks(
+            &time_build.x_exit_time,
+            "survival location-scale prediction time-exit design",
+        )?;
         let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
             let mut full =
                 Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
@@ -3704,7 +3711,10 @@ fn run_predict_survival(
         .map(|(_, exit, _)| exit.ncols())
         .unwrap_or(0);
     let p = p_time + p_timewiggle + p_cov;
-    let x_exit_time_dense = time_build.x_exit_time.to_dense();
+    let x_exit_time_dense = design_to_dense_by_chunks(
+        &time_build.x_exit_time,
+        "survival prediction time-exit design",
+    )?;
     let mut x_exit = Array2::<f64>::zeros((n, p));
     if p_time > 0 {
         x_exit
@@ -3723,20 +3733,21 @@ fn run_predict_survival(
                 .assign(exit_w);
         }
     }
-    //
-    // Materialize the covariate design once into dense form. Calling
-    // `DesignMatrix::get(i, j)` in a per-cell loop would re-densify the
-    // entire operator-backed block on every call (the Lazy/BlockDesignOperator
-    // default `to_dense_arc` does not cache), turning this copy into an
-    // O(n · p_cov · (n · p_cov)) catastrophe at biobank scale.
-    let cov_dense = cov_design.design.as_dense_cow();
     if p_cov > 0 {
-        x_exit
-            .slice_mut(s![
-                ..,
-                (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov)
-            ])
-            .assign(&cov_dense);
+        let cov_start = p_time + p_timewiggle;
+        let chunk_rows = (8 * 1024 * 1024 / (p_cov.max(1) * std::mem::size_of::<f64>()))
+            .max(1)
+            .min(n.max(1));
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let chunk = cov_design
+                .design
+                .try_row_chunk(start..end)
+                .map_err(|err| format!("survival prediction covariate design chunk: {err}"))?;
+            x_exit
+                .slice_mut(s![start..end, cov_start..(cov_start + p_cov)])
+                .assign(&chunk);
+        }
     }
     if args.noise_offset_column.is_some() {
         return Err(
@@ -4987,22 +4998,15 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_beta_time = Some(fit.fit.fit.beta_time().to_vec());
             payload.survival_beta_threshold = Some(fit.fit.fit.beta_threshold().to_vec());
             payload.survival_beta_log_sigma = Some(fit.fit.fit.beta_log_sigma().to_vec());
-            let dense_fit_threshold = fit.fit.threshold_design.design.to_dense();
-            let dense_fit_log_sigma = fit.fit.log_sigma_design.design.to_dense();
-            let dense_time_exit = time_design_exit.to_dense();
-            let mut survival_primary_design =
-                Array2::<f64>::zeros((n, dense_time_exit.ncols() + dense_fit_threshold.ncols()));
-            survival_primary_design
-                .slice_mut(s![.., 0..dense_time_exit.ncols()])
-                .assign(&dense_time_exit);
-            survival_primary_design
-                .slice_mut(s![.., dense_time_exit.ncols()..])
-                .assign(&dense_fit_threshold);
-            let survival_noise_transform = build_scale_deviation_transform(
+            let survival_primary_design = DesignMatrix::hstack(vec![
+                time_design_exit.clone(),
+                fit.fit.threshold_design.design.clone(),
+            ])?;
+            let survival_noise_transform = build_scale_deviation_transform_design(
                 &survival_primary_design,
-                &dense_fit_log_sigma,
+                &fit.fit.log_sigma_design.design,
                 &weights,
-                infer_non_intercept_start(&dense_fit_log_sigma, &weights),
+                infer_non_intercept_start_design(&fit.fit.log_sigma_design.design, &weights)?,
             )
             .map_err(|e| format!("failed to encode survival noise transform: {e}"))?;
             payload.survival_noise_projection = Some(
@@ -7073,12 +7077,14 @@ fn run_generate_binomial_location_scale(
         model.noise_non_intercept_start,
     )?;
     let eta_t = design.design.dot(&beta_t) + threshold_offset;
-    let dense_gen_binom_mean = design.design.to_dense();
-    let dense_gen_binom_noise = design_noise.design.to_dense();
     let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
-        apply_scale_deviation_transform(&dense_gen_binom_mean, &dense_gen_binom_noise, transform)?
+        build_scale_deviation_operator(
+            design.design.clone(),
+            design_noise.design.clone(),
+            transform,
+        )?
     } else {
-        dense_gen_binom_noise
+        design_noise.design.clone()
     };
     let eta_noise = preparednoise_design.dot(&beta_noise) + log_sigma_offset;
     let sigma = eta_noise.mapv(f64::exp);
