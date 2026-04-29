@@ -95,6 +95,14 @@ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
 /// tensor width bounded even when the covariate side is narrow.
 const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
+/// Relative tolerance for response-grid deduplication and zero-width-gap
+/// skipping. Used by both the fit-time grid builder
+/// (`transformation_monotonicity_response_grid`) and the predict-time
+/// derivative-grid builder. Kept in sync so the two grids generate the
+/// same point set on identical inputs (otherwise predict could hit a
+/// distinct grid point that the fit-time barrier never bounded).
+pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
+
 /// Strict-feasibility margin for `h' > 0` on the monotonicity grid. Used
 /// both by the fit-time fraction-to-boundary line search (so accepted β
 /// keeps `h'(grid) ≥ EPS`) and by the predict-time monotonicity check
@@ -2745,7 +2753,7 @@ fn transformation_monotonicity_response_grid(
         let left = window[0];
         let right = window[1];
         let width = right - left;
-        if width <= 1.0e-12 * span {
+        if width <= TRANSFORMATION_GRID_RELATIVE_TOL * span {
             continue;
         }
         for sidx in 1..TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS {
@@ -2758,7 +2766,7 @@ fn transformation_monotonicity_response_grid(
     values.push(max_y + guard);
 
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    values.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12 * span);
+    values.dedup_by(|a, b| (*a - *b).abs() <= TRANSFORMATION_GRID_RELATIVE_TOL * span);
     Ok(Array1::from_vec(values))
 }
 
