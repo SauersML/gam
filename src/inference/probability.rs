@@ -50,6 +50,96 @@ pub fn erfcx_nonnegative(x: f64) -> f64 {
     }
 }
 
+/// Computes `log(1 - exp(-a))` for `a >= 0` without cancellation.
+#[inline]
+pub fn log1mexp_positive(a: f64) -> f64 {
+    assert!(a >= 0.0);
+    if a > core::f64::consts::LN_2 {
+        (-(-a).exp()).ln_1p()
+    } else if a > 0.0 {
+        (-(-a).exp_m1()).ln()
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+/// Computes `log|sum_j signs[j] * exp(log_mags[j])|` and the resulting sign.
+pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
+    let mut pos_max = f64::NEG_INFINITY;
+    let mut neg_max = f64::NEG_INFINITY;
+    for (idx, &lm) in log_mags.iter().enumerate() {
+        if signs[idx] > 0.0 {
+            pos_max = pos_max.max(lm);
+        } else if signs[idx] < 0.0 {
+            neg_max = neg_max.max(lm);
+        }
+    }
+
+    let mut pos_sum = 0.0_f64;
+    let mut neg_sum = 0.0_f64;
+    for (idx, &lm) in log_mags.iter().enumerate() {
+        if !lm.is_finite() {
+            continue;
+        }
+        if signs[idx] > 0.0 {
+            pos_sum += (lm - pos_max).exp();
+        } else if signs[idx] < 0.0 {
+            neg_sum += (lm - neg_max).exp();
+        }
+    }
+
+    let log_pos = if pos_sum > 0.0 {
+        pos_max + pos_sum.ln()
+    } else {
+        f64::NEG_INFINITY
+    };
+    let log_neg = if neg_sum > 0.0 {
+        neg_max + neg_sum.ln()
+    } else {
+        f64::NEG_INFINITY
+    };
+
+    if log_neg == f64::NEG_INFINITY {
+        return (log_pos, 1.0);
+    }
+    if log_pos == f64::NEG_INFINITY {
+        return (log_neg, -1.0);
+    }
+    if log_pos > log_neg {
+        let gap = log_pos - log_neg;
+        (log_pos + log1mexp_positive(gap), 1.0)
+    } else if log_neg > log_pos {
+        let gap = log_neg - log_pos;
+        (log_neg + log1mexp_positive(gap), -1.0)
+    } else {
+        (f64::NEG_INFINITY, 0.0)
+    }
+}
+
+#[inline]
+fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
+    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
+}
+
+#[inline]
+pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
+    if coeffs.is_empty() || !x.is_finite() {
+        return 0.0;
+    }
+    if x <= 600.0 {
+        return horner_polynomial(x, coeffs) * (-x).exp();
+    }
+
+    let inv_x = x.recip();
+    let mut tail = 0.0;
+    for &c in coeffs {
+        tail = tail * inv_x + c;
+    }
+    let degree = (coeffs.len() - 1) as f64;
+    let scale = (degree * x.ln() - x).exp();
+    scale * tail
+}
+
 #[inline]
 pub fn normal_logcdf(x: f64) -> f64 {
     if x == f64::INFINITY {

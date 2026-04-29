@@ -177,6 +177,9 @@ use crate::estimate::EstimationError;
 use crate::mixture_link::{
     beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
 };
+use crate::probability::{
+    erfcx_nonnegative, stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg,
+};
 use crate::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkState, SasLinkState};
 use statrs::function::erf::erfc;
 
@@ -956,32 +959,6 @@ fn logistic_normal_tail_cutoff(mu: f64, sigma: f64, target_accuracy: f64) -> usi
     }
     let raw_n = (coeff / target_accuracy).sqrt() - 1.0;
     raw_n.ceil().clamp(4.0, LOGIT_MAX_TERMS as f64) as usize
-}
-
-#[inline]
-fn erfcx_nonnegative(x: f64) -> f64 {
-    if !x.is_finite() {
-        return if x.is_sign_positive() {
-            0.0
-        } else {
-            f64::INFINITY
-        };
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < 26.0 {
-        ((x * x).min(700.0)).exp() * erfc(x)
-    } else {
-        let inv = 1.0 / x;
-        let inv2 = inv * inv;
-        let poly = 1.0
-            + 0.5 * inv2
-            + 0.75 * inv2 * inv2
-            + 1.875 * inv2 * inv2 * inv2
-            + 6.5625 * inv2 * inv2 * inv2 * inv2;
-        inv * poly / std::f64::consts::PI.sqrt()
-    }
 }
 
 #[inline]
@@ -4046,30 +4023,6 @@ pub struct CLogLogConvolutionDerivatives {
     pub l_mumusigmasigma: f64,
     pub l_musigmasigmasigma: f64,
     pub l_sigmasigmasigmasigma: f64,
-}
-
-#[inline]
-fn cloglog_horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
-    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
-}
-
-#[inline]
-fn cloglog_stable_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
-    if coeffs.is_empty() || !x.is_finite() {
-        return 0.0;
-    }
-    if x <= 600.0 {
-        return cloglog_horner_polynomial(x, coeffs) * (-x).exp();
-    }
-
-    let inv_x = x.recip();
-    let mut tail = 0.0;
-    for &c in coeffs {
-        tail = tail * inv_x + c;
-    }
-    let degree = (coeffs.len() - 1) as f64;
-    let scale = (degree * x.ln() - x).exp();
-    scale * tail
 }
 
 #[inline]

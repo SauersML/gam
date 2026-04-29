@@ -49,7 +49,8 @@ use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicUsize;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
@@ -7004,9 +7005,9 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
 struct DesignTwoBlockRowCoeffOperator {
     x_a: Arc<Array2<f64>>,
     x_b: Arc<Array2<f64>>,
-    c_aa: Array1<f64>,
-    c_ab: Array1<f64>,
-    c_bb: Array1<f64>,
+    c_aa: Arc<Array1<f64>>,
+    c_ab: Arc<Array1<f64>>,
+    c_bb: Arc<Array1<f64>>,
     dim: usize,
     nrows: usize,
     pa: usize,
@@ -7025,8 +7026,8 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         let u_b = fast_av(self.x_b.as_ref(), &v_b);
         debug_assert_eq!(u_a.len(), self.nrows);
         debug_assert_eq!(u_b.len(), self.nrows);
-        let r_a = &self.c_aa * &u_a + &self.c_ab * &u_b;
-        let r_b = &self.c_ab * &u_a + &self.c_bb * &u_b;
+        let r_a = self.c_aa.as_ref() * &u_a + self.c_ab.as_ref() * &u_b;
+        let r_b = self.c_ab.as_ref() * &u_a + self.c_bb.as_ref() * &u_b;
         let out_a = fast_atv(self.x_a.as_ref(), &r_a);
         let out_b = fast_atv(self.x_b.as_ref(), &r_b);
         let mut out = Array1::<f64>::zeros(self.dim);
@@ -7052,9 +7053,9 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         let mut r_a = Array2::<f64>::zeros((self.nrows, cols));
         let mut r_b = Array2::<f64>::zeros((self.nrows, cols));
         for row in 0..self.nrows {
-            let c_aa = self.c_aa[row];
-            let c_ab = self.c_ab[row];
-            let c_bb = self.c_bb[row];
+            let c_aa = self.c_aa.as_ref()[row];
+            let c_ab = self.c_ab.as_ref()[row];
+            let c_bb = self.c_bb.as_ref()[row];
             for col in 0..cols {
                 let ua = u_a[[row, col]];
                 let ub = u_b[[row, col]];
@@ -7097,7 +7098,9 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
                 ab += ua * ub;
                 bb += ub * ub;
             }
-            trace += self.c_aa[row] * aa + 2.0 * self.c_ab[row] * ab + self.c_bb[row] * bb;
+            trace += self.c_aa.as_ref()[row] * aa
+                + 2.0 * self.c_ab.as_ref()[row] * ab
+                + self.c_bb.as_ref()[row] * bb;
         }
         trace
     }
@@ -7148,9 +7151,9 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
             }
             crate::solver::estimate::reml::unified::ProjectedTraceRows { aa, ab, bb }
         });
-        self.c_aa.dot(&trace_rows.aa)
-            + 2.0 * self.c_ab.dot(&trace_rows.ab)
-            + self.c_bb.dot(&trace_rows.bb)
+        self.c_aa.as_ref().dot(&trace_rows.aa)
+            + 2.0 * self.c_ab.as_ref().dot(&trace_rows.ab)
+            + self.c_bb.as_ref().dot(&trace_rows.bb)
     }
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
@@ -7176,9 +7179,9 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         // recomputations from the default `mul_basis_columns_into` path.
         let a = self.x_a.as_ref();
         let b = self.x_b.as_ref();
-        let h_aa = crate::faer_ndarray::fast_xt_diag_x(a, &self.c_aa);
-        let h_bb = crate::faer_ndarray::fast_xt_diag_x(b, &self.c_bb);
-        let h_ab = crate::faer_ndarray::fast_xt_diag_y(a, &self.c_ab, b);
+        let h_aa = crate::faer_ndarray::fast_xt_diag_x(a, self.c_aa.as_ref());
+        let h_bb = crate::faer_ndarray::fast_xt_diag_x(b, self.c_bb.as_ref());
+        let h_ab = crate::faer_ndarray::fast_xt_diag_y(a, self.c_ab.as_ref(), b);
         let mut out = Array2::<f64>::zeros((self.dim, self.dim));
         out.slice_mut(s![0..self.pa, 0..self.pa]).assign(&h_aa);
         out.slice_mut(s![self.pa..self.dim, self.pa..self.dim])
@@ -7417,9 +7420,9 @@ fn make_two_block_row_coeff_operator(
 fn make_two_block_design_row_coeff_operator(
     x_a: Arc<Array2<f64>>,
     x_b: Arc<Array2<f64>>,
-    c_aa: Array1<f64>,
-    c_ab: Array1<f64>,
-    c_bb: Array1<f64>,
+    c_aa: Arc<Array1<f64>>,
+    c_ab: Arc<Array1<f64>>,
+    c_bb: Arc<Array1<f64>>,
 ) -> Result<DesignTwoBlockRowCoeffOperator, String> {
     let nrows = x_a.nrows();
     if x_b.nrows() != nrows || c_aa.len() != nrows || c_ab.len() != nrows || c_bb.len() != nrows {
