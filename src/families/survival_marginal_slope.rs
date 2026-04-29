@@ -15612,4 +15612,190 @@ mod tests {
             }
         ));
     }
+
+    /// Pairwise oracle for survival marginal-slope outer-HVP cross-checking.
+    ///
+    /// Builds a small survival fixture (n=1, no time-wiggle, no link-dev,
+    /// no score-warp) with two ψ axes spanning the marginal and logslope
+    /// blocks. Calls `psi_second_order_terms(i, j)` for every (i, j) pair,
+    /// probes the operator returned via
+    /// `psi_hessian_directional_derivative_operator` at each axis i with
+    /// a fixed direction `d_beta_flat`, and writes the result to
+    /// `/tmp/survival_pairwise_oracle.json`.
+    ///
+    /// Verification anchor for the operator-form survival outer-HVP that
+    /// pairs the existing ψψ likelihood-side directional pullback with
+    /// the directional trace-correction helpers being added under the
+    /// CTN HVP Phase 2 work. The oracle uses only existing public APIs.
+    #[test]
+    fn survival_marginal_slope_pairwise_oracle_dumps_json() {
+        let marginal_design = array![[0.7, -0.2]];
+        let marginal_beta = array![0.35, -0.1];
+        let logslope_design = array![[1.0, 0.4]];
+        let logslope_beta = array![0.2, -0.05];
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.15]),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((1, 1))),
+            offset_entry: Arc::new(array![0.05]),
+            offset_exit: Arc::new(array![0.15]),
+            derivative_offset_exit: Arc::new(array![0.9]),
+            marginal_design: DesignMatrix::from(marginal_design.clone()),
+            logslope_design: DesignMatrix::from(logslope_design.clone()),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+        };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: logslope_beta.clone(),
+                eta: logslope_design.dot(&logslope_beta),
+            },
+        ];
+        // Two ψ axes: one in marginal (block 1), one in logslope (block 2).
+        let derivative_blocks = vec![
+            Vec::new(),
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[1.0, -0.4]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                array![[0.6, 0.3]],
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+        ];
+
+        let psi_dim = 2usize;
+
+        let mut pair_records = Vec::new();
+        for i in 0..psi_dim {
+            for j in 0..psi_dim {
+                let terms = family
+                    .psi_second_order_terms(&block_states, &derivative_blocks, i, j)
+                    .expect("survival pairwise call ok")
+                    .expect("pairwise returns Some for valid i,j");
+                let g_inf = terms
+                    .score_psi_psi
+                    .iter()
+                    .fold(0.0f64, |m, x| m.max(x.abs()));
+                assert!(
+                    terms.objective_psi_psi.is_finite(),
+                    "objective_psi_psi non-finite at (i={i},j={j})"
+                );
+                assert!(
+                    terms.score_psi_psi.iter().all(|v| v.is_finite()),
+                    "score_psi_psi non-finite at (i={i},j={j})"
+                );
+                pair_records.push(serde_json::json!({
+                    "i": i,
+                    "j": j,
+                    "a": terms.objective_psi_psi,
+                    "g_inf": g_inf,
+                    "g": terms.score_psi_psi.to_vec(),
+                    "operator_present": terms.hessian_psi_psi_operator.is_some(),
+                }));
+            }
+        }
+
+        let slices = block_slices(&family, &block_states);
+        let mut d_beta_flat = Array1::zeros(slices.total);
+        d_beta_flat[slices.time.start] = 0.07;
+        d_beta_flat[slices.marginal.start] = 0.05;
+        d_beta_flat[slices.marginal.start + 1] = -0.02;
+        d_beta_flat[slices.logslope.start] = -0.04;
+        d_beta_flat[slices.logslope.start + 1] = 0.03;
+
+        let mut op_records = Vec::new();
+        for i in 0..psi_dim {
+            let op = family
+                .psi_hessian_directional_derivative_operator(
+                    &block_states,
+                    &derivative_blocks,
+                    i,
+                    &d_beta_flat,
+                )
+                .expect("operator call ok")
+                .expect("operator returns Some");
+            let dim = op.dim();
+            let mut probes: Vec<(&'static str, Array1<f64>)> = Vec::new();
+            let mut e0 = Array1::<f64>::zeros(dim);
+            if dim > 0 {
+                e0[0] = 1.0;
+            }
+            probes.push(("e0", e0));
+            let scale = 1.0 / (dim.max(1) as f64).sqrt();
+            probes.push(("uniform", Array1::from_elem(dim, scale)));
+            let alt: Array1<f64> = (0..dim)
+                .map(|k| if k % 2 == 0 { 0.5 } else { -0.3 })
+                .collect();
+            probes.push(("alt", alt));
+
+            let mut probe_outputs = Vec::new();
+            for (label, v) in probes.iter() {
+                let out = op.mul_vec(v);
+                let v_inf = v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let out_inf = out.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                assert!(
+                    out.iter().all(|x| x.is_finite()),
+                    "operator output non-finite at axis {i} probe {label}"
+                );
+                probe_outputs.push(serde_json::json!({
+                    "label": label,
+                    "v_inf": v_inf,
+                    "out_inf": out_inf,
+                }));
+            }
+            op_records.push(serde_json::json!({
+                "i": i,
+                "dim": dim,
+                "probes": probe_outputs,
+            }));
+        }
+
+        let payload = serde_json::json!({
+            "version": 1,
+            "fixture": "survival_marginal_slope:n=1,no_wiggle,no_warp,psi_dim=2",
+            "psi_dim": psi_dim,
+            "p_total": slices.total,
+            "pair_records": pair_records,
+            "operator_records": op_records,
+        });
+
+        let path = std::path::Path::new("/tmp/survival_pairwise_oracle.json");
+        std::fs::write(path, serde_json::to_string_pretty(&payload).unwrap())
+            .expect("write oracle JSON");
+        eprintln!(
+            "[oracle] wrote {} pair records, {} operator records to {}",
+            psi_dim * psi_dim,
+            psi_dim,
+            path.display()
+        );
+    }
 }
