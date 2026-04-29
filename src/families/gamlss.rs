@@ -6621,12 +6621,19 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 //   = 0.5 sum_i (x_i^T J^{-1} x_i) dw_i
                 //
                 // for diagonal working-set blocks.
-                for i in 0..n {
-                    dw[i] = gaussian_log_sigma_irlsinfo_directional_derivative(
-                        self.weights[i],
-                        sigma[i],
-                        d_eta[i],
-                    );
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                let dw_vec: Vec<f64> = (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        gaussian_log_sigma_irlsinfo_directional_derivative(
+                            self.weights[i],
+                            sigma[i],
+                            d_eta[i],
+                        )
+                    })
+                    .collect();
+                for (i, v) in dw_vec.into_iter().enumerate() {
+                    dw[i] = v;
                 }
                 Ok(Some(dw))
             }
