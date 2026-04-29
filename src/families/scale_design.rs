@@ -26,6 +26,51 @@ pub struct ScaleDeviationTransform {
     pub non_intercept_start: usize,
 }
 
+/// Build a [`ScaleDeviationTransform`] from saved projection metadata.
+///
+/// Returns `Ok(None)` only when the payload is completely absent; partial
+/// payloads are invalid because prediction cannot replay the fitted scale
+/// reparameterization unambiguously.
+pub fn scale_transform_from_payload(
+    projection: &Option<Vec<Vec<f64>>>,
+    center: &Option<Vec<f64>>,
+    scale: &Option<Vec<f64>>,
+    non_intercept_start: Option<usize>,
+) -> Result<Option<ScaleDeviationTransform>, String> {
+    match (projection, center, scale, non_intercept_start) {
+        (None, None, None, None) => Ok(None),
+        (Some(projection), Some(center), Some(scale), Some(non_intercept_start)) => {
+            let rows = projection.len();
+            let cols = center.len();
+            if cols != scale.len() {
+                return Err("saved scale transform center/scale length mismatch".to_string());
+            }
+            if rows == 0 && cols > 0 {
+                return Err("saved scale transform projection has zero rows".to_string());
+            }
+            let mut projection_coef = Array2::<f64>::zeros((rows, cols));
+            for (i, row) in projection.iter().enumerate() {
+                if row.len() != cols {
+                    return Err("saved scale transform projection width mismatch".to_string());
+                }
+                for (j, &value) in row.iter().enumerate() {
+                    projection_coef[[i, j]] = value;
+                }
+            }
+            Ok(Some(ScaleDeviationTransform {
+                projection_coef,
+                weighted_column_mean: Array1::from_vec(center.clone()),
+                rescale: Array1::from_vec(scale.clone()),
+                non_intercept_start,
+            }))
+        }
+        _ => Err(
+            "saved scale transform payload is only partially populated; refit with current CLI"
+                .to_string(),
+        ),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ScaleDesignMatrixRef<'a> {
     Dense(&'a Array2<f64>),

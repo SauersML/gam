@@ -3,12 +3,13 @@ use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, DeviationRu
 use gam::estimate::{BlockRole, PredictInput};
 use gam::families::family_meta::{family_to_link, pretty_familyname};
 use gam::families::scale_design::{
-    ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
-    infer_non_intercept_start,
+    apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
+    scale_transform_from_payload,
 };
 use gam::families::survival_construction::survival_likelihood_modename;
 use gam::families::survival_predict::{
-    apply_inverse_link_state_to_fit_result, resolve_termspec_for_prediction,
+    apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
+    resolve_termspec_for_prediction,
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::inference::data::{
@@ -1959,45 +1960,6 @@ fn build_location_scale_predict_input(
     })
 }
 
-fn scale_transform_from_payload(
-    projection: &Option<Vec<Vec<f64>>>,
-    center: &Option<Vec<f64>>,
-    scale: &Option<Vec<f64>>,
-    non_intercept_start: Option<usize>,
-) -> Result<Option<ScaleDeviationTransform>, String> {
-    let (Some(projection), Some(center), Some(scale), Some(non_intercept_start)) = (
-        projection.as_ref(),
-        center.as_ref(),
-        scale.as_ref(),
-        non_intercept_start,
-    ) else {
-        return Ok(None);
-    };
-    let rows = projection.len();
-    let cols = center.len();
-    if cols != scale.len() {
-        return Err("saved scale transform center/scale length mismatch".to_string());
-    }
-    if rows == 0 && cols > 0 {
-        return Err("saved scale transform projection has zero rows".to_string());
-    }
-    let mut mat = ndarray::Array2::<f64>::zeros((rows, cols));
-    for (i, row) in projection.iter().enumerate() {
-        if row.len() != cols {
-            return Err("saved scale transform projection width mismatch".to_string());
-        }
-        for (j, &value) in row.iter().enumerate() {
-            mat[[i, j]] = value;
-        }
-    }
-    Ok(Some(ScaleDeviationTransform {
-        projection_coef: mat,
-        weighted_column_mean: Array1::from_vec(center.clone()),
-        rescale: Array1::from_vec(scale.clone()),
-        non_intercept_start,
-    }))
-}
-
 fn build_transformation_normal_predict_input(
     model: &FittedModel,
     dataset: &EncodedDataset,
@@ -2240,14 +2202,6 @@ fn build_col_map(dataset: &EncodedDataset) -> HashMap<String, usize> {
         .enumerate()
         .map(|(index, header)| (header.clone(), index))
         .collect()
-}
-
-fn fit_result_from_saved_model_for_prediction(
-    model: &FittedModel,
-) -> Result<gam::estimate::UnifiedFitResult, String> {
-    model.payload().fit_result.clone().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit with the current engine".to_string()
-    })
 }
 
 fn link_name(link: gam::types::LinkFunction) -> &'static str {
