@@ -1848,14 +1848,11 @@ impl BernoulliMarginalSlopePredictor {
         // Rigid path mirrors `final_eta_and_gradient_from_theta` lines 1342-1383:
         //   eta = c·q + s·b·z,  ∂eta/∂q = c.
         if !flex_active {
-            let mut eta = Array1::<f64>::zeros(n);
-            let mut deta_dq = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let sb = scale * logslope_eta[i];
-                let c = (1.0 + sb * sb).sqrt();
-                eta[i] = c * marginal_eta[i] + sb * z[i];
-                deta_dq[i] = c;
-            }
+            // Vectorize: sb = scale·logslope, c = sqrt(1 + sb²),
+            // eta = c·marginal_eta + sb·z, ∂eta/∂q = c.
+            let sb = logslope_eta.mapv(|x| scale * x);
+            let deta_dq = sb.mapv(|s| (1.0 + s * s).sqrt());
+            let eta = &deta_dq * marginal_eta + &sb * z;
             return Ok((eta, deta_dq));
         }
 
@@ -1927,10 +1924,7 @@ impl BernoulliMarginalSlopePredictor {
         };
         let final_eta_internal =
             (&eta_base + &(&logslope_eta * &score_dev_obs) + &link_dev_obs).mapv(|v| scale * v);
-        let mut deta_dq = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            deta_dq[i] = scale * link_c_obs[i] * a_q[i];
-        }
+        let deta_dq = (&link_c_obs * &a_q).mapv(|v| scale * v);
         Ok((final_eta_internal, deta_dq))
     }
 }
