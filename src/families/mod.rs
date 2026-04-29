@@ -6,7 +6,7 @@ pub mod gamlss;
 pub mod jet_partitions;
 pub mod latent_survival;
 pub mod lognormal_kernel;
-pub(crate) mod marginal_slope_shared;
+pub mod marginal_slope_shared;
 pub mod monotone_root;
 pub mod row_kernel;
 pub mod royston_parmar;
