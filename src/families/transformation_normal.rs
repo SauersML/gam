@@ -571,19 +571,56 @@ impl TransformationNormalFamily {
 
     // --- Internal helpers ---
 
-    fn row_quantities(&self, beta: &Array1<f64>) -> TransformationNormalRowQuantityCache {
+    fn row_quantities(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<TransformationNormalRowQuantityCache, String> {
         {
             let cache = self
                 .row_quantity_cache
                 .lock()
                 .expect("CTN row quantity cache mutex poisoned");
             if let Some(cached) = cache.as_ref().filter(|cached| cached.matches_beta(beta)) {
-                return cached.clone();
+                return Ok(cached.clone());
             }
         }
 
         let h = self.x_val_kron.forward_mul(beta) + self.offset.as_ref();
         let h_prime = self.x_deriv_kron.forward_mul(beta);
+        // Hard monotonicity / finiteness gate: the reciprocal powers `1/h'^k`
+        // for k ∈ {1,2,3,4} feed the gradient, Hessian, and psi-psi outer
+        // Hessian formulas. A non-finite or non-positive h' produces +∞ /
+        // signed-∞ reciprocals which then collide with zero-valued probe
+        // vectors (`v_*_deriv * weights`) to yield NaN entries throughout the
+        // dense psi-psi block (`hessian_psi_psi`). The likelihood gate in
+        // `evaluate` already rejects such β; surface the same error here so
+        // outer-Hessian probe callsites that call `row_quantities` directly
+        // (psi/psi second-order terms, etc.) produce a clean Err for the
+        // outer evaluator to retreat on, rather than a NaN dense block that
+        // routes a flagrant non-finite Hessian back into the planner.
+        let mut min_hp = f64::INFINITY;
+        let mut nonfinite_idx: Option<usize> = None;
+        for (i, &hp) in h_prime.iter().enumerate() {
+            if !hp.is_finite() {
+                nonfinite_idx = Some(i);
+                break;
+            }
+            if hp < min_hp {
+                min_hp = hp;
+            }
+        }
+        if let Some(i) = nonfinite_idx {
+            return Err(format!(
+                "TransformationNormalFamily row_quantities: h'[{i}] = {} is not finite",
+                h_prime[i]
+            ));
+        }
+        if min_hp <= 0.0 {
+            return Err(format!(
+                "TransformationNormalFamily row_quantities: h' has non-positive values (min = {min_hp:.6e}). \
+                 Monotonicity constraint may be violated."
+            ));
+        }
         let inv_h_prime = h_prime.mapv(|hp| 1.0 / hp);
         let inv_h_prime_sq = h_prime.mapv(|hp| 1.0 / (hp * hp));
         let inv_h_prime_cu = h_prime.mapv(|hp| 1.0 / (hp * hp * hp));
@@ -606,7 +643,7 @@ impl TransformationNormalFamily {
             .lock()
             .expect("CTN row quantity cache mutex poisoned");
         *cache = Some(row_quantities.clone());
-        row_quantities
+        Ok(row_quantities)
     }
 }
 
@@ -992,7 +1029,7 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let row_quantities = self.row_quantities(beta);
+        let row_quantities = self.row_quantities(beta)?;
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
@@ -1078,13 +1115,15 @@ impl CustomFamily for TransformationNormalFamily {
         if block_states.len() != 1 {
             return Err("expected 1 block".to_string());
         }
-        let row_quantities = self.row_quantities(&block_states[0].beta);
+        // The line search uses NEG_INFINITY as the barrier-violation signal,
+        // so we can't propagate the row_quantities Err here. Translate any
+        // h' validation failure back into the NEG_INFINITY rejection contract.
+        let row_quantities = match self.row_quantities(&block_states[0].beta) {
+            Ok(rq) => rq,
+            Err(_) => return Ok(f64::NEG_INFINITY),
+        };
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let min_hp = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
-        if min_hp <= 0.0 {
-            return Ok(f64::NEG_INFINITY);
-        }
         let ll = {
             use rayon::prelude::*;
             let weights = self.weights.as_ref();
@@ -1126,7 +1165,7 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let row_quantities = self.row_quantities(beta);
+        let row_quantities = self.row_quantities(beta)?;
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
@@ -1349,7 +1388,7 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
-        let row_quantities = self.row_quantities(beta);
+        let row_quantities = self.row_quantities(beta)?;
         let h_prime = row_quantities.h_prime.as_ref();
         let d_h_prime = self.x_deriv_kron.forward_mul(d_beta);
 
@@ -1380,7 +1419,7 @@ impl CustomFamily for TransformationNormalFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
-        let row_quantities = self.row_quantities(beta);
+        let row_quantities = self.row_quantities(beta)?;
         let h_prime = row_quantities.h_prime.as_ref();
         let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
         let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
@@ -1406,7 +1445,7 @@ impl CustomFamily for TransformationNormalFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let beta = &block_states[0].beta;
-        let row_quantities = self.row_quantities(beta);
+        let row_quantities = self.row_quantities(beta)?;
         let h_prime = row_quantities.h_prime.as_ref();
         let d_h_prime_u = self.x_deriv_kron.forward_mul(d_beta_u_flat);
         let d_h_prime_v = self.x_deriv_kron.forward_mul(d_beta_v_flat);
@@ -1445,7 +1484,7 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
-        let row = self.row_quantities(beta);
+        let row = self.row_quantities(beta)?;
         let h = row.h.as_ref();
         let n = h.len();
         let inv_h_prime = row.inv_h_prime.as_ref();
@@ -1543,7 +1582,7 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv_i = &psi_derivs[0][psi_i];
         let deriv_j = &psi_derivs[0][psi_j];
         let beta = &block_states[0].beta;
-        let row = self.row_quantities(beta);
+        let row = self.row_quantities(beta)?;
         let h = row.h.as_ref();
         let n = h.len();
         let inv_h_prime = row.inv_h_prime.as_ref();
@@ -1863,7 +1902,7 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let row_quantities = self.row_quantities(beta);
+        let row_quantities = self.row_quantities(beta)?;
         let h_prime = row_quantities.h_prime.as_ref();
         // Build weighted_inv_hp_sq[i] = w_i / h'_i² and validate h' > 0 in one
         // pass — the inner solver's barrier line search keeps h' strictly
@@ -4539,7 +4578,9 @@ mod tests {
         )
         .expect("transformation family");
 
-        let row = family.row_quantities(&family.initial_beta);
+        let row = family
+            .row_quantities(&family.initial_beta)
+            .expect("row quantities at initial beta");
         let h = row.h.as_ref();
         let h_prime = row.h_prime.as_ref();
         let expected_h = array![0.5, 2.0];
