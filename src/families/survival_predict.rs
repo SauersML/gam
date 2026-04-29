@@ -111,10 +111,15 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         ));
     }
 
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let pairs: Result<Vec<(f64, f64)>, _> = (0..n)
+        .into_par_iter()
+        .map(|i| normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i))
+        .collect();
+    let pairs = pairs?;
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (t0, t1) = normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i)?;
+    for (i, (t0, t1)) in pairs.into_iter().enumerate() {
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
