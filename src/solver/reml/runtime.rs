@@ -1835,14 +1835,15 @@ impl<'a> RemlState<'a> {
     /// directly from the eigenspectrum. No δ-regularization or nullity metadata.
     ///
     /// For S(ρ) = Σ exp(ρ_k) S_k with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k)
-    /// is structurally fixed, so this is C∞ in ρ.
+    /// is structurally fixed, so this is C∞ in ρ. The rank must come from the
+    /// same positive eigenspace as the pseudo-logdet; root row count overstates
+    /// rank whenever penalty blocks overlap or the root carries redundant rows.
     pub(super) fn fixed_subspace_penalty_rank_and_logdet(
         &self,
         e_transformed: &Array2<f64>,
         ridge_passport: RidgePassport,
     ) -> Result<(usize, f64), EstimationError> {
-        let structural_rank = e_transformed.nrows().min(e_transformed.ncols());
-        if structural_rank == 0 {
+        if e_transformed.nrows() == 0 || e_transformed.ncols() == 0 {
             return Ok((0, 0.0));
         }
 
@@ -1857,10 +1858,8 @@ impl<'a> RemlState<'a> {
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        // Exact pseudo-logdet on the positive eigenspace: L = Σ_{σ_i > ε} log σ_i.
-        // The structural nullspace is identified directly from the eigenspectrum.
-        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-        let log_det = super::unified::exact_pseudo_logdet(evals.as_slice().unwrap(), threshold);
+        let (structural_rank, log_det) =
+            positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
 
         Ok((structural_rank, log_det))
     }
@@ -4586,6 +4585,13 @@ impl<'a> RemlState<'a> {
     }
 }
 
+fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f64) {
+    let threshold = super::unified::positive_eigenvalue_threshold(eigenvalues);
+    let rank = eigenvalues.iter().filter(|&&ev| ev > threshold).count();
+    let log_det = super::unified::exact_pseudo_logdet(eigenvalues, threshold);
+    (rank, log_det)
+}
+
 #[cfg(test)]
 mod tk_math_tests {
     use super::*;
@@ -4603,6 +4609,24 @@ mod tk_math_tests {
     use faer::Side;
     use ndarray::array;
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
+
+    #[test]
+    fn penalty_rank_uses_actual_positive_eigenspace_not_root_rows() {
+        let e = array![
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let s = e.t().dot(&e);
+        let (evals, _) = s.eigh(Side::Lower).expect("penalty eigensystem");
+        let (rank, log_det) = positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
+
+        assert_eq!(rank, 1);
+        assert!(
+            (log_det - 2.0_f64.ln()).abs() < 1e-12,
+            "logdet should use the single positive eigenvalue, got {log_det}"
+        );
+    }
 
     fn solve_vec(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
         h.cholesky(Side::Lower).expect("chol(H)").solvevec(rhs)
