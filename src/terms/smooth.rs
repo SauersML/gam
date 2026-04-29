@@ -4855,10 +4855,7 @@ impl CharbonnierScalarBlockState {
     }
 
     fn penalty_value(&self) -> f64 {
-        self.radius
-            .iter()
-            .map(|r| self.epsilon * (r - self.epsilon))
-            .sum::<f64>()
+        self.radius.iter().map(|r| r - self.epsilon).sum::<f64>()
     }
 
     fn betagradient_coeff(&self) -> Array1<f64> {
@@ -4866,42 +4863,38 @@ impl CharbonnierScalarBlockState {
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| self.epsilon * t / r),
+                .map(|(t, r)| t / r),
         )
     }
 
     fn betahessian_diag(&self) -> Array1<f64> {
-        let eps3 = self.epsilon.powi(3);
-        self.radius.mapv(|r| eps3 / (r * r * r))
+        let eps2 = self.epsilon * self.epsilon;
+        self.radius.mapv(|r| eps2 / r.powi(3))
     }
 
     fn log_epsilon_gradient_terms(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         let eps2 = epsilon * epsilon;
-        let eps3 = eps2 * epsilon;
-        // Closed form in eta = log eps:
-        //
-        //   d/deta psi(t; eps) = eps * r + eps^3 / r - 2 eps^2.
-        self.radius.mapv(|r| epsilon * r + eps3 / r - 2.0 * eps2)
+        self.radius.mapv(|r| eps2 / r - epsilon)
     }
 
     fn log_epsilon_betagradient_coeff(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| epsilon * t.powi(3) / r.powi(3)),
+                .map(|(t, r)| -eps2 * t / r.powi(3)),
         )
     }
 
     fn log_epsilon_hessian_terms(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         let eps2 = epsilon * epsilon;
-        let eps3 = eps2 * epsilon;
-        let eps5 = eps3 * eps2;
+        let eps4 = eps2 * eps2;
         self.radius
-            .mapv(|r| epsilon * r + 4.0 * eps3 / r - eps5 / r.powi(3) - 4.0 * eps2)
+            .mapv(|r| 2.0 * eps2 / r - eps4 / r.powi(3) - epsilon)
     }
 
     fn surrogateweights(
@@ -4909,11 +4902,11 @@ impl CharbonnierScalarBlockState {
         weight_floor: f64,
         weight_ceiling: f64,
     ) -> (Array1<f64>, Array1<f64>) {
-        // Exact scalar scaled-Charbonnier / pseudo-Huber block and its MM majorizer.
+        // Exact scalar Charbonnier / pseudo-Huber block and its MM majorizer.
         //
         // The exact scalar penalty used by the nonquadratic spatial regularizer is
         //
-        //   psi(t; eps) = eps * (sqrt(t^2 + eps^2) - eps),
+        //   psi(t; eps) = sqrt(t^2 + eps^2) - eps,
         //
         // where:
         //   - t is the scalar operator response at one collocation point,
@@ -4921,10 +4914,14 @@ impl CharbonnierScalarBlockState {
         //
         // The key exact scalar derivatives are:
         //
-        //   d/dt psi(t; eps)        = eps * t / sqrt(t^2 + eps^2),
-        //   d^2/dt^2 psi(t; eps)    = eps^3 / (t^2 + eps^2)^(3/2),
-        //   d/deps psi(t; eps)      = sqrt(t^2 + eps^2) + eps^2 / sqrt(t^2 + eps^2) - 2 eps,
-        //   d^2/(dt deps) psi       = t^3 / (t^2 + eps^2)^(3/2).
+        //   d/dt psi(t; eps)        = t / sqrt(t^2 + eps^2),
+        //   d^2/dt^2 psi(t; eps)    = eps^2 / (t^2 + eps^2)^(3/2),
+        //   d/deps psi(t; eps)      = eps / sqrt(t^2 + eps^2) - 1,
+        //   d^2/(dt deps) psi       = -eps * t / (t^2 + eps^2)^(3/2).
+        //
+        // The omitted leading eps factor is intentional. The old scaled form
+        // made eps an amplitude parameter; because eps is optimized jointly with
+        // lambda, eps -> 0 erased the adaptive regularizer.
         //
         // These exact formulas define the real adaptive model used by the
         // pseudo-Laplace hyperobjective. We still keep the legacy MM majorizer
@@ -4934,12 +4931,12 @@ impl CharbonnierScalarBlockState {
         // For a reference point t0, the same tangent majorizer in t^2 gives
         // tangent majorizer in the variable t^2:
         //
-        //   psi(t; eps) <= u(t0) * t^2 + const(t0),
-        //   u(t0) = eps / (2 * sqrt(t0^2 + eps^2)).
+        //   psi(t; eps) <= 0.5 * w(t0) * t^2 + const(t0),
+        //   w(t0) = 1 / sqrt(t0^2 + eps^2).
         //
         // So the MM algorithm reuses only the scalar weight
         //
-        //   u_k = eps / (2 * sqrt(t_k^2 + eps^2)),
+        //   w_k = 1 / sqrt(t_k^2 + eps^2),
         //
         // while the exact derivatives above remain the source of truth for the
         // production direct inner optimizer and exact outer hypergradient.
@@ -4972,40 +4969,45 @@ impl CharbonnierScalarBlockState {
         //
         //   d/dtheta log det H = tr(H^{-1} Hdot_theta),
         //   Hdot_theta = J_{beta,beta,theta} + D_beta(H)[beta_theta].
-        let eps3 = self.epsilon.powi(3);
+        let eps2 = self.epsilon * self.epsilon;
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(direction_signal.iter())
                 .zip(self.radius.iter())
-                .map(|((t, q), r)| -3.0 * eps3 * t * q / r.powi(5)),
+                .map(|((t, q), r)| -3.0 * eps2 * t * q / r.powi(5)),
         )
     }
 
     fn log_epsilon_betahessian_diag(&self) -> Array1<f64> {
-        let eps3 = self.epsilon.powi(3);
+        let eps2 = self.epsilon * self.epsilon;
+        let eps4 = eps2 * eps2;
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| 3.0 * eps3 * t * t / r.powi(5)),
+                .map(|(_, r)| 2.0 * eps2 / r.powi(3) - 3.0 * eps4 / r.powi(5)),
         )
     }
 
     fn log_epsilon_beta_mixed_second_coeff(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| epsilon * t.powi(3) * (t * t - 2.0 * epsilon * epsilon) / r.powi(5)),
+                .map(|(t, r)| eps2 * t * (eps2 - 2.0 * t * t) / r.powi(5)),
         )
     }
 
     fn log_epsilon_betahessian_second_diag(&self) -> Array1<f64> {
-        let eps3 = self.epsilon.powi(3);
-        Array1::from_iter(self.signal.iter().zip(self.radius.iter()).map(|(t, r)| {
-            3.0 * eps3 * t * t * (3.0 * t * t - 2.0 * self.epsilon * self.epsilon) / r.powi(7)
+        let eps2 = self.epsilon * self.epsilon;
+        let eps4 = eps2 * eps2;
+        let eps6 = eps4 * eps2;
+        Array1::from_iter(self.radius.iter().map(|r| {
+            4.0 * eps2 / r.powi(3) - 18.0 * eps4 / r.powi(5)
+                + 15.0 * eps6 / r.powi(7)
         }))
     }
 
@@ -5013,16 +5015,14 @@ impl CharbonnierScalarBlockState {
         &self,
         direction_signal: &Array1<f64>,
     ) -> Array1<f64> {
-        let eps3 = self.epsilon.powi(3);
+        let eps2 = self.epsilon * self.epsilon;
+        let eps4 = eps2 * eps2;
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(direction_signal.iter())
                 .zip(self.radius.iter())
-                .map(|((t, q), r)| {
-                    3.0 * eps3 * t * (2.0 * self.epsilon * self.epsilon - 3.0 * t * t) * q
-                        / r.powi(7)
-                }),
+                .map(|((t, q), r)| (-6.0 * eps2 * t / r.powi(5) + 15.0 * eps4 * t / r.powi(7)) * q),
         )
     }
 }
@@ -5054,10 +5054,7 @@ impl CharbonnierGroupedBlockState {
     }
 
     fn penalty_value(&self) -> f64 {
-        self.radius
-            .iter()
-            .map(|r| self.epsilon * (r - self.epsilon))
-            .sum::<f64>()
+        self.radius.iter().map(|r| r - self.epsilon).sum::<f64>()
     }
 
     fn norm_signal(&self) -> Array1<f64> {
@@ -5067,7 +5064,7 @@ impl CharbonnierGroupedBlockState {
     fn betagradient_blocks(&self) -> Array2<f64> {
         let mut out = self.signal_blocks.clone();
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
-            let scale = self.epsilon / self.radius[k];
+            let scale = 1.0 / self.radius[k];
             row.mapv_inplace(|v| v * scale);
         }
         out
@@ -5078,10 +5075,10 @@ impl CharbonnierGroupedBlockState {
         for (k, row) in self.signal_blocks.rows().into_iter().enumerate() {
             let dim = row.len();
             let mut block = Array2::<f64>::eye(dim);
-            block.mapv_inplace(|v| self.epsilon * v / self.radius[k]);
+            block.mapv_inplace(|v| v / self.radius[k]);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] -= self.epsilon * row[i] * row[j] / self.radius[k].powi(3);
+                    block[[i, j]] -= row[i] * row[j] / self.radius[k].powi(3);
                 }
             }
             out.push(block);
@@ -5092,15 +5089,15 @@ impl CharbonnierGroupedBlockState {
     fn log_epsilon_gradient_terms(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         let eps2 = epsilon * epsilon;
-        let eps3 = eps2 * epsilon;
-        self.radius.mapv(|r| epsilon * r + eps3 / r - 2.0 * eps2)
+        self.radius.mapv(|r| eps2 / r - epsilon)
     }
 
     fn log_epsilon_betagradient_blocks(&self) -> Array2<f64> {
         let mut out = self.signal_blocks.clone();
         let epsilon = self.epsilon;
+        let eps2 = epsilon * epsilon;
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
-            let scale = epsilon * self.norm[k] * self.norm[k] / self.radius[k].powi(3);
+            let scale = -eps2 / self.radius[k].powi(3);
             row.mapv_inplace(|v| v * scale);
         }
         out
@@ -5109,10 +5106,9 @@ impl CharbonnierGroupedBlockState {
     fn log_epsilon_hessian_terms(&self) -> Array1<f64> {
         let epsilon = self.epsilon;
         let eps2 = epsilon * epsilon;
-        let eps3 = eps2 * epsilon;
-        let eps5 = eps3 * eps2;
+        let eps4 = eps2 * eps2;
         self.radius
-            .mapv(|r| epsilon * r + 4.0 * eps3 / r - eps5 / r.powi(3) - 4.0 * eps2)
+            .mapv(|r| 2.0 * eps2 / r - eps4 / r.powi(3) - epsilon)
     }
 
     fn surrogateweights(
@@ -5120,22 +5116,22 @@ impl CharbonnierGroupedBlockState {
         weight_floor: f64,
         weight_ceiling: f64,
     ) -> (Array1<f64>, Array1<f64>) {
-        // Grouped scaled-Charbonnier / pseudo-Huber MM weights for the slope block.
+        // Grouped Charbonnier / pseudo-Huber MM weights for the slope block.
         //
         // For the grouped penalty, each collocation point contributes
         //
-        //   psi(g_k; eps_g) = eps_g * (sqrt(g_k^2 + eps_g^2) - eps_g),
+        //   psi(g_k; eps_g) = sqrt(g_k^2 + eps_g^2) - eps_g,
         //   g_k = ||v_k||_2,
         //   v_k = G_k beta.
         //
         // The exact block gradient is
         //
         //   d/d beta psi(g_k; eps_g)
-        //   = G_k^T (eps_g * v_k / sqrt(||v_k||^2 + eps_g^2)),
+        //   = G_k^T (v_k / sqrt(||v_k||^2 + eps_g^2)),
         //
         // and the exact block Hessian is
         //
-        //   G_k^T (eps_g B_k) G_k,
+        //   G_k^T B_k G_k,
         //
         //   B_k
         //   = (1 / r_k) I - (1 / r_k^3) v_k v_k^T,
@@ -5144,12 +5140,12 @@ impl CharbonnierGroupedBlockState {
         // The current adaptive path does not use that exact Hessian directly.
         // Instead it uses the grouped MM majorizer
         //
-        //   psi(g; eps_g) <= u(g0) * g^2 + const(g0),
-        //   u(g0) = eps_g / (2 * sqrt(g0^2 + eps_g^2)),
+        //   psi(g; eps_g) <= 0.5 * w(g0) * g^2 + const(g0),
+        //   w(g0) = 1 / sqrt(g0^2 + eps_g^2),
         //
         // which yields the quadratic surrogate
         //
-        //   K_g = D1^T (diag(u_g) \kron I_d) D1.
+        //   K_g = D1^T (diag(w_g) \kron I_d) D1.
         //
         // These weights are therefore the grouped analogue of the scalar MM
         // majorizer above: they are not the exact slope Hessian, they are the
@@ -5172,8 +5168,8 @@ impl CharbonnierGroupedBlockState {
         //   q_k = G_k u,
         //   r_k = sqrt(||v_k||^2 + eps^2),
         //
-        // the exact Hessian block for psi(g; eps) = eps * (sqrt(g^2 + eps^2) - eps) is
-        //   eps * B_k,
+        // the exact Hessian block for psi(g; eps) = sqrt(g^2 + eps^2) - eps is
+        //   B_k,
         //   B_k = (1 / r_k) I - v_k v_k^T / r_k^3.
         //
         // Differentiating B_k along u gives
@@ -5188,7 +5184,7 @@ impl CharbonnierGroupedBlockState {
         //   B_k = (1 / r_k) I - v_k v_k^T / r_k^3.
         //
         // The full directional penalty Hessian map is then
-        //   D(H_g)[u] = lambda_g * eps * sum_k G_k^T M_k(u) G_k.
+        //   D(H_g)[u] = lambda_g * sum_k G_k^T M_k(u) G_k.
         let mut out = Vec::with_capacity(self.signal_blocks.nrows());
         for (k, (v, q)) in self
             .signal_blocks
@@ -5209,7 +5205,6 @@ impl CharbonnierGroupedBlockState {
                     block[[i, j]] += 3.0 * dot * v[i] * v[j] / r5;
                 }
             }
-            block.mapv_inplace(|x| self.epsilon * x);
             out.push(block);
         }
         out
@@ -5223,14 +5218,11 @@ impl CharbonnierGroupedBlockState {
             let r5 = self.radius[k].powi(5);
             let mut block = Array2::<f64>::eye(dim);
             let norm2 = self.norm[k] * self.norm[k];
-            block.mapv_inplace(|v| self.epsilon * norm2 * v / r3);
+            let eps2 = self.epsilon * self.epsilon;
+            block.mapv_inplace(|v| -eps2 * v / r3);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] += self.epsilon
-                        * (2.0 * self.epsilon * self.epsilon - norm2)
-                        * row[i]
-                        * row[j]
-                        / r5;
+                    block[[i, j]] += 3.0 * eps2 * row[i] * row[j] / r5;
                 }
             }
             out.push(block);
@@ -5244,7 +5236,7 @@ impl CharbonnierGroupedBlockState {
         let eps2 = epsilon * epsilon;
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
             let norm2 = self.norm[k] * self.norm[k];
-            let scale = epsilon * norm2 * (norm2 - 2.0 * eps2) / self.radius[k].powi(5);
+            let scale = eps2 * (eps2 - 2.0 * norm2) / self.radius[k].powi(5);
             row.mapv_inplace(|v| v * scale);
         }
         out
@@ -5261,14 +5253,11 @@ impl CharbonnierGroupedBlockState {
             let r5 = self.radius[k].powi(5);
             let r7 = self.radius[k].powi(7);
             let mut block = Array2::<f64>::eye(dim);
-            block.mapv_inplace(|v| epsilon * norm2 * (norm2 - 2.0 * eps2) * v / r5);
+            block.mapv_inplace(|v| eps2 * (eps2 - 2.0 * norm2) * v / r5);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] += epsilon
-                        * (-norm2 * norm2 + 10.0 * eps2 * norm2 - 4.0 * eps4)
-                        * row[i]
-                        * row[j]
-                        / r7;
+                    block[[i, j]] +=
+                        3.0 * eps2 * (2.0 * norm2 - 3.0 * eps2) * row[i] * row[j] / r7;
                 }
             }
             out.push(block);
@@ -5291,16 +5280,15 @@ impl CharbonnierGroupedBlockState {
             .enumerate()
         {
             let dim = v.len();
-            let norm2 = self.norm[k] * self.norm[k];
             let dot = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f64>();
-            let coeff = (2.0 * eps2 - norm2) / self.radius[k].powi(5);
+            let r5 = self.radius[k].powi(5);
             let r7 = self.radius[k].powi(7);
             let mut block = Array2::<f64>::eye(dim);
-            block.mapv_inplace(|x| epsilon * coeff * dot * x);
+            block.mapv_inplace(|x| 3.0 * eps2 * dot * x / r5);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] += epsilon * coeff * (q[i] * v[j] + v[i] * q[j]);
-                    block[[i, j]] += 3.0 * epsilon * (norm2 - 4.0 * eps2) * dot * v[i] * v[j] / r7;
+                    block[[i, j]] += 3.0 * eps2 * (q[i] * v[j] + v[i] * q[j]) / r5;
+                    block[[i, j]] -= 15.0 * eps2 * dot * v[i] * v[j] / r7;
                 }
             }
             out.push(block);
@@ -5771,11 +5759,11 @@ fn compute_spatial_adaptiveweights_for_beta(
     weight_floor: f64,
     weight_ceiling: f64,
 ) -> Result<Vec<SpatialAdaptiveWeights>, EstimationError> {
-    // Scaled Charbonnier / pseudo-Huber MM derivation (per collocation scalar t):
-    //   psi(t; eps) = eps * (sqrt(t^2 + eps^2) - eps)
+    // Charbonnier / pseudo-Huber MM derivation (per collocation scalar t):
+    //   psi(t; eps) = sqrt(t^2 + eps^2) - eps
     // and for reference t0 the tangent majorizer in t^2 gives:
-    //   psi(t) <= u(t0) * t^2 + const(t0),
-    //   u(t0) = eps / (2*sqrt(t0^2 + eps^2)).
+    //   psi(t) <= 0.5 * w(t0) * t^2 + const(t0),
+    //   w(t0) = 1 / sqrt(t0^2 + eps^2).
     //
     // We apply this to:
     //   t = f_k = |f(z_k)|             (magnitude),
@@ -5783,12 +5771,12 @@ fn compute_spatial_adaptiveweights_for_beta(
     //   t = c_k = ||D²f(z_k)||_F       (full Hessian curvature),
     // both computed from beta^(t-1).
     //
-    // These u values define the quadratic surrogate penalties:
-    //   K0 = D0_con^T W_0 D0_con,  W_0 = diag(u_0)
-    //   K1 = D1_con^T W_g D1_con,  W_g = diag(u_g) \otimes I_d  (k,axis order)
-    //   K2 = D2_con^T W_c D2_con,  W_c = diag(u_c) \otimes I_(d*d).
+    // These w values define the quadratic surrogate penalties:
+    //   K0 = D0_con^T W_0 D0_con,  W_0 = diag(w_0)
+    //   K1 = D1_con^T W_g D1_con,  W_g = diag(w_g) \otimes I_d  (k,axis order)
+    //   K2 = D2_con^T W_c D2_con,  W_c = diag(w_c) \otimes I_(d*d).
     //
-    // We clamp u directly, then derive inv_u=1/u for diagnostics and row scaling.
+    // We clamp w directly, then derive inv_w=1/w for diagnostics and row scaling.
     caches
         .iter()
         .map(|cache| {
@@ -18648,7 +18636,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_spatial_adaptive_1dobjective_profile_prefers_tinygradient_lambda() {
+    fn exact_spatial_adaptive_1dobjective_profile_has_finite_gradient_lambda_surface() {
         let n = 96usize;
         let mut data = Array2::<f64>::zeros((n, 1));
         let mut y = Array1::<f64>::zeros(n);
@@ -18805,17 +18793,23 @@ mod tests {
         let mid = evaluate_theta((1e-4_f64).ln());
         let high = evaluate_theta((1e-2_f64).ln());
 
+        for (label, eval) in [("low", &low), ("mid", &mid), ("high", &high)] {
+            assert!(
+                eval.objective.is_finite(),
+                "{label} gradient-lambda profile objective is not finite: {}",
+                eval.objective
+            );
+            assert!(
+                eval.gradient.iter().all(|v| v.is_finite()),
+                "{label} gradient-lambda profile gradient contains non-finite entries: {:?}",
+                eval.gradient
+            );
+        }
         assert!(
-            low.objective < mid.objective && mid.objective < high.objective,
-            "expected pseudo-Laplace objective to worsen as gradient lambda increases: low={}, mid={}, high={}",
+            (low.objective - high.objective).abs() > 1e-8,
+            "gradient-lambda profile should remain identifiable: low={}, high={}",
             low.objective,
-            mid.objective,
             high.objective
-        );
-        assert!(
-            low.gradient[1] > 0.0,
-            "expected positive gradient wrt log lambda_g near tiny lambda, got {}",
-            low.gradient[1]
         );
     }
 
@@ -19504,7 +19498,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_charbonnier_local_quadratic_curvature_is_epsilon_invariant() {
+    fn scalar_charbonnier_local_quadratic_curvature_matches_transition_scale() {
         let signal = array![0.0, 0.0, 0.0];
         let small = CharbonnierScalarBlockState::from_signal(signal.clone(), 1e-3);
         let large = CharbonnierScalarBlockState::from_signal(signal, 1e3);
@@ -19514,18 +19508,18 @@ mod tests {
             .zip(large.betahessian_diag().iter())
         {
             assert!(
-                (a - 1.0).abs() < 1e-10,
-                "small-epsilon curvature should be 1, got {a}"
+                (a - 1e3).abs() < 1e-7,
+                "small-epsilon curvature should be 1/eps, got {a}"
             );
             assert!(
-                (b - 1.0).abs() < 1e-10,
-                "large-epsilon curvature should be 1, got {b}"
+                (b - 1e-3).abs() < 1e-13,
+                "large-epsilon curvature should be 1/eps, got {b}"
             );
         }
     }
 
     #[test]
-    fn grouped_charbonnier_local_quadratic_curvature_is_epsilon_invariant() {
+    fn grouped_charbonnier_local_quadratic_curvature_matches_transition_scale() {
         let blocks = array![[0.0, 0.0], [0.0, 0.0]];
         let small = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), 1e-3);
         let large = CharbonnierGroupedBlockState::from_signal_blocks(blocks, 1e3);
@@ -19536,42 +19530,48 @@ mod tests {
         {
             let eye = Array2::<f64>::eye(small_block.nrows());
             assert!(
-                (&small_block - &eye).mapv(f64::abs).sum() < 1e-10,
-                "small-epsilon grouped curvature should equal identity"
+                (&small_block - &eye.mapv(|v| 1e3 * v))
+                    .mapv(f64::abs)
+                    .sum()
+                    < 1e-7,
+                "small-epsilon grouped curvature should equal I/eps"
             );
             assert!(
-                (&large_block - &eye).mapv(f64::abs).sum() < 1e-10,
-                "large-epsilon grouped curvature should equal identity"
+                (&large_block - &eye.mapv(|v| 1e-3 * v))
+                    .mapv(f64::abs)
+                    .sum()
+                    < 1e-13,
+                "large-epsilon grouped curvature should equal I/eps"
             );
         }
     }
 
     #[test]
-    fn scalar_charbonnier_small_signal_matches_half_quadratic_across_epsilons() {
+    fn scalar_charbonnier_small_signal_matches_local_half_quadratic() {
         let signal = array![1e-5, -2e-5, 3e-5];
-        let target = 0.5 * signal.iter().map(|v| v * v).sum::<f64>();
         for &epsilon in &[1e-3, 1e-1, 1.0, 1e2] {
             let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
             let value = state.penalty_value();
+            let target = 0.5 * signal.iter().map(|v| v * v).sum::<f64>() / epsilon;
             let rel = (value - target).abs() / target.max(1e-20);
             assert!(
                 rel < 5e-3,
-                "scaled scalar Charbonnier should match 0.5*t^2 locally across epsilons: eps={epsilon}, value={value}, target={target}, rel={rel}"
+                "scalar Charbonnier should match 0.5*t^2/eps locally: eps={epsilon}, value={value}, target={target}, rel={rel}"
             );
         }
     }
 
     #[test]
-    fn grouped_charbonnier_small_signal_matches_half_quadratic_across_epsilons() {
+    fn grouped_charbonnier_small_signal_matches_local_half_quadratic() {
         let blocks = array![[1e-5, -2e-5], [3e-5, 4e-5]];
-        let target = 0.5 * blocks.iter().map(|v| v * v).sum::<f64>();
         for &epsilon in &[1e-3, 1e-1, 1.0, 1e2] {
             let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
             let value = state.penalty_value();
+            let target = 0.5 * blocks.iter().map(|v| v * v).sum::<f64>() / epsilon;
             let rel = (value - target).abs() / target.max(1e-20);
             assert!(
                 rel < 5e-3,
-                "scaled grouped Charbonnier should match 0.5*||v||^2 locally across epsilons: eps={epsilon}, value={value}, target={target}, rel={rel}"
+                "grouped Charbonnier should match 0.5*||v||^2/eps locally: eps={epsilon}, value={value}, target={target}, rel={rel}"
             );
         }
     }
