@@ -32,8 +32,7 @@ use crate::families::custom_family::{
     ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -3487,7 +3486,8 @@ impl KroneckerDesign {
 
         let r_t = response_grid.t();
         let n_chunks = n.div_ceil(CHUNK_ROWS);
-        let (active_pairs, min_inactive, alpha_full): (Vec<(usize, usize)>, f64, f64) = (0..n_chunks)
+        let (active_pairs, min_inactive, alpha_full): (Vec<(usize, usize)>, f64, f64) = (0
+            ..n_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * CHUNK_ROWS;
