@@ -6943,14 +6943,31 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         let ranges_vec: Vec<(usize, usize)> = ranges.to_vec();
         let s_lambdas_owned: Vec<Array2<f64>> = s_lambdas.clone();
         let apply_h = Arc::clone(&apply);
+        // Track consecutive matvec failures within this SLQ invocation. A single
+        // transient failure is absorbed (fall back to zeros so SLQ may still
+        // produce a usable estimate); but `JOINT_MATVEC_FAILURE_ESCALATE` in a
+        // row at the same rho indicates a structurally broken matvec — surface
+        // NaN so SLQ Lanczos non-finite guards trip and the surrounding
+        // `.map_err` propagates a hard error to the outer instead of looping
+        // forever on a flat objective (see icu_survival_los).
+        let consecutive_failures = Arc::new(AtomicUsize::new(0));
+        let consecutive_failures_for_op = Arc::clone(&consecutive_failures);
         let apply_op = move |v: &Array1<f64>| -> Array1<f64> {
             let mut out = match apply_h(v) {
-                Ok(out) => out,
+                Ok(out) => {
+                    consecutive_failures_for_op.store(0, Ordering::Relaxed);
+                    out
+                }
                 Err(error) => {
+                    let prev = consecutive_failures_for_op.fetch_add(1, Ordering::Relaxed);
                     log::warn!(
                         "joint exact-newton operator matvec failed during SLQ logdet: {error}"
                     );
-                    Array1::<f64>::zeros(total)
+                    if prev + 1 >= JOINT_MATVEC_FAILURE_ESCALATE {
+                        Array1::<f64>::from_elem(total, f64::NAN)
+                    } else {
+                        Array1::<f64>::zeros(total)
+                    }
                 }
             };
             let penalty = apply_joint_block_penalty(&ranges_vec, &s_lambdas_owned, v, ridge_floor);

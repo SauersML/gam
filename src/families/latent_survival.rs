@@ -40,23 +40,6 @@ use std::sync::Arc;
 
 const MIN_WEIGHT: f64 = 1e-12;
 
-fn design_to_dense_by_chunks(design: &DesignMatrix, context: &str) -> Result<Array2<f64>, String> {
-    let n = design.nrows();
-    let p = design.ncols();
-    let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * std::mem::size_of::<f64>()))
-        .max(1)
-        .min(n.max(1));
-    let mut out = Array2::<f64>::zeros((n, p));
-    for start in (0..n).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n);
-        let chunk = design
-            .try_row_chunk(start..end)
-            .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
-        out.slice_mut(s![start..end, ..]).assign(&chunk);
-    }
-    Ok(out)
-}
-
 #[derive(Clone)]
 pub struct LatentSurvivalTermSpec {
     pub age_entry: Array1<f64>,
@@ -726,14 +709,15 @@ fn prepare_latent_time_block(
                 .to_string(),
         );
     }
-    let design_entry =
-        design_to_dense_by_chunks(&input.design_entry, "latent survival entry time design")?;
-    let design_exit =
-        design_to_dense_by_chunks(&input.design_exit, "latent survival exit time design")?;
-    let design_derivative_exit = design_to_dense_by_chunks(
-        &input.design_derivative_exit,
-        "latent survival derivative time design",
-    )?;
+    let design_entry = input
+        .design_entry
+        .try_to_dense_by_chunks("latent survival entry time design")?;
+    let design_exit = input
+        .design_exit
+        .try_to_dense_by_chunks("latent survival exit time design")?;
+    let design_derivative_exit = input
+        .design_derivative_exit
+        .try_to_dense_by_chunks("latent survival derivative time design")?;
     let linear_constraints = structural_time_coefficient_constraints(
         &design_derivative_exit,
         &input.derivative_offset_exit,

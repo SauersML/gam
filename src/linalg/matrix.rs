@@ -24,6 +24,7 @@ const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
+const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 /// Minimum n*p product for the dense-row parallel fold/reduce paths
@@ -5180,6 +5181,24 @@ impl DesignMatrix {
                 Ok(out)
             }
         }
+    }
+
+    pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
+        let n = self.nrows();
+        let p = self.ncols();
+        let chunk_rows =
+            (CHUNKED_DENSE_MATERIALIZATION_BYTES / (p.max(1) * std::mem::size_of::<f64>()))
+                .max(1)
+                .min(n.max(1));
+        let mut out = Array2::<f64>::zeros((n, p));
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let chunk = self
+                .try_row_chunk(start..end)
+                .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
+            out.slice_mut(s![start..end, ..]).assign(&chunk);
+        }
+        Ok(out)
     }
 
     /// Dot a single design row against a coefficient vector without allocating

@@ -120,23 +120,6 @@ mod report;
 
 type CliResult<T> = Result<T, CliError>;
 
-fn design_to_dense_by_chunks(design: &DesignMatrix, context: &str) -> Result<Array2<f64>, String> {
-    let n = design.nrows();
-    let p = design.ncols();
-    let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * std::mem::size_of::<f64>()))
-        .max(1)
-        .min(n.max(1));
-    let mut out = Array2::<f64>::zeros((n, p));
-    for start in (0..n).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n);
-        let chunk = design
-            .try_row_chunk(start..end)
-            .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
-        out.slice_mut(s![start..end, ..]).assign(&chunk);
-    }
-    Ok(out)
-}
-
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{message}")]
@@ -2588,14 +2571,12 @@ fn run_predict_saved_latent_window_impl(
                 state.fit.beta.len()
             ));
         }
-        let x_time_entry = design_to_dense_by_chunks(
-            &prepared.time_design_entry,
-            "latent survival entry time covariance design",
-        )?;
-        let x_time_exit = design_to_dense_by_chunks(
-            &prepared.time_design_exit,
-            "latent survival exit time covariance design",
-        )?;
+        let x_time_entry = prepared
+            .time_design_entry
+            .try_to_dense_by_chunks("latent survival entry time covariance design")?;
+        let x_time_exit = prepared
+            .time_design_exit
+            .try_to_dense_by_chunks("latent survival exit time covariance design")?;
         Some(saved_latent_window_local_covariances(
             cov_design,
             &x_time_entry,
@@ -2975,10 +2956,9 @@ fn run_predict_survival(
             &model.survival_noise_scale,
             model.survival_noise_non_intercept_start,
         )?;
-        let x_time_exit_dense = design_to_dense_by_chunks(
-            &time_build.x_exit_time,
-            "survival location-scale prediction time-exit design",
-        )?;
+        let x_time_exit_dense = time_build
+            .x_exit_time
+            .try_to_dense_by_chunks("survival location-scale prediction time-exit design")?;
         let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
             let mut full =
                 Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
@@ -3236,10 +3216,9 @@ fn run_predict_survival(
         .map(|(_, exit, _)| exit.ncols())
         .unwrap_or(0);
     let p = p_time + p_timewiggle + p_cov;
-    let x_exit_time_dense = design_to_dense_by_chunks(
-        &time_build.x_exit_time,
-        "survival prediction time-exit design",
-    )?;
+    let x_exit_time_dense = time_build
+        .x_exit_time
+        .try_to_dense_by_chunks("survival prediction time-exit design")?;
     let mut x_exit = Array2::<f64>::zeros((n, p));
     if p_time > 0 {
         x_exit
