@@ -881,7 +881,7 @@ use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
     LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, effectivelinkwiggle_formulaspec,
     parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
-    validate_marginal_slope_z_column_exclusion,
+    require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
 use crate::term_builder::{build_termspec, enable_scale_dimensions};
 
