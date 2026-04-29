@@ -21,6 +21,7 @@ use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
 };
+use gam::inference::predict_input::build_predict_input_for_model;
 use gam::matrix::DesignMatrix;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{
@@ -509,19 +510,19 @@ fn predict_table_impl(
     if matches!(model_class, PredictModelClass::Survival) {
         return predict_table_survival(&model, &dataset, &options);
     }
-    let predict_input = match model_class {
-        PredictModelClass::Standard => build_standard_predict_input(&model, &dataset)?,
-        PredictModelClass::BernoulliMarginalSlope => {
-            build_bernoulli_marginal_slope_predict_input(&model, &dataset)?
-        }
-        PredictModelClass::TransformationNormal => {
-            build_transformation_normal_predict_input(&model, &dataset)?
-        }
-        PredictModelClass::Survival => unreachable!("survival handled above"),
-        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
-            build_location_scale_predict_input(&model, &dataset)?
-        }
-    };
+    let col_map = build_col_map(&dataset);
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    let predict_input = build_predict_input_for_model(
+        &model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &offset,
+        &offset_noise,
+        false,
+    )?;
     let predictor = model
         .predictor()
         .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
