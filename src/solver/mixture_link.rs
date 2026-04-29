@@ -837,6 +837,81 @@ pub fn inverse_link_jet_for_inverse_link(
     link.jet(eta)
 }
 
+#[derive(Clone, Copy)]
+enum PdfDerivativeOrder {
+    Third,
+    Fourth,
+}
+
+impl PdfDerivativeOrder {
+    fn probit(self, eta: f64) -> f64 {
+        match self {
+            Self::Third => probit_pdfthird_derivative(eta),
+            Self::Fourth => probit_pdffourth_derivative(eta),
+        }
+    }
+
+    fn component(self, component: LinkComponent, eta: f64) -> f64 {
+        match self {
+            Self::Third => component_inverse_link_pdfthird_derivative(component, eta),
+            Self::Fourth => component_inverse_link_pdffourth_derivative(component, eta),
+        }
+    }
+
+    fn latent_cloglog(self, eta: f64, latent_sd: f64) -> Result<f64, EstimationError> {
+        let jet = latent_cloglog_jet5(latent_cloglog_quadctx(), eta, latent_sd)?;
+        Ok(match self {
+            Self::Third => jet.d4,
+            Self::Fourth => jet.d5,
+        })
+    }
+
+    fn sas(self, eta: f64, epsilon: f64, log_delta: f64) -> f64 {
+        match self {
+            Self::Third => sas_inverse_link_pdfthird_derivative(eta, epsilon, log_delta),
+            Self::Fourth => sas_inverse_link_pdffourth_derivative(eta, epsilon, log_delta),
+        }
+    }
+
+    fn beta_logistic(self, eta: f64, delta: f64, epsilon: f64) -> f64 {
+        match self {
+            Self::Third => beta_logistic_inverse_link_pdfthird_derivative(eta, delta, epsilon),
+            Self::Fourth => beta_logistic_inverse_link_pdffourth_derivative(eta, delta, epsilon),
+        }
+    }
+}
+
+fn inverse_link_pdf_derivative_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+    order: PdfDerivativeOrder,
+) -> Result<f64, EstimationError> {
+    match link {
+        InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
+        InverseLink::Standard(LinkFunction::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
+        InverseLink::Standard(LinkFunction::Probit) => Ok(order.probit(eta)),
+        InverseLink::Standard(LinkFunction::Logit) => {
+            Ok(order.component(LinkComponent::Logit, eta))
+        }
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            Ok(order.component(LinkComponent::CLogLog, eta))
+        }
+        InverseLink::LatentCLogLog(state) => order.latent_cloglog(eta, state.latent_sd),
+        InverseLink::Standard(LinkFunction::Sas) => Ok(order.sas(eta, 0.0, 0.0)),
+        InverseLink::Sas(state) => Ok(order.sas(eta, state.epsilon, state.log_delta)),
+        InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(order.beta_logistic(eta, 0.0, 0.0)),
+        InverseLink::BetaLogistic(state) => {
+            Ok(order.beta_logistic(eta, state.log_delta, state.epsilon))
+        }
+        InverseLink::Mixture(state) => Ok(state
+            .components
+            .iter()
+            .zip(state.pi.iter())
+            .map(|(&component, &weight)| weight * order.component(component, eta))
+            .sum()),
+    }
+}
+
 pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     link: &InverseLink,
     eta: f64,
@@ -856,47 +931,7 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     //   => f''' = sum_j pi_j f_j'''
     //
     // because the mixture weights `pi_j` are constant with respect to `eta`.
-    match link {
-        InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
-        InverseLink::Standard(LinkFunction::Log) => {
-            // For log link: g⁻¹(η) = exp(η), all derivatives = exp(η).
-            Ok(eta.clamp(-700.0, 700.0).exp())
-        }
-        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdfthird_derivative(eta)),
-        InverseLink::Standard(LinkFunction::Logit) => Ok(
-            component_inverse_link_pdfthird_derivative(LinkComponent::Logit, eta),
-        ),
-        InverseLink::Standard(LinkFunction::CLogLog) => Ok(
-            component_inverse_link_pdfthird_derivative(LinkComponent::CLogLog, eta),
-        ),
-        InverseLink::LatentCLogLog(state) => {
-            Ok(latent_cloglog_jet5(latent_cloglog_quadctx(), eta, state.latent_sd)?.d4)
-        }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            Ok(sas_inverse_link_pdfthird_derivative(eta, 0.0, 0.0))
-        }
-        InverseLink::Sas(state) => Ok(sas_inverse_link_pdfthird_derivative(
-            eta,
-            state.epsilon,
-            state.log_delta,
-        )),
-        InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(
-            beta_logistic_inverse_link_pdfthird_derivative(eta, 0.0, 0.0),
-        ),
-        InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_pdfthird_derivative(
-            eta,
-            state.log_delta,
-            state.epsilon,
-        )),
-        InverseLink::Mixture(state) => Ok(state
-            .components
-            .iter()
-            .zip(state.pi.iter())
-            .map(|(&component, &weight)| {
-                weight * component_inverse_link_pdfthird_derivative(component, eta)
-            })
-            .sum()),
-    }
+    inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Third)
 }
 
 /// Fifth derivative of the inverse-link CDF (= fourth derivative of the PDF).
@@ -908,44 +943,7 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
     link: &InverseLink,
     eta: f64,
 ) -> Result<f64, EstimationError> {
-    match link {
-        InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
-        InverseLink::Standard(LinkFunction::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
-        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdffourth_derivative(eta)),
-        InverseLink::Standard(LinkFunction::Logit) => Ok(
-            component_inverse_link_pdffourth_derivative(LinkComponent::Logit, eta),
-        ),
-        InverseLink::Standard(LinkFunction::CLogLog) => Ok(
-            component_inverse_link_pdffourth_derivative(LinkComponent::CLogLog, eta),
-        ),
-        InverseLink::LatentCLogLog(state) => {
-            Ok(latent_cloglog_jet5(latent_cloglog_quadctx(), eta, state.latent_sd)?.d5)
-        }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            Ok(sas_inverse_link_pdffourth_derivative(eta, 0.0, 0.0))
-        }
-        InverseLink::Sas(state) => Ok(sas_inverse_link_pdffourth_derivative(
-            eta,
-            state.epsilon,
-            state.log_delta,
-        )),
-        InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(
-            beta_logistic_inverse_link_pdffourth_derivative(eta, 0.0, 0.0),
-        ),
-        InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_pdffourth_derivative(
-            eta,
-            state.log_delta,
-            state.epsilon,
-        )),
-        InverseLink::Mixture(state) => Ok(state
-            .components
-            .iter()
-            .zip(state.pi.iter())
-            .map(|(&component, &weight)| {
-                weight * component_inverse_link_pdffourth_derivative(component, eta)
-            })
-            .sum()),
-    }
+    inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Fourth)
 }
 
 pub fn inverse_link_jet_for_link_function(

@@ -2416,19 +2416,31 @@ fn rowwise_kronecker_dense(base: &Array2<f64>, time_basis: &Array2<f64>) -> Arra
     let n = base.nrows();
     let p_base = base.ncols();
     let p_time = time_basis.ncols();
-    let mut out = Array2::<f64>::zeros((n, p_base * p_time));
-    for i in 0..n {
-        for j in 0..p_base {
-            let base_ij = base[[i, j]];
-            if base_ij == 0.0 {
-                continue;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    // Row-wise Khatri-Rao of (base ⊗ time_basis) per observation:
+    // out[i, j*p_time + t] = base[i, j] * time_basis[i, t]. Independent
+    // across rows.
+    let row_data: Vec<f64> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let base_row = base.row(i);
+            let time_row = time_basis.row(i);
+            let mut row_vec = vec![0.0f64; p_base * p_time];
+            for j in 0..p_base {
+                let base_ij = base_row[j];
+                if base_ij == 0.0 {
+                    continue;
+                }
+                let off = j * p_time;
+                for t in 0..p_time {
+                    row_vec[off + t] = base_ij * time_row[t];
+                }
             }
-            for t in 0..p_time {
-                out[[i, j * p_time + t]] = base_ij * time_basis[[i, t]];
-            }
-        }
-    }
-    out
+            row_vec.into_iter()
+        })
+        .collect();
+    Array2::<f64>::from_shape_vec((n, p_base * p_time), row_data)
+        .expect("row Khatri-Rao shape consistent")
 }
 
 fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
