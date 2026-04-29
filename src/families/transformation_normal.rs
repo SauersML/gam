@@ -5197,16 +5197,29 @@ mod tests {
     fn ctn_inner_hvp_does_not_advertise_outer_hyper_hessian() {
         let psi = array![0.15, -0.10];
         let (family, _, _, spec) = toy_family_and_derivatives(&psi);
+        let specs = std::slice::from_ref(&spec);
 
-        assert!(family.inner_coefficient_hessian_hvp_available(std::slice::from_ref(&spec)));
-        assert!(!family.outer_hyper_hessian_hvp_available(std::slice::from_ref(&spec)));
-        assert!(!family.outer_hyper_hessian_dense_available(std::slice::from_ref(&spec)));
+        assert!(family.inner_coefficient_hessian_hvp_available(specs));
+        assert!(!family.outer_hyper_hessian_hvp_available(specs));
+        assert!(!family.outer_hyper_hessian_dense_available(specs));
         assert_eq!(
-            family.exact_outer_derivative_order(
-                std::slice::from_ref(&spec),
-                &BlockwiseFitOptions::default()
-            ),
+            family.exact_outer_derivative_order(specs, &BlockwiseFitOptions::default()),
             crate::custom_family::ExactOuterDerivativeOrder::First
+        );
+
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::Derivative::Unavailable
         );
     }
 
