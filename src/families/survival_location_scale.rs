@@ -4211,7 +4211,7 @@ fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
     Ok(lower_bounds)
 }
 
-pub(crate) fn project_onto_linear_constraints(
+pub fn project_onto_linear_constraints(
     dim: usize,
     constraints: &LinearInequalityConstraints,
     beta0: Option<&Array1<f64>>,

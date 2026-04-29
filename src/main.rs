@@ -76,17 +76,19 @@ use gam::survival_construction::{
     build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    marginal_slope_baseline_chain_rule_gradient, normalize_survival_time_pair,
-    optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
-    parse_survival_baseline_config, parse_survival_distribution, parse_survival_likelihood_mode,
-    parse_survival_time_basis_config, require_structural_survival_time_basis,
+    initial_survival_baseline_config_for_fit, marginal_slope_baseline_chain_rule_gradient,
+    normalize_survival_time_pair, optimize_survival_baseline_config,
+    optimize_survival_baseline_config_with_gradient, parse_survival_baseline_config,
+    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    positive_survival_time_seed, require_structural_survival_time_basis,
     resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
     survival_baseline_targetname, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
     SurvivalLocationScalePredictInput, SurvivalLocationScaleTermSpec, TimeBlockInput,
-    TimeWiggleBlockInput, predict_survival_location_scale, residual_distribution_inverse_link,
+    TimeWiggleBlockInput, predict_survival_location_scale, project_onto_linear_constraints,
+    residual_distribution_inverse_link,
 };
 use gam::survival_marginal_slope::{
     DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
@@ -3469,47 +3471,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn build_survival_feasible_initial_beta(
-    dim: usize,
-    constraints: Option<&gam::pirls::LinearInequalityConstraints>,
-) -> Array1<f64> {
-    let Some(constraints) = constraints else {
-        return Array1::zeros(dim);
-    };
-    if constraints.a.ncols() != dim || constraints.a.nrows() == 0 {
-        return Array1::zeros(dim);
-    }
-
-    // Dykstra projection of 0 onto the feasible intersection A * beta >= b.
-    let mut beta = Array1::<f64>::zeros(dim);
-    let mut corrections = Array2::<f64>::zeros((constraints.a.nrows(), dim));
-    for _ in 0..100 {
-        let mut max_violation = 0.0_f64;
-        for i in 0..constraints.a.nrows() {
-            let row = constraints.a.row(i);
-            let row_norm_sq = row.dot(&row);
-            if row_norm_sq <= 1e-18 {
-                continue;
-            }
-            let y = &beta + &corrections.row(i);
-            let slack = row.dot(&y) - constraints.b[i];
-            max_violation = max_violation.max((-slack).max(0.0));
-            if slack >= 0.0 {
-                corrections.row_mut(i).assign(&(&y - &beta));
-                continue;
-            }
-            let step = (constraints.b[i] - row.dot(&y)) / row_norm_sq;
-            let projected = &y + &(row.to_owned() * step);
-            corrections.row_mut(i).assign(&(&y - &projected));
-            beta.assign(&projected);
-        }
-        if max_violation <= 1e-10 {
-            break;
-        }
-    }
-    beta
-}
-
 fn add_survival_time_derivative_guard_offset(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
@@ -3554,81 +3515,6 @@ struct PreparedSurvivalTimeStack {
     timewiggle_block: Option<TimeWiggleBlockInput>,
 }
 
-fn parse_survival_baseline_target_for_fit(raw: &str) -> Result<SurvivalBaselineTarget, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "linear" => Ok(SurvivalBaselineTarget::Linear),
-        "weibull" => Ok(SurvivalBaselineTarget::Weibull),
-        "gompertz" => Ok(SurvivalBaselineTarget::Gompertz),
-        "gompertz-makeham" => Ok(SurvivalBaselineTarget::GompertzMakeham),
-        other => Err(format!(
-            "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
-        )),
-    }
-}
-
-fn positive_survival_time_seed(age_exit: &Array1<f64>) -> f64 {
-    let sum = age_exit
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .sum::<f64>();
-    let count = age_exit
-        .iter()
-        .filter(|v| v.is_finite() && **v > 0.0)
-        .count()
-        .max(1);
-    (sum / count as f64).max(gam::survival_construction::SURVIVAL_TIME_FLOOR)
-}
-
-fn initial_survival_baseline_config_for_fit(
-    target_raw: &str,
-    scale: Option<f64>,
-    shape: Option<f64>,
-    rate: Option<f64>,
-    makeham: Option<f64>,
-    age_exit: &Array1<f64>,
-) -> Result<SurvivalBaselineConfig, String> {
-    let target = parse_survival_baseline_target_for_fit(target_raw)?;
-    let time_scale_seed = positive_survival_time_seed(age_exit);
-    let cfg = match target {
-        SurvivalBaselineTarget::Linear => SurvivalBaselineConfig {
-            target,
-            scale: None,
-            shape: None,
-            rate: None,
-            makeham: None,
-        },
-        SurvivalBaselineTarget::Weibull => SurvivalBaselineConfig {
-            target,
-            scale: Some(scale.unwrap_or(time_scale_seed)),
-            shape: Some(shape.unwrap_or(1.0)),
-            rate: None,
-            makeham: None,
-        },
-        SurvivalBaselineTarget::Gompertz => SurvivalBaselineConfig {
-            target,
-            scale: None,
-            shape: Some(shape.unwrap_or(0.01)),
-            rate: Some(rate.unwrap_or(1.0 / time_scale_seed)),
-            makeham: None,
-        },
-        SurvivalBaselineTarget::GompertzMakeham => SurvivalBaselineConfig {
-            target,
-            scale: None,
-            shape: Some(shape.unwrap_or(0.01)),
-            rate: Some(rate.unwrap_or(0.5 / time_scale_seed)),
-            makeham: Some(makeham.unwrap_or(0.5 / time_scale_seed)),
-        },
-    };
-    parse_survival_baseline_config(
-        survival_baseline_targetname(cfg.target),
-        cfg.scale,
-        cfg.shape,
-        cfg.rate,
-        cfg.makeham,
-    )
-}
-
 fn survival_working_reml_score(state: &gam::pirls::WorkingState) -> f64 {
     0.5 * (state.deviance + state.penalty_term)
 }
@@ -3660,9 +3546,11 @@ fn build_survival_time_initial_beta(
     } else {
         None
     };
-    build_survival_feasible_initial_beta(
-        prepared.time_design_exit.ncols(),
-        time_initial_constraints.as_ref(),
+    time_initial_constraints.as_ref().map_or_else(
+        || Array1::zeros(prepared.time_design_exit.ncols()),
+        |constraints| {
+            project_onto_linear_constraints(prepared.time_design_exit.ncols(), constraints, None)
+        },
     )
 }
 
@@ -9260,8 +9148,7 @@ mod tests {
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
         LinkMode, MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-        build_survival_feasible_initial_beta, build_survival_time_basis,
-        chi_square_survival_approx, classify_cli_error,
+        build_survival_time_basis, chi_square_survival_approx, classify_cli_error,
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
@@ -15045,7 +14932,7 @@ mod tests {
             b: Array1::from_vec(vec![0.25, 0.5, 0.75]),
         };
 
-        let beta0 = build_survival_feasible_initial_beta(3, Some(&constraints));
+        let beta0 = project_onto_linear_constraints(3, &constraints, None);
 
         assert!(beta0.iter().all(|v| v.is_finite()));
         for i in 0..constraints.a.nrows() {
@@ -15061,7 +14948,7 @@ mod tests {
             b: Array1::from_vec(vec![-0.5, 0.4]),
         };
 
-        let beta0 = build_survival_feasible_initial_beta(2, Some(&constraints));
+        let beta0 = project_onto_linear_constraints(2, &constraints, None);
 
         assert!(beta0.iter().all(|v| v.is_finite()));
         assert!(constraints.a.row(0).dot(&beta0) - constraints.b[0] >= -1e-9);
