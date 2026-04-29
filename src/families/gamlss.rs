@@ -4482,9 +4482,8 @@ fn binomial_location_scalesecond_directional_coefficients(
             let du = -r * a - q * b;
             let dv = -r * c - q * d;
             let d2 = r * (a * d + b * c) + q * b * d;
-            let tt = r
-                * r
-                * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
+            let tt =
+                r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
             let tl = s
                 * r
                 * (q * m4 * du * dv

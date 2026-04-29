@@ -3014,13 +3014,8 @@ pub fn logit_posterior_mean_batch(
     let values: Result<Vec<f64>, EstimationError> = (0..n)
         .into_par_iter()
         .map(|i| {
-            integrated_inverse_link_mean_and_derivative(
-                ctx,
-                LinkFunction::Logit,
-                eta[i],
-                se_eta[i],
-            )
-            .map(|integrated| integrated.mean)
+            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i])
+                .map(|integrated| integrated.mean)
         })
         .collect();
     Ok(ndarray::Array1::from_vec(values?))
