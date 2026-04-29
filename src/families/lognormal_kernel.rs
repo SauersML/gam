@@ -12,6 +12,7 @@
 //! log-space kernel bundles and treats non-positive signed sums as invalid rows.
 
 use crate::estimate::EstimationError;
+use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
     latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_unit_term_shared,
@@ -355,25 +356,6 @@ pub fn kernel_ratio_jet(
     jet
 }
 
-/// Computes `log(1 − exp(−a))` for `a > 0`, numerically stable.
-///
-/// Uses `ln_1p(−exp(−a))` for large `a` (avoids catastrophic cancellation)
-/// and `ln(−expm1(−a))` for small `a` (avoids loss of significance).
-#[inline]
-fn log1mexp(a: f64) -> f64 {
-    assert!(a >= 0.0);
-    if a > core::f64::consts::LN_2 {
-        // exp(-a) < 0.5, so 1 - exp(-a) > 0.5: safe for ln_1p.
-        (-(-a).exp()).ln_1p()
-    } else if a > 0.0 {
-        // exp(-a) close to 1: use expm1 for precision.
-        // expm1(-a) = exp(-a) - 1, negate to get 1 - exp(-a).
-        (-(-a).exp_m1()).ln()
-    } else {
-        f64::NEG_INFINITY
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct LatentCLogLogJet5 {
     pub mean: f64,
@@ -690,71 +672,6 @@ impl LogKernelSumJet {
                 - 6.0 * wr1.powi(4),
             mode: overall_mode,
         })
-    }
-}
-
-/// Sign-aware log-sum-exp: computes `log|Σ s_j exp(l_j)|` and the sign.
-///
-/// Separates positive and negative contributions, applies log-sum-exp within
-/// each group, then uses [`log1mexp`] for the group difference.
-fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
-    // Separate into positive and negative buckets.
-    let mut pos_max = f64::NEG_INFINITY;
-    let mut neg_max = f64::NEG_INFINITY;
-    for (i, &lm) in log_mags.iter().enumerate() {
-        if signs[i] > 0.0 {
-            pos_max = pos_max.max(lm);
-        } else if signs[i] < 0.0 {
-            neg_max = neg_max.max(lm);
-        }
-    }
-
-    // Accumulate exp(l − max) within each bucket.
-    let mut pos_sum = 0.0f64;
-    let mut neg_sum = 0.0f64;
-    for (i, &lm) in log_mags.iter().enumerate() {
-        if !lm.is_finite() {
-            continue;
-        }
-        if signs[i] > 0.0 {
-            pos_sum += (lm - pos_max).exp();
-        } else if signs[i] < 0.0 {
-            neg_sum += (lm - neg_max).exp();
-        }
-    }
-
-    let log_pos = if pos_sum > 0.0 {
-        pos_max + pos_sum.ln()
-    } else {
-        f64::NEG_INFINITY
-    };
-    let log_neg = if neg_sum > 0.0 {
-        neg_max + neg_sum.ln()
-    } else {
-        f64::NEG_INFINITY
-    };
-
-    if log_neg == f64::NEG_INFINITY {
-        // All positive (or all zero).
-        return (log_pos, 1.0);
-    }
-    if log_pos == f64::NEG_INFINITY {
-        // All negative.
-        return (log_neg, -1.0);
-    }
-
-    // Both groups present: compute log|pos − neg| and its sign.
-    if log_pos > log_neg {
-        // Positive dominates: log(pos − neg) = log_pos + log(1 − exp(−(log_pos − log_neg)))
-        let gap = log_pos - log_neg;
-        (log_pos + log1mexp(gap), 1.0)
-    } else if log_neg > log_pos {
-        // Negative dominates.
-        let gap = log_neg - log_pos;
-        (log_neg + log1mexp(gap), -1.0)
-    } else {
-        // Exact cancellation.
-        (f64::NEG_INFINITY, 0.0)
     }
 }
 
