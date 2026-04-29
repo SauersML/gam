@@ -2085,26 +2085,71 @@ fn plan_joint_spatial_centers_for_term_blocks(
     Ok(planned_blocks)
 }
 
+fn linear_conditioning_chunk_rows(n: usize, p: usize) -> usize {
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 256;
+    const MAX_ROWS: usize = 65_536;
+    if p == 0 {
+        return n.max(1);
+    }
+    (TARGET_BYTES / (p * 8))
+        .clamp(MIN_ROWS, MAX_ROWS)
+        .min(n.max(1))
+}
+
 impl LinearFitConditioning {
     fn from_columns(design: &TermCollectionDesign, selected_cols: &[usize]) -> Self {
         const SCALE_EPS: f64 = 1e-12;
-        let dense = design.design.as_dense_cow();
+        let n = design.design.nrows();
+        let p = design.design.ncols();
         let mut columns = Vec::with_capacity(selected_cols.len());
-        for &col_idx in selected_cols {
-            let col = dense.column(col_idx);
-            let n = col.len();
-            if n == 0 {
-                continue;
+        if n == 0 || selected_cols.is_empty() {
+            return Self {
+                intercept_idx: design.intercept_range.start,
+                columns,
+            };
+        }
+        let chunk_rows = linear_conditioning_chunk_rows(n, p);
+        // Two-pass mean/variance so operator-backed designs don't need to
+        // materialize the full dense matrix. Pass 1 accumulates per-column
+        // sums; pass 2 accumulates the sum of squared deviations from the
+        // pass-1 mean. This matches the original `Σ (x − mean)² / n` formula
+        // without the catastrophic cancellation of `E[X²] − E[X]²`.
+        let mut sums = vec![0.0_f64; selected_cols.len()];
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let chunk = design
+                .design
+                .try_row_chunk(start..end)
+                .expect("LinearFitConditioning::from_columns row chunk failed");
+            for (k, &col_idx) in selected_cols.iter().enumerate() {
+                let column = chunk.column(col_idx);
+                for &v in column.iter() {
+                    sums[k] += v;
+                }
             }
-            let mean = col.iter().copied().sum::<f64>() / n as f64;
-            let var = col
-                .iter()
-                .map(|&v| {
-                    let d = v - mean;
-                    d * d
-                })
-                .sum::<f64>()
-                / n as f64;
+        }
+        let inv_n = 1.0_f64 / n as f64;
+        let means: Vec<f64> = sums.iter().map(|&s| s * inv_n).collect();
+        let mut sq_devs = vec![0.0_f64; selected_cols.len()];
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let chunk = design
+                .design
+                .try_row_chunk(start..end)
+                .expect("LinearFitConditioning::from_columns row chunk failed");
+            for (k, &col_idx) in selected_cols.iter().enumerate() {
+                let mean_k = means[k];
+                let column = chunk.column(col_idx);
+                for &v in column.iter() {
+                    let d = v - mean_k;
+                    sq_devs[k] += d * d;
+                }
+            }
+        }
+        for (k, &col_idx) in selected_cols.iter().enumerate() {
+            let mean = means[k];
+            let var = sq_devs[k] * inv_n;
             let (mean, scale) = if var.is_finite() && var > SCALE_EPS * SCALE_EPS {
                 (mean, var.sqrt())
             } else {
@@ -8828,7 +8873,7 @@ fn fit_bounded_term_collection_with_design(
         })
         .collect();
     let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
-    let dense_design = design.design.as_dense_cow();
+    let dense_design = design.design.to_dense_cow();
     let fit_design = conditioning.apply_to_design(&dense_design);
     let fit_penalties = conditioning
         .transform_blockwise_penalties_to_internal(&design.penalties, design.design.ncols());
@@ -13985,7 +14030,7 @@ mod tests {
         // Raw TPS width for k=4,d=2 is 4; we drop intercept + matching x0 linear component.
         assert_eq!(design.smooth.total_smooth_cols(), 2);
 
-        let dense = design.design.as_dense_cow();
+        let dense = design.design.to_dense_cow();
         let lin_col = design.linear_ranges[0].1.start;
         let linvalues = dense.column(lin_col).to_owned();
         let smooth_start = 1 + spec.linear_terms.len();
@@ -14567,7 +14612,7 @@ mod tests {
         assert_eq!(design.penalties.len(), 1);
         assert_eq!(design.nullspace_dims, vec![0]);
         let (_, range) = &design.random_effect_ranges[0];
-        let dense = design.design.as_dense_cow();
+        let dense = design.design.to_dense_cow();
         for i in 0..dense.nrows() {
             let row_sum: f64 = dense.slice(s![i, range.clone()]).sum();
             assert!((row_sum - 1.0).abs() < 1e-12);
