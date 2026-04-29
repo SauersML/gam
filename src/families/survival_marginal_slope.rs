@@ -12803,27 +12803,30 @@ fn pooled_survival_baseline(
         return 0.0;
     }
     let objective_grad_hess = |slope: f64| -> Option<(f64, f64, f64)> {
-        let mut obj = 0.0;
-        let mut grad = 0.0;
-        let mut hess = 0.0;
-        for i in 0..n {
-            let (row_obj, row_grad, row_hess) = row_primary_closed_form(
-                q0[i],
-                q1[i],
-                qd1[i],
-                slope,
-                z[i],
-                weights[i],
-                event[i],
-                0.0,
-                probit_scale,
-            )
-            .ok()?;
-            obj += row_obj;
-            grad += row_grad[3];
-            hess += row_hess[3][3];
-        }
-        Some((obj, grad, hess))
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let triples: Option<Vec<(f64, f64, f64)>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let (row_obj, row_grad, row_hess) = row_primary_closed_form(
+                    q0[i],
+                    q1[i],
+                    qd1[i],
+                    slope,
+                    z[i],
+                    weights[i],
+                    event[i],
+                    0.0,
+                    probit_scale,
+                )
+                .ok()?;
+                Some((row_obj, row_grad[3], row_hess[3][3]))
+            })
+            .collect();
+        let triples = triples?;
+        Some(triples.into_iter().fold(
+            (0.0_f64, 0.0_f64, 0.0_f64),
+            |(o, g, h), (oi, gi, hi)| (o + oi, g + gi, h + hi),
+        ))
     };
 
     let Some(state0) = objective_grad_hess(0.0) else {
