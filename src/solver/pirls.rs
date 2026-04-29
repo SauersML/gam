@@ -1555,7 +1555,10 @@ impl<'a> GamWorkingModel<'a> {
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         match design {
-            DesignMatrix::Dense(x) => {
+            // Only the materialized arm can use the streaming-BLAS dense path.
+            // Lazy operator-backed dense designs (TPS/Matern at biobank scale)
+            // cannot be densified; fall through to the operator XᵀWX path.
+            DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
                 let x_dense = x.to_dense_arc();
                 workspace.fill_sqrtweights(weights);
@@ -5737,7 +5740,9 @@ fn solve_penalized_least_squares_implicit(
     // 2. Form X'WX: compute in original coordinates, then rotate by Qs.
     let weights_owned = weights.to_owned();
     let xtwx_orig = match x_original {
-        DesignMatrix::Dense(x_dense) => {
+        // Only materialized dense designs can use the streaming-BLAS path.
+        // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
+        DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
             let p = x_dense.ncols();
             let x_dense = x_dense.to_dense_arc();
             if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
