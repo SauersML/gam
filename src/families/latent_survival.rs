@@ -834,69 +834,7 @@ const LATENT_SURVIVAL_PRIMARY_MU: usize = 3;
 const LATENT_SURVIVAL_PRIMARY_LOG_SIGMA: usize = 4;
 const LATENT_SURVIVAL_PRIMARY_DIM: usize = 5;
 
-use crate::families::jet_partitions::partitions as latent_jet_subset_partitions;
-
-#[derive(Clone)]
-struct LatentMultiDirJet {
-    coeffs: Vec<f64>,
-}
-
-impl LatentMultiDirJet {
-    fn zero(n_dirs: usize) -> Self {
-        Self {
-            coeffs: vec![0.0; 1usize << n_dirs],
-        }
-    }
-
-    fn constant(n_dirs: usize, value: f64) -> Self {
-        let mut out = Self::zero(n_dirs);
-        out.coeffs[0] = value;
-        out
-    }
-
-    fn coeff(&self, mask: usize) -> f64 {
-        self.coeffs[mask]
-    }
-
-    fn add(&self, other: &Self) -> Self {
-        Self {
-            coeffs: self
-                .coeffs
-                .iter()
-                .zip(other.coeffs.iter())
-                .map(|(l, r)| l + r)
-                .collect(),
-        }
-    }
-
-    fn scale(&self, scalar: f64) -> Self {
-        Self {
-            coeffs: self.coeffs.iter().map(|v| scalar * v).collect(),
-        }
-    }
-
-    fn compose_unary(&self, derivs: [f64; 5]) -> Self {
-        let count = self.coeffs.len();
-        let mut out = vec![0.0; count];
-        out[0] = derivs[0];
-        for (mask, value) in out.iter_mut().enumerate().skip(1) {
-            let mut total = 0.0;
-            for partition in latent_jet_subset_partitions(mask) {
-                let order = partition.len();
-                if order == 0 || order >= derivs.len() {
-                    continue;
-                }
-                let mut prod = 1.0;
-                for &block in partition {
-                    prod *= self.coeffs[block];
-                }
-                total += derivs[order] * prod;
-            }
-            *value = total;
-        }
-        Self { coeffs: out }
-    }
-}
+use crate::families::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
 #[inline]
 fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
