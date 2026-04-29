@@ -29,6 +29,7 @@ use crate::families::sigma_link::{
     logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
+use crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle;
 use crate::linalg::utils::solve_spd_pcg_with_info;
 use crate::matrix::SymmetricMatrix;
 use crate::matrix::{DenseDesignOperator, DesignMatrix};
@@ -913,15 +914,6 @@ fn validate_binomial_location_scale_termspec(
     Ok(())
 }
 
-fn inverse_link_supports_joint_wiggle(link_kind: &InverseLink) -> bool {
-    matches!(
-        link_kind,
-        InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
-    )
-}
-
 fn validate_binomial_location_scalewiggle_termspec(
     data: ndarray::ArrayView2<'_, f64>,
     spec: &BinomialLocationScaleWiggleTermSpec,
@@ -933,11 +925,7 @@ fn validate_binomial_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    if !inverse_link_supports_joint_wiggle(&spec.link_kind) {
-        return Err(format!(
-            "{context}: link wiggle does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-        ));
-    }
+    require_binomial_inverse_link_supports_joint_wiggle(&spec.link_kind, context)?;
     if spec.wiggle_degree < 2 {
         return Err(format!(
             "{context}: wiggle_degree must be >= 2, got {}",
@@ -1705,12 +1693,10 @@ fn fit_binomial_mean_wiggle(
     ) {
         return Err("fit_binomial_mean_wiggle does not support identity link".to_string());
     }
-    if !inverse_link_supports_joint_wiggle(&spec.link_kind) {
-        return Err(
-            "fit_binomial_mean_wiggle does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-                .to_string(),
-        );
-    }
+    require_binomial_inverse_link_supports_joint_wiggle(
+        &spec.link_kind,
+        "fit_binomial_mean_wiggle",
+    )?;
     if spec.wiggle_degree < 2 {
         return Err(format!(
             "fit_binomial_mean_wiggle: wiggle_degree must be >= 2, got {}",
