@@ -64,6 +64,18 @@ pub fn resolve_col(col_map: &HashMap<String, usize>, name: &str) -> Result<usize
     })
 }
 
+pub fn column_map_with_alias(
+    col_map: &HashMap<String, usize>,
+    alias: &str,
+    target_column: &str,
+) -> HashMap<String, usize> {
+    let mut aliased = col_map.clone();
+    if let Some(idx) = col_map.get(target_column).copied() {
+        aliased.entry(alias.to_string()).or_insert(idx);
+    }
+    aliased
+}
+
 fn shared_prefix(a: &str, b: &str) -> usize {
     a.chars()
         .zip(b.chars())

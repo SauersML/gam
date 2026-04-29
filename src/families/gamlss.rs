@@ -6958,7 +6958,6 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.dim);
-        let n = self.nrows;
         let mut scratch = self.acquire_scratch();
         let RowCoeffScratch { u, r } = &mut scratch;
 
