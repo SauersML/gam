@@ -18,7 +18,8 @@ use gam::families::bernoulli_marginal_slope::{
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::family_meta::{
-    family_to_link, family_to_string, is_binomial_family, pretty_familyname,
+    family_to_link, family_to_string, inverse_link_to_binomial_family, is_binomial_family,
+    pretty_familyname,
 };
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
@@ -8240,24 +8241,6 @@ fn inverse_link_to_saved_string(link: &InverseLink) -> String {
                 .join(",");
             format!("blended({names})")
         }
-    }
-}
-
-fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
-    match link {
-        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
-        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-        InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-        InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-        InverseLink::Standard(LinkFunction::Sas) | InverseLink::Sas(_) => {
-            LikelihoodFamily::BinomialSas
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) | InverseLink::BetaLogistic(_) => {
-            LikelihoodFamily::BinomialBetaLogistic
-        }
-        InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-        InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
-        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
     }
 }
 
