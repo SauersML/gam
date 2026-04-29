@@ -7287,28 +7287,37 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let pmu = self.xmu.ncols();
         let p_ls = self.x_ls.ncols();
         let total = pmu + p_ls;
+        // Per-column reduction is independent; parallelize across columns.
+        let diag_mu: Vec<f64> = (0..pmu)
+            .into_par_iter()
+            .map(|j| {
+                let col = self.xmu.column(j);
+                col.iter()
+                    .zip(self.coeff_mm.iter())
+                    .map(|(&v, &c)| c * v * v)
+                    .sum()
+            })
+            .collect();
+        let diag_ls: Vec<f64> = (0..p_ls)
+            .into_par_iter()
+            .map(|j| {
+                let col = self.x_ls.column(j);
+                col.iter()
+                    .zip(self.coeff_ll.iter())
+                    .map(|(&v, &c)| c * v * v)
+                    .sum()
+            })
+            .collect();
         let mut diag = Array1::<f64>::zeros(total);
-        let n = self.coeff_mm.len();
-        for j in 0..pmu {
-            let col = self.xmu.column(j);
-            let mut acc = 0.0;
-            for i in 0..n {
-                let v = col[i];
-                acc += self.coeff_mm[i] * v * v;
-            }
-            diag[j] = acc;
+        for (j, v) in diag_mu.into_iter().enumerate() {
+            diag[j] = v;
         }
-        for j in 0..p_ls {
-            let col = self.x_ls.column(j);
-            let mut acc = 0.0;
-            for i in 0..n {
-                let v = col[i];
-                acc += self.coeff_ll[i] * v * v;
-            }
-            diag[pmu + j] = acc;
+        for (j, v) in diag_ls.into_iter().enumerate() {
+            diag[pmu + j] = v;
         }
         Ok(Some(diag))
     }
