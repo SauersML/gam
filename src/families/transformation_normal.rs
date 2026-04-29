@@ -780,6 +780,40 @@ fn factored_weighted_cross(
     Ok(out)
 }
 
+fn factored_weighted_gram(
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    weights: ndarray::ArrayView1<'_, f64>,
+    policy: &ResourcePolicy,
+) -> Array2<f64> {
+    let n = weights.len();
+    debug_assert_eq!(left.nrows(), n);
+    debug_assert_eq!(right.nrows(), n);
+    let p_resp = left.ncols();
+    let p_cov = right.ncols();
+    let mut out = Array2::<f64>::zeros((p_resp * p_cov, p_resp * p_cov));
+    let mut pair_weights = Array1::<f64>::zeros(n);
+
+    for ia in 0..p_resp {
+        let a_col = left.column(ia);
+        for ic in ia..p_resp {
+            let c_col = left.column(ic);
+            for r in 0..n {
+                pair_weights[r] = weights[r] * a_col[r] * c_col[r];
+            }
+            let block = chunked_weighted_bt_d(right, pair_weights.view(), right, policy);
+            out.slice_mut(s![ia * p_cov..(ia + 1) * p_cov, ic * p_cov..(ic + 1) * p_cov])
+                .assign(&block);
+            if ic != ia {
+                out.slice_mut(s![ic * p_cov..(ic + 1) * p_cov, ia * p_cov..(ia + 1) * p_cov])
+                    .assign(&block);
+            }
+        }
+    }
+
+    out
+}
+
 /// Chunked weighted B^T diag(w) D product without materializing any
 /// full rowwise-Kronecker intermediate.
 ///
@@ -3633,6 +3667,11 @@ impl KroneckerDesign {
     /// Thin wrapper over `weighted_cross_with(self, self, ...)`. Callers thread
     /// a real `ResourcePolicy` so chunk sizing matches the surrounding workload.
     fn weighted_gram(&self, w: &Array1<f64>, policy: &ResourcePolicy) -> Array2<f64> {
+        if let KroneckerDesign::KhatriRao { left, right } = self
+            && let Some(right_dense) = right.as_dense_ref()
+        {
+            return factored_weighted_gram(left, right_dense, w.view(), policy);
+        }
         self.weighted_cross_with(w.view(), self, policy)
             .expect("validated KroneckerDesign weighted Gram dimensions")
     }
