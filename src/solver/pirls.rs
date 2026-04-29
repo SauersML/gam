@@ -147,20 +147,21 @@ fn gamma_loglikelihood_with_shape(
     shape: f64,
 ) -> f64 {
     const EPS: f64 = 1e-12;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let shape_c = shape.clamp(GAMMA_SHAPE_MIN, GAMMA_SHAPE_MAX);
     let shape_ln = shape_c.ln();
     let ln_gamma_shape = ln_gamma(shape_c);
-    ndarray::Zip::from(y)
-        .and(mu)
-        .and(priorweights)
-        .fold(0.0, |acc, &yi, &mui, &wi| {
-            let yi_c = yi.max(EPS);
-            let mui_c = mui.max(EPS);
-            acc + wi
+    (0..y.len())
+        .into_par_iter()
+        .map(|i| {
+            let yi_c = y[i].max(EPS);
+            let mui_c = mu[i].max(EPS);
+            priorweights[i]
                 * (shape_c * shape_ln - ln_gamma_shape - shape_c * mui_c.ln()
                     + (shape_c - 1.0) * yi_c.ln()
                     - shape_c * yi_c / mui_c)
         })
+        .sum()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7570,26 +7571,26 @@ pub fn calculate_deviance(
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture => {
-            let total_residual =
-                ndarray::Zip::from(y)
-                    .and(mu)
-                    .and(priorweights)
-                    .fold(0.0, |acc, &yi, &mui, &wi| {
-                        let mui_c = mui;
-                        // More numerically stable formulation: use difference of logs instead of log of ratio
-                        let term1 = if yi > EPS {
-                            yi * (yi.ln() - mui_c.ln())
-                        } else {
-                            0.0
-                        };
-                        // More numerically stable formulation: use difference of logs instead of log of ratio
-                        let term2 = if yi < 1.0 - EPS {
-                            (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
-                        } else {
-                            0.0
-                        };
-                        acc + wi * (term1 + term2)
-                    });
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let total_residual: f64 = (0..y.len())
+                .into_par_iter()
+                .map(|i| {
+                    let yi = y[i];
+                    let mui_c = mu[i];
+                    let wi = priorweights[i];
+                    let term1 = if yi > EPS {
+                        yi * (yi.ln() - mui_c.ln())
+                    } else {
+                        0.0
+                    };
+                    let term2 = if yi < 1.0 - EPS {
+                        (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
+                    } else {
+                        0.0
+                    };
+                    wi * (term1 + term2)
+                })
+                .sum();
             2.0 * total_residual
         }
         GlmLikelihoodFamily::GaussianIdentity => ndarray::Zip::from(y)
@@ -7598,33 +7599,34 @@ pub fn calculate_deviance(
             .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
             .sum(),
         GlmLikelihoodFamily::PoissonLog => {
-            let total =
-                ndarray::Zip::from(y)
-                    .and(mu)
-                    .and(priorweights)
-                    .fold(0.0, |acc, &yi, &mui, &wi| {
-                        let mui_c = mui.max(EPS);
-                        let term = if yi > EPS {
-                            yi * (yi / mui_c).ln() - (yi - mui_c)
-                        } else {
-                            mui_c // when y=0, deviance contribution is mu
-                        };
-                        acc + wi * term
-                    });
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let total: f64 = (0..y.len())
+                .into_par_iter()
+                .map(|i| {
+                    let yi = y[i];
+                    let mui_c = mu[i].max(EPS);
+                    let term = if yi > EPS {
+                        yi * (yi / mui_c).ln() - (yi - mui_c)
+                    } else {
+                        mui_c
+                    };
+                    priorweights[i] * term
+                })
+                .sum();
             2.0 * total
         }
         GlmLikelihoodFamily::GammaLog => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
-            let total =
-                ndarray::Zip::from(y)
-                    .and(mu)
-                    .and(priorweights)
-                    .fold(0.0, |acc, &yi, &mui, &wi| {
-                        let yi_c = yi.max(EPS);
-                        let mui_c = mui.max(EPS);
-                        let ratio = yi_c / mui_c;
-                        acc + wi * shape * (ratio - 1.0 - ratio.ln())
-                    });
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let total: f64 = (0..y.len())
+                .into_par_iter()
+                .map(|i| {
+                    let yi_c = y[i].max(EPS);
+                    let mui_c = mu[i].max(EPS);
+                    let ratio = yi_c / mui_c;
+                    priorweights[i] * shape * (ratio - 1.0 - ratio.ln())
+                })
+                .sum();
             2.0 * total
         }
     }
