@@ -628,6 +628,26 @@ impl TransformationNormalFamily {
             let hp2 = hp * hp;
             1.0 / (hp2 * hp2)
         });
+        // Backstop for IEEE overflow in the higher reciprocal powers. The
+        // closed-form ψ-ψ Hessian and gradient downstream consume
+        // `inv_h_prime_qu` (and to a lesser extent `inv_h_prime_cu`); for
+        // h' below ~1e-77 the f64 division `1.0 / (hp2 * hp2)` overflows
+        // to +∞, and the outer REML caller silently propagates that into
+        // a NaN dense Hessian when the +∞ is multiplied against zero
+        // entries in `v_*_deriv` or zero rows of the derivative basis.
+        // The monotonicity gate above (`min_hp <= 0`) does not catch this
+        // because the iterate is mathematically feasible — only its higher
+        // reciprocal powers overflow. Surface the infeasibility cleanly so
+        // the outer evaluator can retreat from this trial point instead of
+        // consuming the NaN Hessian.
+        if !inv_h_prime_qu.iter().all(|v| v.is_finite())
+            || !inv_h_prime_cu.iter().all(|v| v.is_finite())
+        {
+            return Err(format!(
+                "TransformationNormalFamily row_quantities: 1/h'^k overflowed at min h' = \
+                 {min_hp:.6e}. The outer evaluator should retreat from this trial point."
+            ));
+        }
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
@@ -1809,6 +1829,34 @@ impl CustomFamily for TransformationNormalFamily {
             hess += &self.x_deriv_kron.weighted_gram(&quartic, policy);
             0.5 * (&hess + &hess.t())
         };
+
+        // Result-validation gate. The formula above can still produce NaN
+        // when an input that bypasses the `row_quantities` reciprocal-power
+        // check overflows — for example, the second-order spatial-basis
+        // term `v_ij_deriv = op.forward_mul_second_deriv(axis_i, axis_j, β)`
+        // for tightly anisotropic Duchon length scales, or the materialized
+        // `cov_ij = materialize_cov_second(axis_i, axis_j)` when its second
+        // derivative blows up at extreme ψ. Surfacing the infeasibility as
+        // an Err lets the outer REML evaluator return +∞ cost / retreat
+        // through its existing PerfectSeparation/PirlsDidNotConverge-style
+        // handling instead of forwarding a NaN dense Hessian into the
+        // unified evaluator (observed: the entire 238×238 dense `b_mat` is
+        // NaN on the κ_i-κ_i diagonals of the 16-axis aniso Duchon
+        // margslope CTN run, with `pair.a=NaN` `pair.ld_s=NaN`).
+        if !objective_psi_psi.is_finite()
+            || !score_psi_psi.iter().all(|v| v.is_finite())
+            || !hessian_psi_psi.iter().all(|v| v.is_finite())
+        {
+            return Err(format!(
+                "TransformationNormalFamily exact ψ-ψ second-order terms produced \
+                 non-finite values at psi_i={psi_i}, psi_j={psi_j}: \
+                 obj_finite={}, score_all_finite={}, hess_all_finite={}. \
+                 The outer evaluator should retreat from this trial point.",
+                objective_psi_psi.is_finite(),
+                score_psi_psi.iter().all(|v| v.is_finite()),
+                hessian_psi_psi.iter().all(|v| v.is_finite()),
+            ));
+        }
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
