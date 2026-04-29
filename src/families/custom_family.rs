@@ -12495,6 +12495,101 @@ mod tests {
         Ok((obj, grad, warm))
     }
 
+    struct BinomialLocationScaleWiggleOuterFixture {
+        family: BinomialLocationScaleWiggleFamily,
+        specs: Vec<ParameterBlockSpec>,
+        penalty_counts: Vec<usize>,
+        rho: Array1<f64>,
+        options: BlockwiseFitOptions,
+    }
+
+    fn binomial_location_scale_wiggle_outer_fixture() -> BinomialLocationScaleWiggleOuterFixture {
+        let n = 7usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
+        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((n, 1), 1.0),
+        ));
+        let thresholdspec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: threshold_design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.2]),
+        };
+        let log_sigmaspec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: log_sigma_design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![-0.2],
+            initial_beta: Some(array![-0.1]),
+        };
+        let q_seed = Array1::linspace(-1.4, 1.4, n);
+        let knots = crate::families::gamlss::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
+            .expect("knots");
+        let wiggle_block = crate::families::gamlss::buildwiggle_block_input_from_knots(
+            q_seed.view(),
+            &knots,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let wigglespec = ParameterBlockSpec {
+            name: "wiggle".to_string(),
+            design: wiggle_block.design.clone(),
+            offset: wiggle_block.offset.clone(),
+            penalties: wiggle_block
+                .penalties
+                .iter()
+                .map(|ps| match ps {
+                    crate::solver::estimate::PenaltySpec::Block {
+                        local, col_range, ..
+                    } => PenaltyMatrix::Blockwise {
+                        local: local.clone(),
+                        col_range: col_range.clone(),
+                        total_dim: wiggle_block.design.ncols(),
+                    },
+                    crate::solver::estimate::PenaltySpec::Dense(m) => {
+                        PenaltyMatrix::Dense(m.clone())
+                    }
+                })
+                .collect(),
+            nullspace_dims: wiggle_block.nullspace_dims.clone(),
+            initial_log_lambdas: array![0.1],
+            initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
+        };
+        let family = BinomialLocationScaleWiggleFamily {
+            y,
+            weights,
+            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
+            wiggle_knots: knots,
+            wiggle_degree: 3,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        BinomialLocationScaleWiggleOuterFixture {
+            family,
+            specs: vec![thresholdspec, log_sigmaspec, wigglespec],
+            penalty_counts: vec![1usize, 1usize, 1usize],
+            rho: array![0.05, -0.15, 0.1],
+            options: BlockwiseFitOptions {
+                use_remlobjective: true,
+                ridge_floor: 1e-10,
+                outer_max_iter: 1,
+                ..BlockwiseFitOptions::default()
+            },
+        }
+    }
+
     #[derive(Clone)]
     struct OneBlockIdentityFamily;
 
@@ -14335,89 +14430,13 @@ mod tests {
 
     #[test]
     fn outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active() {
-        let n = 7usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: threshold_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2]),
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: log_sigma_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![-0.2],
-            initial_beta: Some(array![-0.1]),
-        };
-        let q_seed = Array1::linspace(-1.4, 1.4, n);
-        let knots = crate::families::gamlss::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
-            .expect("knots");
-        let wiggle_block = crate::families::gamlss::buildwiggle_block_input_from_knots(
-            q_seed.view(),
-            &knots,
-            3,
-            2,
-            false,
-        )
-        .expect("wiggle block");
-        let wigglespec = ParameterBlockSpec {
-            name: "wiggle".to_string(),
-            design: wiggle_block.design.clone(),
-            offset: wiggle_block.offset.clone(),
-            penalties: wiggle_block
-                .penalties
-                .iter()
-                .map(|ps| match ps {
-                    crate::solver::estimate::PenaltySpec::Block {
-                        local, col_range, ..
-                    } => PenaltyMatrix::Blockwise {
-                        local: local.clone(),
-                        col_range: col_range.clone(),
-                        total_dim: wiggle_block.design.ncols(),
-                    },
-                    crate::solver::estimate::PenaltySpec::Dense(m) => {
-                        PenaltyMatrix::Dense(m.clone())
-                    }
-                })
-                .collect(),
-            nullspace_dims: wiggle_block.nullspace_dims.clone(),
-            initial_log_lambdas: array![0.1],
-            initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
-        };
-
-        let family = BinomialLocationScaleWiggleFamily {
-            y,
-            weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
-            wiggle_knots: knots,
-            wiggle_degree: 3,
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-
-        let specs = vec![thresholdspec, log_sigmaspec, wigglespec];
-        let penalty_counts = vec![1usize, 1usize, 1usize];
-        let rho = array![0.05, -0.15, 0.1];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
+        let BinomialLocationScaleWiggleOuterFixture {
+            family,
+            specs,
+            penalty_counts,
+            rho,
+            options,
+        } = binomial_location_scale_wiggle_outer_fixture();
 
         let (f0, g0, _) =
             outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
@@ -14501,89 +14520,13 @@ mod tests {
 
     #[test]
     fn rho_only_outer_objective_matches_joint_hyper_when_psi_is_empty() {
-        let n = 7usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: threshold_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2]),
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: log_sigma_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![-0.2],
-            initial_beta: Some(array![-0.1]),
-        };
-        let q_seed = Array1::linspace(-1.4, 1.4, n);
-        let knots = crate::families::gamlss::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
-            .expect("knots");
-        let wiggle_block = crate::families::gamlss::buildwiggle_block_input_from_knots(
-            q_seed.view(),
-            &knots,
-            3,
-            2,
-            false,
-        )
-        .expect("wiggle block");
-        let wigglespec = ParameterBlockSpec {
-            name: "wiggle".to_string(),
-            design: wiggle_block.design.clone(),
-            offset: wiggle_block.offset.clone(),
-            penalties: wiggle_block
-                .penalties
-                .iter()
-                .map(|ps| match ps {
-                    crate::solver::estimate::PenaltySpec::Block {
-                        local, col_range, ..
-                    } => PenaltyMatrix::Blockwise {
-                        local: local.clone(),
-                        col_range: col_range.clone(),
-                        total_dim: wiggle_block.design.ncols(),
-                    },
-                    crate::solver::estimate::PenaltySpec::Dense(m) => {
-                        PenaltyMatrix::Dense(m.clone())
-                    }
-                })
-                .collect(),
-            nullspace_dims: wiggle_block.nullspace_dims.clone(),
-            initial_log_lambdas: array![0.1],
-            initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
-        };
-
-        let family = BinomialLocationScaleWiggleFamily {
-            y,
-            weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
-            wiggle_knots: knots,
-            wiggle_degree: 3,
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-
-        let specs = vec![thresholdspec, log_sigmaspec, wigglespec];
-        let penalty_counts = vec![1usize, 1usize, 1usize];
-        let rho = array![0.05, -0.15, 0.1];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
+        let BinomialLocationScaleWiggleOuterFixture {
+            family,
+            specs,
+            penalty_counts,
+            rho,
+            options,
+        } = binomial_location_scale_wiggle_outer_fixture();
 
         let (outer_obj, outer_grad, outer_hessian, _) = outerobjectivegradienthessian(
             &family,
