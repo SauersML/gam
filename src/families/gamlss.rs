@@ -21877,10 +21877,7 @@ mod tests {
             &specs,
             &BlockwiseFitOptions::default(),
         );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
+        assert_eq!(hessian, crate::solver::outer_strategy::Derivative::Analytic);
     }
 
     #[test]
