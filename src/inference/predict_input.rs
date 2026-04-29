@@ -8,11 +8,7 @@ use crate::families::scale_design::{build_scale_deviation_operator, scale_transf
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
-use crate::families::transformation_normal::{
-    TRANSFORMATION_GRID_RELATIVE_TOL, TRANSFORMATION_MONOTONICITY_EPS,
-    TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES, TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS,
-    TRANSFORMATION_TAIL_GUARD_FRACTION,
-};
+use crate::families::transformation_normal::TRANSFORMATION_MONOTONICITY_EPS;
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
@@ -236,114 +232,81 @@ pub fn build_predict_input_for_model(
                 .try_row_chunk(0..n)
                 .map_err(|e| e.to_string())?;
 
-            let mut derivative_grid = resp_knots
-                .iter()
-                .copied()
-                .filter(|value| value.is_finite())
-                .collect::<Vec<_>>();
-            let mut sorted_response_new = response_new.to_vec();
-            sorted_response_new
-                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let prediction_quantiles = sorted_response_new
-                .len()
-                .min(TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES);
-            if prediction_quantiles == 1 {
-                derivative_grid.push(sorted_response_new[0]);
-            } else if prediction_quantiles > 1 {
-                for q in 0..prediction_quantiles {
-                    let idx = q * (sorted_response_new.len() - 1) / (prediction_quantiles - 1);
-                    derivative_grid.push(sorted_response_new[idx]);
-                }
+            // Continuous monotonicity check (no grid sampling).
+            //
+            // CTN response design has columns `[1, y, dev_val(y)]` where
+            // `dev_val_j(y) = Σ_k B_{k,d}(y) · resp_transform[k, j]`. So
+            //   h(y, x)  = β₀(x) + y β₁(x) + Σ_k A_k(x) B_{k,d}(y)
+            //   h'(y, x) = β₁(x) + Σ_k A_k(x) B'_{k,d}(y)
+            // with `A_k(x) = Σ_j resp_transform[k,j] · β_{2+j}(x)`.
+            //
+            // Standard B-spline derivative + reindex gives
+            //   h'(y, x) = β₁(x) + Σ_{k=1}^{p_basis-1} δ_k(x) N_{k,d-1}(y),
+            //   δ_k(x)   = d/(t_{k+d}-t_k) · (A_k(x) - A_{k-1}(x)).
+            // Because `Σ_{k=1}^{p_basis-1} N_{k,d-1}(y) = 1` on the basis
+            // support [t_d, t_{p_basis}], h'(y, x) is a convex combination of
+            // `{β₁(x) + δ_k(x)}`. The pointwise minimum lower bound is
+            //   h'_min(x) = β₁(x) + min_k δ_k(x).
+            // Outside the basis support, the B-spline first derivative
+            // clamps to its boundary value, which is itself in this convex
+            // combination — so the same lower bound covers extrapolation.
+            // No tail-guard heuristic, no grid sampling needed.
+            let kn = resp_knots
+                .as_slice()
+                .ok_or_else(|| "internal error: response knots are not contiguous".to_string())?;
+            let p_basis = resp_transform.nrows();
+            let dim_dev = resp_transform.ncols();
+            let expected_knot_len = p_basis + response_degree + 1;
+            if kn.len() < expected_knot_len {
+                return Err(format!(
+                    "saved transformation-normal knots length {} < expected {} (p_basis={}, degree={})",
+                    kn.len(),
+                    expected_knot_len,
+                    p_basis,
+                    response_degree
+                ));
             }
-            if derivative_grid.is_empty() {
-                return Err(
-                    "saved transformation-normal model has no finite response knots".to_string(),
-                );
-            }
-            derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let min_grid = derivative_grid[0];
-            let max_grid = derivative_grid[derivative_grid.len() - 1];
-            let grid_span = (max_grid - min_grid).abs().max(1.0);
-            let base_grid = derivative_grid.clone();
-            for window in base_grid.windows(2) {
-                let left = window[0];
-                let right = window[1];
-                let width = right - left;
-                if width <= TRANSFORMATION_GRID_RELATIVE_TOL * grid_span {
-                    continue;
-                }
-                for sidx in 1..TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS {
-                    let frac =
-                        sidx as f64 / TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS as f64;
-                    derivative_grid.push(left + frac * width);
-                }
-            }
-            let grid_guard = TRANSFORMATION_TAIL_GUARD_FRACTION * grid_span;
-            derivative_grid.push(min_grid - grid_guard);
-            derivative_grid.push(max_grid + grid_guard);
-            derivative_grid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            derivative_grid.dedup_by(|a, b| (*a - *b).abs() <= TRANSFORMATION_GRID_RELATIVE_TOL * grid_span);
-            let derivative_grid = ndarray::Array1::from_vec(derivative_grid);
-            let (raw_deriv_basis, _) = create_basis::<Dense>(
-                derivative_grid.view(),
-                KnotSource::Provided(resp_knots.view()),
-                response_degree,
-                BasisOptions::first_derivative(),
-            )
-            .map_err(|e| e.to_string())?;
-            let dev_deriv = raw_deriv_basis.as_ref().dot(&resp_transform);
-            let mut resp_deriv_grid =
-                ndarray::Array2::<f64>::zeros((derivative_grid.len(), p_resp));
-            resp_deriv_grid.column_mut(1).fill(1.0);
-            resp_deriv_grid
-                .slice_mut(ndarray::s![.., 2..])
-                .assign(&dev_deriv);
-            let (raw_obs_deriv_basis, _) = create_basis::<Dense>(
-                response_new.view(),
-                KnotSource::Provided(resp_knots.view()),
-                response_degree,
-                BasisOptions::first_derivative(),
-            )
-            .map_err(|e| e.to_string())?;
-            let dev_obs_deriv = raw_obs_deriv_basis.as_ref().dot(&resp_transform);
-            let mut resp_deriv_obs = ndarray::Array2::<f64>::zeros((n, p_resp));
-            resp_deriv_obs.column_mut(1).fill(1.0);
-            resp_deriv_obs
-                .slice_mut(ndarray::s![.., 2..])
-                .assign(&dev_obs_deriv);
-
             let monotonicity_eps = TRANSFORMATION_MONOTONICITY_EPS;
             let mut min_h_prime = f64::INFINITY;
+            let mut gamma = vec![0.0f64; dim_dev.max(1)];
+            let mut a_coef = vec![0.0f64; p_basis.max(1)];
             for i in 0..n {
                 let cov_row = cov_mat.row(i);
-                for g in 0..resp_deriv_grid.nrows() {
-                    let resp_deriv_row = resp_deriv_grid.row(g);
-                    let mut h_prime = 0.0;
-                    for r in 0..p_resp {
-                        if resp_deriv_row[r] == 0.0 {
-                            continue;
-                        }
-                        for c in 0..p_cov {
-                            h_prime += resp_deriv_row[r] * cov_row[c] * beta_mat[[r, c]];
-                        }
-                    }
-                    min_h_prime = min_h_prime.min(h_prime);
+                let beta1_x = beta_mat.row(1).dot(&cov_row);
+                for j in 0..dim_dev {
+                    gamma[j] = beta_mat.row(2 + j).dot(&cov_row);
                 }
-                let resp_deriv_row = resp_deriv_obs.row(i);
-                let mut h_prime = 0.0;
-                for r in 0..p_resp {
-                    if resp_deriv_row[r] == 0.0 {
+                for k in 0..p_basis {
+                    let mut sum = 0.0;
+                    for j in 0..dim_dev {
+                        sum += resp_transform[[k, j]] * gamma[j];
+                    }
+                    a_coef[k] = sum;
+                }
+                // h'_min(x) = β₁(x) + min_{k ∈ [1, p_basis-1]} δ_k(x).
+                // Knots with multiplicity (zero denominator) make N_{k,d-1}
+                // identically zero, so they contribute nothing — skip them.
+                let mut h_prime_lb = beta1_x;
+                let mut found_any = false;
+                for k in 1..p_basis {
+                    let denom = kn[k + response_degree] - kn[k];
+                    if denom <= 0.0 {
                         continue;
                     }
-                    for c in 0..p_cov {
-                        h_prime += resp_deriv_row[r] * cov_row[c] * beta_mat[[r, c]];
+                    let delta_k = (response_degree as f64) / denom * (a_coef[k] - a_coef[k - 1]);
+                    let bound_k = beta1_x + delta_k;
+                    if !found_any || bound_k < h_prime_lb {
+                        h_prime_lb = bound_k;
+                        found_any = true;
                     }
                 }
-                min_h_prime = min_h_prime.min(h_prime);
+                if h_prime_lb < min_h_prime {
+                    min_h_prime = h_prime_lb;
+                }
             }
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
-                    "transformation-normal prediction violates monotonicity on the response grid for new data: min h'={min_h_prime:.6e}"
+                    "transformation-normal prediction violates monotonicity: min h'(y, x) lower bound = {min_h_prime:.6e} (continuous variation-diminishing certificate)"
                 ));
             }
 
