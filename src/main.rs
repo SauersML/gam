@@ -1976,7 +1976,7 @@ fn run_fitwith_predict_noise(
         let mut model = build_location_scale_saved_model(
             formula_text.to_string(),
             FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
-            Some(inverse_link_to_saved_string(&location_scale_link_kind)),
+            Some(location_scale_link_kind.saved_string()),
             ds.schema.clone(),
             noise_formula,
             ds.headers.clone(),
@@ -4409,7 +4409,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
-                    survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
+                    survival_distribution: Some(fitted_inverse_link.saved_string()),
                     frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
                 family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
@@ -4417,7 +4417,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.unified = Some(fit_result.clone());
             payload.fit_result = Some(fit_result);
             payload.data_schema = Some(ds.schema.clone());
-            payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
+            payload.link = Some(fitted_inverse_link.saved_string());
             payload.linkwiggle_degree = fit.wiggle_degree;
             payload.beta_link_wiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
             payload.linkwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
@@ -4512,7 +4512,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_noise_non_intercept_start =
                 Some(survival_noise_transform.non_intercept_start);
             payload.survival_distribution =
-                Some(inverse_link_to_saved_string(&fitted_inverse_link));
+                Some(fitted_inverse_link.saved_string());
             payload.training_headers = Some(ds.headers.clone());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
@@ -7295,7 +7295,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
-    payload.link = Some(inverse_link_to_saved_string(&base_link));
+    payload.link = Some(base_link.saved_string());
     payload.training_headers = Some(training_headers);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_logslope = Some(resolved_logslopespec);
@@ -8203,13 +8203,7 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
     if let Some(components) = choice.mixture_components.as_ref() {
         let names = components
             .iter()
-            .map(|c| match c {
-                LinkComponent::Logit => "logit",
-                LinkComponent::Probit => "probit",
-                LinkComponent::CLogLog => "cloglog",
-                LinkComponent::LogLog => "loglog",
-                LinkComponent::Cauchit => "cauchit",
-            })
+            .map(|component| component.name())
             .collect::<Vec<_>>()
             .join(",");
         return format!("blended({names})");
@@ -8217,30 +8211,6 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
     match choice.mode {
         LinkMode::Strict => linkname(choice.link).to_string(),
         LinkMode::Flexible => format!("flexible({})", linkname(choice.link)),
-    }
-}
-
-fn inverse_link_to_saved_string(link: &InverseLink) -> String {
-    match link {
-        InverseLink::Standard(link_fn) => linkname(*link_fn).to_string(),
-        InverseLink::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
-        InverseLink::Sas(_) => "sas".to_string(),
-        InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
-        InverseLink::Mixture(state) => {
-            let names = state
-                .components
-                .iter()
-                .map(|c| match c {
-                    LinkComponent::Logit => "logit",
-                    LinkComponent::Probit => "probit",
-                    LinkComponent::CLogLog => "cloglog",
-                    LinkComponent::LogLog => "loglog",
-                    LinkComponent::Cauchit => "cauchit",
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("blended({names})")
-        }
     }
 }
 
@@ -8361,13 +8331,7 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
                         "--mixture-rho expects {expected} values for blended({})",
                         components
                             .iter()
-                            .map(|c| match c {
-                                LinkComponent::Probit => "probit",
-                                LinkComponent::Logit => "logit",
-                                LinkComponent::CLogLog => "cloglog",
-                                LinkComponent::LogLog => "loglog",
-                                LinkComponent::Cauchit => "cauchit",
-                            })
+                            .map(|component| component.name())
                             .collect::<Vec<_>>()
                             .join(",")
                     ));

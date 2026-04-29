@@ -1109,7 +1109,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
     });
     payload.marginal_baseline = Some(ms_result.baseline_marginal);
     payload.logslope_baseline = Some(ms_result.baseline_logslope);
-    payload.link = Some(inverse_link_to_saved_string(&base_link));
+    payload.link = Some(base_link.saved_string());
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_logslope = Some(frozen_logslope);
@@ -1321,7 +1321,7 @@ fn build_binomial_location_scale_ffi_payload(
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(inverse_link_to_saved_string(&link_kind));
+    payload.link = Some(link_kind.saved_string());
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = scale_beta;
     payload.noise_projection = Some(
@@ -1478,7 +1478,7 @@ fn build_survival_location_scale_ffi_payload(
         FittedFamily::Survival {
             likelihood: LikelihoodFamily::RoystonParmar,
             survival_likelihood: Some(survival_likelihood_modename(likelihood_mode).to_string()),
-            survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
+            survival_distribution: Some(fitted_inverse_link.saved_string()),
             frailty: gam::families::lognormal_kernel::FrailtySpec::None,
         },
         "royston-parmar".to_string(),
@@ -1486,7 +1486,7 @@ fn build_survival_location_scale_ffi_payload(
     payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(inverse_link_to_saved_string(&fitted_inverse_link));
+    payload.link = Some(fitted_inverse_link.saved_string());
     payload.linkwiggle_degree = ls_result.wiggle_degree;
     payload.beta_link_wiggle = ls_result
         .fit
@@ -1527,7 +1527,7 @@ fn build_survival_location_scale_ffi_payload(
     payload.survival_noise_center = Some(survival_noise_transform.weighted_column_mean.to_vec());
     payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
     payload.survival_noise_non_intercept_start = Some(survival_noise_transform.non_intercept_start);
-    payload.survival_distribution = Some(inverse_link_to_saved_string(&fitted_inverse_link));
+    payload.survival_distribution = Some(fitted_inverse_link.saved_string());
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(
         freeze_term_collection_from_design(
@@ -1759,16 +1759,6 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
             .into_iter()
             .map(|row| row.to_vec())
             .collect(),
-    }
-}
-
-fn inverse_link_to_saved_string(link: &InverseLink) -> String {
-    match link {
-        InverseLink::Standard(link_fn) => link_fn.name().to_string(),
-        InverseLink::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
-        InverseLink::Sas(_) => "sas".to_string(),
-        InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
-        InverseLink::Mixture(_) => "blended".to_string(),
     }
 }
 
