@@ -23,8 +23,9 @@ use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_scaled_coeff4,
-    add_two_surface_psi_outer, build_denested_partition_cells as shared_denested_partition_cells,
-    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
+    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
+    is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials,
     probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
     scale_coeff4,
@@ -330,26 +331,10 @@ impl DynamicQBlockwiseAccumulator {
         self.hess_time += &other.hess_time;
         self.hess_marginal += &other.hess_marginal;
         self.hess_logslope += &other.hess_logslope;
-        if let (Some(lhs), Some(rhs)) = (
-            self.grad_score_warp.as_mut(),
-            other.grad_score_warp.as_ref(),
-        ) {
-            *lhs += rhs;
-        }
-        if let (Some(lhs), Some(rhs)) = (
-            self.hess_score_warp.as_mut(),
-            other.hess_score_warp.as_ref(),
-        ) {
-            *lhs += rhs;
-        }
-        if let (Some(lhs), Some(rhs)) = (self.grad_link_dev.as_mut(), other.grad_link_dev.as_ref())
-        {
-            *lhs += rhs;
-        }
-        if let (Some(lhs), Some(rhs)) = (self.hess_link_dev.as_mut(), other.hess_link_dev.as_ref())
-        {
-            *lhs += rhs;
-        }
+        add_optional_vector(&mut self.grad_score_warp, &other.grad_score_warp);
+        add_optional_vector(&mut self.grad_link_dev, &other.grad_link_dev);
+        add_optional_matrix(&mut self.hess_score_warp, &other.hess_score_warp);
+        add_optional_matrix(&mut self.hess_link_dev, &other.hess_link_dev);
     }
 
     fn into_family_evaluation(self) -> FamilyEvaluation {

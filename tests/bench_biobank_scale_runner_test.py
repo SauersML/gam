@@ -225,7 +225,14 @@ class BiobankScaleRunnerTests(unittest.TestCase):
 
         standardization = _RUNNER.add_standardized_columns(train_rows, test_rows)
 
-        self.assertEqual(set(standardization), {"age_entry", "lat_final", "lon_final", "pgs_raw", *[f"pc{i}" for i in range(1, 17)]})
+        expected_columns = {
+            "age_entry",
+            "lat_final",
+            "lon_final",
+            "pgs_raw",
+            *[f"pc{i}" for i in range(1, 17)],
+        }
+        self.assertEqual(set(standardization), expected_columns)
         self.assertAlmostEqual(standardization["age_entry"]["mean"], 11.0)
         self.assertGreater(standardization["age_entry"]["sd"], 0.0)
         self.assertIn("pgs_std", train_rows[0])

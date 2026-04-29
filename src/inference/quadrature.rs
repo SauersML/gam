@@ -3182,59 +3182,58 @@ fn integrated_logit_jet_ghq(
 }
 
 #[inline]
+fn cloglog_inverse_link_controlled_values(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+    max_order: usize,
+) -> ([f64; 6], IntegratedExpectationMode) {
+    debug_assert!(max_order <= 5);
+    if sigma <= 1e-10 {
+        let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
+        return (
+            [mean, d1, d2, d3, d4, d5],
+            IntegratedExpectationMode::ExactClosedForm,
+        );
+    }
+
+    let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, max_order);
+    let mut values = [0.0; 6];
+    values[0] = if log_k0.is_finite() {
+        -log_k0.exp_m1()
+    } else {
+        1.0
+    };
+    values[1] = k[1].max(0.0);
+    if max_order >= 2 {
+        values[2] = k[1] - k[2];
+    }
+    if max_order >= 3 {
+        values[3] = k[1] - 3.0 * k[2] + k[3];
+    }
+    if max_order >= 4 {
+        values[4] = k[1] - 7.0 * k[2] + 6.0 * k[3] - k[4];
+    }
+    if max_order >= 5 {
+        values[5] = k[1] - 15.0 * k[2] + 25.0 * k[3] - 10.0 * k[4] + k[5];
+    }
+    (values, mode)
+}
+
+#[inline]
 pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet5 {
-    // Single latent-cloglog derivative tower via the shared lognormal-Laplace
-    // kernel terms
-    //
-    //   K_k(mu, sigma) := E[exp(k eta - exp(eta))],   eta ~ N(mu, sigma^2).
-    //
-    // Since
-    //
-    //   E[1 - exp(-exp(eta))] = 1 - K_0,
-    //
-    // every eta-derivative is a fixed linear combination of K_1..K_5:
-    //
-    //   d1 = K1
-    //   d2 = K1 - K2
-    //   d3 = K1 - 3 K2 + K3
-    //   d4 = K1 - 7 K2 + 6 K3 - K4
-    //   d5 = K1 - 15 K2 + 25 K3 - 10 K4 + K5.
-    //
-    // Each K_k is evaluated through the same routed lognormal-Laplace backend
-    // used elsewhere in the cloglog/survival stack, so there is no finite-
-    // difference bridge in the latent jet anymore. The returned `mode` still
-    // records whether that scalar backend was closed-form, controlled, special-
-    // function, or quadrature fallback at runtime.
-    if sigma <= 1e-10 {
-        let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
-        return IntegratedInverseLinkJet5 {
-            mean,
-            d1,
-            d2,
-            d3,
-            d4,
-            d5,
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        };
-    }
-
-    let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, 5);
-
+    let (values, mode) = cloglog_inverse_link_controlled_values(ctx, mu, sigma, 5);
     IntegratedInverseLinkJet5 {
-        mean: if log_k0.is_finite() {
-            -log_k0.exp_m1()
-        } else {
-            1.0
-        },
-        d1: k[1].max(0.0),
-        d2: k[1] - k[2],
-        d3: k[1] - 3.0 * k[2] + k[3],
-        d4: k[1] - 7.0 * k[2] + 6.0 * k[3] - k[4],
-        d5: k[1] - 15.0 * k[2] + 25.0 * k[3] - 10.0 * k[4] + k[5],
+        mean: values[0],
+        d1: values[1],
+        d2: values[2],
+        d3: values[3],
+        d4: values[4],
+        d5: values[5],
         mode,
     }
 }
@@ -3245,27 +3244,12 @@ fn integrated_cloglog_inverse_link_jet_controlled(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet {
-    if sigma <= 1e-10 {
-        let (mean, d1, d2, d3, _, _) = cloglog_point_jet5(mu);
-        return IntegratedInverseLinkJet {
-            mean,
-            d1,
-            d2,
-            d3,
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        };
-    }
-
-    let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, 3);
+    let (values, mode) = cloglog_inverse_link_controlled_values(ctx, mu, sigma, 3);
     IntegratedInverseLinkJet {
-        mean: if log_k0.is_finite() {
-            -log_k0.exp_m1()
-        } else {
-            1.0
-        },
-        d1: k[1].max(0.0),
-        d2: k[1] - k[2],
-        d3: k[1] - 3.0 * k[2] + k[3],
+        mean: values[0],
+        d1: values[1],
+        d2: values[2],
+        d3: values[3],
         mode,
     }
 }
