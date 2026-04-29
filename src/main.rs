@@ -71,10 +71,12 @@ use gam::smooth::{
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, append_zero_tail_columns,
+    SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
+    append_zero_tail_columns,
     build_latent_survival_baseline_offsets, build_survival_baseline_offsets,
     build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
+    build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     initial_survival_baseline_config_for_fit, marginal_slope_baseline_chain_rule_gradient,
     normalize_survival_time_pair, optimize_survival_baseline_config,
@@ -82,17 +84,15 @@ use gam::survival_construction::{
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
-    survival_likelihood_modename,
+    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
-    DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
-    SurvivalLocationScalePredictInput, SurvivalLocationScaleTermSpec, TimeBlockInput,
-    TimeWiggleBlockInput, predict_survival_location_scale, project_onto_linear_constraints,
+    SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
+    SurvivalLocationScaleTermSpec, TimeBlockInput, TimeWiggleBlockInput,
+    predict_survival_location_scale, project_onto_linear_constraints,
     residual_distribution_inverse_link,
 };
-use gam::survival_marginal_slope::{
-    DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD, SurvivalMarginalSlopeTermSpec,
-};
+use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::survival_predict::{
     apply_inverse_link_state_to_fit_result, build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
@@ -2871,7 +2871,7 @@ fn run_predict_survival(
             saved_likelihood_mode,
             None,
             time_anchor,
-            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+            survival_derivative_guard_for_likelihood(saved_likelihood_mode),
             &time_build,
             None,
             Some(loading),
@@ -2917,16 +2917,11 @@ fn run_predict_survival(
         let time_anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
-        let derivative_guard = if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
-            DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD
-        } else {
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD
-        };
         add_survival_time_derivative_guard_offset(
             &age_entry,
             &age_exit,
             time_anchor,
-            derivative_guard,
+            survival_derivative_guard_for_likelihood(saved_likelihood_mode),
             &mut eta_offset_entry,
             &mut eta_offset_exit,
             &mut derivative_offset_exit,
@@ -3471,34 +3466,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn add_survival_time_derivative_guard_offset(
-    age_entry: &Array1<f64>,
-    age_exit: &Array1<f64>,
-    anchor_time: f64,
-    derivative_guard: f64,
-    eta_offset_entry: &mut Array1<f64>,
-    eta_offset_exit: &mut Array1<f64>,
-    derivative_offset_exit: &mut Array1<f64>,
-) -> Result<(), String> {
-    if derivative_guard <= 0.0 {
-        return Ok(());
-    }
-    let n = age_entry.len();
-    if age_exit.len() != n
-        || eta_offset_entry.len() != n
-        || eta_offset_exit.len() != n
-        || derivative_offset_exit.len() != n
-    {
-        return Err("survival derivative-guard offset lengths must match".to_string());
-    }
-    for i in 0..n {
-        eta_offset_entry[i] += derivative_guard * (age_entry[i] - anchor_time);
-        eta_offset_exit[i] += derivative_guard * (age_exit[i] - anchor_time);
-        derivative_offset_exit[i] += derivative_guard;
-    }
-    Ok(())
-}
-
 struct PreparedSurvivalTimeStack {
     eta_offset_entry: Array1<f64>,
     eta_offset_exit: Array1<f64>,
@@ -3568,30 +3535,6 @@ fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(
         return None;
     }
     Some((scale, shape))
-}
-
-fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&InverseLink>) -> bool {
-    matches!(
-        inverse_link,
-        Some(InverseLink::Standard(LinkFunction::Probit))
-    )
-}
-
-fn build_survival_time_offsets_for_likelihood(
-    age_entry: &Array1<f64>,
-    age_exit: &Array1<f64>,
-    baseline_cfg: &SurvivalBaselineConfig,
-    likelihood_mode: SurvivalLikelihoodMode,
-    inverse_link: Option<&InverseLink>,
-) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-    if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope
-        || (likelihood_mode == SurvivalLikelihoodMode::LocationScale
-            && location_scale_uses_probit_survival_baseline(inverse_link))
-    {
-        build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)
-    } else {
-        build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)
-    }
 }
 
 fn prepare_survival_time_stack(
@@ -4058,17 +4001,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         );
     }
     let time_anchor = resolve_survival_time_anchor_value(&age_entry, args.survival_time_anchor)?;
-    let mut exact_derivative_guard = 0.0_f64;
-    if matches!(
-        likelihood_mode,
-        SurvivalLikelihoodMode::LocationScale
-            | SurvivalLikelihoodMode::Latent
-            | SurvivalLikelihoodMode::LatentBinary
-    ) {
-        exact_derivative_guard = DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
-    } else if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        exact_derivative_guard = DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD;
-    }
+    let exact_derivative_guard = survival_derivative_guard_for_likelihood(likelihood_mode);
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         inference_notes.push(format!(
             "survival time block enforces structural monotonicity with derivative floor {:.3e}; boundary solutions may clamp at that floor",
@@ -4157,7 +4090,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 event_target: event_target.mapv(f64::from),
                 weights: weights.clone(),
                 inverse_link,
-                derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+                derivative_guard: exact_derivative_guard,
                 max_iter: 400,
                 tol: 1e-6,
                 time_block: TimeBlockInput {
@@ -4516,7 +4449,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             marginalspec: termspec.clone(),
             marginal_offset: threshold_offset.clone(),
             frailty: frailty.clone(),
-            derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+            derivative_guard: exact_derivative_guard,
             time_block: TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
@@ -4749,7 +4682,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let frailty = fit_frailty_spec_from_survival_args(&args, latent_context)?;
         let latent_loading = latent_hazard_loading(&frailty, latent_context)?;
-        let latent_derivative_guard = DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
+        let latent_derivative_guard = survival_derivative_guard_for_likelihood(likelihood_mode);
         let options = gam::families::custom_family::BlockwiseFitOptions {
             compute_covariance: false,
             ..Default::default()
@@ -5705,11 +5638,13 @@ fn run_sample_survival(
     }
     let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
     let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
-        if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-            build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
-        } else {
-            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?
-        };
+        build_survival_time_offsets_for_likelihood(
+            &age_entry,
+            &age_exit,
+            &baseline_cfg,
+            saved_likelihood_mode,
+            None,
+        )?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
         let time_anchor = model
             .survival_time_anchor
@@ -5718,7 +5653,7 @@ fn run_sample_survival(
             &age_entry,
             &age_exit,
             time_anchor,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+            survival_derivative_guard_for_likelihood(saved_likelihood_mode),
             &mut eta_offset_entry,
             &mut eta_offset_exit,
             &mut derivative_offset_exit,

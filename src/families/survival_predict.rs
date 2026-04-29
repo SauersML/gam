@@ -752,9 +752,7 @@ fn predict_survival_location_scale_batch(
     time_grid: Option<&[f64]>,
 ) -> Result<SurvivalPredictResult, String> {
     use crate::families::scale_design::build_scale_deviation_operator;
-    use crate::families::survival_construction::{
-        build_survival_marginal_slope_baseline_offsets, evaluate_survival_time_basis_row,
-    };
+    use crate::families::survival_construction::evaluate_survival_time_basis_row;
     use crate::families::survival_location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
     };
