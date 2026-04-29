@@ -5162,9 +5162,8 @@ fn compute_outer_hessian(
             // are both read-only borrows so the K(K+1)/2 pairs dispatch in
             // parallel, then we stitch the symmetric `n × n` Array2
             // sequentially.
-            let pairs: Vec<(usize, usize)> = (0..n)
-                .flat_map(|i| (i..n).map(move |j| (i, j)))
-                .collect();
+            let pairs: Vec<(usize, usize)> =
+                (0..n).flat_map(|i| (i..n).map(move |j| (i, j))).collect();
             let pair_values: Vec<(usize, usize, f64)> = pairs
                 .into_par_iter()
                 .map(|(i, j)| {
@@ -7925,9 +7924,7 @@ impl HessianOperator for DenseSpectralOperator {
         }
         let chunk_rows = {
             const TARGET_BYTES: usize = 8 * 1024 * 1024;
-            (TARGET_BYTES / ((p + rank).max(1) * 8))
-                .max(512)
-                .min(n)
+            (TARGET_BYTES / ((p + rank).max(1) * 8)).max(512).min(n)
         };
         let mut start = 0usize;
         while start < n {
