@@ -21828,6 +21828,53 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_many_smoothing_params_uses_first_order_outer() {
+        fn spec_with_penalties(name: &str, n: usize, p: usize, k: usize) -> ParameterBlockSpec {
+            ParameterBlockSpec {
+                name: name.to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::from_elem((n, p), 1.0),
+                )),
+                offset: Array1::zeros(n),
+                penalties: (0..k)
+                    .map(|_| PenaltyMatrix::Dense(identity_penalty(p)))
+                    .collect(),
+                nullspace_dims: vec![0; k],
+                initial_log_lambdas: Array1::zeros(k),
+                initial_beta: None,
+            }
+        }
+
+        let n = 8usize;
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]),
+            weights: Array1::from_elem(n, 1.0),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let specs = vec![
+            spec_with_penalties("threshold", n, 3, 2),
+            spec_with_penalties("log_sigma", n, 6, 11),
+        ];
+
+        assert_eq!(
+            family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
+            crate::custom_family::ExactOuterDerivativeOrder::First
+        );
+        let (_gradient, hessian) = crate::custom_family::custom_family_outer_derivatives(
+            &family,
+            &specs,
+            &BlockwiseFitOptions::default(),
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::Derivative::Unavailable
+        );
+    }
+
+    #[test]
     fn binomial_location_scale_term_builder_requires_exact_spatial_joint_path() {
         let n = 8usize;
         let builder = BinomialLocationScaleTermBuilder {
