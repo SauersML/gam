@@ -12070,10 +12070,22 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Survival marginal-slope rows couple time, marginal, log-slope, and
-        // optional flex blocks (score-warp / link-deviation) through the row
-        // kernel.
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.n as u64, specs)
+        // Operator-aware: the rigid K=4 RowKernel + RowKernelHessianWorkspace
+        // adapter (see `exact_newton_joint_hessian_workspace`) applies joint
+        // Hv at O(n · (p_time + p_marginal + p_logslope + p_flex)) per call.
+        // Reporting the dense build cost when the matrix-free path will run
+        // would push the outer planner's cost gate to first-order BFGS even
+        // though the operator path is what actually executes.
+        let n = self.n as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |a, p| a.saturating_add(p));
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
+            n.saturating_mul(p_total)
+        } else {
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
+        }
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
