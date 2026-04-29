@@ -5,6 +5,7 @@ use crate::faer_ndarray::{
 use crate::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
 use crate::types::RidgePolicy;
 use faer::Accum;
+use faer::Par;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{
@@ -3042,11 +3043,18 @@ impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOpera
                 context: "ChunkedKernelDesignOperator::row_chunk_into shape mismatch",
             });
         }
-        out.assign(&self.row_chunk_combined(rows));
+        if let Some(combined) = self.materialized_combined() {
+            out.assign(&combined.slice(s![rows, ..]));
+        } else {
+            out.assign(&self.row_chunk_combined(rows));
+        }
         Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return combined.clone();
+        }
         self.row_chunk_combined(0..self.n)
     }
 }
