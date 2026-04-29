@@ -806,9 +806,11 @@ fn predict_survival_location_scale_batch(
     let derivative_guard =
         crate::families::survival_location_scale::DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
     if derivative_guard > 0.0 {
-        for i in 0..n {
-            eta_offset_exit[i] += derivative_guard * (age_exit[i] - time_anchor);
-        }
+        ndarray::Zip::from(&mut eta_offset_exit)
+            .and(&age_exit)
+            .par_for_each(|out, &t| {
+                *out += derivative_guard * (t - time_anchor);
+            });
     }
 
     let saved_fit = saved_survival_location_scale_fit_result(model)?;
