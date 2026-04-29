@@ -665,13 +665,6 @@ def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> 
     knots = min(knots, max_knots)
     if family == "binomial":
         knots = min(knots, max(3, n_obs // 5))
-    if basis_type == "tps":
-        # Rust's low-rank TPS path is unstable at centers=3 in crowded,
-        # near-collinear small-n designs (for example 10 smooths over a
-        # 40-row training split). mgcv's `bs='tp', k=3` behaves like an
-        # aggressively low-rank linear smoother, so that corner tests a
-        # basis mismatch more than TPS behavior. Keep TPS fuzzing at k>=4.
-        knots = max(knots, 4)
     if basis_type == "duchon" and n_smooths < 2:
         n_smooths = 2  # duchon needs at least 2 dims
         smooth_kinds = [choice(list(SMOOTH_FN.keys())) for _ in range(n_smooths)]
@@ -729,8 +722,6 @@ def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
         min_duchon_centers = 8
         max_knots = max(min_duchon_centers, sc.n_obs // max(sc.n_smooths + 1, 2) - 2)
         sc.knots = min(max(sc.knots, min_duchon_centers), max_knots)
-    elif basis_filter == "tps":
-        sc.knots = max(sc.knots, 4)
 
 
 def select_scenarios(

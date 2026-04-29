@@ -121,16 +121,6 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertIn("length_scale=1.0", formula)
         self.assertIn("order=1, power=1", formula)
 
-    def test_tps_scenarios_do_not_use_three_centers(self) -> None:
-        sc = _FUZZ.generate_scenario(54)
-        self.assertEqual(sc.basis_type, "tps")
-        self.assertGreaterEqual(sc.knots, 4)
-
-        forced = _FUZZ.generate_scenario(1)
-        forced.knots = 3
-        _FUZZ._apply_basis_filter(forced, "tps")
-        self.assertEqual(forced.knots, 4)
-
 
 def _trial(*, family="gaussian", model_type="gam", basis="ps",
            gap=None, rust_metric=None, mgcv_metric=None,
