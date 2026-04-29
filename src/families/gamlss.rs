@@ -4449,9 +4449,9 @@ fn binomial_location_scalesecond_directional_coefficients(
     let n = y.len();
     // Per-row second-directional coefficient computation. m4 dispatch
     // can fail (Result), so collect a Result<Vec<(tt, tl, ll)>>.
-    let triples: Result<Vec<(f64, f64, f64)>, _> = (0..n)
+    let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
         .into_par_iter()
-        .map(|i| -> Result<(f64, f64, f64), _> {
+        .map(|i| -> Result<(f64, f64, f64), String> {
             let q = core.q0[i];
             let r = 1.0 / core.sigma[i];
             let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
