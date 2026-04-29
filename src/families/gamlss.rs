@@ -7090,7 +7090,11 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
     }
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.dim);
+        assert_eq!(
+            factor.nrows(),
+            self.dim,
+            "two-block projected trace factor row mismatch"
+        );
         let cols = factor.ncols();
         if cols == 0 {
             return 0.0;
@@ -7127,7 +7131,11 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         factor: &Array2<f64>,
         cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.dim);
+        assert_eq!(
+            factor.nrows(),
+            self.dim,
+            "two-block cached projected trace factor row mismatch"
+        );
         let cols = factor.ncols();
         if cols == 0 {
             return 0.0;
@@ -20350,7 +20358,7 @@ mod tests {
             .expect("d2H operator present");
         let cache = crate::solver::estimate::reml::unified::ProjectedFactorCache::default();
 
-        for (name, op) in [("dH", dh_op), ("d2H", d2h_op)] {
+        for (name, op) in [("dH", dh_op.clone()), ("d2H", d2h_op.clone())] {
             let dense = op.to_dense();
             let dense_projected = dense.dot(&factor);
             let want: f64 = factor
@@ -20374,6 +20382,42 @@ mod tests {
                 );
             }
         }
+
+        let mut reused_factor = factor.clone();
+        let _ = dh_op.trace_projected_factor_cached(&reused_factor, &cache);
+        reused_factor[[0, 0]] += 0.25;
+        let dense = dh_op.to_dense();
+        let dense_projected = dense.dot(&reused_factor);
+        let want: f64 = reused_factor
+            .iter()
+            .zip(dense_projected.iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum();
+        let got = dh_op.trace_projected_factor_cached(&reused_factor, &cache);
+        let tol = 1e-9 * want.abs().max(1.0) + 1e-9;
+        assert!(
+            (want - got).abs() <= tol,
+            "cached projected trace reused stale factor contents: dense={want:.6e}, got={got:.6e}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "two-block cached projected trace factor row mismatch")]
+    fn binomial_location_scale_projected_trace_rejects_wrong_factor_rows() {
+        let (family, states, specs) = bls_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len();
+        let d_beta = array![0.07, -0.04, 0.21, 0.08, -0.13];
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dh_op = workspace
+            .directional_derivative_operator(&d_beta)
+            .expect("dH operator call")
+            .expect("dH operator present");
+        let bad_factor = Array2::<f64>::zeros((p + 1, 2));
+        let cache = crate::solver::estimate::reml::unified::ProjectedFactorCache::default();
+        let _ = dh_op.trace_projected_factor_cached(&bad_factor, &cache);
     }
 
     #[test]
