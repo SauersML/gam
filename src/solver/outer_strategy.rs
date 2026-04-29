@@ -1563,11 +1563,23 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=ValueAndGradient dim={} (first-order bridge)",
+            x.len()
+        );
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
+        let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        log::info!(
+            "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge)",
+            stage_start.elapsed().as_secs_f64(),
+            eval.cost,
+            g_norm,
+        );
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -1607,6 +1619,11 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=ValueAndGradient dim={}",
+            x.len()
+        );
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
@@ -1614,6 +1631,12 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        log::info!(
+            "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e}",
+            stage_start.elapsed().as_secs_f64(),
+            eval.cost,
+            g_norm,
+        );
         log::info!(
             "[OUTER] eval#{n} (grad) cost={cost:.6e} |g|={gnorm:.3e}",
             n = self.eval_count,
@@ -1630,6 +1653,11 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        let stage_start = std::time::Instant::now();
+        log::info!(
+            "[STAGE] outer eval start order=ValueGradientHessian dim={}",
+            x.len()
+        );
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
@@ -1637,6 +1665,12 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        log::info!(
+            "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s cost={:.6e} |g|={:.3e}",
+            stage_start.elapsed().as_secs_f64(),
+            eval.cost,
+            g_norm,
+        );
         log::info!(
             "[OUTER] eval#{n} (hess) cost={cost:.6e} |g|={gnorm:.3e}",
             n = self.eval_count,

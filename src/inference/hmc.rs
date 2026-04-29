@@ -825,19 +825,28 @@ fn joint_family_logp_and_grad(
 fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let n = data.n_samples;
     let mut residual = Array1::<f64>::zeros(n);
-    // Zip-based fused fill-and-fold avoids per-element bounds checks
-    // (vs `eta[i]` / `data.y[i]` / `data.weights[i]`) and lets LLVM vectorize
-    // the dominant exp/log1p kernel across contiguous slices.
-    let mut ll = 0.0_f64;
-    ndarray::Zip::from(&mut residual)
-        .and(eta)
-        .and(&**data.y)
-        .and(&**data.weights)
-        .for_each(|r, &eta_i, &y_i, &w_i| {
-            ll += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
+    // Per-row independent: residual entry + ll contribution. Parallel map
+    // + sum reduce.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let n = data.n_samples;
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let eta_i = eta[i];
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
             let mu = NutsPosterior::sigmoid_stable(eta_i);
-            *r = w_i * (y_i - mu);
-        });
+            (
+                w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i)),
+                w_i * (y_i - mu),
+            )
+        })
+        .collect();
+    let mut ll = 0.0_f64;
+    for (i, (ll_i, r_i)) in pairs.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = r_i;
+    }
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -850,25 +859,32 @@ fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64
 ///
 /// Uses erfc-based log Φ for numerical stability.
 fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.n_samples;
-    let mut residual = Array1::<f64>::zeros(n);
-    let mut ll = 0.0_f64;
-    ndarray::Zip::from(&mut residual)
-        .and(eta)
-        .and(&**data.y)
-        .and(&**data.weights)
-        .for_each(|r, &eta_i, &y_i, &w_i| {
-            // log Φ(η) and log(1−Φ(η)) = log Φ(−η)
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let eta_i = eta[i];
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
             let log_phi_pos = log_ndtr(eta_i);
             let log_phi_neg = log_ndtr(-eta_i);
-            ll += w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg);
-            // Inverse Mills ratios via exp(log φ − log Φ) for stability.
             let log_phi_val = standard_normal_log_pdf(eta_i);
             let ratio_pos = (log_phi_val - log_phi_pos).exp();
             let ratio_neg = (log_phi_val - log_phi_neg).exp();
             let grad_i = y_i * ratio_pos - (1.0 - y_i) * ratio_neg;
-            *r = w_i * grad_i;
-        });
+            (
+                w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg),
+                w_i * grad_i,
+            )
+        })
+        .collect();
+    let mut residual = Array1::<f64>::zeros(n);
+    let mut ll = 0.0_f64;
+    for (i, (ll_i, r_i)) in pairs.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = r_i;
+    }
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -880,34 +896,35 @@ fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f6
 /// log p(y|η) = Σ [y·log(1−exp(−exp(η))) + (1−y)·(−exp(η))]
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
 fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.n_samples;
-    let mut residual = Array1::<f64>::zeros(n);
-    let mut ll = 0.0_f64;
-    ndarray::Zip::from(&mut residual)
-        .and(eta)
-        .and(&**data.y)
-        .and(&**data.weights)
-        .for_each(|r, &eta_raw, &y_i, &w_i| {
-            let eta_i = eta_raw.clamp(-700.0, 700.0);
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
             let exp_eta = eta_i.exp();
-            // −exp(η) clamped to avoid overflow in exp(−exp(η))
             let neg_exp_eta = (-exp_eta).clamp(-700.0, 0.0);
-            let exp_neg_exp_eta = neg_exp_eta.exp(); // exp(−exp(η))
+            let exp_neg_exp_eta = neg_exp_eta.exp();
             let log_mu = (-exp_neg_exp_eta).ln_1p();
-            // log(1−μ) = log(exp(−exp(η))) = −exp(η)
             let log_one_minus_mu = -exp_eta;
-            ll += w_i * (y_i * log_mu + (1.0 - y_i) * log_one_minus_mu);
-
-            // Gradient: y · exp(η)·exp(−exp(η)) / (1−exp(−exp(η))) − (1-y)·exp(η).
-            // Ratio computed as exp(η)·exp(−exp(η) − log_mu) for stability.
+            let ll_i = w_i * (y_i * log_mu + (1.0 - y_i) * log_one_minus_mu);
             let grad_y1 = if log_mu.is_finite() && log_mu > -700.0 {
                 exp_eta * (neg_exp_eta - log_mu).exp()
             } else {
                 1.0
             };
             let grad_y0 = -exp_eta;
-            *r = w_i * (y_i * grad_y1 + (1.0 - y_i) * grad_y0);
-        });
+            (ll_i, w_i * (y_i * grad_y1 + (1.0 - y_i) * grad_y0))
+        })
+        .collect();
+    let mut residual = Array1::<f64>::zeros(n);
+    let mut ll = 0.0_f64;
+    for (i, (ll_i, r_i)) in pairs.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = r_i;
+    }
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)

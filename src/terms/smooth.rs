@@ -10512,10 +10512,10 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         );
         self.realizer
             .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
-        log::trace!(
-            "[outer-timing] ensure_theta (apply_log_kappa, {} terms): {:.1}ms",
+        log::info!(
+            "[STAGE] ensure_theta (apply_log_kappa, {} terms): {:.3}s",
             self.spatial_terms.len(),
-            t_ensure.elapsed().as_secs_f64() * 1000.0,
+            t_ensure.elapsed().as_secs_f64(),
         );
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
@@ -12262,12 +12262,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         target_term.lower_bounds_local = lower_bounds_local;
         target_term.linear_constraints_local = linear_constraints_local;
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
-        log::trace!(
-            "[outer-timing] replace_term_realization (term {}, '{}', cols={}): {:.1}ms",
+        log::info!(
+            "[STAGE] smooth basis rebuild (term {}, '{}', cols={}): {:.3}s",
             term_idx,
             target_term.name,
             coeff_range.len(),
-            t_replace.elapsed().as_secs_f64() * 1000.0,
+            t_replace.elapsed().as_secs_f64(),
         );
         Ok(())
     }
@@ -12561,11 +12561,11 @@ impl<'d> ExactJointDesignCache<'d> {
             }
         }
 
-        log::trace!(
-            "[outer-timing] ensure_theta (n-block, {} blocks, {} realizers): {:.1}ms",
+        log::info!(
+            "[STAGE] ensure_theta (n-block, {} blocks, {} realizers): {:.3}s",
             n,
             self.realizers.len(),
-            t_ensure.elapsed().as_secs_f64() * 1000.0,
+            t_ensure.elapsed().as_secs_f64(),
         );
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
