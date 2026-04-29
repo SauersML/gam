@@ -19209,7 +19209,7 @@ mod tests {
     use super::*;
     use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
-    use crate::testing::no_densify_design;
+    use crate::testing::{binomial_location_scale_base_fixture, no_densify_design};
     use ndarray::{Array2, Axis, array};
     use num_dual::{
         DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
@@ -25215,52 +25215,24 @@ mod tests {
     /// dispatcher will trip the FD check via stale (zero) gradients.
     #[test]
     fn binomial_location_scale_batched_gradient_matches_finite_difference() {
-        use crate::families::custom_family::{
-            BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix,
-        };
+        use crate::families::custom_family::BlockwiseFitOptions;
 
         // 7-row, two-block intercept-only problem with a unit-Identity
         // penalty per block. Larger n risks PIRLS taking many iterations and
         // amplifying FD round-off; small p keeps the leverage-block sizes
         // (p_t = 1, p_ls = 1) tiny so the manual reference is trivial to
         // sanity-check.
-        let n = 7usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: threshold_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2]),
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: log_sigma_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![-0.2],
-            initial_beta: Some(array![-0.1]),
-        };
+        let base = binomial_location_scale_base_fixture();
         let family = BinomialLocationScaleFamily {
-            y,
-            weights,
+            y: base.y,
+            weights: base.weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
+            threshold_design: Some(base.threshold_design),
+            log_sigma_design: Some(base.log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
         };
 
-        let specs = vec![thresholdspec, log_sigmaspec];
+        let specs = vec![base.threshold_spec, base.log_sigma_spec];
         let penalty_counts = vec![1usize, 1usize];
         let rho = array![0.05, -0.15];
         let options = BlockwiseFitOptions {
