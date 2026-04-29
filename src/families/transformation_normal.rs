@@ -569,14 +569,54 @@ impl TransformationNormalFamily {
 
     // --- Internal helpers ---
 
+    fn row_quantities(&self, beta: &Array1<f64>) -> TransformationNormalRowQuantityCache {
+        {
+            let cache = self
+                .row_quantity_cache
+                .lock()
+                .expect("CTN row quantity cache mutex poisoned");
+            if let Some(cached) = cache.as_ref().filter(|cached| cached.matches_beta(beta)) {
+                return cached.clone();
+            }
+        }
+
+        let h = self.x_val_kron.forward_mul(beta) + self.offset.as_ref();
+        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let inv_h_prime = h_prime.mapv(|hp| 1.0 / hp);
+        let inv_h_prime_sq = h_prime.mapv(|hp| 1.0 / (hp * hp));
+        let inv_h_prime_cu = h_prime.mapv(|hp| 1.0 / (hp * hp * hp));
+        let inv_h_prime_qu = h_prime.mapv(|hp| {
+            let hp2 = hp * hp;
+            1.0 / (hp2 * hp2)
+        });
+        let row_quantities = TransformationNormalRowQuantityCache {
+            beta: Arc::new(beta.clone()),
+            h: Arc::new(h),
+            h_prime: Arc::new(h_prime),
+            inv_h_prime: Arc::new(inv_h_prime),
+            inv_h_prime_sq: Arc::new(inv_h_prime_sq),
+            inv_h_prime_cu: Arc::new(inv_h_prime_cu),
+            inv_h_prime_qu: Arc::new(inv_h_prime_qu),
+        };
+
+        let mut cache = self
+            .row_quantity_cache
+            .lock()
+            .expect("CTN row quantity cache mutex poisoned");
+        *cache = Some(row_quantities.clone());
+        row_quantities
+    }
+
     /// Compute h and h' from the current coefficients.
     ///
     /// Uses the Kronecker-aware operators directly, avoiding full
     /// n × p_total matrix-vector products through a materialized tensor product.
     fn compute_h_and_h_prime(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let h = self.x_val_kron.forward_mul(beta) + self.offset.as_ref();
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
-        (h, h_prime)
+        let row_quantities = self.row_quantities(beta);
+        (
+            row_quantities.h.as_ref().clone(),
+            row_quantities.h_prime.as_ref().clone(),
+        )
     }
 }
 
@@ -918,7 +958,9 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
 
         // Hard monotonicity gate: ℓ = -½h² + log h' is only defined for h' > 0,
@@ -957,12 +999,13 @@ impl CustomFamily for TransformationNormalFamily {
                 .zip(h.as_slice().unwrap().par_iter())
                 .zip(h_prime.as_slice().unwrap().par_iter())
                 .zip(weights.as_slice().unwrap().par_iter())
-                .map(|(((((wh, wih), wih2), &hi), &hpi), &wi)| {
-                    let inv = 1.0 / hpi;
+                .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
+                .zip(row_quantities.inv_h_prime_sq.as_slice().unwrap().par_iter())
+                .map(|(((((((wh, wih), wih2), &hi), &hpi), &wi), &inv), &inv_sq)| {
                     let w_inv = wi * inv;
                     *wh = wi * hi;
                     *wih = w_inv;
-                    *wih2 = w_inv * inv;
+                    *wih2 = wi * inv_sq;
                     wi * (-0.5 * hi * hi + hpi.ln())
                 })
                 .sum::<f64>()
@@ -999,7 +1042,9 @@ impl CustomFamily for TransformationNormalFamily {
         if block_states.len() != 1 {
             return Err("expected 1 block".to_string());
         }
-        let (h, h_prime) = self.compute_h_and_h_prime(&block_states[0].beta);
+        let row_quantities = self.row_quantities(&block_states[0].beta);
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
         let min_hp = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
         if min_hp <= 0.0 {
             return Ok(f64::NEG_INFINITY);
@@ -1045,7 +1090,9 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
         let n = h.len();
         let min_h_prime = h_prime.iter().copied().fold(f64::INFINITY, f64::min);
         if min_h_prime <= 0.0 {
@@ -1069,9 +1116,10 @@ impl CustomFamily for TransformationNormalFamily {
                 .zip(h.as_slice().unwrap().par_iter())
                 .zip(h_prime.as_slice().unwrap().par_iter())
                 .zip(weights.as_slice().unwrap().par_iter())
-                .map(|((((wh, wih), &hi), &hpi), &wi)| {
+                .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
+                .map(|(((((wh, wih), &hi), &hpi), &wi), &inv)| {
                     *wh = wi * hi;
-                    *wih = wi / hpi;
+                    *wih = wi * inv;
                     wi * (-0.5 * hi * hi + hpi.ln())
                 })
                 .sum::<f64>()
