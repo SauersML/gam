@@ -7002,8 +7002,8 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
 }
 
 struct DesignTwoBlockRowCoeffOperator {
-    x_a: DesignMatrix,
-    x_b: DesignMatrix,
+    x_a: Arc<Array2<f64>>,
+    x_b: Arc<Array2<f64>>,
     c_aa: Array1<f64>,
     c_ab: Array1<f64>,
     c_bb: Array1<f64>,
@@ -7019,16 +7019,16 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.dim);
-        let v_a = v.slice(s![0..self.pa]).to_owned();
-        let v_b = v.slice(s![self.pa..self.dim]).to_owned();
-        let u_a = self.x_a.matrixvectormultiply(&v_a);
-        let u_b = self.x_b.matrixvectormultiply(&v_b);
+        let v_a = v.slice(s![0..self.pa]);
+        let v_b = v.slice(s![self.pa..self.dim]);
+        let u_a = fast_av(self.x_a.as_ref(), &v_a);
+        let u_b = fast_av(self.x_b.as_ref(), &v_b);
         debug_assert_eq!(u_a.len(), self.nrows);
         debug_assert_eq!(u_b.len(), self.nrows);
         let r_a = &self.c_aa * &u_a + &self.c_ab * &u_b;
         let r_b = &self.c_ab * &u_a + &self.c_bb * &u_b;
-        let out_a = self.x_a.transpose_vector_multiply(&r_a);
-        let out_b = self.x_b.transpose_vector_multiply(&r_b);
+        let out_a = fast_atv(self.x_a.as_ref(), &r_a);
+        let out_b = fast_atv(self.x_b.as_ref(), &r_b);
         let mut out = Array1::<f64>::zeros(self.dim);
         out.slice_mut(s![0..self.pa]).assign(&out_a);
         out.slice_mut(s![self.pa..self.dim]).assign(&out_b);
@@ -7042,12 +7042,12 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
             return Array2::<f64>::zeros((self.dim, 0));
         }
 
-        let a = self.x_a.to_dense_cow();
-        let b = self.x_b.to_dense_cow();
+        let a = self.x_a.as_ref();
+        let b = self.x_b.as_ref();
         let f_a = factor.slice(s![0..self.pa, ..]);
         let f_b = factor.slice(s![self.pa..self.dim, ..]);
-        let u_a = fast_ab(a.as_ref(), &f_a);
-        let u_b = fast_ab(b.as_ref(), &f_b);
+        let u_a = fast_ab(a, &f_a);
+        let u_b = fast_ab(b, &f_b);
 
         let mut r_a = Array2::<f64>::zeros((self.nrows, cols));
         let mut r_b = Array2::<f64>::zeros((self.nrows, cols));
@@ -7063,8 +7063,8 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
             }
         }
 
-        let out_a = fast_atb(a.as_ref(), &r_a);
-        let out_b = fast_atb(b.as_ref(), &r_b);
+        let out_a = fast_atb(a, &r_a);
+        let out_b = fast_atb(b, &r_b);
         let mut out = Array2::<f64>::zeros((self.dim, cols));
         out.slice_mut(s![0..self.pa, ..]).assign(&out_a);
         out.slice_mut(s![self.pa..self.dim, ..]).assign(&out_b);
@@ -7078,12 +7078,12 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
             return 0.0;
         }
 
-        let a = self.x_a.to_dense_cow();
-        let b = self.x_b.to_dense_cow();
+        let a = self.x_a.as_ref();
+        let b = self.x_b.as_ref();
         let f_a = factor.slice(s![0..self.pa, ..]);
         let f_b = factor.slice(s![self.pa..self.dim, ..]);
-        let u_a = fast_ab(a.as_ref(), &f_a);
-        let u_b = fast_ab(b.as_ref(), &f_b);
+        let u_a = fast_ab(a, &f_a);
+        let u_b = fast_ab(b, &f_b);
 
         let mut trace = 0.0;
         for row in 0..self.nrows {
@@ -7123,11 +7123,11 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         // once and assembling the four blocks via the streaming faer GEMMs
         // costs `O(n · max(pa,pb)²)` instead of `O(dim²)` repeated row-chunk
         // recomputations from the default `mul_basis_columns_into` path.
-        let a = self.x_a.to_dense_cow();
-        let b = self.x_b.to_dense_cow();
-        let h_aa = crate::faer_ndarray::fast_xt_diag_x(a.as_ref(), &self.c_aa);
-        let h_bb = crate::faer_ndarray::fast_xt_diag_x(b.as_ref(), &self.c_bb);
-        let h_ab = crate::faer_ndarray::fast_xt_diag_y(a.as_ref(), &self.c_ab, b.as_ref());
+        let a = self.x_a.as_ref();
+        let b = self.x_b.as_ref();
+        let h_aa = crate::faer_ndarray::fast_xt_diag_x(a, &self.c_aa);
+        let h_bb = crate::faer_ndarray::fast_xt_diag_x(b, &self.c_bb);
+        let h_ab = crate::faer_ndarray::fast_xt_diag_y(a, &self.c_ab, b);
         let mut out = Array2::<f64>::zeros((self.dim, self.dim));
         out.slice_mut(s![0..self.pa, 0..self.pa]).assign(&h_aa);
         out.slice_mut(s![self.pa..self.dim, self.pa..self.dim])
@@ -7364,8 +7364,8 @@ fn make_two_block_row_coeff_operator(
 }
 
 fn make_two_block_design_row_coeff_operator(
-    x_a: DesignMatrix,
-    x_b: DesignMatrix,
+    x_a: Arc<Array2<f64>>,
+    x_b: Arc<Array2<f64>>,
     c_aa: Array1<f64>,
     c_ab: Array1<f64>,
     c_bb: Array1<f64>,
@@ -14653,9 +14653,11 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
 /// second directional derivatives.
 struct BinomialLocationScaleHessianWorkspace {
     family: BinomialLocationScaleFamily,
-    block_states: Vec<ParameterBlockState>,
     x_t: DesignMatrix,
     x_ls: DesignMatrix,
+    x_t_dense: Arc<Array2<f64>>,
+    x_ls_dense: Arc<Array2<f64>>,
+    core: BinomialLocationScaleCore,
     coeff_tt: Array1<f64>,
     coeff_tl: Array1<f64>,
     coeff_ll: Array1<f64>,
@@ -14669,13 +14671,27 @@ impl BinomialLocationScaleHessianWorkspace {
         x_t: DesignMatrix,
         x_ls: DesignMatrix,
     ) -> Result<Self, String> {
+        let eta_t = &block_states[BinomialLocationScaleFamily::BLOCK_T].eta;
+        let eta_ls = &block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+        let core = binomial_location_scale_core(
+            &family.y,
+            &family.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &family.link_kind,
+        )?;
         let (coeff_tt, coeff_tl, coeff_ll) =
             family.exact_newton_joint_hessian_row_coefficients(&block_states)?;
+        let x_t_dense = Arc::new(x_t.to_dense_cow().into_owned());
+        let x_ls_dense = Arc::new(x_ls.to_dense_cow().into_owned());
         Ok(Self {
             family,
-            block_states,
             x_t,
             x_ls,
+            x_t_dense,
+            x_ls_dense,
+            core,
             coeff_tt,
             coeff_tl,
             coeff_ll,
@@ -14696,18 +14712,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             ));
         }
         // u_t = X_t v_t, u_ls = X_ls v_ls
-        let u_t = self
-            .x_t
-            .matrixvectormultiply(&v.slice(s![0..pt]).to_owned());
-        let u_ls = self
-            .x_ls
-            .matrixvectormultiply(&v.slice(s![pt..total]).to_owned());
+        let u_t = fast_av(self.x_t_dense.as_ref(), &v.slice(s![0..pt]));
+        let u_ls = fast_av(self.x_ls_dense.as_ref(), &v.slice(s![pt..total]));
         // r_t = D_tt .* u_t + D_tl .* u_ls; r_ls = D_tl .* u_t + D_ll .* u_ls
         let r_t = &self.coeff_tt * &u_t + &self.coeff_tl * &u_ls;
         let r_ls = &self.coeff_tl * &u_t + &self.coeff_ll * &u_ls;
         // (X_t^T r_t, X_ls^T r_ls)
-        let out_t = self.x_t.transpose_vector_multiply(&r_t);
-        let out_ls = self.x_ls.transpose_vector_multiply(&r_ls);
+        let out_t = fast_atv(self.x_t_dense.as_ref(), &r_t);
+        let out_ls = fast_atv(self.x_ls_dense.as_ref(), &r_ls);
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pt]).assign(&out_t);
         out.slice_mut(s![pt..total]).assign(&out_ls);
@@ -14748,33 +14760,19 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
                 total
             ));
         }
-        let eta_t = &self.block_states[BinomialLocationScaleFamily::BLOCK_T].eta;
-        let eta_ls = &self.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
-        let core = binomial_location_scale_core(
-            &self.family.y,
-            &self.family.weights,
-            eta_t,
-            eta_ls,
-            None,
-            &self.family.link_kind,
-        )?;
-        let d_eta_t = self
-            .x_t
-            .matrixvectormultiply(&d_beta_flat.slice(s![0..pt]).to_owned());
-        let d_eta_ls = self
-            .x_ls
-            .matrixvectormultiply(&d_beta_flat.slice(s![pt..total]).to_owned());
+        let d_eta_t = fast_av(self.x_t_dense.as_ref(), &d_beta_flat.slice(s![0..pt]));
+        let d_eta_ls = fast_av(self.x_ls_dense.as_ref(), &d_beta_flat.slice(s![pt..total]));
         let (c_tt, c_tl, c_ll) = binomial_location_scale_first_directional_coefficients(
             &self.family.y,
             &self.family.weights,
-            &core,
+            &self.core,
             &d_eta_t,
             &d_eta_ls,
             &self.family.link_kind,
         );
         Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
-            self.x_t.clone(),
-            self.x_ls.clone(),
+            self.x_t_dense.clone(),
+            self.x_ls_dense.clone(),
             c_tt,
             c_tl,
             c_ll,
@@ -14806,32 +14804,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
                 total
             ));
         }
-        let eta_t = &self.block_states[BinomialLocationScaleFamily::BLOCK_T].eta;
-        let eta_ls = &self.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
-        let core = binomial_location_scale_core(
-            &self.family.y,
-            &self.family.weights,
-            eta_t,
-            eta_ls,
-            None,
-            &self.family.link_kind,
-        )?;
-        let d_eta_t_u = self
-            .x_t
-            .matrixvectormultiply(&d_beta_u.slice(s![0..pt]).to_owned());
-        let d_eta_ls_u = self
-            .x_ls
-            .matrixvectormultiply(&d_beta_u.slice(s![pt..total]).to_owned());
-        let d_eta_t_v = self
-            .x_t
-            .matrixvectormultiply(&d_beta_v.slice(s![0..pt]).to_owned());
-        let d_eta_ls_v = self
-            .x_ls
-            .matrixvectormultiply(&d_beta_v.slice(s![pt..total]).to_owned());
+        let d_eta_t_u = fast_av(self.x_t_dense.as_ref(), &d_beta_u.slice(s![0..pt]));
+        let d_eta_ls_u = fast_av(self.x_ls_dense.as_ref(), &d_beta_u.slice(s![pt..total]));
+        let d_eta_t_v = fast_av(self.x_t_dense.as_ref(), &d_beta_v.slice(s![0..pt]));
+        let d_eta_ls_v = fast_av(self.x_ls_dense.as_ref(), &d_beta_v.slice(s![pt..total]));
         let (c_tt, c_tl, c_ll) = binomial_location_scalesecond_directional_coefficients(
             &self.family.y,
             &self.family.weights,
-            &core,
+            &self.core,
             &d_eta_t_u,
             &d_eta_ls_u,
             &d_eta_t_v,
@@ -14839,8 +14819,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
             &self.family.link_kind,
         )?;
         Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
-            self.x_t.clone(),
-            self.x_ls.clone(),
+            self.x_t_dense.clone(),
+            self.x_ls_dense.clone(),
             c_tt,
             c_tl,
             c_ll,
