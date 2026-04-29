@@ -1039,7 +1039,7 @@ pub fn materialize<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
     let parsed = parse_formula(formula)?;
-    let col_map = build_col_map(data);
+    let col_map = data.column_map();
 
     if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
         if config.transformation_normal {
@@ -1138,14 +1138,6 @@ pub fn resolve_family(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-fn build_col_map(data: &Dataset) -> HashMap<String, usize> {
-    data.headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect()
-}
 
 fn marginal_slope_col_map_with_z_alias(
     col_map: &HashMap<String, usize>,

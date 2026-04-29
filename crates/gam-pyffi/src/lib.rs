@@ -1,6 +1,9 @@
 use csv::StringRecord;
 use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, DeviationRuntime};
-use gam::estimate::BlockRole;
+use gam::estimate::{
+    BlockRole, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
+    saved_sas_state_from_fit,
+};
 use gam::families::family_meta::{family_to_link, pretty_familyname};
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::survival_likelihood_modename;
@@ -22,9 +25,7 @@ use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkState,
-};
+use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::Array1;
 use pyo3::exceptions::PyValueError;
@@ -503,7 +504,7 @@ fn predict_table_impl(
     if matches!(model_class, PredictModelClass::Survival) {
         return predict_table_survival(&model, &dataset, &options);
     }
-    let col_map = build_col_map(&dataset);
+    let col_map = dataset.column_map();
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
         resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
@@ -1787,30 +1788,6 @@ fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
     }
 }
 
-fn saved_mixture_state_from_fit(fit: &gam::estimate::UnifiedFitResult) -> Option<MixtureLinkState> {
-    match &fit.fitted_link {
-        gam::estimate::FittedLinkState::Mixture { state, .. } => Some(state.clone()),
-        _ => None,
-    }
-}
-
-fn saved_latent_cloglog_state_from_fit(
-    fit: &gam::estimate::UnifiedFitResult,
-) -> Option<LatentCLogLogState> {
-    match &fit.fitted_link {
-        gam::estimate::FittedLinkState::LatentCLogLog { state } => Some(*state),
-        _ => None,
-    }
-}
-
-fn saved_sas_state_from_fit(fit: &gam::estimate::UnifiedFitResult) -> Option<SasLinkState> {
-    match &fit.fitted_link {
-        gam::estimate::FittedLinkState::Sas { state, .. }
-        | gam::estimate::FittedLinkState::BetaLogistic { state, .. } => Some(*state),
-        _ => None,
-    }
-}
-
 fn predict_table_survival(
     model: &FittedModel,
     dataset: &EncodedDataset,
@@ -1818,7 +1795,7 @@ fn predict_table_survival(
 ) -> Result<String, String> {
     use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
 
-    let col_map = build_col_map(dataset);
+    let col_map = dataset.column_map();
     let payload = model.payload();
     let training_headers = payload.training_headers.as_ref();
     let primary_offset =
@@ -1908,15 +1885,6 @@ fn predict_table_survival(
     };
     serde_json::to_string(&survival_payload)
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
-}
-
-fn build_col_map(dataset: &EncodedDataset) -> HashMap<String, usize> {
-    dataset
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(index, header)| (header.clone(), index))
-        .collect()
 }
 
 fn link_name(link: gam::types::LinkFunction) -> &'static str {

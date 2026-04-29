@@ -11,6 +11,7 @@ use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
+    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentZPolicy,
@@ -2966,7 +2967,7 @@ fn run_predict_survival(
                 .assign(&x_time_exit_dense);
             full
         } else {
-            x_time_exit_dense
+            x_time_exit_dense.as_ref().clone()
         };
         let time_design = DesignMatrix::from(x_time_exit.clone());
         let survival_primary_design =
@@ -7564,31 +7565,6 @@ impl SavedFitSummary {
 }
 
 use gam::estimate::{ensure_finite_scalar, validate_all_finite};
-
-fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::MixtureLinkState> {
-    match &fit.fitted_link {
-        FittedLinkState::Mixture { state, .. } => Some(state.clone()),
-        _ => None,
-    }
-}
-
-fn saved_latent_cloglog_state_from_fit(
-    fit: &UnifiedFitResult,
-) -> Option<gam::types::LatentCLogLogState> {
-    match &fit.fitted_link {
-        FittedLinkState::LatentCLogLog { state } => Some(*state),
-        _ => None,
-    }
-}
-
-fn saved_sas_state_from_fit(fit: &UnifiedFitResult) -> Option<gam::types::SasLinkState> {
-    match &fit.fitted_link {
-        FittedLinkState::Sas { state, .. } | FittedLinkState::BetaLogistic { state, .. } => {
-            Some(state.clone())
-        }
-        _ => None,
-    }
-}
 
 fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
     spec.linear_terms.iter().any(|term| {
