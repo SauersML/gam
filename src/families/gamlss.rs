@@ -6812,16 +6812,16 @@ struct RowCoeffPair {
     coeff: Array1<f64>,
 }
 
-/// Per-call scratch buffers for `RowCoeffOperator::mul_vec`. Held under a
-/// `Mutex` so the operator stays `Send + Sync` while reusing the
-/// per-channel allocations across `mul_vec` calls. At biobank scale
-/// (`n ≈ 4·10⁵`, up to 8 channels) this saves `2 · n_ch · n` floats of
-/// allocation per call (≈6 MB for `n_ch = 8`).
+/// Pooled per-call scratch for `RowCoeffOperator::mul_vec`. Each call
+/// pops a buffer set; if the pool is empty (parallel callers exhausted
+/// it) we allocate fresh — the alloc is amortized as concurrent callers
+/// recycle. The pool's `Mutex` is taken only for `pop`/`push` (constant
+/// time), never during the matmul.
 ///
-/// **Invariant**: `u[k].len() == nrows` and `r[k].len() == nrows` for
-/// every channel `k` after construction. `mul_vec` overwrites `u` (via
-/// `fast_av_into`) and zeroes-then-accumulates `r`, leaving both buffers
-/// in any state on return — callers must not depend on residual content.
+/// **Invariant**: every buffer in `pool[k].u[ch]` and `pool[k].r[ch]` has
+/// length `nrows`. `mul_vec` overwrites `u` via `fast_av_into` and
+/// zeroes-then-accumulates `r`, leaving both buffers in any state on
+/// return — callers must not depend on residual content.
 struct RowCoeffScratch {
     u: Vec<Array1<f64>>,
     r: Vec<Array1<f64>>,
@@ -6831,7 +6831,8 @@ struct RowCoeffScratch {
 /// derivatives that decompose as `H = sum_{a,b} X_a^T diag(c_{ab}) X_b`
 /// with each `X_a` an `n × p_a` design and `c_{ab}` an `n` row coefficient
 /// vector. `mul_vec` applies the operator in O(n · sum_a p_a) per call,
-/// reusing pre-sized scratch buffers for `u`, `r`.
+/// reusing pre-sized scratch buffers for `u`, `r` from a small lock-pool
+/// so concurrent `mul_vec` callers do not serialize on the same scratch.
 ///
 /// `block_offsets` gives the starting column of each output block; the
 /// operator dimension is the sum of all block widths. Each channel's
@@ -6843,7 +6844,7 @@ struct RowCoeffOperator {
     dim: usize,
     pair_coeffs: Vec<RowCoeffPair>,
     nrows: usize,
-    scratch: std::sync::Mutex<RowCoeffScratch>,
+    scratch_pool: std::sync::Mutex<Vec<RowCoeffScratch>>,
 }
 
 impl RowCoeffOperator {
@@ -6870,8 +6871,8 @@ impl RowCoeffOperator {
     /// One-line constructor for the standard (channels, pair-coeffs)
     /// recipe used by every GAMLSS LS workspace: pass the block widths,
     /// the channel list as `(block_id, design)` tuples, and the pair
-    /// list as `(a, b, coeff)` tuples. The constructor builds the
-    /// scratch buffers once.
+    /// list as `(a, b, coeff)` tuples. Pre-allocates one scratch in the
+    /// pool so the first warm `mul_vec` call skips allocation.
     fn from_directions(
         block_widths: Vec<usize>,
         channels: Vec<(usize, Arc<Array2<f64>>)>,
@@ -6892,13 +6893,10 @@ impl RowCoeffOperator {
             block_offsets.push(acc);
             acc += *w;
         }
-        let scratch = RowCoeffScratch {
-            u: (0..channels.len())
-                .map(|_| Array1::<f64>::zeros(nrows))
-                .collect(),
-            r: (0..channels.len())
-                .map(|_| Array1::<f64>::zeros(nrows))
-                .collect(),
+        let n_ch = channels.len();
+        let initial = RowCoeffScratch {
+            u: (0..n_ch).map(|_| Array1::<f64>::zeros(nrows)).collect(),
+            r: (0..n_ch).map(|_| Array1::<f64>::zeros(nrows)).collect(),
         };
         Self {
             channels,
@@ -6907,8 +6905,29 @@ impl RowCoeffOperator {
             dim: acc,
             pair_coeffs,
             nrows,
-            scratch: std::sync::Mutex::new(scratch),
+            scratch_pool: std::sync::Mutex::new(vec![initial]),
         }
+    }
+
+    fn acquire_scratch(&self) -> RowCoeffScratch {
+        self.scratch_pool
+            .lock()
+            .expect("RowCoeffOperator scratch pool poisoned")
+            .pop()
+            .unwrap_or_else(|| {
+                let n_ch = self.channels.len();
+                RowCoeffScratch {
+                    u: (0..n_ch).map(|_| Array1::<f64>::zeros(self.nrows)).collect(),
+                    r: (0..n_ch).map(|_| Array1::<f64>::zeros(self.nrows)).collect(),
+                }
+            })
+    }
+
+    fn release_scratch(&self, scratch: RowCoeffScratch) {
+        self.scratch_pool
+            .lock()
+            .expect("RowCoeffOperator scratch pool poisoned")
+            .push(scratch);
     }
 }
 
@@ -6920,11 +6939,8 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.dim);
         let n = self.nrows;
-        let mut scratch = self
-            .scratch
-            .lock()
-            .expect("RowCoeffOperator scratch lock poisoned");
-        let RowCoeffScratch { u, r } = &mut *scratch;
+        let mut scratch = self.acquire_scratch();
+        let RowCoeffScratch { u, r } = &mut scratch;
 
         // 1) u_a = X_a · v[block_a slice]. `fast_av_into` writes directly
         //    into the pre-sized scratch buffer — no per-call n-sized
@@ -6998,6 +7014,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
             let contrib = fast_atv(ch.design.as_ref(), &r[k]);
             block += &contrib;
         }
+        self.release_scratch(scratch);
         out
     }
 
