@@ -1856,7 +1856,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             self.priorweights,
                         )?
                     } else {
-                        let x_dense_cow = x_transformed.as_dense_cow();
+                        let x_dense_cow = x_transformed.to_dense_cow();
                         compute_jeffreys_pirls_diagnostics(
                             x_dense_cow.view(),
                             self.workspace.eta_buf.view(),
@@ -2734,6 +2734,18 @@ fn constrained_stationarity_norm(
     projected_gradient_norm(gradient, beta, lower_bounds)
 }
 
+fn chunk_rows_for_nnz_count(n: usize, p: usize) -> usize {
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 256;
+    const MAX_ROWS: usize = 65_536;
+    if p == 0 {
+        return n.max(1);
+    }
+    (TARGET_BYTES / (p * 8))
+        .clamp(MIN_ROWS, MAX_ROWS)
+        .min(n.max(1))
+}
+
 fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
@@ -2778,11 +2790,31 @@ fn estimate_sparse_native_decision(
     let x_sparse = if let Some(sparse) = x_original.as_sparse() {
         sparse
     } else {
-        let dense = x_original.as_dense_cow();
-        return dense_reject(
-            "design_not_sparse",
-            dense.as_ref().iter().filter(|v| v.abs() > 1e-12).count(),
-        );
+        // Count nonzeros via chunks so operator-backed dense designs
+        // (e.g. lazy ScaleDeviationOperator) participate in this diagnostic
+        // path without forcing a full materialization.
+        let n = x_original.nrows();
+        let chunk = chunk_rows_for_nnz_count(n, x_original.ncols());
+        let mut nnz: usize = 0;
+        if chunk > 0 && n > 0 {
+            let mut start = 0;
+            while start < n {
+                let end = (start + chunk).min(n);
+                match x_original.try_row_chunk(start..end) {
+                    Ok(rows) => {
+                        nnz = nnz.saturating_add(
+                            rows.iter().filter(|v| v.abs() > 1e-12).count(),
+                        );
+                    }
+                    Err(_) => {
+                        nnz = nnz
+                            .saturating_add((end - start).saturating_mul(x_original.ncols()));
+                    }
+                }
+                start = end;
+            }
+        }
+        return dense_reject("design_not_sparse", nnz);
     };
     let nnz_x = x_sparse.val().len();
     match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
