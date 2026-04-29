@@ -1,6 +1,8 @@
 use crate::estimate::EstimationError;
 use crate::families::lognormal_kernel::latent_cloglog_jet5;
-use crate::probability::{normal_cdf, normal_pdf};
+use crate::probability::{
+    normal_cdf, normal_pdf, stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
+};
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkComponent, LinkFunction,
     MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
@@ -63,30 +65,6 @@ fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
     jet.d2 = canonicalzero(jet.d2);
     jet.d3 = canonicalzero(jet.d3);
     jet
-}
-
-#[inline]
-fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
-    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
-}
-
-#[inline]
-fn stable_nonnegative_poly_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
-    if coeffs.is_empty() || !x.is_finite() {
-        return 0.0;
-    }
-    if x <= 600.0 {
-        return horner_polynomial(x, coeffs) * (-x).exp();
-    }
-
-    let inv_x = x.recip();
-    let mut tail = 0.0;
-    for &c in coeffs {
-        tail = tail * inv_x + c;
-    }
-    let degree = (coeffs.len() - 1) as f64;
-    let scale = (degree * x.ln() - x).exp();
-    scale * tail
 }
 
 #[inline]
