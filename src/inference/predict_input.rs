@@ -328,12 +328,13 @@ pub fn build_predict_input_for_model(
                 .reduce(|| f64::INFINITY, f64::min);
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
-                    "transformation-normal fit is non-monotone in y for at least one observation: \
-                     analytic lower bound on h'(y, x) is {min_h_prime:.3e}, threshold {monotonicity_eps:.0e}. \
-                     The model β admits a region where h(y, x) decreases in y, which contradicts the CTN \
-                     conditional-Gaussianization contract. Refit with stronger regularization (raise the \
-                     penalty seed) or with more training data; this typically arises when n is small \
-                     relative to p_resp × p_cov."
+                    "prediction failed: transformation-normal fit is non-monotone in y \
+                     for at least one observation. Analytic lower bound on h'(y, x) is \
+                     {min_h_prime:.3e}, threshold {monotonicity_eps:.0e}. The model β \
+                     admits a region where h(y, x) decreases in y, which contradicts the \
+                     CTN conditional-Gaussianization contract. Refit with stronger \
+                     regularization (raise the penalty seed) or with more training data; \
+                     this typically arises when n is small relative to p_resp × p_cov."
                 ));
             }
 
