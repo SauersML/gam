@@ -244,22 +244,8 @@ fn resolved_wiggle_inverse_link(
         FittedLinkState::BetaLogistic { state, .. } => InverseLink::BetaLogistic(state),
         FittedLinkState::Mixture { state, .. } => InverseLink::Mixture(state),
     };
-    ensure_joint_wiggle_supported(&resolved, "standard link wiggle")?;
+    require_inverse_link_supports_joint_wiggle(&resolved, "standard link wiggle")?;
     Ok(resolved)
-}
-
-fn ensure_joint_wiggle_supported(link: &InverseLink, context: &str) -> Result<(), String> {
-    match link {
-        InverseLink::Standard(crate::types::LinkFunction::Sas)
-        | InverseLink::Standard(crate::types::LinkFunction::BetaLogistic)
-        | InverseLink::LatentCLogLog(_)
-        | InverseLink::Sas(_)
-        | InverseLink::BetaLogistic(_)
-        | InverseLink::Mixture(_) => Err(format!(
-            "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
-        )),
-        InverseLink::Standard(_) => Ok(()),
-    }
 }
 
 fn deviation_block_config_from_formula_linkwiggle(
@@ -446,7 +432,7 @@ fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
 ) -> Result<BinomialLocationScaleFitResult, String> {
     if let Some(wiggle_cfg) = request.wiggle {
-        ensure_joint_wiggle_supported(
+        require_inverse_link_supports_joint_wiggle(
             &request.spec.link_kind,
             "binomial location-scale link wiggle",
         )?;
@@ -528,7 +514,7 @@ fn fit_survival_location_scale_model(
         let inverse_link = spec.inverse_link.clone();
 
         let fit = if let Some(wiggle) = wiggle {
-            ensure_joint_wiggle_supported(&inverse_link, "survival link wiggle")?;
+            require_inverse_link_supports_joint_wiggle(&inverse_link, "survival link wiggle")?;
             let mut pilot_spec = spec.clone();
             pilot_spec.linkwiggle_block = None;
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;

@@ -85,19 +85,20 @@ fn estimate_gamma_shape_from_eta(
 ) -> f64 {
     const EPS: f64 = 1e-12;
 
-    let mut weighted_target = 0.0;
-    let mut total_weight = 0.0;
-    for i in 0..eta.len() {
-        let wi = priorweights[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let yi = y[i].max(EPS);
-        let mui = eta[i].clamp(-700.0, 700.0).exp().max(EPS);
-        let ratio = yi / mui;
-        weighted_target += wi * (ratio - ratio.ln() - 1.0);
-        total_weight += wi;
-    }
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let (weighted_target, total_weight) = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i].max(0.0);
+            if wi == 0.0 {
+                return (0.0_f64, 0.0_f64);
+            }
+            let yi = y[i].max(EPS);
+            let mui = eta[i].clamp(-700.0, 700.0).exp().max(EPS);
+            let ratio = yi / mui;
+            (wi * (ratio - ratio.ln() - 1.0), wi)
+        })
+        .reduce(|| (0.0_f64, 0.0_f64), |(t1, w1), (t2, w2)| (t1 + t2, w1 + w2));
 
     if total_weight <= 0.0 {
         return 1.0;
