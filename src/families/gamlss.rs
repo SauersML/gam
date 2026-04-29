@@ -7071,6 +7071,37 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         out
     }
 
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.dim);
+        let cols = factor.ncols();
+        if cols == 0 {
+            return 0.0;
+        }
+
+        let a = self.x_a.to_dense_cow();
+        let b = self.x_b.to_dense_cow();
+        let f_a = factor.slice(s![0..self.pa, ..]);
+        let f_b = factor.slice(s![self.pa..self.dim, ..]);
+        let u_a = fast_ab(a.as_ref(), &f_a);
+        let u_b = fast_ab(b.as_ref(), &f_b);
+
+        let mut trace = 0.0;
+        for row in 0..self.nrows {
+            let mut aa = 0.0;
+            let mut ab = 0.0;
+            let mut bb = 0.0;
+            for col in 0..cols {
+                let ua = u_a[[row, col]];
+                let ub = u_b[[row, col]];
+                aa += ua * ua;
+                ab += ua * ub;
+                bb += ub * ub;
+            }
+            trace += self.c_aa[row] * aa + 2.0 * self.c_ab[row] * ab + self.c_bb[row] * bb;
+        }
+        trace
+    }
+
     fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
         debug_assert!(start + cols <= self.dim);
