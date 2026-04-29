@@ -7,7 +7,9 @@ use gam::families::scale_design::{
     infer_non_intercept_start,
 };
 use gam::families::survival_construction::survival_likelihood_modename;
-use gam::families::survival_predict::apply_inverse_link_state_to_fit_result;
+use gam::families::survival_predict::{
+    apply_inverse_link_state_to_fit_result, resolve_termspec_for_prediction,
+};
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -21,8 +23,7 @@ use gam::inference::model::{
 use gam::matrix::DesignMatrix;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{
-    SmoothBasisSpec, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design,
+    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::transformation_normal::TransformationNormalFitResult;
@@ -2239,68 +2240,6 @@ fn build_col_map(dataset: &EncodedDataset) -> HashMap<String, usize> {
         .enumerate()
         .map(|(index, header)| (header.clone(), index))
         .collect()
-}
-
-fn resolve_termspec_for_prediction(
-    model_spec: &Option<TermCollectionSpec>,
-    training_headers: Option<&Vec<String>>,
-    col_map: &HashMap<String, usize>,
-    spec_label: &str,
-) -> Result<TermCollectionSpec, String> {
-    let saved = model_spec.as_ref().ok_or_else(|| {
-        format!(
-            "model is missing {spec_label}; refit with the current engine to guarantee train/predict design consistency"
-        )
-    })?;
-    saved.validate_frozen(spec_label)?;
-    let headers = training_headers.ok_or_else(|| {
-        "model is missing training_headers; refit with the current engine to guarantee stable feature mapping at prediction time"
-            .to_string()
-    })?;
-    let remapped = remap_term_collectionspec_columns(saved, headers, col_map)?;
-    remapped.validate_frozen(spec_label)?;
-    Ok(remapped)
-}
-
-fn remap_term_collectionspec_columns(
-    spec: &TermCollectionSpec,
-    training_headers: &[String],
-    prediction_column_map: &HashMap<String, usize>,
-) -> Result<TermCollectionSpec, String> {
-    let mut remapped = spec.clone();
-    let resolve_training_index = |index: usize| -> Result<usize, String> {
-        let name = training_headers
-            .get(index)
-            .ok_or_else(|| format!("saved training column index {index} is out of bounds"))?;
-        prediction_column_map
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("prediction data is missing required column '{name}'"))
-    };
-
-    for linear_term in &mut remapped.linear_terms {
-        linear_term.feature_col = resolve_training_index(linear_term.feature_col)?;
-    }
-    for random_effect_term in &mut remapped.random_effect_terms {
-        random_effect_term.feature_col = resolve_training_index(random_effect_term.feature_col)?;
-    }
-    for smooth_term in &mut remapped.smooth_terms {
-        match &mut smooth_term.basis {
-            SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                *feature_col = resolve_training_index(*feature_col)?;
-            }
-            SmoothBasisSpec::ThinPlate { feature_cols, .. }
-            | SmoothBasisSpec::Matern { feature_cols, .. }
-            | SmoothBasisSpec::Duchon { feature_cols, .. }
-            | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
-                for feature_col in feature_cols.iter_mut() {
-                    *feature_col = resolve_training_index(*feature_col)?;
-                }
-            }
-        }
-    }
-
-    Ok(remapped)
 }
 
 fn fit_result_from_saved_model_for_prediction(
