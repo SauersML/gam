@@ -32,7 +32,7 @@ use crate::families::custom_family::{
     ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -6107,6 +6107,28 @@ fn build_blocks_from_base_spec(
     vec![spec]
 }
 
+fn build_blocks_from_base_spec_with_log_lambdas(
+    base_block_spec: &ParameterBlockSpec,
+    beta_hint: Option<&Array1<f64>>,
+    log_lambdas: &Array1<f64>,
+) -> Result<Vec<ParameterBlockSpec>, String> {
+    if log_lambdas.len() != base_block_spec.initial_log_lambdas.len() {
+        return Err(format!(
+            "transformation final fit rho length mismatch: got {}, expected {}",
+            log_lambdas.len(),
+            base_block_spec.initial_log_lambdas.len()
+        ));
+    }
+    let mut spec = base_block_spec.clone();
+    spec.initial_log_lambdas = log_lambdas.clone();
+    if let Some(hint) = beta_hint
+        && hint.len() == spec.design.ncols()
+    {
+        spec.initial_beta = Some(hint.clone());
+    }
+    Ok(vec![spec])
+}
+
 // ---------------------------------------------------------------------------
 // Top-level fit function
 // ---------------------------------------------------------------------------
@@ -6404,15 +6426,28 @@ pub fn fit_transformation_normal(
         // configuration with --scale-dimensions and ≥4 PCs.
         true,
         // fit_fn
-        |_, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let cache_ref = exact_geometry_cache.borrow();
             let geometry = cache_ref
                 .as_ref()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            let blocks =
-                build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
-            let fit = fit_custom_family(&geometry.family, &blocks, &options)
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            let blocks = build_blocks_from_base_spec_with_log_lambdas(
+                &geometry.base_block_spec,
+                beta_hint.borrow().as_ref(),
+                &rho,
+            )?;
+            let warm_start = exact_warm_start.borrow();
+            let fit = fit_custom_family_fixed_log_lambdas(
+                &geometry.family,
+                &blocks,
+                &options,
+                warm_start.as_ref(),
+                0,
+                0.0,
+                true,
+            )
                 .map_err(|e| format!("transformation fit_fn: {e}"))?;
             // Update warm start hints.
             if let Some(block) = fit.block_states.first() {
