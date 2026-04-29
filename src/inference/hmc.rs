@@ -609,13 +609,12 @@ impl NutsPosterior {
         // === Step 5: z-space gradient ===
         // ∇z log p = L^T ∇_β ℓ  −  (l + M z)
         let mut gradz = self.chol_t.dot(&grad_ll_beta);
-        // gradz -= (penalty_z_lin + M z); fused in a single per-element loop
-        // to avoid temporary Array1 allocations.
+        // gradz -= (penalty_z_lin + M z); fused parallel per-element update.
         let lin_view = self.penalty_z_lin.view();
         ndarray::Zip::from(&mut gradz)
             .and(&lin_view)
             .and(&mz)
-            .for_each(|g, &l, &m| {
+            .par_for_each(|g, &l, &m| {
                 *g -= l + m;
             });
 
