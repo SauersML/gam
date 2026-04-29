@@ -3217,76 +3217,20 @@ impl KroneckerDesign {
                     c.column_mut(a).assign(&covariate.apply(&beta_row));
                     d.column_mut(a).assign(&covariate.apply(&delta_row));
                 }
-                Self::min_step_kronecker_reduce(response_grid, c.view(), d.view(), slack, dh_eps)
+                let mut cache = KroneckerActiveSetCache::new();
+                Self::scan_kronecker_boundary_and_refresh_cache(
+                    response_grid,
+                    c.view(),
+                    d.view(),
+                    slack,
+                    dh_eps,
+                    n,
+                    response_grid.nrows(),
+                    p_resp,
+                    &mut cache,
+                )
             }
         }
-    }
-
-    /// Streaming reduction over the `n_cov × n_grid` virtual rows from
-    /// pre-computed `C = X · β_matᵀ` and `D = X · δ_matᵀ` projections.
-    ///
-    /// Splitting this out lets the inner-Newton outer loop cache `C` across
-    /// successive `min_step_to_boundary` calls when only `β` (or only `δ`)
-    /// has changed: a single `apply` pass per fresh column is enough to
-    /// refresh the projection, instead of re-projecting both factors from
-    /// scratch each time. The reduction itself is identical to the inline
-    /// path in `min_step_to_boundary`, so the cached and un-cached paths
-    /// agree to BLAS-rounding.
-    ///
-    /// `c` and `d` must each be `(n_cov × p_resp)` and share the column
-    /// ordering with `response_grid` (`p_resp` columns). The active
-    /// monotonicity certification at accepted iterates can call this
-    /// directly with the freshly-projected pair so the full grid is scanned
-    /// exactly once per accepted step.
-    fn min_step_kronecker_reduce(
-        response_grid: &Array2<f64>,
-        c: ndarray::ArrayView2<'_, f64>,
-        d: ndarray::ArrayView2<'_, f64>,
-        slack: f64,
-        dh_eps: f64,
-    ) -> f64 {
-        let n = c.nrows();
-        let n_grid = response_grid.nrows();
-        let p_resp = response_grid.ncols();
-        debug_assert_eq!(c.ncols(), p_resp);
-        debug_assert_eq!(d.nrows(), n);
-        debug_assert_eq!(d.ncols(), p_resp);
-        // Stream the (i, g) reduction in row chunks. For each chunk:
-        //   H_chunk  = C[chunk] · Rᵀ      (m × n_grid)
-        //   dH_chunk = D[chunk] · Rᵀ      (m × n_grid)
-        // and reduce the fraction-to-boundary minimum locally before
-        // dropping the buffers. Per chunk: 2 · m · n_grid · 8 B
-        // ≈ 9 MiB at m = 1024 and biobank-scale n_grid.
-        const CHUNK_ROWS: usize = 1024;
-        let n_chunks = n.div_ceil(CHUNK_ROWS);
-        let r_t = response_grid.t();
-        (0..n_chunks)
-            .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * CHUNK_ROWS;
-                let end = (start + CHUNK_ROWS).min(n);
-                let m = end - start;
-                let c_chunk = c.slice(s![start..end, ..]);
-                let d_chunk = d.slice(s![start..end, ..]);
-                let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
-                let mut dh_chunk = Array2::<f64>::zeros((m, n_grid));
-                fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
-                fast_ab_into(&d_chunk, &r_t, &mut dh_chunk);
-                let mut local = f64::INFINITY;
-                for i_local in 0..m {
-                    for g in 0..n_grid {
-                        let dval = dh_chunk[[i_local, g]];
-                        if dval < -dh_eps {
-                            let hit = (h_chunk[[i_local, g]] - slack) / (-dval);
-                            if hit < local {
-                                local = hit;
-                            }
-                        }
-                    }
-                }
-                local
-            })
-            .reduce(|| f64::INFINITY, f64::min)
     }
 
     /// Project a `(p_resp × p_cov)` row-major coefficient vector through the
@@ -3496,7 +3440,7 @@ impl KroneckerDesign {
 
         // Cache stale or certificate failed: refresh the active set in the
         // same full-grid scan that computes the exact boundary step.
-        Self::refresh_active_set_cache_and_alpha(
+        Self::scan_kronecker_boundary_and_refresh_cache(
             response_grid,
             c,
             d,
@@ -3509,18 +3453,17 @@ impl KroneckerDesign {
         )
     }
 
-    /// Recompute the active-set cache from the current `c` projection and
-    /// return the exact full-grid boundary step for the current `d` projection.
+    /// Scan the full `n_cov × n_grid` virtual rows, recompute the active-set
+    /// cache from the current `c` projection, and return the exact boundary
+    /// step for the current `d` projection.
     ///
-    /// This fuses the old `min_step_kronecker_reduce(c,d)` pass with the
-    /// active-set refresh pass. On a stale certificate the previous code built
-    /// `H = c · Rᵀ` twice across the full monotonicity grid; this routine builds
-    /// `H` once, builds `dH` once, and updates both outputs from those chunks.
+    /// Both cached and uncached Kronecker line searches use this one streaming
+    /// reducer, so the full-grid scan has a single implementation.
     ///
     /// `active_pairs` collects (i, g) with `h_{i,g} - slack ≤ τ`; the
     /// `min_inactive_margin` is the smallest `h_{i,g} - slack` over inactive
     /// pairs (= the tightest non-active constraint).
-    fn refresh_active_set_cache_and_alpha(
+    fn scan_kronecker_boundary_and_refresh_cache(
         response_grid: &Array2<f64>,
         c: ndarray::ArrayView2<'_, f64>,
         d: ndarray::ArrayView2<'_, f64>,
