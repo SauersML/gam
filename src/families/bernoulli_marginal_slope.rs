@@ -7239,9 +7239,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // flex path produces a
         // `BernoulliMarginalSlopeExactNewtonJointHessianWorkspace`. Both
         // route the joint Hessian through Hv operators rather than dense
-        // assembly. This advertises representation support only; the realized
-        // custom-family cost gate still decides whether exact second-order
-        // outer work is affordable.
+        // assembly. This advertises β-space representation support only; it
+        // does not imply a profiled outer θ-HVP.
         true
     }
 
