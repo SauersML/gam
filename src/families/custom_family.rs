@@ -9799,6 +9799,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     s_psi_local,
                     start,
                     end,
+                    total,
                     psi_terms.hessian_psi_operator,
                 )
             } else {

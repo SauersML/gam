@@ -21,8 +21,8 @@ use gam::families::family_meta::{
 };
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
-    ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_operator,
-    build_scale_deviation_transform, infer_non_intercept_start,
+    ScaleDeviationTransform, build_scale_deviation_operator, build_scale_deviation_transform_design,
+    infer_non_intercept_start_design,
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
@@ -114,6 +114,23 @@ use thiserror::Error;
 mod report;
 
 type CliResult<T> = Result<T, CliError>;
+
+fn design_to_dense_by_chunks(design: &DesignMatrix, context: &str) -> Result<Array2<f64>, String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * std::mem::size_of::<f64>()))
+        .max(1)
+        .min(n.max(1));
+    let mut out = Array2::<f64>::zeros((n, p));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
+        out.slice_mut(s![start..end, ..]).assign(&chunk);
+    }
+    Ok(out)
+}
 
 #[derive(Debug, Error)]
 enum CliError {
