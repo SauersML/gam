@@ -806,7 +806,7 @@ fn factored_weighted_gram(
                 .assign(&block);
             if ic != ia {
                 out.slice_mut(s![ic * p_cov..(ic + 1) * p_cov, ia * p_cov..(ia + 1) * p_cov])
-                    .assign(&block);
+                    .assign(&block.t());
             }
         }
     }
