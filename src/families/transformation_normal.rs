@@ -780,40 +780,6 @@ fn factored_weighted_cross(
     Ok(out)
 }
 
-fn factored_weighted_gram(
-    left: &Array2<f64>,
-    right: &Array2<f64>,
-    weights: ndarray::ArrayView1<'_, f64>,
-    policy: &ResourcePolicy,
-) -> Array2<f64> {
-    let n = weights.len();
-    debug_assert_eq!(left.nrows(), n);
-    debug_assert_eq!(right.nrows(), n);
-    let p_resp = left.ncols();
-    let p_cov = right.ncols();
-    let mut out = Array2::<f64>::zeros((p_resp * p_cov, p_resp * p_cov));
-    let mut pair_weights = Array1::<f64>::zeros(n);
-
-    for ia in 0..p_resp {
-        let a_col = left.column(ia);
-        for ic in ia..p_resp {
-            let c_col = left.column(ic);
-            for r in 0..n {
-                pair_weights[r] = weights[r] * a_col[r] * c_col[r];
-            }
-            let block = chunked_weighted_bt_d(right, pair_weights.view(), right, policy);
-            out.slice_mut(s![ia * p_cov..(ia + 1) * p_cov, ic * p_cov..(ic + 1) * p_cov])
-                .assign(&block);
-            if ic != ia {
-                out.slice_mut(s![ic * p_cov..(ic + 1) * p_cov, ia * p_cov..(ia + 1) * p_cov])
-                    .assign(&block.t());
-            }
-        }
-    }
-
-    out
-}
-
 /// Chunked weighted B^T diag(w) D product without materializing any
 /// full rowwise-Kronecker intermediate.
 ///
@@ -3528,28 +3494,47 @@ impl KroneckerDesign {
             }
         }
 
-        // Cache stale or certificate failed: full grid scan refreshes both
-        // the answer AND the active set.
-        let alpha_full = Self::min_step_kronecker_reduce(response_grid, c, d, slack, dh_eps);
-        Self::refresh_active_set_cache(response_grid, c, slack, dh_eps, n, n_grid, p_resp, cache);
-        alpha_full
+        // Cache stale or certificate failed: refresh the active set in the
+        // same full-grid scan that computes the exact boundary step.
+        Self::refresh_active_set_cache_and_alpha(
+            response_grid,
+            c,
+            d,
+            slack,
+            dh_eps,
+            n,
+            n_grid,
+            p_resp,
+            cache,
+        )
     }
 
-    /// Recompute the active-set cache from the current `c` projection.
+    /// Recompute the active-set cache from the current `c` projection and
+    /// return the exact full-grid boundary step for the current `d` projection.
+    ///
+    /// This fuses the old `min_step_kronecker_reduce(c,d)` pass with the
+    /// active-set refresh pass. On a stale certificate the previous code built
+    /// `H = c · Rᵀ` twice across the full monotonicity grid; this routine builds
+    /// `H` once, builds `dH` once, and updates both outputs from those chunks.
+    ///
     /// `active_pairs` collects (i, g) with `h_{i,g} - slack ≤ τ`; the
     /// `min_inactive_margin` is the smallest `h_{i,g} - slack` over inactive
     /// pairs (= the tightest non-active constraint).
-    fn refresh_active_set_cache(
+    fn refresh_active_set_cache_and_alpha(
         response_grid: &Array2<f64>,
         c: ndarray::ArrayView2<'_, f64>,
+        d: ndarray::ArrayView2<'_, f64>,
         slack: f64,
         dh_eps: f64,
         n: usize,
         n_grid: usize,
         p_resp: usize,
         cache: &mut KroneckerActiveSetCache,
-    ) {
-        // Compute H = c · response_gridᵀ in chunked passes; classify rows.
+    ) -> f64 {
+        debug_assert_eq!(d.nrows(), n);
+        debug_assert_eq!(d.ncols(), p_resp);
+        // Compute H = c · response_gridᵀ and dH = d · response_gridᵀ in
+        // chunked passes; classify rows and reduce the boundary step.
         const CHUNK_ROWS: usize = 1024;
         // Active-set tolerance: small relative-to-slack with an additive
         // floor. The certificate is valid for any τ ≥ 0; this scale keeps
@@ -3559,21 +3544,32 @@ impl KroneckerDesign {
 
         let r_t = response_grid.t();
         let n_chunks = n.div_ceil(CHUNK_ROWS);
-        let (active_pairs, min_inactive): (Vec<(usize, usize)>, f64) = (0..n_chunks)
+        let (active_pairs, min_inactive, alpha_full): (Vec<(usize, usize)>, f64, f64) = (0..n_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * CHUNK_ROWS;
                 let end = (start + CHUNK_ROWS).min(n);
                 let m = end - start;
                 let c_chunk = c.slice(s![start..end, ..]);
+                let d_chunk = d.slice(s![start..end, ..]);
                 let mut h_chunk = Array2::<f64>::zeros((m, n_grid));
+                let mut dh_chunk = Array2::<f64>::zeros((m, n_grid));
                 fast_ab_into(&c_chunk, &r_t, &mut h_chunk);
+                fast_ab_into(&d_chunk, &r_t, &mut dh_chunk);
                 let mut local_active: Vec<(usize, usize)> = Vec::new();
                 let mut local_min = f64::INFINITY;
+                let mut local_alpha = f64::INFINITY;
                 for i_local in 0..m {
                     let i = start + i_local;
                     for g in 0..n_grid {
                         let h = h_chunk[[i_local, g]];
+                        let dval = dh_chunk[[i_local, g]];
+                        if dval < -dh_eps {
+                            let hit = (h - slack) / (-dval);
+                            if hit < local_alpha {
+                                local_alpha = hit;
+                            }
+                        }
                         let margin = h - slack;
                         if margin <= tau {
                             local_active.push((i, g));
@@ -3582,13 +3578,13 @@ impl KroneckerDesign {
                         }
                     }
                 }
-                (local_active, local_min)
+                (local_active, local_min, local_alpha)
             })
             .reduce(
-                || (Vec::new(), f64::INFINITY),
-                |(mut a, am), (b, bm)| {
+                || (Vec::new(), f64::INFINITY, f64::INFINITY),
+                |(mut a, am, aa), (b, bm, ba)| {
                     a.extend(b);
-                    (a, am.min(bm))
+                    (a, am.min(bm), aa.min(ba))
                 },
             );
 
@@ -3601,6 +3597,7 @@ impl KroneckerDesign {
         cache.dh_eps = dh_eps;
         cache.c_fingerprint = KroneckerActiveSetCache::fingerprint_of(c);
         cache.cached_for_version = cache.c_version;
+        alpha_full
     }
 
     /// Compute `self^T · v` where v is an n-vector.
@@ -3667,11 +3664,6 @@ impl KroneckerDesign {
     /// Thin wrapper over `weighted_cross_with(self, self, ...)`. Callers thread
     /// a real `ResourcePolicy` so chunk sizing matches the surrounding workload.
     fn weighted_gram(&self, w: &Array1<f64>, policy: &ResourcePolicy) -> Array2<f64> {
-        if let KroneckerDesign::KhatriRao { left, right } = self
-            && let Some(right_dense) = right.as_dense_ref()
-        {
-            return factored_weighted_gram(left, right_dense, w.view(), policy);
-        }
         self.weighted_cross_with(w.view(), self, policy)
             .expect("validated KroneckerDesign weighted Gram dimensions")
     }
