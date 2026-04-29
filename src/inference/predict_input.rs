@@ -10,6 +10,7 @@ use crate::families::survival_predict::{
 };
 use crate::families::transformation_normal::{
     TRANSFORMATION_GRID_RELATIVE_TOL, TRANSFORMATION_MONOTONICITY_EPS,
+    TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES, TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS,
     TRANSFORMATION_TAIL_GUARD_FRACTION,
 };
 use crate::inference::model::{FittedModel, PredictModelClass};
@@ -243,7 +244,9 @@ pub fn build_predict_input_for_model(
             let mut sorted_response_new = response_new.to_vec();
             sorted_response_new
                 .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let prediction_quantiles = sorted_response_new.len().min(129);
+            let prediction_quantiles = sorted_response_new
+                .len()
+                .min(TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES);
             if prediction_quantiles == 1 {
                 derivative_grid.push(sorted_response_new[0]);
             } else if prediction_quantiles > 1 {
