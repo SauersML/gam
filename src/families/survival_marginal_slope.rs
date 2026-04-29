@@ -23,8 +23,8 @@ use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_scaled_coeff4,
-    build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
-    is_sigma_aux_index as shared_is_sigma_aux_index,
+    add_two_surface_psi_outer, build_denested_partition_cells as shared_denested_partition_cells,
+    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials,
     probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
     scale_coeff4,
@@ -1315,36 +1315,18 @@ impl BlockHessianAccumulator {
         psi_row_j: &Array1<f64>,
         alpha: f64,
     ) {
-        if alpha == 0.0 {
-            return;
-        }
-        let col_i = psi_row_i.view().insert_axis(Axis(1));
-        let row_j = psi_row_j.view().insert_axis(Axis(0));
-
-        if block_i == block_j {
-            // Same block: symmetric rank-2 update to the diagonal block
-            let col_j = psi_row_j.view().insert_axis(Axis(1));
-            let row_i = psi_row_i.view().insert_axis(Axis(0));
-            let target = match block_i {
-                1 => &mut self.h_mm,
-                2 => &mut self.h_gg,
-                _ => return,
-            };
-            ndarray::linalg::general_mat_mul(alpha, &col_i, &row_j, 1.0, target);
-            ndarray::linalg::general_mat_mul(alpha, &col_j, &row_i, 1.0, target);
-        } else {
-            // Different blocks: one rank-1 update to h_mg.
-            // Block (marginal, logslope) gets the psi_marginal ⊗ psi_logslope contribution;
-            // the (logslope, marginal) transpose is assembled from h_mg^T automatically.
-            let (marginal_row, logslope_row) = if block_i == 1 {
-                (psi_row_i, psi_row_j)
-            } else {
-                (psi_row_j, psi_row_i)
-            };
-            let m_col = marginal_row.view().insert_axis(Axis(1));
-            let g_row = logslope_row.view().insert_axis(Axis(0));
-            ndarray::linalg::general_mat_mul(alpha, &m_col, &g_row, 1.0, &mut self.h_mg);
-        }
+        add_two_surface_psi_outer(
+            block_i,
+            psi_row_i,
+            block_j,
+            psi_row_j,
+            alpha,
+            1,
+            2,
+            &mut self.h_mm,
+            &mut self.h_gg,
+            &mut self.h_mg,
+        );
     }
 
     /// Assemble into a dense p×p matrix.
