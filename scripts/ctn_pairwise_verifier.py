@@ -181,12 +181,32 @@ def main():
     print(f"[verifier] max |Δ| pair  = {max_pair_diff:.3e}")
     print(f"[verifier] max |Δ| a_dir = {max_dir_diff:.3e}")
 
+    # Tight tolerance for IEEE-double rebuild of identical algebra in two
+    # languages. If this fails, either:
+    #   (a) the Rust pairwise body has a subtle bug not yet caught by the
+    #       existing tests (interesting!),
+    #   (b) my numpy reference has a different convention (e.g. Khatri-Rao
+    #       β indexing flipped), or
+    #   (c) the toy fixture in tests has drifted from this script.
     tol = 1e-12
     if max_pair_diff < tol and max_dir_diff < tol:
-        print(f"[verifier] PASS — Rust pairwise body matches numpy reference at < {tol}")
+        print(
+            f"[verifier] \033[32mPASS\033[0m — Rust pairwise body matches numpy reference at < {tol}"
+        )
         sys.exit(0)
     else:
-        print(f"[verifier] FAIL — Rust pairwise differs from numpy reference at > {tol}")
+        # Detailed sign-and-symmetry hints when something is off.
+        rust_pair = {(e["i"], e["j"]): e["a"] for e in rust["pairwise"]}
+        for (i, j), rust_a in sorted(rust_pair.items()):
+            if (j, i) in rust_pair:
+                sym = abs(rust_pair[(i, j)] - rust_pair[(j, i)])
+                if sym > 1e-12:
+                    print(
+                        f"[verifier]   asymmetry pair({i},{j})-pair({j},{i}) = {sym:.3e}"
+                    )
+        print(
+            f"[verifier] \033[31mFAIL\033[0m — Rust pairwise differs from numpy reference at > {tol}"
+        )
         sys.exit(1)
 
 
