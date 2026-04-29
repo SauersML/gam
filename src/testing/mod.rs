@@ -1,6 +1,66 @@
-//! Generic finite-difference testing utilities.
+//! Generic testing utilities.
 
-use ndarray::Array2;
+use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
+use crate::resource::MatrixMaterializationError;
+use ndarray::{Array1, Array2, Axis, s};
+use std::ops::Range;
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct NoDensifyOperator {
+    dense: Array2<f64>,
+}
+
+impl LinearOperator for NoDensifyOperator {
+    fn nrows(&self) -> usize {
+        self.dense.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.dense.ncols()
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        self.dense.dot(vector)
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        self.dense.t().dot(vector)
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "NoDensifyOperator weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
+        Ok(self.dense.t().dot(&weighted))
+    }
+}
+
+impl DenseDesignOperator for NoDensifyOperator {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ndarray::ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        out.assign(&self.dense.slice(s![rows, ..]));
+        Ok(())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        panic!("NoDensifyOperator must stay lazy")
+    }
+}
+
+pub fn no_densify_design(dense: Array2<f64>) -> DesignMatrix {
+    DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
+        dense,
+    })))
+}
 
 /// Assert that a central difference of an array-producing function matches the analytical derivative.
 #[macro_export]

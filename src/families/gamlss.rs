@@ -19209,6 +19209,7 @@ mod tests {
     use super::*;
     use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+    use crate::testing::no_densify_design;
     use ndarray::{Array2, Axis, array};
     use num_dual::{
         DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
@@ -19764,62 +19765,6 @@ mod tests {
             },
         ];
         (family, states, specs)
-    }
-
-    #[derive(Clone)]
-    struct NoDensifyOperator {
-        dense: Array2<f64>,
-    }
-
-    impl crate::matrix::LinearOperator for NoDensifyOperator {
-        fn nrows(&self) -> usize {
-            self.dense.nrows()
-        }
-
-        fn ncols(&self) -> usize {
-            self.dense.ncols()
-        }
-
-        fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-            self.dense.dot(vector)
-        }
-
-        fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-            self.dense.t().dot(vector)
-        }
-
-        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-            if weights.len() != self.nrows() {
-                return Err(format!(
-                    "NoDensifyOperator weight length mismatch: weights={}, nrows={}",
-                    weights.len(),
-                    self.nrows()
-                ));
-            }
-            let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
-            Ok(self.dense.t().dot(&weighted))
-        }
-    }
-
-    impl DenseDesignOperator for NoDensifyOperator {
-        fn row_chunk_into(
-            &self,
-            rows: std::ops::Range<usize>,
-            mut out: ndarray::ArrayViewMut2<'_, f64>,
-        ) -> Result<(), crate::resource::MatrixMaterializationError> {
-            out.assign(&self.dense.slice(s![rows, ..]));
-            Ok(())
-        }
-
-        fn to_dense(&self) -> Array2<f64> {
-            panic!("binomial location-scale operator workspace must not densify designs")
-        }
-    }
-
-    fn no_densify_design(dense: Array2<f64>) -> DesignMatrix {
-        DesignMatrix::from(crate::matrix::DenseDesignMatrix::from(Arc::new(
-            NoDensifyOperator { dense },
-        )))
     }
 
     #[test]

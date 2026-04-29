@@ -6183,17 +6183,16 @@ impl From<&DesignMatrix> for DesignBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkedKernelDesignOperator, DenseDesignMatrix, DenseDesignOperator, DesignMatrix,
-        EmbeddedColumnBlock, MultiChannelOperator, ReparamOperator, SparseDesignMatrix,
-        SparseHessianAccumulator, dense_matvec, dense_transpose_matvec,
-        dense_transpose_weighted_response,
+        ChunkedKernelDesignOperator, DenseDesignMatrix, DesignMatrix, EmbeddedColumnBlock,
+        MultiChannelOperator, ReparamOperator, SparseDesignMatrix, SparseHessianAccumulator,
+        dense_matvec, dense_transpose_matvec, dense_transpose_weighted_response,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
+    use crate::testing::no_densify_design;
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, Axis, array, s};
-    use std::ops::Range;
     use std::sync::Arc;
 
     fn exact_weighted_penalized_solve(
@@ -6430,64 +6429,10 @@ mod tests {
 
     #[test]
     fn design_matrix_hstack_preserves_lazy_blocks() {
-        #[derive(Clone)]
-        struct NoDensifyOperator {
-            dense: Array2<f64>,
-        }
-
-        impl LinearOperator for NoDensifyOperator {
-            fn nrows(&self) -> usize {
-                self.dense.nrows()
-            }
-
-            fn ncols(&self) -> usize {
-                self.dense.ncols()
-            }
-
-            fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-                self.dense.dot(vector)
-            }
-
-            fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-                self.dense.t().dot(vector)
-            }
-
-            fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-                if weights.len() != self.nrows() {
-                    return Err(format!(
-                        "NoDensifyOperator weight length mismatch: weights={}, nrows={}",
-                        weights.len(),
-                        self.nrows()
-                    ));
-                }
-                let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
-                Ok(self.dense.t().dot(&weighted))
-            }
-        }
-
-        impl DenseDesignOperator for NoDensifyOperator {
-            fn row_chunk_into(
-                &self,
-                rows: Range<usize>,
-                mut out: ndarray::ArrayViewMut2<'_, f64>,
-            ) -> Result<(), crate::resource::MatrixMaterializationError> {
-                out.assign(&self.dense.slice(s![rows, ..]));
-                Ok(())
-            }
-
-            fn to_dense(&self) -> Array2<f64> {
-                panic!("DesignMatrix::hstack should not densify lazy blocks")
-            }
-        }
-
         let left_dense = array![[1.0, 2.0], [3.0, 4.0]];
         let right_dense = array![[5.0], [6.0]];
-        let left = DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
-            dense: left_dense.clone(),
-        })));
-        let right = DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
-            dense: right_dense.clone(),
-        })));
+        let left = no_densify_design(left_dense.clone());
+        let right = no_densify_design(right_dense.clone());
         let stacked = DesignMatrix::hstack(vec![left, right]).expect("stacked design");
 
         assert!(stacked.as_dense_ref().is_none());
@@ -6512,52 +6457,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "DesignMatrix::as_dense_cow called on operator-backed design")]
     fn design_matrix_as_dense_cow_rejects_operator_backed_designs() {
-        #[derive(Clone)]
-        struct NoDensifyOperator {
-            dense: Array2<f64>,
-        }
-
-        impl LinearOperator for NoDensifyOperator {
-            fn nrows(&self) -> usize {
-                self.dense.nrows()
-            }
-
-            fn ncols(&self) -> usize {
-                self.dense.ncols()
-            }
-
-            fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-                self.dense.dot(vector)
-            }
-
-            fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-                self.dense.t().dot(vector)
-            }
-
-            fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-                let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
-                Ok(self.dense.t().dot(&weighted))
-            }
-        }
-
-        impl DenseDesignOperator for NoDensifyOperator {
-            fn row_chunk_into(
-                &self,
-                rows: Range<usize>,
-                mut out: ndarray::ArrayViewMut2<'_, f64>,
-            ) -> Result<(), crate::resource::MatrixMaterializationError> {
-                out.assign(&self.dense.slice(s![rows, ..]));
-                Ok(())
-            }
-
-            fn to_dense(&self) -> Array2<f64> {
-                panic!("as_dense_cow must reject before to_dense")
-            }
-        }
-
-        let design = DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
-            dense: array![[1.0, 2.0], [3.0, 4.0]],
-        })));
+        let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
         let _ = design.as_dense_cow();
     }
 
