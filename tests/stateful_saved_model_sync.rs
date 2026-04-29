@@ -192,7 +192,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         covariance: Some(covariance.clone()),
     }));
     payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
-    payload.training_headers = Some(vec![]);
+    payload.set_training_feature_metadata(vec![], vec![]);
     payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],
@@ -272,7 +272,7 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
         state: latent_state,
     }));
     payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
-    payload.training_headers = Some(vec![]);
+    payload.set_training_feature_metadata(vec![], vec![]);
     payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],

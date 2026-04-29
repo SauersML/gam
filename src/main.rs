@@ -73,8 +73,7 @@ use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSp
 use gam::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
-    append_zero_tail_columns, build_latent_survival_baseline_offsets,
-    build_survival_baseline_offsets, build_survival_time_basis,
+    append_zero_tail_columns, build_latent_survival_baseline_offsets, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_from_baseline,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
@@ -9185,6 +9184,7 @@ mod tests {
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
     };
+    use gam::survival_construction::build_survival_baseline_offsets;
     use gam::survival_construction::parse_survival_baseline_config;
     use gam::survival_construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
     use gam::survival_location_scale::project_onto_linear_constraints;
@@ -10237,7 +10237,7 @@ mod tests {
         payload.unified = Some(fit_result.clone());
         payload.fit_result = Some(fit_result);
         payload.data_schema = Some(DataSchema { columns: vec![] });
-        payload.training_headers = Some(vec![]);
+        payload.set_training_feature_metadata(vec![], vec![]);
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_logslope = Some(empty_termspec());
         payload.formula_logslope =
@@ -10342,7 +10342,10 @@ mod tests {
                 },
             ],
         });
-        payload.training_headers = Some(vec!["x".to_string(), "y".to_string()]);
+        payload.set_training_feature_metadata(
+            vec!["x".to_string(), "y".to_string()],
+            vec![(0.0, 1.0), (0.0, 1.0)],
+        );
         payload.resolved_termspec = Some(empty_termspec());
 
         let model = SavedModel::from_payload(payload);
@@ -10589,7 +10592,7 @@ mod tests {
         payload.formula_noise = Some("1".to_string());
         payload.beta_noise = Some(vec![beta_log_sigma]);
         payload.gaussian_response_scale = Some(response_scale);
-        payload.training_headers = Some(vec![]);
+        payload.set_training_feature_metadata(vec![], vec![]);
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
         SavedModel::from_payload(payload)
@@ -10650,7 +10653,7 @@ mod tests {
         payload.linkwiggle_knots = wiggle_knots;
         payload.linkwiggle_degree = wiggle_degree;
         payload.beta_link_wiggle = beta_link_wiggle;
-        payload.training_headers = Some(vec![]);
+        payload.set_training_feature_metadata(vec![], vec![]);
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
         SavedModel::from_payload(payload)
@@ -10708,7 +10711,7 @@ mod tests {
         payload.link = Some(linkname(link).to_string());
         payload.linkwiggle_knots = Some(wiggle_knots);
         payload.linkwiggle_degree = Some(wiggle_degree);
-        payload.training_headers = Some(vec![]);
+        payload.set_training_feature_metadata(vec![], vec![]);
         payload.resolved_termspec = Some(empty_termspec());
         SavedModel::from_payload(payload)
     }
@@ -11901,7 +11904,7 @@ mod tests {
             saved_fit_summary_stub(),
         ));
         survival.data_schema = Some(DataSchema { columns: vec![] });
-        survival.training_headers = Some(vec![]);
+        survival.set_training_feature_metadata(vec![], vec![]);
         survival.resolved_termspec = Some(empty_termspec());
         survival.resolved_termspec_noise = Some(empty_termspec());
         survival.formula_logslope = Some("1".to_string());
@@ -13050,12 +13053,15 @@ mod tests {
                 },
             ],
         });
-        payload.training_headers = Some(vec![
-            "entry".to_string(),
-            "exit".to_string(),
-            "event".to_string(),
-            "z".to_string(),
-        ]);
+        payload.set_training_feature_metadata(
+            vec![
+                "entry".to_string(),
+                "exit".to_string(),
+                "event".to_string(),
+                "z".to_string(),
+            ],
+            vec![(0.0, 0.0); 4],
+        );
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
         payload.resolved_termspec_logslope = Some(empty_termspec());
@@ -13159,7 +13165,7 @@ mod tests {
         payload.survival_time_basis = Some("none".to_string());
         payload.survival_likelihood = Some("transformation".to_string());
         payload.survival_distribution = Some("gaussian".to_string());
-        payload.training_headers = Some(vec![]);
+        payload.set_training_feature_metadata(vec![], vec![]);
         payload.resolved_termspec = Some(empty_termspec());
         let model = SavedModel::from_payload(payload);
         let got = super::saved_baseline_timewiggle_components(&eta, &eta, &deriv, &model)
@@ -13179,7 +13185,7 @@ mod tests {
             makeham: None,
         };
         let (eta_entry, eta_exit, derivative_exit) =
-            super::build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
+            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
                 .expect("baseline offsets");
         let wiggle_cfg = parse_linkwiggle_formulaspec(
             &BTreeMap::from([
@@ -13236,7 +13242,10 @@ mod tests {
         payload.survivalridge_lambda = Some(1e-4);
         payload.survival_likelihood = Some("transformation".to_string());
         payload.survival_distribution = Some("gaussian".to_string());
-        payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
+        payload.set_training_feature_metadata(
+            vec!["entry".to_string(), "exit".to_string()],
+            vec![(0.0, 0.0); 2],
+        );
         payload.resolved_termspec = Some(empty_termspec());
         payload.data_schema = Some(DataSchema {
             columns: vec![
@@ -13392,7 +13401,10 @@ mod tests {
         payload.survival_time_anchor = Some(time_anchor);
         payload.survival_beta_time = Some(vec![0.0; p_time]);
         payload.survival_likelihood = Some("latent".to_string());
-        payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
+        payload.set_training_feature_metadata(
+            vec!["entry".to_string(), "exit".to_string()],
+            vec![(0.0, 0.0); 2],
+        );
         payload.resolved_termspec = Some(empty_termspec());
         let model = SavedModel::from_payload(payload);
 
@@ -13482,7 +13494,7 @@ mod tests {
             makeham: None,
         };
         let (eta_entry, eta_exit, derivative_exit) =
-            super::build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
+            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)
                 .expect("baseline offsets");
         let wiggle_cfg = parse_linkwiggle_formulaspec(
             &BTreeMap::from([
@@ -13534,7 +13546,10 @@ mod tests {
         payload.survivalridge_lambda = Some(1e-4);
         payload.survival_likelihood = Some("transformation".to_string());
         payload.survival_distribution = Some("gaussian".to_string());
-        payload.training_headers = Some(vec!["entry".to_string(), "exit".to_string()]);
+        payload.set_training_feature_metadata(
+            vec!["entry".to_string(), "exit".to_string()],
+            vec![(0.0, 0.0); 2],
+        );
         payload.resolved_termspec = Some(empty_termspec());
         let model = SavedModel::from_payload(payload);
 
