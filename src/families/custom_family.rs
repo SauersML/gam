@@ -6951,15 +6951,14 @@ fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
         // `.map_err` propagates a hard error to the outer instead of looping
         // forever on a flat objective (see icu_survival_los).
         let consecutive_failures = Arc::new(AtomicUsize::new(0));
-        let consecutive_failures_for_op = Arc::clone(&consecutive_failures);
         let apply_op = move |v: &Array1<f64>| -> Array1<f64> {
             let mut out = match apply_h(v) {
                 Ok(out) => {
-                    consecutive_failures_for_op.store(0, Ordering::Relaxed);
+                    consecutive_failures.store(0, Ordering::Relaxed);
                     out
                 }
                 Err(error) => {
-                    let prev = consecutive_failures_for_op.fetch_add(1, Ordering::Relaxed);
+                    let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
                     log::warn!(
                         "joint exact-newton operator matvec failed during SLQ logdet: {error}"
                     );
@@ -8878,14 +8877,24 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
+                    let consecutive_failures = Arc::new(AtomicUsize::new(0));
                     match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
                         let mut out = match apply_h(v) {
-                            Ok(out) => out,
+                            Ok(out) => {
+                                consecutive_failures.store(0, Ordering::Relaxed);
+                                out
+                            }
                             Err(error) => {
+                                let prev =
+                                    consecutive_failures.fetch_add(1, Ordering::Relaxed);
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during outer trace construction: {error}"
                                 );
-                                Array1::<f64>::zeros(total)
+                                if prev + 1 >= JOINT_MATVEC_FAILURE_ESCALATE {
+                                    Array1::<f64>::from_elem(total, f64::NAN)
+                                } else {
+                                    Array1::<f64>::zeros(total)
+                                }
                             }
                         };
                         let penalty = apply_joint_block_penalty(
@@ -9161,14 +9170,24 @@ fn joint_outer_evaluate_efs(
                     let apply_h = Arc::clone(&apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
+                    let consecutive_failures = Arc::new(AtomicUsize::new(0));
                     match MatrixFreeSpdOperator::new(total, preconditioner_diag, move |v| {
                         let mut out = match apply_h(v) {
-                            Ok(out) => out,
+                            Ok(out) => {
+                                consecutive_failures.store(0, Ordering::Relaxed);
+                                out
+                            }
                             Err(error) => {
+                                let prev =
+                                    consecutive_failures.fetch_add(1, Ordering::Relaxed);
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during fixed-point trace construction: {error}"
                                 );
-                                Array1::<f64>::zeros(total)
+                                if prev + 1 >= JOINT_MATVEC_FAILURE_ESCALATE {
+                                    Array1::<f64>::from_elem(total, f64::NAN)
+                                } else {
+                                    Array1::<f64>::zeros(total)
+                                }
                             }
                         };
                         let penalty = apply_joint_block_penalty(
@@ -11424,6 +11443,13 @@ const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
 const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
+/// Number of consecutive matvec failures inside one SLQ logdet invocation
+/// after which the closure surfaces NaN (escalating to outer infeasibility)
+/// instead of substituting zeros. Single transient failures are still
+/// absorbed; a structurally broken matvec at the same rho — the
+/// icu_survival_los/death signature — escalates almost immediately because
+/// every probe in Lanczos calls the matvec and they all fail in succession.
+const JOINT_MATVEC_FAILURE_ESCALATE: usize = 3;
 
 pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
     true
