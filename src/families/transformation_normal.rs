@@ -2025,16 +2025,23 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        // CTN's joint Hessian is always supplied as a matrix-free Hv
+        // CTN's coefficient-space joint Hessian is supplied as a matrix-free Hv
         // operator: `exact_newton_joint_hessian_workspace` above unconditionally
         // returns a `TransformationNormalJointHessianWorkspace` for any single
         // block (the `block_states.len() != 1` guard surfaces a panic, never a
         // `None`), so the unified outer evaluator will see
-        // `JointHessianSource::Operator` rather than a dense matrix as soon as
-        // `use_joint_matrix_free_path` fires on `(p, n)`. Returning `true`
-        // advertises that representation only; the custom-family cost gate
-        // still decides whether second-order outer work is affordable.
+        // `JointHessianSource::Operator` rather than a dense coefficient
+        // matrix as soon as `use_joint_matrix_free_path` fires on `(p, n)`.
+        // This advertises β-space representation only, not a profiled outer
+        // θθ Hessian-vector product over the rho/anisotropy coordinates.
         true
+    }
+
+    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        // The current CTN ψψ path is pairwise row streaming, not a scalable
+        // dense outer hyper-Hessian capability. Keep CTN on exact-gradient
+        // outer optimization until a true directional outer-HVP is implemented.
+        false
     }
 }
 
@@ -4989,6 +4996,23 @@ mod tests {
         // would have been (the whole point of branching).
         let dense_cost = (n as u64) * p_total * p_total;
         assert!(expected_matvec < dense_cost / 100);
+    }
+
+    #[test]
+    fn ctn_inner_hvp_does_not_advertise_outer_hyper_hessian() {
+        let psi = array![0.15, -0.10];
+        let (family, _, _, spec) = toy_family_and_derivatives(&psi);
+
+        assert!(family.inner_coefficient_hessian_hvp_available(std::slice::from_ref(&spec)));
+        assert!(!family.outer_hyper_hessian_hvp_available(std::slice::from_ref(&spec)));
+        assert!(!family.outer_hyper_hessian_dense_available(std::slice::from_ref(&spec)));
+        assert_eq!(
+            family.exact_outer_derivative_order(
+                std::slice::from_ref(&spec),
+                &BlockwiseFitOptions::default()
+            ),
+            crate::custom_family::ExactOuterDerivativeOrder::First
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::families::transformation_normal::TRANSFORMATION_MONOTONICITY_EPS;
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
+use crate::term_builder::resolve_role_col;
 
 /// Clip each new-data column to the (min, max) range observed in training.
 ///
@@ -163,9 +164,7 @@ pub fn build_predict_input_for_model(
                 .z_column
                 .as_ref()
                 .ok_or_else(|| "marginal-slope model is missing z_column".to_string())?;
-            let &z_col = col_map
-                .get(z_name)
-                .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
+            let z_col = resolve_role_col(col_map, z_name, "z")?;
             let z = data.column(z_col).to_owned();
             let spec_logslope = resolve_termspec_for_prediction(
                 &model.resolved_termspec_logslope.as_ref().cloned(),
@@ -226,12 +225,7 @@ pub fn build_predict_input_for_model(
                 .next()
                 .map(str::trim)
                 .ok_or("cannot parse response column from formula")?;
-            let response_col_idx = *col_map.get(response_col_name).ok_or_else(|| {
-                format!(
-                    "response column '{}' not found in new data",
-                    response_col_name
-                )
-            })?;
+            let response_col_idx = resolve_role_col(col_map, response_col_name, "response")?;
             let response_new = data.column(response_col_idx).to_owned();
             for value in response_new.iter().copied() {
                 if !value.is_finite() {

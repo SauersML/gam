@@ -883,7 +883,9 @@ use crate::inference::formula_dsl::{
     parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
     require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
-use crate::term_builder::{build_termspec, column_map_with_alias, enable_scale_dimensions};
+use crate::term_builder::{
+    build_termspec, column_map_with_alias, enable_scale_dimensions, resolve_role_col,
+};
 
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
 #[derive(Clone, Debug)]
@@ -1296,9 +1298,7 @@ fn resolve_continuous_column(
     column_name: &str,
     role: &str,
 ) -> Result<Array1<f64>, String> {
-    let col_idx = *col_map
-        .get(column_name)
-        .ok_or_else(|| format!("{role} column '{column_name}' not found"))?;
+    let col_idx = resolve_role_col(col_map, column_name, role)?;
     let values = data.values.column(col_idx).to_owned();
     for (row_idx, value) in values.iter().enumerate() {
         if !value.is_finite() {
@@ -1351,9 +1351,7 @@ fn materialize_standard<'a>(
             "noise_offset_column requires a location-scale model with noise_formula".to_string(),
         );
     }
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
@@ -1490,9 +1488,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
 
     if !is_binary_response(y.view()) {
@@ -1543,14 +1539,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         config.scale_dimensions,
         &policy,
     )?;
-    let z_idx = *col_map.get(z_column).ok_or_else(|| {
-        let mut available: Vec<&str> = col_map.keys().map(String::as_str).collect();
-        available.sort_unstable();
-        format!(
-            "z column '{z_column}' not found in data. Available columns: [{}]",
-            available.join(", ")
-        )
-    })?;
+    let z_idx = resolve_role_col(col_map, z_column, "z")?;
     let z = data.values.column(z_idx).to_owned();
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
@@ -1602,15 +1591,9 @@ fn materialize_survival<'a>(
     let mut inference_notes = Vec::new();
 
     // Extract columns
-    let entry_idx = *col_map
-        .get(entry_col)
-        .ok_or_else(|| format!("entry column '{entry_col}' not found"))?;
-    let exit_idx = *col_map
-        .get(exit_col)
-        .ok_or_else(|| format!("exit column '{exit_col}' not found"))?;
-    let event_idx = *col_map
-        .get(event_col)
-        .ok_or_else(|| format!("event column '{event_col}' not found"))?;
+    let entry_idx = resolve_role_col(col_map, entry_col, "entry")?;
+    let exit_idx = resolve_role_col(col_map, exit_col, "exit")?;
+    let event_idx = resolve_role_col(col_map, event_col, "event")?;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.values.nrows();
     let event = data.values.column(event_idx).to_owned();
@@ -1796,14 +1779,7 @@ fn materialize_survival<'a>(
         let _base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
         let z_col_name = marginal_z_column_name
             .expect("marginal-slope z column should be validated before materialization");
-        let z_idx = *col_map.get(z_col_name).ok_or_else(|| {
-            let mut available: Vec<&str> = col_map.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            format!(
-                "z column '{z_col_name}' not found in data. Available columns: [{}]",
-                available.join(", ")
-            )
-        })?;
+        let z_idx = resolve_role_col(col_map, z_col_name, "z")?;
         Some(data.values.column(z_idx).to_owned())
     } else {
         None
@@ -2273,9 +2249,7 @@ fn materialize_transformation_normal<'a>(
         return Err("frailty is not supported for transformation-normal models".to_string());
     }
 
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
@@ -2311,9 +2285,7 @@ fn materialize_location_scale<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
