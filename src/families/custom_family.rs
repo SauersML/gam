@@ -11530,6 +11530,23 @@ fn apply_joint_block_penalty(
     out
 }
 
+/// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
+/// in the inner coefficient solve.
+///
+/// Builds `|diag(H) + Σ_k diag(S_k(λ)) + ridge|`, clamped at 1e-10. This is
+/// the diagonal of the full penalized joint Hessian `H + Σ_k λ_k S_k`, so it
+/// already incorporates contributions from every penalty operator the model
+/// uses — including the cubic-Duchon `[mass, tension, stiffness]` triple
+/// (orders [1,2,3] in `WigglePenaltyConfig::cubic_triple_operator_default`).
+/// Design docs sometimes call this the "triple-operator penalty
+/// preconditioner" for that reason; in code it is the single, unified
+/// preconditioner shared by all PCG callsites.
+///
+/// Callers (PIRLS inner Newton at custom_family.rs ~7434 and the four
+/// trace-time `MatrixFreeSpdOperator::new` constructions at ~8874, 8917,
+/// 9166, 9209) feed the result as `MatrixFreeSpdOperator`'s
+/// `preconditioner_diag`, which `solve_pcg` then applies as a diagonal
+/// rescale every CG iteration.
 fn joint_penalty_preconditioner_diag(
     base_diagonal: &Array1<f64>,
     ranges: &[(usize, usize)],
