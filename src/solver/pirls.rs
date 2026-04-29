@@ -7640,36 +7640,36 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let n = y.len();
     match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity => ndarray::Zip::from(y)
-            .and(mu)
-            .and(priorweights)
-            .fold(0.0, |acc, &yi, &mui, &wi| {
-                let resid = yi - mui;
-                acc - 0.5 * wi * resid * resid
-            }),
+        GlmLikelihoodFamily::GaussianIdentity => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let resid = y[i] - mu[i];
+                -0.5 * priorweights[i] * resid * resid
+            })
+            .sum(),
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
         | GlmLikelihoodFamily::BinomialCLogLog
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture => ndarray::Zip::from(y)
-            .and(mu)
-            .and(priorweights)
-            .fold(0.0, |acc, &yi, &mui, &wi| {
-                let mui_c = mui.clamp(EPS, 1.0 - EPS);
-                acc + wi * (yi * mui_c.ln() + (1.0 - yi) * (1.0 - mui_c).ln())
-            }),
-        GlmLikelihoodFamily::PoissonLog => {
-            ndarray::Zip::from(y)
-                .and(mu)
-                .and(priorweights)
-                .fold(0.0, |acc, &yi, &mui, &wi| {
-                    let mui_c = mui.max(EPS);
-                    let log_term = if yi > 0.0 { yi * mui_c.ln() } else { 0.0 };
-                    acc + wi * (log_term - mui_c)
-                })
-        }
+        | GlmLikelihoodFamily::BinomialMixture => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mui_c = mu[i].clamp(EPS, 1.0 - EPS);
+                priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
+            })
+            .sum(),
+        GlmLikelihoodFamily::PoissonLog => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mui_c = mu[i].max(EPS);
+                let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
+                priorweights[i] * (log_term - mui_c)
+            })
+            .sum(),
         GlmLikelihoodFamily::GammaLog => gamma_loglikelihood_with_shape(
             y,
             mu,
