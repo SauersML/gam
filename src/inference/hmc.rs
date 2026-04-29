@@ -918,18 +918,24 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
 ///
 /// log p(y|η) = −½ w·(y − η)², gradient = X'(w ⊙ (y − η))
 fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.n_samples;
+    // Per-row: residual = y - η, weighted_residual = w·residual,
+    // ll contribution = -0.5·w·residual². All independent across rows.
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let residual = data.y[i] - eta[i];
+            let w_i = data.weights[i];
+            (-0.5 * w_i * residual * residual, w_i * residual)
+        })
+        .collect();
     let mut weighted_residual = Array1::<f64>::zeros(n);
     let mut ll = 0.0_f64;
-    ndarray::Zip::from(&mut weighted_residual)
-        .and(eta)
-        .and(&**data.y)
-        .and(&**data.weights)
-        .for_each(|wr, &eta_i, &y_i, &w_i| {
-            let residual = y_i - eta_i;
-            ll -= 0.5 * w_i * residual * residual;
-            *wr = w_i * residual;
-        });
+    for (i, (ll_i, wr_i)) in pairs.into_iter().enumerate() {
+        ll += ll_i;
+        weighted_residual[i] = wr_i;
+    }
 
     let grad_ll = fast_atv(&data.x, &weighted_residual);
     (ll, grad_ll)
@@ -939,19 +945,24 @@ fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<
 ///
 /// log p(y|η) = y·η − exp(η), gradient = X'(w ⊙ (y − μ))
 fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.n_samples;
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp();
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
+            (w_i * (y_i * eta_i - mu_i), w_i * (y_i - mu_i))
+        })
+        .collect();
     let mut residual = Array1::<f64>::zeros(n);
     let mut ll = 0.0_f64;
-    ndarray::Zip::from(&mut residual)
-        .and(eta)
-        .and(&**data.y)
-        .and(&**data.weights)
-        .for_each(|r, &eta_raw, &y_i, &w_i| {
-            let eta_i = eta_raw.clamp(-700.0, 700.0);
-            let mu_i = eta_i.exp();
-            ll += w_i * (y_i * eta_i - mu_i);
-            *r = w_i * (y_i - mu_i);
-        });
+    for (i, (ll_i, r_i)) in pairs.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = r_i;
+    }
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
