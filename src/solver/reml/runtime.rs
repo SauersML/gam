@@ -586,11 +586,11 @@ impl<'a> RemlState<'a> {
         ndarray::Zip::from(&mut c_prime)
             .and(d_array)
             .and(eta_total)
-            .for_each(|out, &d, &eta| *out = d * eta);
+            .par_for_each(|out, &d, &eta| *out = d * eta);
         ndarray::Zip::from(&mut d_prime)
             .and(e_array)
             .and(eta_total)
-            .for_each(|out, &e, &eta| *out = e * eta);
+            .par_for_each(|out, &e, &eta| *out = e * eta);
 
         let mut h_prime = Array1::<f64>::zeros(n);
         let mut design_q_prime = Array1::<f64>::zeros(x_dense.ncols());

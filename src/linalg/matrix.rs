@@ -2777,6 +2777,10 @@ pub struct ChunkedKernelDesignOperator<K: SpatialKernelEvaluator> {
     poly_basis: Option<Arc<Array2<f64>>>,
     n: usize,
     total_cols: usize,
+    /// One-time-materialized [K_eff | poly] block, populated on first hot use.
+    /// Only allocated when the dense block fits within the materialization budget;
+    /// reused across all PIRLS iterations and outer-seed evaluations.
+    materialized: OnceLock<Option<Arc<Array2<f64>>>>,
 }
 
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
@@ -2824,7 +2828,38 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             poly_basis,
             n,
             total_cols: k_eff + poly_cols,
+            materialized: OnceLock::new(),
         })
+    }
+
+    /// Maximum bytes we are willing to spend on the one-shot materialized
+    /// [K_eff | poly] block. The lazy operator was originally selected because
+    /// the *initial* fit-time allocation budget was tight, but once PIRLS is
+    /// running we will pay the kernel-evaluation cost on every iteration unless
+    /// we cache the result. 1 GB is generous enough to cover biobank-scale
+    /// dense Duchon / TPS (n = 320k, p = 117 → ~300 MiB) while still rejecting
+    /// pathological dense kernels.
+    const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+    /// Get-or-build the materialized [K_eff | poly] dense block.  Returns
+    /// `None` when the block would exceed `MATERIALIZE_MAX_BYTES`; in that
+    /// case callers must fall back to row-chunked evaluation.
+    fn materialized_combined(&self) -> Option<&Array2<f64>> {
+        self.materialized
+            .get_or_init(|| {
+                let bytes = self
+                    .n
+                    .checked_mul(self.total_cols)
+                    .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
+                match bytes {
+                    Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
+                        Some(Arc::new(self.row_chunk_combined(0..self.n)))
+                    }
+                    _ => None,
+                }
+            })
+            .as_ref()
+            .map(|a| a.as_ref())
     }
 
     /// Evaluate kernel block for a range of rows: K[rows, :] or K[rows, :] * Z.
