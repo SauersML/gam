@@ -3012,23 +3012,32 @@ fn tensor_product_design_from_marginals(
         acc.checked_mul(b.ncols())
             .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
     })?;
+    // Tensor-product Khatri-Rao: design[i, j] = Π_d marginal_d[i, j_d]
+    // where j is the multi-index (j_1, ..., j_D) flattened. Independent
+    // across rows — parallelize.
     let mut design = Array2::<f64>::zeros((n, total_cols));
-    for i in 0..n {
-        let mut rowvals = vec![1.0_f64];
-        for b in marginal_designs {
-            let q = b.ncols();
-            let mut next = vec![0.0_f64; rowvals.len() * q];
-            for (a_idx, &aval) in rowvals.iter().enumerate() {
-                for col in 0..q {
-                    next[a_idx * q + col] = aval * b[[i, col]];
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    use rayon::iter::IndexedParallelIterator;
+    design
+        .axis_iter_mut(ndarray::Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut design_row)| {
+            let mut rowvals = vec![1.0_f64];
+            for b in marginal_designs {
+                let q = b.ncols();
+                let mut next = vec![0.0_f64; rowvals.len() * q];
+                for (a_idx, &aval) in rowvals.iter().enumerate() {
+                    for col in 0..q {
+                        next[a_idx * q + col] = aval * b[[i, col]];
+                    }
                 }
+                rowvals = next;
             }
-            rowvals = next;
-        }
-        for (j, &v) in rowvals.iter().enumerate() {
-            design[[i, j]] = v;
-        }
-    }
+            for (j, &v) in rowvals.iter().enumerate() {
+                design_row[j] = v;
+            }
+        });
     Ok(design)
 }
 
