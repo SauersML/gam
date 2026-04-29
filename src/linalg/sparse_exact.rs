@@ -498,9 +498,15 @@ pub fn assemble_and_factor_sparse_penalized_system(
     s_lambda: &Array2<f64>,
     ridge: f64,
 ) -> Result<SparsePenalizedSystem, EstimationError> {
+    let logdet_h_start = std::time::Instant::now();
     let h_sparse = sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge)?;
     let factor = factorize_sparse_spd(&h_sparse)?;
     let logdet_h = logdet_from_factor(&factor)?;
+    log::info!(
+        "[STAGE] logdet H (sparse Cholesky) p={} elapsed={:.3}s",
+        h_sparse.nrows(),
+        logdet_h_start.elapsed().as_secs_f64(),
+    );
     Ok(SparsePenalizedSystem {
         h_sparse,
         factor,
