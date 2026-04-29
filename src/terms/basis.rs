@@ -7568,9 +7568,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         padded.slice_mut(s![.., 0..kernel_cols]).assign(&d0_raw);
         if poly_cols > 0 {
             let poly_values = polynomial_block_from_order(centers, nullspace_order);
-            padded
-                .slice_mut(s![.., kernel_cols..])
-                .assign(&poly_values);
+            padded.slice_mut(s![.., kernel_cols..]).assign(&poly_values);
         }
         if let Some(z) = identifiability_transform {
             fast_ab(&padded, z)
@@ -14043,7 +14041,11 @@ fn polynomial_gradient_operator_block(
                 }
                 let mut value = exponent as f64;
                 for other in 0..d {
-                    let e = if other == axis { exponent - 1 } else { alpha[other] };
+                    let e = if other == axis {
+                        exponent - 1
+                    } else {
+                        alpha[other]
+                    };
                     if e != 0 {
                         value *= points[[row, other]].powi(e as i32);
                     }
