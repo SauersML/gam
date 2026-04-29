@@ -50,8 +50,8 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
@@ -14715,6 +14715,39 @@ struct BinomialLocationScaleHessianWorkspace {
     coeff_tt: Array1<f64>,
     coeff_tl: Array1<f64>,
     coeff_ll: Array1<f64>,
+    direction_eta_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialDirectionEta>>>,
+    first_coeff_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialRowCoeffTriple>>>,
+    second_coeff_cache: Mutex<HashMap<BinomialDirectionPairKey, Arc<BinomialRowCoeffTriple>>>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct BinomialDirectionKey {
+    bits: Vec<u64>,
+}
+
+impl BinomialDirectionKey {
+    fn from_array(v: &Array1<f64>) -> Self {
+        Self {
+            bits: v.iter().map(|value| value.to_bits()).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct BinomialDirectionPairKey {
+    left: BinomialDirectionKey,
+    right: BinomialDirectionKey,
+}
+
+struct BinomialDirectionEta {
+    t: Array1<f64>,
+    ls: Array1<f64>,
+}
+
+struct BinomialRowCoeffTriple {
+    tt: Arc<Array1<f64>>,
+    tl: Arc<Array1<f64>>,
+    ll: Arc<Array1<f64>>,
 }
 
 impl BinomialLocationScaleHessianWorkspace {
@@ -14749,7 +14782,114 @@ impl BinomialLocationScaleHessianWorkspace {
             coeff_tt,
             coeff_tl,
             coeff_ll,
+            direction_eta_cache: Mutex::new(HashMap::new()),
+            first_coeff_cache: Mutex::new(HashMap::new()),
+            second_coeff_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn direction_eta(
+        &self,
+        key: &BinomialDirectionKey,
+        d_beta: &Array1<f64>,
+        pt: usize,
+        total: usize,
+    ) -> Arc<BinomialDirectionEta> {
+        if let Some(value) = self
+            .direction_eta_cache
+            .lock()
+            .expect("binomial direction eta cache lock poisoned")
+            .get(key)
+            .cloned()
+        {
+            return value;
+        }
+        let value = Arc::new(BinomialDirectionEta {
+            t: fast_av(self.x_t_dense.as_ref(), &d_beta.slice(s![0..pt])),
+            ls: fast_av(self.x_ls_dense.as_ref(), &d_beta.slice(s![pt..total])),
+        });
+        let mut cache = self
+            .direction_eta_cache
+            .lock()
+            .expect("binomial direction eta cache lock poisoned");
+        cache
+            .entry(key.clone())
+            .or_insert_with(|| value.clone())
+            .clone()
+    }
+
+    fn first_coefficients(
+        &self,
+        key: &BinomialDirectionKey,
+        eta: &BinomialDirectionEta,
+    ) -> Arc<BinomialRowCoeffTriple> {
+        if let Some(value) = self
+            .first_coeff_cache
+            .lock()
+            .expect("binomial first coefficient cache lock poisoned")
+            .get(key)
+            .cloned()
+        {
+            return value;
+        }
+        let (tt, tl, ll) = binomial_location_scale_first_directional_coefficients(
+            &self.family.y,
+            &self.family.weights,
+            &self.core,
+            &eta.t,
+            &eta.ls,
+            &self.family.link_kind,
+        );
+        let value = Arc::new(BinomialRowCoeffTriple {
+            tt: Arc::new(tt),
+            tl: Arc::new(tl),
+            ll: Arc::new(ll),
+        });
+        let mut cache = self
+            .first_coeff_cache
+            .lock()
+            .expect("binomial first coefficient cache lock poisoned");
+        cache
+            .entry(key.clone())
+            .or_insert_with(|| value.clone())
+            .clone()
+    }
+
+    fn second_coefficients(
+        &self,
+        key: BinomialDirectionPairKey,
+        eta_u: &BinomialDirectionEta,
+        eta_v: &BinomialDirectionEta,
+    ) -> Result<Arc<BinomialRowCoeffTriple>, String> {
+        if let Some(value) = self
+            .second_coeff_cache
+            .lock()
+            .expect("binomial second coefficient cache lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(value);
+        }
+        let (tt, tl, ll) = binomial_location_scalesecond_directional_coefficients(
+            &self.family.y,
+            &self.family.weights,
+            &self.core,
+            &eta_u.t,
+            &eta_u.ls,
+            &eta_v.t,
+            &eta_v.ls,
+            &self.family.link_kind,
+        )?;
+        let value = Arc::new(BinomialRowCoeffTriple {
+            tt: Arc::new(tt),
+            tl: Arc::new(tl),
+            ll: Arc::new(ll),
+        });
+        let mut cache = self
+            .second_coeff_cache
+            .lock()
+            .expect("binomial second coefficient cache lock poisoned");
+        Ok(cache.entry(key).or_insert_with(|| value.clone()).clone())
     }
 }
 
@@ -14814,22 +14954,15 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
                 total
             ));
         }
-        let d_eta_t = fast_av(self.x_t_dense.as_ref(), &d_beta_flat.slice(s![0..pt]));
-        let d_eta_ls = fast_av(self.x_ls_dense.as_ref(), &d_beta_flat.slice(s![pt..total]));
-        let (c_tt, c_tl, c_ll) = binomial_location_scale_first_directional_coefficients(
-            &self.family.y,
-            &self.family.weights,
-            &self.core,
-            &d_eta_t,
-            &d_eta_ls,
-            &self.family.link_kind,
-        );
+        let key = BinomialDirectionKey::from_array(d_beta_flat);
+        let eta = self.direction_eta(&key, d_beta_flat, pt, total);
+        let coeffs = self.first_coefficients(&key, &eta);
         Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
             self.x_t_dense.clone(),
             self.x_ls_dense.clone(),
-            c_tt,
-            c_tl,
-            c_ll,
+            coeffs.tt.clone(),
+            coeffs.tl.clone(),
+            coeffs.ll.clone(),
         )?)))
     }
 
@@ -14858,26 +14991,24 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
                 total
             ));
         }
-        let d_eta_t_u = fast_av(self.x_t_dense.as_ref(), &d_beta_u.slice(s![0..pt]));
-        let d_eta_ls_u = fast_av(self.x_ls_dense.as_ref(), &d_beta_u.slice(s![pt..total]));
-        let d_eta_t_v = fast_av(self.x_t_dense.as_ref(), &d_beta_v.slice(s![0..pt]));
-        let d_eta_ls_v = fast_av(self.x_ls_dense.as_ref(), &d_beta_v.slice(s![pt..total]));
-        let (c_tt, c_tl, c_ll) = binomial_location_scalesecond_directional_coefficients(
-            &self.family.y,
-            &self.family.weights,
-            &self.core,
-            &d_eta_t_u,
-            &d_eta_ls_u,
-            &d_eta_t_v,
-            &d_eta_ls_v,
-            &self.family.link_kind,
+        let key_u = BinomialDirectionKey::from_array(d_beta_u);
+        let key_v = BinomialDirectionKey::from_array(d_beta_v);
+        let eta_u = self.direction_eta(&key_u, d_beta_u, pt, total);
+        let eta_v = self.direction_eta(&key_v, d_beta_v, pt, total);
+        let coeffs = self.second_coefficients(
+            BinomialDirectionPairKey {
+                left: key_u,
+                right: key_v,
+            },
+            &eta_u,
+            &eta_v,
         )?;
         Ok(Some(Arc::new(make_two_block_design_row_coeff_operator(
             self.x_t_dense.clone(),
             self.x_ls_dense.clone(),
-            c_tt,
-            c_tl,
-            c_ll,
+            coeffs.tt.clone(),
+            coeffs.tl.clone(),
+            coeffs.ll.clone(),
         )?)))
     }
 }

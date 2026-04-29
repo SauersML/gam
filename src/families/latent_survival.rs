@@ -29,6 +29,7 @@ use crate::families::survival_location_scale::{
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
+use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
 use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -845,70 +846,6 @@ fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
     [x1.ln(), 1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4]
 }
 
-#[inline]
-fn latent_log1mexp(a: f64) -> f64 {
-    assert!(a >= 0.0);
-    if a > core::f64::consts::LN_2 {
-        (-(-a).exp()).ln_1p()
-    } else if a > 0.0 {
-        (-(-a).exp_m1()).ln()
-    } else {
-        f64::NEG_INFINITY
-    }
-}
-
-fn latent_signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
-    let mut pos_max = f64::NEG_INFINITY;
-    let mut neg_max = f64::NEG_INFINITY;
-    for (idx, &lm) in log_mags.iter().enumerate() {
-        if signs[idx] > 0.0 {
-            pos_max = pos_max.max(lm);
-        } else if signs[idx] < 0.0 {
-            neg_max = neg_max.max(lm);
-        }
-    }
-
-    let mut pos_sum = 0.0_f64;
-    let mut neg_sum = 0.0_f64;
-    for (idx, &lm) in log_mags.iter().enumerate() {
-        if !lm.is_finite() {
-            continue;
-        }
-        if signs[idx] > 0.0 {
-            pos_sum += (lm - pos_max).exp();
-        } else if signs[idx] < 0.0 {
-            neg_sum += (lm - neg_max).exp();
-        }
-    }
-
-    let log_pos = if pos_sum > 0.0 {
-        pos_max + pos_sum.ln()
-    } else {
-        f64::NEG_INFINITY
-    };
-    let log_neg = if neg_sum > 0.0 {
-        neg_max + neg_sum.ln()
-    } else {
-        f64::NEG_INFINITY
-    };
-
-    if log_neg == f64::NEG_INFINITY {
-        return (log_pos, 1.0);
-    }
-    if log_pos == f64::NEG_INFINITY {
-        return (log_neg, -1.0);
-    }
-    if log_pos > log_neg {
-        let gap = log_pos - log_neg;
-        (log_pos + latent_log1mexp(gap), 1.0)
-    } else if log_neg > log_pos {
-        let gap = log_neg - log_pos;
-        (log_neg + latent_log1mexp(gap), -1.0)
-    } else {
-        (f64::NEG_INFINITY, 0.0)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct LatentKernelPrimaryTerm {
     coeff: f64,
@@ -1124,7 +1061,7 @@ fn latent_kernel_sum_log_jet(
         if log_mags.is_empty() {
             return Ok((f64::NEG_INFINITY, 0.0));
         }
-        Ok(latent_signed_log_sum_exp(&log_mags, &signs))
+        Ok(signed_log_sum_exp(&log_mags, &signs))
     };
 
     let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
