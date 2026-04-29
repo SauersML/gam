@@ -78,11 +78,11 @@ use gam::survival_construction::{
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     initial_survival_baseline_config_for_fit, marginal_slope_baseline_chain_rule_gradient,
     normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient, parse_survival_baseline_config,
-    parse_survival_distribution, parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    positive_survival_time_seed, require_structural_survival_time_basis,
-    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
-    survival_baseline_targetname, survival_likelihood_modename,
+    optimize_survival_baseline_config_with_gradient, parse_survival_distribution,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
+    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
+    survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, SurvivalCovariateTermBlockTemplate,
@@ -9154,11 +9154,11 @@ mod tests {
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
         covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel, family_to_string,
         linkname, load_dataset_projected, parse_formula, parse_link_choice,
-        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_baseline_config,
-        parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
-        pretty_familyname, required_columns_for_fit, resolve_family, summarizewiggle_domain,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
+        parse_survival_time_basis_config, predict_gam, pretty_familyname, required_columns_for_fit,
+        resolve_family, summarizewiggle_domain, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_survival_binary_prediction_csv,
+        write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
@@ -9193,6 +9193,7 @@ mod tests {
         LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
         SmoothTermSpec, TermCollectionSpec,
     };
+    use gam::survival_construction::parse_survival_baseline_config;
     use gam::survival_construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
     use gam::term_builder::{
         heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
