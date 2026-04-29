@@ -2371,36 +2371,43 @@ impl CustomFamily for LatentSurvivalFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let latent_sd = self.latent_sd(block_states)?;
         let n = self.event_target.len();
-        let mut ll = 0.0;
-        for i in 0..n {
-            let wi = self.weights[i];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let event_type = if self.event_target[i] >= 1 {
-                LatentSurvivalEventType::ExactEvent
-            } else {
-                LatentSurvivalEventType::RightCensored
-            };
-            let row = build_latent_survival_row(
-                i,
-                self.hazard_loading,
-                event_type,
-                q_entry[i],
-                q_exit[i],
-                qdot_exit[i],
-                self.unloaded_mass_entry[i],
-                self.unloaded_mass_exit[i],
-                self.unloaded_hazard_exit[i],
-            )?;
-            let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
-                .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
-            ll += wi * jet.log_lik;
-        }
-        Ok(ll)
+        // Per-row latent-survival jet + log-lik contribution. Independent
+        // across rows; sum via parallel reduce. `?` propagation happens
+        // through a Result-collecting fold.
+        let contributions: Result<Vec<f64>, String> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<f64, String> {
+                let wi = self.weights[i];
+                if wi <= MIN_WEIGHT {
+                    return Ok(0.0);
+                }
+                let event_type = if self.event_target[i] >= 1 {
+                    LatentSurvivalEventType::ExactEvent
+                } else {
+                    LatentSurvivalEventType::RightCensored
+                };
+                let row = build_latent_survival_row(
+                    i,
+                    self.hazard_loading,
+                    event_type,
+                    q_entry[i],
+                    q_exit[i],
+                    qdot_exit[i],
+                    self.unloaded_mass_entry[i],
+                    self.unloaded_mass_exit[i],
+                    self.unloaded_hazard_exit[i],
+                )?;
+                let jet =
+                    LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
+                        .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
+                Ok(wi * jet.log_lik)
+            })
+            .collect();
+        Ok(contributions?.into_iter().sum())
     }
 
     fn block_linear_constraints(
