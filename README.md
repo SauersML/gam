@@ -163,7 +163,7 @@ response ~ term + term + ...
 | `duchon(x1, x2, ...)` | Duchon radial basis with triple operator regularization (scale-free) |
 | `tensor(x, z)` or `te(x, z)` | Tensor-product B-splines |
 
-Common smooth options: `knots=`, `k=`, `centers=`, `degree=`, `penalty_order=`, `double_penalty=true|false`, `type=ps|tps|matern|duchon`.
+Common smooth options: `knots=`, `k=`, `centers=`, `degree=`, `penalty_order=`, `type=ps|tps|matern|duchon`. `double_penalty=true|false` applies to P-spline, thin-plate, tensor, and Matérn smooths; Duchon smooths use mass, tension, and stiffness operator penalties.
 
 Spatial smooths support per-axis anisotropy via `scale_dims=true` or the global `--scale-dimensions` flag. For pure Duchon this stays scale-free: the optimizer updates only centered per-axis shape contrasts, not a scalar `length_scale`.
 

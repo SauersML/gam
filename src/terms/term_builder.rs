@@ -368,8 +368,8 @@ pub fn build_smooth_basis(
         }
         "duchon" => {
             if options.contains_key("double_penalty") {
-                inference_notes.push(format!(
-                    "Warning: ignored redundant double_penalty option for Duchon smooth '{}'; Duchon smooths always include nullspace shrinkage.",
+                return Err(format!(
+                    "Duchon smooth '{}' does not support double_penalty; Duchon uses mass, tension, and stiffness operator penalties.",
                     vars.join(",")
                 ));
             }
