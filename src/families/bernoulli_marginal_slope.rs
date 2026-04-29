@@ -12,8 +12,9 @@ use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_kn
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
-    add_two_surface_psi_outer, build_denested_partition_cells as shared_denested_partition_cells,
-    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
+    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    build_denested_partition_cells as shared_denested_partition_cells, eval_coeff4_at,
+    is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials,
     probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
     scale_coeff4,
@@ -1876,18 +1877,10 @@ impl BernoulliExactNewtonAccumulator {
         self.grad_logslope += &other.grad_logslope;
         self.hess_marginal += &other.hess_marginal;
         self.hess_logslope += &other.hess_logslope;
-        if let (Some(left), Some(right)) = (self.grad_h.as_mut(), other.grad_h.as_ref()) {
-            *left += right;
-        }
-        if let (Some(left), Some(right)) = (self.grad_w.as_mut(), other.grad_w.as_ref()) {
-            *left += right;
-        }
-        if let (Some(left), Some(right)) = (self.hess_h.as_mut(), other.hess_h.as_ref()) {
-            *left += right;
-        }
-        if let (Some(left), Some(right)) = (self.hess_w.as_mut(), other.hess_w.as_ref()) {
-            *left += right;
-        }
+        add_optional_vector(&mut self.grad_h, &other.grad_h);
+        add_optional_vector(&mut self.grad_w, &other.grad_w);
+        add_optional_matrix(&mut self.hess_h, &other.hess_h);
+        add_optional_matrix(&mut self.hess_w, &other.hess_w);
     }
 }
 

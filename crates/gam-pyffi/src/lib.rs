@@ -959,6 +959,7 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
         PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
     ) {
         if let Some(z_column) = payload.z_column.as_ref() {
+            required.remove("z");
             required.insert(z_column.clone());
         }
     }
@@ -967,7 +968,11 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
     }
     if let Some(logslope_formula) = payload.formula_logslope.as_ref() {
         if logslope_formula != "same-as-main" {
-            add_auxiliary_formula_columns(&mut required, logslope_formula, parsed.response.as_str())?;
+            add_auxiliary_formula_columns(
+                &mut required,
+                logslope_formula,
+                parsed.response.as_str(),
+            )?;
         }
     }
     Ok(required)
@@ -1226,6 +1231,10 @@ fn build_survival_marginal_slope_ffi_payload(
         .z_column
         .clone()
         .ok_or_else(|| "survival marginal-slope requires z_column".to_string())?;
+    let parsed = parse_formula(&formula)
+        .map_err(|err| format!("failed to re-parse survival marginal formula: {err}"))?;
+    let (entryname, exitname, eventname) = parse_surv_response(&parsed.response)?
+        .ok_or_else(|| "survival marginal-slope FFI requires Surv(...) response".to_string())?;
 
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -1242,6 +1251,9 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.unified = Some(ms_result.fit.clone());
     payload.fit_result = Some(ms_result.fit);
     payload.data_schema = Some(dataset.schema.clone());
+    payload.survival_entry = Some(entryname);
+    payload.survival_exit = Some(exitname);
+    payload.survival_event = Some(eventname);
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.survival_likelihood = Some("marginal-slope".to_string());
     payload.training_headers = Some(dataset.headers.clone());
