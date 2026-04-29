@@ -23,8 +23,7 @@ use crate::families::latent_survival::{
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_location_scale::{
     SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
-    fit_survival_location_scale_terms,
-    fit_survival_location_scale_terms_with_selected_wiggle,
+    fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
     select_survival_link_wiggle_basis_from_pilot,
 };
 use crate::families::survival_marginal_slope::{

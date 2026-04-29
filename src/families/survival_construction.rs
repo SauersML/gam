@@ -2129,9 +2129,7 @@ pub fn build_survival_marginal_slope_baseline_offsets(
     Ok((eta_entry, eta_exit, derivative_exit))
 }
 
-pub fn location_scale_uses_probit_survival_baseline(
-    inverse_link: Option<&InverseLink>,
-) -> bool {
+pub fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&InverseLink>) -> bool {
     matches!(
         inverse_link,
         Some(
@@ -2144,9 +2142,7 @@ pub fn location_scale_uses_probit_survival_baseline(
     )
 }
 
-pub fn survival_derivative_guard_for_likelihood(
-    likelihood_mode: SurvivalLikelihoodMode,
-) -> f64 {
+pub fn survival_derivative_guard_for_likelihood(likelihood_mode: SurvivalLikelihoodMode) -> f64 {
     match likelihood_mode {
         SurvivalLikelihoodMode::LocationScale
         | SurvivalLikelihoodMode::Latent
