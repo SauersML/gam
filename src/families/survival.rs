@@ -3277,9 +3277,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crude_risk_quadrature_rejects_decreasing_cumulative_hazard() {
-        let err = calculate_crude_risk_quadrature(
+    fn crude_risk_quadrature_error(
+        cumulative_entry: f64,
+        cumulative_exit: f64,
+        hazard_exit: f64,
+    ) -> SurvivalError {
+        calculate_crude_risk_quadrature(
             1.0,
             2.0,
             &[],
@@ -3291,31 +3294,21 @@ mod tests {
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;
-                Ok((0.1, 0.3, 0.25))
+                Ok((cumulative_entry, cumulative_exit, hazard_exit))
             },
         )
-        .expect_err("non-monotone cumulative hazards should fail");
+        .expect_err("invalid hazards should fail")
+    }
+
+    #[test]
+    fn crude_risk_quadrature_rejects_decreasing_cumulative_hazard() {
+        let err = crude_risk_quadrature_error(0.1, 0.3, 0.25);
         assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
     }
 
     #[test]
     fn crude_risk_quadrature_rejects_nonpositive_instantaneous_hazard() {
-        let err = calculate_crude_risk_quadrature(
-            1.0,
-            2.0,
-            &[],
-            0.4,
-            0.2,
-            array![1.0].view(),
-            array![1.0].view(),
-            |_, design_d, deriv_d, design_m| {
-                design_d[0] = 1.0;
-                deriv_d[0] = 0.0;
-                design_m[0] = 1.0;
-                Ok((0.0, 0.4, 0.25))
-            },
-        )
-        .expect_err("nonpositive hazards should fail");
+        let err = crude_risk_quadrature_error(0.0, 0.4, 0.25);
         assert!(matches!(err, SurvivalError::NonPositiveHazard));
     }
 
