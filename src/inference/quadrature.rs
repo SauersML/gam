@@ -3009,17 +3009,21 @@ pub fn logit_posterior_mean_batch(
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
 ) -> Result<ndarray::Array1<f64>, EstimationError> {
-    let mut out = ndarray::Array1::<f64>::zeros(eta.len());
-    for i in 0..eta.len() {
-        out[i] = integrated_inverse_link_mean_and_derivative(
-            ctx,
-            LinkFunction::Logit,
-            eta[i],
-            se_eta[i],
-        )?
-        .mean;
-    }
-    Ok(out)
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let n = eta.len();
+    let values: Result<Vec<f64>, EstimationError> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            integrated_inverse_link_mean_and_derivative(
+                ctx,
+                LinkFunction::Logit,
+                eta[i],
+                se_eta[i],
+            )
+            .map(|integrated| integrated.mean)
+        })
+        .collect();
+    Ok(ndarray::Array1::from_vec(values?))
 }
 
 pub trait GhqValue: Sized {
