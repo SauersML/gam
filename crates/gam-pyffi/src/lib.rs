@@ -4,7 +4,9 @@ use gam::estimate::{
     BlockRole, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
     saved_sas_state_from_fit,
 };
-use gam::families::family_meta::{family_to_link, pretty_familyname};
+use gam::families::family_meta::{
+    family_to_link, inverse_link_to_binomial_family, pretty_familyname,
+};
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::survival_likelihood_modename;
 use gam::families::survival_predict::{
@@ -25,7 +27,7 @@ use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::Array1;
 use pyo3::exceptions::PyValueError;
@@ -1767,24 +1769,6 @@ fn inverse_link_to_saved_string(link: &InverseLink) -> String {
         InverseLink::Sas(_) => "sas".to_string(),
         InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
         InverseLink::Mixture(_) => "blended".to_string(),
-    }
-}
-
-fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
-    match link {
-        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
-        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-        InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-        InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-        InverseLink::Standard(LinkFunction::Sas) | InverseLink::Sas(_) => {
-            LikelihoodFamily::BinomialSas
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) | InverseLink::BetaLogistic(_) => {
-            LikelihoodFamily::BinomialBetaLogistic
-        }
-        InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-        InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
-        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
     }
 }
 
