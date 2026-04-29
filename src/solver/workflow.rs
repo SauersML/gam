@@ -1814,10 +1814,13 @@ fn materialize_survival<'a>(
     };
     let log_sigmaspec = if let Some(noise) = config.noise_formula.as_deref() {
         let noise_parsed = parse_formula(&format!("{} ~ {noise}", parsed.response))?;
+        // Use the same aliased col_map as the main termspec — survival
+        // marginal-slope reserves `z` as a placeholder for `--z-column`,
+        // and the logslope/noise formula may reference it too.
         build_termspec_with_geometry(
             &noise_parsed.terms,
             data,
-            col_map,
+            termspec_col_map,
             &mut inference_notes,
             config.scale_dimensions,
             &policy,
