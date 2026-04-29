@@ -53,10 +53,7 @@ use gam::inference::model::{
 };
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
-use gam::mixture_link::{
-    inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
-    state_fromspec,
-};
+use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam::predict::{
     PredictableModel, predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
@@ -2045,16 +2042,6 @@ fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
         PredictModelClass::BernoulliMarginalSlope => "bernoulli marginal-slope",
         PredictModelClass::TransformationNormal => "transformation-normal",
         PredictModelClass::Survival => "survival",
-    }
-}
-
-fn needs_special_generate_handling(model: &SavedModel) -> bool {
-    match model.predict_model_class() {
-        PredictModelClass::Survival | PredictModelClass::BinomialLocationScale => true,
-        PredictModelClass::Standard
-        | PredictModelClass::GaussianLocationScale
-        | PredictModelClass::BernoulliMarginalSlope
-        | PredictModelClass::TransformationNormal => false,
     }
 }
 
@@ -4348,13 +4335,6 @@ fn saved_baseline_timewiggle_spec(
             double_penalty: saved.double_penalty,
         })
     })
-}
-
-fn apply_saved_linkwiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
-    match model.saved_link_wiggle()? {
-        None => Ok(q0.clone()),
-        Some(runtime) => runtime.apply(q0),
-    }
 }
 
 fn saved_baseline_timewiggle_components(
@@ -6878,7 +6858,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     let model = SavedModel::load_from_path(&args.model)?;
     progress.advance_workflow(1);
 
-    if matches!(model.model_kind, ModelKind::Survival) {
+    if model.predict_model_class() == PredictModelClass::Survival {
         return Err(
             "generate is not available for survival models in this command; use survival-specific simulation APIs"
                 .to_string(),
@@ -6905,49 +6885,16 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         saved_noise_offset_column,
     )?;
     progress.set_stage("generate", "building predictive state");
-    // Unified path: delegate to PredictableModel for models that do not need
-    // specialized saved-model handling. Use per-class helpers only for the
-    // remaining saved-model special cases.
-    let spec = if needs_special_generate_handling(&model) {
-        match model.predict_model_class() {
-            PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
-                &mut progress,
-                &model,
-                ds.values.view(),
-                &col_map,
-                training_headers,
-                &generate_offset,
-                &generate_noise_offset,
-            )?,
-            PredictModelClass::Survival => {
-                return Err(
-                    "generate is not available for survival models in this command; \
-                     use survival-specific simulation APIs"
-                        .to_string(),
-                );
-            }
-            PredictModelClass::Standard
-            | PredictModelClass::GaussianLocationScale
-            | PredictModelClass::BernoulliMarginalSlope
-            | PredictModelClass::TransformationNormal => {
-                return Err(format!(
-                    "{} model unexpectedly bypassed the unified generation path",
-                    pretty_predict_model_class(model.predict_model_class())
-                ));
-            }
-        }
-    } else {
-        run_generate_unified(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &generate_offset,
-            &generate_noise_offset,
-            saved_noise_offset_column.is_some(),
-        )?
-    };
+    let spec = run_generate_unified(
+        &mut progress,
+        &model,
+        ds.values.view(),
+        &col_map,
+        training_headers,
+        &generate_offset,
+        &generate_noise_offset,
+        saved_noise_offset_column.is_some(),
+    )?;
     progress.advance_workflow(3);
 
     let mut rng = StdRng::seed_from_u64(42);
@@ -6971,13 +6918,11 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
 }
 
 /// Unified generate path: uses `PredictableModel` to produce a
-/// `GenerativeSpec` for any model class that does not require specialized
-/// saved-model handling.
+/// `GenerativeSpec` for every non-survival model class.
 ///
-/// Covers: Standard (plain), GaussianLocationScale, BinomialLocationScale
-/// (without wiggles).  For Gaussian LS the sigma vector is extracted via
-/// `predict_with_uncertainty`; all other families derive their noise model
-/// from `generativespec_from_predict`.
+/// For Gaussian LS the sigma vector is extracted via `predict_noise_scale`;
+/// all other families derive their observation model from
+/// `generativespec_from_predict`.
 fn run_generate_unified(
     progress: &mut gam::visualizer::VisualizerSession,
     model: &SavedModel,
@@ -7037,8 +6982,8 @@ fn run_generate_unified(
             noise: gam::generative::NoiseModel::Gaussian { sigma },
         })
     } else {
-        // Standard-family models and non-wiggle binomial location-scale models
-        // produce their response-scale plug-in mean directly here.
+        // Non-Gaussian models produce their response-scale plug-in mean
+        // directly here.
         let pred = predictor
             .predict_plugin_response(&pred_input)
             .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
@@ -7047,86 +6992,6 @@ fn run_generate_unified(
         generativespec_from_predict(pred, family, family_noise_parameter(&fit_saved, family))
             .map_err(|e| format!("failed to build generative spec: {e}"))
     }
-}
-
-fn run_generate_binomial_location_scale(
-    progress: &mut gam::visualizer::VisualizerSession,
-    model: &SavedModel,
-    data: ndarray::ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    threshold_offset: &Array1<f64>,
-    log_sigma_offset: &Array1<f64>,
-) -> Result<gam::generative::GenerativeSpec, String> {
-    progress.set_stage(
-        "generate",
-        "building binomial location-scale generation design",
-    );
-    let spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    if termspec_has_bounded_terms(&spec) {
-        return Err(
-            "sample is not yet supported for models with bounded() coefficients".to_string(),
-        );
-    }
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|e| format!("failed to build design: {e}"))?;
-    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-    let saved_link_kind = model
-        .resolved_inverse_link()?
-        .ok_or_else(|| "saved binomial-location-scale model is missing link state".to_string())?;
-    let beta_t = saved_binomial_location_scale_threshold_beta(&fit_saved)?;
-    let spec_noise = resolve_termspec_for_prediction(
-        &model.resolved_termspec_noise,
-        training_headers,
-        col_map,
-        "resolved_termspec_noise",
-    )?;
-    let design_noise = build_term_collection_design(data, &spec_noise)
-        .map_err(|e| format!("failed to build noise design: {e}"))?;
-    let beta_noise = saved_location_scale_noise_beta(
-        model,
-        &fit_saved,
-        "binomial-location-scale model is missing beta_noise",
-    )?;
-    if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
-        return Err("location-scale model/design dimension mismatch".to_string());
-    }
-    let noise_transform = scale_transform_from_payload(
-        &model.noise_projection,
-        &model.noise_center,
-        &model.noise_scale,
-        model.noise_non_intercept_start,
-    )?;
-    let eta_t = design.design.dot(&beta_t) + threshold_offset;
-    let preparednoise_design = if let Some(transform) = noise_transform.as_ref() {
-        build_scale_deviation_operator(
-            design.design.clone(),
-            design_noise.design.clone(),
-            transform,
-        )?
-    } else {
-        design_noise.design.clone()
-    };
-    let eta_noise = preparednoise_design.dot(&beta_noise) + log_sigma_offset;
-    let sigma = eta_noise.mapv(f64::exp);
-    let q0 = Array1::from_iter(eta_t.iter().zip(sigma.iter()).map(|(&t, &s)| -t / s));
-    let eta = apply_saved_linkwiggle(&q0, model)?;
-    let mean = Array1::from_iter(
-        eta.iter()
-            .copied()
-            .map(|v| inverse_link_jet_for_inverse_link(&saved_link_kind, v).map(|jet| jet.mu))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("location-scale inverse-link prediction failed: {e}"))?,
-    );
-    Ok(gam::generative::GenerativeSpec {
-        mean,
-        noise: gam::generative::NoiseModel::Bernoulli,
-    })
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
@@ -8760,34 +8625,6 @@ fn compact_saved_survival_location_scale_fit_result(
     Ok(fit_result)
 }
 
-fn saved_binomial_location_scale_threshold_beta(
-    fit: &UnifiedFitResult,
-) -> Result<Array1<f64>, String> {
-    fit.block_by_role(BlockRole::Threshold)
-        .or_else(|| fit.block_by_role(BlockRole::Location))
-        .or_else(|| fit.block_by_role(BlockRole::Mean))
-        .map(|block| block.beta.clone())
-        .ok_or_else(|| {
-            "binomial-location-scale fit_result is missing the threshold/location block".to_string()
-        })
-}
-
-fn saved_location_scale_noise_beta(
-    model: &SavedModel,
-    fit: &UnifiedFitResult,
-    missing_message: &str,
-) -> Result<Array1<f64>, String> {
-    if let Some(block) = fit.block_by_role(BlockRole::Scale) {
-        return Ok(block.beta.clone());
-    }
-    model
-        .payload()
-        .beta_noise
-        .clone()
-        .map(Array1::from_vec)
-        .ok_or_else(|| missing_message.to_string())
-}
-
 fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,
     label: &str,
@@ -10343,7 +10180,7 @@ mod tests {
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
         LinkMode, MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-        apply_saved_linkwiggle, build_survival_feasible_initial_beta, build_survival_time_basis,
+        build_survival_feasible_initial_beta, build_survival_time_basis,
         chi_square_survival_approx, classify_cli_error,
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
@@ -10358,8 +10195,7 @@ mod tests {
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg,
-        needs_special_generate_handling, needs_special_predict_handling, run_fit, run_predict,
-        write_model_json,
+        needs_special_predict_handling, run_fit, run_predict, write_model_json,
     };
     use clap::Parser;
     use csv::StringRecord;
@@ -16538,8 +16374,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_saved_linkwiggle_rejects_partial_metadata() {
-        let q0 = array![-0.2, 0.1];
+    fn saved_linkwiggle_runtime_rejects_partial_metadata() {
         let mut payload = test_payload(
             "y ~ x",
             ModelKind::LocationScale,
@@ -16553,7 +16388,9 @@ mod tests {
         payload.linkwiggle_knots = Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]);
         payload.linkwiggle_degree = Some(2);
         let model = SavedModel::from_payload(payload);
-        let err = apply_saved_linkwiggle(&q0, &model).expect_err("expected partial-metadata error");
+        let err = model
+            .saved_link_wiggle()
+            .expect_err("expected partial-metadata error");
         assert!(err.contains("link-wiggle"));
     }
 
@@ -16588,7 +16425,7 @@ mod tests {
     }
 
     #[test]
-    fn binomial_location_scale_wiggle_uses_unified_predictor_but_special_generate_path() {
+    fn binomial_location_scale_wiggle_uses_unified_generate_path() {
         let model = intercept_only_binomial_location_scale_model(
             -0.4,
             -1.3,
@@ -16598,7 +16435,23 @@ mod tests {
             Some(3),
         );
         assert!(!needs_special_predict_handling(&model));
-        assert!(needs_special_generate_handling(&model));
+        let data = ndarray::Array2::<f64>::zeros((2, 0));
+        let headers = vec![];
+        let col_map = HashMap::new();
+        let mut progress = gam::visualizer::VisualizerSession::new(false);
+        let spec = super::run_generate_unified(
+            &mut progress,
+            &model,
+            data.view(),
+            &col_map,
+            Some(&headers),
+            &Array1::zeros(data.nrows()),
+            &Array1::zeros(data.nrows()),
+            false,
+        )
+        .expect("generate binomial location-scale through unified predictor");
+        assert!(spec.mean.iter().all(|value| value.is_finite()));
+        assert!(matches!(spec.noise, gam::generative::NoiseModel::Bernoulli));
     }
 
     #[test]
