@@ -5425,7 +5425,39 @@ fn compute_outer_hessian(
                         subspace,
                     )?;
 
-                    (cross_trace, base + m_terms + correction)
+                    let h2 = base + m_terms + correction;
+                    if !cross_trace.is_finite()
+                        || !base.is_finite()
+                        || !m_terms.is_finite()
+                        || !correction.is_finite()
+                        || !h2.is_finite()
+                    {
+                        let g_dot_v = coord_i.g.dot(&ext_v[jj]);
+                        let b_mat_finite = pair.b_mat.iter().all(|v| v.is_finite());
+                        let ext_vi_finite = ext_v[ii].iter().all(|v| v.is_finite());
+                        let ext_vj_finite = ext_v[jj].iter().all(|v| v.is_finite());
+                        log::warn!(
+                            "[OUTER ext-ext non-finite] ({},{}): cross_trace={} base={} m_terms={} correction={} pair.a={} pair.ld_s={} g.dot(v_jj)={} b_mat_finite={} b_operator_present={} b_mat_dim={}x{} ext_v[ii]_finite={} ext_v[jj]_finite={} coord_i.b_depends_on_beta={} coord_j.b_depends_on_beta={}",
+                            ii,
+                            jj,
+                            cross_trace,
+                            base,
+                            m_terms,
+                            correction,
+                            pair.a,
+                            pair.ld_s,
+                            g_dot_v,
+                            b_mat_finite,
+                            pair.b_operator.is_some(),
+                            pair.b_mat.nrows(),
+                            pair.b_mat.ncols(),
+                            ext_vi_finite,
+                            ext_vj_finite,
+                            coord_i.b_depends_on_beta,
+                            coord_j.b_depends_on_beta,
+                        );
+                    }
+                    (cross_trace, h2)
                 } else {
                     (0.0, 0.0)
                 };
