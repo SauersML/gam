@@ -979,20 +979,28 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
     let shape_ln_shape = shape * shape.ln();
     let log_gamma_shape = statrs::function::gamma::ln_gamma(shape);
     let shape_minus_one = shape - 1.0;
-    let mut ll = 0.0_f64;
-    ndarray::Zip::from(&mut residual)
-        .and(eta)
-        .and(&**data.y)
-        .and(&**data.weights)
-        .for_each(|r, &eta_raw, &y_i, &w_i| {
-            let eta_i = eta_raw.clamp(-700.0, 700.0);
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let n = data.n_samples;
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
             let mu_i = eta_i.exp();
-            ll += w_i
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
+            let ll_i = w_i
                 * (shape_ln_shape - log_gamma_shape - shape * eta_i
                     + shape_minus_one * y_i.max(1e-12).ln()
                     - shape * y_i / mu_i);
-            *r = w_i * shape * (y_i / mu_i - 1.0);
-        });
+            let r_i = w_i * shape * (y_i / mu_i - 1.0);
+            (ll_i, r_i)
+        })
+        .collect();
+    let mut ll = 0.0_f64;
+    for (i, (ll_i, r_i)) in pairs.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = r_i;
+    }
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
