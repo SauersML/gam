@@ -35,6 +35,7 @@ use crate::linalg::matrix::DesignMatrix;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::probability::normal_cdf;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
+use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
 use crate::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
@@ -87,12 +88,8 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         .survival_exit
         .as_ref()
         .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let entry_col = *col_map
-        .get(entryname)
-        .ok_or_else(|| format!("entry column '{}' not found", entryname))?;
-    let exit_col = *col_map
-        .get(exitname)
-        .ok_or_else(|| format!("exit column '{}' not found", exitname))?;
+    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
+    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
 
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -461,9 +458,7 @@ fn build_marginal_slope_predict_context(
         .z_column
         .as_ref()
         .ok_or_else(|| "saved survival marginal-slope model missing z_column".to_string())?;
-    let z_col = *col_map
-        .get(z_name)
-        .ok_or_else(|| format!("prediction data is missing z column '{}'", z_name))?;
+    let z_col = resolve_role_col(col_map, z_name, "z")?;
     let z_raw = data.column(z_col).to_owned();
 
     let logslopespec = resolve_termspec_for_prediction(
@@ -996,10 +991,7 @@ fn remap_term_collectionspec_columns(
         let name = training_headers
             .get(index)
             .ok_or_else(|| format!("saved training column index {index} is out of bounds"))?;
-        prediction_column_map
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("prediction data is missing required column '{name}'"))
+        resolve_role_col(prediction_column_map, name, "prediction")
     };
     for linear_term in &mut remapped.linear_terms {
         linear_term.feature_col = resolve_training_index(linear_term.feature_col)?;

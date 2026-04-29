@@ -98,7 +98,10 @@ fn estimate_gamma_shape_from_eta(
             let ratio = yi / mui;
             (wi * (ratio - ratio.ln() - 1.0), wi)
         })
-        .reduce(|| (0.0_f64, 0.0_f64), |(t1, w1), (t2, w2)| (t1 + t2, w1 + w2));
+        .reduce(
+            || (0.0_f64, 0.0_f64),
+            |(t1, w1), (t2, w2)| (t1 + t2, w1 + w2),
+        );
 
     if total_weight <= 0.0 {
         return 1.0;
@@ -3503,33 +3506,6 @@ where
     F: FnMut(&WorkingModelIterationInfo),
 {
     const LM_MAX_LAMBDA: f64 = 1e12;
-    // Wall-clock budget for a single inner PIRLS solve. A single inner solve
-    // that exceeds this budget at biobank n is empirically a "bad
-    // smoothing-parameter point" signal: surface it as
-    // `PirlsTimeBudgetExceeded` so the outer line search treats it as a
-    // recoverable evaluation failure and shrinks the step (see
-    // `into_objective_error` in `outer_strategy.rs`).
-    //
-    // This is principled, not a bandaid: the alternative is the line search
-    // sitting blind for tens of minutes on a single PIRLS call that will
-    // never converge at the proposed log-λ. Returning an error tells the
-    // outer optimizer the truth — the step was too aggressive.
-    const PIRLS_MAX_SECONDS: f64 = 60.0;
-    let pirls_deadline_start = std::time::Instant::now();
-    let check_time_budget = |attempt_label: &str| -> Result<(), EstimationError> {
-        let elapsed = pirls_deadline_start.elapsed().as_secs_f64();
-        if elapsed > PIRLS_MAX_SECONDS {
-            log::warn!(
-                "[PIRLS] time-budget exceeded at {attempt_label}: elapsed={elapsed:.1}s > limit={PIRLS_MAX_SECONDS:.1}s; \
-                 returning PirlsTimeBudgetExceeded so the outer line search shrinks the step"
-            );
-            return Err(EstimationError::PirlsTimeBudgetExceeded {
-                elapsed_seconds: elapsed,
-                max_seconds: PIRLS_MAX_SECONDS,
-            });
-        }
-        Ok(())
-    };
 
     fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
@@ -3652,7 +3628,6 @@ where
     // changes the approximation itself --- it becomes a PQL-type surrogate.
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
-        check_time_budget(&format!("pirls iter {iter} start"))?;
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
         // if the process is killed during `update_with_curvature` or the LM solve.
@@ -3727,7 +3702,6 @@ where
 
         loop {
             attempts += 1;
-            check_time_budget(&format!("pirls iter {iter} LM attempt {attempts}"))?;
 
             // 1. Solve (H + λI)δ = -g
             // Update diagonal in-place: add (loop_lambda - applied_lambda) to diagonal
