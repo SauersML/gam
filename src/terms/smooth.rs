@@ -8709,7 +8709,7 @@ fn xt_diag_x_dense(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Arr
         let mut weighted = x.to_owned();
         ndarray::Zip::from(weighted.rows_mut())
             .and(w)
-            .for_each(|mut row, wi| row *= *wi);
+            .par_for_each(|mut row, wi| row *= *wi);
         return Ok(fast_atb(&x, &weighted));
     }
 
