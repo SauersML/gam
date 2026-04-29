@@ -1342,15 +1342,7 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
 }
 
 pub fn linkname(link: LinkFunction) -> &'static str {
-    match link {
-        LinkFunction::Identity => "identity",
-        LinkFunction::Log => "log",
-        LinkFunction::Logit => "logit",
-        LinkFunction::Probit => "probit",
-        LinkFunction::CLogLog => "cloglog",
-        LinkFunction::Sas => "sas",
-        LinkFunction::BetaLogistic => "beta-logistic",
-    }
+    link.name()
 }
 
 pub fn parse_link_component(v: &str) -> Result<LinkComponent, String> {

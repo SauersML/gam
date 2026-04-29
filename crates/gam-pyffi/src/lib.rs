@@ -575,7 +575,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let payload = SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: pretty_familyname(model.likelihood()).to_string(),
-        model_class: predict_model_class_name(model.predict_model_class()).to_string(),
+        model_class: model.predict_model_class().name().to_string(),
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
@@ -621,13 +621,13 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
             role: fit
                 .blocks
                 .get(index)
-                .map(|block| block_role_name(block.role.clone()).to_string()),
+                .map(|block| block.role.name().to_string()),
         })
         .collect::<Vec<_>>();
     let report_input = ReportInput {
         model_path: "<in-memory>".to_string(),
         family_name: pretty_familyname(model.likelihood()).to_string(),
-        model_class: predict_model_class_name(model.predict_model_class()).to_string(),
+        model_class: model.predict_model_class().name().to_string(),
         formula: model.payload().formula.clone(),
         n_obs: None,
         deviance: fit.deviance,
@@ -1004,7 +1004,7 @@ fn build_standard_payload(
     payload.unified = Some(saved_fit.clone());
     payload.fit_result = Some(saved_fit.clone());
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(link_name(family_to_link(family)).to_string());
+    payload.link = Some(family_to_link(family).name().to_string());
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.training_headers = Some(dataset.headers.clone());
@@ -1764,7 +1764,7 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
 
 fn inverse_link_to_saved_string(link: &InverseLink) -> String {
     match link {
-        InverseLink::Standard(link_fn) => link_name(*link_fn).to_string(),
+        InverseLink::Standard(link_fn) => link_fn.name().to_string(),
         InverseLink::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
         InverseLink::Sas(_) => "sas".to_string(),
         InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
@@ -1854,7 +1854,7 @@ fn predict_table_survival(
             "survival location-scale".to_string()
         }
         gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent survival".to_string(),
-        _ => predict_model_class_name(model.predict_model_class()).to_string(),
+        _ => model.predict_model_class().name().to_string(),
     };
     let survival_payload = SurvivalPredictionPayload {
         class: "survival_prediction",
@@ -1869,40 +1869,6 @@ fn predict_table_survival(
     };
     serde_json::to_string(&survival_payload)
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
-}
-
-fn link_name(link: gam::types::LinkFunction) -> &'static str {
-    match link {
-        gam::types::LinkFunction::Logit => "logit",
-        gam::types::LinkFunction::Probit => "probit",
-        gam::types::LinkFunction::CLogLog => "cloglog",
-        gam::types::LinkFunction::Sas => "sas",
-        gam::types::LinkFunction::BetaLogistic => "beta-logistic",
-        gam::types::LinkFunction::Identity => "identity",
-        gam::types::LinkFunction::Log => "log",
-    }
-}
-
-fn predict_model_class_name(class: PredictModelClass) -> &'static str {
-    match class {
-        PredictModelClass::Standard => "standard",
-        PredictModelClass::GaussianLocationScale => "gaussian location-scale",
-        PredictModelClass::BinomialLocationScale => "binomial location-scale",
-        PredictModelClass::BernoulliMarginalSlope => "bernoulli marginal-slope",
-        PredictModelClass::Survival => "survival",
-        PredictModelClass::TransformationNormal => "transformation-normal",
-    }
-}
-
-fn block_role_name(role: BlockRole) -> &'static str {
-    match role {
-        BlockRole::Mean => "mean",
-        BlockRole::Location => "location",
-        BlockRole::Scale => "scale",
-        BlockRole::Time => "time",
-        BlockRole::Threshold => "threshold",
-        BlockRole::LinkWiggle => "link-wiggle",
-    }
 }
 
 #[cfg(test)]
