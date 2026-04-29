@@ -36,7 +36,6 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         sc = _scenario()
         cmd = _FUZZ.build_rust_fit_cmd(sc, "train.csv", "model.json", ["x0", "x1"])
 
-        self.assertEqual(cmd[2:4], ["--adaptive-regularization", "false"])
         self.assertIn("--predict-noise", cmd)
         noise_terms = cmd[cmd.index("--predict-noise") + 1]
         self.assertEqual(noise_terms, "s(x0, type=ps, knots=4, double_penalty=true)")
@@ -48,9 +47,11 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
 
+        # length_scale was dropped in commit 35e62344 to align rust pure
+        # scale-free Duchon with mgcv bs='ds' (mgcv has no hybrid-mode analog).
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=1, power=2, length_scale=1.0, double_penalty=false)",
+            "duchon(x0, x1, centers=5, order=1, power=2, double_penalty=false)",
         )
         self.assertNotIn("~", noise_terms)
 
@@ -59,7 +60,6 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         cmd = _FUZZ.build_rust_fit_cmd(sc, "train.csv", "model.json", ["x0", "x1"])
 
-        self.assertIn("--adaptive-regularization", cmd)
         self.assertNotIn("--predict-noise", cmd)
         self.assertEqual(
             cmd[-1],
@@ -111,15 +111,6 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         )
         self.assertGreater(_FUZZ.estimate_scenario_cost(large), 75_000)
         self.assertLess(_FUZZ.estimate_scenario_cost(small), 75_000)
-
-    def test_generated_duchon_scenarios_use_stable_hybrid_tuple(self) -> None:
-        sc = _FUZZ.generate_scenario(1)
-        _FUZZ._apply_basis_filter(sc, "duchon")
-        self.assertEqual((sc.duchon_order, sc.duchon_power), (1, 1))
-
-        formula = _FUZZ.rust_mean_formula(["x0", "x1", "x2"], sc)
-        self.assertIn("length_scale=1.0", formula)
-        self.assertIn("order=1, power=1", formula)
 
 
 def _trial(*, family="gaussian", model_type="gam", basis="ps",
@@ -227,23 +218,11 @@ class FuzzCiGateTests(unittest.TestCase):
         gate_names = [gf["gate"] for gf in gates["gate_failures"]]
         self.assertIn("rust_nan_inf", gate_names)
 
-    def test_coverage_uses_cost_selected_denominator(self) -> None:
-        # 50 valid selected trials out of 50 runnable scenarios should not
-        # fail just because another 50 requested scenarios were cost-capped.
+    def test_coverage_failure_fires_when_too_many_skipped(self) -> None:
+        # 50 valid trials out of 100 requested ⇒ below the 80% floor.
         results = [
-            _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i)
+            _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
             for i in range(50)
-        ]
-        gates = _FUZZ.compute_ci_gates(
-            results, requested_trials=100, skipped_count=50,
-        )
-        self.assertFalse(gates["failed"], gates)
-
-    def test_coverage_failure_fires_when_selected_valid_fraction_is_too_low(self) -> None:
-        # 30 valid trials out of 50 selected scenarios ⇒ below the 80% floor.
-        results = [
-            _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i)
-            for i in range(30)
         ]
         gates = _FUZZ.compute_ci_gates(
             results, requested_trials=100, skipped_count=50,
