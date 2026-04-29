@@ -2014,26 +2014,6 @@ fn run_fitwith_predict_noise(
     Ok(())
 }
 
-/// Returns `true` when a model requires special-case prediction handling that
-/// cannot go through the unified `PredictableModel` path.
-///
-/// Special cases:
-/// - **Survival**: time basis construction, entry/exit handling, location-scale
-///   sub-branch, and time wiggles are deeply model-specific.
-fn needs_special_predict_handling(model: &SavedModel) -> bool {
-    match model.predict_model_class() {
-        // Survival always needs specialised handling (time basis, entry/exit).
-        PredictModelClass::Survival => true,
-        // BinomialLocationScalePredictor handles wiggle-aware prediction
-        // (conditional integration over wiggle coefficients) natively.
-        PredictModelClass::BinomialLocationScale
-        | PredictModelClass::Standard
-        | PredictModelClass::GaussianLocationScale
-        | PredictModelClass::BernoulliMarginalSlope
-        | PredictModelClass::TransformationNormal => false,
-    }
-}
-
 fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
     match class {
         PredictModelClass::Standard => "standard",
@@ -2045,8 +2025,7 @@ fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
     }
 }
 
-/// Build a `PredictInput` for any model type that can go through the unified
-/// `PredictableModel` path.
+/// Build a `PredictInput` for model types backed directly by `PredictableModel`.
 ///
 /// - **Standard**: single design from `resolved_termspec`, optional primary offset,
 ///   no noise design.
@@ -2060,8 +2039,8 @@ fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
 /// - **TransformationNormal**: response-basis tensor product prediction with an
 ///   optional primary offset added to the reconstructed scalar predictor.
 ///
-/// Survival models and special-case models should not call this function; they are
-/// handled by the model-specific `run_predict_*` functions.
+/// Survival prediction has its own design assembly because it needs entry/exit
+/// time geometry before it can call the same predictor/output machinery.
 fn build_predict_input_for_model(
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -2524,7 +2503,7 @@ fn resolve_predict_offsets(
     Ok((offset, noise_offset))
 }
 
-/// Unified prediction + CSV output path for models that go through `PredictableModel`.
+/// Prediction + CSV output path for models that expose `PredictableModel`.
 ///
 /// Handles the three prediction modes (simple, posterior-mean, uncertainty) and
 /// writes the appropriate CSV format for the model class.
@@ -2632,24 +2611,55 @@ fn run_predict_unified(
     Ok(())
 }
 
+fn run_predict_model(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    predict_offset: &Array1<f64>,
+    predict_noise_offset: &Array1<f64>,
+    noise_offset_supplied: bool,
+) -> Result<(), String> {
+    if model.predict_model_class() == PredictModelClass::Survival {
+        return run_predict_survival(
+            progress,
+            args,
+            model,
+            data,
+            col_map,
+            training_headers,
+            predict_offset,
+            predict_noise_offset,
+        );
+    }
+
+    let predictor = model.predictor().ok_or_else(|| {
+        format!(
+            "{} prediction requires a predictor, but the saved model could not construct one",
+            pretty_predict_model_class(model.predict_model_class())
+        )
+    })?;
+    let pred_input = build_predict_input_for_model(
+        model,
+        data,
+        col_map,
+        training_headers,
+        predict_offset,
+        predict_noise_offset,
+        noise_offset_supplied,
+    )?;
+    progress.advance_workflow(3);
+    run_predict_unified(progress, args, model, &pred_input, &*predictor)
+}
+
 fn run_predict(args: PredictArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
     progress.set_stage("predict", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     progress.advance_workflow(1);
-    let saved_mixture = model.saved_mixture_state()?;
-    let saved_sas = model
-        .saved_sas_state()?
-        .or(model.saved_beta_logistic_state()?);
-    let saved_link_kind = model.resolved_inverse_link()?;
-    let saved_mixture_param_cov = parse_optional_covariance(
-        model.mixture_link_param_covariance.as_ref(),
-        "mixture_link_param_covariance",
-    )?;
-    let saved_sas_param_cov =
-        parse_optional_covariance(model.sas_param_covariance.as_ref(), "sas_param_covariance")?;
-
     let schema = model.require_data_schema()?;
     progress.set_stage("predict", "loading new data");
     let ds = load_datasetwith_schema(&args.new_data, schema)?;
@@ -2671,84 +2681,17 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         effective_offset_column,
         effective_noise_offset_column,
     )?;
-
-    // ── Unified path via PredictableModel ──────────────────────────────────
-    //
-    // Models that do not require specialized saved-model handling go through
-    // build_predict_input_for_model() + model.predictor(). This covers:
-    // Standard, GaussianLocationScale, BinomialLocationScale (with or without
-    // link wiggles), BernoulliMarginalSlope, and TransformationNormal.
-    if !needs_special_predict_handling(&model) {
-        let predictor = model.predictor().ok_or_else(|| {
-            format!(
-                "{} prediction requires a unified predictor, but the saved model could not construct one",
-                pretty_predict_model_class(model.predict_model_class())
-            )
-        })?;
-        let pred_input = build_predict_input_for_model(
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &predict_offset,
-            &predict_noise_offset,
-            effective_noise_offset_column.is_some(),
-        )?;
-        progress.advance_workflow(3);
-        let result = run_predict_unified(&mut progress, &args, &model, &pred_input, &*predictor);
-        if result.is_ok() {
-            progress.advance_workflow(5);
-            progress.finish_progress("prediction complete");
-        }
-        return result;
-    }
-
-    // ── Special-case dispatch ──────────────────────────────────────────────
-    //
-    // This branch handles the genuinely model-specific survival prediction
-    // logic that `PredictableModel` does not cover: time basis construction,
-    // entry/exit columns, baseline offsets, time wiggles, and the
-    // location-scale sub-branch.
-    let result = match model.predict_model_class() {
-        PredictModelClass::Survival => run_predict_survival(
-            &mut progress,
-            &args,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &predict_offset,
-            &predict_noise_offset,
-            saved_link_kind.as_ref(),
-            saved_mixture.as_ref(),
-            saved_sas.as_ref(),
-            saved_mixture_param_cov.as_ref(),
-            saved_sas_param_cov.as_ref(),
-        ),
-        PredictModelClass::BinomialLocationScale => Err(
-            "binomial location-scale model unexpectedly bypassed the unified prediction path"
-                .to_string(),
-        ),
-        PredictModelClass::GaussianLocationScale => Err(
-            "gaussian location-scale model unexpectedly bypassed the unified prediction path"
-                .to_string(),
-        ),
-        PredictModelClass::BernoulliMarginalSlope => Err(
-            "bernoulli marginal-slope model unexpectedly bypassed the unified prediction path"
-                .to_string(),
-        ),
-        PredictModelClass::TransformationNormal => {
-            // Transformation-normal uses the unified path via build_predict_input_for_model.
-            // If we reach here, something went wrong in the dispatch.
-            Err(
-                "transformation-normal model unexpectedly bypassed the unified prediction path"
-                    .to_string(),
-            )
-        }
-        PredictModelClass::Standard => {
-            Err("standard model unexpectedly bypassed the unified prediction path".to_string())
-        }
-    };
+    let result = run_predict_model(
+        &mut progress,
+        &args,
+        &model,
+        ds.values.view(),
+        &col_map,
+        training_headers,
+        &predict_offset,
+        &predict_noise_offset,
+        effective_noise_offset_column.is_some(),
+    );
     if result.is_ok() {
         progress.advance_workflow(5);
         progress.finish_progress("prediction complete");
@@ -3242,12 +3185,6 @@ fn run_predict_saved_latent_binary(
     )
 }
 
-/// Special-case survival prediction.
-///
-/// This handles the full survival prediction pipeline which cannot go through
-/// `PredictableModel` because of time basis construction, entry/exit column
-/// handling, baseline offsets, time wiggles, and the LocationScale sub-branch.
-/// The unified path in `run_predict` bypasses this function for non-survival models.
 fn run_predict_survival(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -3257,11 +3194,6 @@ fn run_predict_survival(
     training_headers: Option<&Vec<String>>,
     primary_offset: &Array1<f64>,
     noise_offset: &Array1<f64>,
-    _: Option<&InverseLink>,
-    _: Option<&MixtureLinkState>,
-    _: Option<&SasLinkState>,
-    _: Option<&Array2<f64>>,
-    _: Option<&Array2<f64>>,
 ) -> Result<(), String> {
     progress.set_stage("predict", "building survival prediction design");
     let entryname = model

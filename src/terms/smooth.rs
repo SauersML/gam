@@ -6235,13 +6235,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
-    let prefer_gradient_only =
-        analytic_outer_hessian_available && baseline.design.design.as_sparse().is_none();
-    if prefer_gradient_only {
-        log::info!(
-            "[OUTER] spatial-adaptive exact REML: dense exact-joint design detected; preferring gradient-only BFGS over Arc"
-        );
-    }
+    let prefer_gradient_only = false;
     // The automatic fallback ladder degrades to BFGS+BfgsApprox after a
     // Strong-Wolfe iter-0 failure; those rank-2 updates are directionally
     // wrong on the Charbonnier-penalized pseudo-Laplace surface, so the
