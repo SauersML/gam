@@ -4453,6 +4453,8 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dirs: &[ArrayView1<'_, f64>],
     ) -> Result<f64, String> {
+        crate::families::jet_partitions::ROW_NEGLOG_CALLS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let k = dirs.len();
         if k > 4 {
             return Err(format!(
@@ -8141,7 +8143,7 @@ impl SurvivalMarginalSlopeFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<(usize, usize, usize, &'static str)>, String> {
-        let Some((block_idx, local_idx)) = self.resolve_psi_location(derivative_blocks, psi_index)
+        let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index)
         else {
             return Ok(None);
         };

@@ -5,7 +5,9 @@ use ndarray::Array1;
 use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use crate::estimate::{BlockRole, PredictInput};
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
-use crate::families::transformation_normal::TRANSFORMATION_TAIL_GUARD_FRACTION;
+use crate::families::transformation_normal::{
+    TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_TAIL_GUARD_FRACTION,
+};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
@@ -305,7 +307,7 @@ pub fn build_predict_input_for_model(
                 .slice_mut(ndarray::s![.., 2..])
                 .assign(&dev_obs_deriv);
 
-            let monotonicity_eps = 1.0e-8;
+            let monotonicity_eps = TRANSFORMATION_MONOTONICITY_EPS;
             let mut min_h_prime = f64::INFINITY;
             for i in 0..n {
                 let cov_row = cov_mat.row(i);
