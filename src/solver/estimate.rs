@@ -4925,19 +4925,22 @@ mod estimate_policy_tests {
                 initial_log_delta: theta[2],
             })
             .expect("score sas state");
-            let mut out = Array1::<f64>::zeros(eta.len());
-            for i in 0..eta.len() {
-                let jets = sas_inverse_link_jetwith_param_partials(
-                    eta[i],
-                    sas_state.epsilon,
-                    sas_state.log_delta,
-                );
-                let mu = jets.jet.mu;
-                let d1 = jets.jet.d1;
-                let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
-                out[i] = aux.a1 * d1;
-            }
-            out
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let out_vec: Vec<f64> = (0..eta.len())
+                .into_par_iter()
+                .map(|i| {
+                    let jets = sas_inverse_link_jetwith_param_partials(
+                        eta[i],
+                        sas_state.epsilon,
+                        sas_state.log_delta,
+                    );
+                    let mu = jets.jet.mu;
+                    let d1 = jets.jet.d1;
+                    let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+                    aux.a1 * d1
+                })
+                .collect();
+            Array1::from_vec(out_vec)
         };
         let score_p = score_at(theta[1] + 1e-4 * (1.0 + theta[1].abs()));
         let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));

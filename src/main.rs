@@ -44,9 +44,9 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{
     LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
-    effectivelinkwiggle_formulaspec, formula_rhs_text, inverse_link_supports_joint_wiggle,
-    linkchoice_supports_joint_wiggle, linkname, parse_formula, parse_link_choice,
-    parse_matching_auxiliary_formula, parse_surv_response, validate_auxiliary_formula_controls,
+    effectivelinkwiggle_formulaspec, formula_rhs_text, linkchoice_supports_joint_wiggle, linkname,
+    parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
+    require_inverse_link_supports_joint_wiggle, validate_auxiliary_formula_controls,
     validate_marginal_slope_z_column_exclusion,
 };
 use gam::inference::model::{
@@ -1864,13 +1864,8 @@ fn run_fitwith_predict_noise(
         }
         _ => InverseLink::Standard(effective_link),
     };
-    if formula_linkwiggle.is_some()
-        && !inverse_link_supports_joint_wiggle(&location_scale_link_kind)
-    {
-        return Err(
-            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-                .to_string(),
-        );
+    if formula_linkwiggle.is_some() {
+        require_inverse_link_supports_joint_wiggle(&location_scale_link_kind, "linkwiggle(...)")?;
     }
 
     let options = blockwise_options_from_fit_args(args)?;
@@ -3820,14 +3815,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     parse_survival_distribution(&effective_survival_distribution)?;
     let survival_inverse_link = parse_survival_inverse_link(&effective_args)?;
-    if effective_linkwiggle.is_some()
-        && likelihood_mode == SurvivalLikelihoodMode::LocationScale
-        && !inverse_link_supports_joint_wiggle(&survival_inverse_link)
-    {
-        return Err(
-            "linkwiggle(...) does not support SAS/BetaLogistic/Mixture links; wiggle is only available for jointly fitted standard links"
-                .to_string(),
-        );
+    if effective_linkwiggle.is_some() && likelihood_mode == SurvivalLikelihoodMode::LocationScale {
+        require_inverse_link_supports_joint_wiggle(&survival_inverse_link, "linkwiggle(...)")?;
     }
     if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
         if !matches!(
