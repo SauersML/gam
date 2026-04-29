@@ -12471,6 +12471,7 @@ mod tests {
         build_term_collection_design, freeze_term_collection_from_design,
         spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
     };
+    use crate::testing::binomial_location_scale_base_fixture;
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
@@ -12504,34 +12505,8 @@ mod tests {
     }
 
     fn binomial_location_scale_wiggle_outer_fixture() -> BinomialLocationScaleWiggleOuterFixture {
-        let n = 7usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let threshold_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let log_sigma_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            Array2::from_elem((n, 1), 1.0),
-        ));
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: threshold_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2]),
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: log_sigma_design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![-0.2],
-            initial_beta: Some(array![-0.1]),
-        };
-        let q_seed = Array1::linspace(-1.4, 1.4, n);
+        let base = binomial_location_scale_base_fixture();
+        let q_seed = Array1::linspace(-1.4, 1.4, base.n);
         let knots = crate::families::gamlss::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
             .expect("knots");
         let wiggle_block = crate::families::gamlss::buildwiggle_block_input_from_knots(
@@ -12567,18 +12542,18 @@ mod tests {
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
         };
         let family = BinomialLocationScaleWiggleFamily {
-            y,
-            weights,
+            y: base.y,
+            weights: base.weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
+            threshold_design: Some(base.threshold_design),
+            log_sigma_design: Some(base.log_sigma_design),
             wiggle_knots: knots,
             wiggle_degree: 3,
             policy: crate::resource::ResourcePolicy::default_library(),
         };
         BinomialLocationScaleWiggleOuterFixture {
             family,
-            specs: vec![thresholdspec, log_sigmaspec, wigglespec],
+            specs: vec![base.threshold_spec, base.log_sigma_spec, wigglespec],
             penalty_counts: vec![1usize, 1usize, 1usize],
             rho: array![0.05, -0.15, 0.1],
             options: BlockwiseFitOptions {
