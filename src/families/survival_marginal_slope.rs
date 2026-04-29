@@ -12823,10 +12823,13 @@ fn pooled_survival_baseline(
             })
             .collect();
         let triples = triples?;
-        Some(triples.into_iter().fold(
-            (0.0_f64, 0.0_f64, 0.0_f64),
-            |(o, g, h), (oi, gi, hi)| (o + oi, g + gi, h + hi),
-        ))
+        Some(
+            triples
+                .into_iter()
+                .fold((0.0_f64, 0.0_f64, 0.0_f64), |(o, g, h), (oi, gi, hi)| {
+                    (o + oi, g + gi, h + hi)
+                }),
+        )
     };
 
     let Some(state0) = objective_grad_hess(0.0) else {
