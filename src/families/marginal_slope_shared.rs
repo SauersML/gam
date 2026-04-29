@@ -1,6 +1,6 @@
+use crate::custom_family::CustomFamilyBlockPsiDerivative;
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
-use crate::custom_family::CustomFamilyBlockPsiDerivative;
 use ndarray::Array1;
 use std::ops::Range;
 
