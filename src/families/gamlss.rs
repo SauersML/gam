@@ -6848,26 +6848,6 @@ struct RowCoeffOperator {
 }
 
 impl RowCoeffOperator {
-    fn new(
-        channels: Vec<RowCoeffChannel>,
-        block_widths: Vec<usize>,
-        pair_coeffs: Vec<RowCoeffPair>,
-        nrows: usize,
-    ) -> Self {
-        Self::from_directions(
-            block_widths,
-            channels
-                .into_iter()
-                .map(|channel| (channel.block, channel.design))
-                .collect(),
-            pair_coeffs
-                .into_iter()
-                .map(|pair| (pair.a, pair.b, pair.coeff))
-                .collect(),
-            nrows,
-        )
-    }
-
     /// One-line constructor for the standard (channels, pair-coeffs)
     /// recipe used by every GAMLSS LS workspace: pass the block widths,
     /// the channel list as `(block_id, design)` tuples, and the pair
