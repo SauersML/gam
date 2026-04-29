@@ -1438,7 +1438,10 @@ impl ProjectedFactorCache {
             .entries
             .lock()
             .expect("projected factor cache lock poisoned");
-        entries.entry(key).or_insert_with(|| computed.clone()).clone()
+        entries
+            .entry(key)
+            .or_insert_with(|| computed.clone())
+            .clone()
     }
 }
 

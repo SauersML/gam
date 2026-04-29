@@ -10,7 +10,7 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::fast_av;
 use crate::families::bernoulli_marginal_slope::{
-    DeviationBlockConfig, DeviationPrepared, DeviationRuntime, LatentZNormalization, LatentZPolicy,
+    DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed, padded_deviation_seed,
     project_monotone_feasible_beta, push_deviation_aux_blockspecs,
@@ -13248,29 +13248,15 @@ pub fn fit_survival_marginal_slope_terms(
                 hints.logslope_beta.clone(),
             ),
         ];
-        if let Some(ref prepared) = score_warp_prepared {
-            let rho_h = rho
-                .slice(s![cursor..cursor + prepared.block.penalties.len()])
-                .to_owned();
-            cursor += prepared.block.penalties.len();
-            blocks.push(build_aux_blockspec(
-                "score_warp_dev",
-                prepared,
-                rho_h,
-                hints.score_warp_beta.clone(),
-            )?);
-        }
-        if let Some(ref prepared) = link_dev_prepared {
-            let rho_w = rho
-                .slice(s![cursor..cursor + prepared.block.penalties.len()])
-                .to_owned();
-            blocks.push(build_aux_blockspec(
-                "link_dev",
-                prepared,
-                rho_w,
-                hints.link_dev_beta.clone(),
-            )?);
-        }
+        push_deviation_aux_blockspecs(
+            &mut blocks,
+            rho,
+            &mut cursor,
+            score_warp_prepared.as_ref(),
+            link_dev_prepared.as_ref(),
+            hints.score_warp_beta.clone(),
+            hints.link_dev_beta.clone(),
+        )?;
         Ok(blocks)
     };
 
