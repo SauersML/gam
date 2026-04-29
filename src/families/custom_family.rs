@@ -438,7 +438,7 @@ pub fn cost_gated_outer_order(
 /// the same as an inner coefficient-space Hessian HVP. Inner matrix-free
 /// coefficient algebra keeps β-space memory under control, but it does not
 /// make the pairwise outer θθ Hessian cheap to request.
-pub fn cost_gated_outer_order_with_matrix_free(
+pub fn cost_gated_outer_order_with_outer_hvp(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
     outer_hyper_hessian_hvp_available: bool,
@@ -720,7 +720,7 @@ pub trait CustomFamily {
         {
             return ExactOuterDerivativeOrder::First;
         }
-        cost_gated_outer_order_with_matrix_free(
+        cost_gated_outer_order_with_outer_hvp(
             specs,
             coefficient_work,
             self.outer_hyper_hessian_hvp_available(specs),
@@ -1001,29 +1001,12 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Static query: does this family supply a matrix-free inner coefficient
-    /// Hessian operator (`HessianResult::Operator` via
-    /// `exact_newton_joint_hessian_workspace`) for the given specs?
-    ///
-    /// The default returns `false`.  Families that override
-    /// `exact_newton_joint_hessian_workspace` to return `Some(workspace)`
-    /// at evaluation time should also override this to return `true` so
-    /// the outer build site can promote `cap_hessian` to `Analytic` before
-    /// the first evaluation.
-    ///
-    /// This is an inner β-space representation capability only. It must not
-    /// promote an expensive problem back to second-order outer θ optimization
-    /// after [`cost_gated_outer_order`] has downgraded the realized scale.
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        false
-    }
-
     /// Explicit name for the inner coefficient-space Hessian HVP capability.
     ///
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        self.supports_matrix_free_joint_hessian(specs)
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        false
     }
 
     /// True only when the family has a real profiled outer Hessian-vector
