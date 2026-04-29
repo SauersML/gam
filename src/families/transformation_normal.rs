@@ -271,6 +271,7 @@ struct TransformationNormalRowQuantityCache {
     log_likelihood: f64,
 }
 
+#[derive(Debug)]
 struct TransformationNormalRowDerived {
     inv_h_prime: Array1<f64>,
     inv_h_prime_sq: Array1<f64>,
@@ -4836,6 +4837,19 @@ mod tests {
             .row_quantities(&beta_b)
             .expect("updated beta row quantity lookup");
         assert!(Arc::ptr_eq(&row_b.h, &row_b_again.h));
+    }
+
+    #[test]
+    fn ctn_row_quantities_reject_nonrepresentable_exact_derivatives() {
+        let h = array![0.0];
+        let h_prime = array![1.0e-100];
+        let weights = array![1.0];
+        let err = build_transformation_row_derived(&h, &h_prime, &weights)
+            .expect_err("1/h'^4 overflows f64 and must not be clamped");
+        assert!(
+            err.contains("1/h'^4") && err.contains("outside the finite exact-derivative range"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
