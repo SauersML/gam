@@ -963,20 +963,6 @@ pub fn saved_survival_runtime_baseline_config(
     survival_baseline_config_from_model(model)
 }
 
-/// Dispatch baseline-offset construction by likelihood mode.
-pub fn build_baseline_offsets_by_mode(
-    age_entry: &Array1<f64>,
-    age_exit: &Array1<f64>,
-    baseline_cfg: &SurvivalBaselineConfig,
-    likelihood_mode: SurvivalLikelihoodMode,
-) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-    if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, baseline_cfg)
-    } else {
-        build_survival_baseline_offsets(age_entry, age_exit, baseline_cfg)
-    }
-}
-
 /// Resolve the covariate `TermCollectionSpec` for prediction, remapping
 /// saved training-column indices onto the runtime dataset's layout.
 pub fn resolve_termspec_for_prediction(
