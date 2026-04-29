@@ -485,6 +485,25 @@ pub trait HessianDerivativeProvider: Send + Sync {
         self.scalar_glm_ingredients()
             .map(OuterHessianDerivativeKernel::from_scalar_glm)
     }
+
+    /// Family-supplied exact outer Hessian operator over θ = (ρ, ψ).
+    ///
+    /// When a family can produce the full profiled outer Hessian as a
+    /// matrix-free Hv operator without enumerating θ_iθ_j pairs, it returns
+    /// `Some(op)` here.  The unified evaluator then short-circuits the
+    /// kernel-based assembly path at
+    /// [`reml_laml_evaluate`](self::reml_laml_evaluate) and routes the result
+    /// straight into [`HessianResult::Operator`].
+    ///
+    /// Default returns `None`, in which case the evaluator falls through to
+    /// the existing `outer_hessian_derivative_kernel` / `compute_outer_hessian`
+    /// path.  This is the contract surface for CTN, survival, GAMLSS and
+    /// other families that ship a directional outer-HVP operator.
+    fn family_outer_hessian_operator(
+        &self,
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        None
+    }
 }
 
 /// Raw ingredients for the adjoint trace optimization in scalar GLMs.
@@ -4746,6 +4765,23 @@ pub fn reml_laml_evaluate(
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
+        // First, allow the family to short-circuit with its own exact outer
+        // Hv operator.  Default `None` keeps the fall-through identical to
+        // the historical kernel-based assembly path; CTN/survival/GAMLSS
+        // families that implement a directional θθ HVP will return Some(op)
+        // here and skip the kernel-based dispatch entirely.
+        if let Some(family_op) = effective_deriv.family_outer_hessian_operator() {
+            let mut hessian =
+                crate::solver::outer_strategy::HessianResult::Operator(family_op);
+            if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
+                hessian.add_rho_block_dense(ph)?;
+            }
+            return Ok(RemlLamlResult {
+                cost,
+                gradient: Some(grad),
+                hessian,
+            });
+        }
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
         // Cost selects representation (operator vs dense), not capability.
         // The (n, p, K) scale rule routes biobank-scale problems through the
