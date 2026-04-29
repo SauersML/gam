@@ -6987,11 +6987,17 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
                 };
                 let u_a = u[a].as_slice().expect("contiguous");
                 let u_b = u[b].as_slice().expect("contiguous");
-                for i in 0..n {
-                    let c = coeff[i];
-                    r_a_slice[i] += c * u_b[i];
-                    r_b_slice[i] += c * u_a[i];
-                }
+                use rayon::prelude::*;
+                r_a_slice
+                    .par_iter_mut()
+                    .zip(r_b_slice.par_iter_mut())
+                    .zip(coeff.par_iter())
+                    .zip(u_a.par_iter())
+                    .zip(u_b.par_iter())
+                    .for_each(|((((ra, rb), c), ua), ub)| {
+                        *ra += c * ub;
+                        *rb += c * ua;
+                    });
             }
         }
 
