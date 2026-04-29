@@ -13815,45 +13815,12 @@ pub fn build_duchon_basiswithworkspace(
     // Duchon radial basis with triple operator regularization. These are
     // collocation operator penalties on the fitted function, not the native
     // Fourier-space Duchon seminorm.
-    let mut candidates = operator_penalty_candidates_from_collocation(
+    let candidates = operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
         &ops.d2,
         &spec.operator_penalties,
     );
-    // Identity ridge on the polynomial null-space block. Mass+tension+stiffness
-    // collectively cover all Π_k directions (after the d1/d2 polynomial-block
-    // fix), but each is data-weighted via the collocation Gram matrices, and
-    // REML can drive any one of them to ≈0 on weakly-informative data — at
-    // which point the polynomial coefficients can grow enough to dominate
-    // out-of-hull predictions even though in-hull is well-fit (the radial
-    // part cancels the polynomial trend locally, then decays at infinity).
-    // An always-on data-independent identity ridge on the Π_k block gives
-    // REML an additional handle that cannot have its scale collapse with the
-    // operator penalties on noise-free data, honoring the "Duchon smooths
-    // always include nullspace shrinkage" contract surfaced in the
-    // term-builder warning.
-    if poly_cols > 0 {
-        let pre_z_cols = kernel_transform.ncols() + poly_cols;
-        let mut ridge_pre_z = Array2::<f64>::zeros((pre_z_cols, pre_z_cols));
-        for i in kernel_transform.ncols()..pre_z_cols {
-            ridge_pre_z[[i, i]] = 1.0;
-        }
-        let ridge = if let Some(z) = identifiability_transform.as_ref() {
-            symmetrize(&fast_ab(&fast_atb(z, &ridge_pre_z), z))
-        } else {
-            ridge_pre_z
-        };
-        if ridge.iter().any(|v| v.abs() > 0.0) {
-            candidates.push(PenaltyCandidate {
-                matrix: ridge,
-                nullspace_dim_hint: 0,
-                source: PenaltySource::DoublePenaltyNullspace,
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-            });
-        }
-    }
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
