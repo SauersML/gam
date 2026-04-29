@@ -1001,13 +1001,15 @@ impl CustomFamily for TransformationNormalFamily {
                 .zip(weights.as_slice().unwrap().par_iter())
                 .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
                 .zip(row_quantities.inv_h_prime_sq.as_slice().unwrap().par_iter())
-                .map(|(((((((wh, wih), wih2), &hi), &hpi), &wi), &inv), &inv_sq)| {
-                    let w_inv = wi * inv;
-                    *wh = wi * hi;
-                    *wih = w_inv;
-                    *wih2 = wi * inv_sq;
-                    wi * (-0.5 * hi * hi + hpi.ln())
-                })
+                .map(
+                    |(((((((wh, wih), wih2), &hi), &hpi), &wi), &inv), &inv_sq)| {
+                        let w_inv = wi * inv;
+                        *wh = wi * hi;
+                        *wih = w_inv;
+                        *wih2 = wi * inv_sq;
+                        wi * (-0.5 * hi * hi + hpi.ln())
+                    },
+                )
                 .sum::<f64>()
         };
 
@@ -1313,7 +1315,8 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        let row_quantities = self.row_quantities(beta);
+        let h_prime = row_quantities.h_prime.as_ref();
         let d_h_prime = self.x_deriv_kron.forward_mul(d_beta);
 
         // ∂H/∂β · d_beta = -2 X_deriv^T diag((X_deriv · d_beta) / h'^3) X_deriv
@@ -1406,14 +1409,16 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row = self.row_quantities(beta);
+        let h = row.h.as_ref();
+        let h_prime = row.h_prime.as_ref();
         let n = h.len();
-        let inv_h_prime: Array1<f64> = h_prime.mapv(|v| 1.0 / v);
-        let inv_h_prime_sq: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v));
-        let inv_h_prime_cu: Array1<f64> = h_prime.mapv(|v| 1.0 / (v * v * v));
-        let weighted_h = &h * self.weights.as_ref();
-        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
-        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+        let inv_h_prime = row.inv_h_prime.as_ref();
+        let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
+        let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
+        let weighted_h = h * self.weights.as_ref();
+        let weighted_inv_h_prime = inv_h_prime * self.weights.as_ref();
+        let weighted_inv_h_prime_sq = inv_h_prime_sq * self.weights.as_ref();
 
         let op = deriv
             .implicit_operator
@@ -1475,7 +1480,7 @@ impl CustomFamily for TransformationNormalFamily {
                 .map_err(|e| format!("tensor psi weighted_cross(derivative) failed: {e}"))?;
             let sym_deriv = &xdt_xdp + &xdt_xdp.t();
 
-            let w_cubic = ((&v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+            let w_cubic = ((&v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
             let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic, &self.policy);
 
             sym_val + &sym_deriv + &cubic_term
@@ -1503,15 +1508,17 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv_i = &psi_derivs[0][psi_i];
         let deriv_j = &psi_derivs[0][psi_j];
         let beta = &block_states[0].beta;
-        let (h, h_prime) = self.compute_h_and_h_prime(beta);
+        let row = self.row_quantities(beta);
+        let h = row.h.as_ref();
+        let h_prime = row.h_prime.as_ref();
         let n = h.len();
-        let inv_h_prime = h_prime.mapv(|v| 1.0 / v);
-        let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
-        let inv_h_prime_cu = h_prime.mapv(|v| 1.0 / (v * v * v));
-        let inv_h_prime_qu = h_prime.mapv(|v| 1.0 / (v * v * v * v));
-        let weighted_h = &h * self.weights.as_ref();
-        let weighted_inv_h_prime = &inv_h_prime * self.weights.as_ref();
-        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
+        let inv_h_prime = row.inv_h_prime.as_ref();
+        let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
+        let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
+        let inv_h_prime_qu = row.inv_h_prime_qu.as_ref();
+        let weighted_h = h * self.weights.as_ref();
+        let weighted_inv_h_prime = inv_h_prime * self.weights.as_ref();
+        let weighted_inv_h_prime_sq = inv_h_prime_sq * self.weights.as_ref();
 
         let op = deriv_i
             .implicit_operator
@@ -1843,13 +1850,14 @@ impl CustomFamily for TransformationNormalFamily {
                 "TransformationNormalFamily Hessian workspace: h'[{i}] = {hp} is not strictly positive"
             ));
         }
-        let weighted_inv_hp_sq = ndarray::Zip::from(&h_prime)
+        let weighted_inv_hp_sq = ndarray::Zip::from(row_quantities.inv_h_prime_sq.as_ref())
             .and(self.weights.as_ref())
-            .par_map_collect(|&hp, &w| w / (hp * hp));
+            .par_map_collect(|&inv_hp_sq, &w| w * inv_hp_sq);
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
-            h_prime,
             weighted_inv_hp_sq,
+            Arc::clone(&row_quantities.inv_h_prime_cu),
+            Arc::clone(&row_quantities.inv_h_prime_qu),
         )?;
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
@@ -1904,19 +1912,15 @@ struct TransformationNormalJointHessianWorkspace {
 impl TransformationNormalJointHessianWorkspace {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        h_prime: Array1<f64>,
         weighted_inv_hp_sq: Array1<f64>,
+        inv_hp_cu: Arc<Array1<f64>>,
+        inv_hp_qu: Arc<Array1<f64>>,
     ) -> Result<Self, String> {
-        let inv_hp_cu = ndarray::Zip::from(&h_prime).par_map_collect(|&hp| 1.0 / (hp * hp * hp));
-        let inv_hp_qu = ndarray::Zip::from(&h_prime).par_map_collect(|&hp| {
-            let hp2 = hp * hp;
-            1.0 / (hp2 * hp2)
-        });
         Ok(Self {
             family,
             weighted_inv_hp_sq,
-            inv_hp_cu: Arc::new(inv_hp_cu),
-            inv_hp_qu: Arc::new(inv_hp_qu),
+            inv_hp_cu,
+            inv_hp_qu,
         })
     }
 
