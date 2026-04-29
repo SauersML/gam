@@ -2907,6 +2907,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         self.total_cols
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return dense_matvec(combined, vector);
+        }
         let k_eff = self
             .constraint_transform
             .as_ref()
@@ -2928,6 +2931,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         result
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return dense_transpose_matvec(combined, vector);
+        }
         let k_eff = self
             .constraint_transform
             .as_ref()
@@ -2950,22 +2956,56 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
     }
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         let p = self.total_cols;
-        let mut xtwx = Array2::<f64>::zeros((p, p));
-        for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
-            let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
-            let chunk = self.row_chunk_combined(start..end);
-            // Build W·chunk with signed weights and accumulate Xᵀ·(W·X). The
-            // prior sqrt(max(0, w))-then-Gram path clipped negative weights to
-            // zero, corrupting observed-Hessian assembly when any block had a
-            // negative diagonal entry (e.g. n > a under the logb σ link).
-            let mut wchunk = chunk.clone();
-            for local in 0..(end - start) {
-                let wi = weights[start + local];
-                wchunk.row_mut(local).mapv_inplace(|v| v * wi);
-            }
-            let ata = fast_ab(&chunk.t().to_owned(), &wchunk);
-            xtwx += &ata;
+        // [STAGE] kernel-xtwx: prefer the one-shot materialized [K_eff | poly]
+        // block + faer streaming GEMM.  This is the BLAS-3 path that beats
+        // the per-iteration kernel rebuild by an order of magnitude on dense
+        // Duchon / TPS designs.
+        if let Some(combined) = self.materialized_combined() {
+            let mut xtwx = Array2::<f64>::zeros((p, p));
+            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+            return Ok(xtwx);
         }
+        // Fallback: design too large to materialize.  Run row chunks in
+        // parallel, each thread folding into its own p×p accumulator and
+        // performing one BLAS-3 GEMM (Xc^T·(W·Xc)) per chunk.
+        let n = self.n;
+        if n == 0 || p == 0 {
+            return Ok(Array2::<f64>::zeros((p, p)));
+        }
+        let chunk_starts: Vec<usize> = (0..n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE).collect();
+        let xtwx = chunk_starts
+            .into_par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut acc, start| {
+                    let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(n);
+                    let chunk = self.row_chunk_combined(start..end);
+                    let mut wchunk = chunk.clone();
+                    for local in 0..(end - start) {
+                        let wi = weights[start + local];
+                        wchunk.row_mut(local).mapv_inplace(|v| v * wi);
+                    }
+                    let chunk_view = FaerArrayView::new(&chunk);
+                    let wchunk_view = FaerArrayView::new(&wchunk);
+                    let mut acc_view = array2_to_matmut(&mut acc);
+                    matmul(
+                        acc_view.as_mut(),
+                        Accum::Add,
+                        chunk_view.as_ref().transpose(),
+                        wchunk_view.as_ref(),
+                        1.0,
+                        Par::Seq,
+                    );
+                    acc
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            );
         Ok(xtwx)
     }
 }

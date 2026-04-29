@@ -505,11 +505,9 @@ where
                 // via LU on |det| with sign tracking would not help here
                 // (we need an SPD-style logdet); surface a descriptive error
                 // so the outer driver can fall back.
-                return Err(
-                    "SLQ exact tiny-system Cholesky failed and symmetric \
+                return Err("SLQ exact tiny-system Cholesky failed and symmetric \
                      eigendecomposition fallback also failed"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
     }
