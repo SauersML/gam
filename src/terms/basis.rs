@@ -4,7 +4,10 @@ use crate::faer_ndarray::{
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix};
-use crate::probability::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
+use crate::probability::{
+    binomial_coefficient_f64 as binomial_f64,
+    stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
+};
 use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
@@ -8539,23 +8542,6 @@ fn duchon_effective_nullspace_order(
         return DuchonNullspaceOrder::Zero;
     }
     order
-}
-
-#[inline(always)]
-fn binomial_f64(n: usize, k: usize) -> f64 {
-    if k > n {
-        return 0.0;
-    }
-    if k == 0 || k == n {
-        return 1.0;
-    }
-    let kk = k.min(n - k);
-    let mut c = 1.0_f64;
-    for i in 0..kk {
-        c *= (n - i) as f64;
-        c /= (i + 1) as f64;
-    }
-    c
 }
 
 #[inline(always)]
