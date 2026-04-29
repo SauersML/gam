@@ -10279,6 +10279,37 @@ mod tests {
             cost_gated_outer_order(&ctn_specs, ctn_cost),
             ExactOuterDerivativeOrder::First
         );
+
+        // Same biobank-scale specs, but the family advertises a matrix-free
+        // joint Hv operator. Per the user's plan ("cost selects representation,
+        // never capability") the gate must NOT downgrade to first-order: the
+        // operator path applies HVPs in O(K·n·p), not O(K·n·p²), so the dense-
+        // assembly cost it was guarding does not apply. The hard K² element
+        // cap still fires because the K×K outer Hessian is allocated either way.
+        use crate::custom_family::cost_gated_outer_order_with_matrix_free;
+        assert_eq!(
+            cost_gated_outer_order_with_matrix_free(&ctn_specs, ctn_cost, true),
+            ExactOuterDerivativeOrder::Second,
+            "matrix-free families must keep Second-order capability at biobank scale"
+        );
+        let huge_k_specs = vec![ParameterBlockSpec {
+            name: "k".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, 1,
+            )))),
+            offset: ndarray::Array1::zeros(1),
+            penalties: (0..5_000)
+                .map(|_| crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((1, 1))))
+                .collect(),
+            nullspace_dims: vec![0; 5_000],
+            initial_log_lambdas: ndarray::Array1::zeros(5_000),
+            initial_beta: None,
+        }];
+        assert_eq!(
+            cost_gated_outer_order_with_matrix_free(&huge_k_specs, 0, true),
+            ExactOuterDerivativeOrder::First,
+            "K² > 16M element cap must fire even when matrix-free is available"
+        );
     }
 
     #[test]
