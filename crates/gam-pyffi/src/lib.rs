@@ -1113,7 +1113,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
     payload.link = Some(inverse_link_to_saved_string(&base_link));
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
-    payload.resolved_termspec_noise = Some(frozen_logslope);
+    payload.resolved_termspec_logslope = Some(frozen_logslope);
     payload.score_warp_runtime = ms_result
         .score_warp_runtime
         .as_ref()
@@ -1874,10 +1874,10 @@ fn build_bernoulli_marginal_slope_predict_input(
     let design = build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build marginal prediction design: {err}"))?;
     let spec_logslope = resolve_termspec_for_prediction(
-        &payload.resolved_termspec_noise,
+        &payload.resolved_termspec_logslope,
         training_headers,
         &col_map,
-        "resolved_termspec_noise",
+        "resolved_termspec_logslope",
     )?;
     let design_logslope = build_term_collection_design(dataset.values.view(), &spec_logslope)
         .map_err(|err| format!("failed to build logslope prediction design: {err}"))?;

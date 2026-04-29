@@ -6067,8 +6067,43 @@ pub fn build_tensor_psi_derivatives(
 struct TransformationExactGeometryCache {
     key: Vec<u64>,
     family: TransformationNormalFamily,
-    base_block_spec: ParameterBlockSpec,
+    blocks: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+}
+
+impl TransformationExactGeometryCache {
+    fn block_spec(&self) -> Result<&ParameterBlockSpec, String> {
+        self.blocks
+            .first()
+            .ok_or_else(|| "missing transformation block spec".to_string())
+    }
+
+    fn update_initial_beta(&mut self, beta_hint: Option<&Array1<f64>>) {
+        let Some(spec) = self.blocks.first_mut() else {
+            return;
+        };
+        if let Some(hint) = beta_hint
+            && hint.len() == spec.design.ncols()
+        {
+            spec.initial_beta = Some(hint.clone());
+        }
+    }
+
+    fn update_initial_log_lambdas(&mut self, log_lambdas: &Array1<f64>) -> Result<(), String> {
+        let spec = self
+            .blocks
+            .first_mut()
+            .ok_or_else(|| "missing transformation block spec".to_string())?;
+        if log_lambdas.len() != spec.initial_log_lambdas.len() {
+            return Err(format!(
+                "transformation final fit rho length mismatch: got {}, expected {}",
+                log_lambdas.len(),
+                spec.initial_log_lambdas.len()
+            ));
+        }
+        spec.initial_log_lambdas = log_lambdas.clone();
+        Ok(())
+    }
 }
 
 fn transformation_spatial_geometry_key(
@@ -6093,41 +6128,6 @@ fn transformation_spatial_geometry_key(
         }
     }
     key
-}
-
-fn build_blocks_from_base_spec(
-    base_block_spec: &ParameterBlockSpec,
-    beta_hint: Option<&Array1<f64>>,
-) -> Vec<ParameterBlockSpec> {
-    let mut spec = base_block_spec.clone();
-    if let Some(hint) = beta_hint
-        && hint.len() == spec.design.ncols()
-    {
-        spec.initial_beta = Some(hint.clone());
-    }
-    vec![spec]
-}
-
-fn build_blocks_from_base_spec_with_log_lambdas(
-    base_block_spec: &ParameterBlockSpec,
-    beta_hint: Option<&Array1<f64>>,
-    log_lambdas: &Array1<f64>,
-) -> Result<Vec<ParameterBlockSpec>, String> {
-    if log_lambdas.len() != base_block_spec.initial_log_lambdas.len() {
-        return Err(format!(
-            "transformation final fit rho length mismatch: got {}, expected {}",
-            log_lambdas.len(),
-            base_block_spec.initial_log_lambdas.len()
-        ));
-    }
-    let mut spec = base_block_spec.clone();
-    spec.initial_log_lambdas = log_lambdas.clone();
-    if let Some(hint) = beta_hint
-        && hint.len() == spec.design.ncols()
-    {
-        spec.initial_beta = Some(hint.clone());
-    }
-    Ok(vec![spec])
 }
 
 // ---------------------------------------------------------------------------
@@ -6395,7 +6395,7 @@ pub fn fit_transformation_normal(
         exact_warm_start.replace(None);
         exact_geometry_cache.replace(Some(TransformationExactGeometryCache {
             key,
-            base_block_spec: family.block_spec(),
+            blocks: vec![family.block_spec()],
             family,
             derivative_blocks: vec![tensor_derivs],
         }));
@@ -6429,20 +6429,17 @@ pub fn fit_transformation_normal(
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
-            let cache_ref = exact_geometry_cache.borrow();
+            let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let blocks = build_blocks_from_base_spec_with_log_lambdas(
-                &geometry.base_block_spec,
-                beta_hint.borrow().as_ref(),
-                &rho,
-            )?;
+            geometry.update_initial_log_lambdas(&rho)?;
+            geometry.update_initial_beta(beta_hint.borrow().as_ref());
             let warm_start = exact_warm_start.borrow();
             let fit = fit_custom_family_fixed_log_lambdas(
                 &geometry.family,
-                &blocks,
+                &geometry.blocks,
                 &options,
                 warm_start.as_ref(),
                 0,
@@ -6460,17 +6457,16 @@ pub fn fit_transformation_normal(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
             use crate::solver::estimate::reml::unified::EvalMode;
             ensure_exact_geometry(&specs[0], &designs[0])?;
-            let cache_ref = exact_geometry_cache.borrow();
+            let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            let blocks =
-                build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
+            geometry.update_initial_beta(beta_hint.borrow().as_ref());
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
 
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
-                &blocks,
+                &geometry.blocks,
                 &options,
                 &rho,
                 &geometry.derivative_blocks,
@@ -6488,6 +6484,11 @@ pub fn fit_transformation_normal(
                 );
             }
 
+            if let Some(beta) = eval.warm_start.first_block_beta()
+                && beta.len() == geometry.block_spec()?.design.ncols()
+            {
+                *beta_hint.borrow_mut() = Some(beta.clone());
+            }
             exact_warm_start.replace(Some(eval.warm_start));
 
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
@@ -6503,22 +6504,26 @@ pub fn fit_transformation_normal(
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
-            let cache_ref = exact_geometry_cache.borrow();
+            let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            let blocks =
-                build_blocks_from_base_spec(&geometry.base_block_spec, beta_hint.borrow().as_ref());
+            geometry.update_initial_beta(beta_hint.borrow().as_ref());
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
-                &blocks,
+                &geometry.blocks,
                 &options,
                 &rho,
                 &geometry.derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )
             .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
+            if let Some(beta) = eval.warm_start.first_block_beta()
+                && beta.len() == geometry.block_spec()?.design.ncols()
+            {
+                *beta_hint.borrow_mut() = Some(beta.clone());
+            }
             exact_warm_start.replace(Some(eval.warm_start));
             Ok(eval.efs_eval)
         },
