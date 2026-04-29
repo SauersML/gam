@@ -2975,19 +2975,27 @@ pub fn logit_posterior_meanwith_deriv_batch(
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
 ) -> Result<(ndarray::Array1<f64>, ndarray::Array1<f64>), EstimationError> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = eta.len();
+    // Per-row quadrature integration is independent across rows.
+    let pairs: Result<Vec<(f64, f64)>, _> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let integrated = integrated_inverse_link_mean_and_derivative(
+                ctx,
+                LinkFunction::Logit,
+                eta[i],
+                se_eta[i],
+            )?;
+            Ok::<_, EstimationError>((integrated.mean, integrated.dmean_dmu))
+        })
+        .collect();
+    let pairs = pairs?;
     let mut mu = ndarray::Array1::<f64>::zeros(n);
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let integrated = integrated_inverse_link_mean_and_derivative(
-            ctx,
-            LinkFunction::Logit,
-            eta[i],
-            se_eta[i],
-        )?;
-        mu[i] = integrated.mean;
-        dmu[i] = integrated.dmean_dmu;
+    for (i, (m, d)) in pairs.into_iter().enumerate() {
+        mu[i] = m;
+        dmu[i] = d;
     }
 
     Ok((mu, dmu))
