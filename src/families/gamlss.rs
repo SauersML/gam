@@ -6966,9 +6966,11 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
                 let r_a = r[a]
                     .as_slice_mut()
                     .expect("RowCoeffOperator r must be contiguous");
-                for i in 0..n {
-                    r_a[i] += coeff[i] * u_a[i];
-                }
+                use rayon::prelude::*;
+                r_a.par_iter_mut()
+                    .zip(coeff.par_iter())
+                    .zip(u_a.par_iter())
+                    .for_each(|((r, c), u)| *r += c * u);
             } else {
                 let (r_a_slice, r_b_slice) = if a < b {
                     let (left, right) = r.split_at_mut(b);
