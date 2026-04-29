@@ -1234,13 +1234,13 @@ impl LinearOperator for RandomEffectOperator {
 
     /// Forward: out[i] = β[group[i]], or 0 if unmatched.
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            if let Some(g) = self.group_ids[i] {
-                out[i] = vector[g];
-            }
-        }
-        out
+        use rayon::prelude::*;
+        let out: Vec<f64> = self
+            .group_ids
+            .par_iter()
+            .map(|g| g.map(|g| vector[g]).unwrap_or(0.0))
+            .collect();
+        Array1::from(out)
     }
 
     /// Transpose: out[g] = Σ_{i: group[i]=g} v[i].
@@ -1328,13 +1328,13 @@ impl DenseDesignOperator for RandomEffectOperator {
 
     /// diag(X M X') for one-hot X: out[i] = M[group[i], group[i]].
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        let mut out = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            if let Some(g) = self.group_ids[i] {
-                out[i] = middle[[g, g]].max(0.0);
-            }
-        }
-        Ok(out)
+        use rayon::prelude::*;
+        let out: Vec<f64> = self
+            .group_ids
+            .par_iter()
+            .map(|g| g.map(|g| middle[[g, g]].max(0.0)).unwrap_or(0.0))
+            .collect();
+        Ok(Array1::from(out))
     }
 
     fn row_chunk_into(
@@ -1359,11 +1359,11 @@ impl DenseDesignOperator for RandomEffectOperator {
     /// Materialize the full n × q one-hot matrix (fallback for diagnostics).
     fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.n, self.num_groups));
-        for i in 0..self.n {
+        ndarray::Zip::indexed(out.rows_mut()).par_for_each(|i, mut row| {
             if let Some(g) = self.group_ids[i] {
-                out[[i, g]] = 1.0;
+                row[g] = 1.0;
             }
-        }
+        });
         out
     }
 }
@@ -1642,9 +1642,10 @@ impl BlockDesignOperator {
                 if let Some(dense) = d.as_dense_ref() {
                     let xm = fast_ab(dense, m_kk);
                     let mut out = Array1::<f64>::zeros(self.n);
-                    for i in 0..self.n {
-                        out[i] = dense.row(i).dot(&xm.row(i));
-                    }
+                    ndarray::Zip::from(&mut out)
+                        .and(dense.rows())
+                        .and(xm.rows())
+                        .par_for_each(|o, dr, xmr| *o = dr.dot(&xmr));
                     Ok(out)
                 } else {
                     d.quadratic_form_diag(m_kk)
@@ -1655,13 +1656,13 @@ impl BlockDesignOperator {
                 sparse.quadratic_form_diag(m_kk)
             }
             DesignBlock::RandomEffect(re) => {
-                let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    if let Some(g) = re.group_ids[i] {
-                        out[i] = m_kk[[g, g]];
-                    }
-                }
-                Ok(out)
+                use rayon::prelude::*;
+                let out: Vec<f64> = re
+                    .group_ids
+                    .par_iter()
+                    .map(|g| g.map(|g| m_kk[[g, g]]).unwrap_or(0.0))
+                    .collect();
+                Ok(Array1::from(out))
             }
             DesignBlock::Intercept(_) => {
                 // Row i of intercept block is [1], so contribution = M[0,0] for all i.
@@ -1682,9 +1683,10 @@ impl BlockDesignOperator {
                 if let (Some(da), Some(db)) = (da.as_dense_ref(), db.as_dense_ref()) {
                     let da_m = fast_ab(da, m_ab);
                     let mut out = Array1::<f64>::zeros(self.n);
-                    for i in 0..self.n {
-                        out[i] = da_m.row(i).dot(&db.row(i));
-                    }
+                    ndarray::Zip::from(&mut out)
+                        .and(da_m.rows())
+                        .and(db.rows())
+                        .par_for_each(|o, ar, br| *o = ar.dot(&br));
                     Ok(out)
                 } else {
                     self.quadratic_form_diag_cross_chunked(block_a, block_b, m_ab)
@@ -1734,13 +1736,17 @@ impl BlockDesignOperator {
                 Ok(out)
             }
             (DesignBlock::RandomEffect(re_a), DesignBlock::RandomEffect(re_b)) => {
-                let mut out = Array1::<f64>::zeros(self.n);
-                for i in 0..self.n {
-                    if let (Some(ga), Some(gb)) = (re_a.group_ids[i], re_b.group_ids[i]) {
-                        out[i] = m_ab[[ga, gb]];
-                    }
-                }
-                Ok(out)
+                use rayon::prelude::*;
+                let out: Vec<f64> = re_a
+                    .group_ids
+                    .par_iter()
+                    .zip(re_b.group_ids.par_iter())
+                    .map(|(ga, gb)| match (ga, gb) {
+                        (Some(ga), Some(gb)) => m_ab[[*ga, *gb]],
+                        _ => 0.0,
+                    })
+                    .collect();
+                Ok(Array1::from(out))
             }
 
             // Intercept × anything: contribution at row i = m_ab[0, :] · row_i(B_b)
@@ -1879,9 +1885,10 @@ impl LinearOperator for BlockDesignOperator {
 impl DenseDesignOperator for BlockDesignOperator {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         let mut wy = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            wy[i] = weights[i].max(0.0) * y[i];
-        }
+        ndarray::Zip::from(&mut wy)
+            .and(weights)
+            .and(y)
+            .par_for_each(|o, &w, &yi| *o = w.max(0.0) * yi);
         Ok(self.apply_transpose(&wy))
     }
 
