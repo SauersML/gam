@@ -1584,6 +1584,12 @@ struct OuterSecondOrderBridge<'a> {
     /// operator into a dense K×K matrix so the dense ARC path can run an exact
     /// factorization instead of operator-CG.
     materialize_operator_max_dim: usize,
+    /// Counts gradient/Hessian evaluations so that progress is visible even
+    /// when the upstream `opt` solver does not emit per-iteration logs of its
+    /// own. Emitted at INFO from `eval_grad` and `eval_hessian` (the calls
+    /// that gate one optimizer step); skipped on `eval_cost` so linesearch
+    /// trial points do not flood the log.
+    eval_count: usize,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -1606,6 +1612,14 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
+        self.eval_count += 1;
+        let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        log::info!(
+            "[OUTER] eval#{n} (grad) cost={cost:.6e} |g|={gnorm:.3e}",
+            n = self.eval_count,
+            cost = eval.cost,
+            gnorm = g_norm,
+        );
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -1621,6 +1635,14 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+        self.eval_count += 1;
+        let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        log::info!(
+            "[OUTER] eval#{n} (hess) cost={cost:.6e} |g|={gnorm:.3e}",
+            n = self.eval_count,
+            cost = eval.cost,
+            gnorm = g_norm,
+        );
         let hessian = match self.hessian_source {
             HessianSource::Analytic => match eval.hessian {
                 HessianResult::Analytic(h) => Some(h),
@@ -3076,6 +3098,7 @@ fn run_outer_with_plan(
                         layout,
                         hessian_source,
                         materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+                        eval_count: 0,
                     };
 
                     let (lo, hi) = &bounds_template;
@@ -4057,6 +4080,7 @@ mod tests {
             layout: OuterThetaLayout::new(1, 0),
             hessian_source: HessianSource::Analytic,
             materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+            eval_count: 0,
         };
         let grad_sample =
             FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
