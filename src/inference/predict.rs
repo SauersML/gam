@@ -2383,14 +2383,19 @@ impl BinomialLocationScalePredictor {
         } else {
             q0.clone()
         };
-        let mut prob = Array1::zeros(q0.len());
-        for i in 0..eta.len() {
-            let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                &self.inverse_link,
-                eta[i],
-            )?;
-            prob[i] = jet.mu.clamp(0.0, 1.0);
-        }
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let n = eta.len();
+        let prob_vec: Result<Vec<f64>, EstimationError> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                    &self.inverse_link,
+                    eta[i],
+                )?;
+                Ok(jet.mu.clamp(0.0, 1.0))
+            })
+            .collect();
+        let prob = Array1::from_vec(prob_vec?);
         Ok((eta, prob))
     }
 }
