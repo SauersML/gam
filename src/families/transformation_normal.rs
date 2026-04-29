@@ -343,8 +343,9 @@ impl TransformationNormalFamily {
         let policy = ResourcePolicy::default_library();
         let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
 
-        // ----- 5. Initial log-lambdas (one per penalty, start at 0.0) -----
-        let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
+        // ----- 5. CTN-specific smoothing seed from likelihood/penalty scales -----
+        let initial_log_lambdas =
+            ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
 
         // Compute response median for anchoring
         let mut sorted_resp = response.to_vec();
@@ -495,7 +496,8 @@ impl TransformationNormalFamily {
         let policy = ResourcePolicy::default_library();
         let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
 
-        let initial_log_lambdas = Array1::zeros(tensor_penalties.len());
+        let initial_log_lambdas =
+            ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
 
         // Compute response median from column 1 (y values)
         let mut sorted_resp = response_approx.to_vec();
@@ -620,6 +622,48 @@ fn weighted_crossprod_dense(
     // n × right.ncols matrix. At biobank scale (n=300K, p_cov=200) that drops
     // a transient ~480 MiB allocation per call to a few-MiB sliding chunk.
     crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
+}
+
+fn ctn_penalty_scale_log_lambdas(
+    penalties: &[PenaltyMatrix],
+    likelihood_gram: &Array2<f64>,
+) -> Array1<f64> {
+    if penalties.is_empty() {
+        return Array1::zeros(0);
+    }
+
+    let likelihood_scale = matrix_diag_mean_abs(likelihood_gram).max(1.0e-8);
+    Array1::from_iter(penalties.iter().map(|penalty| {
+        let penalty_scale = penalty_diag_scale(penalty).max(1.0e-8);
+        (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
+    }))
+}
+
+fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
+    match penalty {
+        PenaltyMatrix::Dense(matrix) => matrix_diag_mean_abs(matrix).max(matrix_frobenius_rms(matrix)),
+        PenaltyMatrix::KroneckerFactored { left, right } => {
+            let diag_scale = matrix_diag_mean_abs(left) * matrix_diag_mean_abs(right);
+            let frob_scale = matrix_frobenius_rms(left) * matrix_frobenius_rms(right);
+            diag_scale.max(frob_scale)
+        }
+        PenaltyMatrix::Blockwise { local, .. } => {
+            matrix_diag_mean_abs(local).max(matrix_frobenius_rms(local))
+        }
+    }
+}
+
+fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
+    let d = matrix.nrows().min(matrix.ncols());
+    if d == 0 {
+        return 0.0;
+    }
+    matrix.diag().iter().map(|v| v.abs()).sum::<f64>() / d as f64
+}
+
+fn matrix_frobenius_rms(matrix: &Array2<f64>) -> f64 {
+    let d = matrix.nrows().max(1).min(matrix.ncols().max(1));
+    (matrix.iter().map(|v| v * v).sum::<f64>() / d as f64).sqrt()
 }
 
 /// Weighted cross-product of two rowwise-Kronecker designs, kept strictly
