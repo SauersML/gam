@@ -9639,11 +9639,22 @@ fn evaluate_joint_reml_efs_at_theta(
 }
 
 fn exact_joint_spatial_outer_hessian_available(
-    family: LikelihoodFamily,
-    design: &TermCollectionDesign,
+    _family: LikelihoodFamily,
+    _design: &TermCollectionDesign,
 ) -> bool {
-    let sparse_design = design.design.as_sparse().is_some();
-    family.link_function() == crate::types::LinkFunction::Identity || sparse_design
+    // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
+    // Royston-Parmar) routes through the unified evaluator's outer-Hessian
+    // path: Gaussian Identity uses the no-correction dense form, all GLM
+    // variants supply scalar-GLM derivative ingredients consumed by
+    // `compute_outer_hessian` / `build_outer_hessian_operator`, and the
+    // (n, p, K) crossover in `prefer_outer_hessian_operator` chooses the
+    // matrix-free `HessianResult::Operator` representation at biobank scale
+    // for dense-lazy designs.  The previous `Identity || sparse_design`
+    // gate predates that operator routing and forced binomial+logit+Matern
+    // (and any other non-Gaussian dense-lazy spatial design) onto the
+    // gradient-only BFGS path even though analytic Hessian is fully
+    // available — capability check, not cost.
+    true
 }
 
 fn spatial_tau_tau_hessian_policy(
@@ -15353,7 +15364,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_joint_spatial_outer_hessian_gate_disables_dense_non_gaussian_designs() {
+    fn exact_joint_spatial_outer_hessian_available_for_dense_non_gaussian_designs() {
         let n = 5_001usize;
         let p = 100usize;
         let data = Array2::from_shape_fn((n, p), |(i, j)| ((i + j + 1) as f64).sin());
@@ -15373,7 +15384,11 @@ mod tests {
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
 
-        assert!(!exact_joint_spatial_outer_hessian_available(
+        // Both Gaussian and BinomialLogit on a dense design now report
+        // analytic Hessian available; the unified evaluator routes
+        // non-Gaussian dense-lazy designs through `build_outer_hessian_operator`
+        // at biobank scale and through `compute_outer_hessian` otherwise.
+        assert!(exact_joint_spatial_outer_hessian_available(
             LikelihoodFamily::BinomialLogit,
             &design,
         ));
