@@ -5426,18 +5426,47 @@ fn compute_outer_hessian(
                     )?;
 
                     let h2 = base + m_terms + correction;
-                    if !cross_trace.is_finite()
+                    let g_dot_v = coord_i.g.dot(&ext_v[jj]);
+                    let pair_g_finite = pair.g.iter().all(|v| v.is_finite());
+                    let b_mat_finite = pair.b_mat.iter().all(|v| v.is_finite());
+                    let ext_vi_finite = ext_v[ii].iter().all(|v| v.is_finite());
+                    let ext_vj_finite = ext_v[jj].iter().all(|v| v.is_finite());
+                    let any_non_finite = !cross_trace.is_finite()
                         || !base.is_finite()
                         || !m_terms.is_finite()
                         || !correction.is_finite()
                         || !h2.is_finite()
-                    {
-                        let g_dot_v = coord_i.g.dot(&ext_v[jj]);
-                        let b_mat_finite = pair.b_mat.iter().all(|v| v.is_finite());
-                        let ext_vi_finite = ext_v[ii].iter().all(|v| v.is_finite());
-                        let ext_vj_finite = ext_v[jj].iter().all(|v| v.is_finite());
+                        || !pair.a.is_finite()
+                        || !pair.ld_s.is_finite()
+                        || !g_dot_v.is_finite()
+                        || !pair_g_finite
+                        || !b_mat_finite;
+                    if any_non_finite {
+                        // Probe a single bad b_mat entry so we can tell whether
+                        // the NaN is structural (whole matrix bad) or localized
+                        // to a particular row/col.
+                        let mut first_bad_b_mat = None;
+                        if !b_mat_finite {
+                            'outer: for r in 0..pair.b_mat.nrows() {
+                                for c in 0..pair.b_mat.ncols() {
+                                    if !pair.b_mat[[r, c]].is_finite() {
+                                        first_bad_b_mat = Some((r, c, pair.b_mat[[r, c]]));
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                        let mut first_bad_pair_g = None;
+                        if !pair_g_finite {
+                            for (idx, value) in pair.g.iter().enumerate() {
+                                if !value.is_finite() {
+                                    first_bad_pair_g = Some((idx, *value));
+                                    break;
+                                }
+                            }
+                        }
                         log::warn!(
-                            "[OUTER ext-ext non-finite] ({},{}): cross_trace={} base={} m_terms={} correction={} pair.a={} pair.ld_s={} g.dot(v_jj)={} b_mat_finite={} b_operator_present={} b_mat_dim={}x{} ext_v[ii]_finite={} ext_v[jj]_finite={} coord_i.b_depends_on_beta={} coord_j.b_depends_on_beta={}",
+                            "[OUTER ext-ext non-finite] ({},{}): cross_trace={} base={} m_terms={} correction={} pair.a={} pair.ld_s={} g.dot(v_jj)={} pair_g_finite={} first_bad_pair_g={:?} b_mat_finite={} first_bad_b_mat={:?} b_operator_present={} b_mat_dim={}x{} ext_v[ii]_finite={} ext_v[jj]_finite={} coord_i.b_depends_on_beta={} coord_j.b_depends_on_beta={}",
                             ii,
                             jj,
                             cross_trace,
@@ -5447,7 +5476,10 @@ fn compute_outer_hessian(
                             pair.a,
                             pair.ld_s,
                             g_dot_v,
+                            pair_g_finite,
+                            first_bad_pair_g,
                             b_mat_finite,
+                            first_bad_b_mat,
                             pair.b_operator.is_some(),
                             pair.b_mat.nrows(),
                             pair.b_mat.ncols(),
