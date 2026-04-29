@@ -132,7 +132,7 @@ pub fn build_predict_input_for_model(
                 col_map,
                 "resolved_termspec_noise",
             )?;
-            let design_noise_raw = build_term_collection_design(data, &spec_noise)
+            let design_noise_raw = build_term_collection_design(design_input, &spec_noise)
                 .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
 
             let noise_transform = scale_transform_from_payload(
@@ -172,7 +172,7 @@ pub fn build_predict_input_for_model(
                 col_map,
                 "resolved_termspec_logslope",
             )?;
-            let design_logslope = build_term_collection_design(data, &spec_logslope)
+            let design_logslope = build_term_collection_design(design_input, &spec_logslope)
                 .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
             Ok(PredictInput {
                 design: design.design.clone(),

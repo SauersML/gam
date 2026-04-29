@@ -2440,14 +2440,8 @@ impl<'a> RemlState<'a> {
                 // biobank scale — the main signal for "what's the slow path"
                 // when an outer BFGS / line-search step blows past the
                 // 2400 s job budget.
-                let level = if in_screening {
-                    log::Level::Debug
-                } else {
-                    log::Level::Info
-                };
-                log::log!(
-                    level,
-                    "[PIRLS-timing] iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s",
+                log::info!(
+                    "[STAGE] inner pirls solve iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
                     res.max_abs_eta,
