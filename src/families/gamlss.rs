@@ -10213,34 +10213,47 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         let p_ls = self.x_ls.ncols();
         let pw = self.pieces.basis.ncols();
         let total = pmu + p_ls + pw;
+        // Diagonals are independent column-wise reductions: parallelize.
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let diag_mu: Vec<f64> = (0..pmu)
+            .into_par_iter()
+            .map(|j| {
+                let col = self.xmu.column(j);
+                col.iter()
+                    .zip(self.pieces.coeff_mm.iter())
+                    .map(|(&v, &c)| c * v * v)
+                    .sum()
+            })
+            .collect();
+        let diag_ls: Vec<f64> = (0..p_ls)
+            .into_par_iter()
+            .map(|j| {
+                let col = self.x_ls.column(j);
+                col.iter()
+                    .zip(self.pieces.coeff_ll.iter())
+                    .map(|(&v, &c)| c * v * v)
+                    .sum()
+            })
+            .collect();
+        let diag_w: Vec<f64> = (0..pw)
+            .into_par_iter()
+            .map(|j| {
+                let col = self.pieces.basis.column(j);
+                col.iter()
+                    .zip(self.pieces.coeff_ww.iter())
+                    .map(|(&v, &c)| c * v * v)
+                    .sum()
+            })
+            .collect();
         let mut diag = Array1::<f64>::zeros(total);
-        let n = self.pieces.coeff_mm.len();
-        for j in 0..pmu {
-            let col = self.xmu.column(j);
-            let mut acc = 0.0;
-            for i in 0..n {
-                let v = col[i];
-                acc += self.pieces.coeff_mm[i] * v * v;
-            }
-            diag[j] = acc;
+        for (j, v) in diag_mu.into_iter().enumerate() {
+            diag[j] = v;
         }
-        for j in 0..p_ls {
-            let col = self.x_ls.column(j);
-            let mut acc = 0.0;
-            for i in 0..n {
-                let v = col[i];
-                acc += self.pieces.coeff_ll[i] * v * v;
-            }
-            diag[pmu + j] = acc;
+        for (j, v) in diag_ls.into_iter().enumerate() {
+            diag[pmu + j] = v;
         }
-        for j in 0..pw {
-            let col = self.pieces.basis.column(j);
-            let mut acc = 0.0;
-            for i in 0..n {
-                let v = col[i];
-                acc += self.pieces.coeff_ww[i] * v * v;
-            }
-            diag[pmu + p_ls + j] = acc;
+        for (j, v) in diag_w.into_iter().enumerate() {
+            diag[pmu + p_ls + j] = v;
         }
         Ok(Some(diag))
     }
