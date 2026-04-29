@@ -1024,6 +1024,30 @@ pub trait CustomFamily {
         true
     }
 
+    /// Family-supplied exact outer Hessian operator over θ = (ρ, ψ).
+    ///
+    /// When a family can produce the full profiled outer Hessian as a
+    /// matrix-free Hv operator — using its own directional θθ kernels and
+    /// trace algebra rather than the generic per-pair enumeration — it
+    /// overrides this method and returns `Some(op)`.  The unified REML/LAML
+    /// evaluator wires the operator into [`HessianResult::Operator`] via
+    /// the [`HessianDerivativeProvider::family_outer_hessian_operator`] hook
+    /// the family installs on its provider; consumers see a generic
+    /// `Arc<dyn OuterHessianOperator>` (matvec / dim / mul_mat /
+    /// is_cheap_to_materialize).
+    ///
+    /// Default returns `None`, leaving the family on the existing pairwise
+    /// assembly path.  This is the architectural contract for CTN, survival
+    /// (Gompertz-Makeham + timewiggle), GAMLSS location-scale, and
+    /// Bernoulli marginal-slope families to plug their directional
+    /// outer-HVP operators into the same surface.
+    fn outer_hyper_hessian_operator(
+        &self,
+        _specs: &[ParameterBlockSpec],
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        None
+    }
+
     /// Optional spec-aware exact joint Hessian.
     ///
     /// This hook exists because the outer hyper-derivative code works from the

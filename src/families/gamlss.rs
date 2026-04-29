@@ -10746,19 +10746,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Operator-aware: when `use_joint_matrix_free_path` selects the
-        // matrix-free workspace, joint Hv apply is O(n · (p_μ + p_w)) and the
-        // dense (p_μ + p_w)² matrix is never built; report that to the gate.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        // Mean and link-wiggle blocks couple through the binomial weight,
+        // giving a dense joint Hessian of size (p_μ + p_w)² per row. This
+        // family does not yet expose a matrix-free joint workspace, so the
+        // honest per-evaluation cost remains the dense build.
+        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
     fn block_linear_constraints(
