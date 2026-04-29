@@ -9384,20 +9384,8 @@ mod tests {
     mod saved_survival_marginal_slope_test_support {
         use super::super::exact_kernel;
         use super::{Array1, SavedAnchoredDeviationRuntime};
+        use gam::families::marginal_slope_shared::{probit_frailty_scale, scale_coeff4};
         use gam::probability::normal_cdf;
-
-        fn probit_frailty_scale_from_sigma(sigma: Option<f64>) -> f64 {
-            gam::families::lognormal_kernel::ProbitFrailtyScale::new(sigma.unwrap_or(0.0)).s
-        }
-
-        fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
-            [
-                scale * coefficients[0],
-                scale * coefficients[1],
-                scale * coefficients[2],
-                scale * coefficients[3],
-            ]
-        }
 
         fn saved_survival_default_score_span() -> exact_kernel::LocalSpanCubic {
             exact_kernel::LocalSpanCubic {
@@ -9460,7 +9448,7 @@ mod tests {
                     }
                 },
             )?;
-            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let scale = probit_frailty_scale(gaussian_frailty_sd);
             if scale != 1.0 {
                 for partition_cell in &mut cells {
                     partition_cell.cell.c0 *= scale;
@@ -9491,7 +9479,7 @@ mod tests {
                 link_runtime,
                 link_beta,
             )?;
-            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let scale = probit_frailty_scale(gaussian_frailty_sd);
             let mut f = -gam::probability::normal_cdf(-q);
             let mut f_a = 0.0;
             for partition_cell in cells {
@@ -9540,7 +9528,7 @@ mod tests {
                 )?;
                 Ok((f, f_a, 0.0))
             };
-            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let scale = probit_frailty_scale(gaussian_frailty_sd);
             let a_init = q * (1.0 + (scale * slope) * (scale * slope)).sqrt();
             let (root, _, residual) = gam::families::monotone_root::solve_monotone_root(
                 eval,
@@ -9612,7 +9600,7 @@ mod tests {
                         .to_string(),
                 );
             }
-            let scale = probit_frailty_scale_from_sigma(gaussian_frailty_sd);
+            let scale = probit_frailty_scale(gaussian_frailty_sd);
             let flex_active = score_runtime.is_some() || link_runtime.is_some();
             if !flex_active {
                 let sb = slope.mapv(|value| scale * value);
@@ -12859,10 +12847,7 @@ mod tests {
         )
         .expect("rigid frailty path should predict");
 
-        let scale = gam::families::lognormal_kernel::ProbitFrailtyScale::new(
-            gaussian_frailty_sd.unwrap_or(0.0),
-        )
-        .s;
+        let scale = gam::families::marginal_slope_shared::probit_frailty_scale(gaussian_frailty_sd);
         for i in 0..q_exit.len() {
             let sb = scale * slope[i];
             let c = (1.0 + sb * sb).sqrt();
