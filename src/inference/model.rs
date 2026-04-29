@@ -7,6 +7,10 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
+use crate::inference::formula_dsl::{
+    inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message,
+    saved_link_name_supports_joint_wiggle,
+};
 use crate::inference::predict::{
     BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
     GaussianLocationScalePredictor, PredictableModel, StandardPredictor, SurvivalPredictor,
@@ -338,6 +342,15 @@ impl FittedModelPayload {
             resolved_termspec_logslope: None,
             adaptive_regularization_diagnostics: None,
         }
+    }
+
+    pub fn set_training_feature_metadata(
+        &mut self,
+        headers: Vec<String>,
+        feature_ranges: Vec<(f64, f64)>,
+    ) {
+        self.training_headers = Some(headers);
+        self.training_feature_ranges = Some(feature_ranges);
     }
 
     fn validate_payload_version(&self) -> Result<(), String> {
@@ -1247,25 +1260,6 @@ impl SavedAnchoredDeviationRuntime {
     }
 }
 
-fn saved_link_name_disallows_wiggle(link_name: &str) -> bool {
-    let link_name = link_name.trim().to_ascii_lowercase();
-    link_name == "sas"
-        || link_name == "beta-logistic"
-        || link_name.starts_with("blended(")
-        || link_name.starts_with("mixture(")
-}
-
-fn inverse_link_disallows_wiggle(link: &InverseLink) -> bool {
-    matches!(
-        link,
-        InverseLink::Standard(LinkFunction::Sas)
-            | InverseLink::Standard(LinkFunction::BetaLogistic)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_)
-    )
-}
-
 impl FittedFamily {
     #[inline]
     pub fn likelihood(&self) -> LikelihoodFamily {
@@ -1294,6 +1288,65 @@ impl FittedFamily {
 }
 
 impl FittedModel {
+    /// Axis-clip each continuous new-data column to the (min, max) range
+    /// observed in training. Categorical and binary columns are left
+    /// untouched so unseen levels surface rather than being silently remapped
+    /// onto seen ones. Returns `Some(clipped_copy)` only if at least one
+    /// value was actually clipped; otherwise `None` so callers can avoid
+    /// owning a redundant copy. Pre-2026-04-29 model JSONs that lack the
+    /// `training_feature_ranges` field deserialize to `None` and pass through
+    /// unchanged.
+    pub fn axis_clip_to_training_ranges(
+        &self,
+        data: ndarray::ArrayView2<'_, f64>,
+        col_map: &std::collections::HashMap<String, usize>,
+    ) -> Option<ndarray::Array2<f64>> {
+        let training_headers = self.training_headers.as_ref()?;
+        let ranges = self.training_feature_ranges.as_ref()?;
+        if training_headers.len() != ranges.len() {
+            return None;
+        }
+        let mut kind_by_header: std::collections::HashMap<&str, ColumnKindTag> =
+            std::collections::HashMap::new();
+        if let Some(schema) = self.data_schema.as_ref() {
+            for col in &schema.columns {
+                kind_by_header.insert(col.name.as_str(), col.kind);
+            }
+        }
+        let mut clipped = data.to_owned();
+        let mut any_clipped = false;
+        for (header, &(lo, hi)) in training_headers.iter().zip(ranges.iter()) {
+            if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
+                continue;
+            }
+            if !matches!(
+                kind_by_header.get(header.as_str()).copied(),
+                Some(ColumnKindTag::Continuous)
+            ) {
+                continue;
+            }
+            let Some(&col_idx) = col_map.get(header) else {
+                continue;
+            };
+            if col_idx >= clipped.ncols() {
+                continue;
+            }
+            let mut col = clipped.column_mut(col_idx);
+            for v in col.iter_mut() {
+                if v.is_finite() {
+                    if *v < lo {
+                        *v = lo;
+                        any_clipped = true;
+                    } else if *v > hi {
+                        *v = hi;
+                        any_clipped = true;
+                    }
+                }
+            }
+        }
+        if any_clipped { Some(clipped) } else { None }
+    }
+
     pub fn from_payload(mut payload: FittedModelPayload) -> Self {
         let likelihood = payload.family_state.likelihood();
         let class = match payload.model_kind {
@@ -1455,16 +1508,13 @@ impl FittedModel {
         let resolved_link = self.resolved_inverse_link()?;
         let saved_link_disallows_wiggle = resolved_link
             .as_ref()
-            .is_some_and(inverse_link_disallows_wiggle)
+            .is_some_and(|link| !inverse_link_supports_joint_wiggle(link))
             || payload
                 .link
                 .as_deref()
-                .is_some_and(saved_link_name_disallows_wiggle);
+                .is_some_and(|link_name| !saved_link_name_supports_joint_wiggle(link_name));
         if saved_link_disallows_wiggle {
-            return Err(
-                "link wiggle does not support SAS/BetaLogistic/Mixture links; refit without wiggle or with a jointly fitted standard link"
-                    .to_string(),
-            );
+            return Err(joint_wiggle_unsupported_link_message("link wiggle"));
         }
         let beta = match self.predict_model_class() {
             PredictModelClass::Standard => {
