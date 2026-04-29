@@ -8885,8 +8885,7 @@ fn joint_outer_evaluate(
                                 out
                             }
                             Err(error) => {
-                                let prev =
-                                    consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                                let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during outer trace construction: {error}"
                                 );
@@ -9178,8 +9177,7 @@ fn joint_outer_evaluate_efs(
                                 out
                             }
                             Err(error) => {
-                                let prev =
-                                    consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                                let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
                                 log::warn!(
                                     "joint exact-newton operator matvec failed during fixed-point trace construction: {error}"
                                 );
