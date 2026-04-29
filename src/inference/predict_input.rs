@@ -179,7 +179,10 @@ pub fn build_predict_input_for_model(
                 .map(str::trim)
                 .ok_or("cannot parse response column from formula")?;
             let response_col_idx = *col_map.get(response_col_name).ok_or_else(|| {
-                format!("response column '{}' not found in new data", response_col_name)
+                format!(
+                    "response column '{}' not found in new data",
+                    response_col_name
+                )
             })?;
             let response_new = data.column(response_col_idx).to_owned();
             for value in response_new.iter().copied() {

@@ -5003,10 +5003,11 @@ impl CharbonnierScalarBlockState {
         let eps2 = self.epsilon * self.epsilon;
         let eps4 = eps2 * eps2;
         let eps6 = eps4 * eps2;
-        Array1::from_iter(self.radius.iter().map(|r| {
-            4.0 * eps2 / r.powi(3) - 18.0 * eps4 / r.powi(5)
-                + 15.0 * eps6 / r.powi(7)
-        }))
+        Array1::from_iter(
+            self.radius.iter().map(|r| {
+                4.0 * eps2 / r.powi(3) - 18.0 * eps4 / r.powi(5) + 15.0 * eps6 / r.powi(7)
+            }),
+        )
     }
 
     fn log_epsilon_betahessian_directional_diag(
@@ -5020,9 +5021,7 @@ impl CharbonnierScalarBlockState {
                 .iter()
                 .zip(direction_signal.iter())
                 .zip(self.radius.iter())
-                .map(|((t, q), r)| {
-                    (-6.0 * eps2 * t / r.powi(5) + 15.0 * eps4 * t / r.powi(7)) * q
-                }),
+                .map(|((t, q), r)| (-6.0 * eps2 * t / r.powi(5) + 15.0 * eps4 * t / r.powi(7)) * q),
         )
     }
 }
@@ -5248,9 +5247,7 @@ impl CharbonnierGroupedBlockState {
             block.mapv_inplace(|v| eps2 * (eps2 - 2.0 * norm2) * v / r5);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] += 3.0 * eps2 * (2.0 * norm2 - 3.0 * eps2) * row[i]
-                        * row[j]
-                        / r7;
+                    block[[i, j]] += 3.0 * eps2 * (2.0 * norm2 - 3.0 * eps2) * row[i] * row[j] / r7;
                 }
             }
             out.push(block);
@@ -19522,10 +19519,7 @@ mod tests {
         {
             let eye = Array2::<f64>::eye(small_block.nrows());
             assert!(
-                (&small_block - &eye.mapv(|v| 1e3 * v))
-                    .mapv(f64::abs)
-                    .sum()
-                    < 1e-7,
+                (&small_block - &eye.mapv(|v| 1e3 * v)).mapv(f64::abs).sum() < 1e-7,
                 "small-epsilon grouped curvature should equal I/eps"
             );
             assert!(
