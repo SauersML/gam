@@ -314,10 +314,18 @@ out = {
     "ground_truth": {
         "H_V": H_full.tolist(),
         "HVP": HVP.tolist(),
+        # psi-only block of the outer Hessian (rows/cols 1..q): the original
+        # task spec asked for this 2x2 block explicitly.
+        "H_V_psi_psi": H_full[1:, 1:].tolist(),
+        # HVP restricted to the psi block, contracted with v_psi only.
+        "HVP_psi": (H_full[1:, 1:] @ v_arr[1:]).tolist(),
     },
     "term_breakdown": {
         "objective_part": HVP_obj.tolist(),
         "score_part": HVP_score.tolist(),
+        # "hessian_part" alias matches the original task spec field name; it is
+        # the 1/2 d_v tr(H^{-1} H_theta_i) contribution (same as logdet_H_part).
+        "hessian_part": HVP_lH.tolist(),
         "logdet_H_part": HVP_lH.tolist(),
         "logdet_S_part": HVP_lS.tolist(),
     },
