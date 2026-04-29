@@ -4597,10 +4597,27 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     };
     let mut inference_notes = Vec::new();
     progress.set_stage("fit", "building survival design matrices");
+    // Survival marginal-slope formulas may reference the literal placeholder
+    // `z` to bind to the auxiliary score supplied via --z-column. Alias `z`
+    // to the actual `z_column` index in a local copy of `col_map` so
+    // build_termspec resolves it without the user renaming their data column.
+    let col_map_local: HashMap<String, usize> =
+        if matches!(likelihood_mode, SurvivalLikelihoodMode::MarginalSlope) {
+            let mut m = col_map.clone();
+            if let Some(z_name) = args.z_column.as_deref() {
+                if let Some(idx) = col_map.get(z_name).copied() {
+                    m.entry("z".to_string()).or_insert(idx);
+                }
+            }
+            m
+        } else {
+            col_map.clone()
+        };
+    let col_map_for_termspec: &HashMap<String, usize> = &col_map_local;
     let mut termspec = build_termspec(
         &parsed.terms,
         &ds,
-        &col_map,
+        col_map_for_termspec,
         &mut inference_notes,
         &gam::resource::ResourcePolicy::default_library(),
     )?;
@@ -4611,7 +4628,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let mut spec = build_termspec(
             &parsed_noise.terms,
             &ds,
-            &col_map,
+            col_map_for_termspec,
             &mut inference_notes,
             &gam::resource::ResourcePolicy::default_library(),
         )?;
@@ -5088,7 +5105,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let mut logslopespec = build_termspec(
             &parsed_logslope.terms,
             &ds,
-            &col_map,
+            col_map_for_termspec,
             &mut inference_notes,
             &gam::resource::ResourcePolicy::default_library(),
         )?;
