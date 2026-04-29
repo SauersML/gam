@@ -6367,10 +6367,23 @@ impl CustomFamily for GaussianLocationScaleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Two fully-coupled blocks (mean p_t, log-σ p_ℓ): every row contributes
-        // an outer-product over all (p_t + p_ℓ) coefficients, so honest cost is
-        // n · (p_t + p_ℓ)² rather than the block-diagonal n · (p_t² + p_ℓ²).
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
+        // Operator-aware: when the unified evaluator picks the matrix-free
+        // joint Hessian path (see `use_joint_matrix_free_path`), the workspace
+        // applies the joint Hessian via row-streaming Khatri-Rao matvecs at
+        // O(n · (p_t + p_ℓ)) per Hv, never building the dense (p_t + p_ℓ)²
+        // matrix. Reporting the dense build cost here would cause the outer
+        // planner's cost gate to downgrade to first-order BFGS even though
+        // the operator path is what actually runs at fit time.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |a, p| a.saturating_add(p));
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
+            n.saturating_mul(p_total)
+        } else {
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
+        }
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -9766,9 +9779,20 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Three fully-coupled blocks (mean p_t, log-σ p_ℓ, link-wiggle p_w):
-        // every cross-block in the joint Hessian is dense.
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
+        // Operator-aware (see GaussianLocationScaleFamily for derivation): when
+        // `use_joint_matrix_free_path` selects the workspace operator, joint
+        // Hv apply is O(n · (p_t + p_ℓ + p_w)) — the row-streaming RowCoeffOperator
+        // never materializes the dense (p_t + p_ℓ + p_w)² matrix.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |a, p| a.saturating_add(p));
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
+            n.saturating_mul(p_total)
+        } else {
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
+        }
     }
 
     fn block_linear_constraints(
@@ -10722,9 +10746,19 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Mean and link-wiggle blocks couple through the binomial weight,
-        // giving a dense joint Hessian of size (p_μ + p_w)² per row.
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
+        // Operator-aware: when `use_joint_matrix_free_path` selects the
+        // matrix-free workspace, joint Hv apply is O(n · (p_μ + p_w)) and the
+        // dense (p_μ + p_w)² matrix is never built; report that to the gate.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |a, p| a.saturating_add(p));
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
+            n.saturating_mul(p_total)
+        } else {
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
+        }
     }
 
     fn block_linear_constraints(
@@ -14036,9 +14070,19 @@ impl CustomFamily for BinomialLocationScaleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Two fully-coupled blocks (threshold p_t, log-σ p_ℓ): joint Hessian
-        // size (p_t + p_ℓ)² per row.
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
+        // Operator-aware: matrix-free workspace applies joint Hv at
+        // O(n · (p_t + p_ℓ)); only fall back to the dense build cost when
+        // `use_joint_matrix_free_path` declines the operator path.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |a, p| a.saturating_add(p));
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
+            n.saturating_mul(p_total)
+        } else {
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
+        }
     }
 
     fn exact_outer_derivative_order(
@@ -17643,9 +17687,19 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        // Three fully-coupled blocks (threshold p_t, log-σ p_ℓ, link-wiggle
-        // p_w): joint Hessian size (p_t + p_ℓ + p_w)² per row.
-        crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
+        // Operator-aware: matrix-free workspace applies joint Hv at
+        // O(n · (p_t + p_ℓ + p_w)); only fall back to the dense build cost when
+        // `use_joint_matrix_free_path` declines the operator path.
+        let n = self.y.len() as u64;
+        let p_total: u64 = specs
+            .iter()
+            .map(|s| s.design.ncols() as u64)
+            .fold(0u64, |a, p| a.saturating_add(p));
+        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
+            n.saturating_mul(p_total)
+        } else {
+            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
+        }
     }
 
     /// The wiggle family carries a structural null-space direction: the
