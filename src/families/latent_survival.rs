@@ -2401,9 +2401,8 @@ impl CustomFamily for LatentSurvivalFamily {
                     self.unloaded_mass_exit[i],
                     self.unloaded_hazard_exit[i],
                 )?;
-                let jet =
-                    LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
-                        .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
+                let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
+                    .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
                 Ok(wi * jet.log_lik)
             })
             .collect();
