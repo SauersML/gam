@@ -479,30 +479,34 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     let z = input.working_response;
     let offset = input.offset;
 
-    let mut eta_tilde = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let denom_raw = 1.0 - aii[i];
-        if denom_raw <= 0.0 || !denom_raw.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
-                aii[i], denom_raw
-            )));
-        }
-        eta_tilde[i] = alo_eta_updatewith_offset(
-            eta_hat[i],
-            z[i],
-            offset[i],
-            x_hinv_x_diag[i],
-            w_h[i],
-            w_s[i],
-        );
-        if !eta_tilde[i].is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO eta_tilde is not finite at row {i}: eta_tilde={}",
-                eta_tilde[i]
-            )));
-        }
-    }
+    use rayon::prelude::*;
+    let eta_tilde_vec: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let denom_raw = 1.0 - aii[i];
+            if denom_raw <= 0.0 || !denom_raw.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
+                    aii[i], denom_raw
+                )));
+            }
+            let v = alo_eta_updatewith_offset(
+                eta_hat[i],
+                z[i],
+                offset[i],
+                x_hinv_x_diag[i],
+                w_h[i],
+                w_s[i],
+            );
+            if !v.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO eta_tilde is not finite at row {i}: eta_tilde={v}"
+                )));
+            }
+            Ok(v)
+        })
+        .collect::<Result<_, _>>()?;
+    let eta_tilde = Array1::from(eta_tilde_vec);
 
     Ok(AloDiagnostics {
         eta_tilde,

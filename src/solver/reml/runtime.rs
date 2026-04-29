@@ -200,16 +200,20 @@ impl<'a> RemlState<'a> {
     ) -> Result<TkSharedIntermediates, EstimationError> {
         let n = x_dense.nrows();
         let active_blocks = Self::tk_active_blocks(c_array);
-        let mut h_diag = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let val = x_dense.row(i).dot(&z.column(i));
-            if !val.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "{context} produced non-finite leverage at row {i}: {val}"
-                )));
-            }
-            h_diag[i] = val;
-        }
+        use rayon::prelude::*;
+        let h_diag_vec: Vec<f64> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let val = x_dense.row(i).dot(&z.column(i));
+                if !val.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context} produced non-finite leverage at row {i}: {val}"
+                    )));
+                }
+                Ok(val)
+            })
+            .collect::<Result<_, _>>()?;
+        let h_diag = Array1::from(h_diag_vec);
         let m_vec = c_array * &h_diag;
         let x_m = x_dense.t().dot(&m_vec);
         let y = h_inv_solve(&x_m)?;
@@ -358,9 +362,12 @@ impl<'a> RemlState<'a> {
         let x_y = x_dense.dot(&shared.y);
 
         let mut diag_combined = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            diag_combined[i] = d_array[i] * shared.h_diag[i] - c_array[i] * x_y[i];
-        }
+        ndarray::Zip::from(&mut diag_combined)
+            .and(d_array)
+            .and(&shared.h_diag)
+            .and(c_array)
+            .and(&x_y)
+            .par_for_each(|o, &d, &h, &c, &xy| *o = d * h - c * xy);
         let mut p_total = Array2::<f64>::zeros((p, p));
         for i in 0..n {
             let wi = diag_combined[i];
@@ -430,9 +437,10 @@ impl<'a> RemlState<'a> {
 
         let xp = x_dense.dot(&p_total);
         let mut lev_p = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            lev_p[i] = xp.row(i).dot(&x_dense.row(i));
-        }
+        ndarray::Zip::from(&mut lev_p)
+            .and(xp.rows())
+            .and(x_dense.rows())
+            .par_for_each(|o, xp_row, x_row| *o = xp_row.dot(&x_row));
 
         let mut gradient = Array1::<f64>::zeros(total_k);
         for idx in 0..k {
@@ -605,9 +613,10 @@ impl<'a> RemlState<'a> {
         if let Some(x_theta) = x_fixed {
             let ch = c_array * &shared.h_diag;
             design_q_prime += &x_theta.t().dot(&ch);
-            for i in 0..n {
-                h_prime[i] = 2.0 * x_theta.row(i).dot(&z.column(i));
-            }
+            ndarray::Zip::from(&mut h_prime)
+                .and(x_theta.rows())
+                .and(z.columns())
+                .par_for_each(|o, xr, zc| *o = 2.0 * xr.dot(&zc));
         }
 
         let q_weight_prime = &(&c_prime * &shared.h_diag) + &(c_array * &h_prime);

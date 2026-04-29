@@ -5,7 +5,9 @@ use pest::iterators::Pair;
 use pest_derive::Parser;
 
 use crate::smooth::BoundedCoefficientPriorSpec;
-use crate::types::{InverseLink, LinkComponent, LinkFunction, WigglePenaltyConfig};
+use crate::types::{
+    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, WigglePenaltyConfig,
+};
 
 #[derive(Parser)]
 #[grammar_inline = r#"
@@ -495,6 +497,38 @@ pub fn linkchoice_supports_joint_wiggle(choice: &LinkChoice) -> bool {
     choice.mixture_components.is_none() && linkname_supports_joint_wiggle(choice.link)
 }
 
+pub fn require_linkchoice_supports_joint_wiggle(
+    choice: &LinkChoice,
+    context: &str,
+) -> Result<(), String> {
+    if linkchoice_supports_joint_wiggle(choice) {
+        Ok(())
+    } else {
+        Err(joint_wiggle_unsupported_link_message(context))
+    }
+}
+
+pub fn likelihood_family_supports_joint_wiggle(family: LikelihoodFamily) -> bool {
+    !matches!(
+        family,
+        LikelihoodFamily::BinomialLatentCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture
+    )
+}
+
+pub fn require_likelihood_family_supports_joint_wiggle(
+    family: LikelihoodFamily,
+    context: &str,
+) -> Result<(), String> {
+    if likelihood_family_supports_joint_wiggle(family) {
+        Ok(())
+    } else {
+        Err(joint_wiggle_unsupported_link_message(context))
+    }
+}
+
 pub fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
@@ -506,6 +540,15 @@ pub fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     )
 }
 
+pub fn saved_link_name_supports_joint_wiggle(link_name: &str) -> bool {
+    let link_name = link_name.trim().to_ascii_lowercase();
+    link_name != "sas"
+        && link_name != "beta-logistic"
+        && !link_name.starts_with("latent-cloglog")
+        && !link_name.starts_with("blended(")
+        && !link_name.starts_with("mixture(")
+}
+
 pub fn require_inverse_link_supports_joint_wiggle(
     link: &InverseLink,
     context: &str,
@@ -513,10 +556,36 @@ pub fn require_inverse_link_supports_joint_wiggle(
     if inverse_link_supports_joint_wiggle(link) {
         Ok(())
     } else {
+        Err(joint_wiggle_unsupported_link_message(context))
+    }
+}
+
+pub fn binomial_inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
+    matches!(
+        link,
+        InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+    )
+}
+
+pub fn require_binomial_inverse_link_supports_joint_wiggle(
+    link: &InverseLink,
+    context: &str,
+) -> Result<(), String> {
+    if binomial_inverse_link_supports_joint_wiggle(link) {
+        Ok(())
+    } else {
         Err(format!(
-            "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
+            "{context} does not support identity, log, latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted logit/probit/cloglog links"
         ))
     }
+}
+
+fn joint_wiggle_unsupported_link_message(context: &str) -> String {
+    format!(
+        "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
+    )
 }
 
 // ---------------------------------------------------------------------------
