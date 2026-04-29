@@ -38,6 +38,24 @@ pub struct RoystonParmarSharedTimeCovariateInputs<'a> {
     pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
 }
 
+fn survival_baseline_offsets<'a>(
+    eta_offset_entry: Option<ArrayView1<'a, f64>>,
+    eta_offset_exit: Option<ArrayView1<'a, f64>>,
+    derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+) -> Result<Option<SurvivalBaselineOffsets<'a>>, crate::survival::SurvivalError> {
+    match (eta_offset_entry, eta_offset_exit, derivative_offset_exit) {
+        (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => {
+            Ok(Some(SurvivalBaselineOffsets {
+                eta_entry,
+                eta_exit,
+                derivative_exit,
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ => Err(crate::survival::SurvivalError::DimensionMismatch),
+    }
+}
+
 /// Build an engine survival working model from flattened arrays.
 pub fn working_model_from_flattened(
     penalties: PenaltyBlocks,
@@ -45,21 +63,11 @@ pub fn working_model_from_flattened(
     spec: SurvivalSpec,
     inputs: RoystonParmarInputs<'_>,
 ) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
-    let offsets = match (
+    let offsets = survival_baseline_offsets(
         inputs.eta_offset_entry,
         inputs.eta_offset_exit,
         inputs.derivative_offset_exit,
-    ) {
-        (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => Some(SurvivalBaselineOffsets {
-            eta_entry,
-            eta_exit,
-            derivative_exit,
-        }),
-        (None, None, None) => None,
-        _ => {
-            return Err(crate::survival::SurvivalError::DimensionMismatch);
-        }
-    };
+    )?;
 
     WorkingModelSurvival::from_engine_inputswith_offsets(
         SurvivalEngineInputs {
@@ -87,21 +95,11 @@ pub fn working_model_from_time_covariateshared(
     spec: SurvivalSpec,
     inputs: RoystonParmarSharedTimeCovariateInputs<'_>,
 ) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
-    let offsets = match (
+    let offsets = survival_baseline_offsets(
         inputs.eta_offset_entry,
         inputs.eta_offset_exit,
         inputs.derivative_offset_exit,
-    ) {
-        (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => Some(SurvivalBaselineOffsets {
-            eta_entry,
-            eta_exit,
-            derivative_exit,
-        }),
-        (None, None, None) => None,
-        _ => {
-            return Err(crate::survival::SurvivalError::DimensionMismatch);
-        }
-    };
+    )?;
     WorkingModelSurvival::from_time_covariate_inputswith_offsets(
         SurvivalTimeCovarInputs {
             age_entry: inputs.age_entry,
