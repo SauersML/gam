@@ -267,43 +267,59 @@ pub fn build_predict_input_for_model(
                 ));
             }
             let monotonicity_eps = TRANSFORMATION_MONOTONICITY_EPS;
-            let mut min_h_prime = f64::INFINITY;
-            let mut gamma = vec![0.0f64; dim_dev.max(1)];
-            let mut a_coef = vec![0.0f64; p_basis.max(1)];
-            for i in 0..n {
-                let cov_row = cov_mat.row(i);
-                let beta1_x = beta_mat.row(1).dot(&cov_row);
-                for j in 0..dim_dev {
-                    gamma[j] = beta_mat.row(2 + j).dot(&cov_row);
-                }
-                for k in 0..p_basis {
-                    let mut sum = 0.0;
-                    for j in 0..dim_dev {
-                        sum += resp_transform[[k, j]] * gamma[j];
-                    }
-                    a_coef[k] = sum;
-                }
-                // h'_min(x) = β₁(x) + min_{k ∈ [1, p_basis-1]} δ_k(x).
-                // Knots with multiplicity (zero denominator) make N_{k,d-1}
-                // identically zero, so they contribute nothing — skip them.
-                let mut h_prime_lb = beta1_x;
-                let mut found_any = false;
-                for k in 1..p_basis {
-                    let denom = kn[k + response_degree] - kn[k];
-                    if denom <= 0.0 {
-                        continue;
-                    }
-                    let delta_k = (response_degree as f64) / denom * (a_coef[k] - a_coef[k - 1]);
-                    let bound_k = beta1_x + delta_k;
-                    if !found_any || bound_k < h_prime_lb {
-                        h_prime_lb = bound_k;
-                        found_any = true;
-                    }
-                }
-                if h_prime_lb < min_h_prime {
-                    min_h_prime = h_prime_lb;
-                }
-            }
+            // Parallel reduction over observation rows. The per-row state
+            // (β₁(x), γ_j(x), A_k(x), running h'_lb) is fully thread-local —
+            // no shared mutable state — so this is a straight rayon
+            // par_iter().fold/reduce over min.
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let resp_transform_ref = &resp_transform;
+            let beta_mat_ref = &beta_mat;
+            let cov_mat_ref = &cov_mat;
+            let kn_ref = kn;
+            let min_h_prime: f64 = (0..n)
+                .into_par_iter()
+                .fold(
+                    || (f64::INFINITY, vec![0.0f64; dim_dev.max(1)], vec![0.0f64; p_basis.max(1)]),
+                    |(mut local_min, mut gamma, mut a_coef), i| {
+                        let cov_row = cov_mat_ref.row(i);
+                        let beta1_x = beta_mat_ref.row(1).dot(&cov_row);
+                        for j in 0..dim_dev {
+                            gamma[j] = beta_mat_ref.row(2 + j).dot(&cov_row);
+                        }
+                        for k in 0..p_basis {
+                            let mut sum = 0.0;
+                            for j in 0..dim_dev {
+                                sum += resp_transform_ref[[k, j]] * gamma[j];
+                            }
+                            a_coef[k] = sum;
+                        }
+                        // h'_min(x) = β₁(x) + min_{k ∈ [1, p_basis-1]} δ_k(x).
+                        // Knots with multiplicity (zero denominator) make
+                        // N_{k,d-1} identically zero, so they contribute
+                        // nothing — skip them.
+                        let mut h_prime_lb = beta1_x;
+                        let mut found_any = false;
+                        for k in 1..p_basis {
+                            let denom = kn_ref[k + response_degree] - kn_ref[k];
+                            if denom <= 0.0 {
+                                continue;
+                            }
+                            let delta_k = (response_degree as f64) / denom
+                                * (a_coef[k] - a_coef[k - 1]);
+                            let bound_k = beta1_x + delta_k;
+                            if !found_any || bound_k < h_prime_lb {
+                                h_prime_lb = bound_k;
+                                found_any = true;
+                            }
+                        }
+                        if h_prime_lb < local_min {
+                            local_min = h_prime_lb;
+                        }
+                        (local_min, gamma, a_coef)
+                    },
+                )
+                .map(|(local_min, _, _)| local_min)
+                .reduce(|| f64::INFINITY, f64::min);
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
                     "transformation-normal fit is non-monotone in y for at least one observation: \
