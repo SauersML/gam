@@ -5,11 +5,11 @@ use ndarray::Array1;
 use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use crate::estimate::{BlockRole, PredictInput};
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
-use crate::families::transformation_normal::{
-    TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_TAIL_GUARD_FRACTION,
-};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
+};
+use crate::families::transformation_normal::{
+    TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_TAIL_GUARD_FRACTION,
 };
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
