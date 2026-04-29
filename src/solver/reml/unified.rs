@@ -1542,18 +1542,15 @@ pub struct BlockLocalDrift {
     pub local: Array2<f64>,
     pub start: usize,
     pub end: usize,
-}
-
-impl BlockLocalDrift {
-    /// Total joint dimension (needed for to_dense materialization).
-    fn total_dim_from_context(&self, hint: usize) -> usize {
-        hint.max(self.end)
-    }
+    /// Total joint dimension `p` — recorded at construction so `dim()` is
+    /// `O(1)` and `to_dense` does not need a separate hint.  Must satisfy
+    /// `total_dim >= end`.
+    pub total_dim: usize,
 }
 
 impl HyperOperator for BlockLocalDrift {
     fn dim(&self) -> usize {
-        self.end
+        self.total_dim
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
@@ -1633,7 +1630,7 @@ impl HyperOperator for BlockLocalDrift {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        let p = self.total_dim_from_context(self.end);
+        let p = self.total_dim;
         let mut out = Array2::zeros((p, p));
         out.slice_mut(ndarray::s![self.start..self.end, self.start..self.end])
             .assign(&self.local);
@@ -1699,11 +1696,17 @@ impl HyperCoordDrift {
         local: Array2<f64>,
         start: usize,
         end: usize,
+        total_dim: usize,
         operator: Option<Arc<dyn HyperOperator>>,
     ) -> Self {
         Self {
             dense: None,
-            block_local: Some(BlockLocalDrift { local, start, end }),
+            block_local: Some(BlockLocalDrift {
+                local,
+                start,
+                end,
+                total_dim,
+            }),
             operator,
         }
     }
@@ -11027,6 +11030,7 @@ mod tests {
             local: local.clone(),
             start,
             end,
+            total_dim: h.nrows(),
         };
         let mut full = Array2::<f64>::zeros(h.raw_dim());
         full.slice_mut(ndarray::s![start..end, start..end])
@@ -11069,6 +11073,7 @@ mod tests {
             local: local.clone(),
             start,
             end,
+            total_dim: h.nrows(),
         };
         let mut full = Array2::<f64>::zeros(h.raw_dim());
         full.slice_mut(ndarray::s![start..end, start..end])

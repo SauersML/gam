@@ -1,10 +1,11 @@
 use crate::faer_ndarray::{FaerArrayView, default_rrqr_rank_alpha, fast_ab};
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
 use dyn_stack::{MemBuffer, MemStack};
 use faer::Unbind;
 use faer::prelude::ReborrowMut;
 use faer::{Conj, get_global_parallelism};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, ArrayViewMut2, s};
+use std::sync::Arc;
 use std::ops::Range;
 
 const COLUMN_TOL: f64 = 1e-12;
@@ -106,6 +107,139 @@ pub fn apply_scale_deviation_transform(
         out.slice_mut(s![start..end, ..]).assign(&chunk);
     }
     Ok(out)
+}
+
+#[derive(Clone)]
+struct ScaleDeviationOperator {
+    primary_design: DesignMatrix,
+    rawnoise_design: DesignMatrix,
+    transform: ScaleDeviationTransform,
+    chunk_rows: usize,
+}
+
+impl ScaleDeviationOperator {
+    fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
+        let primary_chunk = self
+            .primary_design
+            .try_row_chunk(rows.clone())
+            .map_err(|e| format!("scale deviation operator primary chunk: {e}"))?;
+        let noise_chunk = self
+            .rawnoise_design
+            .try_row_chunk(rows)
+            .map_err(|e| format!("scale deviation operator noise chunk: {e}"))?;
+        Ok(apply_scale_deviation_reparam_chunk(
+            &primary_chunk,
+            &noise_chunk,
+            &self.transform,
+        ))
+    }
+}
+
+impl LinearOperator for ScaleDeviationOperator {
+    fn nrows(&self) -> usize {
+        self.rawnoise_design.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.rawnoise_design.ncols()
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(vector.len(), self.ncols());
+        let n = self.nrows();
+        let mut out = Array1::<f64>::zeros(n);
+        for start in (0..n).step_by(self.chunk_rows) {
+            let end = (start + self.chunk_rows).min(n);
+            let chunk = self
+                .row_chunk(start..end)
+                .expect("scale deviation operator row chunk failed");
+            out.slice_mut(s![start..end]).assign(&chunk.dot(vector));
+        }
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(vector.len(), self.nrows());
+        let n = self.nrows();
+        let p = self.ncols();
+        let mut out = Array1::<f64>::zeros(p);
+        for start in (0..n).step_by(self.chunk_rows) {
+            let end = (start + self.chunk_rows).min(n);
+            let chunk = self
+                .row_chunk(start..end)
+                .expect("scale deviation operator row chunk failed");
+            out += &chunk.t().dot(&vector.slice(s![start..end]).to_owned());
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "scale deviation operator XtWX weight mismatch: weights={}, rows={}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let n = self.nrows();
+        let p = self.ncols();
+        let mut out = Array2::<f64>::zeros((p, p));
+        for start in (0..n).step_by(self.chunk_rows) {
+            let end = (start + self.chunk_rows).min(n);
+            let chunk = self.row_chunk(start..end)?;
+            for local in 0..chunk.nrows() {
+                let w = weights[start + local].max(0.0);
+                if w == 0.0 {
+                    continue;
+                }
+                for a in 0..p {
+                    let xa = chunk[[local, a]];
+                    for b in a..p {
+                        let value = w * xa * chunk[[local, b]];
+                        out[[a, b]] += value;
+                        if a != b {
+                            out[[b, a]] += value;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn uses_matrix_free_pcg(&self) -> bool {
+        self.primary_design.nrows().saturating_mul(self.rawnoise_design.ncols()) > 1_000_000
+    }
+}
+
+impl DenseDesignOperator for ScaleDeviationOperator {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), crate::resource::MatrixMaterializationError> {
+        let chunk = self
+            .row_chunk(rows)
+            .map_err(|_| crate::resource::MatrixMaterializationError::MissingRowChunk {
+                context: "ScaleDeviationOperator::row_chunk_into",
+            })?;
+        out.assign(&chunk);
+        Ok(())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let n = self.nrows();
+        let p = self.ncols();
+        let mut out = Array2::<f64>::zeros((n, p));
+        for start in (0..n).step_by(self.chunk_rows) {
+            let end = (start + self.chunk_rows).min(n);
+            let chunk = self
+                .row_chunk(start..end)
+                .expect("scale deviation operator row chunk failed");
+            out.slice_mut(s![start..end, ..]).assign(&chunk);
+        }
+        out
+    }
 }
 
 #[derive(Debug)]
@@ -598,21 +732,14 @@ pub fn build_scale_deviation_operator(
     let p_primary = primary_design.ncols();
     let p_noise = rawnoise_design.ncols();
     let chunk_rows = scale_design_row_chunk_size(n, p_primary.max(p_noise));
-    let mut out = Array2::<f64>::zeros((n, p_noise));
-    for start in (0..n).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n);
-        let primary_chunk = primary_design
-            .try_row_chunk(start..end)
-            .map_err(|e| format!("scale deviation operator primary chunk: {e}"))?;
-        let noise_chunk = rawnoise_design
-            .try_row_chunk(start..end)
-            .map_err(|e| format!("scale deviation operator noise chunk: {e}"))?;
-        let chunk = apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
-        out.slice_mut(s![start..end, ..]).assign(&chunk);
-    }
-    Ok(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-        out,
-    )))
+    Ok(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+        ScaleDeviationOperator {
+            primary_design,
+            rawnoise_design,
+            transform: transform.clone(),
+            chunk_rows,
+        },
+    ))))
 }
 
 #[cfg(test)]
