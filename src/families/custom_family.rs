@@ -12614,6 +12614,7 @@ mod tests {
                         local: array![[3.0, 1.0], [1.0, 2.0]],
                         start: 1,
                         end: 3,
+                        total_dim: 3,
                     },
                 ))))
             }

@@ -4635,12 +4635,23 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 /// representation, never capability — the operator path delivers the same
 /// math as the dense path with `O(n · p)` HVPs instead of dense `p × p`
 /// assembly.
+///
+/// Each clause is one independent crossover regime; any one firing routes
+/// the evaluator to the operator path.
 pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
-    p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD
-        || (n >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
-            && p >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N)
-        || n.saturating_mul(p) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD
-        || k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD
+    // Wide coefficient basis: dense `p × p` assembly itself dominates.
+    let large_p = p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
+    // Tall design with moderate width: per-row work dominates even when `p`
+    // alone is below the wide-basis threshold.
+    let large_n_and_moderate_p = n >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
+        && p >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N;
+    // Linear-work fallback: `n · p` crosses the assembly-cost crossover even
+    // when neither `n` nor `p` individually trip a per-axis threshold.
+    let large_linear_work = n.saturating_mul(p) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
+    // Many smoothing parameters: per-outer-eval cost is `O(K · n · p²)`, so
+    // `K` itself can drive the crossover regardless of `(n, p)`.
+    let large_k = k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
+    large_p || large_n_and_moderate_p || large_linear_work || large_k
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
@@ -6169,10 +6180,18 @@ fn build_outer_hessian_operator(
     // matches the previous on-the-fly recomputation that built `alpha_dense`,
     // `alpha_dense_rotated`, and `alpha_op` at every HVP.
     let cross_trace: Option<Array2<f64>> = if incl_logdet_h {
-        let mut ct = Array2::<f64>::zeros((total, total));
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let dense_hop_opt = hop.as_dense_spectral();
-        for ii in 0..total {
-            for jj in ii..total {
+        // Enumerate the upper triangle (`ii ≤ jj`) so each `(ii, jj)` is an
+        // independent unit of work — every entry of `cross_trace` is computed
+        // from `coords[ii]` / `coords[jj]` only, with no shared mutable
+        // state, so we can dispatch the K(K+1)/2 pair traces in parallel.
+        let pairs: Vec<(usize, usize)> = (0..total)
+            .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
+            .collect();
+        let pair_values: Vec<((usize, usize), f64)> = pairs
+            .into_par_iter()
+            .map(|(ii, jj)| {
                 let left = &coords[ii].total_drift;
                 let right = &coords[jj].total_drift;
                 let mut value = 0.0;
@@ -6224,10 +6243,14 @@ fn build_outer_hessian_operator(
                     };
                     value -= hop.trace_hinv_operator_cross(&left_bundle, &right_bundle);
                 }
-                ct[[ii, jj]] = value;
-                if ii != jj {
-                    ct[[jj, ii]] = value;
-                }
+                ((ii, jj), value)
+            })
+            .collect();
+        let mut ct = Array2::<f64>::zeros((total, total));
+        for ((ii, jj), value) in pair_values {
+            ct[[ii, jj]] = value;
+            if ii != jj {
+                ct[[jj, ii]] = value;
             }
         }
         Some(ct)

@@ -21224,6 +21224,110 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
+        let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let d_beta_u = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).sin());
+        let d_beta_v = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).cos());
+
+        let dense_d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&states, &d_beta_u, &d_beta_v)
+            .expect("dense d2H build")
+            .expect("dense d2H present");
+        assert_eq!(dense_d2h.nrows(), p);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&d_beta_u, &d_beta_v)
+            .expect("d2H op call")
+            .expect("d2H op present");
+
+        let pmu = states[0].beta.len();
+        let pls = states[1].beta.len();
+        let probes = vec![
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == pmu { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| if i == pmu + pls { 1.0 } else { 0.0 }),
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos()),
+        ];
+        for (k, w) in probes.iter().enumerate() {
+            let want = dense_d2h.dot(w);
+            let got = d2h_op.mul_vec(w);
+            for i in 0..p {
+                let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+                assert!(
+                    (want[i] - got[i]).abs() <= tol,
+                    "GLSW d2H op matvec[{k}, {i}] mismatch: dense={:.6e}, op={:.6e}",
+                    want[i],
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_wiggle_workspace_d2h_operator_finite_difference() {
+        let (family, states, specs, xmu, xls, xw) = gls_wiggle_workspace_fixture();
+        let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
+        let u_fd = Array1::from_shape_fn(p, |i| 0.05 * ((i + 1) as f64).cos());
+        let u = Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin());
+        let probe = Array1::from_shape_fn(p, |i| 0.04 * ((i + 3) as f64).sin());
+        let pmu = states[0].beta.len();
+        let pls = states[1].beta.len();
+        let eps = 1e-5;
+        let perturb = |sign: f64| -> Vec<ParameterBlockState> {
+            let mut out = states.clone();
+            for j in 0..pmu {
+                out[0].beta[j] += sign * eps * u_fd[j];
+            }
+            for j in 0..pls {
+                out[1].beta[j] += sign * eps * u_fd[pmu + j];
+            }
+            for j in 0..(p - pmu - pls) {
+                out[2].beta[j] += sign * eps * u_fd[pmu + pls + j];
+            }
+            out[0].eta = xmu.dot(&out[0].beta);
+            out[1].eta = xls.dot(&out[1].beta);
+            out[2].eta = xw.dot(&out[2].beta);
+            out
+        };
+        let states_plus = perturb(1.0);
+        let states_minus = perturb(-1.0);
+        let dh_plus = family
+            .exact_newton_joint_hessian_directional_derivative(&states_plus, &u)
+            .expect("dense dH+")
+            .expect("dense dH+ present");
+        let dh_minus = family
+            .exact_newton_joint_hessian_directional_derivative(&states_minus, &u)
+            .expect("dense dH-")
+            .expect("dense dH- present");
+        let fd = (dh_plus.dot(&probe) - dh_minus.dot(&probe)) / (2.0 * eps);
+
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let d2h_op = workspace
+            .second_directional_derivative_operator(&u_fd, &u)
+            .expect("d2H op call")
+            .expect("d2H op present");
+        let analytic = d2h_op.mul_vec(&probe);
+
+        for i in 0..p {
+            let tol = 5e-5 * fd[i].abs().max(1.0) + 5e-5;
+            assert!(
+                (fd[i] - analytic[i]).abs() <= tol,
+                "GLSW d2H FD mismatch at {i}: fd={:.6e}, analytic={:.6e}",
+                fd[i],
+                analytic[i]
+            );
+        }
+    }
+
+    #[test]
     fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
         let weights = Array1::from_vec(vec![0.0, 1.0]);
 
