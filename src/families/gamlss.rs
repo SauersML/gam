@@ -13815,23 +13815,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
         crate::custom_family::joint_coupled_coefficient_hessian_cost(self.y.len() as u64, specs)
     }
 
-    fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        let rho_dim: usize = specs.iter().map(|spec| spec.penalties.len()).sum();
-        if rho_dim > 12 {
-            return 20_000_000_000;
-        }
-        self.coefficient_hessian_cost(specs) / 2
-    }
-
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
         _: &BlockwiseFitOptions,
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
-        let rho_dim: usize = specs.iter().map(|spec| spec.penalties.len()).sum();
-        if rho_dim > 12 {
-            return crate::custom_family::ExactOuterDerivativeOrder::First;
-        }
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -21849,7 +21837,7 @@ mod tests {
     }
 
     #[test]
-    fn binomial_location_scale_many_smoothing_params_uses_first_order_outer() {
+    fn binomial_location_scale_many_smoothing_params_keeps_second_order_outer() {
         fn spec_with_penalties(name: &str, n: usize, p: usize, k: usize) -> ParameterBlockSpec {
             ParameterBlockSpec {
                 name: name.to_string(),
@@ -21882,16 +21870,7 @@ mod tests {
 
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            crate::custom_family::ExactOuterDerivativeOrder::First
-        );
-        assert_eq!(family.coefficient_gradient_cost(&specs), 20_000_000_000);
-        assert_eq!(
-            crate::custom_family::cost_gated_first_order_max_iter(
-                BlockwiseFitOptions::default().outer_max_iter,
-                family.coefficient_gradient_cost(&specs),
-                false,
-            ),
-            4
+            crate::custom_family::ExactOuterDerivativeOrder::Second
         );
         let (_gradient, hessian) = crate::custom_family::custom_family_outer_derivatives(
             &family,
@@ -21900,7 +21879,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::Derivative::Unavailable
+            crate::solver::outer_strategy::Derivative::Analytic
         );
     }
 
