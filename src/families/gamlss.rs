@@ -6783,13 +6783,12 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on
-        // both block designs being present.  Mirror that condition so the
-        // planner knows an operator representation exists. The cost gate
-        // still decides whether second-order outer work is affordable.
+        // both block designs being present. This is only a β-space operator
+        // capability; outer θθ Hessian availability is declared separately.
         self.exact_joint_supported()
     }
 }
@@ -10150,7 +10149,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl above: matrix-free fires when
         // `exact_joint_dense_block_designs` is satisfiable, which requires
         // both location and scale block designs to be present.  The wiggle
@@ -14050,7 +14049,12 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
-        crate::custom_family::cost_gated_outer_order_with_matrix_free(
+        if !self.outer_hyper_hessian_dense_available(specs)
+            && !self.outer_hyper_hessian_hvp_available(specs)
+        {
+            return crate::custom_family::ExactOuterDerivativeOrder::First;
+        }
+        crate::custom_family::cost_gated_outer_order_with_outer_hvp(
             specs,
             coefficient_work,
             self.outer_hyper_hessian_hvp_available(specs),
@@ -14429,10 +14433,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Representation support means the realized two-block designs can be
-        // applied as operators. It does not imply that exact second-order outer
-        // work is cheap; the cost gate still owns that decision.
+        // applied as β-space operators. It does not imply that exact
+        // second-order outer θ work is cheap.
         if specs.len() != 2 {
             return false;
         }
@@ -18642,13 +18646,12 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside
         // `BinomialLocationScaleWiggleHessianWorkspace`). This advertises
-        // representation support only; the cost gate still decides whether
-        // exact second-order outer work is affordable.
+        // β-space representation support only.
         self.exact_joint_supported()
     }
 }
@@ -20231,7 +20234,7 @@ mod tests {
                 initial_beta: None,
             },
         ];
-        assert!(family.supports_matrix_free_joint_hessian(&specs));
+        assert!(family.inner_coefficient_hessian_hvp_available(&specs));
 
         let dense_h = family
             .exact_newton_joint_hessian_from_designs(&states, &xt, &xls)

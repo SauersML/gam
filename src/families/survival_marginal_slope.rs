@@ -12191,15 +12191,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         )))
     }
 
-    fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
         // `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`. Both
         // route the joint Hessian through Hv operators rather than dense
-        // assembly. This advertises representation support only; the realized
-        // custom-family cost gate still decides whether exact second-order
-        // outer work is affordable.
+        // assembly. This advertises β-space representation support only; it
+        // does not imply a profiled outer θ-HVP.
         true
     }
 
