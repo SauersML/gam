@@ -18,7 +18,8 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
-    fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
+    fast_ab, fast_atb, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x,
+    fast_xt_diag_y,
 };
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
@@ -7032,6 +7033,42 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         let mut out = Array1::<f64>::zeros(self.dim);
         out.slice_mut(s![0..self.pa]).assign(&out_a);
         out.slice_mut(s![self.pa..self.dim]).assign(&out_b);
+        out
+    }
+
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.dim);
+        let cols = factor.ncols();
+        if cols == 0 {
+            return Array2::<f64>::zeros((self.dim, 0));
+        }
+
+        let a = self.x_a.to_dense_cow();
+        let b = self.x_b.to_dense_cow();
+        let f_a = factor.slice(s![0..self.pa, ..]);
+        let f_b = factor.slice(s![self.pa..self.dim, ..]);
+        let u_a = fast_ab(a.as_ref(), &f_a);
+        let u_b = fast_ab(b.as_ref(), &f_b);
+
+        let mut r_a = Array2::<f64>::zeros((self.nrows, cols));
+        let mut r_b = Array2::<f64>::zeros((self.nrows, cols));
+        for row in 0..self.nrows {
+            let c_aa = self.c_aa[row];
+            let c_ab = self.c_ab[row];
+            let c_bb = self.c_bb[row];
+            for col in 0..cols {
+                let ua = u_a[[row, col]];
+                let ub = u_b[[row, col]];
+                r_a[[row, col]] = c_aa * ua + c_ab * ub;
+                r_b[[row, col]] = c_ab * ua + c_bb * ub;
+            }
+        }
+
+        let out_a = fast_atb(a.as_ref(), &r_a);
+        let out_b = fast_atb(b.as_ref(), &r_b);
+        let mut out = Array2::<f64>::zeros((self.dim, cols));
+        out.slice_mut(s![0..self.pa, ..]).assign(&out_a);
+        out.slice_mut(s![self.pa..self.dim, ..]).assign(&out_b);
         out
     }
 
