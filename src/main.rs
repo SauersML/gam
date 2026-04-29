@@ -9195,6 +9195,7 @@ mod tests {
     };
     use gam::survival_construction::parse_survival_baseline_config;
     use gam::survival_construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
+    use gam::survival_location_scale::project_onto_linear_constraints;
     use gam::term_builder::{
         heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
     };
