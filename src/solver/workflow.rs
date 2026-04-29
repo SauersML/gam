@@ -1600,9 +1600,14 @@ fn materialize_bernoulli_marginal_slope<'a>(
         config.scale_dimensions,
         &policy,
     )?;
-    let z_idx = *col_map
-        .get(z_column)
-        .ok_or_else(|| format!("z column '{z_column}' not found"))?;
+    let z_idx = *col_map.get(z_column).ok_or_else(|| {
+        let mut available: Vec<&str> = col_map.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        format!(
+            "z column '{z_column}' not found in data. Available columns: [{}]",
+            available.join(", ")
+        )
+    })?;
     let z = data.values.column(z_idx).to_owned();
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
@@ -1853,9 +1858,14 @@ fn materialize_survival<'a>(
         let _base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
         let z_col_name = marginal_z_column_name
             .expect("marginal-slope z column should be validated before materialization");
-        let z_idx = *col_map
-            .get(z_col_name)
-            .ok_or_else(|| format!("z column '{z_col_name}' not found"))?;
+        let z_idx = *col_map.get(z_col_name).ok_or_else(|| {
+            let mut available: Vec<&str> = col_map.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            format!(
+                "z column '{z_col_name}' not found in data. Available columns: [{}]",
+                available.join(", ")
+            )
+        })?;
         Some(data.values.column(z_idx).to_owned())
     } else {
         None
