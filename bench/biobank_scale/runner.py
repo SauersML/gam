@@ -1549,17 +1549,23 @@ def split_rows(rows: list[dict[str, Any]], cfg: dict[str, Any]) -> tuple[list[di
     return train, test
 
 
-def add_standardized_columns(train_rows: list[dict[str, Any]], test_rows: list[dict[str, Any]]) -> None:
+def add_standardized_columns(
+    train_rows: list[dict[str, Any]],
+    test_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
     numeric_cols = ["age_entry", "lat_final", "lon_final", "pgs_raw", *[f"pc{i}" for i in range(1, 17)]]
+    standardization: dict[str, dict[str, float]] = {}
     for col in numeric_cols:
         tr = np.array([float(r[col]) for r in train_rows], dtype=float)
         te = np.array([float(r[col]) for r in test_rows], dtype=float)
-        tr_std, te_std, _, _ = zscore_train_test(tr, te)
+        tr_std, te_std, mu, sd = zscore_train_test(tr, te)
+        standardization[col] = {"mean": float(mu), "sd": float(sd)}
         out_col = col.replace("_raw", "") + "_std"
         for i, row in enumerate(train_rows):
             row[out_col] = float(tr_std[i])
         for i, row in enumerate(test_rows):
             row[out_col] = float(te_std[i])
+    return standardization
 
 
 def do_prepare(args: argparse.Namespace) -> int:
@@ -1574,7 +1580,7 @@ def do_prepare(args: argparse.Namespace) -> int:
     rows = impute_and_upsample(rows, cfg, args.smoke)
     rows = attach_outcomes(rows, cfg)
     train_rows, test_rows = split_rows(rows, cfg)
-    add_standardized_columns(train_rows, test_rows)
+    standardization = add_standardized_columns(train_rows, test_rows)
     write_cohort_csv(out_dir / "all_cohort.csv", rows)
     write_cohort_csv(out_dir / "disease_train.csv", train_rows)
     write_cohort_csv(out_dir / "disease_test.csv", test_rows)
@@ -1588,6 +1594,7 @@ def do_prepare(args: argparse.Namespace) -> int:
         "n_train": len(train_rows),
         "n_test": len(test_rows),
         "smoke": bool(args.smoke),
+        "standardization": standardization,
     }
     dump_json(out_dir / "prep_metadata.json", prep_meta)
     print(f"Wrote prepared data to {out_dir}")

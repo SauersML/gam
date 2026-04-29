@@ -24,9 +24,16 @@ MAX_DENSE_SURVIVAL_CURVE_CELLS = 1_000_000
 
 _SURVIVAL_MODEL_CLASSES = frozenset(
     {
+        "survival",
         "survival marginal-slope",
         "survival location-scale",
         "latent survival",
+    }
+)
+_SURVIVAL_TIME_GRID_MODEL_CLASSES = frozenset(
+    {
+        "survival",
+        "survival marginal-slope",
     }
 )
 _MARGINAL_SLOPE_MODEL_CLASSES = frozenset(
@@ -482,7 +489,7 @@ class Model:
         import re
         import numpy as np
 
-        if not self.is_survival:
+        if self.model_class not in _SURVIVAL_TIME_GRID_MODEL_CLASSES:
             return None
         formula = self.formula
         match = re.match(
