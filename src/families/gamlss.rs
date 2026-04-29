@@ -13803,11 +13803,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
         _: &BlockwiseFitOptions,
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
         let rho_dim: usize = specs.iter().map(|spec| spec.penalties.len()).sum();
-        // Dense P-spline location-scale fits can expose many smoothing
-        // coordinates from the sigma block. The exact Hessian is available, but
-        // ARC repeatedly asks for expensive joint Hessian actions and stalls on
-        // benchmark-sized rho spaces; analytic BFGS reaches the same fit surface
-        // without paying that second-order loop.
         if rho_dim > 12 {
             return crate::custom_family::ExactOuterDerivativeOrder::First;
         }
