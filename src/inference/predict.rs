@@ -1,6 +1,9 @@
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::bernoulli_marginal_slope::bernoulli_marginal_link_map;
-use crate::families::lognormal_kernel::{FrailtySpec, ProbitFrailtyScale};
+use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::marginal_slope_shared::{
+    probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
+};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::inference::model::{
     SavedAnchoredDeviationRuntime, SavedLatentZNormalization, SavedLinkWiggleRuntime,
@@ -874,7 +877,7 @@ impl BernoulliMarginalSlopePredictor {
     }
 
     fn probit_frailty_scale(&self) -> f64 {
-        ProbitFrailtyScale::new(self.gaussian_frailty_sd.unwrap_or(0.0)).s
+        marginal_slope_probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
     fn rigid_intercept_from_marginal(&self, marginal_eta: f64, slope: f64) -> f64 {
@@ -888,15 +891,6 @@ impl BernoulliMarginalSlopePredictor {
         internal_grad: Option<Array2<f64>>,
     ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
         Ok((internal_eta, internal_grad))
-    }
-
-    fn scale_coeff4(coefficients: [f64; 4], scale: f64) -> [f64; 4] {
-        [
-            scale * coefficients[0],
-            scale * coefficients[1],
-            scale * coefficients[2],
-            scale * coefficients[3],
-        ]
     }
 
     fn link_terms_value_d1(
@@ -1027,8 +1021,8 @@ impl BernoulliMarginalSlopePredictor {
                 a,
                 slope,
             );
-            let dc_da = Self::scale_coeff4(dc_da_raw, scale);
-            let d2c_da2 = Self::scale_coeff4(d2c_da2_raw, scale);
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            let d2c_da2 = scale_coeff4(d2c_da2_raw, scale);
             f_a += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
@@ -1506,7 +1500,7 @@ impl BernoulliMarginalSlopePredictor {
                         // `denested_partition_cells` scales the cell itself for
                         // Gaussian frailty, so every coefficient partial of
                         // F(a, theta) must carry the same probit scale as F_a.
-                        let dc_db = Self::scale_coeff4(dc_db_raw, scale);
+                        let dc_db = scale_coeff4(dc_db_raw, scale);
                         f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                             &dc_db,
                             &state.moments,
@@ -1524,7 +1518,7 @@ impl BernoulliMarginalSlopePredictor {
                                 let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
                                     basis_span, slope,
                                 );
-                                let coeffs = Self::scale_coeff4(coeffs, scale);
+                                let coeffs = scale_coeff4(coeffs, scale);
                                 f_h_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                                     &coeffs,
                                     &state.moments,
@@ -1549,7 +1543,7 @@ impl BernoulliMarginalSlopePredictor {
                                     intercept,
                                     slope,
                                 );
-                                let coeffs = Self::scale_coeff4(coeffs, scale);
+                                let coeffs = scale_coeff4(coeffs, scale);
                                 f_w_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                                     &coeffs,
                                     &state.moments,
