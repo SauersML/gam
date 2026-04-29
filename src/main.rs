@@ -98,7 +98,9 @@ use gam::survival_predict::{
     saved_baseline_timewiggle_components, saved_survival_location_scale_fit_result,
     saved_survival_runtime_baseline_config,
 };
-use gam::term_builder::{build_termspec, column_map_with_alias, enable_scale_dimensions};
+use gam::term_builder::{
+    build_termspec, column_map_with_alias, enable_scale_dimensions, resolve_role_col,
+};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
@@ -710,9 +712,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let col_map = ds.column_map();
 
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(&col_map, &parsed.response, "response")?;
     let y = ds.values.column(y_col).to_owned();
     let mut inference_notes: Vec<String> = Vec::new();
 
@@ -1366,9 +1366,7 @@ fn run_fit_bernoulli_marginal_slope(
     emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
 
-    let z_col = *col_map
-        .get(z_column)
-        .ok_or_else(|| format!("z column '{z_column}' not found"))?;
+    let z_col = resolve_role_col(col_map, z_column, "z")?;
     let z = ds.values.column(z_col).to_owned();
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
@@ -2780,12 +2778,8 @@ fn run_predict_survival(
         .survival_exit
         .as_ref()
         .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let entry_col = *col_map
-        .get(entryname)
-        .ok_or_else(|| format!("entry column '{}' not found", entryname))?;
-    let exit_col = *col_map
-        .get(exitname)
-        .ok_or_else(|| format!("exit column '{}' not found", exitname))?;
+    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
+    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -3082,9 +3076,7 @@ fn run_predict_survival(
             .z_column
             .as_ref()
             .ok_or_else(|| "saved survival marginal-slope model missing z_column".to_string())?;
-        let &z_col = col_map
-            .get(z_name)
-            .ok_or_else(|| format!("prediction data is missing z column '{z_name}'"))?;
+        let z_col = resolve_role_col(col_map, z_name, "z")?;
         let z = data.column(z_col).to_owned();
         let logslopespec = resolve_termspec_for_prediction(
             &model.resolved_termspec_logslope.as_ref().cloned(),
@@ -3356,9 +3348,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(&col_map, &parsed.response, "response")?;
 
     let y = ds.values.column(y_col).to_owned();
     let spec = resolve_termspec_for_prediction(
@@ -3669,15 +3659,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     progress.advance_workflow(1);
     let col_map = ds.column_map();
 
-    let entry_col = *col_map
-        .get(&args.entry)
-        .ok_or_else(|| format!("entry column '{}' not found", args.entry))?;
-    let exit_col = *col_map
-        .get(&args.exit)
-        .ok_or_else(|| format!("exit column '{}' not found", args.exit))?;
-    let event_col = *col_map
-        .get(&args.event)
-        .ok_or_else(|| format!("event column '{}' not found", args.event))?;
+    let entry_col = resolve_role_col(&col_map, &args.entry, "entry")?;
+    let exit_col = resolve_role_col(&col_map, &args.exit, "exit")?;
+    let event_col = resolve_role_col(&col_map, &args.event, "event")?;
 
     let n = ds.values.nrows();
     if n == 0 {
@@ -4308,7 +4292,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 Some(survival_noise_transform.non_intercept_start);
             payload.survival_distribution = Some(fitted_inverse_link.saved_string());
             payload.training_headers = Some(ds.headers.clone());
-        payload.training_feature_ranges = Some(ds.feature_ranges());
+            payload.training_feature_ranges = Some(ds.feature_ranges());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
                     &fit.fit.resolved_thresholdspec,
@@ -4371,9 +4355,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             enable_scale_dimensions(&mut logslopespec);
         }
 
-        let z_col = *col_map
-            .get(z_column_name)
-            .ok_or_else(|| format!("z column '{z_column_name}' not found"))?;
+        let z_col = resolve_role_col(&col_map, z_column_name, "z")?;
         let z = ds.values.column(z_col).to_owned();
 
         let routed_deviations = route_marginal_slope_deviation_blocks(
@@ -4605,7 +4587,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
             payload.training_headers = Some(ds.headers.clone());
-        payload.training_feature_ranges = Some(ds.feature_ranges());
+            payload.training_feature_ranges = Some(ds.feature_ranges());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
                     &fit.marginalspec_resolved,
@@ -4901,7 +4883,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.training_headers = Some(ds.headers.clone());
-        payload.training_feature_ranges = Some(ds.feature_ranges());
+            payload.training_feature_ranges = Some(ds.feature_ranges());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(&termspec, &cov_design)
                     .map_err(|e| e.to_string())?,
@@ -5558,15 +5540,9 @@ fn run_sample_survival(
         .survival_event
         .as_ref()
         .ok_or_else(|| "survival model missing event column metadata".to_string())?;
-    let entry_col = *col_map
-        .get(entryname)
-        .ok_or_else(|| format!("entry column '{}' not found", entryname))?;
-    let exit_col = *col_map
-        .get(exitname)
-        .ok_or_else(|| format!("exit column '{}' not found", exitname))?;
-    let event_col = *col_map
-        .get(eventname)
-        .ok_or_else(|| format!("event column '{}' not found", eventname))?;
+    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
+    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
+    let event_col = resolve_role_col(col_map, eventname, "event")?;
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -5867,9 +5843,7 @@ fn run_sample_standard(
     }
     progress.set_stage("sample", "building sampling design");
     let parsed = parse_formula(&model.formula)?;
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -5956,9 +5930,7 @@ fn run_sample_standard_link_wiggle(
 
     // Response vector
     let parsed = parse_formula(&model.formula)?;
-    let y_col = *col_map
-        .get(&parsed.response)
-        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
 
     // Main design matrix (base η block)

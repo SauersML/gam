@@ -9722,17 +9722,15 @@ mod tests {
             ExactOuterDerivativeOrder::First
         );
 
-        // Same biobank-scale specs, but the family advertises a matrix-free
-        // joint Hv operator. Per the user's plan ("cost selects representation,
-        // never capability") the gate must NOT downgrade to first-order: the
-        // operator path applies HVPs in O(K·n·p), not O(K·n·p²), so the dense-
-        // assembly cost it was guarding does not apply. The hard K² element
-        // cap still fires because the K×K outer Hessian is allocated either way.
+        // Same biobank-scale specs, but the available matrix-free primitive is
+        // only the inner coefficient-space Hv operator. That must not upgrade
+        // the profiled outer hyper-Hessian back to second order; without a real
+        // θ-HVP the K·coefficient-work gate still owns the decision.
         use crate::custom_family::cost_gated_outer_order_with_matrix_free;
         assert_eq!(
-            cost_gated_outer_order_with_matrix_free(&ctn_specs, ctn_cost, true),
-            ExactOuterDerivativeOrder::Second,
-            "matrix-free families must keep Second-order capability at biobank scale"
+            cost_gated_outer_order_with_matrix_free(&ctn_specs, ctn_cost, false),
+            ExactOuterDerivativeOrder::First,
+            "inner matrix-free coefficient Hv must not imply second-order outer hyper-Hessian"
         );
         let huge_k_specs = vec![ParameterBlockSpec {
             name: "k".to_string(),
@@ -9750,7 +9748,7 @@ mod tests {
         assert_eq!(
             cost_gated_outer_order_with_matrix_free(&huge_k_specs, 0, true),
             ExactOuterDerivativeOrder::First,
-            "K² > 16M element cap must fire even when matrix-free is available"
+            "K² > 16M element cap must fire even when a true outer HVP is available"
         );
     }
 

@@ -6442,8 +6442,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             let rows: Vec<(f64, f64, f64, f64, f64)> = (0..n)
                 .into_par_iter()
                 .map(|i| {
-                    let row =
-                        gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
+                    let row = gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
                     (
                         row.log_likelihood,
                         row.location_working_weight,
@@ -14066,7 +14065,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         crate::custom_family::cost_gated_outer_order_with_matrix_free(
             specs,
             coefficient_work,
-            self.supports_matrix_free_joint_hessian(specs),
+            self.outer_hyper_hessian_hvp_available(specs),
         )
     }
 

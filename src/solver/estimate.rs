@@ -948,15 +948,6 @@ pub enum EstimationError {
     PredictionError,
 
     #[error(
-        "P-IRLS exceeded its wall-clock budget after {elapsed_seconds:.1}s \
-         (limit {max_seconds:.1}s); the outer line search should shrink the step."
-    )]
-    PirlsTimeBudgetExceeded {
-        elapsed_seconds: f64,
-        max_seconds: f64,
-    },
-
-    #[error(
         "outer ARC iteration exceeded its wall-clock budget after {elapsed_seconds:.1}s \
          (limit {max_seconds:.1}s); the outer fallback cascade should degrade to a cheaper plan."
     )]

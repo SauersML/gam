@@ -433,23 +433,15 @@ pub fn cost_gated_outer_order(
 
 /// Capability-aware variant of [`cost_gated_outer_order`].
 ///
-/// Per the user's plan: cost selects representation, never capability. When
-/// the family advertises a matrix-free joint Hessian (`matrix_free_available`)
-/// the per-Hessian-vector-product work is `O(n·p)`, not `O(n·p²)`, so the
-/// `K · coefficient_cost` materialization-work gate that is appropriate for
-/// dense assembly does not apply: the evaluator will return
-/// `HessianResult::Operator` and ARC will route through
-/// `run_operator_trust_region`, which only ever issues HVPs (never assembles
-/// the dense `n·p²` Hessian). Bypass the work gate in that case.
-///
-/// The hard `K² > OUTER_HESSIAN_MAX_ELEMENTS` element cap is always enforced
-/// because it bounds the size of the `K×K` outer Hessian itself, which the
-/// operator path still allocates (it stores the cached pair-trace table
-/// `cross_trace[i,j]` and the materialized matvec result).
+/// `outer_hyper_hessian_hvp_available` means the family can apply the profiled
+/// outer Hessian itself as `v -> ∇²_theta V(theta) v`. It is deliberately not
+/// the same as an inner coefficient-space Hessian HVP. Inner matrix-free
+/// coefficient algebra keeps β-space memory under control, but it does not
+/// make the pairwise outer θθ Hessian cheap to request.
 pub fn cost_gated_outer_order_with_matrix_free(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
-    matrix_free_available: bool,
+    outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
     const OUTER_HESSIAN_MAX_ELEMENTS: u64 = 16_000_000;
 
@@ -464,7 +456,7 @@ pub fn cost_gated_outer_order_with_matrix_free(
     if outer_elements > OUTER_HESSIAN_MAX_ELEMENTS {
         return ExactOuterDerivativeOrder::First;
     }
-    if matrix_free_available {
+    if outer_hyper_hessian_hvp_available {
         return ExactOuterDerivativeOrder::Second;
     }
     cost_gated_outer_order(specs, coefficient_cost)
@@ -723,10 +715,15 @@ pub trait CustomFamily {
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
+        if !self.outer_hyper_hessian_dense_available(specs)
+            && !self.outer_hyper_hessian_hvp_available(specs)
+        {
+            return ExactOuterDerivativeOrder::First;
+        }
         cost_gated_outer_order_with_matrix_free(
             specs,
             coefficient_work,
-            self.supports_matrix_free_joint_hessian(specs),
+            self.outer_hyper_hessian_hvp_available(specs),
         )
     }
 
@@ -1004,8 +1001,8 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Static query: does this family supply a matrix-free joint Hessian
-    /// operator (`HessianResult::Operator` via
+    /// Static query: does this family supply a matrix-free inner coefficient
+    /// Hessian operator (`HessianResult::Operator` via
     /// `exact_newton_joint_hessian_workspace`) for the given specs?
     ///
     /// The default returns `false`.  Families that override
@@ -1014,11 +1011,34 @@ pub trait CustomFamily {
     /// the outer build site can promote `cap_hessian` to `Analytic` before
     /// the first evaluation.
     ///
-    /// This is a representation capability only. It must not promote an
-    /// expensive problem back to second-order outer optimization after
-    /// [`cost_gated_outer_order`] has downgraded the realized scale.
+    /// This is an inner β-space representation capability only. It must not
+    /// promote an expensive problem back to second-order outer θ optimization
+    /// after [`cost_gated_outer_order`] has downgraded the realized scale.
     fn supports_matrix_free_joint_hessian(&self, _specs: &[ParameterBlockSpec]) -> bool {
         false
+    }
+
+    /// Explicit name for the inner coefficient-space Hessian HVP capability.
+    ///
+    /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
+    /// operators do not accidentally advertise pairwise θθ calculus as cheap.
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        self.supports_matrix_free_joint_hessian(specs)
+    }
+
+    /// True only when the family has a real profiled outer Hessian-vector
+    /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
+    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        false
+    }
+
+    /// True when the family can expose the dense profiled outer Hessian and
+    /// the cost gate may decide whether to request it. Generic custom-family
+    /// pairwise derivative paths default to dense availability; families with
+    /// only inner HVP support should override this if dense θθ assembly is not
+    /// a valid capability for their path.
+    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        true
     }
 
     /// Optional spec-aware exact joint Hessian.
