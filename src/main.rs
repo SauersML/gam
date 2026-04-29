@@ -12042,7 +12042,7 @@ mod tests {
     }
 
     #[test]
-    fn build_termspecwarns_and_ignores_duchon_double_penalty_option() {
+    fn build_termspecrejects_duchon_double_penalty_option() {
         let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, double_penalty=false)")
             .expect("formula should parse before basis validation");
         let ds = Dataset {
@@ -12066,20 +12066,16 @@ mod tests {
         };
         let col_map = HashMap::from([("pc1".to_string(), 0usize), ("pc2".to_string(), 1usize)]);
         let mut inference_notes = Vec::<String>::new();
-        let spec = super::build_termspec(
+        let err = super::build_termspec(
             &parsed.terms,
             &ds,
             &col_map,
             &mut inference_notes,
             &gam::resource::ResourcePolicy::default_library(),
         )
-        .expect("duchon double_penalty should be accepted and ignored");
-        assert_eq!(spec.smooth_terms.len(), 1);
-        let redundant_warning = inference_notes
-            .iter()
-            .find(|n| n.contains("ignored redundant double_penalty option"))
-            .expect("redundant double_penalty warning should be emitted");
-        assert!(redundant_warning.contains("Duchon smooths always include nullspace shrinkage"));
+        .expect_err("duchon double_penalty should be rejected");
+        assert!(err.contains("does not support double_penalty"));
+        assert!(inference_notes.is_empty());
     }
 
     #[test]

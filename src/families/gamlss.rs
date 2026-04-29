@@ -18,7 +18,7 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
-    fast_ab, fast_atb, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
+    fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
 };
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
