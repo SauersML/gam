@@ -2392,10 +2392,7 @@ pub fn run_logit_polya_gamma_gibbs(
     let mut rng = StdRng::seed_from_u64(config.seed);
 
     // b = X^T (y - 1/2), constant across iterations.
-    let mut kappa = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        kappa[i] = y[i] - 0.5;
-    }
+    let kappa = y.mapv(|v| v - 0.5);
     let rhs_b = fast_atv(&x, &kappa);
 
     let mut samples_array = Array3::<f64>::zeros((config.n_chains, config.n_samples, p));
