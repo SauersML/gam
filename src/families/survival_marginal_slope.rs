@@ -13091,6 +13091,34 @@ fn inner_fit(
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
 }
 
+fn mean_abs(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for v in values {
+        sum += v.abs();
+        count += 1;
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+fn block_log_lambda_seeds<'a, I>(design: &DesignMatrix, penalty_locals: I) -> Vec<f64>
+where
+    I: IntoIterator<Item = &'a Array2<f64>>,
+{
+    let unit_weights = Array1::<f64>::ones(design.nrows());
+    let likelihood_scale = match design.diag_gram(&unit_weights) {
+        Ok(d) => mean_abs(d.iter().copied()).max(1.0e-8),
+        Err(_) => 1.0,
+    };
+    penalty_locals
+        .into_iter()
+        .map(|s| {
+            let penalty_scale = mean_abs(s.diag().iter().copied()).max(1.0e-8);
+            (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
+        })
+        .collect()
+}
+
 fn joint_setup(
     data: ArrayView2<'_, f64>,
     time_penalties: usize,
@@ -13098,16 +13126,26 @@ fn joint_setup(
     marginal_penalties: usize,
     logslopespec: &TermCollectionSpec,
     logslope_penalties: usize,
+    core_rho0_seed: &[f64],
     extra_rho0: &[f64],
     initial_sigma: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
-    let rho_dim = time_penalties + marginal_penalties + logslope_penalties + extra_rho0.len();
+    let core_len = time_penalties + marginal_penalties + logslope_penalties;
+    let rho_dim = core_len + extra_rho0.len();
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
+    debug_assert_eq!(
+        core_rho0_seed.len(),
+        core_len,
+        "core_rho0_seed length must equal time+marginal+logslope penalty count"
+    );
+    for (idx, value) in core_rho0_seed.iter().copied().enumerate().take(core_len) {
+        rho0vec[idx] = value;
+    }
     if !extra_rho0.is_empty() {
-        let start = time_penalties + marginal_penalties + logslope_penalties;
+        let start = core_len;
         for (idx, value) in extra_rho0.iter().copied().enumerate() {
             rho0vec[start + idx] = value;
         }
@@ -13583,6 +13621,24 @@ pub fn fit_survival_marginal_slope_terms(
         }
         out
     };
+    let core_rho0_seed: Vec<f64> = {
+        let mut seeds = Vec::with_capacity(
+            time_penalties_len + marginal_design.penalties.len() + logslope_design.penalties.len(),
+        );
+        seeds.extend(block_log_lambda_seeds(
+            &spec.time_block.design_exit,
+            spec.time_block.penalties.iter(),
+        ));
+        seeds.extend(block_log_lambda_seeds(
+            &marginal_design.design,
+            marginal_design.penalties.iter().map(|bp| &bp.local),
+        ));
+        seeds.extend(block_log_lambda_seeds(
+            &logslope_design.design,
+            logslope_design.penalties.iter().map(|bp| &bp.local),
+        ));
+        seeds
+    };
     let setup = joint_setup(
         data,
         time_penalties_len,
@@ -13590,6 +13646,7 @@ pub fn fit_survival_marginal_slope_terms(
         marginal_design.penalties.len(),
         &logslopespec_boot,
         logslope_design.penalties.len(),
+        &core_rho0_seed,
         &extra_rho0,
         initial_sigma,
         kappa_options,
