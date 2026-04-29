@@ -2573,10 +2573,10 @@ fn run_predict_saved_latent_window_impl(
         }
         let x_time_entry = prepared
             .time_design_entry
-            .try_to_dense_by_chunks("latent survival entry time covariance design")?;
+            .try_to_dense_arc("latent survival entry time covariance design")?;
         let x_time_exit = prepared
             .time_design_exit
-            .try_to_dense_by_chunks("latent survival exit time covariance design")?;
+            .try_to_dense_arc("latent survival exit time covariance design")?;
         Some(saved_latent_window_local_covariances(
             cov_design,
             &x_time_entry,
@@ -2958,7 +2958,7 @@ fn run_predict_survival(
         )?;
         let x_time_exit_dense = time_build
             .x_exit_time
-            .try_to_dense_by_chunks("survival location-scale prediction time-exit design")?;
+            .try_to_dense_arc("survival location-scale prediction time-exit design")?;
         let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
             let mut full =
                 Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
@@ -3218,7 +3218,7 @@ fn run_predict_survival(
     let p = p_time + p_timewiggle + p_cov;
     let x_exit_time_dense = time_build
         .x_exit_time
-        .try_to_dense_by_chunks("survival prediction time-exit design")?;
+        .try_to_dense_arc("survival prediction time-exit design")?;
     let mut x_exit = Array2::<f64>::zeros((n, p));
     if p_time > 0 {
         x_exit

@@ -5186,10 +5186,10 @@ impl DesignMatrix {
     pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
         let n = self.nrows();
         let p = self.ncols();
-        let chunk_rows =
-            (CHUNKED_DENSE_MATERIALIZATION_BYTES / (p.max(1) * std::mem::size_of::<f64>()))
-                .max(1)
-                .min(n.max(1));
+        let chunk_rows = (CHUNKED_DENSE_MATERIALIZATION_BYTES
+            / (p.max(1) * std::mem::size_of::<f64>()))
+        .max(1)
+        .min(n.max(1));
         let mut out = Array2::<f64>::zeros((n, p));
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
