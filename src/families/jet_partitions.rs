@@ -8,6 +8,11 @@
 //! bounded by the Bell numbers up to `B(MAX_DIRS) = 52` for `MAX_DIRS=5`, so
 //! the cache is tiny and computed lazily on first use.
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MUL_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static ROW_NEGLOG_CALLS: AtomicU64 = AtomicU64::new(0);
 
 const MAX_DIRS: usize = 5;
 const TABLE_LEN: usize = 1usize << MAX_DIRS;
@@ -113,6 +118,7 @@ impl MultiDirJet {
     }
 
     pub(crate) fn mul(&self, other: &Self) -> Self {
+        MUL_CALLS.fetch_add(1, Ordering::Relaxed);
         let count = self.coeffs.len();
         let mut out = vec![0.0; count];
         for mask in 0..count {
@@ -131,6 +137,7 @@ impl MultiDirJet {
     }
 
     pub(crate) fn compose_unary(&self, derivs: [f64; 5]) -> Self {
+        COMPOSE_UNARY_CALLS.fetch_add(1, Ordering::Relaxed);
         let count = self.coeffs.len();
         let mut out = vec![0.0; count];
         out[0] = derivs[0];

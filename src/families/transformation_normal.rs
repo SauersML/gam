@@ -95,7 +95,14 @@ const BASE_TRANSFORMATION_TENSOR_WIDTH: usize = 160;
 /// tensor width bounded even when the covariate side is narrow.
 const LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH: usize = 320;
 const STANDARD_NORMAL_LOG_ABS_MEAN: f64 = -0.635_181_422_730_739_1;
-const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
+/// Strict-feasibility margin for `h' > 0` on the monotonicity grid. Used
+/// both by the fit-time fraction-to-boundary line search (so accepted β
+/// keeps `h'(grid) ≥ EPS`) and by the predict-time monotonicity check
+/// in `inference::predict_input` (which rejects predictions whose minimum
+/// `h'` on the response grid drops below this threshold). Keeping these
+/// in sync prevents the predict path from rejecting fits that the
+/// optimizer accepted as feasible — and vice versa.
+pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
 /// Fraction of the response span by which fit-time monotonicity grids and
 /// predict-time monotonicity scans extend past the observed `[min, max]`.
 /// Re-exported because the predict-time guard in `inference::predict_input`
