@@ -606,18 +606,6 @@ impl TransformationNormalFamily {
         *cache = Some(row_quantities.clone());
         row_quantities
     }
-
-    /// Compute h and h' from the current coefficients.
-    ///
-    /// Uses the Kronecker-aware operators directly, avoiding full
-    /// n × p_total matrix-vector products through a materialized tensor product.
-    fn compute_h_and_h_prime(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let row_quantities = self.row_quantities(beta);
-        (
-            row_quantities.h.as_ref().clone(),
-            row_quantities.h_prime.as_ref().clone(),
-        )
-    }
 }
 
 fn weighted_crossprod_dense(
@@ -4493,7 +4481,9 @@ mod tests {
         )
         .expect("transformation family");
 
-        let (h, h_prime) = family.compute_h_and_h_prime(&family.initial_beta);
+        let row = family.row_quantities(&family.initial_beta);
+        let h = row.h.as_ref();
+        let h_prime = row.h_prime.as_ref();
         let expected_h = array![0.5, 2.0];
         let expected_h_prime = array![0.5, 0.5];
 
