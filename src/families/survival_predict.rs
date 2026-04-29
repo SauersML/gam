@@ -792,36 +792,23 @@ fn predict_survival_location_scale_batch(
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
     let saved_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
-    // Choose the proper baseline (probit-survival for SAS/etc, default for the rest).
-    let probit_baseline = matches!(
-        &saved_inverse_link,
-        InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_)
-            | InverseLink::LatentCLogLog(_)
-    );
-    let (_eta_offset_entry, mut eta_offset_exit, _derivative_offset_exit) = if probit_baseline {
-        build_survival_marginal_slope_baseline_offsets(age_entry, age_exit, &baseline_cfg)?
-    } else {
-        crate::families::survival_construction::build_survival_baseline_offsets(
+    let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
+        build_survival_time_offsets_for_likelihood(
             age_entry,
             age_exit,
             &baseline_cfg,
-        )?
-    };
-    // Apply the survival-location-scale derivative guard to the exit-time eta
-    // offset. The entry-time + derivative offsets aren't consumed by
-    // `predict_survival_location_scale` so we skip those updates here.
-    let derivative_guard =
-        crate::families::survival_location_scale::DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
-    if derivative_guard > 0.0 {
-        ndarray::Zip::from(&mut eta_offset_exit)
-            .and(age_exit)
-            .par_for_each(|out, &t| {
-                *out += derivative_guard * (t - time_anchor);
-            });
-    }
+            saved_likelihood_mode,
+            Some(&saved_inverse_link),
+        )?;
+    add_survival_time_derivative_guard_offset(
+        age_entry,
+        age_exit,
+        time_anchor,
+        survival_derivative_guard_for_likelihood(saved_likelihood_mode),
+        &mut eta_offset_entry,
+        &mut eta_offset_exit,
+        &mut derivative_offset_exit,
+    )?;
 
     let saved_fit = saved_survival_location_scale_fit_result(model)?;
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
