@@ -559,6 +559,30 @@ const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
 const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
 
 fn main() {
+    std::thread::spawn(|| {
+        use std::sync::atomic::Ordering;
+        let start = std::time::Instant::now();
+        let mut prev_compose = 0u64;
+        let mut prev_mul = 0u64;
+        let mut prev_row = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let compose =
+                gam::families::jet_partitions::COMPOSE_UNARY_CALLS.load(Ordering::Relaxed);
+            let mul = gam::families::jet_partitions::MUL_CALLS.load(Ordering::Relaxed);
+            let row = gam::families::jet_partitions::ROW_NEGLOG_CALLS.load(Ordering::Relaxed);
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!(
+                "[COUNTER] t={elapsed:.1}s compose_unary={compose} (+{}) mul={mul} (+{}) row_neglog={row} (+{})",
+                compose - prev_compose,
+                mul - prev_mul,
+                row - prev_row
+            );
+            prev_compose = compose;
+            prev_mul = mul;
+            prev_row = row;
+        }
+    });
     if let Err(e) = run() {
         eprintln!("error: {e}");
         if let Some(advice) = e.advice() {
