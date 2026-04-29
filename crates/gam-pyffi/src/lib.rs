@@ -17,7 +17,7 @@ use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
     encode_recordswith_schema,
 };
-use gam::inference::formula_dsl::parse_surv_response;
+use gam::inference::formula_dsl::{ParsedTerm, parse_formula, parse_surv_response};
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
@@ -575,7 +575,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let payload = SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: pretty_familyname(model.likelihood()).to_string(),
-        model_class: model.predict_model_class().name().to_string(),
+        model_class: prediction_model_class_label(&model),
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
@@ -627,7 +627,7 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
     let report_input = ReportInput {
         model_path: "<in-memory>".to_string(),
         family_name: pretty_familyname(model.likelihood()).to_string(),
-        model_class: model.predict_model_class().name().to_string(),
+        model_class: prediction_model_class_label(&model),
         formula: model.payload().formula.clone(),
         n_obs: None,
         deviance: fit.deviance,
@@ -867,28 +867,8 @@ fn schema_check(
     rows: &[Vec<String>],
 ) -> Result<SchemaCheckPayload, String> {
     let schema = model.require_data_schema()?;
-    // The response column is part of the training schema but plays no role in
-    // prediction — it is the target, not an input. Strict-extras validation
-    // (which catches typos like passing `z` to a model trained on `x`) must
-    // therefore exempt it on both sides: it is neither *required* in the
-    // prediction frame nor *forbidden* from being there. Filtering only one
-    // side breaks the symmetric pattern users rely on (`fit(df, ...);
-    // predict(df)` where `df` carries the response throughout).
-    //
-    // Surv(...)-style formulas have no scalar response column —
-    // `response_column_name` returns None and both filters become no-ops.
-    let response_column = response_column_name(model.payload().formula.as_str());
-    let expected_names = schema
-        .columns
-        .iter()
-        .filter(|column| response_column.as_deref() != Some(column.name.as_str()))
-        .map(|column| column.name.clone())
-        .collect::<BTreeSet<_>>();
-    let present_names = headers
-        .iter()
-        .filter(|name| response_column.as_deref() != Some(name.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let expected_names = required_prediction_columns(model)?;
+    let present_names = headers.iter().cloned().collect::<BTreeSet<_>>();
     let mut issues = Vec::<SchemaIssue>::new();
 
     for missing in expected_names.difference(&present_names) {
@@ -896,13 +876,6 @@ fn schema_check(
             kind: "missing_column".to_string(),
             message: format!("missing required column '{missing}'"),
             column: Some(missing.clone()),
-        });
-    }
-    for unknown in present_names.difference(&expected_names) {
-        issues.push(SchemaIssue {
-            kind: "unknown_column".to_string(),
-            message: format!("unknown column '{unknown}' is not part of the training schema"),
-            column: Some(unknown.clone()),
         });
     }
 
@@ -934,6 +907,107 @@ fn response_column_name(formula: &str) -> Option<String> {
         None
     } else {
         Some(candidate.to_string())
+    }
+}
+
+fn prediction_model_class_label(model: &FittedModel) -> String {
+    let payload = model.payload();
+    match &payload.family_state {
+        FittedFamily::Survival {
+            survival_likelihood,
+            ..
+        } => match survival_likelihood
+            .as_deref()
+            .or(payload.survival_likelihood.as_deref())
+        {
+            Some("marginal-slope") => "survival marginal-slope".to_string(),
+            Some("location-scale") => "survival location-scale".to_string(),
+            _ => model.predict_model_class().name().to_string(),
+        },
+        FittedFamily::LatentSurvival { .. } => "latent survival".to_string(),
+        FittedFamily::LatentBinary { .. } => "latent binary".to_string(),
+        _ => model.predict_model_class().name().to_string(),
+    }
+}
+
+fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, String> {
+    let payload = model.payload();
+    let parsed = parse_formula(payload.formula.as_str())?;
+    let mut required = BTreeSet::<String>::new();
+    add_formula_term_columns(&mut required, &parsed.terms);
+
+    if let Some((entry, exit, _event)) = parse_surv_response(parsed.response.as_str())? {
+        required.insert(entry);
+        required.insert(exit);
+    } else if matches!(
+        model.predict_model_class(),
+        PredictModelClass::TransformationNormal
+    ) {
+        if let Some(response) = response_column_name(payload.formula.as_str()) {
+            required.insert(response);
+        }
+    }
+
+    if let Some(offset) = payload.offset_column.as_ref() {
+        required.insert(offset.clone());
+    }
+    if let Some(noise_offset) = payload.noise_offset_column.as_ref() {
+        required.insert(noise_offset.clone());
+    }
+    if matches!(
+        model.predict_model_class(),
+        PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
+    ) {
+        if let Some(z_column) = payload.z_column.as_ref() {
+            required.insert(z_column.clone());
+        }
+    }
+    if let Some(noise_formula) = payload.formula_noise.as_ref() {
+        add_auxiliary_formula_columns(&mut required, noise_formula, parsed.response.as_str())?;
+    }
+    if let Some(logslope_formula) = payload.formula_logslope.as_ref() {
+        if logslope_formula != "same-as-main" {
+            add_auxiliary_formula_columns(&mut required, logslope_formula, parsed.response.as_str())?;
+        }
+    }
+    Ok(required)
+}
+
+fn add_auxiliary_formula_columns(
+    required: &mut BTreeSet<String>,
+    formula_or_rhs: &str,
+    response: &str,
+) -> Result<(), String> {
+    let trimmed = formula_or_rhs.trim();
+    if trimmed.is_empty() || trimmed == "1" {
+        return Ok(());
+    }
+    let formula = if trimmed.contains('~') {
+        trimmed.to_string()
+    } else {
+        format!("{response} ~ {trimmed}")
+    };
+    let parsed = parse_formula(formula.as_str())?;
+    add_formula_term_columns(required, &parsed.terms);
+    Ok(())
+}
+
+fn add_formula_term_columns(required: &mut BTreeSet<String>, terms: &[ParsedTerm]) {
+    for term in terms {
+        match term {
+            ParsedTerm::Linear { name, .. }
+            | ParsedTerm::BoundedLinear { name, .. }
+            | ParsedTerm::RandomEffect { name } => {
+                required.insert(name.clone());
+            }
+            ParsedTerm::Smooth { vars, .. } => {
+                required.extend(vars.iter().cloned());
+            }
+            ParsedTerm::LinkWiggle { .. }
+            | ParsedTerm::TimeWiggle { .. }
+            | ParsedTerm::LinkConfig { .. }
+            | ParsedTerm::SurvivalConfig { .. } => {}
+        }
     }
 }
 

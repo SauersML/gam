@@ -20,6 +20,7 @@ overridden at construction time:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -52,6 +53,10 @@ class PgsCalibration:
     duchon_length_scale:
         Fixed Duchon radial length scale. Defaults to ``1.0`` so anisotropic
         PC scaling is active but does not duplicate the global smoothing scale.
+    duchon_double_penalty:
+        Whether to add the extra null-space penalty to the Duchon term.
+        Defaults to ``True`` to match the documented triple-operator
+        regularization used by the calibration pipeline.
     scale_dimensions:
         Forwarded to :func:`gam.fit`. When ``True`` (the default), enables
         learned per-axis anisotropic length scales on the Duchon smooth.
@@ -79,6 +84,7 @@ class PgsCalibration:
     duchon_order: int = 1
     duchon_power: int = 1
     duchon_length_scale: float = 1.0
+    duchon_double_penalty: bool = True
     scale_dimensions: bool | None = True
     out_column: str = "pgs_ctn_z"
     extra_fit_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -104,7 +110,8 @@ class PgsCalibration:
         duchon = (
             f"duchon({pc_args}, centers={self._resolved_centers}, "
             f"order={self.duchon_order}, power={self.duchon_power}, "
-            f"length_scale={self.duchon_length_scale:g})"
+            f"length_scale={self.duchon_length_scale:g}, "
+            f"double_penalty={str(self.duchon_double_penalty).lower()})"
         )
         return f"{self.pgs_column} ~ {duchon}"
 
@@ -148,27 +155,73 @@ class PgsCalibration:
         return self.model.predict(data)
 
     def save(self, path: str | Path) -> None:
-        """Persist the underlying fitted model to ``path``."""
-        self.model.save(path)
+        """Persist the fitted model and wrapper metadata."""
+        model_path = Path(path)
+        self.model.save(model_path)
+        _manifest_path(model_path).write_text(
+            json.dumps(self._manifest(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     @classmethod
     def load(
         cls,
         path: str | Path,
         *,
-        pc_columns: Sequence[str],
+        pc_columns: Sequence[str] | None = None,
         pgs_column: str = "PGS",
         **kwargs: Any,
     ) -> "PgsCalibration":
         """Load a previously-saved calibration model.
 
-        The PC column ordering and raw-PGS column name are not recorded in the
-        model bytes, so callers must pass ``pc_columns`` and ``pgs_column``
-        explicitly.
+        Wrapper metadata is restored from the sidecar manifest written by
+        :meth:`save`. ``pc_columns`` and ``pgs_column`` may still be supplied
+        to override the manifest when loading older model-only artifacts.
         """
+        model_path = Path(path)
+        manifest_path = _manifest_path(model_path)
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            pc_columns = pc_columns or manifest["pc_columns"]
+            pgs_column = pgs_column if pgs_column != "PGS" else manifest["pgs_column"]
+            kwargs.setdefault("out_column", manifest.get("out_column", "pgs_ctn_z"))
+            kwargs.setdefault("duchon_centers", manifest.get("duchon_centers"))
+            kwargs.setdefault("duchon_order", manifest.get("duchon_order", 1))
+            kwargs.setdefault("duchon_power", manifest.get("duchon_power", 1))
+            kwargs.setdefault("duchon_length_scale", manifest.get("duchon_length_scale", 1.0))
+            kwargs.setdefault(
+                "duchon_double_penalty",
+                manifest.get("duchon_double_penalty", True),
+            )
+            kwargs.setdefault("scale_dimensions", manifest.get("scale_dimensions", True))
+        if pc_columns is None:
+            raise ValueError(
+                "PgsCalibration.load requires pc_columns when the sidecar manifest is missing"
+            )
         instance = cls(pc_columns=pc_columns, pgs_column=pgs_column, **kwargs)
-        instance._model = load_model(path)
+        instance._model = load_model(model_path)
         return instance
+
+    def _manifest(self) -> dict[str, Any]:
+        return {
+            "kind": "PgsCalibration",
+            "version": 1,
+            "pc_columns": list(self.pc_columns),
+            "pgs_column": self.pgs_column,
+            "out_column": self.out_column,
+            "formula": self.formula,
+            "duchon_centers": self.duchon_centers,
+            "resolved_duchon_centers": self._resolved_centers,
+            "duchon_order": self.duchon_order,
+            "duchon_power": self.duchon_power,
+            "duchon_length_scale": self.duchon_length_scale,
+            "duchon_double_penalty": self.duchon_double_penalty,
+            "scale_dimensions": self.scale_dimensions,
+        }
+
+
+def _manifest_path(model_path: Path) -> Path:
+    return model_path.with_name(f"{model_path.name}.pgs.json")
 
 
 def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
