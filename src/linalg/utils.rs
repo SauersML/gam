@@ -337,7 +337,7 @@ where
     let mut inv_m = Array1::<f64>::zeros(p);
     Zip::from(&mut inv_m)
         .and(preconditioner_diag)
-        .for_each(|inv, &m| {
+        .par_for_each(|inv, &m| {
             *inv = 1.0 / m.abs().max(1e-12);
         });
 
@@ -345,7 +345,7 @@ where
     Zip::from(&mut z)
         .and(&r)
         .and(&inv_m)
-        .for_each(|zi, &ri, &im| {
+        .par_for_each(|zi, &ri, &im| {
             *zi = ri * im;
         });
     let mut p_dir = z.clone();
@@ -394,7 +394,7 @@ where
         Zip::from(&mut z)
             .and(&r)
             .and(&inv_m)
-            .for_each(|zi, &ri, &im| {
+            .par_for_each(|zi, &ri, &im| {
                 *zi = ri * im;
             });
         let rz_new = r.dot(&z);
@@ -405,8 +405,9 @@ where
         if !beta.is_finite() {
             return None;
         }
-        // p <- z + beta * p (fused, SIMD-friendly via ndarray::Zip).
-        Zip::from(&mut p_dir).and(&z).for_each(|pi, &zi| {
+        // p <- z + beta * p (fused, SIMD-friendly via ndarray::Zip; parallel
+        // over coefficient dimension at biobank-scale p).
+        Zip::from(&mut p_dir).and(&z).par_for_each(|pi, &zi| {
             *pi = zi + beta * *pi;
         });
         rz_old = rz_new;
@@ -462,11 +463,55 @@ where
         return Ok(0.0);
     }
     if dim <= 128 {
-        let matrix = materialize_symmetric_operator(dim, &apply)?;
-        let chol = matrix
-            .cholesky(Side::Lower)
-            .map_err(|_| "SLQ exact tiny-system Cholesky failed".to_string())?;
-        return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
+        let mut matrix = materialize_symmetric_operator(dim, &apply)?;
+        // Symmetrize defensively: matrix-free operator residuals can introduce
+        // small asymmetry that trips Cholesky on otherwise-PSD systems.
+        enforce_symmetry(&mut matrix);
+        if let Ok(chol) = matrix.clone().cholesky(Side::Lower) {
+            return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
+        }
+        // Cholesky failed (operator-induced indefiniteness from PCG residuals
+        // or SLQ trace correction). Fall back to symmetric eigendecomposition
+        // with a small positive floor so logdet stays finite. This preserves
+        // the trace-correction contract: we still return Σ ln(λ_i) on the
+        // symmetrized matrix, just with eigenvalues clipped to a tiny floor
+        // when they wander non-positive due to numerical noise.
+        match FaerEigh::eigh(&matrix, Side::Lower) {
+            Ok((evals, _)) => {
+                // Floor eigenvalues at a scale-relative tiny positive value.
+                let max_abs = evals
+                    .iter()
+                    .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                    .max(1.0);
+                let floor = max_abs * 1e-14;
+                let mut logdet = 0.0_f64;
+                for &lam in evals.iter() {
+                    let clipped = if lam.is_finite() && lam > floor {
+                        lam
+                    } else {
+                        floor
+                    };
+                    logdet += clipped.ln();
+                }
+                log::warn!(
+                    "[STAGE] SLQ tiny-system Cholesky failed (dim={dim}); recovered \
+                     logdet via symmetric eigendecomposition with positive-eigenvalue \
+                     floor {floor:.3e} (max|λ|={max_abs:.3e})"
+                );
+                return Ok(logdet);
+            }
+            Err(_) => {
+                // Eigendecomposition also failed. Last-resort dense logdet
+                // via LU on |det| with sign tracking would not help here
+                // (we need an SPD-style logdet); surface a descriptive error
+                // so the outer driver can fall back.
+                return Err(
+                    "SLQ exact tiny-system Cholesky failed and symmetric \
+                     eigendecomposition fallback also failed"
+                        .to_string(),
+                );
+            }
+        }
     }
     let probes = num_probes.max(1);
     let steps = lanczos_steps.clamp(2, dim.max(2));
