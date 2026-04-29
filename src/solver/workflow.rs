@@ -1696,13 +1696,7 @@ fn materialize_survival<'a>(
         )?
     };
     let time_anchor = resolve_survival_time_anchor_value(&age_entry, None)?;
-    let exact_derivative_guard = match survival_mode {
-        SurvivalLikelihoodMode::LocationScale
-        | SurvivalLikelihoodMode::Latent
-        | SurvivalLikelihoodMode::LatentBinary => DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-        SurvivalLikelihoodMode::MarginalSlope => DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => 0.0,
-    };
+    let exact_derivative_guard = survival_derivative_guard_for_likelihood(survival_mode);
 
     // Build time basis
     let mut time_build = build_survival_time_basis(
@@ -1975,6 +1969,8 @@ fn materialize_survival<'a>(
                 &age_exit,
                 candidate,
                 survival_mode,
+                (survival_mode == SurvivalLikelihoodMode::LocationScale)
+                    .then_some(&survival_inverse_link),
                 time_anchor,
                 exact_derivative_guard,
                 &time_build,
@@ -2088,6 +2084,7 @@ fn materialize_survival<'a>(
                 &age_exit,
                 candidate,
                 survival_mode,
+                None,
                 time_anchor,
                 exact_derivative_guard,
                 &time_build,
@@ -2146,6 +2143,7 @@ fn materialize_survival<'a>(
                 &age_exit,
                 candidate,
                 survival_mode,
+                None,
                 time_anchor,
                 exact_derivative_guard,
                 &time_build,
