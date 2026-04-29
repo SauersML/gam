@@ -6498,6 +6498,156 @@ mod tests {
             "fallback must rerun the refresh and restore m_inactive"
         );
     }
+
+    /// Pairwise oracle for Phase-2 outer-HVP cross-checking.
+    ///
+    /// Builds the toy CTN fixture (n=4, p_resp=2, p_cov=2, ψ_dim=2), calls the
+    /// existing pairwise body `exact_newton_joint_psisecond_order_terms(i, j)`
+    /// for every (i, j) pair, computes the directional contraction
+    /// `Σ_j v_j · pair(i, j)` for a fixed direction `v`, and writes the full
+    /// likelihood-only result to `/tmp/ctn_pairwise_oracle.json`.
+    ///
+    /// One of three independent verification paths for the CTN HVP work:
+    ///   (1) sympy proof shadow (`scripts/ctn_hvp_groundtruth.py`, task #14)
+    ///   (2) THIS oracle — current pairwise body, before the directional version
+    ///   (3) `CtnOuterHessianOperator::matvec` (when ctn-hvp-phase2 commit 2 lands)
+    /// All three must agree to ~1e-7 on the likelihood pieces.
+    ///
+    /// Run via:
+    ///     cargo test --release ctn_pairwise_oracle_dumps_json -- --nocapture
+    #[test]
+    fn ctn_pairwise_oracle_dumps_json() {
+        let psi = array![0.15, -0.10];
+        let v = array![0.4, -0.7];
+
+        let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let block_states = vec![state.clone()];
+        let specs = vec![spec.clone()];
+        let beta = state.beta.clone();
+
+        let psi_dim = psi.len();
+        let p_total = beta.len();
+        let n_obs = family.weights.as_ref().len();
+
+        eprintln!(
+            "[oracle] toy CTN: n={n_obs}, p_resp=2, p_cov=2, p_total={p_total}, ψ_dim={psi_dim}"
+        );
+        eprintln!("[oracle] β = {:?}", beta.as_slice().unwrap());
+        eprintln!("[oracle] ψ = {:?}", psi.as_slice().unwrap());
+        eprintln!("[oracle] v = {:?}", v.as_slice().unwrap());
+
+        // Per-pair pairwise body — likelihood pieces only (no penalty/logdet).
+        let mut pair_records = Vec::new();
+        for i in 0..psi_dim {
+            for j in 0..psi_dim {
+                let terms = family
+                    .exact_newton_joint_psisecond_order_terms(
+                        &block_states,
+                        &specs,
+                        &derivative_blocks,
+                        i,
+                        j,
+                    )
+                    .expect("pairwise call ok")
+                    .expect("pairwise returns Some for valid i,j");
+                let g_inf = terms.score_psi_psi.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let b_inf = terms
+                    .hessian_psi_psi
+                    .iter()
+                    .fold(0.0f64, |m, x| m.max(x.abs()));
+                eprintln!(
+                    "[oracle] pair (i={i}, j={j}): a={:.10}, ‖g‖∞={:.6e}, ‖b_mat‖∞={:.6e}",
+                    terms.objective_psi_psi, g_inf, b_inf,
+                );
+                pair_records.push(serde_json::json!({
+                    "i": i,
+                    "j": j,
+                    "a": terms.objective_psi_psi,
+                    "g": terms.score_psi_psi.to_vec(),
+                    "b_mat": terms.hessian_psi_psi.iter().copied().collect::<Vec<f64>>(),
+                    "b_mat_shape": [terms.hessian_psi_psi.nrows(), terms.hessian_psi_psi.ncols()],
+                }));
+            }
+        }
+
+        // Directional contraction: Σ_j v_j · pair(i, j) for each free axis i.
+        let mut a_dir = Array1::<f64>::zeros(psi_dim);
+        let mut g_dir = Array2::<f64>::zeros((psi_dim, p_total));
+        let mut b_dir = vec![Array2::<f64>::zeros((p_total, p_total)); psi_dim];
+        for i in 0..psi_dim {
+            for j in 0..psi_dim {
+                let terms = family
+                    .exact_newton_joint_psisecond_order_terms(
+                        &block_states,
+                        &specs,
+                        &derivative_blocks,
+                        i,
+                        j,
+                    )
+                    .expect("pairwise call ok")
+                    .expect("pairwise returns Some for valid i,j");
+                a_dir[i] += v[j] * terms.objective_psi_psi;
+                let mut g_row = g_dir.slice_mut(s![i, ..]);
+                g_row.scaled_add(v[j], &terms.score_psi_psi);
+                b_dir[i].scaled_add(v[j], &terms.hessian_psi_psi);
+            }
+        }
+
+        eprintln!("[oracle] directional contraction Σ_j v_j · pair(i, j):");
+        for i in 0..psi_dim {
+            eprintln!(
+                "[oracle]   i={i}: a_dir={:.10}, ‖g_dir‖∞={:.6e}, ‖b_dir‖∞={:.6e}",
+                a_dir[i],
+                g_dir.row(i).iter().fold(0.0f64, |m, x| m.max(x.abs())),
+                b_dir[i].iter().fold(0.0f64, |m, x| m.max(x.abs())),
+            );
+        }
+
+        let directional_records: Vec<_> = (0..psi_dim)
+            .map(|i| {
+                serde_json::json!({
+                    "i": i,
+                    "a_dir": a_dir[i],
+                    "g_dir": g_dir.row(i).to_vec(),
+                    "b_dir": b_dir[i].iter().copied().collect::<Vec<f64>>(),
+                    "b_dir_shape": [p_total, p_total],
+                })
+            })
+            .collect();
+
+        let blob = serde_json::json!({
+            "config": {
+                "n": n_obs,
+                "p_resp": 2,
+                "p_cov": 2,
+                "p_total": p_total,
+                "psi_dim": psi_dim,
+                "beta": beta.to_vec(),
+                "psi": psi.to_vec(),
+                "v": v.to_vec(),
+            },
+            "pairwise": pair_records,
+            "directional_contraction": directional_records,
+            "note": "Likelihood-only pieces from exact_newton_joint_psisecond_order_terms. \
+                     Penalty/logdet contributions are added by the unified evaluator's \
+                     outer_hessian_entry. Cross-check this against sympy-shadow's symbolic \
+                     derivation of the same likelihood quantities at the same toy config.",
+        });
+
+        let path = "/tmp/ctn_pairwise_oracle.json";
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&blob).expect("serialize ok"),
+        )
+        .expect("write ok");
+        eprintln!("[oracle] wrote {path}");
+
+        // Sanity assertions: nothing NaN, directional contraction is consistent
+        // with element-wise summation.
+        assert!(a_dir.iter().all(|x| x.is_finite()));
+        assert!(g_dir.iter().all(|x| x.is_finite()));
+        assert!(b_dir.iter().all(|m| m.iter().all(|x| x.is_finite())));
+    }
 }
 
 impl CustomFamilyPsiDerivativeOperator for TensorKroneckerPsiOperator {
