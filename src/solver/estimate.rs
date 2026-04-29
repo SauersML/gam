@@ -2692,6 +2692,29 @@ pub enum FittedLinkState {
     },
 }
 
+pub fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<MixtureLinkState> {
+    match &fit.fitted_link {
+        FittedLinkState::Mixture { state, .. } => Some(state.clone()),
+        _ => None,
+    }
+}
+
+pub fn saved_latent_cloglog_state_from_fit(fit: &UnifiedFitResult) -> Option<LatentCLogLogState> {
+    match &fit.fitted_link {
+        FittedLinkState::LatentCLogLog { state } => Some(*state),
+        _ => None,
+    }
+}
+
+pub fn saved_sas_state_from_fit(fit: &UnifiedFitResult) -> Option<SasLinkState> {
+    match &fit.fitted_link {
+        FittedLinkState::Sas { state, .. } | FittedLinkState::BetaLogistic { state, .. } => {
+            Some(*state)
+        }
+        _ => None,
+    }
+}
+
 fn validate_fitted_link_estimation(fitted_link: &FittedLinkState) -> Result<(), EstimationError> {
     match fitted_link {
         FittedLinkState::Standard(_) => Ok(()),
