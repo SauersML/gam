@@ -1448,9 +1448,8 @@ impl CustomFamily for TransformationNormalFamily {
         //   factors `H v` through `forward_mul` / `transpose_mul` on the
         //   Khatri–Rao operands): per-`Hv` matvec cost is just
         //   `n · (p_resp + p_cov)` flops — see `ctn_matrix_free_workspace`.
-        //   The trait doc specifies that matrix-free families report the
-        //   per-`Hv` cost so the gate reflects the operator path actually
-        //   used at fit time, not the dense build the evaluator skips.
+        //   This is only an inner coefficient-space cost estimate; outer
+        //   θθ Hessian availability is declared separately.
         let n_usize = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols() as u64;
         let p_cov = self.covariate_design.ncols() as u64;
