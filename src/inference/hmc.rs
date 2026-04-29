@@ -2598,10 +2598,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
     // Logistic PG identity uses kappa_i = y_i - 1/2 so that
     // b = X^T kappa in the Gaussian conditional for beta|omega.
-    let mut kappa = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        kappa[i] = y[i] - 0.5;
-    }
+    let kappa = y.mapv(|v| v - 0.5);
     let rhs_b = fast_atv(&x, &kappa);
 
     let penalty = penalty_matrix.to_owned();
@@ -2632,12 +2629,15 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
                 omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
             }
 
-            for i in 0..n {
-                let s = omega[i].sqrt();
-                for j in 0..p {
-                    xw[[i, j]] = x[[i, j]] * s;
-                }
-            }
+            ndarray::Zip::from(xw.rows_mut())
+                .and(x.rows())
+                .and(&omega)
+                .par_for_each(|mut xw_row, x_row, &omega_i| {
+                    let s = omega_i.sqrt();
+                    for j in 0..p {
+                        xw_row[j] = x_row[j] * s;
+                    }
+                });
             fast_ata_into(&xw, &mut xt_omega_x);
 
             // Conditional precision:
@@ -3213,9 +3213,9 @@ impl LinkWigglePosterior {
             return g;
         }
         let dwiggle_dz = crate::faer_ndarray::fast_av(&b_prime_constrained, theta);
-        for i in 0..n {
-            g[i] = 1.0 + dwiggle_dz[i] / rw;
-        }
+        ndarray::Zip::from(&mut g)
+            .and(&dwiggle_dz)
+            .par_for_each(|gi, &dw| *gi = 1.0 + dw / rw);
         g
     }
 

@@ -2774,7 +2774,9 @@ fn run_predict_survival(
         col_map,
         "resolved_termspec",
     )?;
-    let cov_design = build_term_collection_design(data, &termspec)
+    let cov_clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let cov_input = cov_clipped.as_ref().map_or(data, |arr| arr.view());
+    let cov_design = build_term_collection_design(cov_input, &termspec)
         .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
     progress.advance_workflow(3);
     let n = data.nrows();
@@ -2915,7 +2917,9 @@ fn run_predict_survival(
             col_map,
             "resolved_termspec",
         )?;
-        let threshold_design = build_term_collection_design(data, &thresholdspec)
+        let threshold_clipped = model.axis_clip_to_training_ranges(data, col_map);
+        let threshold_input = threshold_clipped.as_ref().map_or(data, |arr| arr.view());
+        let threshold_design = build_term_collection_design(threshold_input, &thresholdspec)
             .map_err(|e| format!("failed to build survival threshold design: {e}"))?;
         let log_sigmaspec = resolve_termspec_for_prediction(
             &model.resolved_termspec_noise,
@@ -2923,7 +2927,7 @@ fn run_predict_survival(
             col_map,
             "resolved_termspec_noise",
         )?;
-        let raw_sigma_design = build_term_collection_design(data, &log_sigmaspec)
+        let raw_sigma_design = build_term_collection_design(threshold_input, &log_sigmaspec)
             .map_err(|e| format!("failed to build survival log-sigma design: {e}"))?;
         let survival_noise_transform = scale_transform_from_payload(
             &model.survival_noise_projection,
@@ -3072,7 +3076,9 @@ fn run_predict_survival(
             col_map,
             "resolved_termspec_logslope",
         )?;
-        let logslope_design = build_term_collection_design(data, &logslopespec)
+        let logslope_clipped = model.axis_clip_to_training_ranges(data, col_map);
+        let logslope_input = logslope_clipped.as_ref().map_or(data, |arr| arr.view());
+        let logslope_design = build_term_collection_design(logslope_input, &logslopespec)
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let (predictor, pred_input, predictor_fit) = build_saved_survival_marginal_slope_predictor(
@@ -5533,7 +5539,9 @@ fn run_sample_survival(
         col_map,
         "resolved_termspec",
     )?;
-    let cov_design = build_term_collection_design(data, &termspec)
+    let cov_clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let cov_input = cov_clipped.as_ref().map_or(data, |arr| arr.view());
+    let cov_design = build_term_collection_design(cov_input, &termspec)
         .map_err(|e| format!("failed to build survival design: {e}"))?;
     progress.advance_workflow(3);
     let n = data.nrows();
@@ -6710,17 +6718,8 @@ fn summarizewiggle_domain(
     })
 }
 
-fn set_training_feature_metadata(
-    payload: &mut FittedModelPayload,
-    headers: Vec<String>,
-    feature_ranges: Vec<(f64, f64)>,
-) {
-    payload.training_headers = Some(headers);
-    payload.training_feature_ranges = Some(feature_ranges);
-}
-
 fn set_training_feature_metadata_from_dataset(payload: &mut FittedModelPayload, ds: &Dataset) {
-    set_training_feature_metadata(payload, ds.headers.clone(), ds.feature_ranges());
+    payload.set_training_feature_metadata(ds.headers.clone(), ds.feature_ranges());
 }
 
 fn build_location_scale_saved_model(
@@ -6772,7 +6771,7 @@ fn build_location_scale_saved_model(
         payload.noise_scale = Some(transform.rescale.to_vec());
         payload.noise_non_intercept_start = Some(transform.non_intercept_start);
     }
-    set_training_feature_metadata(&mut payload, training_headers, training_feature_ranges);
+    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_termspec);
     payload.resolved_termspec_noise = Some(resolved_termspec_noise);
     SavedModel::from_payload(payload)
@@ -7052,7 +7051,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
     payload.link = Some(base_link.saved_string());
-    set_training_feature_metadata(&mut payload, training_headers, training_feature_ranges);
+    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_logslope = Some(resolved_logslopespec);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
@@ -7117,7 +7116,7 @@ fn build_transformation_normal_saved_model(
     payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
-    set_training_feature_metadata(&mut payload, training_headers, training_feature_ranges);
+    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_covariate_spec);
     payload.transformation_response_knots = Some(family.response_knots().to_vec());
     payload.transformation_response_transform = Some(
@@ -14735,7 +14734,7 @@ mod tests {
         })
         .expect_err("mixture-backed survival linkwiggle should be rejected before fitting");
         assert!(
-            err.contains("linkwiggle(...) does not support SAS/BetaLogistic/Mixture links"),
+            err.contains("linkwiggle(...) does not support latent-cloglog, SAS, BetaLogistic, or Mixture links"),
             "unexpected error: {err}",
         );
     }

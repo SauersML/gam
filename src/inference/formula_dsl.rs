@@ -582,7 +582,7 @@ pub fn require_binomial_inverse_link_supports_joint_wiggle(
     }
 }
 
-fn joint_wiggle_unsupported_link_message(context: &str) -> String {
+pub fn joint_wiggle_unsupported_link_message(context: &str) -> String {
     format!(
         "{context} does not support latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard links"
     )
