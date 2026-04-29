@@ -599,11 +599,11 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // scale, so we never materialize the full (n×p) dense block.
         let x_v = self.x_transformed.matrixvectormultiply(v_k); // X vₖ: n-vector
 
-        // Elementwise: −c ⊙ (X vₖ)
+        // Elementwise: −c ⊙ (X vₖ); par_for_each scales over n at biobank size.
         let mut neg_c_xv = x_v;
         Zip::from(&mut neg_c_xv)
             .and(&self.c_array)
-            .for_each(|xv_i, &c_i| *xv_i *= -c_i);
+            .par_for_each(|xv_i, &c_i| *xv_i *= -c_i);
 
         // −Xᵀ diag(c ⊙ Xvₖ) X via the design's matrix-free weighted gram.
         let result = self
@@ -637,7 +637,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         Zip::from(&mut weights)
             .and(&self.c_array)
             .and(&x_ukl)
-            .for_each(|w, &c, &xu| *w = c * xu);
+            .par_for_each(|w, &c, &xu| *w = c * xu);
 
         // + d ⊙ (X vₖ) ⊙ (X vₗ)
         if let Some(ref d_array) = self.d_array {
@@ -645,7 +645,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
                 .and(d_array)
                 .and(&x_vk)
                 .and(&x_vl)
-                .for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
+                .par_for_each(|w, &d, &xvk, &xvl| *w += d * xvk * xvl);
         }
 
         // Xᵀ diag(weights) X via the design's matrix-free weighted gram.
@@ -2079,7 +2079,7 @@ impl HyperOperator for ImplicitHyperOperator {
             Zip::from(weighted.view_mut())
                 .and(self.w_diag.view())
                 .and(x_col.view())
-                .for_each(|dst, &w, &x| *dst = w * x);
+                .par_for_each(|dst, &w, &x| *dst = w * x);
             term.assign(
                 &self
                     .implicit_deriv
@@ -2100,7 +2100,7 @@ impl HyperOperator for ImplicitHyperOperator {
             Zip::from(weighted.view_mut())
                 .and(self.w_diag.view())
                 .and(dx_col.view())
-                .for_each(|dst, &w, &dx| *dst = w * dx);
+                .par_for_each(|dst, &w, &dx| *dst = w * dx);
             design_matrix_transpose_apply_view_into(
                 &self.x_design,
                 weighted.view(),
