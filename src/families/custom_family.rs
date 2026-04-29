@@ -4324,13 +4324,11 @@ pub(crate) struct ExactNewtonJointPsiDirectCache<T> {
 }
 
 impl<T> ExactNewtonJointPsiDirectCache<T> {
-    const DEFAULT_LIMIT: usize = 4;
-
     pub(crate) fn new(len: usize) -> Self {
         Self {
             entries: (0..len).map(|_| Mutex::new(None)).collect(),
             lru: Mutex::new(std::collections::VecDeque::new()),
-            limit: Self::DEFAULT_LIMIT.min(len),
+            limit: len,
         }
     }
 
