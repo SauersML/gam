@@ -4421,6 +4421,31 @@ impl TensorKroneckerPsiOperator {
         &self,
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
+        unit[axis] = 1.0;
+        self.materialize_cov_directional(&unit.view())
+    }
+
+    fn materialize_cov_second(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let q = self.covariate_derivs.len();
+        let mut unit_d = Array1::<f64>::zeros(q);
+        let mut unit_e = Array1::<f64>::zeros(q);
+        unit_d[axis_d] = 1.0;
+        unit_e[axis_e] = 1.0;
+        self.materialize_cov_second_directional(&unit_d.view(), &unit_e.view())
+    }
+
+    /// Per-axis covariate first-derivative materialization for axis `axis`,
+    /// equivalent to the unit-vector dispatch through
+    /// [`materialize_cov_directional`].
+    fn materialize_cov_first_axis(
+        &self,
+        axis: usize,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
         let deriv = self.cov_deriv(axis)?;
         if deriv.x_psi.nrows() == self.n_data() && deriv.x_psi.ncols() == self.p_cov() {
             return Ok(deriv.x_psi.clone());
@@ -4438,7 +4463,10 @@ impl TensorKroneckerPsiOperator {
         mat_op.materialize_first(deriv.implicit_axis)
     }
 
-    fn materialize_cov_second(
+    /// Per-axis covariate second-derivative materialization for axis pair
+    /// `(axis_d, axis_e)`, equivalent to the unit-vector dispatch through
+    /// [`materialize_cov_second_directional`].
+    fn materialize_cov_second_axis(
         &self,
         axis_d: usize,
         axis_e: usize,
@@ -4469,6 +4497,69 @@ impl TensorKroneckerPsiOperator {
             }
         }
         Ok(Array2::<f64>::zeros((self.n_data(), self.p_cov())))
+    }
+
+    /// Directional `Σ_j v_psi[j] · ∂C/∂ψ_j` returning an `n × p_cov` matrix.
+    /// Calling with `v_psi = e_axis` matches [`materialize_cov_first_axis`] at axis.
+    /// Used by the directional outer-HVP path to compute `cov_v` once per HVP
+    /// instead of materializing each per-axis cov_j.
+    fn materialize_cov_directional(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        if v_psi.len() != self.covariate_derivs.len() {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "directional ψ vector length {} does not match {} ψ axes",
+                v_psi.len(),
+                self.covariate_derivs.len()
+            )));
+        }
+        let mut out = Array2::<f64>::zeros((self.n_data(), self.p_cov()));
+        for (axis, &coef) in v_psi.iter().enumerate() {
+            if coef == 0.0 {
+                continue;
+            }
+            let contrib = self.materialize_cov_first_axis(axis)?;
+            out.scaled_add(coef, &contrib);
+        }
+        Ok(out)
+    }
+
+    /// Bilinear directional `Σ_{j,k} v_psi[j] · w_psi[k] · ∂²C/∂ψ_j∂ψ_k`
+    /// returning an `n × p_cov` matrix. With `v_psi = e_a, w_psi = e_b`
+    /// matches [`materialize_cov_second_axis`] at `(a, b)`. Used by the
+    /// directional outer-HVP path to compute `cov_iv := Σ_j v_j · cov_ij`
+    /// in one pass per free axis i instead of materializing every cov_ij pair.
+    fn materialize_cov_second_directional(
+        &self,
+        v_psi: &ndarray::ArrayView1<'_, f64>,
+        w_psi: &ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        let q = self.covariate_derivs.len();
+        if v_psi.len() != q || w_psi.len() != q {
+            return Err(crate::terms::basis::BasisError::InvalidInput(format!(
+                "directional ψ vectors length ({}, {}) do not match {} ψ axes",
+                v_psi.len(),
+                w_psi.len(),
+                q
+            )));
+        }
+        let mut out = Array2::<f64>::zeros((self.n_data(), self.p_cov()));
+        for j in 0..q {
+            let v_j = v_psi[j];
+            if v_j == 0.0 {
+                continue;
+            }
+            for k in 0..q {
+                let w_k = w_psi[k];
+                if w_k == 0.0 {
+                    continue;
+                }
+                let contrib = self.materialize_cov_second_axis(j, k)?;
+                out.scaled_add(v_j * w_k, &contrib);
+            }
+        }
+        Ok(out)
     }
 
     fn lifted_forward(
