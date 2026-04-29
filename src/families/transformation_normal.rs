@@ -117,6 +117,15 @@ pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
 /// Number of equal subdivisions inserted between consecutive grid points
 /// (knots + quantiles). Shared between fit and predict.
 pub const TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS: usize = 4;
+const HPRIME_RECIPROCAL_FLOOR: f64 = 1.0e-12;
+
+fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
+    cached.len() == candidate.len()
+        && cached
+            .iter()
+            .zip(candidate.iter())
+            .all(|(&left, &right)| left.to_bits() == right.to_bits())
+}
 
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
@@ -244,12 +253,7 @@ impl PsiAxisVectorCache {
     }
 
     fn matches_beta(&self, beta: &Array1<f64>) -> bool {
-        self.beta.len() == beta.len()
-            && self
-                .beta
-                .iter()
-                .zip(beta.iter())
-                .all(|(&cached, &candidate)| cached.to_bits() == candidate.to_bits())
+        beta_bits_match(&self.beta, beta)
     }
 }
 
@@ -268,14 +272,126 @@ struct TransformationNormalRowQuantityCache {
     log_likelihood: f64,
 }
 
+struct TransformationNormalRowDerived {
+    inv_h_prime: Array1<f64>,
+    inv_h_prime_sq: Array1<f64>,
+    inv_h_prime_cu: Array1<f64>,
+    inv_h_prime_qu: Array1<f64>,
+    weighted_h: Array1<f64>,
+    weighted_inv_h_prime: Array1<f64>,
+    weighted_inv_h_prime_sq: Array1<f64>,
+    log_likelihood: f64,
+}
+
 impl TransformationNormalRowQuantityCache {
     fn matches_beta(&self, beta: &Array1<f64>) -> bool {
-        self.beta.len() == beta.len()
-            && self
-                .beta
-                .iter()
-                .zip(beta.iter())
-                .all(|(&cached, &candidate)| cached.to_bits() == candidate.to_bits())
+        beta_bits_match(&self.beta, beta)
+    }
+}
+
+fn build_transformation_row_derived(
+    h: &Array1<f64>,
+    h_prime: &Array1<f64>,
+    weights: &Array1<f64>,
+) -> TransformationNormalRowDerived {
+    let n = h_prime.len();
+    debug_assert_eq!(h.len(), n);
+    debug_assert_eq!(weights.len(), n);
+
+    let mut inv_h_prime = Array1::<f64>::zeros(n);
+    let mut inv_h_prime_sq = Array1::<f64>::zeros(n);
+    let mut inv_h_prime_cu = Array1::<f64>::zeros(n);
+    let mut inv_h_prime_qu = Array1::<f64>::zeros(n);
+    let mut weighted_h = Array1::<f64>::zeros(n);
+    let mut weighted_inv_h_prime = Array1::<f64>::zeros(n);
+    let mut weighted_inv_h_prime_sq = Array1::<f64>::zeros(n);
+
+    let log_likelihood = {
+        use rayon::prelude::*;
+        inv_h_prime
+            .as_slice_mut()
+            .expect("CTN inv_h_prime is contiguous")
+            .par_iter_mut()
+            .zip(
+                inv_h_prime_sq
+                    .as_slice_mut()
+                    .expect("CTN inv_h_prime_sq is contiguous")
+                    .par_iter_mut(),
+            )
+            .zip(
+                inv_h_prime_cu
+                    .as_slice_mut()
+                    .expect("CTN inv_h_prime_cu is contiguous")
+                    .par_iter_mut(),
+            )
+            .zip(
+                inv_h_prime_qu
+                    .as_slice_mut()
+                    .expect("CTN inv_h_prime_qu is contiguous")
+                    .par_iter_mut(),
+            )
+            .zip(
+                weighted_h
+                    .as_slice_mut()
+                    .expect("CTN weighted_h is contiguous")
+                    .par_iter_mut(),
+            )
+            .zip(
+                weighted_inv_h_prime
+                    .as_slice_mut()
+                    .expect("CTN weighted_inv_h_prime is contiguous")
+                    .par_iter_mut(),
+            )
+            .zip(
+                weighted_inv_h_prime_sq
+                    .as_slice_mut()
+                    .expect("CTN weighted_inv_h_prime_sq is contiguous")
+                    .par_iter_mut(),
+            )
+            .zip(h.as_slice().expect("CTN h is contiguous").par_iter())
+            .zip(
+                h_prime
+                    .as_slice()
+                    .expect("CTN h_prime is contiguous")
+                    .par_iter(),
+            )
+            .zip(
+                weights
+                    .as_slice()
+                    .expect("CTN weights are contiguous")
+                    .par_iter(),
+            )
+            .map(
+                |(
+                    ((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp),
+                    &wi,
+                )| {
+                    let inv_v = 1.0 / hp;
+                    let inv_sq_v = inv_v * inv_v;
+                    let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
+                    let hp_safe_sq = hp_safe * hp_safe;
+                    *inv = inv_v;
+                    *inv_sq = inv_sq_v;
+                    *inv_cu = 1.0 / (hp_safe_sq * hp_safe);
+                    *inv_qu = 1.0 / (hp_safe_sq * hp_safe_sq);
+                    *wh = wi * hi;
+                    *wih = wi * inv_v;
+                    *wih2 = wi * inv_sq_v;
+                    wi * (-0.5 * hi * hi + hp.ln())
+                },
+            )
+            .sum::<f64>()
+    };
+
+    TransformationNormalRowDerived {
+        inv_h_prime,
+        inv_h_prime_sq,
+        inv_h_prime_cu,
+        inv_h_prime_qu,
+        weighted_h,
+        weighted_inv_h_prime,
+        weighted_inv_h_prime_sq,
+        log_likelihood,
     }
 }
 
