@@ -52,6 +52,7 @@ use gam::inference::model::{
     ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
     load_survival_time_basis_config_from_model,
 };
+use gam::inference::predict_input::build_predict_input_for_model;
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
