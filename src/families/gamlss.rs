@@ -7125,22 +7125,32 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         );
         let u_a = cache.get_or_insert_with(key_a, || fast_ab(self.x_a.as_ref(), &f_a));
         let u_b = cache.get_or_insert_with(key_b, || fast_ab(self.x_b.as_ref(), &f_b));
-
-        let mut trace = 0.0;
-        for row in 0..self.nrows {
-            let mut aa = 0.0;
-            let mut ab = 0.0;
-            let mut bb = 0.0;
-            for col in 0..cols {
-                let ua = u_a[[row, col]];
-                let ub = u_b[[row, col]];
-                aa += ua * ua;
-                ab += ua * ub;
-                bb += ub * ub;
+        let trace_rows_key =
+            crate::solver::estimate::reml::unified::ProjectedTraceRowsKey::new(key_a, key_b);
+        let trace_rows = cache.get_or_insert_trace_rows_with(trace_rows_key, || {
+            let mut aa = Array1::<f64>::zeros(self.nrows);
+            let mut ab = Array1::<f64>::zeros(self.nrows);
+            let mut bb = Array1::<f64>::zeros(self.nrows);
+            for row in 0..self.nrows {
+                let mut aa_row = 0.0;
+                let mut ab_row = 0.0;
+                let mut bb_row = 0.0;
+                for col in 0..cols {
+                    let ua = u_a[[row, col]];
+                    let ub = u_b[[row, col]];
+                    aa_row += ua * ua;
+                    ab_row += ua * ub;
+                    bb_row += ub * ub;
+                }
+                aa[row] = aa_row;
+                ab[row] = ab_row;
+                bb[row] = bb_row;
             }
-            trace += self.c_aa[row] * aa + 2.0 * self.c_ab[row] * ab + self.c_bb[row] * bb;
-        }
-        trace
+            crate::solver::estimate::reml::unified::ProjectedTraceRows { aa, ab, bb }
+        });
+        self.c_aa.dot(&trace_rows.aa)
+            + 2.0 * self.c_ab.dot(&trace_rows.ab)
+            + self.c_bb.dot(&trace_rows.bb)
     }
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
