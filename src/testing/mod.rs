@@ -1,10 +1,58 @@
 //! Generic testing utilities.
 
+use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
 use crate::resource::MatrixMaterializationError;
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array1, Array2, Axis, array, s};
 use std::ops::Range;
 use std::sync::Arc;
+
+pub struct BinomialLocationScaleBaseFixture {
+    pub n: usize,
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub threshold_design: DesignMatrix,
+    pub log_sigma_design: DesignMatrix,
+    pub threshold_spec: ParameterBlockSpec,
+    pub log_sigma_spec: ParameterBlockSpec,
+}
+
+pub fn binomial_location_scale_base_fixture() -> BinomialLocationScaleBaseFixture {
+    let n = 7usize;
+    let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+    let weights = Array1::from_vec(vec![1.0; n]);
+    let threshold_design =
+        DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem((n, 1), 1.0)));
+    let log_sigma_design =
+        DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem((n, 1), 1.0)));
+    let threshold_spec = ParameterBlockSpec {
+        name: "threshold".to_string(),
+        design: threshold_design.clone(),
+        offset: Array1::zeros(n),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.2]),
+    };
+    let log_sigma_spec = ParameterBlockSpec {
+        name: "log_sigma".to_string(),
+        design: log_sigma_design.clone(),
+        offset: Array1::zeros(n),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![-0.2],
+        initial_beta: Some(array![-0.1]),
+    };
+    BinomialLocationScaleBaseFixture {
+        n,
+        y,
+        weights,
+        threshold_design,
+        log_sigma_design,
+        threshold_spec,
+        log_sigma_spec,
+    }
+}
 
 #[derive(Clone)]
 struct NoDensifyOperator {
