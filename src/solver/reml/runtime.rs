@@ -141,8 +141,15 @@ impl<'a> RemlState<'a> {
         ridge_passport: RidgePassport,
         mode: super::unified::EvalMode,
     ) -> Result<(usize, super::unified::PenaltyLogdetDerivs), EstimationError> {
+        let logdet_s_start = std::time::Instant::now();
         let (penalty_rank, log_det_s) =
             self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?;
+        log::info!(
+            "[STAGE] logdet S rho_dim={} penalty_rank={} elapsed={:.3}s",
+            rho.len(),
+            penalty_rank,
+            logdet_s_start.elapsed().as_secs_f64(),
+        );
         let lambdas = rho.mapv(f64::exp);
 
         // Use block-local path from canonical penalties (basis-invariant logdet).

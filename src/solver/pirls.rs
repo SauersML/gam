@@ -2526,6 +2526,8 @@ fn solve_newton_direction_dense(
     gradient: &Array1<f64>,
     direction_out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
+    let dense_solve_start = std::time::Instant::now();
+    let p = hessian.nrows();
     if direction_out.len() != gradient.len() {
         *direction_out = Array1::zeros(gradient.len());
     }
@@ -2538,6 +2540,12 @@ fn solve_newton_direction_dense(
     factor.solve_in_place(rhsview.as_mut());
     direction_out.mapv_inplace(|v| -v);
     if array1_is_finite(direction_out) {
+        log::info!(
+            "[STAGE] PIRLS dense newton solve p={} flops~{} elapsed={:.3}s",
+            p,
+            (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
+            dense_solve_start.elapsed().as_secs_f64(),
+        );
         return Ok(());
     }
     Err(EstimationError::LinearSystemSolveFailed(
@@ -2819,13 +2827,16 @@ fn estimate_sparse_native_decision(
         // Count nonzeros via chunks so operator-backed dense designs
         // (e.g. lazy ScaleDeviationOperator) participate in this diagnostic
         // path without forcing a full materialization.
+        let row_chunk_start = std::time::Instant::now();
         let n = x_original.nrows();
         let chunk = chunk_rows_for_nnz_count(n, x_original.ncols());
         let mut nnz: usize = 0;
+        let mut chunks_processed = 0usize;
         if chunk > 0 && n > 0 {
             let mut start = 0;
             while start < n {
                 let end = (start + chunk).min(n);
+                chunks_processed += 1;
                 match x_original.try_row_chunk(start..end) {
                     Ok(rows) => {
                         nnz = nnz.saturating_add(rows.iter().filter(|v| v.abs() > 1e-12).count());
@@ -2837,6 +2848,14 @@ fn estimate_sparse_native_decision(
                 start = end;
             }
         }
+        log::info!(
+            "[STAGE] PIRLS row-chunk generation chunks={} n={} p={} nnz={} elapsed={:.3}s",
+            chunks_processed,
+            n,
+            x_original.ncols(),
+            nnz,
+            row_chunk_start.elapsed().as_secs_f64(),
+        );
         return dense_reject("design_not_sparse", nnz);
     };
     let nnz_x = x_sparse.val().len();
