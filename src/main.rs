@@ -49,7 +49,7 @@ use gam::inference::formula_dsl::{
 use gam::inference::model::{
     DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
     ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
-    load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
+    load_survival_time_basis_config_from_model,
 };
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
@@ -8400,13 +8400,6 @@ fn compact_saved_survival_location_scale_fit_result(
     Ok(fit_result)
 }
 
-fn validate_frozen_term_collectionspec(
-    spec: &TermCollectionSpec,
-    label: &str,
-) -> Result<(), String> {
-    spec.validate_frozen(label)
-}
-
 fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
     model.save_to_path(path)?;
     println!("saved model: {}", path.display());
@@ -9349,14 +9342,6 @@ fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCov
             gam::estimate::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
         }
     }
-}
-
-fn fit_result_from_saved_model_for_prediction(
-    model: &SavedModel,
-) -> Result<UnifiedFitResult, String> {
-    model.fit_result.clone().ok_or_else(|| {
-        "model is missing canonical fit_result payload; refit with current CLI".to_string()
-    })
 }
 
 fn response_interval_from_mean_sd(
