@@ -2301,10 +2301,13 @@ impl NutsResult {
         if n == 0 {
             return 0.0;
         }
-        let mut sum = 0.0;
-        for i in 0..n {
-            sum += f(self.samples.row(i));
-        }
+        // Posterior mean of a sample-function: parallel reduction over rows.
+        // `f: Fn(ArrayView1) -> f64` is shared-access so safe across threads.
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let sum: f64 = (0..n)
+            .into_par_iter()
+            .map(|i| f(self.samples.row(i)))
+            .sum();
         sum / n as f64
     }
 
