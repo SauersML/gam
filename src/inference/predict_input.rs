@@ -279,7 +279,13 @@ pub fn build_predict_input_for_model(
             let min_h_prime: f64 = (0..n)
                 .into_par_iter()
                 .fold(
-                    || (f64::INFINITY, vec![0.0f64; dim_dev.max(1)], vec![0.0f64; p_basis.max(1)]),
+                    || {
+                        (
+                            f64::INFINITY,
+                            vec![0.0f64; dim_dev.max(1)],
+                            vec![0.0f64; p_basis.max(1)],
+                        )
+                    },
                     |(mut local_min, mut gamma, mut a_coef), i| {
                         let cov_row = cov_mat_ref.row(i);
                         let beta1_x = beta_mat_ref.row(1).dot(&cov_row);
@@ -304,8 +310,8 @@ pub fn build_predict_input_for_model(
                             if denom <= 0.0 {
                                 continue;
                             }
-                            let delta_k = (response_degree as f64) / denom
-                                * (a_coef[k] - a_coef[k - 1]);
+                            let delta_k =
+                                (response_degree as f64) / denom * (a_coef[k] - a_coef[k - 1]);
                             let bound_k = beta1_x + delta_k;
                             if !found_any || bound_k < h_prime_lb {
                                 h_prime_lb = bound_k;

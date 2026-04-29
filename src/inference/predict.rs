@@ -1868,29 +1868,42 @@ impl BernoulliMarginalSlopePredictor {
                     .map_err(EstimationError::InvalidInput)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Per-row: solve intercept scalar, evaluate denested calibration,
+        // record (intercept, a_q). The `warm_start_buf` is just per-call
+        // scratch — give each rayon worker its own buffer via fold init.
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Result<Vec<(f64, f64)>, EstimationError> = (0..n)
+            .into_par_iter()
+            .map_init(
+                || Array1::<f64>::zeros(1),
+                |warm_start_buf, i| {
+                    let q = marginal_eta[i];
+                    let slope = logslope_eta[i];
+                    let intercept = self.solve_intercept_scalar(
+                        q,
+                        slope,
+                        self.beta_link_dev.as_ref(),
+                        self.beta_score_warp.as_ref(),
+                        warm_start_buf,
+                    )?;
+                    let (_, m_a_raw, _) = self.evaluate_denested_calibration(
+                        intercept,
+                        q,
+                        slope,
+                        self.beta_score_warp.as_ref(),
+                        self.beta_link_dev.as_ref(),
+                    )?;
+                    let m_a = m_a_raw.max(1e-12);
+                    Ok((intercept, marginal_map[i].mu1 / m_a))
+                },
+            )
+            .collect();
+        let pairs = pairs?;
         let mut intercepts = Array1::<f64>::zeros(n);
         let mut a_q = Array1::<f64>::zeros(n);
-        let mut warm_start_buf = Array1::<f64>::zeros(1);
-        for i in 0..n {
-            let q = marginal_eta[i];
-            let slope = logslope_eta[i];
-            let intercept = self.solve_intercept_scalar(
-                q,
-                slope,
-                self.beta_link_dev.as_ref(),
-                self.beta_score_warp.as_ref(),
-                &mut warm_start_buf,
-            )?;
+        for (i, (intercept, a)) in pairs.into_iter().enumerate() {
             intercepts[i] = intercept;
-            let (_, m_a_raw, _) = self.evaluate_denested_calibration(
-                intercept,
-                q,
-                slope,
-                self.beta_score_warp.as_ref(),
-                self.beta_link_dev.as_ref(),
-            )?;
-            let m_a = m_a_raw.max(1e-12);
-            a_q[i] = marginal_map[i].mu1 / m_a;
+            a_q[i] = a;
         }
 
         let score_dev_obs = if let (Some(runtime), Some(beta)) = (
@@ -2899,12 +2912,9 @@ impl SurvivalPredictor {
         let survival_prob: Result<Vec<f64>, EstimationError> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let (q0, _) =
-                    survival_q0_and_inverse_sigma(eta_threshold[i], eta_log_sigma[i]);
-                let (survival, _) = inverse_link_survival_tail_value_and_failure_density(
-                    &self.inverse_link,
-                    q0,
-                )?;
+                let (q0, _) = survival_q0_and_inverse_sigma(eta_threshold[i], eta_log_sigma[i]);
+                let (survival, _) =
+                    inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q0)?;
                 Ok(survival)
             })
             .collect();

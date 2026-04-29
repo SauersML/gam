@@ -606,103 +606,20 @@ fn symmetric_tridiagonal_eigen(
     diag: &mut [f64; N_POINTS],
     off_diag: &mut [f64; N_POINTS - 1],
 ) -> ([f64; N_POINTS], [[f64; N_POINTS]; N_POINTS]) {
-    // Initialize eigenvector matrix as identity
-    let mut z: [[f64; N_POINTS]; N_POINTS] = [[0.0; N_POINTS]; N_POINTS];
+    let mut diag_vec = diag.to_vec();
+    let mut off_diag_vec = off_diag.to_vec();
+    let (eigenvalues, eigenvectors) =
+        symmetric_tridiagonal_eigen_dynamic(&mut diag_vec, &mut off_diag_vec);
+
+    let mut values = [0.0; N_POINTS];
+    let mut vectors = [[0.0; N_POINTS]; N_POINTS];
+    values.copy_from_slice(&eigenvalues);
     for i in 0..N_POINTS {
-        z[i][i] = 1.0;
+        vectors[i].copy_from_slice(&eigenvectors[i]);
     }
-
-    let eps = 1e-15;
-    let max_iter = 100;
-    let mut t_norm = 0.0_f64;
-    for i in 0..N_POINTS {
-        let l = if i > 0 { off_diag[i - 1].abs() } else { 0.0 };
-        let r = if i + 1 < N_POINTS {
-            off_diag[i].abs()
-        } else {
-            0.0
-        };
-        t_norm = t_norm.max(diag[i].abs() + l + r);
-    }
-    let mut n = N_POINTS;
-    while n > 1 {
-        let mut converged = false;
-        for _ in 0..max_iter {
-            let mut m = n - 1;
-            while m > 0 {
-                let scl = (diag[m - 1].abs() + diag[m].abs()).max(t_norm);
-                if off_diag[m - 1].abs() <= eps * scl {
-                    off_diag[m - 1] = 0.0;
-                    break;
-                }
-                m -= 1;
-            }
-
-            if m == n - 1 {
-                // Last element converged
-                n -= 1;
-                converged = true;
-                break;
-            }
-
-            // Wilkinson shift: eigenvalue of trailing 2x2 closer to diag[n-1].
-            // Use sign(0)=+1 (not f64::signum) to avoid zero denominator when d=0.
-            let shift = wilkinson_shift(diag[n - 2], diag[n - 1], off_diag[n - 2]);
-
-            // Implicit QR step with shift
-            let mut x = diag[m] - shift;
-            let mut y = off_diag[m];
-
-            for k in m..(n - 1) {
-                // Givens rotation to zero out y
-                let (c, s) = if y.abs() > eps {
-                    let r = x.hypot(y);
-                    if r > 0.0 && r.is_finite() {
-                        (x / r, -y / r)
-                    } else {
-                        (1.0, 0.0)
-                    }
-                } else {
-                    (1.0, 0.0)
-                };
-
-                // Apply rotation to tridiagonal matrix
-                if k > m {
-                    off_diag[k - 1] = x.hypot(y);
-                }
-
-                let d1 = diag[k];
-                let d2 = diag[k + 1];
-                let e_k = off_diag[k];
-
-                diag[k] = c * c * d1 + s * s * d2 - 2.0 * c * s * e_k;
-                diag[k + 1] = s * s * d1 + c * c * d2 + 2.0 * c * s * e_k;
-                off_diag[k] = c * s * (d1 - d2) + (c * c - s * s) * e_k;
-
-                if k < n - 2 {
-                    x = off_diag[k];
-                    y = -s * off_diag[k + 1];
-                    off_diag[k + 1] *= c;
-                }
-
-                // Accumulate rotation into eigenvector matrix
-                for i in 0..N_POINTS {
-                    let t = z[k][i];
-                    z[k][i] = c * t - s * z[k + 1][i];
-                    z[k + 1][i] = s * t + c * z[k + 1][i];
-                }
-            }
-        }
-        if !converged {
-            // Guaranteed progress fallback: force trailing deflation if QR did not
-            // converge within max_iter. For our tiny fixed-size Jacobi matrices this
-            // is extremely rare and avoids a potential infinite loop.
-            off_diag[n - 2] = 0.0;
-            n -= 1;
-        }
-    }
-
-    (*diag, z)
+    diag.copy_from_slice(&values);
+    off_diag.copy_from_slice(&off_diag_vec);
+    (values, vectors)
 }
 
 fn symmetric_tridiagonal_eigen_dynamic(
