@@ -709,17 +709,80 @@ impl TransformationNormalFamily {
         // localized to the higher powers and does not perturb the main
         // gradient/Hessian pipeline.
         const HPRIME_RECIPROCAL_FLOOR: f64 = 1.0e-12;
-        let inv_h_prime = h_prime.mapv(|hp| 1.0 / hp);
-        let inv_h_prime_sq = h_prime.mapv(|hp| 1.0 / (hp * hp));
-        let inv_h_prime_cu = h_prime.mapv(|hp| {
-            let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
-            1.0 / (hp_safe * hp_safe * hp_safe)
-        });
-        let inv_h_prime_qu = h_prime.mapv(|hp| {
-            let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
-            let hp2 = hp_safe * hp_safe;
-            1.0 / (hp2 * hp2)
-        });
+        let n = h_prime.len();
+        let mut inv_h_prime = Array1::<f64>::zeros(n);
+        let mut inv_h_prime_sq = Array1::<f64>::zeros(n);
+        let mut inv_h_prime_cu = Array1::<f64>::zeros(n);
+        let mut inv_h_prime_qu = Array1::<f64>::zeros(n);
+        let mut weighted_h = Array1::<f64>::zeros(n);
+        let mut weighted_inv_h_prime = Array1::<f64>::zeros(n);
+        let mut weighted_inv_h_prime_sq = Array1::<f64>::zeros(n);
+        let log_likelihood = {
+            use rayon::prelude::*;
+            let h_slice = h.as_slice().expect("CTN h is contiguous");
+            let hp_slice = h_prime.as_slice().expect("CTN h_prime is contiguous");
+            let weights = self.weights.as_ref();
+            inv_h_prime
+                .as_slice_mut()
+                .expect("CTN inv_h_prime is contiguous")
+                .par_iter_mut()
+                .zip(
+                    inv_h_prime_sq
+                        .as_slice_mut()
+                        .expect("CTN inv_h_prime_sq is contiguous")
+                        .par_iter_mut(),
+                )
+                .zip(
+                    inv_h_prime_cu
+                        .as_slice_mut()
+                        .expect("CTN inv_h_prime_cu is contiguous")
+                        .par_iter_mut(),
+                )
+                .zip(
+                    inv_h_prime_qu
+                        .as_slice_mut()
+                        .expect("CTN inv_h_prime_qu is contiguous")
+                        .par_iter_mut(),
+                )
+                .zip(
+                    weighted_h
+                        .as_slice_mut()
+                        .expect("CTN weighted_h is contiguous")
+                        .par_iter_mut(),
+                )
+                .zip(
+                    weighted_inv_h_prime
+                        .as_slice_mut()
+                        .expect("CTN weighted_inv_h_prime is contiguous")
+                        .par_iter_mut(),
+                )
+                .zip(
+                    weighted_inv_h_prime_sq
+                        .as_slice_mut()
+                        .expect("CTN weighted_inv_h_prime_sq is contiguous")
+                        .par_iter_mut(),
+                )
+                .zip(h_slice.par_iter())
+                .zip(hp_slice.par_iter())
+                .zip(weights.as_slice().expect("CTN weights are contiguous").par_iter())
+                .map(
+                    |(((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp), &wi)| {
+                        let inv_v = 1.0 / hp;
+                        let inv_sq_v = inv_v * inv_v;
+                        let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
+                        let hp_safe_sq = hp_safe * hp_safe;
+                        *inv = inv_v;
+                        *inv_sq = inv_sq_v;
+                        *inv_cu = 1.0 / (hp_safe_sq * hp_safe);
+                        *inv_qu = 1.0 / (hp_safe_sq * hp_safe_sq);
+                        *wh = wi * hi;
+                        *wih = wi * inv_v;
+                        *wih2 = wi * inv_sq_v;
+                        wi * (-0.5 * hi * hi + hp.ln())
+                    },
+                )
+                .sum::<f64>()
+        };
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
@@ -728,6 +791,10 @@ impl TransformationNormalFamily {
             inv_h_prime_sq: Arc::new(inv_h_prime_sq),
             inv_h_prime_cu: Arc::new(inv_h_prime_cu),
             inv_h_prime_qu: Arc::new(inv_h_prime_qu),
+            weighted_h: Arc::new(weighted_h),
+            weighted_inv_h_prime: Arc::new(weighted_inv_h_prime),
+            weighted_inv_h_prime_sq: Arc::new(weighted_inv_h_prime_sq),
+            log_likelihood,
         };
 
         let mut cache = self
@@ -1251,48 +1318,16 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
 
-        // Single fused pass over rows: accumulate ℓ = Σ w·(-½h² + log h') and
-        // build the weighted vectors the gradient and Hessian consume. The
-        // unfused version allocated five full-length O(n) temporaries
-        // (inv_h_prime, weighted_h, weighted_inv_h_prime, inv_h_prime_sq,
-        // weighted_inv_h_prime_sq) with two reciprocals per row; at biobank n
-        // that is ~40·n bytes of allocator churn and 2·n divisions per call.
-        // Here we allocate three vectors, divide once, and derive the squared
-        // quantity by multiplication.
-        let mut weighted_h = Array1::<f64>::zeros(n);
-        let mut weighted_inv_hp = Array1::<f64>::zeros(n);
-        let mut weighted_inv_hp_sq = Array1::<f64>::zeros(n);
-        let log_likelihood = {
-            use rayon::prelude::*;
-            let weights = self.weights.as_ref();
-            weighted_h
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .zip(weighted_inv_hp.as_slice_mut().unwrap().par_iter_mut())
-                .zip(weighted_inv_hp_sq.as_slice_mut().unwrap().par_iter_mut())
-                .zip(h.as_slice().unwrap().par_iter())
-                .zip(h_prime.as_slice().unwrap().par_iter())
-                .zip(weights.as_slice().unwrap().par_iter())
-                .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
-                .zip(row_quantities.inv_h_prime_sq.as_slice().unwrap().par_iter())
-                .map(
-                    |(((((((wh, wih), wih2), &hi), &hpi), &wi), &inv), &inv_sq)| {
-                        let w_inv = wi * inv;
-                        *wh = wi * hi;
-                        *wih = w_inv;
-                        *wih2 = wi * inv_sq;
-                        wi * (-0.5 * hi * hi + hpi.ln())
-                    },
-                )
-                .sum::<f64>()
-        };
+        let log_likelihood = row_quantities.log_likelihood;
+        let weighted_h = row_quantities.weighted_h.as_ref();
+        let weighted_inv_hp = row_quantities.weighted_inv_h_prime.as_ref();
+        let weighted_inv_hp_sq = row_quantities.weighted_inv_h_prime_sq.as_ref();
 
         // Gradient of log-likelihood: ∇ℓ = -X_val^T (w·h) + X_deriv^T (w/h')
         let grad_start = std::time::Instant::now();
         let grad = {
-            let xdt_inv = self.x_deriv_kron.transpose_mul(&weighted_inv_hp);
-            let xvt_h = self.x_val_kron.transpose_mul(&weighted_h);
+            let xdt_inv = self.x_deriv_kron.transpose_mul(weighted_inv_hp);
+            let xvt_h = self.x_val_kron.transpose_mul(weighted_h);
             xdt_inv - xvt_h
         };
         log::info!(
@@ -1309,7 +1344,7 @@ impl CustomFamily for TransformationNormalFamily {
         let hessian = {
             let mut xtx_deriv = self
                 .x_deriv_kron
-                .weighted_gram(&weighted_inv_hp_sq, &self.policy);
+                .weighted_gram(weighted_inv_hp_sq, &self.policy);
             xtx_deriv += &self.x_val_weighted_gram;
             xtx_deriv
         };
@@ -1403,31 +1438,13 @@ impl CustomFamily for TransformationNormalFamily {
                  Monotonicity constraint may be violated."
             ));
         }
-        // Fused single-pass O(n) reduction: log-likelihood + per-row weighted
-        // vectors needed for the two transpose_muls below.
-        let mut weighted_h = Array1::<f64>::zeros(n);
-        let mut weighted_inv_hp = Array1::<f64>::zeros(n);
-        let weights = self.weights.as_ref();
-        let log_likelihood = {
-            use rayon::prelude::*;
-            weighted_h
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .zip(weighted_inv_hp.as_slice_mut().unwrap().par_iter_mut())
-                .zip(h.as_slice().unwrap().par_iter())
-                .zip(h_prime.as_slice().unwrap().par_iter())
-                .zip(weights.as_slice().unwrap().par_iter())
-                .zip(row_quantities.inv_h_prime.as_slice().unwrap().par_iter())
-                .map(|(((((wh, wih), &hi), &hpi), &wi), &inv)| {
-                    *wh = wi * hi;
-                    *wih = wi * inv;
-                    wi * (-0.5 * hi * hi + hpi.ln())
-                })
-                .sum::<f64>()
-        };
-        let mut gradient = self.x_deriv_kron.transpose_mul(&weighted_inv_hp);
-        gradient -= &self.x_val_kron.transpose_mul(&weighted_h);
+        let log_likelihood = row_quantities.log_likelihood;
+        let mut gradient = self
+            .x_deriv_kron
+            .transpose_mul(row_quantities.weighted_inv_h_prime.as_ref());
+        gradient -= &self
+            .x_val_kron
+            .transpose_mul(row_quantities.weighted_h.as_ref());
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
@@ -1653,12 +1670,9 @@ impl CustomFamily for TransformationNormalFamily {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let h_prime = row_quantities.h_prime.as_ref();
-        let inv_h_prime_sq = h_prime.mapv(|v| 1.0 / (v * v));
-        let weighted_inv_h_prime_sq = &inv_h_prime_sq * self.weights.as_ref();
         let mut xtx_deriv = self
             .x_deriv_kron
-            .weighted_gram(&weighted_inv_h_prime_sq, &self.policy);
+            .weighted_gram(row_quantities.weighted_inv_h_prime_sq.as_ref(), &self.policy);
         xtx_deriv += &self.x_val_weighted_gram;
         Ok(Some(xtx_deriv))
     }
@@ -1722,11 +1736,10 @@ impl CustomFamily for TransformationNormalFamily {
         let h = row.h.as_ref();
         let n = h.len();
         let inv_h_prime = row.inv_h_prime.as_ref();
-        let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
         let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
-        let weighted_h = h * self.weights.as_ref();
-        let weighted_inv_h_prime = inv_h_prime * self.weights.as_ref();
-        let weighted_inv_h_prime_sq = inv_h_prime_sq * self.weights.as_ref();
+        let weighted_h = row.weighted_h.as_ref();
+        let weighted_inv_h_prime = row.weighted_inv_h_prime.as_ref();
+        let weighted_inv_h_prime_sq = row.weighted_inv_h_prime_sq.as_ref();
 
         let op = deriv
             .implicit_operator
@@ -1829,9 +1842,9 @@ impl CustomFamily for TransformationNormalFamily {
         let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
         let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
         let inv_h_prime_qu = row.inv_h_prime_qu.as_ref();
-        let weighted_h = h * self.weights.as_ref();
-        let weighted_inv_h_prime = inv_h_prime * self.weights.as_ref();
-        let weighted_inv_h_prime_sq = inv_h_prime_sq * self.weights.as_ref();
+        let weighted_h = row.weighted_h.as_ref();
+        let weighted_inv_h_prime = row.weighted_inv_h_prime.as_ref();
+        let weighted_inv_h_prime_sq = row.weighted_inv_h_prime_sq.as_ref();
 
         let op = deriv_i
             .implicit_operator
