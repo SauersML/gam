@@ -1257,6 +1257,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             FittedLinkState::Standard(_) => {}
         }
         payload.training_headers = Some(ds.headers.clone());
+        payload.training_feature_ranges = Some(ds.feature_ranges());
         payload.resolved_termspec = Some(saved_termspec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
         set_saved_offset_columns(
@@ -4332,6 +4333,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 Some(survival_noise_transform.non_intercept_start);
             payload.survival_distribution = Some(fitted_inverse_link.saved_string());
             payload.training_headers = Some(ds.headers.clone());
+        payload.training_feature_ranges = Some(ds.feature_ranges());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
                     &fit.fit.resolved_thresholdspec,
@@ -4628,6 +4630,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_likelihood =
                 Some(survival_likelihood_modename(likelihood_mode).to_string());
             payload.training_headers = Some(ds.headers.clone());
+        payload.training_feature_ranges = Some(ds.feature_ranges());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
                     &fit.marginalspec_resolved,
@@ -4923,6 +4926,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
             payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
             payload.training_headers = Some(ds.headers.clone());
+        payload.training_feature_ranges = Some(ds.feature_ranges());
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(&termspec, &cov_design)
                     .map_err(|e| e.to_string())?,
@@ -5356,6 +5360,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_likelihood =
             Some(survival_likelihood_modename(likelihood_mode).to_string());
         payload.training_headers = Some(ds.headers.clone());
+        payload.training_feature_ranges = Some(ds.feature_ranges());
         set_saved_offset_columns(
             &mut payload,
             args.offset_column.clone(),

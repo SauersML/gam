@@ -4900,20 +4900,24 @@ mod estimate_policy_tests {
             .expect("pirls_result");
         let eta = &pirls_result.final_eta;
         let x_t = &pirls_result.x_transformed;
-        let mut du_by_eps = Array1::<f64>::zeros(eta.len());
-        for i in 0..eta.len() {
-            let jets = sas_inverse_link_jetwith_param_partials(
-                eta[i],
-                sas_state.epsilon,
-                sas_state.log_delta,
-            );
-            let mu = jets.jet.mu;
-            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
-            let d1 = jets.jet.d1;
-            let dmu = jets.djet_depsilon.mu;
-            let dd1 = jets.djet_depsilon.d1;
-            du_by_eps[i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
-        }
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let du_vec: Vec<f64> = (0..eta.len())
+            .into_par_iter()
+            .map(|i| {
+                let jets = sas_inverse_link_jetwith_param_partials(
+                    eta[i],
+                    sas_state.epsilon,
+                    sas_state.log_delta,
+                );
+                let mu = jets.jet.mu;
+                let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+                let d1 = jets.jet.d1;
+                let dmu = jets.djet_depsilon.mu;
+                let dd1 = jets.djet_depsilon.d1;
+                aux.a2 * dmu * d1 + aux.a1 * dd1
+            })
+            .collect();
+        let du_by_eps = Array1::from_vec(du_vec);
         let score_at = |raw_eps: f64| -> Array1<f64> {
             let (eps_eff, _) = sas_effective_epsilon(raw_eps);
             let sas_state = state_from_sasspec(SasLinkSpec {

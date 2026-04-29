@@ -59,7 +59,7 @@ def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
 
 
 def restore_output_table(
-    columns: dict[str, list[float]],
+    columns: dict[str, list[Any]],
     *,
     requested: str | None,
     input_kind: str,
