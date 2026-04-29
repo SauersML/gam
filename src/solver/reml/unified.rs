@@ -8786,7 +8786,7 @@ impl HessianOperator for BlockCoupledOperator {
 pub struct MatrixFreeSpdOperator {
     apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
     preconditioner_diag: Array1<f64>,
-    cached_logdet: f64,
+    cached_logdet: OnceLock<f64>,
     n_dim: usize,
     solve_rel_tol: f64,
     max_iter: usize,
@@ -8811,23 +8811,34 @@ impl MatrixFreeSpdOperator {
         }
 
         let apply = Arc::new(apply);
-        let (probes, steps) = default_slq_parameters(dim);
-        let cached_logdet = stochastic_lanczos_logdet_spd_operator(
-            dim,
-            |v| apply(v),
-            probes,
-            steps,
-            Self::DEFAULT_LOGDET_SEED,
-        )?;
 
         Ok(Self {
             apply,
             preconditioner_diag,
-            cached_logdet,
+            cached_logdet: OnceLock::new(),
             n_dim: dim,
             solve_rel_tol: Self::DEFAULT_SOLVE_REL_TOL,
             max_iter: Self::DEFAULT_MAX_ITER_MULTIPLIER * dim.max(1),
             dense_fallback: OnceLock::new(),
+        })
+    }
+
+    fn compute_logdet_slq(&self) -> f64 {
+        let (probes, steps) = default_slq_parameters(self.n_dim);
+        stochastic_lanczos_logdet_spd_operator(
+            self.n_dim,
+            |v| (self.apply)(v),
+            probes,
+            steps,
+            Self::DEFAULT_LOGDET_SEED,
+        )
+        .unwrap_or_else(|err| {
+            log::warn!("MatrixFreeSpdOperator SLQ logdet failed: {err}");
+            if let Some(fallback) = self.dense_fallback() {
+                fallback.logdet()
+            } else {
+                0.0
+            }
         })
     }
 
@@ -8878,7 +8889,9 @@ impl MatrixFreeSpdOperator {
 
 impl HessianOperator for MatrixFreeSpdOperator {
     fn logdet(&self) -> f64 {
-        self.cached_logdet
+        *self
+            .cached_logdet
+            .get_or_init(|| self.compute_logdet_slq())
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
@@ -9283,6 +9296,65 @@ impl StochasticTraceEstimator {
             }
         }
 
+        means
+    }
+
+    fn estimate_matrix_from_probe_batch<F>(
+        &self,
+        hop: &dyn HessianOperator,
+        n_coords: usize,
+        mut evaluate_probe: F,
+    ) -> Array2<f64>
+    where
+        F: FnMut(&Array1<f64>, &mut Array2<f64>),
+    {
+        if n_coords == 0 {
+            return Array2::zeros((0, 0));
+        }
+        let p = hop.dim();
+        if p == 0 {
+            return Array2::zeros((n_coords, n_coords));
+        }
+
+        let mut means = Array2::<f64>::zeros((n_coords, n_coords));
+        let mut m2s = Array2::<f64>::zeros((n_coords, n_coords));
+        let mut probe_values = Array2::<f64>::zeros((n_coords, n_coords));
+        let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
+        let check_interval = 4;
+        let mut z = Array1::<f64>::zeros(p);
+
+        for m in 0..self.config.n_probes_max {
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
+            probe_values.fill(0.0);
+            evaluate_probe(&z, &mut probe_values);
+
+            let count = (m + 1) as f64;
+            for d in 0..n_coords {
+                for e in 0..n_coords {
+                    let q = probe_values[[d, e]];
+                    let delta = q - means[[d, e]];
+                    means[[d, e]] += delta / count;
+                    let delta2 = q - means[[d, e]];
+                    m2s[[d, e]] += delta * delta2;
+                }
+            }
+
+            let n_done = m + 1;
+            if n_done >= self.config.n_probes_min
+                && n_done % check_interval == 0
+                && self.check_matrix_convergence(n_done, &means, &m2s)
+            {
+                break;
+            }
+        }
+
+        for d in 0..n_coords {
+            for e in (d + 1)..n_coords {
+                let avg = 0.5 * (means[[d, e]] + means[[e, d]]);
+                means[[d, e]] = avg;
+                means[[e, d]] = avg;
+            }
+        }
         means
     }
 
@@ -9925,6 +9997,29 @@ impl StochasticTraceEstimator {
             let variance = m2s[k] / (n_f - 1.0);
             let std_dev = variance.max(0.0).sqrt();
             let denom = sqrt_n * means[k].abs().max(self.config.tau_rel);
+            let rel_err = std_dev / denom;
+            if rel_err > self.config.relative_tol {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn check_matrix_convergence(
+        &self,
+        n: usize,
+        means: &Array2<f64>,
+        m2s: &Array2<f64>,
+    ) -> bool {
+        if n < 2 {
+            return false;
+        }
+        let sqrt_n = (n as f64).sqrt();
+        let n_f = n as f64;
+        for ((d, e), &mean) in means.indexed_iter() {
+            let variance = m2s[[d, e]] / (n_f - 1.0);
+            let std_dev = variance.max(0.0).sqrt();
+            let denom = sqrt_n * mean.abs().max(self.config.tau_rel);
             let rel_err = std_dev / denom;
             if rel_err > self.config.relative_tol {
                 return false;
