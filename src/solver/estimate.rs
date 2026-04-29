@@ -2775,6 +2775,20 @@ pub enum BlockRole {
     LinkWiggle,
 }
 
+impl BlockRole {
+    #[inline]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Mean => "mean",
+            Self::Location => "location",
+            Self::Scale => "scale",
+            Self::Time => "time",
+            Self::Threshold => "threshold",
+            Self::LinkWiggle => "link-wiggle",
+        }
+    }
+}
+
 /// Inference quantities for one coefficient block.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FittedBlock {

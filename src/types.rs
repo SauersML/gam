@@ -40,6 +40,21 @@ pub enum LinkFunction {
     Log,
 }
 
+impl LinkFunction {
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Logit => "logit",
+            Self::Probit => "probit",
+            Self::CLogLog => "cloglog",
+            Self::Sas => "sas",
+            Self::BetaLogistic => "beta-logistic",
+            Self::Identity => "identity",
+            Self::Log => "log",
+        }
+    }
+}
+
 /// Supported inverse-link components for convex blended inverse links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkComponent {
@@ -48,6 +63,19 @@ pub enum LinkComponent {
     CLogLog,
     LogLog,
     Cauchit,
+}
+
+impl LinkComponent {
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Probit => "probit",
+            Self::Logit => "logit",
+            Self::CLogLog => "cloglog",
+            Self::LogLog => "loglog",
+            Self::Cauchit => "cauchit",
+        }
+    }
 }
 
 /// User-facing configuration for a blended inverse link.
@@ -148,6 +176,24 @@ impl InverseLink {
         match self {
             Self::LatentCLogLog(state) => Some(state),
             _ => None,
+        }
+    }
+
+    pub fn saved_string(&self) -> String {
+        match self {
+            Self::Standard(link) => link.name().to_string(),
+            Self::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
+            Self::Sas(_) => "sas".to_string(),
+            Self::BetaLogistic(_) => "beta-logistic".to_string(),
+            Self::Mixture(state) => {
+                let names = state
+                    .components
+                    .iter()
+                    .map(|component| component.name())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("blended({names})")
+            }
         }
     }
 }
