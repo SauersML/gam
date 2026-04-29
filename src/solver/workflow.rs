@@ -1669,11 +1669,7 @@ fn materialize_survival<'a>(
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            normalize_survival_time_pair(
-                data.values[[i, entry_idx]],
-                data.values[[i, exit_idx]],
-                i,
-            )
+            normalize_survival_time_pair(data.values[[i, entry_idx]], data.values[[i, exit_idx]], i)
         })
         .collect();
     let pairs = pairs?;

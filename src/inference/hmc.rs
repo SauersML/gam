@@ -779,8 +779,7 @@ fn joint_binomial_logp_and_grad(
             let y_i = data.y[i];
             let w_i = data.weights[i];
             let ll_i = w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
-            let residual_i =
-                w_i * (y_i - mu) * dmu_deta / (mu * (1.0 - mu)).max(1.0e-30);
+            let residual_i = w_i * (y_i - mu) * dmu_deta / (mu * (1.0 - mu)).max(1.0e-30);
             Ok((ll_i, residual_i))
         })
         .collect();
@@ -2335,10 +2334,7 @@ impl NutsResult {
         // Posterior mean of a sample-function: parallel reduction over rows.
         // `f: Fn(ArrayView1) -> f64` is shared-access so safe across threads.
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let sum: f64 = (0..n)
-            .into_par_iter()
-            .map(|i| f(self.samples.row(i)))
-            .sum();
+        let sum: f64 = (0..n).into_par_iter().map(|i| f(self.samples.row(i))).sum();
         sum / n as f64
     }
 
