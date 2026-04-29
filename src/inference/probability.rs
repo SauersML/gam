@@ -141,6 +141,22 @@ pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
 }
 
 #[inline]
+pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    if k == 0 || k == n {
+        return 1.0;
+    }
+    let k_eff = k.min(n - k);
+    let mut out = 1.0;
+    for j in 0..k_eff {
+        out *= (n - j) as f64 / (j + 1) as f64;
+    }
+    out
+}
+
+#[inline]
 pub fn normal_logcdf(x: f64) -> f64 {
     if x == f64::INFINITY {
         return 0.0;

@@ -3014,15 +3014,12 @@ fn tensor_product_design_from_marginals(
     })?;
     // Tensor-product Khatri-Rao: design[i, j] = Π_d marginal_d[i, j_d]
     // where j is the multi-index (j_1, ..., j_D) flattened. Independent
-    // across rows — parallelize.
-    let mut design = Array2::<f64>::zeros((n, total_cols));
+    // across rows — parallelize the per-row computation, then assemble
+    // into the contiguous Array2.
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    use rayon::iter::IndexedParallelIterator;
-    design
-        .axis_iter_mut(ndarray::Axis(0))
+    let row_data: Vec<f64> = (0..n)
         .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut design_row)| {
+        .flat_map_iter(|i| {
             let mut rowvals = vec![1.0_f64];
             for b in marginal_designs {
                 let q = b.ncols();
@@ -3034,10 +3031,11 @@ fn tensor_product_design_from_marginals(
                 }
                 rowvals = next;
             }
-            for (j, &v) in rowvals.iter().enumerate() {
-                design_row[j] = v;
-            }
-        });
+            rowvals.into_iter()
+        })
+        .collect();
+    let design = Array2::<f64>::from_shape_vec((n, total_cols), row_data)
+        .map_err(|e| BasisError::DimensionMismatch(format!("tensor design assembly: {e}")))?;
     Ok(design)
 }
 
