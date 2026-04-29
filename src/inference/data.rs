@@ -21,6 +21,16 @@ pub struct EncodedDataset {
     pub column_kinds: Vec<ColumnKindTag>,
 }
 
+impl EncodedDataset {
+    pub fn column_map(&self) -> HashMap<String, usize> {
+        self.headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| (header.clone(), index))
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Format detection
 // ---------------------------------------------------------------------------
