@@ -111,14 +111,6 @@ pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
 /// in sync prevents the predict path from rejecting fits that the
 /// optimizer accepted as feasible — and vice versa.
 pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
-/// Fraction of the response span by which fit-time monotonicity grids and
-/// predict-time monotonicity scans extend past the observed `[min, max]`.
-/// Re-exported because the predict-time guard in `inference::predict_input`
-/// must match the fit-time barrier grid; if these ever diverge, the fit
-/// would enforce monotonicity on one grid while predict would scan a
-/// different one and silently report violations on points the fit never
-/// constrained.
-pub const TRANSFORMATION_TAIL_GUARD_FRACTION: f64 = 0.25;
 /// Maximum number of response quantiles drawn into the monotonicity grid.
 /// Shared between fit and predict so the grid construction is identical.
 pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
@@ -2765,10 +2757,13 @@ fn transformation_monotonicity_response_grid(
             values.push(left + frac * width);
         }
     }
-    let guard = TRANSFORMATION_TAIL_GUARD_FRACTION * span;
-    values.push(min_y - guard);
-    values.push(max_y + guard);
-
+    // No tail guard. The B-spline derivative basis clamps `x` to the basis
+    // support `[t_d, t_{p_basis}]`, so any check at `min_y - guard`
+    // evaluates the same `B_k'` as the boundary point — already covered by
+    // the existing knot/quantile entries. The historical 25% extension was
+    // a no-op redundant scan that nonetheless drove the perception that
+    // CTN was extrapolating outside the basis. Removing it makes the fit
+    // and predict checks operate on the same support.
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     values.dedup_by(|a, b| (*a - *b).abs() <= TRANSFORMATION_GRID_RELATIVE_TOL * span);
     Ok(Array1::from_vec(values))
@@ -6302,13 +6297,12 @@ pub fn fit_transformation_normal(
     // historical -12 so the optimizer can find genuinely small-λ optima.
     let total_param_count = probe_block.design.ncols();
     let n_obs_for_bound = response.len();
-    let rho_floor = if total_param_count > 0
-        && n_obs_for_bound < 5usize.saturating_mul(total_param_count)
-    {
-        0.0
-    } else {
-        -12.0
-    };
+    let rho_floor =
+        if total_param_count > 0 && n_obs_for_bound < 5usize.saturating_mul(total_param_count) {
+            0.0
+        } else {
+            -12.0
+        };
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let probe_blocks = vec![probe_block];
