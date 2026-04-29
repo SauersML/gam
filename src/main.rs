@@ -16429,8 +16429,8 @@ mod tests {
         let model = intercept_only_binomial_location_scale_model(
             -0.4,
             -1.3,
-            Array2::eye(5),
-            Some(vec![0.25, -0.1, 0.05]),
+            Array2::eye(6),
+            Some(vec![0.25, 0.1, 0.05, 0.02]),
             Some(vec![-3.0, -3.0, -3.0, -3.0, 0.0, 3.0, 3.0, 3.0, 3.0]),
             Some(3),
         );
