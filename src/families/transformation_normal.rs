@@ -362,10 +362,7 @@ fn build_transformation_row_derived(
                     .par_iter(),
             )
             .map(
-                |(
-                    ((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp),
-                    &wi,
-                )| {
+                |(((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp), &wi)| {
                     let inv_v = 1.0 / hp;
                     let inv_sq_v = inv_v * inv_v;
                     let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
@@ -824,101 +821,19 @@ impl TransformationNormalFamily {
         // 1/h'² (which stay finite well below the floor), so the clamp is
         // localized to the higher powers and does not perturb the main
         // gradient/Hessian pipeline.
-        const HPRIME_RECIPROCAL_FLOOR: f64 = 1.0e-12;
-        let n = h_prime.len();
-        let mut inv_h_prime = Array1::<f64>::zeros(n);
-        let mut inv_h_prime_sq = Array1::<f64>::zeros(n);
-        let mut inv_h_prime_cu = Array1::<f64>::zeros(n);
-        let mut inv_h_prime_qu = Array1::<f64>::zeros(n);
-        let mut weighted_h = Array1::<f64>::zeros(n);
-        let mut weighted_inv_h_prime = Array1::<f64>::zeros(n);
-        let mut weighted_inv_h_prime_sq = Array1::<f64>::zeros(n);
-        let log_likelihood = {
-            use rayon::prelude::*;
-            let h_slice = h.as_slice().expect("CTN h is contiguous");
-            let hp_slice = h_prime.as_slice().expect("CTN h_prime is contiguous");
-            let weights = self.weights.as_ref();
-            inv_h_prime
-                .as_slice_mut()
-                .expect("CTN inv_h_prime is contiguous")
-                .par_iter_mut()
-                .zip(
-                    inv_h_prime_sq
-                        .as_slice_mut()
-                        .expect("CTN inv_h_prime_sq is contiguous")
-                        .par_iter_mut(),
-                )
-                .zip(
-                    inv_h_prime_cu
-                        .as_slice_mut()
-                        .expect("CTN inv_h_prime_cu is contiguous")
-                        .par_iter_mut(),
-                )
-                .zip(
-                    inv_h_prime_qu
-                        .as_slice_mut()
-                        .expect("CTN inv_h_prime_qu is contiguous")
-                        .par_iter_mut(),
-                )
-                .zip(
-                    weighted_h
-                        .as_slice_mut()
-                        .expect("CTN weighted_h is contiguous")
-                        .par_iter_mut(),
-                )
-                .zip(
-                    weighted_inv_h_prime
-                        .as_slice_mut()
-                        .expect("CTN weighted_inv_h_prime is contiguous")
-                        .par_iter_mut(),
-                )
-                .zip(
-                    weighted_inv_h_prime_sq
-                        .as_slice_mut()
-                        .expect("CTN weighted_inv_h_prime_sq is contiguous")
-                        .par_iter_mut(),
-                )
-                .zip(h_slice.par_iter())
-                .zip(hp_slice.par_iter())
-                .zip(
-                    weights
-                        .as_slice()
-                        .expect("CTN weights are contiguous")
-                        .par_iter(),
-                )
-                .map(
-                    |(
-                        ((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp),
-                        &wi,
-                    )| {
-                        let inv_v = 1.0 / hp;
-                        let inv_sq_v = inv_v * inv_v;
-                        let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
-                        let hp_safe_sq = hp_safe * hp_safe;
-                        *inv = inv_v;
-                        *inv_sq = inv_sq_v;
-                        *inv_cu = 1.0 / (hp_safe_sq * hp_safe);
-                        *inv_qu = 1.0 / (hp_safe_sq * hp_safe_sq);
-                        *wh = wi * hi;
-                        *wih = wi * inv_v;
-                        *wih2 = wi * inv_sq_v;
-                        wi * (-0.5 * hi * hi + hp.ln())
-                    },
-                )
-                .sum::<f64>()
-        };
+        let derived = build_transformation_row_derived(&h, &h_prime, self.weights.as_ref());
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
-            inv_h_prime: Arc::new(inv_h_prime),
-            inv_h_prime_sq: Arc::new(inv_h_prime_sq),
-            inv_h_prime_cu: Arc::new(inv_h_prime_cu),
-            inv_h_prime_qu: Arc::new(inv_h_prime_qu),
-            weighted_h: Arc::new(weighted_h),
-            weighted_inv_h_prime: Arc::new(weighted_inv_h_prime),
-            weighted_inv_h_prime_sq: Arc::new(weighted_inv_h_prime_sq),
-            log_likelihood,
+            inv_h_prime: Arc::new(derived.inv_h_prime),
+            inv_h_prime_sq: Arc::new(derived.inv_h_prime_sq),
+            inv_h_prime_cu: Arc::new(derived.inv_h_prime_cu),
+            inv_h_prime_qu: Arc::new(derived.inv_h_prime_qu),
+            weighted_h: Arc::new(derived.weighted_h),
+            weighted_inv_h_prime: Arc::new(derived.weighted_inv_h_prime),
+            weighted_inv_h_prime_sq: Arc::new(derived.weighted_inv_h_prime_sq),
+            log_likelihood: derived.log_likelihood,
         };
 
         let mut cache = self
@@ -4820,6 +4735,86 @@ mod tests {
         };
         let spec = family.block_spec();
         (family, derivative_blocks, state, spec)
+    }
+
+    #[test]
+    fn ctn_row_quantity_cache_matches_direct_formulas() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, _) = toy_family_and_derivatives(&psi);
+        let row = family
+            .row_quantities(&state.beta)
+            .expect("toy row quantities");
+        let direct_h = family.x_val_kron.forward_mul(&state.beta) + family.offset.as_ref();
+        let direct_h_prime = family.x_deriv_kron.forward_mul(&state.beta);
+        let weights = family.weights.as_ref();
+
+        assert_eq!(row.h.as_ref(), &direct_h);
+        assert_eq!(row.h_prime.as_ref(), &direct_h_prime);
+
+        let mut expected_ll = 0.0;
+        for i in 0..direct_h.len() {
+            let hp = direct_h_prime[i];
+            let inv = 1.0 / hp;
+            let inv_sq = inv * inv;
+            let hp_safe = hp.max(HPRIME_RECIPROCAL_FLOOR);
+            let hp_safe_sq = hp_safe * hp_safe;
+            let inv_cu = 1.0 / (hp_safe_sq * hp_safe);
+            let inv_qu = 1.0 / (hp_safe_sq * hp_safe_sq);
+            expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln());
+
+            let tol = 1.0e-14;
+            assert!((row.inv_h_prime[i] - inv).abs() <= tol);
+            assert!((row.inv_h_prime_sq[i] - inv_sq).abs() <= tol);
+            assert!((row.inv_h_prime_cu[i] - inv_cu).abs() <= tol);
+            assert!((row.inv_h_prime_qu[i] - inv_qu).abs() <= tol);
+            assert!((row.weighted_h[i] - weights[i] * direct_h[i]).abs() <= tol);
+            assert!((row.weighted_inv_h_prime[i] - weights[i] * inv).abs() <= tol);
+            assert!((row.weighted_inv_h_prime_sq[i] - weights[i] * inv_sq).abs() <= tol);
+        }
+
+        assert!(
+            (row.log_likelihood - expected_ll).abs() <= 1.0e-14,
+            "cached log-likelihood={} expected={expected_ll}",
+            row.log_likelihood
+        );
+    }
+
+    #[test]
+    fn ctn_row_quantity_cache_is_exact_beta_keyed() {
+        let psi = array![0.15, -0.10];
+        let (family, _, state, _) = toy_family_and_derivatives(&psi);
+        let row_a = family
+            .row_quantities(&state.beta)
+            .expect("first row quantity build");
+        let row_a_again = family
+            .row_quantities(&state.beta)
+            .expect("same beta row quantity lookup");
+        assert!(Arc::ptr_eq(&row_a.h, &row_a_again.h));
+        assert!(Arc::ptr_eq(
+            &row_a.weighted_inv_h_prime_sq,
+            &row_a_again.weighted_inv_h_prime_sq
+        ));
+
+        let mut beta_b = state.beta.clone();
+        beta_b[0] += 0.125;
+        let row_b = family
+            .row_quantities(&beta_b)
+            .expect("updated beta row quantity build");
+        assert!(!Arc::ptr_eq(&row_a.h, &row_b.h));
+        assert!(row_b.matches_beta(&beta_b));
+        assert!(!row_b.matches_beta(&state.beta));
+        assert!(
+            row_a
+                .h
+                .iter()
+                .zip(row_b.h.iter())
+                .any(|(&left, &right)| left.to_bits() != right.to_bits())
+        );
+
+        let row_b_again = family
+            .row_quantities(&beta_b)
+            .expect("updated beta row quantity lookup");
+        assert!(Arc::ptr_eq(&row_b.h, &row_b_again.h));
     }
 
     #[test]
