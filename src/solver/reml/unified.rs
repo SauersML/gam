@@ -4771,8 +4771,7 @@ pub fn reml_laml_evaluate(
         // families that implement a directional θθ HVP will return Some(op)
         // here and skip the kernel-based dispatch entirely.
         if let Some(family_op) = effective_deriv.family_outer_hessian_operator() {
-            let mut hessian =
-                crate::solver::outer_strategy::HessianResult::Operator(family_op);
+            let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
             if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
                 hessian.add_rho_block_dense(ph)?;
             }

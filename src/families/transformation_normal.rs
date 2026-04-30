@@ -6550,7 +6550,10 @@ mod tests {
                     )
                     .expect("pairwise call ok")
                     .expect("pairwise returns Some for valid i,j");
-                let g_inf = terms.score_psi_psi.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let g_inf = terms
+                    .score_psi_psi
+                    .iter()
+                    .fold(0.0f64, |m, x| m.max(x.abs()));
                 let b_inf = terms
                     .hessian_psi_psi
                     .iter()
