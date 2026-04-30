@@ -12659,6 +12659,37 @@ mod tests {
     }
 
     #[test]
+    fn biobank_exact_adaptive_hessian_cost_gate_demotes_to_first_order() {
+        let n_train = 320_000u64;
+        let p = 101usize;
+        let retained_rho_dim = 3usize;
+        let spec = ParameterBlockSpec {
+            name: "matern60".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, p,
+            )))),
+            offset: Array1::zeros(1),
+            penalties: (0..retained_rho_dim)
+                .map(|_| PenaltyMatrix::Dense(Array2::eye(p)))
+                .collect(),
+            nullspace_dims: vec![0; retained_rho_dim],
+            initial_log_lambdas: Array1::zeros(retained_rho_dim),
+            initial_beta: None,
+        };
+        let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
+
+        assert_eq!(coefficient_hessian_cost, 3_264_320_000);
+        assert_eq!(
+            retained_rho_dim as u64 * coefficient_hessian_cost,
+            9_792_960_000
+        );
+        assert_eq!(
+            cost_gated_outer_order(&[spec], coefficient_hessian_cost),
+            ExactOuterDerivativeOrder::First
+        );
+    }
+
+    #[test]
     fn use_joint_matrix_free_path_triggers_at_each_documented_threshold() {
         // p ≥ 512 is sufficient regardless of n.
         assert!(use_joint_matrix_free_path(512, 1));
