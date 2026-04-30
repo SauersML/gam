@@ -18,7 +18,7 @@ use tempfile::tempdir;
 
 const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 4;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 70;
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 71;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
@@ -192,7 +192,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         covariance: Some(covariance.clone()),
     }));
     payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
-    payload.set_training_feature_metadata(vec![], vec![]);
+    payload.set_training_feature_metadata(vec!["x".to_string()], vec![(-1.5f64, 2.25f64)]);
     payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],
@@ -234,6 +234,14 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         saved_model_payload(&saved).get("sas_param_covariance"),
         Some(&serde_json::json!([[0.1, 0.02], [0.02, 0.2]]))
     );
+    assert_eq!(
+        saved_model_payload(&saved).get("training_headers"),
+        Some(&serde_json::json!(["x"]))
+    );
+    assert_eq!(
+        saved_model_payload(&saved).get("training_feature_ranges"),
+        Some(&serde_json::json!([[-1.5, 2.25]]))
+    );
 
     let loaded = FittedModel::load_from_path(&path).expect("load model");
     let loaded_state = loaded
@@ -250,6 +258,8 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         payload.sas_param_covariance,
         Some(vec![vec![0.1, 0.02], vec![0.02, 0.2]])
     );
+    assert_eq!(payload.training_headers, Some(vec!["x".to_string()]));
+    assert_eq!(payload.training_feature_ranges, Some(vec![(-1.5, 2.25)]));
 }
 
 #[test]
@@ -272,7 +282,10 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
         state: latent_state,
     }));
     payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
-    payload.set_training_feature_metadata(vec![], vec![]);
+    payload.set_training_feature_metadata(
+        vec!["x".to_string(), "z".to_string()],
+        vec![(0.0f64, 1.0f64), (-3.5f64, 4.0f64)],
+    );
     payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],
@@ -314,6 +327,14 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
     );
     assert_eq!(family_state.get("mixture_state"), Some(&Value::Null));
     assert_eq!(family_state.get("sas_state"), Some(&Value::Null));
+    assert_eq!(
+        saved_model_payload(&saved).get("training_headers"),
+        Some(&serde_json::json!(["x", "z"]))
+    );
+    assert_eq!(
+        saved_model_payload(&saved).get("training_feature_ranges"),
+        Some(&serde_json::json!([[0.0, 1.0], [-3.5, 4.0]]))
+    );
 
     let loaded = FittedModel::load_from_path(&path).expect("load model");
     let loaded_state = loaded
@@ -326,6 +347,17 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
             .resolved_inverse_link()
             .expect("loaded resolved inverse link"),
         Some(InverseLink::LatentCLogLog(latent_state))
+    );
+    let FittedModel::Standard { payload } = loaded else {
+        panic!("expected standard model");
+    };
+    assert_eq!(
+        payload.training_headers,
+        Some(vec!["x".to_string(), "z".to_string()])
+    );
+    assert_eq!(
+        payload.training_feature_ranges,
+        Some(vec![(0.0, 1.0), (-3.5, 4.0)])
     );
 }
 
