@@ -1779,6 +1779,8 @@ pub struct DuchonBasisSpec {
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
+    pub double_penalty: bool,
+    #[serde(default)]
     pub identifiability: SpatialIdentifiability,
     /// Per-axis anisotropy log-scales η_a.
     ///
@@ -7292,7 +7294,6 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     aniso_log_scales: &[f64],
     identifiability_transform: Option<&Array2<f64>>,
     operator_penalties: &DuchonOperatorPenaltySpec,
-    double_penalty: bool,
     workspace: &mut BasisWorkspace,
 ) -> Result<
     (
@@ -7881,6 +7882,23 @@ fn duchon_polynomial_shrinkage_candidate(
     ))
 }
 
+fn append_duchon_operator_double_penalty_candidate(
+    candidates: &mut Vec<PenaltyCandidate>,
+    double_penalty: bool,
+    kernel_cols: usize,
+    poly_cols: usize,
+    identifiability_transform: Option<&Array2<f64>>,
+) {
+    if !double_penalty {
+        return;
+    }
+    if let Some(candidate) =
+        duchon_polynomial_shrinkage_candidate(kernel_cols, poly_cols, identifiability_transform)
+    {
+        candidates.push(candidate);
+    }
+}
+
 fn active_operator_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     operator_derivatives: &[Array2<f64>],
@@ -7900,9 +7918,6 @@ fn active_operator_penalty_derivatives(
             PenaltySource::OperatorMass => Ok(operator_derivatives[0].clone()),
             PenaltySource::OperatorTension => Ok(operator_derivatives[1].clone()),
             PenaltySource::OperatorStiffness => Ok(operator_derivatives[2].clone()),
-            PenaltySource::DoublePenaltyNullspace => {
-                Ok(Array2::<f64>::zeros(operator_derivatives[0].raw_dim()))
-            }
             other => Err(BasisError::InvalidInput(format!(
                 "unexpected {label} penalty source in canonical operator path: {other:?}"
             ))),
@@ -12064,7 +12079,6 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         raw_eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
-        spec.double_penalty,
         &mut workspace,
     )?;
     let (penalties_first, penalties_second_diag, penalties_cross_pairs, penalties_cross_provider) =
@@ -12127,7 +12141,6 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
-        spec.double_penalty,
         &mut workspace,
     )?;
 
