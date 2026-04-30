@@ -169,37 +169,37 @@ def main():
                 _validate_prediction_output(name, out)
 
     # ── Bernoulli marginal-slope ─────────────────────────────────────
+    # Score-warp / link-deviation blocks are enabled by including
+    # `linkwiggle(...)` in the corresponding formula and disabled by
+    # omitting it. The "rigid" variants therefore omit linkwiggle from
+    # both formulas; the "scorewarp" variants include it only in the
+    # logslope formula.
     bern("bern_rigid",
          "1",
-         ["--disable-score-warp", "--disable-link-dev"])
+         [])
     bern("bern_scorewarp",
          "1 + linkwiggle(internal_knots=6)",
-         ["--disable-link-dev"])
+         [])
     bern("bern_frailty",
          "1",
-         ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3",
-          "--disable-score-warp", "--disable-link-dev"])
+         ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3"])
     bern("bern_sw_frailty",
          "1 + linkwiggle(internal_knots=6)",
-         ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.2",
-          "--disable-link-dev"])
+         ["--frailty-kind", "gaussian-shift", "--frailty-sd", "0.2"])
 
     # ── Survival marginal-slope ──────────────────────────────────────
     surv("surv_ms_rigid", "s(bmi)",
          ["--z-column", "z",
-          "--survival-likelihood", "marginal-slope",
-          "--disable-score-warp", "--disable-link-dev"],
+          "--survival-likelihood", "marginal-slope"],
          logslope_formula="1")
     surv("surv_ms_scorewarp", "s(bmi)",
          ["--z-column", "z",
-          "--survival-likelihood", "marginal-slope",
-          "--disable-link-dev"],
+          "--survival-likelihood", "marginal-slope"],
          logslope_formula="1 + linkwiggle(internal_knots=6)")
     surv("surv_ms_frailty", "s(bmi)",
          ["--z-column", "z",
           "--survival-likelihood", "marginal-slope",
-          "--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3",
-          "--disable-score-warp", "--disable-link-dev"],
+          "--frailty-kind", "gaussian-shift", "--frailty-sd", "0.3"],
          logslope_formula="1")
 
     # ── Latent survival (PH kernel) ──────────────────────────────────
