@@ -58,11 +58,6 @@ def parse_args() -> argparse.Namespace:
         help="Forwarded to gam fit; lower default is faster on large high-D fits",
     )
     parser.add_argument(
-        "--double-penalty",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
         "--adaptive-regularization",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -108,7 +103,6 @@ def build_duchon_term(
     order: int,
     power: int,
     length_scale: float | None,
-    double_penalty: bool,
 ) -> str:
     if len(features) < 2:
         raise SystemExit("--features needs at least 2 columns for a multidimensional Duchon term")
@@ -117,7 +111,6 @@ def build_duchon_term(
         f"centers={centers}",
         f"order={order}",
         f"power={power}",
-        f"double_penalty={'true' if double_penalty else 'false'}",
     ]
     if length_scale is not None:
         parts.append(f"length_scale={length_scale}")
@@ -144,7 +137,6 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
             order=order,
             power=power,
             length_scale=length_scale,
-            double_penalty=args.double_penalty,
         )
     ]
     maybe_add_linkwiggle(main_terms, args.main_linkwiggle_knots)
@@ -160,7 +152,6 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
             order=order,
             power=power,
             length_scale=length_scale,
-            double_penalty=args.double_penalty,
         )
     ]
     maybe_add_linkwiggle(logslope_terms, args.score_warp_knots)

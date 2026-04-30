@@ -51,7 +51,7 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         # scale-free Duchon with mgcv bs='ds' (mgcv has no hybrid-mode analog).
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=1, power=2, double_penalty=false)",
+            "duchon(x0, x1, centers=5, order=1, power=2)",
         )
         self.assertNotIn("~", noise_terms)
 

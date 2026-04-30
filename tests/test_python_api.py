@@ -326,7 +326,7 @@ def _require_extension():
 def _pc_duchon(centers: int = 6) -> str:
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
-        "order=1, power=2, length_scale=1, double_penalty=true)"
+        "order=1, power=2, length_scale=1)"
     )
 
 
@@ -400,10 +400,11 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory)
         model.predict(missing_pgs)
 
 
-def test_pgs_calibration_formula_uses_double_penalty_by_default():
+def test_pgs_calibration_formula_uses_duchon_operator_penalties_without_double_penalty():
     calibration = PgsCalibration(pc_columns=["pc1", "pc2"], pgs_column="PGS")
 
-    assert "double_penalty=true" in calibration.formula
+    assert "double_penalty" not in calibration.formula
+    assert "duchon(pc1, pc2" in calibration.formula
 
 
 def test_pgs_calibration_save_load_restores_wrapper_metadata(

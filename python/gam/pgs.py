@@ -53,10 +53,6 @@ class PgsCalibration:
     duchon_length_scale:
         Fixed Duchon radial length scale. Defaults to ``1.0`` so anisotropic
         PC scaling is active but does not duplicate the global smoothing scale.
-    duchon_double_penalty:
-        Whether to add the extra null-space penalty to the Duchon term.
-        Defaults to ``True`` to match the documented triple-operator
-        regularization used by the calibration pipeline.
     scale_dimensions:
         Forwarded to :func:`gam.fit`. When ``True`` (the default), enables
         learned per-axis anisotropic length scales on the Duchon smooth.
@@ -84,7 +80,6 @@ class PgsCalibration:
     duchon_order: int = 1
     duchon_power: int = 1
     duchon_length_scale: float = 1.0
-    duchon_double_penalty: bool = True
     scale_dimensions: bool | None = True
     out_column: str = "pgs_ctn_z"
     extra_fit_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -110,8 +105,7 @@ class PgsCalibration:
         duchon = (
             f"duchon({pc_args}, centers={self._resolved_centers}, "
             f"order={self.duchon_order}, power={self.duchon_power}, "
-            f"length_scale={self.duchon_length_scale:g}, "
-            f"double_penalty={str(self.duchon_double_penalty).lower()})"
+            f"length_scale={self.duchon_length_scale:g})"
         )
         return f"{self.pgs_column} ~ {duchon}"
 
@@ -189,10 +183,6 @@ class PgsCalibration:
             kwargs.setdefault("duchon_order", manifest.get("duchon_order", 1))
             kwargs.setdefault("duchon_power", manifest.get("duchon_power", 1))
             kwargs.setdefault("duchon_length_scale", manifest.get("duchon_length_scale", 1.0))
-            kwargs.setdefault(
-                "duchon_double_penalty",
-                manifest.get("duchon_double_penalty", True),
-            )
             kwargs.setdefault("scale_dimensions", manifest.get("scale_dimensions", True))
         if pc_columns is None:
             raise ValueError(
@@ -215,7 +205,6 @@ class PgsCalibration:
             "duchon_order": self.duchon_order,
             "duchon_power": self.duchon_power,
             "duchon_length_scale": self.duchon_length_scale,
-            "duchon_double_penalty": self.duchon_double_penalty,
             "scale_dimensions": self.scale_dimensions,
         }
 
