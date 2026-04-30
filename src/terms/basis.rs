@@ -12047,7 +12047,6 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         raw_eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
-        spec.double_penalty,
         &mut workspace,
     )?;
     let (penalties_first, penalties_second_diag, penalties_cross_pairs, penalties_cross_provider) =
@@ -12110,7 +12109,6 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
-        spec.double_penalty,
         &mut workspace,
     )?;
 
