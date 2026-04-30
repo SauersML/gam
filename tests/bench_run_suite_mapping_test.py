@@ -269,6 +269,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertIn("order=1", term)
         self.assertIn("power=8", term)
         self.assertIn("length_scale=1.0", term)
+        self.assertNotIn("double_penalty", term)
 
     def test_geo_subpop16_marginal_slope_aniso_lane_is_present_and_enabled(self) -> None:
         scenarios = json.loads((_REPO_ROOT / "bench" / "scenarios.json").read_text())["scenarios"]
