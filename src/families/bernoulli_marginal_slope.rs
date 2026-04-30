@@ -7081,17 +7081,58 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             return Ok(Some(row_kernel_hessian_dense(&kern, &cache)));
         }
 
+        // Build the dense joint Hessian by accumulating per-row primary
+        // Hessians once per row and pulling each one back through the design
+        // matrices via `BernoulliBlockHessianAccumulator::add_pullback`. The
+        // earlier implementation materialized the dense matrix column-by-column
+        // by calling `exact_newton_joint_hessian_matvec_from_cache` once per
+        // unit basis vector, and each matvec re-ran
+        // `compute_row_analytic_flex_into` (cell partition + cell-moment
+        // evaluation + basis evaluation) for every row. That made the dense
+        // build cost `slices.total * n * per_row_cell_work`. The flex
+        // per-row work is direction-independent, so the column loop was
+        // recomputing the same primary-space Hessian `slices.total` times.
+        // For the bern_scorewarp / bern_sw_frailty integration cases the
+        // outer factor of `slices.total ≈ 35` blew the optimizer past the
+        // 240s timeout even on a 300-row dataset.
+        //
+        // The single-pass form below evaluates the per-row primary Hessian
+        // exactly once per row and lets the existing accumulator distribute
+        // every (a, b) entry into the marginal/logslope/h/w block targets.
         let cache = self.build_exact_eval_cache_with_order(block_states)?;
-        let mut dense = Array2::<f64>::zeros((slices.total, slices.total));
-        let mut basis = Array1::<f64>::zeros(slices.total);
-        for col in 0..slices.total {
-            basis[col] = 1.0;
-            let applied =
-                self.exact_newton_joint_hessian_matvec_from_cache(&basis, block_states, &cache)?;
-            basis[col] = 0.0;
-            dense.column_mut(col).assign(&applied);
-        }
-        Ok(Some(dense))
+        let primary = cache.primary.clone();
+        let n = self.y.len();
+        let acc = (0..n.div_ceil(ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                || BernoulliBlockHessianAccumulator::new(&slices),
+                |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                    for row in start..end {
+                        let row_ctx = Self::row_ctx(&cache, row);
+                        self.compute_row_analytic_flex_into(
+                            row,
+                            block_states,
+                            &primary,
+                            row_ctx,
+                            true,
+                            &mut scratch,
+                        )?;
+                        acc.add_pullback(self, row, &slices, &primary, &scratch.hess);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || BernoulliBlockHessianAccumulator::new(&slices),
+                |mut left, right| -> Result<_, String> {
+                    left.add(&right);
+                    Ok(left)
+                },
+            )?;
+        Ok(Some(acc.to_dense(&slices)))
     }
 
     fn exact_newton_joint_gradient_evaluation(
