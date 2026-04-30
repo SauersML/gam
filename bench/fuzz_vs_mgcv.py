@@ -838,7 +838,7 @@ def _rust_mean_terms(cols, sc):
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
         d_cols = cols[:dims]
-        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
+        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={sc.duchon_power})"
         extra = [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols[dims:]]
         return [duchon_term] + extra
     elif sc.basis_type == "tps":
@@ -865,7 +865,7 @@ def rust_noise_terms(cols, sc):
         centers = max(min_centers, sc.knots // 2)
         dims = _duchon_dims_for_centers(cols, sc, centers)
         d_cols = cols[:dims]
-        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power}, double_penalty={dp})"
+        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power})"
     return f"s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
 
 

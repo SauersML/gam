@@ -3171,9 +3171,9 @@ def _requires_joint_spatial_term(cfg: dict | None) -> bool:
     return _is_joint_spatial_basis(cfg.get("smooth_basis", "ps")) and len(smooth_cols) >= 2
 
 
-def _rust_duchon_options_for_dimension(dimension: int, dp_opt: str) -> str:
+def _rust_duchon_options_for_dimension(dimension: int) -> str:
     power = max(1, dimension // 2)
-    return f", order=1, power={power}, length_scale=1.0{dp_opt}"
+    return f", order=1, power={power}, length_scale=1.0"
 
 
 def _rust_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int, dp_opt: str) -> str:
@@ -3182,7 +3182,7 @@ def _rust_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int
     if basis in {"thinplate", "tps"}:
         return f"thinplate({cols}, centers={knot_count}{dp_opt})"
     if basis == "duchon":
-        return f"duchon({cols}, centers={knot_count}{_rust_duchon_options_for_dimension(len(smooth_cols), dp_opt)})"
+        return f"duchon({cols}, centers={knot_count}{_rust_duchon_options_for_dimension(len(smooth_cols))})"
     if basis == "matern":
         return f"matern({cols}, centers={knot_count}{dp_opt})"
     raise RuntimeError(f"Unsupported joint Rust spatial basis '{basis}'")
@@ -3227,7 +3227,7 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
                     terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
                 elif basis == "duchon":
                     terms.append(
-                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1, dp_opt)})"
+                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
                     )
                 elif basis == "matern":
                     terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
@@ -3248,7 +3248,7 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
             elif basis in {"duchon", "matern"}:
                 if basis == "duchon":
                     terms.append(
-                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1, dp_opt)})"
+                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
                     )
                 else:
                     terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
