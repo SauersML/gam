@@ -1801,6 +1801,15 @@ pub struct DuchonOperatorPenaltySpec {
     pub mass: OperatorPenaltySpec,
     pub tension: OperatorPenaltySpec,
     pub stiffness: OperatorPenaltySpec,
+    #[serde(default = "default_function_variance_spec")]
+    pub function_variance: OperatorPenaltySpec,
+}
+
+fn default_function_variance_spec() -> OperatorPenaltySpec {
+    OperatorPenaltySpec::Active {
+        initial_log_lambda: 0.0,
+        prior: None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1827,6 +1836,7 @@ impl Default for DuchonOperatorPenaltySpec {
                 initial_log_lambda: 0.0,
                 prior: None,
             },
+            function_variance: default_function_variance_spec(),
         }
     }
 }
@@ -2008,6 +2018,7 @@ pub enum PenaltySource {
     OperatorMass,
     OperatorTension,
     OperatorStiffness,
+    FunctionVariance,
     TensorMarginal { dim: usize },
     TensorGlobalRidge,
     Other(String),
@@ -7822,7 +7833,8 @@ fn operator_penalty_candidates_from_collocation(
     d2: &Array2<f64>,
     spec: &DuchonOperatorPenaltySpec,
 ) -> Vec<PenaltyCandidate> {
-    let (s0, c0) = normalize_penalty(&symmetrize(&fast_ata(d0)));
+    let s0_raw = symmetrize(&fast_ata(d0));
+    let (s0, c0) = normalize_penalty(&s0_raw);
     let (s1, c1) = normalize_penalty(&symmetrize(&fast_ata(d1)));
     let (s2, c2) = normalize_penalty(&symmetrize(&fast_ata(d2)));
     let mut out = Vec::new();
@@ -7853,7 +7865,43 @@ fn operator_penalty_candidates_from_collocation(
             kronecker_factors: None,
         });
     }
+    if matches!(spec.function_variance, OperatorPenaltySpec::Active { .. })
+        && let Some(s_var_raw) = function_variance_raw_from_d0(d0, &s0_raw)
+    {
+        let (s_var, c_var) = normalize_penalty(&s_var_raw);
+        out.push(PenaltyCandidate {
+            matrix: s_var,
+            nullspace_dim_hint: 1,
+            source: PenaltySource::FunctionVariance,
+            normalization_scale: c_var,
+            kronecker_factors: None,
+        });
+    }
     out
+}
+
+/// Function-space variance penalty: S_var = D0^T D0 - K · avg · avg^T,
+/// where avg = column-mean of D0 and K = D0.nrows(). The constant function
+/// lies in the null space (intercept exempt by mathematics).
+fn function_variance_raw_from_d0(d0: &Array2<f64>, s0_raw: &Array2<f64>) -> Option<Array2<f64>> {
+    let k = d0.nrows();
+    if k == 0 {
+        return None;
+    }
+    let avg = d0.mean_axis(Axis(0))?;
+    let p = avg.len();
+    let k_f = k as f64;
+    let mut centering = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..p {
+            centering[[i, j]] = k_f * avg[i] * avg[j];
+        }
+    }
+    let s_var = symmetrize(&(s0_raw - &centering));
+    if s_var.iter().all(|v| v.abs() <= 1e-12) {
+        return None;
+    }
+    Some(s_var)
 }
 
 fn active_operator_penalty_derivatives(
@@ -7861,9 +7909,9 @@ fn active_operator_penalty_derivatives(
     operator_derivatives: &[Array2<f64>],
     label: &str,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
-    if operator_derivatives.len() != 3 {
+    if operator_derivatives.len() != 3 && operator_derivatives.len() != 4 {
         return Err(BasisError::InvalidInput(format!(
-            "{label} operator derivative path requires exactly 3 canonical penalties; found {}",
+            "{label} operator derivative path requires 3 or 4 canonical penalties; found {}",
             operator_derivatives.len()
         )));
     }
@@ -7875,6 +7923,15 @@ fn active_operator_penalty_derivatives(
             PenaltySource::OperatorMass => Ok(operator_derivatives[0].clone()),
             PenaltySource::OperatorTension => Ok(operator_derivatives[1].clone()),
             PenaltySource::OperatorStiffness => Ok(operator_derivatives[2].clone()),
+            PenaltySource::FunctionVariance => {
+                if operator_derivatives.len() < 4 {
+                    return Err(BasisError::InvalidInput(format!(
+                        "{label} FunctionVariance derivative requested but only {} derivatives provided",
+                        operator_derivatives.len()
+                    )));
+                }
+                Ok(operator_derivatives[3].clone())
+            }
             other => Err(BasisError::InvalidInput(format!(
                 "unexpected {label} penalty source in canonical operator path: {other:?}"
             ))),
@@ -10116,11 +10173,13 @@ fn build_matern_operator_penalty_candidates(
         z_opt.map(|z| z.view()),
         aniso_log_scales,
     )?;
+    let mut matern_spec = DuchonOperatorPenaltySpec::default();
+    matern_spec.function_variance = OperatorPenaltySpec::Disabled;
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
         &ops.d2,
-        &DuchonOperatorPenaltySpec::default(),
+        &matern_spec,
     ))
 }
 
@@ -11294,13 +11353,17 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let (s2, s2_psi, s2_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
 
+    let (s_var_raw_opt, s_var_psi_raw, s_var_psi_psi_raw) =
+        function_variance_raw_psi_derivatives(&d0, &d0_psi, &d0_psi_psi, &s0, &s0_psi, &s0_psi_psi);
+
     let (s0_norm, s0_norm_psi, s0_norm_psi_psi, c0) =
         normalize_penaltywith_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
     let (s1_norm, s1_norm_psi, s1_norm_psi_psi, c1) =
         normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
     let (s2_norm, s2_norm_psi, s2_norm_psi_psi, c2) =
         normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
-    let candidates = vec![
+
+    let mut candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
             nullspace_dim_hint: 0,
@@ -11323,18 +11386,102 @@ fn build_duchon_operator_penalty_psi_derivatives(
             kronecker_factors: None,
         },
     ];
+
+    let mut first_derivs = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
+    let mut second_derivs = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
+
+    if matches!(
+        spec.operator_penalties.function_variance,
+        OperatorPenaltySpec::Active { .. }
+    ) && let Some(s_var_raw) = s_var_raw_opt
+    {
+        let (s_var_norm, s_var_norm_psi, s_var_norm_psi_psi, c_var) =
+            normalize_penaltywith_psi_derivatives(
+                &s_var_raw,
+                &s_var_psi_raw,
+                &s_var_psi_psi_raw,
+            );
+        candidates.push(PenaltyCandidate {
+            matrix: s_var_norm,
+            nullspace_dim_hint: 1,
+            source: PenaltySource::FunctionVariance,
+            normalization_scale: c_var,
+            kronecker_factors: None,
+        });
+        first_derivs.push(s_var_norm_psi);
+        second_derivs.push(s_var_norm_psi_psi);
+    }
+
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
-    let penalties_derivative = active_operator_penalty_derivatives(
-        &penaltyinfo,
-        &[s0_norm_psi, s1_norm_psi, s2_norm_psi],
-        "Duchon",
-    )?;
-    let penaltiessecond_derivative = active_operator_penalty_derivatives(
-        &penaltyinfo,
-        &[s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi],
-        "Duchon",
-    )?;
+    let penalties_derivative =
+        active_operator_penalty_derivatives(&penaltyinfo, &first_derivs, "Duchon")?;
+    let penaltiessecond_derivative =
+        active_operator_penalty_derivatives(&penaltyinfo, &second_derivs, "Duchon")?;
     Ok((penalties_derivative, penaltiessecond_derivative))
+}
+
+/// Compute S_var = D0^T D0 - K · avg · avg^T and its psi derivatives, using
+/// the operator-level Frechet derivatives of D0 and the chain rule for avg.
+///
+/// avg = (1/K) Σ_p D0[p, :], so avg = (1/K) · 1^T · D0 (row sum).
+/// avg' = (1/K) · 1^T · D0_psi, avg'' = (1/K) · 1^T · D0_psi_psi.
+/// d/dψ (K · avg · avg^T) = K · (avg' · avg^T + avg · avg'^T).
+/// d²/dψ² = K · (avg'' · avg^T + 2 · avg' · avg'^T + avg · avg''^T).
+fn function_variance_raw_psi_derivatives(
+    d0: &Array2<f64>,
+    d0_psi: &Array2<f64>,
+    d0_psi_psi: &Array2<f64>,
+    s0_raw: &Array2<f64>,
+    s0_raw_psi: &Array2<f64>,
+    s0_raw_psi_psi: &Array2<f64>,
+) -> (Option<Array2<f64>>, Array2<f64>, Array2<f64>) {
+    let k = d0.nrows();
+    let p = d0.ncols();
+    if k == 0 {
+        let zero = Array2::<f64>::zeros((p, p));
+        return (None, zero.clone(), zero);
+    }
+    let k_f = k as f64;
+    let avg = match d0.mean_axis(Axis(0)) {
+        Some(a) => a,
+        None => {
+            let zero = Array2::<f64>::zeros((p, p));
+            return (None, zero.clone(), zero);
+        }
+    };
+    let avg_psi = d0_psi.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(p));
+    let avg_psi_psi = d0_psi_psi
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(p));
+
+    let outer = |u: &Array1<f64>, v: &Array1<f64>| -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                out[[i, j]] = u[i] * v[j];
+            }
+        }
+        out
+    };
+
+    let centering = outer(&avg, &avg).mapv(|v| k_f * v);
+    let s_var_raw = symmetrize(&(s0_raw - &centering));
+    if s_var_raw.iter().all(|v| v.abs() <= 1e-12) {
+        let zero = Array2::<f64>::zeros((p, p));
+        return (None, zero.clone(), zero);
+    }
+
+    let cent_psi_raw = outer(&avg_psi, &avg) + outer(&avg, &avg_psi);
+    let cent_psi = cent_psi_raw.mapv(|v| k_f * v);
+    let s_var_psi = symmetrize(&(s0_raw_psi - &cent_psi));
+
+    let cent_psi_psi_raw = outer(&avg_psi_psi, &avg)
+        + outer(&avg, &avg_psi_psi)
+        + outer(&avg_psi, &avg_psi).mapv(|v| 2.0 * v);
+    let cent_psi_psi = cent_psi_psi_raw.mapv(|v| k_f * v);
+    let s_var_psi_psi = symmetrize(&(s0_raw_psi_psi - &cent_psi_psi));
+
+    (Some(s_var_raw), s_var_psi, s_var_psi_psi)
 }
 
 fn prepare_duchon_derivative_contextwithworkspace(
@@ -19257,8 +19404,8 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penalties.len(), 4);
+        assert_eq!(out.penaltyinfo.len(), 4);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
             out.penaltyinfo[0].source,
@@ -19271,6 +19418,10 @@ mod tests {
         assert!(matches!(
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
+        ));
+        assert!(matches!(
+            out.penaltyinfo[3].source,
+            PenaltySource::FunctionVariance
         ));
     }
 
@@ -19287,7 +19438,7 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 4);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
             out.penaltyinfo[0].source,
@@ -19300,6 +19451,10 @@ mod tests {
         assert!(matches!(
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
+        ));
+        assert!(matches!(
+            out.penaltyinfo[3].source,
+            PenaltySource::FunctionVariance
         ));
     }
 
@@ -22490,6 +22645,506 @@ mod tests {
         assert!(
             (got - expected).abs() < 1e-12,
             "psi-scale-share full-formula mismatch: got={got} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_function_variance_matches_centered_mass_at_knots() {
+        // For the *raw* (pre-normalization) S_var = D0^T D0 - K · avg · avg^T
+        // the quadratic form β^T S_var β equals Σ_p (f_p - f̄)² where f = D0·β.
+        // We rebuild D0 using the same constrained-coefficient pipeline as the
+        // basis builder and verify the identity for an arbitrary β.
+        use ndarray::Array1;
+        let data = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.5, 0.5, 0.5]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: Some(0.7),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let var_info = out
+            .penaltyinfo
+            .iter()
+            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
+            .expect("function variance penalty must be present");
+        let var_idx = var_info.original_index;
+        let s_var_norm = &out.penalties[var_idx];
+        // De-normalize back to S_var (raw):
+        let s_var_raw = s_var_norm.mapv(|v| v * var_info.normalization_scale);
+
+        // Recompute D0 directly from the spec via the public collocation API.
+        let centers = match &out.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!("Duchon metadata expected"),
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            spec.length_scale,
+            spec.power,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let d0 = ops.d0;
+        let p = d0.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            beta[i] = 0.5 + 0.17 * (i as f64) - 0.09 * ((i * i) as f64);
+        }
+        let f = d0.dot(&beta);
+        let mean_f = f.iter().copied().sum::<f64>() / f.len() as f64;
+        let expected_var: f64 = f.iter().map(|v| (v - mean_f).powi(2)).sum();
+
+        let quad_raw = beta.dot(&s_var_raw.dot(&beta));
+        let rel_err = (quad_raw - expected_var).abs() / (1.0 + expected_var.abs());
+        assert!(
+            rel_err < 1e-9,
+            "β^T S_var β = {quad_raw} should match Σ(f-f̄)² = {expected_var}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_function_variance_null_space_contains_constant_direction() {
+        // Verify mathematically: the vector β = avg/||avg||² mapped onto the
+        // null-space of S_var should give a zero quadratic form. We construct
+        // β such that D0·β is the constant 1_K vector by least-squares:
+        // β = (D0^T D0)^{-1} D0^T · 1, solved via faer Cholesky on a ridge.
+        use crate::faer_ndarray::FaerCholesky;
+        use ndarray::Array1;
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.4],
+            [0.3, 0.7]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let var_info = out
+            .penaltyinfo
+            .iter()
+            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
+            .expect("function variance penalty must be present");
+        let var_idx = var_info.original_index;
+        let s_var = &out.penalties[var_idx];
+
+        // Recompute D0 to find a β representing the constant function at knots.
+        let centers = match &out.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!("Duchon metadata expected"),
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            spec.length_scale,
+            spec.power,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let d0 = ops.d0;
+        let k_rows = d0.nrows();
+        let p = d0.ncols();
+        let ones = Array1::<f64>::ones(k_rows);
+
+        // Solve (D0^T D0 + ε I) β = D0^T 1 via faer Cholesky.
+        let dt_d = d0.t().dot(&d0);
+        let dt_one = d0.t().dot(&ones);
+        let mut a = dt_d.clone();
+        for i in 0..p {
+            a[[i, i]] += 1e-10;
+        }
+        let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
+        let beta = chol.solvevec(&dt_one);
+        let residual = (&d0.dot(&beta) - &ones)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            residual < 1e-6,
+            "design must span constant at knots (residual = {residual})"
+        );
+        let quad = beta.dot(&s_var.dot(&beta));
+        // Normalized S_var is divided by Frobenius norm, so β^T S_var β scales
+        // accordingly but the zero is preserved.
+        assert!(
+            quad.abs() < 1e-8,
+            "constant function must lie in S_var null space, got β^T S_var β = {quad}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_function_variance_penalizes_tilt_more_than_constant() {
+        // Constant function: zero penalty. Tilted (linear) function: strictly
+        // positive penalty. Compares β^T S_var β for two coefficient vectors
+        // built to represent each function at the centers.
+        use crate::faer_ndarray::FaerCholesky;
+        use ndarray::Array1;
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.4, 0.6],
+            [0.2, 0.3]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let var_info = out
+            .penaltyinfo
+            .iter()
+            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
+            .expect("function variance penalty must be present");
+        let var_idx = var_info.original_index;
+        let s_var = &out.penalties[var_idx];
+
+        let centers = match &out.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!("Duchon metadata expected"),
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            spec.length_scale,
+            spec.power,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let d0 = ops.d0;
+        let k_rows = d0.nrows();
+        let p = d0.ncols();
+
+        // Targets at the K center rows.
+        let constant_target = Array1::<f64>::ones(k_rows);
+        let mut tilt_target = Array1::<f64>::zeros(k_rows);
+        for i in 0..k_rows {
+            tilt_target[i] = centers[[i, 0]] + 0.5 * centers[[i, 1]];
+        }
+        let solve_for = |t: &Array1<f64>| -> Array1<f64> {
+            let mut a = d0.t().dot(&d0);
+            for i in 0..p {
+                a[[i, i]] += 1e-10;
+            }
+            let rhs = d0.t().dot(t);
+            let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
+            chol.solvevec(&rhs)
+        };
+        let beta_const = solve_for(&constant_target);
+        let beta_tilt = solve_for(&tilt_target);
+
+        let var_const = beta_const.dot(&s_var.dot(&beta_const));
+        let var_tilt = beta_tilt.dot(&s_var.dot(&beta_tilt));
+        assert!(
+            var_const.abs() < 1e-6,
+            "constant function should have ~zero variance penalty, got {var_const}"
+        );
+        assert!(
+            var_tilt > 1e-6,
+            "tilted function must have positive variance penalty, got {var_tilt}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_function_variance_null_space_for_constant() {
+        // β representing a constant function at the centers must lie in the
+        // null space of the function-variance penalty: β^T S_var β = 0.
+        use crate::faer_ndarray::FaerCholesky;
+        use ndarray::Array1;
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let var_info = out
+            .penaltyinfo
+            .iter()
+            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
+            .expect("FunctionVariance penalty must be wired into default Duchon basis");
+        let s_var = &out.penalties[var_info.original_index];
+
+        let centers = match &out.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!("Duchon metadata expected"),
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            spec.length_scale,
+            spec.power,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let d0 = ops.d0;
+        let k_rows = d0.nrows();
+        let p = d0.ncols();
+
+        // Solve D0·β ≈ c·1 for c = 1.7 via tiny-ridge normal equations.
+        let c = 1.7;
+        let target = Array1::<f64>::from_elem(k_rows, c);
+        let mut a = d0.t().dot(&d0);
+        for i in 0..p {
+            a[[i, i]] += 1e-10;
+        }
+        let rhs = d0.t().dot(&target);
+        let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
+        let beta = chol.solvevec(&rhs);
+        let residual = (&d0.dot(&beta) - &target)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            residual < 1e-6,
+            "design must reproduce the constant c·1 at knots (residual = {residual})"
+        );
+        let quad = beta.dot(&s_var.dot(&beta));
+        assert!(
+            quad.abs() < 1e-12 * (1.0 + c * c) + 1e-10,
+            "constant function must lie in S_var null space, got β^T S_var β = {quad}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_function_variance_basis_invariant() {
+        // If two coefficient vectors β_1 and β_2 produce the same function at
+        // the centers (D0·β_1 = D0·β_2), they must yield the same function-
+        // variance penalty: β_1^T S_var β_1 = β_2^T S_var β_2. We construct
+        // β_2 = β_1 + n where n lies in the null space of D0, computed as
+        // the smallest-eigenvalue eigenvector of D0^T D0 (which is exactly
+        // zero whenever D0 is rank-deficient).
+        use ndarray::Array1;
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.25],
+            [0.7, 0.8],
+            [0.2, 0.6]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: Some(0.9),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let var_info = out
+            .penaltyinfo
+            .iter()
+            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
+            .expect("FunctionVariance penalty must be wired into default Duchon basis");
+        let s_var = &out.penalties[var_info.original_index];
+
+        let centers = match &out.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!("Duchon metadata expected"),
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            spec.length_scale,
+            spec.power,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let d0 = ops.d0;
+        let k_rows = d0.nrows();
+        let p = d0.ncols();
+
+        // The null space of D0 (K × p) is the eigenspace of D0^T D0 at
+        // eigenvalue 0. Compute eigh on the symmetric Gram matrix; pick the
+        // eigenvector whose eigenvalue is smallest (and effectively zero).
+        let gram = d0.t().dot(&d0);
+        let (eigvals, eigvecs) = gram.eigh(faer::Side::Lower).expect("eigh must succeed");
+        let max_eig = eigvals.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+        let null_tol = 1e-9 * max_eig;
+        let (null_idx, null_eig) = eigvals
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .expect("eigvals non-empty");
+        assert!(
+            *null_eig <= null_tol,
+            "fixture must have rank-deficient D0 (smallest eig = {null_eig}, tol = {null_tol})"
+        );
+        let n: Array1<f64> = eigvecs.column(null_idx).to_owned();
+        let n_norm = n.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(n_norm > 1e-8, "null vector must be non-degenerate");
+
+        // Construct an arbitrary β_1 and form β_2 = β_1 + α·n.
+        let mut beta1 = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            beta1[i] = 0.3 - 0.11 * (i as f64) + 0.07 * ((i * i) as f64);
+        }
+        let alpha = 0.6;
+        let beta2 = &beta1 + &(&n * alpha);
+
+        // Sanity: D0·β_1 ≈ D0·β_2 at knots.
+        let f1 = d0.dot(&beta1);
+        let f2 = d0.dot(&beta2);
+        let f_diff = (&f1 - &f2).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let f_scale = (f1.iter().map(|v| v * v).sum::<f64>() / k_rows as f64).sqrt() + 1.0;
+        assert!(
+            f_diff < 1e-8 * f_scale,
+            "β_1 and β_2 must produce the same function at knots (||Δf|| = {f_diff})"
+        );
+
+        let q1 = beta1.dot(&s_var.dot(&beta1));
+        let q2 = beta2.dot(&s_var.dot(&beta2));
+        let rel_diff = (q1 - q2).abs() / (1.0 + q1.abs() + q2.abs());
+        assert!(
+            rel_diff < 1e-10,
+            "function-variance penalty must be invariant to the D0 null-space \
+             component: β_1^T S β_1 = {q1}, β_2^T S β_2 = {q2}"
+        );
+    }
+
+    #[test]
+    fn test_duchon_function_variance_penalizes_tilt() {
+        // β_const reproduces a constant; β_tilted adds a small linear
+        // perturbation. The variance penalty must strictly increase.
+        use crate::faer_ndarray::FaerCholesky;
+        use ndarray::Array1;
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.4, 0.5],
+            [0.2, 0.7]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let var_info = out
+            .penaltyinfo
+            .iter()
+            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
+            .expect("FunctionVariance penalty must be wired into default Duchon basis");
+        let s_var = &out.penalties[var_info.original_index];
+
+        let centers = match &out.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers.clone(),
+            _ => unreachable!("Duchon metadata expected"),
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            spec.length_scale,
+            spec.power,
+            DuchonNullspaceOrder::Linear,
+            None,
+            None,
+            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let d0 = ops.d0;
+        let k_rows = d0.nrows();
+        let p = d0.ncols();
+
+        let solve_for = |t: &Array1<f64>| -> Array1<f64> {
+            let mut a = d0.t().dot(&d0);
+            for i in 0..p {
+                a[[i, i]] += 1e-10;
+            }
+            let rhs = d0.t().dot(t);
+            let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
+            chol.solvevec(&rhs)
+        };
+        let const_target = Array1::<f64>::ones(k_rows);
+        let mut tilted_target = const_target.clone();
+        let perturbation = 0.05;
+        for i in 0..k_rows {
+            tilted_target[i] += perturbation * centers[[i, 0]];
+        }
+        let beta_const = solve_for(&const_target);
+        let beta_tilted = solve_for(&tilted_target);
+
+        let q_const = beta_const.dot(&s_var.dot(&beta_const));
+        let q_tilted = beta_tilted.dot(&s_var.dot(&beta_tilted));
+        assert!(
+            q_tilted > q_const + 1e-6,
+            "tilted function must incur strictly larger variance penalty: \
+             β_tilted^T S β_tilted = {q_tilted}, β_const^T S β_const = {q_const}"
         );
     }
 }
