@@ -11202,6 +11202,7 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: false,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -11219,6 +11220,7 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: false,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -11236,6 +11238,7 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: false,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -11357,6 +11360,7 @@ mod tests {
                         length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
+                        double_penalty: false,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -11393,6 +11397,7 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: false,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -12042,8 +12047,8 @@ mod tests {
     }
 
     #[test]
-    fn build_termspecrejects_duchon_double_penalty_option() {
-        let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, double_penalty=false)")
+    fn build_termspec_wires_duchon_double_penalty_option() {
+        let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, centers=8, double_penalty=true)")
             .expect("formula should parse before basis validation");
         let ds = Dataset {
             headers: vec!["pc1".to_string(), "pc2".to_string()],
@@ -12066,15 +12071,18 @@ mod tests {
         };
         let col_map = HashMap::from([("pc1".to_string(), 0usize), ("pc2".to_string(), 1usize)]);
         let mut inference_notes = Vec::<String>::new();
-        let err = super::build_termspec(
+        let spec = super::build_termspec(
             &parsed.terms,
             &ds,
             &col_map,
             &mut inference_notes,
             &gam::resource::ResourcePolicy::default_library(),
         )
-        .expect_err("duchon double_penalty should be rejected");
-        assert!(err.contains("does not support double_penalty"));
+        .expect("duchon double_penalty should build");
+        let SmoothBasisSpec::Duchon { spec, .. } = &spec.smooth_terms[0].basis else {
+            panic!("expected Duchon smooth");
+        };
+        assert!(spec.double_penalty);
         assert!(inference_notes.is_empty());
     }
 
