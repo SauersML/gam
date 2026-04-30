@@ -31,8 +31,6 @@ def _build_fit_payload(
     link: str | None,
     logslope_formula: str | None,
     scale_dimensions: bool | None,
-    disable_link_dev: bool | None,
-    disable_score_warp: bool | None,
     firth: bool | None,
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -53,8 +51,6 @@ def _build_fit_payload(
         "link": link,
         "logslope_formula": logslope_formula,
         "scale_dimensions": scale_dimensions,
-        "disable_link_dev": disable_link_dev,
-        "disable_score_warp": disable_score_warp,
         "firth": firth,
     }
     for key, value in kwarg_items.items():
@@ -84,8 +80,6 @@ def fit(
     link: str | None = None,
     logslope_formula: str | None = None,
     scale_dimensions: bool | None = None,
-    disable_link_dev: bool | None = None,
-    disable_score_warp: bool | None = None,
     firth: bool | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model:
@@ -139,13 +133,6 @@ def fit(
         When ``True``, enables learned per-axis anisotropic length scales on
         spatial smooths (e.g. multi-dim Duchon / Matern / TPS). Per-axis
         scales are learned, not specified. Corresponds to ``--scale-dimensions``.
-    disable_link_dev:
-        Disable the link-deviation correction. Corresponds to
-        ``--disable-link-dev``.
-    disable_score_warp:
-        Disable routing of ``linkwiggle(...)`` in ``--logslope-formula`` into
-        the anchored internal score-warp block. Corresponds to
-        ``--disable-score-warp``.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
     config:
@@ -174,8 +161,6 @@ def fit(
         link=link,
         logslope_formula=logslope_formula,
         scale_dimensions=scale_dimensions,
-        disable_link_dev=disable_link_dev,
-        disable_score_warp=disable_score_warp,
         firth=firth,
         config=config,
     )
@@ -219,8 +204,6 @@ def validate_formula(
     link: str | None = None,
     logslope_formula: str | None = None,
     scale_dimensions: bool | None = None,
-    disable_link_dev: bool | None = None,
-    disable_score_warp: bool | None = None,
     firth: bool | None = None,
     config: dict[str, Any] | None = None,
 ) -> FormulaValidation:
@@ -245,8 +228,6 @@ def validate_formula(
         link=link,
         logslope_formula=logslope_formula,
         scale_dimensions=scale_dimensions,
-        disable_link_dev=disable_link_dev,
-        disable_score_warp=disable_score_warp,
         firth=firth,
         config=config,
     )
