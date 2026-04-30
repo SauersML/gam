@@ -423,7 +423,6 @@ pub fn build_smooth_basis(
                     length_scale,
                     power,
                     nullspace_order,
-                    double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                     aniso_log_scales,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
