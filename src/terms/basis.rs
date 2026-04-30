@@ -13860,11 +13860,18 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    let candidates = operator_penalty_candidates_from_collocation(
+    let mut candidates = operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
         &ops.d2,
         &spec.operator_penalties,
+    );
+    append_duchon_operator_double_penalty_candidate(
+        &mut candidates,
+        spec.double_penalty,
+        kernel_transform.ncols(),
+        poly_cols,
+        identifiability_transform.as_ref(),
     );
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
