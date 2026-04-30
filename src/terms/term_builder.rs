@@ -367,6 +367,12 @@ pub fn build_smooth_basis(
             })
         }
         "duchon" => {
+            if options.contains_key("double_penalty") {
+                return Err(format!(
+                    "Duchon smooth '{}' does not support double_penalty; Duchon uses mass, tension, and stiffness operator penalties.",
+                    vars.join(",")
+                ));
+            }
             let requested_nullspace_order = parse_duchon_order(options)?;
             let length_scale = option_f64(options, "length_scale");
             // Resolve `(nullspace_order, power)` against the joint constraints
@@ -423,6 +429,7 @@ pub fn build_smooth_basis(
                     length_scale,
                     power,
                     nullspace_order,
+                    double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                     aniso_log_scales,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),

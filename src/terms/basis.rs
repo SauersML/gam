@@ -7292,6 +7292,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     aniso_log_scales: &[f64],
     identifiability_transform: Option<&Array2<f64>>,
     operator_penalties: &DuchonOperatorPenaltySpec,
+    double_penalty: bool,
     workspace: &mut BasisWorkspace,
 ) -> Result<
     (
@@ -7854,6 +7855,30 @@ fn operator_penalty_candidates_from_collocation(
         });
     }
     out
+}
+
+fn duchon_polynomial_shrinkage_candidate(
+    kernel_cols: usize,
+    poly_cols: usize,
+    identifiability_transform: Option<&Array2<f64>>,
+) -> Option<PenaltyCandidate> {
+    if poly_cols == 0 {
+        return None;
+    }
+    let total_cols = kernel_cols + poly_cols;
+    let mut ridge = Array2::<f64>::zeros((total_cols, total_cols));
+    for col in kernel_cols..total_cols {
+        ridge[[col, col]] = 1.0;
+    }
+    let projected = project_penalty_matrix(&ridge, identifiability_transform);
+    if projected.iter().all(|v| v.abs() <= 1e-12) {
+        return None;
+    }
+    Some(normalize_penalty_candidate(
+        projected,
+        0,
+        PenaltySource::DoublePenaltyNullspace,
+    ))
 }
 
 fn active_operator_penalty_derivatives(
@@ -12039,6 +12064,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         raw_eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
+        spec.double_penalty,
         &mut workspace,
     )?;
     let (penalties_first, penalties_second_diag, penalties_cross_pairs, penalties_cross_provider) =
@@ -12101,6 +12127,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
+        spec.double_penalty,
         &mut workspace,
     )?;
 
@@ -19183,7 +19210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_basis_spec_deserializes_double_penalty_field() {
+    fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
         let payload = r#"{
             "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
             "length_scale": 1.0,
@@ -19192,9 +19219,9 @@ mod tests {
             "double_penalty": true
         }"#;
 
-        let spec = serde_json::from_str::<DuchonBasisSpec>(payload)
-            .expect("Duchon double_penalty should deserialize");
-        assert!(spec.double_penalty);
+        let err = serde_json::from_str::<DuchonBasisSpec>(payload)
+            .expect_err("removed Duchon double_penalty field should be rejected");
+        assert!(err.to_string().contains("unknown field `double_penalty`"));
     }
 
     #[test]
@@ -19274,16 +19301,6 @@ mod tests {
         assert!(matches!(
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
-        ));
-
-        let mut spec_with_double_penalty = spec.clone();
-        spec_with_double_penalty.double_penalty = true;
-        let out = build_duchon_basis(data.view(), &spec_with_double_penalty)
-            .expect("Duchon basis with double penalty should build");
-        assert_eq!(out.penaltyinfo.len(), 4);
-        assert!(matches!(
-            out.penaltyinfo[3].source,
-            PenaltySource::DoublePenaltyNullspace
         ));
     }
 

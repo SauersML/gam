@@ -2615,6 +2615,7 @@ fn build_shape_constraint_design_1d(
                 length_scale: *length_scale,
                 power: *power,
                 nullspace_order: *nullspace_order,
+                double_penalty: spec.double_penalty,
                 identifiability: identifiability_transform
                     .as_ref()
                     .map(|z| SpatialIdentifiability::FrozenTransform {
