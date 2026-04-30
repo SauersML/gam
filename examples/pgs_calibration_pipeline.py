@@ -89,7 +89,7 @@ def _pc_duchon(centers: int) -> str:
     args = ", ".join(PC_COLUMNS)
     return (
         f"duchon({args}, centers={centers}, order=1, power=1, "
-        "length_scale=1, double_penalty=true)"
+        "length_scale=1)"
     )
 
 
