@@ -1779,8 +1779,6 @@ pub struct DuchonBasisSpec {
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
-    pub double_penalty: bool,
-    #[serde(default)]
     pub identifiability: SpatialIdentifiability,
     /// Per-axis anisotropy log-scales η_a.
     ///
@@ -7858,47 +7856,6 @@ fn operator_penalty_candidates_from_collocation(
     out
 }
 
-fn duchon_polynomial_shrinkage_candidate(
-    kernel_cols: usize,
-    poly_cols: usize,
-    identifiability_transform: Option<&Array2<f64>>,
-) -> Option<PenaltyCandidate> {
-    if poly_cols == 0 {
-        return None;
-    }
-    let total_cols = kernel_cols + poly_cols;
-    let mut ridge = Array2::<f64>::zeros((total_cols, total_cols));
-    for col in kernel_cols..total_cols {
-        ridge[[col, col]] = 1.0;
-    }
-    let projected = project_penalty_matrix(&ridge, identifiability_transform);
-    if projected.iter().all(|v| v.abs() <= 1e-12) {
-        return None;
-    }
-    Some(normalize_penalty_candidate(
-        projected,
-        0,
-        PenaltySource::DoublePenaltyNullspace,
-    ))
-}
-
-fn append_duchon_operator_double_penalty_candidate(
-    candidates: &mut Vec<PenaltyCandidate>,
-    double_penalty: bool,
-    kernel_cols: usize,
-    poly_cols: usize,
-    identifiability_transform: Option<&Array2<f64>>,
-) {
-    if !double_penalty {
-        return;
-    }
-    if let Some(candidate) =
-        duchon_polynomial_shrinkage_candidate(kernel_cols, poly_cols, identifiability_transform)
-    {
-        candidates.push(candidate);
-    }
-}
-
 fn active_operator_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     operator_derivatives: &[Array2<f64>],
@@ -13860,18 +13817,11 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    let mut candidates = operator_penalty_candidates_from_collocation(
+    let candidates = operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
         &ops.d2,
         &spec.operator_penalties,
-    );
-    append_duchon_operator_double_penalty_candidate(
-        &mut candidates,
-        spec.double_penalty,
-        kernel_transform.ncols(),
-        poly_cols,
-        identifiability_transform.as_ref(),
     );
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
