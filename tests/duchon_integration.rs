@@ -65,6 +65,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
                     length_scale: None,
                     power,
                     nullspace_order,
+                    double_penalty: false,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
