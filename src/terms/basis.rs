@@ -7668,7 +7668,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         (op2_info.s_raw.clone(), 1.0)
     };
 
-    let candidates = vec![
+    let mut candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
             nullspace_dim_hint: 0,
@@ -7691,6 +7691,13 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             kronecker_factors: None,
         },
     ];
+    append_duchon_operator_double_penalty_candidate(
+        &mut candidates,
+        double_penalty,
+        z_cols,
+        poly_cols,
+        identifiability_transform,
+    );
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
 
     // Build per-axis results.
@@ -11304,7 +11311,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
         normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
     let (s2_norm, s2_norm_psi, s2_norm_psi_psi, c2) =
         normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
-    let mut candidates = vec![
+    let candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
             nullspace_dim_hint: 0,
@@ -11327,13 +11334,6 @@ fn build_duchon_operator_penalty_psi_derivatives(
             kronecker_factors: None,
         },
     ];
-    append_duchon_operator_double_penalty_candidate(
-        &mut candidates,
-        spec.double_penalty,
-        kernel_cols,
-        poly_cols,
-        identifiability_transform,
-    );
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     let penalties_derivative = active_operator_penalty_derivatives(
         &penaltyinfo,
@@ -19193,18 +19193,21 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_basis_spec_deserializes_double_penalty_field() {
+    fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
         let payload = r#"{
             "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
             "length_scale": 1.0,
             "power": 2,
             "nullspace_order": "Linear",
-            "double_penalty": true
+            "double_penalty": false
         }"#;
 
-        let spec = serde_json::from_str::<DuchonBasisSpec>(payload)
-            .expect("Duchon double_penalty should deserialize");
-        assert!(spec.double_penalty);
+        let err = serde_json::from_str::<DuchonBasisSpec>(payload)
+            .expect_err("stale Duchon double_penalty must not deserialize");
+        assert!(
+            err.to_string().contains("unknown field `double_penalty`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -19252,7 +19255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_pure_duchon_basis_uses_native_kernel_penalty() {
+    fn test_build_duchon_basis_uses_operator_penalty_triplet() {
         let data = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -19270,36 +19273,20 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 1);
-        assert_eq!(out.penaltyinfo.len(), 1);
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
-    }
-
-    #[test]
-    fn test_build_pure_duchon_basis_double_penalty_adds_nullspace_block() {
-        let data = array![
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: None,
-            power: 1,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penaltyinfo.len(), 2);
-        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+        assert!(matches!(
+            out.penaltyinfo[0].source,
+            PenaltySource::OperatorMass
+        ));
         assert!(matches!(
             out.penaltyinfo[1].source,
-            PenaltySource::DoublePenaltyNullspace
+            PenaltySource::OperatorTension
+        ));
+        assert!(matches!(
+            out.penaltyinfo[2].source,
+            PenaltySource::OperatorStiffness
         ));
     }
 
