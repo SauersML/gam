@@ -10099,6 +10099,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let mut a = obj_ll;
             let mut g = score_ll;
             let mut b_mat = hess_ll;
+            let mut b_operator = hess_ll_op;
 
             // Assemble S_{ψ_i ψ_j} only on the touched block.
             let ld_s = if cache_i.block_idx == cache_j.block_idx {
@@ -10118,10 +10119,44 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     let mut g_local = g.slice_mut(s![cache_i.start..cache_i.end]);
                     g_local += &s_ij_beta_local;
                 }
-                {
+                // The S_{ψ_i ψ_j} block contribution attaches to the dense
+                // Hessian when the family returned a dense `b_mat`, and to
+                // the operator-backed Hessian (via a `BlockLocalDrift`
+                // composite) when the family returned `hessian_psi_psi`
+                // empty alongside an operator. Slicing into a `(0, 0)`
+                // dense matrix would otherwise panic in the matrix-free
+                // path that survival-marginal-slope and other operator-
+                // backed families use.
+                if b_mat.nrows() > 0 {
                     let mut b_local =
                         b_mat.slice_mut(s![cache_i.start..cache_i.end, cache_i.start..cache_i.end]);
                     b_local += &s_local;
+                } else {
+                    let block_drift: Arc<dyn HyperOperator> =
+                        Arc::new(crate::solver::estimate::reml::unified::BlockLocalDrift {
+                            local: s_local.clone(),
+                            start: cache_i.start,
+                            end: cache_i.end,
+                            total_dim: total,
+                        });
+                    b_operator = Some(match b_operator.take() {
+                        Some(existing) => {
+                            let existing_arc: Arc<dyn HyperOperator> = Arc::from(existing);
+                            Box::new(
+                                crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                                    dense: None,
+                                    operators: vec![existing_arc, block_drift],
+                                    dim_hint: total,
+                                },
+                            ) as Box<dyn HyperOperator>
+                        }
+                        None => Box::new(crate::solver::estimate::reml::unified::BlockLocalDrift {
+                            local: s_local.clone(),
+                            start: cache_i.start,
+                            end: cache_i.end,
+                            total_dim: total,
+                        }) as Box<dyn HyperOperator>,
+                    });
                 }
 
                 if let Some(ref logdet_blocks) = *s_logdet_block_cache {
@@ -10147,7 +10182,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 a,
                 g,
                 b_mat,
-                b_operator: hess_ll_op,
+                b_operator,
                 ld_s,
             }
         }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
