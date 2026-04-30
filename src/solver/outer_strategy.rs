@@ -1022,16 +1022,29 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     attempts
 }
 
+fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
+    cap: &OuterCapability,
+    config: &OuterConfig,
+) -> bool {
+    config.solver_class == SolverClass::Primary
+        && config.fallback_policy == FallbackPolicy::Disabled
+        && cap.gradient == Derivative::Analytic
+        && matches!(plan(cap).solver, Solver::HybridEfs)
+}
+
 fn primary_capability_for_config(
     mut cap: OuterCapability,
     config: &OuterConfig,
     context: &str,
 ) -> OuterCapability {
-    if config.solver_class == SolverClass::Primary
-        && config.fallback_policy == FallbackPolicy::Disabled
-        && cap.gradient == Derivative::Analytic
-        && matches!(plan(&cap).solver, Solver::HybridEfs)
-    {
+    if disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(&cap, config) {
+        // HybridEFS is not a standalone first-order method for ψ coordinates:
+        // when ψ backtracking proves non-descent, the bridge intentionally
+        // surfaces `EFS_FIRST_ORDER_FALLBACK_MARKER` so the runner can switch
+        // to a joint gradient solver that enforces ∇ψ V = 0. With fallback
+        // disabled and an analytic gradient available, selecting HybridEFS as
+        // the only primary attempt is internally inconsistent; BFGS is the
+        // standalone first-order primary for that capability.
         log::info!(
             "[OUTER] {context}: HybridEFS requires the automatic first-order \
              escape path for ψ coordinates; fallback is disabled, so routing the \
@@ -4517,6 +4530,29 @@ mod tests {
         );
         assert!(primary_cap.disable_fixed_point);
         assert_eq!(plan(&primary_cap).solver, Solver::Bfgs);
+
+        let pure_efs_cap = OuterCapability {
+            psi_dim: 0,
+            ..trapped_cap.clone()
+        };
+        assert_eq!(plan(&pure_efs_cap).solver, Solver::Efs);
+        let pure_primary_cap =
+            primary_capability_for_config(pure_efs_cap.clone(), &disabled_config, "pure EFS");
+        assert!(!pure_primary_cap.disable_fixed_point);
+        assert_eq!(plan(&pure_primary_cap).solver, Solver::Efs);
+
+        let no_gradient_cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            ..trapped_cap.clone()
+        };
+        assert_eq!(plan(&no_gradient_cap).solver, Solver::HybridEfs);
+        let no_gradient_primary_cap = primary_capability_for_config(
+            no_gradient_cap.clone(),
+            &disabled_config,
+            "gradient-unavailable hybrid EFS",
+        );
+        assert!(!no_gradient_primary_cap.disable_fixed_point);
+        assert_eq!(plan(&no_gradient_primary_cap).solver, Solver::HybridEfs);
 
         let automatic_config = OuterConfig::default();
         let automatic_cap = primary_capability_for_config(
