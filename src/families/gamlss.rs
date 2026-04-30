@@ -7069,6 +7069,13 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     }
 }
 
+/// Two-block row-coefficient operator backed by `DesignMatrix`.
+///
+/// This is the operator-form counterpart to `DesignTwoBlockRowCoeffOperator`'s
+/// old dense-array storage: it must keep the realized block designs lazy all
+/// the way through `Xv` and `X^T r`. Do not cache `Array2` snapshots here;
+/// `NoDensifyOperator` regression tests rely on this type to panic if a future
+/// change materializes spec-backed designs.
 struct DesignTwoBlockRowCoeffOperator {
     x_a: DesignMatrix,
     x_b: DesignMatrix,
@@ -20222,6 +20229,29 @@ mod tests {
                 "lazy BLS dH*v mismatch at {i}: dense={:.6e}, op={:.6e}",
                 want_dh_v[i],
                 got_dh_v[i]
+            );
+        }
+
+        let d_beta_v = array![-0.11, 0.13, -0.05, -0.22, 0.09];
+        let dense_d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+                &states, &xt, &xls, &d_beta, &d_beta_v,
+            )
+            .expect("dense d2H")
+            .expect("dense d2H present");
+        let got_d2h_v = workspace
+            .second_directional_derivative_operator(&d_beta, &d_beta_v)
+            .expect("operator d2H")
+            .expect("operator d2H present")
+            .mul_vec(&v);
+        let want_d2h_v = dense_d2h.dot(&v);
+        for i in 0..v.len() {
+            let tol = 1e-9 * want_d2h_v[i].abs().max(1.0) + 1e-9;
+            assert!(
+                (want_d2h_v[i] - got_d2h_v[i]).abs() <= tol,
+                "lazy BLS d2H*v mismatch at {i}: dense={:.6e}, op={:.6e}",
+                want_d2h_v[i],
+                got_d2h_v[i]
             );
         }
     }

@@ -65,6 +65,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
                     length_scale: None,
                     power,
                     nullspace_order,
+                    double_penalty: false,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -141,6 +142,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                     length_scale: None,
                     power: 2,
                     nullspace_order: DuchonNullspaceOrder::Zero,
+                    double_penalty: false,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -262,6 +264,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
                     length_scale: Some(1.0),
                     power: 1,
                     nullspace_order: DuchonNullspaceOrder::Linear,
+                    double_penalty: false,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0; d]),
@@ -402,6 +405,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
                     length_scale: Some(1.0),
                     power: 1,
                     nullspace_order: DuchonNullspaceOrder::Linear,
+                    double_penalty: false,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0; d]),
