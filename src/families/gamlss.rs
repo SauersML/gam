@@ -7129,8 +7129,140 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         out
     }
 
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        // For the two-block row-coefficient operator
+        //   B v = [X_a^T (c_aa·u_a + c_ab·u_b),  X_b^T (c_ab·u_a + c_bb·u_b)]
+        // with u_a = X_a v_a, u_b = X_b v_b, the column-wise quadratic form is
+        //   F[:,k]^T B F[:,k] = u_a^T r_a + u_b^T r_b
+        //                    = Σ_i (c_aa[i] u_a[i]² + 2 c_ab[i] u_a[i] u_b[i]
+        //                            + c_bb[i] u_b[i]²)
+        // so the projected trace never needs the X^T r step that the default
+        // mul_vec path computes, and the per-row coefficients fold the K
+        // columns into a single weighted sum once U_a, U_b are formed.
+        self.assemble_two_block_projected_trace(factor)
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
+    ) -> f64 {
+        // Validate the factor row count up front. Without this, a caller that
+        // hands in a factor whose row count does not equal the joint p slips
+        // into the per-column `mul_vec` slicing where a `debug_assert_eq!`
+        // panics with the generic `left/right` message — that loses the
+        // operator identity and the (pa, pb) split which is the only useful
+        // diagnostic when the trace caller's own dimension bookkeeping is
+        // off. Validate at the operator boundary so the panic localises the
+        // caller, and so this contract is enforced in release builds too
+        // (the inner `debug_assert_eq!` is a debug-only safety net).
+        assert_eq!(
+            factor.nrows(),
+            self.dim,
+            "two-block cached projected trace factor row mismatch: factor rows={} \
+             but joint p={} (pa={}, pb={})",
+            factor.nrows(),
+            self.dim,
+            self.pa,
+            self.dim - self.pa,
+        );
+        self.assemble_two_block_projected_trace(factor)
+    }
+
     fn is_implicit(&self) -> bool {
         true
+    }
+}
+
+impl DesignTwoBlockRowCoeffOperator {
+    /// Compute `trace(F^T B F)` directly from per-row contributions.
+    ///
+    /// `B = X^T C X` decomposes into two design blocks (`X_a`, `X_b`) with
+    /// per-row coefficients `(c_aa, c_ab, c_bb)`. The default
+    /// `trace_projected_factor` path forms `B F` (which requires both `X v`
+    /// and `X^T r` per column) and then takes a Frobenius inner product with
+    /// `F`. The transpose-multiply step is redundant: the column quadratic
+    /// form factors through the row-space images
+    ///   `u_a[:,k] = X_a F_a[:,k],  u_b[:,k] = X_b F_b[:,k]`
+    /// so the trace collapses to a per-row weighted sum
+    ///   trace = Σ_i (c_aa[i] · Σ_k u_a[i,k]² + 2 c_ab[i] · Σ_k u_a[i,k] u_b[i,k]
+    ///                + c_bb[i] · Σ_k u_b[i,k]²).
+    /// This costs one `X v` per design block per factor column instead of
+    /// one `X v` plus one `X^T r` per column, halving the design-matrix
+    /// flops in the projected-trace hot path.
+    fn assemble_two_block_projected_trace(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.dim);
+        let n = self.nrows;
+        let pa = self.pa;
+        let dim = self.dim;
+        let k = factor.ncols();
+        if n == 0 || k == 0 {
+            return 0.0;
+        }
+        let f_a = factor.slice(s![0..pa, ..]);
+        let f_b = factor.slice(s![pa..dim, ..]);
+        // The trait default `mul_mat` already disables rayon when called from
+        // inside an existing rayon worker (`rayon::current_thread_index()` is
+        // `Some` in that case). Mirror that gating here so this path doesn't
+        // oversubscribe the worker pool when it is invoked from inside the
+        // outer-Hessian assembly's own par_iter scope.
+        let cols: Vec<(Array1<f64>, Array1<f64>)> = if rayon::current_thread_index().is_some() {
+            (0..k)
+                .map(|col| {
+                    let f_a_col = f_a.column(col).to_owned();
+                    let f_b_col = f_b.column(col).to_owned();
+                    let u_a = self.x_a.matrixvectormultiply(&f_a_col);
+                    let u_b = self.x_b.matrixvectormultiply(&f_b_col);
+                    debug_assert_eq!(u_a.len(), n);
+                    debug_assert_eq!(u_b.len(), n);
+                    (u_a, u_b)
+                })
+                .collect()
+        } else {
+            (0..k)
+                .into_par_iter()
+                .map(|col| {
+                    let f_a_col = f_a.column(col).to_owned();
+                    let f_b_col = f_b.column(col).to_owned();
+                    let u_a = self.x_a.matrixvectormultiply(&f_a_col);
+                    let u_b = self.x_b.matrixvectormultiply(&f_b_col);
+                    debug_assert_eq!(u_a.len(), n);
+                    debug_assert_eq!(u_b.len(), n);
+                    (u_a, u_b)
+                })
+                .collect()
+        };
+        let mut aa = vec![0.0_f64; n];
+        let mut ab = vec![0.0_f64; n];
+        let mut bb = vec![0.0_f64; n];
+        for (u_a, u_b) in &cols {
+            let ua = u_a.as_slice().expect("u_a contiguous");
+            let ub = u_b.as_slice().expect("u_b contiguous");
+            for i in 0..n {
+                let a = ua[i];
+                let b = ub[i];
+                aa[i] += a * a;
+                ab[i] += a * b;
+                bb[i] += b * b;
+            }
+        }
+        let c_aa = self
+            .c_aa
+            .as_slice()
+            .expect("c_aa is constructed contiguous");
+        let c_ab = self
+            .c_ab
+            .as_slice()
+            .expect("c_ab is constructed contiguous");
+        let c_bb = self
+            .c_bb
+            .as_slice()
+            .expect("c_bb is constructed contiguous");
+        let mut trace = 0.0;
+        for i in 0..n {
+            trace += c_aa[i] * aa[i] + 2.0 * c_ab[i] * ab[i] + c_bb[i] * bb[i];
+        }
+        trace
     }
 }
 
