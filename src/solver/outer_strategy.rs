@@ -1022,6 +1022,26 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     attempts
 }
 
+fn primary_capability_for_config(
+    mut cap: OuterCapability,
+    config: &OuterConfig,
+    context: &str,
+) -> OuterCapability {
+    if config.solver_class == SolverClass::Primary
+        && config.fallback_policy == FallbackPolicy::Disabled
+        && cap.gradient == Derivative::Analytic
+        && matches!(plan(&cap).solver, Solver::HybridEfs)
+    {
+        log::info!(
+            "[OUTER] {context}: HybridEFS requires the automatic first-order \
+             escape path for ψ coordinates; fallback is disabled, so routing the \
+             primary attempt to analytic-gradient BFGS"
+        );
+        cap.disable_fixed_point = true;
+    }
+    cap
+}
+
 /// Result of one outer objective evaluation.
 ///
 /// The Hessian field uses [`HessianResult`] instead of `Option<Array2<f64>>`
@@ -2801,7 +2821,7 @@ fn run_operator_trust_region(
 /// This is the single entry point that replaces the scattered optimizer wiring
 /// across estimate.rs, joint.rs, and custom_family.rs. It:
 ///
-/// 1. Queries the objective's capability declaration.
+/// 1. Queries and canonicalizes the objective's capability declaration.
 /// 2. Calls `plan()` to select solver + hessian source.
 /// 3. Logs the plan (so FD is never silent).
 /// 4. Generates seed candidates.
@@ -2818,7 +2838,7 @@ fn run_outer(
     config: &OuterConfig,
     context: &str,
 ) -> Result<OuterResult, EstimationError> {
-    let cap = obj.capability();
+    let cap = primary_capability_for_config(obj.capability(), config, context);
     cap.validate_layout(context)?;
     if let Some(initial_rho) = config.initial_rho.as_ref() {
         cap.theta_layout()
@@ -4464,15 +4484,16 @@ mod tests {
     }
 
     #[test]
-    fn biobank_exact_adaptive_hessian_gated_capability_exposes_hybrid_efs_trap() {
+    fn disabled_fallback_hybrid_efs_capability_routes_to_bfgs_primary() {
         // Production Matérn60 exact adaptive regularization at biobank scale:
         // rho_dim=3 retained quadratic penalties, psi_dim=6 adaptive λ/ε
         // coordinates, n_params=9, analytic gradient, and exact outer Hessian
-        // cost-gated unavailable. If the EFS hook remains advertised and the
-        // call site does not disable fixed-point planning, the planner selects
-        // HybridEfs. That is the precise failed mechanism: HybridEfs later
-        // emits the first-order marker, but exact adaptive had disabled the
-        // fallback ladder.
+        // cost-gated unavailable. Structurally this is HybridEFS-shaped, but
+        // HybridEFS with ψ coordinates is not a standalone primary solver: its
+        // ψ backtracking path can legitimately request the first-order escape
+        // ladder. If that ladder is disabled, the runner must route the primary
+        // attempt directly to BFGS instead of relying on call sites to remember
+        // `.with_disable_fixed_point(true)`.
         let trapped_cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Unavailable,
@@ -4485,21 +4506,35 @@ mod tests {
         };
         assert_eq!(plan(&trapped_cap).solver, Solver::HybridEfs);
 
+        let disabled_config = OuterConfig {
+            fallback_policy: FallbackPolicy::Disabled,
+            ..OuterConfig::default()
+        };
+        let primary_cap = primary_capability_for_config(
+            trapped_cap.clone(),
+            &disabled_config,
+            "biobank exact adaptive",
+        );
+        assert!(primary_cap.disable_fixed_point);
+        assert_eq!(plan(&primary_cap).solver, Solver::Bfgs);
+
+        let automatic_config = OuterConfig::default();
+        let automatic_cap = primary_capability_for_config(
+            trapped_cap.clone(),
+            &automatic_config,
+            "biobank exact adaptive",
+        );
+        assert!(!automatic_cap.disable_fixed_point);
+        assert_eq!(plan(&automatic_cap).solver, Solver::HybridEfs);
+
         let automatic_attempts = automatic_fallback_attempts(&trapped_cap);
         assert!(!automatic_attempts.is_empty());
         assert!(automatic_attempts[0].disable_fixed_point);
         assert_eq!(plan(&automatic_attempts[0]).solver, Solver::Bfgs);
-
-        let fixed_cap = OuterCapability {
-            disable_fixed_point: true,
-            ..trapped_cap
-        };
-        assert_eq!(plan(&fixed_cap).solver, Solver::Bfgs);
-        assert_eq!(plan(&fixed_cap).hessian_source, HessianSource::BfgsApprox);
     }
 
     #[test]
-    fn efs_first_order_marker_is_terminal_when_fallback_policy_disabled() {
+    fn disabled_fallback_hybrid_efs_problem_uses_bfgs_without_calling_efs() {
         let efs_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(9)
             .with_gradient(Derivative::Analytic)
@@ -4531,17 +4566,14 @@ mod tests {
             },
         );
 
-        let err = problem
+        let result = problem
             .run(&mut obj, "disabled fallback marker")
-            .expect_err("disabled fallback policy must surface the marker as a hard failure");
-        assert!(
-            err.to_string().contains(EFS_FIRST_ORDER_FALLBACK_MARKER),
-            "expected terminal marker error, got {err}"
-        );
+            .expect("disabled-fallback HybridEFS-shaped problem should route directly to BFGS");
+        assert_eq!(result.plan_used.solver, Solver::Bfgs);
         assert_eq!(
             efs_calls.load(Ordering::Relaxed),
-            1,
-            "marker should abort the HybridEFS attempt immediately"
+            0,
+            "central primary-capability canonicalization should avoid the EFS hook entirely"
         );
     }
 
