@@ -1779,8 +1779,6 @@ pub struct DuchonBasisSpec {
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
-    pub double_penalty: bool,
-    #[serde(default)]
     pub identifiability: SpatialIdentifiability,
     /// Per-axis anisotropy log-scales η_a.
     ///
@@ -7294,6 +7292,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     aniso_log_scales: &[f64],
     identifiability_transform: Option<&Array2<f64>>,
     operator_penalties: &DuchonOperatorPenaltySpec,
+    double_penalty: bool,
     workspace: &mut BasisWorkspace,
 ) -> Result<
     (
@@ -7974,9 +7973,8 @@ fn build_duchon_native_penalty_matrices(
     let poly_cols = polynomial_block_from_order(centers, nullspace_order).ncols();
     let total_cols = kernel_cols + poly_cols;
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let coeffs = length_scale.map(|ls| {
-        duchon_partial_fraction_coeffs(p_order, power, 1.0 / ls.max(1e-300))
-    });
+    let coeffs =
+        length_scale.map(|ls| duchon_partial_fraction_coeffs(p_order, power, 1.0 / ls.max(1e-300)));
     let center_center_r = compute_center_center_distances(centers);
     let mut omega = Array2::<f64>::zeros((k, k));
     for i in 0..k {
@@ -11354,7 +11352,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
         normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
     let (s2_norm, s2_norm_psi, s2_norm_psi_psi, c2) =
         normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
-    let candidates = vec![
+    let mut candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
             nullspace_dim_hint: 0,
@@ -11377,6 +11375,13 @@ fn build_duchon_operator_penalty_psi_derivatives(
             kronecker_factors: None,
         },
     ];
+    append_duchon_operator_double_penalty_candidate(
+        &mut candidates,
+        spec.double_penalty,
+        kernel_cols,
+        poly_cols,
+        identifiability_transform,
+    );
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     let penalties_derivative = active_operator_penalty_derivatives(
         &penaltyinfo,
@@ -12090,6 +12095,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         raw_eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
+        spec.double_penalty,
         &mut workspace,
     )?;
     let (penalties_first, penalties_second_diag, penalties_cross_pairs, penalties_cross_provider) =
@@ -12152,6 +12158,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
         eta,
         identifiability_transform.as_ref(),
         &spec.operator_penalties,
+        spec.double_penalty,
         &mut workspace,
     )?;
 
@@ -19251,6 +19258,7 @@ mod tests {
             length_scale: Some(1.0),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -19266,7 +19274,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
+    fn test_duchon_basis_spec_deserializes_double_penalty_field() {
         let payload = r#"{
             "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
             "length_scale": 1.0,
@@ -19275,12 +19283,9 @@ mod tests {
             "double_penalty": true
         }"#;
 
-        let err = serde_json::from_str::<DuchonBasisSpec>(payload)
-            .expect_err("stale Duchon double_penalty must not deserialize");
-        assert!(
-            err.to_string().contains("unknown field `double_penalty`"),
-            "unexpected error: {err}"
-        );
+        let spec = serde_json::from_str::<DuchonBasisSpec>(payload)
+            .expect("Duchon double_penalty should deserialize");
+        assert!(spec.double_penalty);
     }
 
     #[test]
@@ -19298,6 +19303,7 @@ mod tests {
             length_scale: Some(1.0),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -19341,6 +19347,7 @@ mod tests {
             length_scale: None,
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -19353,6 +19360,34 @@ mod tests {
     }
 
     #[test]
+    fn test_build_pure_duchon_basis_double_penalty_adds_nullspace_block() {
+        let data = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: true,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        assert_eq!(out.penaltyinfo.len(), 2);
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+        assert!(matches!(
+            out.penaltyinfo[1].source,
+            PenaltySource::DoublePenaltyNullspace
+        ));
+    }
+
+    #[test]
     fn test_build_duchon_basis_linear_nullspace_uses_operator_penalty_triplet() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
@@ -19360,6 +19395,7 @@ mod tests {
             length_scale: Some(1.0),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -20126,6 +20162,7 @@ mod tests {
             length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -20206,6 +20243,7 @@ mod tests {
             length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -20988,6 +21026,7 @@ mod tests {
             length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21048,6 +21087,7 @@ mod tests {
             length_scale: Some(0.9),
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: Some(vec![0.0, 0.0]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21108,6 +21148,7 @@ mod tests {
             length_scale: None,
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.1, -0.1]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21147,6 +21188,7 @@ mod tests {
             length_scale: None,
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21190,6 +21232,7 @@ mod tests {
             length_scale: None,
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta.clone()),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21305,6 +21348,7 @@ mod tests {
             length_scale: None,
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.05, -0.15]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21436,6 +21480,7 @@ mod tests {
             length_scale: None,
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Zero,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
@@ -21468,6 +21513,7 @@ mod tests {
             length_scale: None,
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Zero,
+            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
