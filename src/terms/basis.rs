@@ -13818,12 +13818,33 @@ pub fn build_duchon_basiswithworkspace(
     // Duchon radial basis with triple operator regularization. These are
     // collocation operator penalties on the fitted function, not the native
     // Fourier-space Duchon seminorm.
-    let candidates = operator_penalty_candidates_from_collocation(
+    let mut candidates = operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
         &ops.d2,
         &spec.operator_penalties,
     );
+    if spec.double_penalty && poly_cols > 0 {
+        let pre_z_cols = kernel_transform.ncols() + poly_cols;
+        let mut ridge_pre_z = Array2::<f64>::zeros((pre_z_cols, pre_z_cols));
+        for i in kernel_transform.ncols()..pre_z_cols {
+            ridge_pre_z[[i, i]] = 1.0;
+        }
+        let ridge = if let Some(z) = identifiability_transform.as_ref() {
+            symmetrize(&fast_ab(&fast_atb(z, &ridge_pre_z), z))
+        } else {
+            ridge_pre_z
+        };
+        if ridge.iter().any(|v| v.abs() > 0.0) {
+            candidates.push(PenaltyCandidate {
+                matrix: ridge,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            });
+        }
+    }
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
