@@ -4612,11 +4612,7 @@ mod tk_math_tests {
 
     #[test]
     fn penalty_rank_uses_actual_positive_eigenspace_not_root_rows() {
-        let e = array![
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-        ];
+        let e = array![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0],];
         let s = e.t().dot(&e);
         let (evals, _) = s.eigh(Side::Lower).expect("penalty eigensystem");
         let (rank, log_det) = positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
