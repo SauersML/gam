@@ -4464,6 +4464,88 @@ mod tests {
     }
 
     #[test]
+    fn biobank_exact_adaptive_hessian_gated_capability_exposes_hybrid_efs_trap() {
+        // Production Matérn60 exact adaptive regularization at biobank scale:
+        // rho_dim=3 retained quadratic penalties, psi_dim=6 adaptive λ/ε
+        // coordinates, n_params=9, analytic gradient, and exact outer Hessian
+        // cost-gated unavailable. If the EFS hook remains advertised and the
+        // call site does not disable fixed-point planning, the planner selects
+        // HybridEfs. That is the precise failed mechanism: HybridEfs later
+        // emits the first-order marker, but exact adaptive had disabled the
+        // fallback ladder.
+        let trapped_cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: Derivative::Unavailable,
+            n_params: 9,
+            psi_dim: 6,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        assert_eq!(plan(&trapped_cap).solver, Solver::HybridEfs);
+
+        let automatic_attempts = automatic_fallback_attempts(&trapped_cap);
+        assert!(!automatic_attempts.is_empty());
+        assert!(automatic_attempts[0].disable_fixed_point);
+        assert_eq!(plan(&automatic_attempts[0]).solver, Solver::Bfgs);
+
+        let fixed_cap = OuterCapability {
+            disable_fixed_point: true,
+            ..trapped_cap
+        };
+        assert_eq!(plan(&fixed_cap).solver, Solver::Bfgs);
+        assert_eq!(plan(&fixed_cap).hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
+    fn efs_first_order_marker_is_terminal_when_fallback_policy_disabled() {
+        let efs_calls = Arc::new(AtomicUsize::new(0));
+        let problem = OuterProblem::new(9)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(Derivative::Unavailable)
+            .with_psi_dim(6)
+            .with_fallback_policy(FallbackPolicy::Disabled)
+            .with_initial_rho(Array1::zeros(9))
+            .with_max_iter(5);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(0.5 * theta.dot(theta)),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.5 * theta.dot(theta),
+                    gradient: theta.clone(),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            None::<fn(&mut ())>,
+            {
+                let efs_calls = Arc::clone(&efs_calls);
+                Some(move |_: &mut (), _: &Array1<f64>| {
+                    efs_calls.fetch_add(1, Ordering::Relaxed);
+                    Err(EstimationError::RemlOptimizationFailed(format!(
+                        "{} synthetic biobank adaptive HybridEFS escape",
+                        EFS_FIRST_ORDER_FALLBACK_MARKER,
+                    )))
+                })
+            },
+        );
+
+        let err = problem
+            .run(&mut obj, "disabled fallback marker")
+            .expect_err("disabled fallback policy must surface the marker as a hard failure");
+        assert!(
+            err.to_string().contains(EFS_FIRST_ORDER_FALLBACK_MARKER),
+            "expected terminal marker error, got {err}"
+        );
+        assert_eq!(
+            efs_calls.load(Ordering::Relaxed),
+            1,
+            "marker should abort the HybridEFS attempt immediately"
+        );
+    }
+
+    #[test]
     fn automatic_fallbacks_without_gradient_stop_at_fixed_point_status() {
         for (psi_dim, expected_solver) in [(0, Solver::Efs), (2, Solver::HybridEfs)] {
             let cap = OuterCapability {
