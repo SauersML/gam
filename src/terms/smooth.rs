@@ -14680,8 +14680,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 3);
-        assert_eq!(sd.nullspace_dims.len(), 3);
+        assert_eq!(sd.penalties.len(), 4);
+        assert_eq!(sd.nullspace_dims.len(), 4);
     }
 
     #[test]
@@ -19106,7 +19106,7 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
-        assert_eq!(design.penalties.len(), 3);
+        assert_eq!(design.penalties.len(), 4);
         let caches =
             extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
         assert_eq!(caches.len(), 1);

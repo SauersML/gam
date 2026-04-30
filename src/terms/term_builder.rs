@@ -465,6 +465,11 @@ pub fn build_smooth_basis(
             } else {
                 None
             };
+            let mut operator_penalties = DuchonOperatorPenaltySpec::default();
+            if !option_bool(options, "function_variance").unwrap_or(true) {
+                operator_penalties.function_variance =
+                    crate::terms::basis::OperatorPenaltySpec::Disabled;
+            }
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
@@ -474,7 +479,7 @@ pub fn build_smooth_basis(
                     nullspace_order,
                     identifiability: parse_spatial_identifiability(options)?,
                     aniso_log_scales,
-                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    operator_penalties,
                 },
                 input_scales: None,
             })
