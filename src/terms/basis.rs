@@ -1768,6 +1768,7 @@ pub enum DuchonNullspaceOrder {
 /// Duchon-like basis configuration with explicit low-frequency null-space
 /// control and explicit spectral power.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuchonBasisSpec {
     pub center_strategy: CenterStrategy,
     /// Optional hybrid Matérn width. `None` means pure scale-free Duchon with
@@ -1777,6 +1778,8 @@ pub struct DuchonBasisSpec {
     /// Integer spectral power `s`.
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
+    #[serde(default)]
+    pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
     /// Per-axis anisotropy log-scales η_a.
@@ -7855,6 +7858,47 @@ fn operator_penalty_candidates_from_collocation(
     out
 }
 
+fn duchon_polynomial_shrinkage_candidate(
+    kernel_cols: usize,
+    poly_cols: usize,
+    identifiability_transform: Option<&Array2<f64>>,
+) -> Option<PenaltyCandidate> {
+    if poly_cols == 0 {
+        return None;
+    }
+    let total_cols = kernel_cols + poly_cols;
+    let mut ridge = Array2::<f64>::zeros((total_cols, total_cols));
+    for col in kernel_cols..total_cols {
+        ridge[[col, col]] = 1.0;
+    }
+    let projected = project_penalty_matrix(&ridge, identifiability_transform);
+    if projected.iter().all(|v| v.abs() <= 1e-12) {
+        return None;
+    }
+    Some(normalize_penalty_candidate(
+        projected,
+        0,
+        PenaltySource::DoublePenaltyNullspace,
+    ))
+}
+
+fn append_duchon_operator_double_penalty_candidate(
+    candidates: &mut Vec<PenaltyCandidate>,
+    double_penalty: bool,
+    kernel_cols: usize,
+    poly_cols: usize,
+    identifiability_transform: Option<&Array2<f64>>,
+) {
+    if !double_penalty {
+        return;
+    }
+    if let Some(candidate) =
+        duchon_polynomial_shrinkage_candidate(kernel_cols, poly_cols, identifiability_transform)
+    {
+        candidates.push(candidate);
+    }
+}
+
 fn active_operator_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     operator_derivatives: &[Array2<f64>],
@@ -7955,6 +7999,55 @@ fn build_thin_plate_penalty_matrices(
         None
     };
     Ok((penalty_bending, penalty_ridge))
+}
+
+fn build_duchon_native_penalty_matrices(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    kernel_transform: &Array2<f64>,
+    double_penalty: bool,
+) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let kernel_cols = kernel_transform.ncols();
+    let poly_cols = polynomial_block_from_order(centers, nullspace_order).ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let coeffs = length_scale.map(|ls| {
+        duchon_partial_fraction_coeffs(p_order, power, 1.0 / ls.max(1e-300))
+    });
+    let center_center_r = compute_center_center_distances(centers);
+    let mut omega = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let kij = duchon_matern_kernel_general_from_distance(
+                center_center_r[[i, j]],
+                length_scale,
+                p_order,
+                power,
+                d,
+                coeffs.as_ref(),
+            )?;
+            omega[[i, j]] = kij;
+            omega[[j, i]] = kij;
+        }
+    }
+    let omega_constrained = {
+        let zt_o = fast_atb(kernel_transform, &omega);
+        symmetrize_penalty(&fast_ab(&zt_o, kernel_transform))
+    };
+    let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_kernel
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega_constrained);
+    let penalty_ridge = if double_penalty {
+        build_nullspace_shrinkage_penalty(&penalty_kernel)?.map(|block| block.sym_penalty)
+    } else {
+        None
+    };
+    Ok((penalty_kernel, penalty_ridge))
 }
 
 fn build_matern_kernel_penalty(
@@ -13815,15 +13908,47 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    // Duchon radial basis with triple operator regularization. These are
-    // collocation operator penalties on the fitted function, not the native
-    // Fourier-space Duchon seminorm.
-    let candidates = operator_penalty_candidates_from_collocation(
-        &ops.d0,
-        &ops.d1,
-        &ops.d2,
-        &spec.operator_penalties,
-    );
+    let candidates = if spec.length_scale.is_none() && aniso.is_none() {
+        let (penalty_kernel, penalty_ridge) = build_duchon_native_penalty_matrices(
+            centers.view(),
+            spec.length_scale,
+            spec.power,
+            effective_nullspace_order,
+            &kernel_transform,
+            spec.double_penalty,
+        )?;
+        let mut out = vec![normalize_penalty_candidate(
+            project_penalty_matrix(&penalty_kernel, identifiability_transform.as_ref()),
+            poly_cols,
+            PenaltySource::Primary,
+        )];
+        if let Some(penalty_ridge) = penalty_ridge {
+            out.push(normalize_penalty_candidate(
+                project_penalty_matrix(&penalty_ridge, identifiability_transform.as_ref()),
+                0,
+                PenaltySource::DoublePenaltyNullspace,
+            ));
+        }
+        out
+    } else {
+        // Hybrid/anisotropic Duchon uses collocation operator penalties because
+        // the exact width/axis derivative path is built around these operator
+        // images.
+        let mut out = operator_penalty_candidates_from_collocation(
+            &ops.d0,
+            &ops.d1,
+            &ops.d2,
+            &spec.operator_penalties,
+        );
+        append_duchon_operator_double_penalty_candidate(
+            &mut out,
+            spec.double_penalty,
+            kernel_transform.ncols(),
+            poly_cols,
+            identifiability_transform.as_ref(),
+        );
+        out
+    };
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -19178,6 +19303,24 @@ mod tests {
             } => assert!(identifiability_transform.is_some()),
             other => panic!("expected Duchon metadata, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
+        let payload = r#"{
+            "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
+            "length_scale": 1.0,
+            "power": 2,
+            "nullspace_order": "Linear",
+            "double_penalty": false
+        }"#;
+
+        let err = serde_json::from_str::<DuchonBasisSpec>(payload)
+            .expect_err("stale Duchon double_penalty must not deserialize");
+        assert!(
+            err.to_string().contains("unknown field `double_penalty`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
