@@ -543,6 +543,11 @@ where
 
     let baseline_seed = clamp_vec(rho_seed);
     let baseline_cost = eval_reml(&baseline_seed);
+    log::info!(
+        "[PREPASS] base rho={:?} cost={:?}",
+        baseline_seed.as_slice().unwrap_or(&[]),
+        baseline_cost
+    );
 
     let shifts: [f64; 9] = [-12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0];
     let mut best_seed = baseline_seed.clone();
@@ -556,7 +561,9 @@ where
         for i in 0..n_smooths {
             candidate[i] = clamp_to_bounds(rho_seed[i] + delta, bnds);
         }
-        if let Some(c) = eval_reml(&candidate)
+        let c_opt = eval_reml(&candidate);
+        log::info!("[PREPASS] d={:+.0} cost={:?}", delta, c_opt);
+        if let Some(c) = c_opt
             && c.is_finite()
             && best_cost.map(|b| c < b).unwrap_or(true)
         {
