@@ -189,8 +189,6 @@ pub struct TransformationNormalFamily {
     offset: Arc<Array1<f64>>,
     // --- Tensor penalties ---
     tensor_penalties: Vec<PenaltyMatrix>,
-    /// Constant `X_val^T W X_val` term reused across all Newton steps.
-    x_val_weighted_gram: Array2<f64>,
 
     // --- Initial values ---
     initial_beta: Array1<f64>,
@@ -585,7 +583,6 @@ impl TransformationNormalFamily {
             weights: Arc::new(weights.clone()),
             offset: Arc::new(offset.clone()),
             tensor_penalties,
-            x_val_weighted_gram,
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
@@ -744,7 +741,6 @@ impl TransformationNormalFamily {
             weights: Arc::new(weights.clone()),
             offset: Arc::new(offset.clone()),
             tensor_penalties,
-            x_val_weighted_gram,
             initial_beta,
             initial_log_lambdas,
             block_name: "transformation".to_string(),
