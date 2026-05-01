@@ -3684,6 +3684,7 @@ where
                 HessianCurvatureKind::Fisher
             };
         let mut used_fisher_fallback_this_iter = false;
+        let curvature_start = std::time::Instant::now();
         let mut state = match model.update_with_curvature(&beta, preferred_curvature) {
             Ok(state) => state,
             Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
@@ -3696,6 +3697,12 @@ where
             }
             Err(err) => return Err(err),
         };
+        log::info!(
+            "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s",
+            iter,
+            preferred_curvature,
+            curvature_start.elapsed().as_secs_f64(),
+        );
         let current_penalized = penalizedobjective(&state);
         if current_penalized.is_finite() && current_penalized < min_penalized_deviance {
             min_penalized_deviance = current_penalized;

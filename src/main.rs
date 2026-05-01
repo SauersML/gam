@@ -581,6 +581,13 @@ fn main() {
 
 fn run() -> CliResult<()> {
     gam::visualizer::init_logging();
+    log::info!(
+        "[STAGE] runtime threads | rayon_current_num_threads={} | std_available_parallelism={}",
+        rayon::current_num_threads(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+    );
     let cli = Cli::parse();
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),
