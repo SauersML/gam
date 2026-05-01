@@ -519,6 +519,73 @@ pub fn generate_rho_candidates(
     seeds
 }
 
+pub fn coarse_grid_log_lambda_seed<F>(
+    rho_seed: &Array1<f64>,
+    bounds: (f64, f64),
+    n_smooths: usize,
+    mut eval_reml: F,
+) -> Array1<f64>
+where
+    F: FnMut(&Array1<f64>) -> Option<f64>,
+{
+    let k = rho_seed.len();
+    if k == 0 || n_smooths == 0 || n_smooths > k {
+        return rho_seed.clone();
+    }
+    let bnds = normalize_bounds(bounds);
+    let clamp_vec = |v: &Array1<f64>| -> Array1<f64> {
+        let mut out = v.clone();
+        for i in 0..n_smooths {
+            out[i] = clamp_to_bounds(out[i], bnds);
+        }
+        out
+    };
+
+    let baseline_seed = clamp_vec(rho_seed);
+    let baseline_cost = eval_reml(&baseline_seed);
+
+    let shifts: [f64; 9] = [-12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0];
+    let mut best_seed = baseline_seed.clone();
+    let mut best_cost: Option<f64> = baseline_cost.filter(|c| c.is_finite());
+
+    for &delta in &shifts {
+        if delta == 0.0 && best_cost.is_some() {
+            continue;
+        }
+        let mut candidate = rho_seed.clone();
+        for i in 0..n_smooths {
+            candidate[i] = clamp_to_bounds(rho_seed[i] + delta, bnds);
+        }
+        if let Some(c) = eval_reml(&candidate)
+            && c.is_finite()
+            && best_cost.map(|b| c < b).unwrap_or(true)
+        {
+            best_cost = Some(c);
+            best_seed = candidate;
+        }
+    }
+
+    if n_smooths <= 6 {
+        let per_axis_shifts: [f64; 2] = [-3.0, 3.0];
+        for axis in 0..n_smooths {
+            let anchor = best_seed.clone();
+            for &delta in &per_axis_shifts {
+                let mut candidate = anchor.clone();
+                candidate[axis] = clamp_to_bounds(anchor[axis] + delta, bnds);
+                if let Some(c) = eval_reml(&candidate)
+                    && c.is_finite()
+                    && best_cost.map(|b| c < b).unwrap_or(true)
+                {
+                    best_cost = Some(c);
+                    best_seed = candidate;
+                }
+            }
+        }
+    }
+
+    best_seed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
