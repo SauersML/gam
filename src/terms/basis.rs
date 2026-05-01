@@ -19509,32 +19509,39 @@ pub mod closed_form_penalty {
             }
         }
 
-        // χ-gate: switch any cancelled order to the Taylor recurrence
-        // (per-derivative-order analogue of `isotropic_duchon_penalty`'s
-        // χ-gate at value level). We replace order-by-order so the
-        // well-conditioned orders keep the literal sum.
+        // χ-gate: switch all derivative orders to the Taylor recurrence
+        // (analogue of `isotropic_duchon_penalty`'s value-level χ-gate). The
+        // Taylor representation must be applied consistently across orders —
+        // mixing literal-sum entries with Taylor ones would produce a fr
+        // table that no longer represents the same analytic kernel and
+        // breaks the (-Δ_B)^q chain that consumes it.
         let kappa_r = kappa * r;
         let x_taylor = kappa_r * kappa_r;
-        if x_taylor < 1.5 {
+        let chi_value = if total[0].abs() > 0.0 {
+            max_term_per_order[0] / total[0].abs()
+        } else {
+            f64::INFINITY
+        };
+        if x_taylor < 1.5 && chi_value > 1.0e4 {
+            let mut taylor_table = vec![0.0_f64; max_order + 1];
+            let mut all_ok = true;
             for k in 0..=max_order {
-                let chi_k = if total[k].abs() > 0.0 {
-                    max_term_per_order[k] / total[k].abs()
+                if let Some(v) = finite_part_duchon_taylor_odd_d_derivative(d, a, b, kappa, r, k)
+                {
+                    taylor_table[k] = v;
                 } else {
-                    f64::INFINITY
-                };
-                if chi_k > 1.0e4 {
-                    if let Some(taylor_k) =
-                        finite_part_duchon_taylor_odd_d_derivative(d, a, b, kappa, r, k)
-                    {
-                        total[k] = taylor_k;
-                    } else if kappa_r < 0.5 {
-                        let limit_block = riesz_block_radial_derivatives(d, a + b, r, max_order);
-                        if let Some(&v) = limit_block.get(k) {
-                            if v.is_finite() {
-                                total[k] = v;
-                            }
-                        }
-                    }
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                total = taylor_table;
+            } else if kappa_r < 0.5 {
+                // Leading-Riesz κ→0 limit fallback (same as iso path), one
+                // block providing all needed derivatives consistently.
+                let limit_block = riesz_block_radial_derivatives(d, a + b, r, max_order);
+                if limit_block.iter().all(|v| v.is_finite()) {
+                    total = limit_block;
                 }
             }
         }

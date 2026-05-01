@@ -1867,6 +1867,206 @@ impl TransformationNormalFamily {
         })
     }
 
+    fn scop_psi_hessian_directional_derivative(
+        &self,
+        beta: &Array1<f64>,
+        direction: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        op: &TensorKroneckerPsiOperator,
+        axis: usize,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || direction.len() != p_total {
+            return Err(format!(
+                "SCOP psi Hessian directional derivative length mismatch: beta={}, direction={}, expected={p_total}",
+                beta.len(),
+                direction.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi hessian beta reshape failed: {e}"))?;
+        let dir_mat = direction
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi hessian direction reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP psi hessian direction requires covariate row chunk: {e}"))?;
+        let cov_psi = op
+            .materialize_cov_first_axis(axis)
+            .map_err(|e| format!("SCOP psi hessian materialize_cov_first failed: {e}"))?;
+        if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi hessian covariate derivative shape {}x{} != expected {}x{}",
+                cov_psi.nrows(),
+                cov_psi.ncols(),
+                n,
+                p_cov
+            ));
+        }
+
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut out = Array2::<f64>::zeros((p_total, p_total));
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let psi_row = cov_psi.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+            let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+            let d_inv_hp = -inv_hp_sq;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_dir = vec![0.0; p_resp];
+            let mut gamma_psi = vec![0.0; p_resp];
+            let mut gamma_psi_dir = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
+            }
+
+            let mut h_dir = rv[0] * gamma_dir[0];
+            let mut hp_dir = rd[0] * gamma_dir[0];
+            let mut h_psi = rv[0] * gamma_psi[0];
+            let mut hp_psi = rd[0] * gamma_psi[0];
+            let mut h_psi_dir = rv[0] * gamma_psi_dir[0];
+            let mut hp_psi_dir = rd[0] * gamma_psi_dir[0];
+            for k in 1..p_resp {
+                h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
+                hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
+                h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
+                hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+                h_psi_dir +=
+                    2.0 * rv[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+                hp_psi_dir +=
+                    2.0 * rd[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+            }
+            let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
+            let d_inv_hp_cu = -3.0 * hp_dir * inv_hp_qu;
+
+            let mut h_factor = vec![0.0; p_resp];
+            let mut hp_factor = vec![0.0; p_resp];
+            let mut h_factor_dir = vec![0.0; p_resp];
+            let mut hp_factor_dir = vec![0.0; p_resp];
+            let mut hpsi_cov_factor = vec![0.0; p_resp];
+            let mut hppsi_cov_factor = vec![0.0; p_resp];
+            let mut hpsi_psi_factor = vec![0.0; p_resp];
+            let mut hppsi_psi_factor = vec![0.0; p_resp];
+            let mut hpsi_cov_factor_dir = vec![0.0; p_resp];
+            let mut hppsi_cov_factor_dir = vec![0.0; p_resp];
+            let mut hpsi_psi_factor_dir = vec![0.0; p_resp];
+            let mut hppsi_psi_factor_dir = vec![0.0; p_resp];
+
+            h_factor[0] = rv[0];
+            hp_factor[0] = rd[0];
+            hpsi_psi_factor[0] = rv[0];
+            hppsi_psi_factor[0] = rd[0];
+            for k in 1..p_resp {
+                h_factor[k] = 2.0 * rv[k] * gamma[k];
+                hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
+                hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+                hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
+                hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
+                hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
+                hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+                hpsi_cov_factor_dir[k] = 2.0 * rv[k] * gamma_psi_dir[k];
+                hppsi_cov_factor_dir[k] = 2.0 * rd[k] * gamma_psi_dir[k];
+                hpsi_psi_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
+                hppsi_psi_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+            }
+
+            for k in 0..p_resp {
+                for l in 0..p_resp {
+                    let same_shape = k == l && k > 0;
+                    for c in 0..p_cov {
+                        let row_idx = k * p_cov + c;
+                        let h_a = h_factor[k] * cov_row[c];
+                        let hp_a = hp_factor[k] * cov_row[c];
+                        let h_a_dir = h_factor_dir[k] * cov_row[c];
+                        let hp_a_dir = hp_factor_dir[k] * cov_row[c];
+                        let hpsi_a =
+                            hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
+                        let hppsi_a =
+                            hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                        let hpsi_a_dir = hpsi_cov_factor_dir[k] * cov_row[c]
+                            + hpsi_psi_factor_dir[k] * psi_row[c];
+                        let hppsi_a_dir = hppsi_cov_factor_dir[k] * cov_row[c]
+                            + hppsi_psi_factor_dir[k] * psi_row[c];
+                        for d in 0..p_cov {
+                            let col_idx = l * p_cov + d;
+                            let h_b = h_factor[l] * cov_row[d];
+                            let hp_b = hp_factor[l] * cov_row[d];
+                            let h_b_dir = h_factor_dir[l] * cov_row[d];
+                            let hp_b_dir = hp_factor_dir[l] * cov_row[d];
+                            let hpsi_b =
+                                hpsi_cov_factor[l] * cov_row[d] + hpsi_psi_factor[l] * psi_row[d];
+                            let hppsi_b =
+                                hppsi_cov_factor[l] * cov_row[d] + hppsi_psi_factor[l] * psi_row[d];
+                            let hpsi_b_dir = hpsi_cov_factor_dir[l] * cov_row[d]
+                                + hpsi_psi_factor_dir[l] * psi_row[d];
+                            let hppsi_b_dir = hppsi_cov_factor_dir[l] * cov_row[d]
+                                + hppsi_psi_factor_dir[l] * psi_row[d];
+                            let (h_ab, hp_ab, hpsi_ab, hppsi_ab) = if same_shape {
+                                (
+                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
+                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
+                                    2.0 * rv[k]
+                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                    2.0 * rd[k]
+                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                )
+                            } else {
+                                (0.0, 0.0, 0.0, 0.0)
+                            };
+                            let numerator = hppsi_a * hp_b + hp_a * hppsi_b;
+                            let numerator_dir = hppsi_a_dir * hp_b
+                                + hppsi_a * hp_b_dir
+                                + hp_a_dir * hppsi_b
+                                + hp_a * hppsi_b_dir;
+                            let barrier_product = hp_a * hp_b * hp_psi;
+                            let barrier_product_dir =
+                                hp_a_dir * hp_b * hp_psi + hp_a * hp_b_dir * hp_psi
+                                    + hp_a * hp_b * hp_psi_dir;
+                            let value = hpsi_a_dir * h_b
+                                + hpsi_a * h_b_dir
+                                + h_a_dir * hpsi_b
+                                + h_a * hpsi_b_dir
+                                + h_psi_dir * h_ab
+                                + h_dir * hpsi_ab
+                                + numerator_dir * inv_hp_sq
+                                + numerator * d_inv_hp_sq
+                                - 2.0 * (barrier_product_dir * inv_hp_cu
+                                    + barrier_product * d_inv_hp_cu)
+                                - hppsi_ab * d_inv_hp
+                                + hp_ab * hp_psi_dir * inv_hp_sq
+                                + hp_ab * hp_psi * d_inv_hp_sq;
+                            out[[row_idx, col_idx]] += wi * value;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(0.5 * (&out + &out.t()))
+    }
+
     /// Cached per-axis `forward_mul(axis, β)` against the value response basis.
     ///
     /// First call for a given β allocates a `PsiAxisVectorCache` with `q` empty
@@ -2847,11 +3047,6 @@ impl CustomFamily for TransformationNormalFamily {
         }
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
-        let d_h_prime = self.x_deriv_kron.forward_mul(d_beta_flat);
-        let inv_h_prime_cu = h_prime.mapv(|v| 1.0 / (v * v * v));
-        let inv_h_prime_qu = h_prime.mapv(|v| 1.0 / (v * v * v * v));
-
         let op = deriv
             .implicit_operator
             .as_ref()
@@ -2861,48 +3056,9 @@ impl CustomFamily for TransformationNormalFamily {
                     .to_string()
             })?;
         let axis = deriv.implicit_axis;
-
-        let v_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis, beta)?;
-        let v_deriv: &Array1<f64> = v_deriv_arc.as_ref();
-        let d_v_deriv = op.forward_mul_deriv(axis, d_beta_flat).map_err(|e| {
-            format!("tensor psi hessian drift directional forward_mul_deriv failed: {e}")
-        })?;
-
-        let policy = &self.policy;
-        let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
-            "TransformationNormalFamily hessian drift requires dense covariate design".to_string()
-        })?;
-        let cov_psi = op
-            .materialize_cov_first(axis)
-            .map_err(|e| format!("tensor psi hessian drift materialize_cov_first failed: {e}"))?;
-        let resp_deriv = op.response_deriv_basis.as_ref();
-
-        let cubic_h = ((&d_h_prime * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-        let mut hess = factored_weighted_cross(
-            resp_deriv,
-            &cov_psi,
-            cubic_h.view(),
-            resp_deriv,
-            cov_design_dense,
-            policy,
-        )?;
-        hess += &factored_weighted_cross(
-            resp_deriv,
-            cov_design_dense,
-            cubic_h.view(),
-            resp_deriv,
-            &cov_psi,
-            policy,
-        )?;
-
-        let cubic_v = ((&d_v_deriv * &inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-        hess += &self.x_deriv_kron.weighted_gram(&cubic_v, &self.policy);
-
-        let quartic =
-            ((v_deriv * &d_h_prime) * &inv_h_prime_qu * self.weights.as_ref()).mapv(|v| 6.0 * v);
-        hess += &self.x_deriv_kron.weighted_gram(&quartic, &self.policy);
-
-        Ok(Some(0.5 * (&hess + &hess.t())))
+        let row = self.row_quantities(beta)?;
+        let hess = self.scop_psi_hessian_directional_derivative(beta, d_beta_flat, &row, op, axis)?;
+        Ok(Some(hess))
     }
 
     fn exact_newton_joint_hessian_workspace(
@@ -5831,6 +5987,43 @@ mod tests {
         (design, vec![deriv_a, deriv_b])
     }
 
+    /// Minimal SCOP-CTN config used by every toy fixture in this test module:
+    /// degree-1 I-splines on 2 internal knots produce the smallest valid
+    /// SCOP-CTN configuration (p_resp = 4 monotone basis columns).
+    fn toy_scop_ctn_config() -> TransformationNormalConfig {
+        TransformationNormalConfig {
+            double_penalty: false,
+            response_degree: 1,
+            response_num_internal_knots: 2,
+            ..TransformationNormalConfig::default()
+        }
+    }
+
+    /// Build (val, deriv, knots, transform, p_resp) from a real
+    /// `build_response_basis` call so test fixtures match the production
+    /// I-spline contract exactly.
+    fn toy_response_basis(
+        response: &Array1<f64>,
+    ) -> (Array2<f64>, Array2<f64>, Array1<f64>, Array2<f64>, usize) {
+        let config = toy_scop_ctn_config();
+        let (val, deriv, _penalties, knots, transform) =
+            build_response_basis(response, &config).expect("toy response basis builds");
+        let p_resp = val.ncols();
+        (val, deriv, knots, transform, p_resp)
+    }
+
+    /// Deterministic probe vector of length `p_total` used by tests that
+    /// previously hand-rolled p_total=4 arrays. Generated from a tiny PRNG so
+    /// each call with a different seed yields linearly-independent probes.
+    fn toy_probe_vector(p_total: usize, seed: u64) -> Array1<f64> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        Array1::from_iter((0..p_total).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let bits = (state >> 11) as f64 / (1u64 << 53) as f64;
+            (bits - 0.5) * 0.8
+        }))
+    }
+
     fn toy_family_and_derivatives(
         psi: &Array1<f64>,
     ) -> (
@@ -5839,34 +6032,47 @@ mod tests {
         ParameterBlockState,
         ParameterBlockSpec,
     ) {
-        let response_val_basis = array![[1.0, -1.0], [1.0, -0.2], [1.0, 0.6], [1.0, 1.3],];
-        let response_deriv_basis = array![[0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0],];
-        let response = Array1::zeros(response_val_basis.nrows());
-        let weights = Array1::from_elem(response_val_basis.nrows(), 1.0);
-        let offset = Array1::zeros(response_val_basis.nrows());
+        let response = array![-1.0, -0.2, 0.6, 1.3];
+        let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
+        let weights = Array1::from_elem(response.len(), 1.0);
+        let offset = Array1::zeros(response.len());
         let (cov_design, cov_derivs) = toy_covariate_design_and_derivs(psi);
+        let p_cov = cov_design.ncols();
+        let p_total = p_resp * p_cov;
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             &response,
-            response_val_basis,
-            response_deriv_basis,
+            val_basis,
+            deriv_basis,
             vec![],
-            Array1::zeros(0),
-            1,
-            Array2::zeros((0, 0)),
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
             &weights,
             &offset,
             DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
             vec![],
-            &TransformationNormalConfig {
-                double_penalty: false,
-                ..TransformationNormalConfig::default()
-            },
+            &toy_scop_ctn_config(),
             None,
         )
         .expect("toy transformation family");
         let derivative_blocks =
             vec![build_tensor_psi_derivatives(&family, &cov_derivs).expect("tensor psi derivs")];
-        let beta = array![0.15, -0.05, 0.80, 0.30];
+        // Positive γ across the response axis with mild covariate variation so
+        // h' = (M ⊗_row B_cov)·β stays strictly positive on every row (M-splines
+        // are non-negative; the toy covariate design is positive-valued).
+        let mut beta_vec = Vec::with_capacity(p_total);
+        for k in 0..p_resp {
+            let base = 0.6 + 0.05 * k as f64;
+            for j in 0..p_cov {
+                if j == 0 {
+                    beta_vec.push(base);
+                } else {
+                    beta_vec.push(0.05 + 0.02 * k as f64 * (j as f64));
+                }
+            }
+        }
+        let beta = Array1::from(beta_vec);
+        assert_eq!(beta.len(), p_total);
         let h_prime = family.x_deriv_kron.forward_mul(&beta);
         assert!(
             h_prime.iter().all(|v| *v > 0.25),
@@ -6008,7 +6214,9 @@ mod tests {
         // δ direction with a negative leading h' contribution so the grid
         // reduction binds above ε rather than returning +∞ (which would still
         // be bit-equivalent but would not exercise the streaming reduction).
-        let delta = array![-0.20, 0.05, -0.10, 0.05];
+        let p_total = state.beta.len();
+        let mut delta = toy_probe_vector(p_total, 0xDE17A);
+        delta[0] = -0.30;
 
         // Production path (cached internally).
         let block_states = vec![state.clone()];
@@ -6050,8 +6258,7 @@ mod tests {
     #[test]
     fn warm_start_absorbs_offset_into_affine_seed() {
         let response = array![2.0, 5.0];
-        let response_val_basis = array![[1.0, 2.0], [1.0, 5.0]];
-        let response_deriv_basis = array![[0.0, 1.0], [0.0, 1.0]];
+        let (val_basis, deriv_basis, knots, transform, _p_resp) = toy_response_basis(&response);
         let weights = array![1.0, 1.0];
         let offset = array![0.7, 0.7];
         let covariate_design = DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [1.0]]));
@@ -6061,20 +6268,17 @@ mod tests {
         };
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             &response,
-            response_val_basis,
-            response_deriv_basis,
+            val_basis,
+            deriv_basis,
             vec![],
-            Array1::zeros(0),
-            1,
-            Array2::zeros((0, 0)),
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
             &weights,
             &offset,
             covariate_design,
             vec![],
-            &TransformationNormalConfig {
-                double_penalty: false,
-                ..TransformationNormalConfig::default()
-            },
+            &toy_scop_ctn_config(),
             Some(&warm_start),
         )
         .expect("transformation family");
@@ -6087,15 +6291,20 @@ mod tests {
         let expected_h = array![0.5, 2.0];
         let expected_h_prime = array![0.5, 0.5];
 
+        // The SCOP-CTN warm start projects the affine target h(y) =
+        // (y - location)/scale into the squared-γ I-spline span. The 1e-9
+        // tolerance absorbs the projection's numerical floor; a degree-1
+        // I-spline span on the response support contains all affine
+        // functions exactly.
         for i in 0..expected_h.len() {
             assert!(
-                (h[i] - expected_h[i]).abs() < 1e-12,
+                (h[i] - expected_h[i]).abs() < 1e-9,
                 "h[{i}] mismatch: got {}, expected {}",
                 h[i],
                 expected_h[i]
             );
             assert!(
-                (h_prime[i] - expected_h_prime[i]).abs() < 1e-12,
+                (h_prime[i] - expected_h_prime[i]).abs() < 1e-9,
                 "h_prime[{i}] mismatch: got {}, expected {}",
                 h_prime[i],
                 expected_h_prime[i]
@@ -6217,8 +6426,8 @@ mod tests {
     fn transformation_normal_joint_psihessian_directional_derivative_matches_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
-        let direction = array![0.02, -0.01, 0.03, 0.015];
         let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+        let direction = toy_probe_vector(spec.design.ncols(), 701);
         let specs = vec![spec];
 
         let analytic = family
@@ -6262,9 +6471,10 @@ mod tests {
     fn transformation_normal_joint_hessian_second_directional_derivative_matches_fd() {
         let psi = array![0.15, -0.10];
         let h = 1e-6;
-        let dir_u = array![0.02, -0.01, 0.03, 0.015];
-        let dir_v = array![-0.01, 0.02, 0.01, -0.025];
         let (family, _, state, _) = toy_family_and_derivatives(&psi);
+        let p = state.beta.len();
+        let dir_u = toy_probe_vector(p, 801);
+        let dir_v = toy_probe_vector(p, 802);
 
         let analytic = family
             .exact_newton_joint_hessiansecond_directional_derivative(
@@ -6331,9 +6541,9 @@ mod tests {
         // Hessian-vector product must agree with dense H · v across a few
         // randomly chosen directions (deterministic seed for stability).
         let directions = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.3, -0.7, 0.5, -0.2]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05]),
+            toy_probe_vector(p, 101),
+            toy_probe_vector(p, 102),
+            toy_probe_vector(p, 103),
         ];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
@@ -6377,41 +6587,38 @@ mod tests {
 
     #[test]
     fn ctn_coefficient_hessian_cost_switches_to_matvec_when_matrix_free_active() {
-        // p_resp=2, p_cov=256 → p_total=512 ≥ JOINT_MATRIX_FREE_MIN_DIM, so
-        // matrix-free is ALWAYS active for any n. The override must report the
-        // per-Hv matvec cost n·(p_resp + p_cov), not the dense p² gram.
+        // p_cov=256 keeps p_total = p_resp · p_cov ≥ JOINT_MATRIX_FREE_MIN_DIM
+        // so matrix-free is ALWAYS active for any n. The override must report
+        // the per-Hv matvec cost n·(p_resp + p_cov), not the dense p² gram.
         // n=8 keeps the test allocation small (~16 KB for covariate_design).
         let n = 8usize;
         let p_cov = 256usize;
-        let mut response_val_basis = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            response_val_basis[[i, 0]] = 1.0;
-            response_val_basis[[i, 1]] = i as f64;
-        }
-        let mut response_deriv_basis = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            response_deriv_basis[[i, 1]] = 1.0;
-        }
+        let response = Array1::from_iter((0..n).map(|i| (i as f64) / (n - 1) as f64));
+        let (val_basis, deriv_basis, knots, transform, _p_resp) = toy_response_basis(&response);
         let weights = Array1::from_elem(n, 1.0);
         let offset = Array1::zeros(n);
-        let cov_design = Array2::<f64>::zeros((n, p_cov));
-        let response = Array1::zeros(n);
+        // Non-degenerate covariate design: small column-wise variation makes
+        // the joint warm-start solve well-posed without changing the
+        // matrix-free gating behavior tested below.
+        let mut cov_design = Array2::<f64>::zeros((n, p_cov));
+        for i in 0..n {
+            for j in 0..p_cov {
+                cov_design[[i, j]] = 0.1 + 0.01 * (i as f64) + 0.001 * (j as f64);
+            }
+        }
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             &response,
-            response_val_basis,
-            response_deriv_basis,
+            val_basis,
+            deriv_basis,
             vec![],
-            Array1::zeros(0),
-            1,
-            Array2::zeros((0, 0)),
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
             &weights,
             &offset,
             DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
             vec![],
-            &TransformationNormalConfig {
-                double_penalty: false,
-                ..TransformationNormalConfig::default()
-            },
+            &toy_scop_ctn_config(),
             None,
         )
         .expect("matrix-free-eligible CTN family");
@@ -6465,7 +6672,7 @@ mod tests {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
-        let d_beta = array![0.07, -0.04, 0.21, 0.08];
+        let d_beta = toy_probe_vector(p, 201);
         assert_eq!(d_beta.len(), p);
 
         let dense_dh = family
@@ -6486,9 +6693,9 @@ mod tests {
             .expect("dH operator present");
 
         let probes = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.3, -0.7, 0.5, -0.2]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05]),
+            toy_probe_vector(p, 202),
+            toy_probe_vector(p, 203),
+            toy_probe_vector(p, 204),
         ];
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
@@ -6512,8 +6719,8 @@ mod tests {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
-        let dir_u = array![0.02, -0.01, 0.03, 0.015];
-        let dir_v = array![-0.01, 0.02, 0.01, -0.025];
+        let dir_u = toy_probe_vector(p, 301);
+        let dir_v = toy_probe_vector(p, 302);
 
         let dense_d2h = family
             .exact_newton_joint_hessiansecond_directional_derivative(
@@ -6534,9 +6741,9 @@ mod tests {
             .expect("d2H operator present");
 
         let probes = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.3, -0.7, 0.5, -0.2]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05]),
+            toy_probe_vector(p, 303),
+            toy_probe_vector(p, 304),
+            toy_probe_vector(p, 305),
         ];
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
@@ -6568,8 +6775,8 @@ mod tests {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
-        let d_beta = array![0.07, -0.04, 0.21, 0.08];
-        let v = array![0.30, -0.20, 0.45, -0.10];
+        let d_beta = toy_probe_vector(p, 401);
+        let v = toy_probe_vector(p, 402);
         assert_eq!(d_beta.len(), p);
         assert_eq!(v.len(), p);
 
@@ -6639,9 +6846,9 @@ mod tests {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
-        let dir_u = array![0.05, -0.03, 0.08, 0.02];
-        let dir_w = array![-0.02, 0.04, 0.01, -0.03];
-        let v = array![0.30, -0.20, 0.45, -0.10];
+        let dir_u = toy_probe_vector(p, 501);
+        let dir_w = toy_probe_vector(p, 502);
+        let v = toy_probe_vector(p, 503);
 
         let workspace = family
             .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
@@ -6706,7 +6913,7 @@ mod tests {
         let psi = array![0.15, -0.10];
         let (family, _, state, spec) = toy_family_and_derivatives(&psi);
         let p = spec.design.ncols();
-        let v = array![0.30, -0.20, 0.45, -0.10];
+        let v = toy_probe_vector(p, 601);
 
         let workspace = family
             .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec.clone()])
