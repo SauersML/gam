@@ -162,7 +162,7 @@ def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float 
     if args.pure_duchon:
         return None
     if args.length_scale is not None:
-        return args.length_scale
+        return float(args.length_scale)
     if num_features >= 2:
         return 1.0
     return None
@@ -170,7 +170,7 @@ def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float 
 
 def resolved_order(args: argparse.Namespace, num_features: int, length_scale: float | None) -> int:
     if args.order is not None:
-        return args.order
+        return int(args.order)
     if length_scale is not None and num_features >= 2:
         return 1
     return 0
@@ -178,7 +178,7 @@ def resolved_order(args: argparse.Namespace, num_features: int, length_scale: fl
 
 def resolved_power(args: argparse.Namespace, num_features: int, length_scale: float | None) -> int:
     if args.power is not None:
-        return args.power
+        return int(args.power)
     if length_scale is not None and num_features >= 2:
         return max(1, num_features // 2)
     return 1
@@ -197,7 +197,7 @@ def run_checked(cmd: list[str]) -> None:
     try:
         for sig in handled_signals:
             signal.signal(sig, forward_and_exit)
-        proc = subprocess.Popen(cmd, cwd=REPO_ROOT, start_new_session=True)
+        proc = subprocess.Popen(cmd, cwd=REPO_ROOT, start_new_session=True, text=True)
         rc = proc.wait()
         if rc != 0:
             raise subprocess.CalledProcessError(rc, cmd)

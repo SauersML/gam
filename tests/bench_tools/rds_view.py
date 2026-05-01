@@ -66,8 +66,11 @@ cat("\\n")
 sink()
 """
     try:
+        rscript = shutil.which("Rscript")
+        if rscript is None:
+            raise FileNotFoundError("Rscript not found on PATH")
         subprocess.run(
-            [shutil.which("Rscript"), "-e", r_code],
+            [rscript, "-e", r_code],
             check=True,
             capture_output=True,
             text=True
@@ -82,7 +85,7 @@ sink()
 
 def round_floats_in_text(content: str) -> str:
     """Finds all float-like numbers in a string and rounds them."""
-    def round_match(match: re.Match) -> str:
+    def round_match(match: re.Match[str]) -> str:
         number_str = match.group(0)
         rounded_num = round(float(number_str), DECIMAL_PLACES)
         return f"{rounded_num:.{DECIMAL_PLACES}f}"
@@ -105,7 +108,7 @@ def truncate_long_lists_in_text(content: str) -> tuple[str, int]:
 
     truncation_count = 0
 
-    def truncate_match(match: re.Match) -> str:
+    def truncate_match(match: re.Match[str]) -> str:
         """Callback function to process and truncate a matched list."""
         nonlocal truncation_count
         

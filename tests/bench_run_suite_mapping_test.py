@@ -156,7 +156,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_run_cmd = _RUN_SUITE.run_cmd
         orig_tempdir = _RUN_SUITE._workspace_tempdir
         try:
-            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> None:
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
                 if cmd[0] == "Rscript":
                     script = Path(cmd[1]).read_text()
                     seen_scripts.append(script)
@@ -293,7 +293,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_figures = _RUN_SUITE.generate_scenario_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 if kwargs.get("contender_name") == "rust_thread3_adaptive_reml":
                     seen.append(list(kwargs.get("rust_fit_extra_args") or []))
                 return {
@@ -358,7 +358,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_datapoint_figures = _RUN_SUITE.generate_scenario_datapoint_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 if kwargs.get("contender_name") == "rust_thread3_adaptive_reml_flexible":
                     seen_formula_links.append(kwargs.get("formula_link"))
                 return {
@@ -479,7 +479,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                 "logratio ~ s(range, type=ps, knots=24)",
             )
 
-            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> None:
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
                 if len(cmd) >= 2 and cmd[1] == "fit":
                     out_path = Path(cmd[cmd.index("--out") + 1])
                     out_path.write_text(json.dumps({"fit_result": {"standard_deviation": 1.25}}))
@@ -522,7 +522,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_figures = _RUN_SUITE.generate_scenario_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 seen.append(("rust_gam", kwargs.get("contender_name", "rust_gam")))
                 return {
                     "status": "ok",
@@ -532,7 +532,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "evaluation": "cv",
                 }
 
-            def _fake_run_rust_gamlss_survival_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_gamlss_survival_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 seen.append(("survival", "rust_gamlss_survival"))
                 return {
                     "status": "ok",
@@ -601,7 +601,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_figures = _RUN_SUITE.generate_scenario_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 seen_rust.append(kwargs.get("contender_name", "rust_gam"))
                 return {
                     "status": "ok",
@@ -611,7 +611,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "evaluation": "cv",
                 }
 
-            def _fake_run_rust_gamlss_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_gamlss_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 seen_gamlss.append(kwargs.get("contender_name", "rust_gamlss"))
                 return {
                     "status": "ok",
@@ -682,7 +682,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_figures = _RUN_SUITE.generate_scenario_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _fake_run_rust_gamlss_survival_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_gamlss_survival_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 seen_survival.append(kwargs.get("contender_name", "rust_gamlss_survival"))
                 return {
                     "status": "ok",
@@ -759,7 +759,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_datapoint_figures = _RUN_SUITE.generate_scenario_datapoint_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _unexpected_runner(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _unexpected_runner(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 contender = kwargs.get("contender_name", "unknown")
                 seen.append(contender)
                 raise AssertionError(f"excluded contender scheduled: {contender}")
@@ -869,7 +869,7 @@ class RunSuiteMappingTests(unittest.TestCase):
         orig_datapoint_figures = _RUN_SUITE.generate_scenario_datapoint_figures
         orig_zip = _RUN_SUITE.zip_figure_dir
         try:
-            def _fake_run_rust_gamlss_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _fake_run_rust_gamlss_scenario_cv(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 return {
                     "status": "ok",
                     "scenario_name": "geo_subpop16_margslope_aniso_duchon16d_k50",
@@ -878,7 +878,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "evaluation": "5-fold CV",
                 }
 
-            def _unexpected_marginal_slope(*args: typing.Any, **kwargs: typing.Any) -> None:
+            def _unexpected_marginal_slope(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
                 contender = kwargs.get("contender_name", "unknown")
                 seen.append(contender)
                 raise AssertionError(f"excluded contender scheduled: {contender}")

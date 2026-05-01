@@ -59,6 +59,7 @@ def main() -> typing.Any:
     args = p.parse_args()
 
     out_path = args.out
+    td: tempfile.TemporaryDirectory[str] | None = None
     cleanup = False
     if out_path is None:
         td = tempfile.TemporaryDirectory(prefix="gam_magic_bench_")
@@ -99,7 +100,8 @@ def main() -> typing.Any:
         print(f"\nWrote: {out_path}")
 
     if cleanup:
-        td.cleanup()  # type: ignore[name-defined]
+        if td is not None:
+            td.cleanup()
     return 0
 
 

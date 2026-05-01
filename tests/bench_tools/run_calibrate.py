@@ -81,6 +81,8 @@ def run_subprocess(command: typing.Any) -> None:
     print(f"Executing: {' '.join(map(str, command))}\n")
     try:
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=PROJECT_ROOT) as proc:
+            if proc.stdout is None:
+                raise RuntimeError("subprocess stdout was not captured")
             for line in proc.stdout:
                 print(line, end='')
         if proc.returncode != 0:
