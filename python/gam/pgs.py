@@ -214,6 +214,7 @@ def _manifest_path(model_path: Path) -> Path:
 
 
 def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
+    pd: Any | None
     try:
         import pandas as pd
     except ImportError:
@@ -243,6 +244,7 @@ def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
             result.append(enriched)
         return result
 
+    pa: Any | None
     try:
         import pyarrow as pa
     except ImportError:
@@ -258,6 +260,7 @@ def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
 
 
 def _to_1d_list(values: Any) -> list[float]:
+    np: Any | None
     try:
         import numpy as np
     except ImportError:

@@ -8183,9 +8183,21 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
 /// from the pure-Duchon closed-form path, which is a polyharmonic of order
 /// `m + s = p_order + s_order` with no Matérn factor. `q ∈ {0,1,2}` rolls
 /// the penalty differential order — same as the hybrid path.
+///
+/// The closed-form Lebesgue penalty is finite only when the Duchon
+/// convergence conditions hold:
+///   - UV (smoothness at origin): `4(m+s) > d + 2q`
+///   - IR (decay at infinity):    `d + 2q > 4m`
+/// When either condition fails for a given `q`, the closed-form integrand
+/// diverges (UV) or vanishes identically (IR — kernel is a finite-degree
+/// polynomial that drops out of `Δ_B^q`); in those regimes we fall back to
+/// the collocation Gram `D_q^T D_q`, which is the same regularization the
+/// pre-closed-form path used.
 pub fn operator_penalty_candidates_closed_form_pure(
     centers: ArrayView2<'_, f64>,
     d0: &Array2<f64>,
+    d1: &Array2<f64>,
+    d2: &Array2<f64>,
     spec: &DuchonOperatorPenaltySpec,
     p_order: usize,
     s_order: usize,
@@ -8194,29 +8206,52 @@ pub fn operator_penalty_candidates_closed_form_pure(
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Vec<PenaltyCandidate> {
+    // q=0 mass always uses collocation Gram (closed-form pair block at q=0
+    // is the kernel itself, but the canonical operator-mass penalty is
+    // `D_0^T D_0` for symmetry with the hybrid path).
     let s0_raw = symmetrize(&fast_ata(d0));
     let (s0, c0) = normalize_penalty(&s0_raw);
-    let s1_raw = closed_form_operator_penalty_in_total_basis_pure(
-        centers,
-        1,
-        p_order,
-        s_order,
-        aniso_log_scales,
-        kernel_nullspace,
-        polynomial_block_cols,
-        outer_identifiability,
-    );
+
+    let d = centers.ncols();
+    let m = p_order;
+    let s = s_order;
+    let closed_form_converges = |q: usize| -> bool {
+        let four_ms = 4 * (m + s);
+        let dp2q = d + 2 * q;
+        let four_m = 4 * m;
+        four_ms > dp2q && dp2q > four_m
+    };
+
+    let s1_raw = if closed_form_converges(1) {
+        closed_form_operator_penalty_in_total_basis_pure(
+            centers,
+            1,
+            p_order,
+            s_order,
+            aniso_log_scales,
+            kernel_nullspace,
+            polynomial_block_cols,
+            outer_identifiability,
+        )
+    } else {
+        symmetrize(&fast_ata(d1))
+    };
     let (s1, c1) = normalize_penalty(&s1_raw);
-    let s2_raw = closed_form_operator_penalty_in_total_basis_pure(
-        centers,
-        2,
-        p_order,
-        s_order,
-        aniso_log_scales,
-        kernel_nullspace,
-        polynomial_block_cols,
-        outer_identifiability,
-    );
+
+    let s2_raw = if closed_form_converges(2) {
+        closed_form_operator_penalty_in_total_basis_pure(
+            centers,
+            2,
+            p_order,
+            s_order,
+            aniso_log_scales,
+            kernel_nullspace,
+            polynomial_block_cols,
+            outer_identifiability,
+        )
+    } else {
+        symmetrize(&fast_ata(d2))
+    };
     let (s2, c2) = normalize_penalty(&s2_raw);
     let mut out = Vec::new();
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
@@ -14276,6 +14311,8 @@ pub fn build_duchon_basiswithworkspace(
         operator_penalty_candidates_closed_form_pure(
             centers.view(),
             &ops.d0,
+            &ops.d1,
+            &ops.d2,
             &spec.operator_penalties,
             p_order,
             spec.power,
