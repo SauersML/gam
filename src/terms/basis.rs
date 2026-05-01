@@ -14220,19 +14220,35 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    // Closed-form Lebesgue penalty via Schoenberg/Riesz-Matérn diverges for
-    // (m, s, d, q) outside `4(m+s) > d + 2q` (UV) and `d + 2q > 4m` (IR).
-    // `resolve_duchon_orders` only enforces pointwise kernel existence, which
-    // is weaker than penalty integral convergence, so wiring closed-form
-    // unconditionally breaks low-d configurations. The closed-form module
-    // remains as a foundation; production penalty path stays on collocation
-    // until divergence-regime detection is added.
-    let candidates = operator_penalty_candidates_from_collocation(
-        &ops.d0,
-        &ops.d1,
-        &ops.d2,
-        &spec.operator_penalties,
-    );
+    // Closed-form Lebesgue penalty: hybrid (κ>0) routes through the
+    // Schoenberg/Matérn closed-form path (when wired by `wire-in-full`),
+    // pure-Duchon (κ=0) routes through the analytic radial-derivative path
+    // which is finite for R > 0 in any (m, s, d, q) regime where
+    // `radial_derivatives_of_isotropic_duchon` is defined. Self-pair (R=0)
+    // entries are ε-regularized inside `closed_form_anisotropic_pair_block_pure`.
+    let candidates = if spec.length_scale.is_some() {
+        // Hybrid path stays on collocation here; `wire-in-full` will swap
+        // this branch to `operator_penalty_candidates_closed_form` once
+        // its divergence-regime detection lands.
+        operator_penalty_candidates_from_collocation(
+            &ops.d0,
+            &ops.d1,
+            &ops.d2,
+            &spec.operator_penalties,
+        )
+    } else {
+        operator_penalty_candidates_closed_form_pure(
+            centers.view(),
+            &ops.d0,
+            &spec.operator_penalties,
+            p_order,
+            spec.power,
+            aniso.as_deref(),
+            Some(&kernel_transform),
+            poly_cols,
+            identifiability_transform.as_ref(),
+        )
+    };
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
