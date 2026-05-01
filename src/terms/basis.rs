@@ -8579,6 +8579,15 @@ pub fn operator_penalty_candidates_closed_form(
         four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1 && !log_riesz_present
     };
 
+    // Threshold for emitting an operator-form handle alongside the dense
+    // matrix. Above this raw kernel size, the closed-form factory attaches
+    // a `ClosedFormPenaltyOperator` so downstream consumers (PCG-against-
+    // implicit-H, Hutchinson EDF) can reuse the operator's matvec without
+    // rebuilding the dense Gram. Below threshold, dense-only is preserved
+    // (Cholesky on the small materialized H is faster).
+    let operator_form_threshold = closed_form_operator_threshold();
+    let emit_operator = centers.nrows() > operator_form_threshold;
+
     let s1_raw = if closed_form_converges(1) {
         closed_form_operator_penalty_in_total_basis(
             centers,
@@ -8611,8 +8620,39 @@ pub fn operator_penalty_candidates_closed_form(
         symmetrize(&fast_ata(d2))
     };
     let (s2, c2) = normalize_penalty(&s2_raw);
+
+    let make_op = |q: usize, c: f64| -> Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
+        if !emit_operator {
+            return None;
+        }
+        if !closed_form_converges(q) {
+            return None;
+        }
+        let raw_op = std::sync::Arc::new(crate::terms::closed_form_operator::ClosedFormPenaltyOperator::new(
+            centers,
+            q,
+            p_order,
+            s_order,
+            kappa,
+            aniso_log_scales,
+            kernel_nullspace,
+            polynomial_block_cols,
+            outer_identifiability,
+        ));
+        // The candidate's `matrix` is the closed-form Gram divided by its
+        // Frobenius norm `c`. Wrap in `ScaledPenaltyOp` with factor `1/c`
+        // so `op.as_dense()` matches the candidate's dense matrix.
+        let scale = if c > 1e-12 { 1.0 / c } else { 1.0 };
+        let scaled: std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp> = std::sync::Arc::new(
+            crate::terms::penalty_op::ScaledPenaltyOp::new(raw_op, scale),
+        );
+        Some(scaled)
+    };
+
     let mut out = Vec::new();
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
+        // Mass is the collocation Gram; no closed-form operator analog (the
+        // factory takes q∈{1,2} via the closed-form path; q=0 is collocation).
         out.push(PenaltyCandidate {
             matrix: s0,
             nullspace_dim_hint: 0,
@@ -8623,26 +8663,43 @@ pub fn operator_penalty_candidates_closed_form(
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        let op = make_op(1, c1);
         out.push(PenaltyCandidate {
             matrix: s1,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
-            op: None,
+            op,
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        let op = make_op(2, c2);
         out.push(PenaltyCandidate {
             matrix: s2,
             nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
-            op: None,
+            op,
         });
     }
     out
+}
+
+/// Configurable threshold above which the closed-form factory emits an
+/// operator-form `op` handle alongside the dense matrix. Default 500 raw
+/// kernel rows. Set the env var `GAM_CLOSED_FORM_OP_THRESHOLD` to override
+/// (e.g. for benchmarking). Below threshold, only dense form is emitted —
+/// Cholesky on the small materialized H is faster than PCG on the implicit H.
+fn closed_form_operator_threshold() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("GAM_CLOSED_FORM_OP_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(500)
+    })
 }
 
 /// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
@@ -19665,11 +19722,13 @@ pub mod closed_form_penalty {
             2 => {
                 // F_i, dF_i/dR, d²F_i/dR² blocks (manually expanded; see
                 // `radial_g_q_partials` for F_i and dF_i/dR derivations).
+                // F1, F2, F3 are used by g_{s1, s1}, g_{s1, u1}, g_{u1, u1}
+                // (the only nonzero pure-invariant Hessian entries for q ≤ 2);
+                // F4, F5 do not appear in any second partial of g (g is linear
+                // in u_2 and s_2) so they are not needed here.
                 let f1 = fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7;
                 let f2 = 2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5;
                 let f3 = fr[2] / r2 - fr[1] / r3;
-                let f4 = 4.0 * fr[3] / r3 - 12.0 * fr[2] / r4 + 12.0 * fr[1] / r5;
-                let f5 = 2.0 * fr[2] / r2 - 2.0 * fr[1] / r3;
 
                 let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6
                     - 105.0 * fr[2] / r7
