@@ -3,7 +3,9 @@ use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
 use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
-use crate::linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
+use crate::linalg::utils::{
+    boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
+};
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
@@ -1938,13 +1940,7 @@ impl<'a> RemlState<'a> {
         // up to roundoff.
         let h_times_u = h_total.dot(&u_s);
         let mut h_proj = u_s.t().dot(&h_times_u);
-        for i in 0..r {
-            for j in (i + 1)..r {
-                let avg = 0.5 * (h_proj[[i, j]] + h_proj[[j, i]]);
-                h_proj[[i, j]] = avg;
-                h_proj[[j, i]] = avg;
-            }
-        }
+        enforce_symmetry(&mut h_proj);
 
         let (h_proj_evals, h_proj_evecs) = h_proj
             .eigh(Side::Lower)
@@ -2181,13 +2177,7 @@ impl<'a> RemlState<'a> {
                 let bpb = fast_ab(&firth_op.b_base.t().to_owned(), &firth_op.p_b_base);
                 let mut hphi = 0.5 * (diag_term - bpb);
                 // Numerical symmetry guard.
-                for i in 0..hphi.nrows() {
-                    for j in 0..i {
-                        let avg = 0.5 * (hphi[[i, j]] + hphi[[j, i]]);
-                        hphi[[i, j]] = avg;
-                        hphi[[j, i]] = avg;
-                    }
-                }
+                enforce_symmetry(&mut hphi);
                 // Keep tiny numerical noise from making the solve surface less stable.
                 if hphi.iter().all(|v| v.is_finite()) {
                     h_total -= &hphi;

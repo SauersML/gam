@@ -1595,11 +1595,7 @@ fn run_fit_transformation_normal(
     };
     progress.advance_workflow(3);
 
-    let frozen_covariate = freeze_term_collection_from_design(
-        &solved.covariate_spec_resolved,
-        &solved.covariate_design,
-    )
-    .map_err(|e| e.to_string())?;
+    let frozen_covariate = solved.covariate_spec_resolved.clone();
     progress.advance_workflow(4);
     println!(
         "model fit complete | family={} | outer_iter={} | converged={}",

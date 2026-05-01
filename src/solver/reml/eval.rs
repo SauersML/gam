@@ -352,25 +352,13 @@ impl<'a> RemlState<'a> {
         let var_beta = second_beta - mean_outer;
 
         let mut total_cov = mean_hinv + var_beta;
-        for i in 0..p {
-            for j in (i + 1)..p {
-                let avg = 0.5 * (total_cov[[i, j]] + total_cov[[j, i]]);
-                total_cov[[i, j]] = avg;
-                total_cov[[j, i]] = avg;
-            }
-        }
+        enforce_symmetry(&mut total_cov);
         if !total_cov.iter().all(|v| v.is_finite()) {
             return first_order_correction;
         }
 
         let mut corr = total_cov - base_cov;
-        for i in 0..p {
-            for j in (i + 1)..p {
-                let avg = 0.5 * (corr[[i, j]] + corr[[j, i]]);
-                corr[[i, j]] = avg;
-                corr[[j, i]] = avg;
-            }
-        }
+        enforce_symmetry(&mut corr);
 
         log::debug!(
             "Using adaptive cubature smoothing correction (rank={}, points={}, near_boundary={}, grad_norm={:.2e}, maxvar={:.2e})",
