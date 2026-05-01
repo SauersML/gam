@@ -190,38 +190,29 @@ impl ClosedFormPenaltyOperator {
             None => u_kernel.to_owned(),
         };
 
-        // Step 4: y = S_raw v with on-the-fly pair-block evaluation. Use the
-        // full row-summation `y[i] = Σ_j G[i,j] v[j]` rather than a symmetry-
-        // halved accumulator: for highly cancelling rows (e.g. when Z projects
-        // out a large coherent mode of G), the order in which contributions
-        // arrive at y[i] changes the cancellation pattern, and the
-        // symmetry-halved variant did not match the dense `G v` summation
-        // order to FP precision. Computing each row independently mirrors how
-        // `dense.dot(v)` accumulates, at the cost of doubling the kernel
-        // evaluations on the off-diagonal pairs.
+        // Step 4: y = S_raw v_k. Build the K×K pair-block via the same
+        // `closed_form_anisotropic_pair_block` routine that `dense_form`
+        // uses, then apply it as `y = G v_k`. Sharing the builder keeps the
+        // cancellation-detector logic identical between the two paths, and
+        // applying the dense matvec in the same row-major order as
+        // `Z^T G Z` cancels the catastrophic-cancellation discrepancy that a
+        // symmetry-halved on-the-fly accumulator otherwise introduces under
+        // kernel-nullspace constraints.
+        let aniso_opt: Option<&[f64]> = if self.eta_centered.iter().all(|&e| e == 0.0) {
+            None
+        } else {
+            Some(self.eta_centered.as_slice())
+        };
+        let g_raw = closed_form_anisotropic_pair_block(
+            self.centers.view(),
+            self.q,
+            self.m,
+            self.s,
+            self.kappa,
+            aniso_opt,
+        );
         let k = self.centers.nrows();
-        let d = self.centers.ncols();
-        let mut y = Array1::<f64>::zeros(k);
-        let mut r_buf = vec![0.0_f64; d];
-        for i in 0..k {
-            let mut acc = 0.0;
-            for j in 0..k {
-                for axis in 0..d {
-                    r_buf[axis] = self.centers[[i, axis]] - self.centers[[j, axis]];
-                }
-                let g_ij = self.j_prefactor
-                    * anisotropic_duchon_penalty(
-                        self.q,
-                        self.m,
-                        self.s,
-                        self.kappa,
-                        &self.eta_centered,
-                        &r_buf,
-                    );
-                acc += g_ij * v_k[j];
-            }
-            y[i] = acc;
-        }
+        let y: Array1<f64> = g_raw.dot(&v_k);
 
         // Step 5: y_kernel = Z^T y.
         let y_kernel: Array1<f64> = match &self.kernel_nullspace {
