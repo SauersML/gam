@@ -118,7 +118,7 @@ def true_surface(x: np.ndarray, z: np.ndarray) -> np.ndarray:
         + rotated_bump(0.84, 0.84, 0.92, 0.024, 0.045, -0.45)
     )
 
-    return background + flat_regions + spikes
+    return np.asarray(background + flat_regions + spikes, dtype=float)
 
 
 def write_csv(path: Path, rows: list[tuple[float, ...]], header: list[str]) -> None:

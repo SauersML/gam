@@ -476,9 +476,9 @@ def condensed_hot_paths(perf_data_path: Path) -> tuple[bool, str]:
     # Format top-N condensed paths
     items = sorted(agg_paths.items(), key=lambda kv: kv[1], reverse=True)[:25]
     lines_out = ["Condensed hot paths (origin → first gnomon → last gnomon → next non-gnomon → extras)", ""]
-    for path, cnt in items:
+    for path_tuple, cnt in items:
         pct = 100.0 * cnt / total
-        lines_out.append(f"{pct:6.2f}%  {cnt:>8}  {' → '.join(path)}")
+        lines_out.append(f"{pct:6.2f}%  {cnt:>8}  {' → '.join(path_tuple)}")
     return True, "\n".join(lines_out)
 
 

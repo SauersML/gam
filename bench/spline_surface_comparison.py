@@ -37,7 +37,7 @@ def farthest_point_centers(xy: typing.Any, m: typing.Any) -> typing.Any:
     n = xy.shape[0]
     m = min(max(2, m), n)
     first = np.argmin(np.sum((xy - np.mean(xy, axis=0)) ** 2, axis=1))
-    selected = [first]
+    selected: list[int] = [int(first)]
     min_d2 = np.sum((xy - xy[first]) ** 2, axis=1)
     for _ in range(1, m):
         idx = np.argmax(min_d2)
