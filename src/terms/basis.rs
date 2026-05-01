@@ -18332,18 +18332,26 @@ pub mod closed_form_penalty {
     //   * exact up to roundoff in the radial-derivative table.
     // ============================================================
 
-    /// Bundle of values K_{ν+i}(x) for ν - 4 ≤ ν+i ≤ ν + 4. Returns
-    /// a length-9 vector indexed so that `out[i+4] = K_{ν+i}(x)`.
-    /// Used to combine into derivatives of `r^a · K_b(κr)` via the
-    /// recurrence `K_b' = -(K_{b-1} + K_{b+1})/2`. Internally we
-    /// require K up to ν ± 4; this is sufficient for f^{(4)}.
+    /// Half-width (in Bessel-order shifts) supported by the cached
+    /// `bessel_k_table_around` lookup. Each successive ∂_R application of
+    /// the recurrence `K_b' = -(K_{b-1} + K_{b+1})/2` widens the required
+    /// Bessel-order range by 1; supporting `f^{(max_order)}` therefore
+    /// requires `max_order` shifts on either side of ν.
+    const BESSEL_TABLE_HALF_WIDTH: i32 = 6;
+
+    /// Bundle of values `K_{ν+i}(x)` for `−H ≤ i ≤ H`, where
+    /// `H = BESSEL_TABLE_HALF_WIDTH`. Returns a length-`(2H + 1)` vector
+    /// indexed so that `out[i + H] = K_{ν+i}(x)`. Used to combine into
+    /// derivatives of `r^a · K_b(κr)` via the recurrence
+    /// `K_b' = -(K_{b-1} + K_{b+1})/2`; supporting `f^{(k)}` requires
+    /// `H ≥ k`.
     fn bessel_k_table_around(nu: f64, x: f64) -> Vec<f64> {
-        // We need K_{ν+i}(x) for i ∈ {-4..=4}. K_{-ν} = K_ν, so just
-        // call bessel_k(|nu+i|, x) for each shift.
-        let mut out = vec![0.0_f64; 9];
-        for i in -4_i32..=4 {
+        let h = BESSEL_TABLE_HALF_WIDTH;
+        let len = (2 * h + 1) as usize;
+        let mut out = vec![0.0_f64; len];
+        for i in -h..=h {
             let order = nu + i as f64;
-            out[(i + 4) as usize] = bessel_k(order, x);
+            out[(i + h) as usize] = bessel_k(order, x);
         }
         out
     }
@@ -18390,12 +18398,16 @@ pub mod closed_form_penalty {
         let mut terms: Vec<(f64, f64, i32)> = vec![(pref, nu, 0)];
         let mut out = Vec::with_capacity(max_order + 1);
 
-        // Cache bessel table at this r once we know which orders we need
+        // Cache bessel table at this r once we know which orders we need.
+        // Each radial-derivative step widens the required Bessel-order
+        // range by 1, so for `max_order ≤ H = BESSEL_TABLE_HALF_WIDTH`
+        // shifts ±H around ν are sufficient.
         let kr = kappa * r;
         let bessel_table = bessel_k_table_around(nu, kr);
+        let half_width = BESSEL_TABLE_HALF_WIDTH;
         let bessel = |b_off: i32| -> f64 {
-            // b_off ∈ [-4, 4]
-            let idx = (b_off + 4) as usize;
+            // b_off ∈ [-H, H] for the supported max_order range.
+            let idx = (b_off + half_width) as usize;
             bessel_table[idx]
         };
 
