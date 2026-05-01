@@ -17519,7 +17519,18 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
 /// Matérn block:  M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r).
 pub mod closed_form_penalty {
     use crate::probability::binomial_coefficient_f64 as binomial_f64;
+    use smallvec::SmallVec;
     use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
+
+    /// Stack-capacity for per-pair η/r buffers used in pair-block hot paths.
+    /// Production d ≤ 16 (PC dim 6–16); above that the SmallVec spills to heap.
+    type EtaBuf = SmallVec<[f64; 16]>;
+
+    fn eta_buf_from(src: &[f64]) -> EtaBuf {
+        let mut buf: EtaBuf = SmallVec::with_capacity(src.len());
+        buf.extend_from_slice(src);
+        buf
+    }
 
     const EULER_GAMMA: f64 = 0.577_215_664_901_532_9_f64;
 
@@ -19343,8 +19354,8 @@ pub mod closed_form_penalty {
         let mut d2_eta_kappa = vec![0.0_f64; d];
 
         // For first deriv ∂η_l: 2-point central FD.
-        let mut eta_p = eta.to_vec();
-        let mut eta_m = eta.to_vec();
+        let mut eta_p: EtaBuf = eta_buf_from(eta);
+        let mut eta_m: EtaBuf = eta_buf_from(eta);
         for l in 0..d {
             eta_p.copy_from_slice(eta);
             eta_m.copy_from_slice(eta);
@@ -19378,12 +19389,16 @@ pub mod closed_form_penalty {
                 / (h_eta * h_eta);
         }
         // Off-diagonal: 4-pt stencil.
+        let mut e_pp: EtaBuf = eta_buf_from(eta);
+        let mut e_pm: EtaBuf = eta_buf_from(eta);
+        let mut e_mp: EtaBuf = eta_buf_from(eta);
+        let mut e_mm: EtaBuf = eta_buf_from(eta);
         for k in 0..d {
             for l in (k + 1)..d {
-                let mut e_pp = eta.to_vec();
-                let mut e_pm = eta.to_vec();
-                let mut e_mp = eta.to_vec();
-                let mut e_mm = eta.to_vec();
+                e_pp.copy_from_slice(eta);
+                e_pm.copy_from_slice(eta);
+                e_mp.copy_from_slice(eta);
+                e_mm.copy_from_slice(eta);
                 e_pp[k] += h_eta;
                 e_pp[l] += h_eta;
                 e_pm[k] += h_eta;
@@ -19402,9 +19417,11 @@ pub mod closed_form_penalty {
 
         // Mixed ∂²_{η_l, κ} via 4-pt stencil.
         if s != 0 {
+            let mut e_p: EtaBuf = eta_buf_from(eta);
+            let mut e_m: EtaBuf = eta_buf_from(eta);
             for l in 0..d {
-                let mut e_p = eta.to_vec();
-                let mut e_m = eta.to_vec();
+                e_p.copy_from_slice(eta);
+                e_m.copy_from_slice(eta);
                 e_p[l] += h_eta;
                 e_m[l] -= h_eta;
                 d2_eta_kappa[l] = (val(&e_p, kappa + h_kappa)
