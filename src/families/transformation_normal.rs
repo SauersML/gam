@@ -1147,10 +1147,7 @@ impl TransformationNormalFamily {
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
-        if beta.len() != p_total
-            || direction_u.len() != p_total
-            || direction_v.len() != p_total
-        {
+        if beta.len() != p_total || direction_u.len() != p_total || direction_v.len() != p_total {
             return Err(format!(
                 "SCOP Hessian second directional derivative length mismatch: beta={}, u={}, v={}, expected={p_total}",
                 beta.len(),
@@ -1254,14 +1251,8 @@ impl TransformationNormalFamily {
                                 + dh_a_v * dh_b_u
                                 + h_uv * h_ab
                                 + (dhp_a_u * dhp_b_v + dhp_a_v * dhp_b_u) * inv_hp_sq
-                                - 2.0
-                                    * (dhp_a_u * hp_b + hp_a * dhp_b_u)
-                                    * hp_v
-                                    * inv_hp_cu
-                                - 2.0
-                                    * (dhp_a_v * hp_b + hp_a * dhp_b_v)
-                                    * hp_u
-                                    * inv_hp_cu
+                                - 2.0 * (dhp_a_u * hp_b + hp_a * dhp_b_u) * hp_v * inv_hp_cu
+                                - 2.0 * (dhp_a_v * hp_b + hp_a * dhp_b_v) * hp_u * inv_hp_cu
                                 - 2.0 * hp_a * hp_b * hp_uv * inv_hp_cu
                                 + 6.0 * hp_a * hp_b * hp_u * hp_v * inv_hp_qu
                                 + hp_ab * hp_uv * inv_hp_sq
@@ -1693,8 +1684,8 @@ impl TransformationNormalFamily {
                 };
                 for c in 0..p_cov {
                     let cc = cov_row[c] * cov_row[c];
-                    diag[k * p_cov + c] +=
-                        wi * ((h_factor * h_factor + hp_factor * hp_factor * inv_hp_sq) * cc
+                    diag[k * p_cov + c] += wi
+                        * ((h_factor * h_factor + hp_factor * hp_factor * inv_hp_sq) * cc
                             + second * cc);
                 }
             }
@@ -2197,156 +2188,6 @@ fn chunked_weighted_bt_d_designmatrix(
         );
     }
     Ok(out)
-}
-
-/// Apply a Khatri-Rao weighted Gram to a vector, fusing the forward and
-/// transpose halves through a single `(n × p_resp)` buffer.
-///
-/// Computes `out = (A ⊙ B)^T diag(weights) (A ⊙ B) v`, where
-///   - `left = A` is the dense response factor `(n × p_resp)`,
-///   - `right = B` is the dense covariate factor `(n × p_cov)`,
-///   - `weights` is the per-row diagonal,
-///   - `v` flattens the response-major coefficient block `(p_resp × p_cov)`.
-///
-/// The standard factored apply
-/// `transpose_mul(weights · forward_mul(v))` allocates the `(n × p_resp)`
-/// intermediate twice — once inside `forward_mul` (`B · V^T`) and once
-/// inside `transpose_mul` (`weighted_left = scaled · A` row-wise). This
-/// fused helper allocates that buffer exactly once: it is filled by the
-/// forward gemm `R = B · V^T`, then overwritten in place row by row to
-/// `U[i, a] = w_i · (A[i, :] · R[i, :]) · A[i, a]`, then consumed by the
-/// transpose gemm `U^T · B`. FLOP count is unchanged (two BLAS gemms plus
-/// one `O(n · p_resp)` row pass); peak transient memory drops by
-/// `n · p_resp · 8` bytes — at biobank scale that is ~33 MiB saved per
-/// matvec, multiplied across the inner-PCG and outer-trace matvec budgets.
-/// Batched form of `fused_khatri_rao_weighted_gram_apply`: apply
-/// `X_deriv^T diag(weights) X_deriv` to ALL columns of `factor` at once.
-///
-/// `factor` is `(p_resp · p_cov) × k`. Each column is a vector that, when
-/// reshaped to `(p_resp, p_cov)`, plays the role of `V` in the single-vector
-/// helper above. We reshape the entire batch to `(p_resp, p_cov, k)`, perform
-/// the forward gemm `BUF = right · V_all` in a SINGLE faer matmul producing
-/// `(n × p_resp · k)`, do the per-row weighted scaling in parallel across
-/// rows AND columns, then reshape back and run the transpose phase as one
-/// `fast_atb`. The two BLAS3 calls replace `k` separate small matmuls.
-fn fused_khatri_rao_weighted_gram_apply_batched(
-    left: &Array2<f64>,
-    right: &Array2<f64>,
-    weights: &Array1<f64>,
-    factor: &Array2<f64>,
-) -> Array2<f64> {
-    let n = left.nrows();
-    let p_resp = left.ncols();
-    let p_cov = right.ncols();
-    let k = factor.ncols();
-    debug_assert_eq!(right.nrows(), n);
-    debug_assert_eq!(weights.len(), n);
-    debug_assert_eq!(factor.nrows(), p_resp * p_cov);
-
-    // Reshape factor (p_resp · p_cov, k) → (p_resp, p_cov, k); the k columns
-    // are stacked along axis 2. We need V_stacked of shape (p_cov, p_resp · k)
-    // where column index `p_resp * c + a` is `V_c[a, :]^T = factor[a*p_cov..(a+1)*p_cov, c]`.
-    //
-    // Equivalent: build it column-major in (p_cov × (p_resp · k)) by walking
-    // (c, a) pairs. This is one transpose-style copy of `p_resp · p_cov · k`
-    // doubles. We fuse it with the natural in-memory order to avoid a second
-    // intermediate.
-    // factor.column(c) is non-contiguous when factor is row-major, so we
-    // can't `into_shape_with_order` it directly. Index it as a flat 1D view
-    // and pull out the (a, b) chunk explicitly: V_c[a, b] = factor[a*p_cov+b, c].
-    let mut v_stacked = Array2::<f64>::zeros((p_cov, p_resp * k));
-    for c in 0..k {
-        let factor_col = factor.column(c); // length p_resp * p_cov
-        for a in 0..p_resp {
-            let mut dst = v_stacked.column_mut(p_resp * c + a);
-            for b in 0..p_cov {
-                dst[b] = factor_col[a * p_cov + b];
-            }
-        }
-    }
-
-    // Forward phase: BUF = right · V_stacked → (n × p_resp · k). One BLAS3.
-    let mut buf = fast_ab(right, &v_stacked);
-
-    // Per-row weighted scaling: for each row i and column k_idx = p_resp * c + a,
-    // we want U[i, p_resp * c + a] = w_i · (left[i, :] · BUF[i, p_resp*c..p_resp*(c+1)]) · left[i, a].
-    //
-    // The dot product `xv_{i, c} = left[i, :] · BUF[i, p_resp*c..p_resp*(c+1)]`
-    // depends on row i and column-group c, but not on a. So we compute it once
-    // per (i, c) and broadcast across a.
-    ndarray::Zip::from(buf.rows_mut())
-        .and(left.rows())
-        .and(weights.view())
-        .par_for_each(|mut buf_row, left_row, &w| {
-            for c in 0..k {
-                let mut group = buf_row.slice_mut(ndarray::s![p_resp * c..p_resp * (c + 1)]);
-                let xv = left_row.dot(&group);
-                let factor_w = w * xv;
-                ndarray::Zip::from(&mut group)
-                    .and(&left_row)
-                    .for_each(|dst, &src| *dst = factor_w * src);
-            }
-        });
-
-    // Transpose phase: result_stacked = U^T · right → (p_resp · k × p_cov). One BLAS3.
-    let result_stacked = fast_atb(&buf, right);
-
-    // Unstack into result (p_resp · p_cov × k): row index `p_resp * c + a` of
-    // `result_stacked` is the (a, :) row of column c reshaped to (p_resp, p_cov).
-    // out is row-major so out.column_mut(c) is non-contiguous; index by hand.
-    let mut out = Array2::<f64>::zeros((p_resp * p_cov, k));
-    for c in 0..k {
-        for a in 0..p_resp {
-            let row = result_stacked.row(p_resp * c + a);
-            for b in 0..p_cov {
-                out[[a * p_cov + b, c]] = row[b];
-            }
-        }
-    }
-    out
-}
-
-fn fused_khatri_rao_weighted_gram_apply(
-    left: &Array2<f64>,
-    right: &Array2<f64>,
-    weights: &Array1<f64>,
-    v: &Array1<f64>,
-) -> Array1<f64> {
-    let n = left.nrows();
-    let p_resp = left.ncols();
-    let p_cov = right.ncols();
-    debug_assert_eq!(right.nrows(), n);
-    debug_assert_eq!(weights.len(), n);
-    debug_assert_eq!(v.len(), p_resp * p_cov);
-    let v_mat = v
-        .view()
-        .into_shape_with_order((p_resp, p_cov))
-        .expect("v reshape to (p_resp, p_cov) — caller validates length");
-    // Forward phase: buf = B · V^T. Pass V^T as a view directly into the faer
-    // matmul: faer accepts arbitrary positive strides, so the (p_cov × p_resp)
-    // transpose view doesn't need to be copied to a contiguous Array2 first.
-    // This eliminates a `p_resp · p_cov · 8`-byte allocation per matvec.
-    let v_t = v_mat.t();
-    let mut buf = fast_ab(right, &v_t);
-    // Inner pass: overwrite buf row-by-row to U[i, :] = w_i · xv_i · A[i, :].
-    // Fuse the previous `assign(left_row); buf_row *= factor` two-pass into a
-    // single elementwise write `U[i,a] = factor · A[i,a]`, halving the pass
-    // count over the (n × p_resp) buffer.
-    ndarray::Zip::from(buf.rows_mut())
-        .and(left.rows())
-        .and(weights.view())
-        .par_for_each(|mut buf_row, left_row, &w| {
-            let xv_i = left_row.dot(&buf_row);
-            let factor = w * xv_i;
-            ndarray::Zip::from(&mut buf_row)
-                .and(&left_row)
-                .for_each(|dst, &src| *dst = factor * src);
-        });
-    // Transpose phase: result_mat = U^T · B → (p_resp × p_cov).
-    let result_mat = fast_atb(&buf, right);
-    result_mat
-        .into_shape_with_order((p_resp * p_cov,))
-        .expect("p_resp · p_cov flatten")
 }
 
 // ---------------------------------------------------------------------------
@@ -3274,12 +3115,7 @@ impl TransformationNormalDhMatrixFreeOperator {
 
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
         self.family
-            .scop_hessian_directional_matvec(
-                &self.beta,
-                &self.direction,
-                &self.row_quantities,
-                v,
-            )
+            .scop_hessian_directional_matvec(&self.beta, &self.direction, &self.row_quantities, v)
             .expect("validated CTN dH operator inputs should not fail")
     }
 }
@@ -3312,11 +3148,7 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 
     fn to_dense(&self) -> Array2<f64> {
         self.family
-            .scop_hessian_directional_derivative(
-                &self.beta,
-                &self.direction,
-                &self.row_quantities,
-            )
+            .scop_hessian_directional_derivative(&self.beta, &self.direction, &self.row_quantities)
             .expect("validated CTN dH operator inputs should not fail")
     }
 
@@ -6962,117 +6794,6 @@ mod tests {
                 want_grad[i],
                 gradient_eval.gradient[i],
             );
-        }
-    }
-
-    #[test]
-    fn fused_khatri_rao_weighted_gram_apply_matches_explicit_dense() {
-        // Hand-constructed oracle: build (A ⊙ B) explicitly, compute
-        // X^T diag(w) X · v, and compare to the fused helper. Locks in the
-        // math (factored vs replicated) without going through the workspace.
-        let left = array![
-            [1.0, 0.5, -0.2],
-            [-0.3, 1.1, 0.4],
-            [0.2, -0.7, 0.9],
-            [0.6, 0.3, -0.5],
-            [1.4, -0.1, 0.7],
-        ];
-        let right = array![
-            [2.0, -1.0],
-            [-0.5, 0.8],
-            [1.2, 0.3],
-            [-0.7, 1.1],
-            [0.4, -0.6]
-        ];
-        let weights = array![0.9, 1.3, 0.7, 1.1, 0.5];
-        let v = array![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
-        let n = left.nrows();
-        let p_resp = left.ncols();
-        let p_cov = right.ncols();
-        assert_eq!(weights.len(), n);
-        assert_eq!(v.len(), p_resp * p_cov);
-        // Replicated reference X[i, a*p_cov + b] = A[i, a] · B[i, b].
-        let mut x_rep = Array2::<f64>::zeros((n, p_resp * p_cov));
-        for i in 0..n {
-            for a in 0..p_resp {
-                for b in 0..p_cov {
-                    x_rep[[i, a * p_cov + b]] = left[[i, a]] * right[[i, b]];
-                }
-            }
-        }
-        let mut weighted_x = x_rep.clone();
-        for i in 0..n {
-            let w = weights[i];
-            for j in 0..(p_resp * p_cov) {
-                weighted_x[[i, j]] *= w;
-            }
-        }
-        let dense_h = x_rep.t().dot(&weighted_x);
-        let want = dense_h.dot(&v);
-        let got = fused_khatri_rao_weighted_gram_apply(&left, &right, &weights, &v);
-        assert_eq!(got.len(), want.len());
-        for i in 0..want.len() {
-            let tol = 1e-12 * want[i].abs().max(1.0) + 1e-12;
-            assert!(
-                (want[i] - got[i]).abs() <= tol,
-                "fused mismatch at {i}: dense={:.6e}, fused={:.6e}",
-                want[i],
-                got[i],
-            );
-        }
-    }
-
-    #[test]
-    fn fused_khatri_rao_batched_matches_per_column() {
-        // The batched helper is the hot path for `projected_operator` (one
-        // BLAS3 matmul replaces K small per-column applies). Here we lock in
-        // that `_batched(F)` equals `[_apply(F[:,0]) | _apply(F[:,1]) | ...]`
-        // to within roundoff for several columns of arbitrary content.
-        let left = array![
-            [1.0, 0.5, -0.2],
-            [-0.3, 1.1, 0.4],
-            [0.2, -0.7, 0.9],
-            [0.6, 0.3, -0.5],
-            [1.4, -0.1, 0.7]
-        ];
-        let right = array![
-            [2.0, -1.0],
-            [-0.5, 0.8],
-            [1.2, 0.3],
-            [-0.7, 1.1],
-            [0.4, -0.6]
-        ];
-        let weights = array![0.9, 1.3, 0.7, 1.1, 0.5];
-        let p_resp = left.ncols();
-        let p_cov = right.ncols();
-        let p_total = p_resp * p_cov;
-
-        // Build a (p_total × 4) factor with linearly independent columns.
-        let factor = array![
-            [0.1, 1.0, -0.5, 0.2],
-            [-0.2, 0.0, 0.8, -0.3],
-            [0.3, -0.4, 0.1, 0.7],
-            [-0.4, 0.5, 0.2, -0.1],
-            [0.5, -0.6, -0.7, 0.4],
-            [-0.6, 0.7, 0.3, -0.5]
-        ];
-        assert_eq!(factor.nrows(), p_total);
-        let k = factor.ncols();
-
-        let got = fused_khatri_rao_weighted_gram_apply_batched(&left, &right, &weights, &factor);
-        assert_eq!(got.dim(), (p_total, k));
-        for c in 0..k {
-            let v = factor.column(c).to_owned();
-            let want = fused_khatri_rao_weighted_gram_apply(&left, &right, &weights, &v);
-            for i in 0..p_total {
-                let tol = 1e-11 * want[i].abs().max(1.0) + 1e-11;
-                assert!(
-                    (want[i] - got[[i, c]]).abs() <= tol,
-                    "batched mismatch at col {c} row {i}: per-col={:.6e}, batched={:.6e}",
-                    want[i],
-                    got[[i, c]],
-                );
-            }
         }
     }
 
