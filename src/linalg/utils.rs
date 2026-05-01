@@ -807,6 +807,135 @@ impl RidgePlanner {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Implicit Hessian operator helpers
+//
+//  These primitives accept a closure that applies the Hessian operator
+//  H v = (X^T W X) v + Σ λ_k S_k v  (+ ridge v), without ever materializing
+//  H as a `p × p` dense matrix. They are the symmetric counterparts of
+//  `solve_newton_direction_implicit` in `solver/pirls.rs`: same operator,
+//  different consumers. Used by the REML log-det / EDF path when the penalty
+//  set contains operator-form penalties at threshold sizes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Stochastic Lanczos quadrature estimate of `log det(H)` where `H` is
+/// supplied as an SPD matvec closure. Thin wrapper around
+/// `stochastic_lanczos_logdet_spd_operator` with a name that reflects the
+/// REML use case. The closure must apply an *already-regularized* H (i.e. the
+/// caller bakes any ridge into `apply_h`); this function does not add a
+/// regularization shift.
+pub fn log_det_implicit_h<F>(
+    apply_h: F,
+    dim: usize,
+    num_probes: usize,
+    lanczos_steps: usize,
+    seed: u64,
+) -> Result<f64, String>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    stochastic_lanczos_logdet_spd_operator(dim, apply_h, num_probes, lanczos_steps, seed)
+}
+
+/// Hutchinson trace estimator: `tr(A) ≈ (1/m) Σ z_i^T A z_i` over `m`
+/// Rademacher probes drawn from a deterministic RNG. Generic — `apply_a`
+/// must compute `A v` and `dim` is the side length of `A`.
+///
+/// At biobank-scale `dim`, this is the only feasible way to estimate
+/// `tr(A)` when `A` itself cannot be materialized (e.g. `A = H^{-1} B`).
+/// For a true matrix-free implementation choose `num_probes` ≥ 32 to keep
+/// the Monte-Carlo standard error below ~1% of `‖A‖_F / √dim`.
+pub fn hutchinson_trace_estimator<F>(
+    apply_a: F,
+    dim: usize,
+    num_probes: usize,
+    seed: u64,
+) -> Result<f64, String>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    if dim == 0 {
+        return Ok(0.0);
+    }
+    if num_probes == 0 {
+        return Err("hutchinson_trace_estimator: num_probes must be > 0".to_string());
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let probes = orthogonal_rademacher_probes(dim, num_probes, &mut rng);
+    let mut acc = KahanSum::default();
+    for z in probes.iter() {
+        let az = apply_a(z);
+        if az.len() != dim {
+            return Err(format!(
+                "hutchinson_trace_estimator: apply_a returned length {} (expected {})",
+                az.len(),
+                dim,
+            ));
+        }
+        let mut local = KahanSum::default();
+        for i in 0..dim {
+            local.add(z[i] * az[i]);
+        }
+        acc.add(local.sum());
+    }
+    Ok(acc.sum() / num_probes as f64)
+}
+
+/// Hutchinson estimate of `tr(H^{-1} B)` for SPD `H` and arbitrary `B`,
+/// both supplied as matvec closures. Each probe vector `z` is mapped to
+/// `B z` and then `H^{-1} (B z)` is solved by PCG using `pcg_diag` as a
+/// Jacobi preconditioner. Returns `(1/m) Σ z^T H^{-1} B z`.
+///
+/// This is the workhorse for REML EDF computation when `H` is implicit:
+/// EDF = `tr(H^{-1} (X^T W X))`. With operator-form penalties wired through
+/// `apply_h`, this avoids materializing the `p × p` Hessian or its inverse.
+///
+/// Caller controls `pcg_rel_tol` and `pcg_max_iter`; failure of any single
+/// inner PCG solve aborts the estimator with `Err`. For routine use,
+/// `pcg_rel_tol = 1e-8` and `pcg_max_iter = max(p, 1000)` are reasonable.
+pub fn hutchinson_trace_inv_h_b<FH, FB>(
+    apply_h: FH,
+    apply_b: FB,
+    pcg_diag: &Array1<f64>,
+    dim: usize,
+    num_probes: usize,
+    pcg_rel_tol: f64,
+    pcg_max_iter: usize,
+    seed: u64,
+) -> Result<f64, String>
+where
+    FH: Fn(&Array1<f64>) -> Array1<f64>,
+    FB: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    if dim == 0 {
+        return Ok(0.0);
+    }
+    if num_probes == 0 {
+        return Err("hutchinson_trace_inv_h_b: num_probes must be > 0".to_string());
+    }
+    if pcg_diag.len() != dim {
+        return Err(format!(
+            "hutchinson_trace_inv_h_b: pcg_diag length {} != dim {}",
+            pcg_diag.len(),
+            dim,
+        ));
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let probes = orthogonal_rademacher_probes(dim, num_probes, &mut rng);
+    let mut acc = KahanSum::default();
+    for z in probes.iter() {
+        let bz = apply_b(z);
+        let h_inv_bz = solve_spd_pcg(&apply_h, &bz, pcg_diag, pcg_rel_tol, pcg_max_iter)
+            .ok_or_else(|| "hutchinson_trace_inv_h_b: inner PCG failed to converge".to_string())?;
+        let mut local = KahanSum::default();
+        for i in 0..dim {
+            local.add(z[i] * h_inv_bz[i]);
+        }
+        acc.add(local.sum());
+    }
+    Ok(acc.sum() / num_probes as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

@@ -1685,6 +1685,12 @@ impl CustomFamily for TransformationNormalFamily {
         block_index: usize,
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // Phase 2: SCOP outer derivatives pending. The body below assumes h' is
+        // linear in β, but under SCOP-CTN h' = Σ_k γ_k(x)² · M_k(y) is
+        // quadratic in β. Routing onto BFGS+BfgsApprox fallback via Ok(None).
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         if block_index != 0 {
             return Ok(None);
         }

@@ -986,11 +986,21 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     // The cascade is:
     //   1. If the primary plan is EFS/HybridEFS AND an analytic gradient is
     //      available, retry with fixed-point disabled so BFGS can use that
-    //      declared analytic gradient directly.
-    //   2. If analytic Hessian was declared, retry with it downgraded to
-    //      BFGS-approximation (still analytic gradient).
-    //   3. No further retries — the caller surfaces the RemlOptimizationFailed
-    //      error so the non-convergence is visible.
+    //      declared analytic gradient directly. As an additional retry,
+    //      downgrade the (now BFGS) plan's analytic Hessian to BFGS-approx.
+    //   2. If the primary plan is Arc (declared (Analytic, Analytic)
+    //      capability), do NOT add a degraded fallback. Demoting to
+    //      BFGS+BfgsApprox in this case discards the analytic outer Hessian
+    //      ARC was using — a strictly weaker geometry — and silently masks
+    //      ARC's actual failure mode (e.g. budget exhaustion, indefinite
+    //      curvature) under a BFGS Strong-Wolfe plateau on a flat surface.
+    //      ARC retries are handled by the per-attempt budget-bump retry
+    //      ladder in `run_outer_with_strategy`; once that is exhausted, the
+    //      caller surfaces the underlying ARC failure verbatim.
+    //   3. Otherwise (e.g. (Analytic, Unavailable) without EFS eligibility,
+    //      which is the BFGS primary), there is nothing to degrade further
+    //      — the caller surfaces the RemlOptimizationFailed error so the
+    //      non-convergence is visible.
     let mut attempts = Vec::new();
 
     if cap.gradient == Derivative::Analytic
@@ -1005,18 +1015,15 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
         }
     }
 
-    if let Some(mut grad_cap) = downgrade_hessian(cap) {
-        // Primary plan was Arc (analytic Hessian). Dropping the Hessian here
-        // must not detour through the EFS planner arm: Arc already saw the
-        // analytic Hessian and failed, so silently switching to an EFS
-        // fixed-point on the same structure is a lateral hop, not a fallback.
-        // We suppress `fixed_point_available` on the degraded cap so the
-        // planner lands on BFGS directly. We do NOT set `disable_fixed_point`
-        // here — that marker is reserved for the "we already tried EFS and it
-        // failed" cascade (see the EFS/HybridEfs branch above).
-        if matches!(plan(cap).solver, Solver::Arc) {
-            grad_cap.fixed_point_available = false;
-        }
+    // Arc primary: no lateral demotion to BFGS. The runner's ARC-budget-bump
+    // retry covers cases where ARC needed more iterations; if even that is
+    // exhausted, the caller sees the genuine analytic-Hessian non-convergence
+    // rather than a misleading BFGS-on-flat-surface plateau.
+    if matches!(plan(cap).solver, Solver::Arc) {
+        return attempts;
+    }
+
+    if let Some(grad_cap) = downgrade_hessian(cap) {
         attempts.push(grad_cap);
     }
     attempts
@@ -2905,7 +2912,53 @@ fn run_outer(
 
         obj.reset();
 
-        match run_outer_with_plan(obj, config, context, attempt_cap, &the_plan) {
+        // ARC budget-bump retry ladder: when an Arc attempt exhausts its
+        // iteration budget, re-run the same Arc plan up to two additional
+        // times with `max_iter *= 2` per retry (3× and 7× original budget,
+        // capped well under 8×) warm-started from the previous attempt's
+        // last rho. This preserves ARC's analytic-Hessian geometry instead
+        // of demoting to a strictly weaker BFGS+BfgsApprox surface, while
+        // still bounding total work. Mirrors the retry structure already
+        // implicit in the cascade for EFS/HybridEFS.
+        let mut arc_retries_left: u32 = if matches!(the_plan.solver, Solver::Arc) {
+            2
+        } else {
+            0
+        };
+        let mut retry_config: Option<OuterConfig> = None;
+
+        let outcome = loop {
+            let active_config: &OuterConfig = retry_config.as_ref().unwrap_or(config);
+            match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
+                Ok(result) => {
+                    if result.converged || arc_retries_left == 0 {
+                        break Ok(result);
+                    }
+                    let prev_max_iter = active_config.max_iter;
+                    let bumped_max_iter = prev_max_iter.saturating_mul(2);
+                    log::info!(
+                        "[OUTER] {context}: ARC attempt exhausted budget at \
+                         iter={} cost={:.6e} |g|={:.6e}; retrying ARC with \
+                         max_iter {} -> {} warm-started from last rho \
+                         (analytic-Hessian preservation)",
+                        result.iterations,
+                        result.final_value,
+                        result.final_grad_norm,
+                        prev_max_iter,
+                        bumped_max_iter,
+                    );
+                    let mut next = active_config.clone();
+                    next.max_iter = bumped_max_iter;
+                    next.initial_rho = Some(result.rho.clone());
+                    retry_config = Some(next);
+                    arc_retries_left -= 1;
+                    obj.reset();
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        match outcome {
             Ok(result) => {
                 if result.converged || attempt_idx + 1 == attempts.len() {
                     return Ok(result);
@@ -4424,9 +4477,16 @@ mod tests {
     }
 
     #[test]
-    fn automatic_fallbacks_only_degrade_hessian_not_gradient() {
-        // The analytic gradient MUST NOT be silently degraded to FD; see
-        // `automatic_fallback_attempts` for the production-safety rationale.
+    fn automatic_fallbacks_preserve_analytic_hessian_for_arc_primary() {
+        // For an (Analytic, Analytic) capability the planner emits ARC. The
+        // cascade MUST NOT add a BFGS+BfgsApprox demotion: doing so discards
+        // the analytic outer Hessian ARC was using, replaces it with a
+        // strictly weaker rank-2 approximation, and silently masks ARC's
+        // actual failure mode (budget exhaustion, indefinite curvature)
+        // under a BFGS Strong-Wolfe plateau. ARC budget exhaustion is
+        // handled by the per-attempt retry ladder in
+        // `run_outer_with_strategy`; once that is exhausted, the caller
+        // sees the genuine analytic-Hessian non-convergence verbatim.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
@@ -4437,10 +4497,13 @@ mod tests {
             prefer_gradient_only: false,
             disable_fixed_point: false,
         };
+        assert_eq!(plan(&cap).solver, Solver::Arc);
         let attempts = automatic_fallback_attempts(&cap);
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].gradient, Derivative::Analytic);
-        assert_eq!(attempts[0].hessian, Derivative::Unavailable);
+        assert!(
+            attempts.is_empty(),
+            "ARC primary must not lateral-demote to BFGS+BfgsApprox; \
+             ARC budget retries live in the runner",
+        );
     }
 
     #[test]
@@ -4636,6 +4699,14 @@ mod tests {
 
     #[test]
     fn automatic_fallbacks_do_not_repeat_arc_when_fixed_point_is_irrelevant() {
+        // The contract here is that the cascade does not lateral-hop ARC
+        // through the EFS planner arm when `fixed_point_available=true` is
+        // incidentally set on an (Analytic, Analytic) capability that the
+        // planner already chose ARC for. Combined with the
+        // analytic-Hessian-preservation contract enforced by
+        // `automatic_fallbacks_preserve_analytic_hessian_for_arc_primary`,
+        // the ARC primary now has zero degraded fallbacks — the runner's
+        // ARC budget-bump retry ladder owns recovery.
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
             hessian: Derivative::Analytic,
@@ -4649,10 +4720,11 @@ mod tests {
         assert_eq!(plan(&cap).solver, Solver::Arc);
 
         let attempts = automatic_fallback_attempts(&cap);
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].hessian, Derivative::Unavailable);
-        assert!(!attempts[0].disable_fixed_point);
-        assert_eq!(plan(&attempts[0]).solver, Solver::Bfgs);
+        assert!(
+            attempts.is_empty(),
+            "ARC primary with incidental fixed_point_available must not \
+             cascade through the EFS arm or lateral-demote to BFGS",
+        );
     }
 
     #[test]
