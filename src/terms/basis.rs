@@ -2057,11 +2057,17 @@ pub struct PenaltyCandidate {
 impl std::fmt::Debug for PenaltyCandidate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PenaltyCandidate")
-            .field("matrix", &format_args!("{}×{}", self.matrix.nrows(), self.matrix.ncols()))
+            .field(
+                "matrix",
+                &format_args!("{}×{}", self.matrix.nrows(), self.matrix.ncols()),
+            )
             .field("nullspace_dim_hint", &self.nullspace_dim_hint)
             .field("source", &self.source)
             .field("normalization_scale", &self.normalization_scale)
-            .field("kronecker_factors", &self.kronecker_factors.as_ref().map(|v| v.len()))
+            .field(
+                "kronecker_factors",
+                &self.kronecker_factors.as_ref().map(|v| v.len()),
+            )
             .field("op", &self.op.as_ref().map(|o| o.dim()))
             .finish()
     }
@@ -2087,9 +2093,19 @@ pub struct CanonicalPenaltyBlock {
 impl std::fmt::Debug for CanonicalPenaltyBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CanonicalPenaltyBlock")
-            .field("sym_penalty", &format_args!("{}×{}", self.sym_penalty.nrows(), self.sym_penalty.ncols()))
+            .field(
+                "sym_penalty",
+                &format_args!("{}×{}", self.sym_penalty.nrows(), self.sym_penalty.ncols()),
+            )
             .field("eigenvalues", &self.eigenvalues)
-            .field("eigenvectors", &format_args!("{}×{}", self.eigenvectors.nrows(), self.eigenvectors.ncols()))
+            .field(
+                "eigenvectors",
+                &format_args!(
+                    "{}×{}",
+                    self.eigenvectors.nrows(),
+                    self.eigenvectors.ncols()
+                ),
+            )
             .field("rank", &self.rank)
             .field("nullity", &self.nullity)
             .field("tol", &self.tol)
@@ -5598,8 +5614,7 @@ pub fn filter_active_penalty_candidates_with_ops(
         Vec::with_capacity(candidates.len());
 
     for (original_index, candidate) in candidates.into_iter().enumerate() {
-        let analysis =
-            analyze_penalty_block_with_op(&candidate.matrix, candidate.op.clone())?;
+        let analysis = analyze_penalty_block_with_op(&candidate.matrix, candidate.op.clone())?;
         let dropped_reason = if analysis.rank == 0 {
             Some(if analysis.iszero {
                 PenaltyDropReason::ZeroMatrix
@@ -19396,6 +19411,78 @@ pub mod closed_form_penalty {
             let kappa_factor = -2.0 * ell as f64 * kappa;
             for k in 0..=max_order {
                 total[k] += b_ell_prime * m_ell[k] + b_ell * kappa_factor * m_ell_p1[k];
+            }
+        }
+
+        total
+    }
+
+    /// Second κ-partial of `radial_derivatives_of_isotropic_duchon`: returns
+    /// `[∂²_κ f, ∂²_κ f', …, ∂²_κ f^{(max_order)}]`(R).
+    ///
+    /// Differentiating the partial-fraction expansion twice in κ:
+    ///   A_j''(κ) = (2 n_j (2 n_j + 1) / κ²) · A_j(κ)
+    ///   B_ℓ''(κ) = (2 n_ℓ (2 n_ℓ + 1) / κ²) · B_ℓ(κ)
+    ///   ∂_κ  M_ℓ = -2 ℓ κ · M_{ℓ+1}
+    ///   ∂²_κ M_ℓ = -2 ℓ · M_{ℓ+1} + 4 ℓ (ℓ+1) κ² · M_{ℓ+2}
+    /// Composition (treat each Matérn term as a product B_ℓ(κ) · M_ℓ(R; κ)):
+    ///   ∂²_κ (B_ℓ · M_ℓ) = B_ℓ'' M_ℓ + 2 B_ℓ' (-2 ℓ κ M_{ℓ+1})
+    ///                   + B_ℓ (-2 ℓ M_{ℓ+1} + 4 ℓ (ℓ+1) κ² M_{ℓ+2}).
+    pub fn radial_derivatives_of_isotropic_duchon_kappa_partial2(
+        d: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
+        assert!(r > 0.0);
+        assert!(max_order <= 6);
+        let mut total = vec![0.0_f64; max_order + 1];
+        if s == 0 || kappa == 0.0 {
+            return total;
+        }
+
+        let a = 2 * m;
+        let b = 2 * s;
+        let kappa_sq = kappa * kappa;
+
+        for j in 1..=a {
+            let n_j = a + b - j;
+            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let binom = binomial_f64(a + b - j - 1, a - j);
+            let a_j = sign * binom * kappa_sq.powi(-(n_j as i32));
+            let nj_f = n_j as f64;
+            let a_j_dd = (2.0 * nj_f * (2.0 * nj_f + 1.0) / kappa_sq) * a_j;
+            let block = riesz_block_radial_derivatives(d, j, r, max_order);
+            for (k, v) in block.into_iter().enumerate() {
+                total[k] += a_j_dd * v;
+            }
+        }
+
+        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        for ell in 1..=b {
+            let n_ell = a + b - ell;
+            let binom = binomial_f64(a + b - ell - 1, b - ell);
+            let b_ell = sign_a * binom * kappa_sq.powi(-(n_ell as i32));
+            let n_ell_f = n_ell as f64;
+            let b_ell_prime = -(2.0 * n_ell_f / kappa) * b_ell;
+            let b_ell_dd = (2.0 * n_ell_f * (2.0 * n_ell_f + 1.0) / kappa_sq) * b_ell;
+
+            let ell_f = ell as f64;
+            let m_ell = matern_block_radial_derivatives(d, ell, kappa, r, max_order);
+            let m_ell_p1 = matern_block_radial_derivatives(d, ell + 1, kappa, r, max_order);
+            let m_ell_p2 = matern_block_radial_derivatives(d, ell + 2, kappa, r, max_order);
+
+            // ∂_κ M_ℓ = -2 ℓ κ · M_{ℓ+1}
+            // ∂²_κ M_ℓ = -2 ℓ · M_{ℓ+1} + 4 ℓ (ℓ+1) κ² · M_{ℓ+2}
+            let cross_factor = -4.0 * ell_f * kappa; // 2 · ∂_κ M_ℓ / B_ℓ' coefficient
+            let m_dd_a = -2.0 * ell_f; // first half of ∂²κ M_ℓ
+            let m_dd_b = 4.0 * ell_f * (ell_f + 1.0) * kappa_sq; // second half
+            for k in 0..=max_order {
+                total[k] += b_ell_dd * m_ell[k]
+                    + b_ell_prime * cross_factor * m_ell_p1[k]
+                    + b_ell * (m_dd_a * m_ell_p1[k] + m_dd_b * m_ell_p2[k]);
             }
         }
 
