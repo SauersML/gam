@@ -244,6 +244,14 @@ pub fn build_predict_input_for_model(
             // support [t_d, t_{p_basis}], h'(y, x) is a convex combination of
             // `{β₁(x) + δ_k(x)}`. The pointwise minimum lower bound is
             //   h'_min(x) = β₁(x) + min_k δ_k(x).
+            // The fit-time monotonicity barrier in
+            // `TransformationNormalFamily::max_feasible_step_size` evaluates
+            // exactly this quantity on every training row through the loose-
+            // bound rows appended by `build_monotonicity_derivative_grid_kron`,
+            // so the optimizer-accepted β is guaranteed to satisfy
+            // `β₁(x_i) + δ_k(x_i) ≥ EPS` for every training x_i and every
+            // non-degenerate basis index k. This makes the loose bound the
+            // sharpest single-pass certifier the predict path can run.
             // Outside the basis support, the B-spline first derivative
             // clamps to its boundary value, which is itself in this convex
             // combination — so the same lower bound covers extrapolation.

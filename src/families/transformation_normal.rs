@@ -3000,8 +3000,74 @@ fn build_monotonicity_derivative_grid_kron(
     covariate_design: &DesignMatrix,
 ) -> Result<KroneckerDesign, String> {
     let response_grid = transformation_monotonicity_response_grid(response, knots)?;
-    let response_deriv_grid =
+    let mut response_deriv_grid =
         evaluate_response_derivative_basis(&response_grid, knots, degree, transform)?;
+    // Append analytic loose-bound rows. The convex-combination identity
+    //   h'(y, x) = β₁(x) + Σ_{k≥1} δ_k(x) · N_{k,d-1}(y)
+    // with `Σ_{k≥1} N_{k,d-1}(y) = 1` on the basis support gives the pointwise
+    // lower bound `h'(y, x) ≥ β₁(x) + δ_k(x)` for every k with non-degenerate
+    // denominator. The fit-time barrier already enforces strict positivity of
+    // every grid-sampled `h'(y_g, x_i)`, but a B-spline basis function of
+    // degree ≥ 1 never actually reaches 1 at any interior y, so a sampled
+    // grid does not bound the convex-combination minimum tightly enough: it
+    // is possible for the optimizer to produce a `δ_k(x_i)` of magnitude
+    // 1e15+ that contributes only fractionally to any sampled `h'(y_g, x_i)`
+    // yet makes the lower bound `β₁(x_i) + δ_k(x_i)` (and therefore the
+    // analytic infimum of `h'`) hugely negative. The predict-time monotonicity
+    // check then refuses to certify, even though the optimizer-accepted β
+    // satisfied every grid-sampled feasibility constraint.
+    //
+    // To bring the fit-time and predict-time semantics into agreement we add
+    // one extra "virtual grid point" per non-degenerate basis index k that
+    // computes `β₁(x_i) + δ_k(x_i)` directly through the same Kronecker
+    // boundary scan: each row encodes the response-side functional
+    //   R_k = [0, 1, (d/(t_{k+d}−t_k)) · (T_{k,:} − T_{k−1,:})]
+    // so `R_k · β_mat · cov_row(x_i)` evaluates to exactly the loose-bound
+    // expression. The line-search now refuses any step that would drive
+    // even one such `(i, k)` pair below the strict-feasibility margin
+    // `TRANSFORMATION_MONOTONICITY_EPS`, which is precisely the constraint
+    // the predict-time bound enforces.
+    let dev_dim = transform.ncols();
+    let p_basis = transform.nrows();
+    if dev_dim > 0 && p_basis >= 2 {
+        let expected_knots = p_basis + degree + 1;
+        if knots.len() < expected_knots {
+            return Err(format!(
+                "response basis loose-bound rows need ≥ {expected_knots} knots, got {}",
+                knots.len()
+            ));
+        }
+        let mut loose_rows: Vec<Vec<f64>> = Vec::with_capacity(p_basis - 1);
+        for k in 1..p_basis {
+            let denom = knots[k + degree] - knots[k];
+            if !(denom > 0.0) {
+                continue;
+            }
+            let scale = degree as f64 / denom;
+            let mut row = vec![0.0; 2 + dev_dim];
+            row[1] = 1.0;
+            for j in 0..dev_dim {
+                row[2 + j] = scale * (transform[[k, j]] - transform[[k - 1, j]]);
+            }
+            loose_rows.push(row);
+        }
+        if !loose_rows.is_empty() {
+            let original_rows = response_deriv_grid.nrows();
+            let p_resp = response_deriv_grid.ncols();
+            let mut combined =
+                Array2::<f64>::zeros((original_rows + loose_rows.len(), p_resp));
+            combined
+                .slice_mut(s![..original_rows, ..])
+                .assign(&response_deriv_grid);
+            for (idx, row) in loose_rows.iter().enumerate() {
+                let mut target = combined.row_mut(original_rows + idx);
+                for (j, &v) in row.iter().enumerate() {
+                    target[j] = v;
+                }
+            }
+            response_deriv_grid = combined;
+        }
+    }
     // Build the operator factored: the small (n_grid × p_resp) response-side
     // factor and the unmodified covariate design. The implied virtual row
     // space is n_cov × n_grid — never materialized.
