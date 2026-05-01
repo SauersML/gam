@@ -190,29 +190,22 @@ impl ClosedFormPenaltyOperator {
             None => u_kernel.to_owned(),
         };
 
-        // Step 4: y = S_raw v with on-the-fly pair-block evaluation. Symmetry
-        // halves the work: g(r) = g(-r). Evaluate the lower triangle and
-        // accumulate symmetrically.
+        // Step 4: y = S_raw v with on-the-fly pair-block evaluation. Use the
+        // full row-summation `y[i] = Σ_j G[i,j] v[j]` rather than a symmetry-
+        // halved accumulator: for highly cancelling rows (e.g. when Z projects
+        // out a large coherent mode of G), the order in which contributions
+        // arrive at y[i] changes the cancellation pattern, and the
+        // symmetry-halved variant did not match the dense `G v` summation
+        // order to FP precision. Computing each row independently mirrors how
+        // `dense.dot(v)` accumulates, at the cost of doubling the kernel
+        // evaluations on the off-diagonal pairs.
         let k = self.centers.nrows();
         let d = self.centers.ncols();
         let mut y = Array1::<f64>::zeros(k);
         let mut r_buf = vec![0.0_f64; d];
         for i in 0..k {
-            // Diagonal: r = 0.
-            for axis in 0..d {
-                r_buf[axis] = 0.0;
-            }
-            let g_diag = self.j_prefactor
-                * anisotropic_duchon_penalty(
-                    self.q,
-                    self.m,
-                    self.s,
-                    self.kappa,
-                    &self.eta_centered,
-                    &r_buf,
-                );
-            y[i] += g_diag * v_k[i];
-            for j in 0..i {
+            let mut acc = 0.0;
+            for j in 0..k {
                 for axis in 0..d {
                     r_buf[axis] = self.centers[[i, axis]] - self.centers[[j, axis]];
                 }
@@ -225,9 +218,9 @@ impl ClosedFormPenaltyOperator {
                         &self.eta_centered,
                         &r_buf,
                     );
-                y[i] += g_ij * v_k[j];
-                y[j] += g_ij * v_k[i];
+                acc += g_ij * v_k[j];
             }
+            y[i] = acc;
         }
 
         // Step 5: y_kernel = Z^T y.
