@@ -19293,27 +19293,161 @@ pub mod closed_form_penalty {
         total
     }
 
+    /// Value `g_q` and its partial derivatives w.r.t. the invariants
+    /// `(R, s_1, s_2, u_1, u_2)` at fixed radial-derivative table `fr`.
+    ///
+    /// `fr[k]` must equal `f^{(k)}(R; κ)` for `k = 0, …, 2q + 1`.
+    /// The extra `f^{(2q+1)}` is needed because `g_R` differentiates
+    /// each `f^{(k)}` term once.
+    ///
+    /// Returns `(g, g_R, g_s1, g_s2, g_u1, g_u2)`.
+    fn radial_g_q_partials(
+        q: usize,
+        big_r: f64,
+        s1: f64,
+        s2: f64,
+        u1: f64,
+        u2: f64,
+        fr: &[f64],
+    ) -> (f64, f64, f64, f64, f64, f64) {
+        let r = big_r;
+        let r2 = r * r;
+        let r3 = r2 * r;
+        let r4 = r2 * r2;
+        let r5 = r4 * r;
+        let r6 = r4 * r2;
+        let r7 = r6 * r;
+        let r8 = r4 * r4;
+
+        match q {
+            0 => {
+                // g_0 = f(R)
+                let g = fr[0];
+                let g_r = fr[1];
+                (g, g_r, 0.0, 0.0, 0.0, 0.0)
+            }
+            1 => {
+                // g_1 = -[f''·u_1/R² + f'·(s_1/R - u_1/R³)]
+                //     = -f''·u_1/R² - f'·s_1/R + f'·u_1/R³
+                let g = -(fr[2] * u1 / r2 + fr[1] * (s1 / r - u1 / r3));
+                // ∂g/∂R: differentiate every R-power and every f^{(k)}(R).
+                //   d/dR[-f''·u1/R²] = -f'''·u1/R² + 2 f''·u1/R³
+                //   d/dR[-f'·s1/R]   = -f''·s1/R + f'·s1/R²
+                //   d/dR[ f'·u1/R³]  =  f''·u1/R³ - 3 f'·u1/R⁴
+                let g_r = -fr[3] * u1 / r2 + 2.0 * fr[2] * u1 / r3
+                    - fr[2] * s1 / r + fr[1] * s1 / r2
+                    + fr[2] * u1 / r3 - 3.0 * fr[1] * u1 / r4;
+                // Combine the two u1/R³ terms:
+                //   2 f''·u1/R³ + f''·u1/R³ = 3 f''·u1/R³.
+                // Final form (kept above as raw sum for clarity; algebra:
+                //   g_R = -f'''·u1/R² + 3 f''·u1/R³ - f''·s1/R + f'·s1/R² - 3 f'·u1/R⁴)
+                let g_s1 = -fr[1] / r;
+                let g_u1 = -fr[2] / r2 + fr[1] / r3;
+                (g, g_r, g_s1, 0.0, g_u1, 0.0)
+            }
+            2 => {
+                // g_2 = u_1²·F1 + s_1·u_1·F2 + s_1²·F3 + u_2·F4 + s_2·F5
+                let f1 = fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7;
+                let f2 = 2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5;
+                let f3 = fr[2] / r2 - fr[1] / r3;
+                let f4 = 4.0 * fr[3] / r3 - 12.0 * fr[2] / r4 + 12.0 * fr[1] / r5;
+                let f5 = 2.0 * fr[2] / r2 - 2.0 * fr[1] / r3;
+                let g = u1 * u1 * f1 + s1 * u1 * f2 + s1 * s1 * f3 + u2 * f4 + s2 * f5;
+
+                // F_i derivatives in R (chain through f^{(k)}(R) and through 1/R^e).
+                //   dF1/dR = f⁽⁵⁾/R⁴ - 10 f''''/R⁵ + 45 f'''/R⁶ - 105 f''/R⁷ + 105 f'/R⁸
+                //   dF2/dR = 2 f''''/R³ - 12 f'''/R⁴ + 30 f''/R⁵ - 30 f'/R⁶
+                //   dF3/dR = f'''/R² - 3 f''/R³ + 3 f'/R⁴
+                //   dF4/dR = 4 f''''/R³ - 24 f'''/R⁴ + 60 f''/R⁵ - 60 f'/R⁶
+                //   dF5/dR = 2 f'''/R² - 6 f''/R³ + 6 f'/R⁴
+                let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6
+                    - 105.0 * fr[2] / r7 + 105.0 * fr[1] / r8;
+                let df2 = 2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5
+                    - 30.0 * fr[1] / r6;
+                let df3 = fr[3] / r2 - 3.0 * fr[2] / r3 + 3.0 * fr[1] / r4;
+                let df4 = 4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5
+                    - 60.0 * fr[1] / r6;
+                let df5 = 2.0 * fr[3] / r2 - 6.0 * fr[2] / r3 + 6.0 * fr[1] / r4;
+
+                let g_r = u1 * u1 * df1 + s1 * u1 * df2 + s1 * s1 * df3 + u2 * df4 + s2 * df5;
+
+                // ∂g/∂s_1 = u_1·F2 + 2 s_1·F3
+                // ∂g/∂s_2 = F5
+                // ∂g/∂u_1 = 2 u_1·F1 + s_1·F2
+                // ∂g/∂u_2 = F4
+                let g_s1 = u1 * f2 + 2.0 * s1 * f3;
+                let g_s2 = f5;
+                let g_u1 = 2.0 * u1 * f1 + s1 * f2;
+                let g_u2 = f4;
+                (g, g_r, g_s1, g_s2, g_u1, g_u2)
+            }
+            _ => panic!("radial_g_q_partials: q must be in {{0, 1, 2}}"),
+        }
+    }
+
+    /// Anisotropic invariants and their first derivatives w.r.t. each `η_l`.
+    ///
+    /// Returns `(R, s_1, s_2, u_1, u_2, [∂R/∂η_l], [∂s_1/∂η_l], …)`.
+    /// Each Jacobian vector has length `d`.
+    ///
+    /// Derivatives (with `b_k = exp(-2η_k)`, `r_k = r[k]`):
+    ///   ∂s_1/∂η_l = −2 b_l
+    ///   ∂s_2/∂η_l = −4 b_l²
+    ///   ∂R/∂η_l   = −b_l r_l² / R    (from R² = Σ b_k r_k²; ∂(R²)/∂η_l = −2 b_l r_l²)
+    ///   ∂u_1/∂η_l = −4 b_l² r_l²
+    ///   ∂u_2/∂η_l = −6 b_l³ r_l²
+    fn aniso_invariants_eta_jacobian(
+        eta: &[f64],
+        r: &[f64],
+    ) -> (
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+    ) {
+        let d = eta.len();
+        let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
+        let mut dr_de = vec![0.0_f64; d];
+        let mut ds1_de = vec![0.0_f64; d];
+        let mut ds2_de = vec![0.0_f64; d];
+        let mut du1_de = vec![0.0_f64; d];
+        let mut du2_de = vec![0.0_f64; d];
+        for l in 0..d {
+            let b_l = (-2.0 * eta[l]).exp();
+            let b_l_sq = b_l * b_l;
+            let b_l_cu = b_l_sq * b_l;
+            let r_l_sq = r[l] * r[l];
+            ds1_de[l] = -2.0 * b_l;
+            ds2_de[l] = -4.0 * b_l_sq;
+            dr_de[l] = if big_r > 0.0 {
+                -b_l * r_l_sq / big_r
+            } else {
+                0.0
+            };
+            du1_de[l] = -4.0 * b_l_sq * r_l_sq;
+            du2_de[l] = -6.0 * b_l_cu * r_l_sq;
+        }
+        (
+            big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de,
+        )
+    }
+
     /// Bundled value + first/second derivatives of the radial-form
     /// anisotropic pair-block `J · g_q`, drop-in replacement for the
     /// Schoenberg-quadrature `pair_block_with_j_second_derivatives`.
     ///
-    /// Implementation status (Task #6):
-    ///   * Value:                 fully analytic via the radial form
-    ///                            (`anisotropic_duchon_penalty_radial`).
-    ///   * ∂η, ∂κ, ∂²η, ∂η∂κ, ∂²κ: computed via central finite differences
-    ///                            of the value-side radial form. This still
-    ///                            avoids the Schoenberg 80-node quadrature
-    ///                            entirely (each FD evaluation is O(d) +
-    ///                            cost of one `radial_derivatives_of_…`
-    ///                            call ≪ 80-node quadrature cost), and is
-    ///                            sufficient for wire-in tasks that depend
-    ///                            on the radial form.
-    ///
-    /// A purely-analytic chain-rule implementation is mechanical but long
-    /// (requires `f^{(0..6)}` for q = 2 Hessian) and is left as
-    /// follow-up work; the math team's letter (eq. 3.8) gives the
-    /// invariant decomposition (R, s_1, s_2, u_1, u_2, J) that lets the
-    /// chain rule close in those scalars plus radial derivatives of f.
+    /// Implementation status:
+    ///   * Value, ∂η, ∂κ:           fully analytic via the radial form
+    ///                              and chain rule on (R, s_1, s_2, u_1, u_2).
+    ///   * ∂²η, ∂η∂κ, ∂²κ:          central FD around the analytic value
+    ///                              (legacy path; phased migration to
+    ///                              fully-analytic chain rule in progress).
     pub fn pair_block_radial_with_j_second_derivatives(
         q: usize,
         m: usize,
@@ -19353,20 +19487,75 @@ pub mod closed_form_penalty {
         let mut d2_eta = vec![vec![0.0_f64; d]; d];
         let mut d2_eta_kappa = vec![0.0_f64; d];
 
-        // For first deriv ∂η_l: 2-point central FD.
-        let mut eta_p: EtaBuf = eta_buf_from(eta);
-        let mut eta_m: EtaBuf = eta_buf_from(eta);
-        for l in 0..d {
-            eta_p.copy_from_slice(eta);
-            eta_m.copy_from_slice(eta);
-            eta_p[l] += h_eta;
-            eta_m[l] -= h_eta;
-            d_eta[l] = (val(&eta_p, kappa) - val(&eta_m, kappa)) / (2.0 * h_eta);
+        // Decide whether to use the analytic chain rule or fall back to FD.
+        // The analytic chain rule requires R > 0 and the non-log-Riesz regime
+        // (otherwise `anisotropic_duchon_penalty_radial` itself routes to a
+        // different formula). Special cases keep the FD path.
+        let (big_r_check, _, _, _, _) = aniso_invariants(eta, r);
+        let analytic_first_ok = big_r_check > 0.0 && !relevant_block_is_log_riesz(d, m, s, kappa);
+
+        if analytic_first_ok {
+            // Analytic d_eta and d_kappa via chain rule on (R, s_1, s_2, u_1, u_2).
+            // Need radial derivatives up to order 2q + 1 because g_R contains
+            // f^{(2q+1)} (one extra differentiation beyond what g_q itself uses).
+            let max_order = 2 * q + 1;
+            let (
+                big_r,
+                s1,
+                s2,
+                u1,
+                u2,
+                dr_de,
+                ds1_de,
+                ds2_de,
+                du1_de,
+                du2_de,
+            ) = aniso_invariants_eta_jacobian(eta, r);
+            let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
+            let (g, g_r, g_s1, g_s2, g_u1, g_u2) =
+                radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
+            let big_j = big_j_of(eta);
+
+            // ∂_η_l (J · g) = J · (g + ∂_η_l g)
+            //   ∂_η_l g = g_R · ∂R/∂η_l + g_s1 · ∂s1/∂η_l + g_s2 · ∂s2/∂η_l
+            //           + g_u1 · ∂u1/∂η_l + g_u2 · ∂u2/∂η_l
+            for l in 0..d {
+                let bare_d_eta_g = g_r * dr_de[l]
+                    + g_s1 * ds1_de[l]
+                    + g_s2 * ds2_de[l]
+                    + g_u1 * du1_de[l]
+                    + g_u2 * du2_de[l];
+                d_eta[l] = big_j * (g + bare_d_eta_g);
+            }
+        } else {
+            // Special-case fallback: 2-point central FD.
+            let mut eta_p: EtaBuf = eta_buf_from(eta);
+            let mut eta_m: EtaBuf = eta_buf_from(eta);
+            for l in 0..d {
+                eta_p.copy_from_slice(eta);
+                eta_m.copy_from_slice(eta);
+                eta_p[l] += h_eta;
+                eta_m[l] -= h_eta;
+                d_eta[l] = (val(&eta_p, kappa) - val(&eta_m, kappa)) / (2.0 * h_eta);
+            }
         }
 
-        // ∂_κ
-        let d_kappa = if s == 0 {
+        // ∂_κ. Analytic via chain rule on F^{(k)}: only the radial-derivative
+        // table depends on κ, the invariants (R, s_1, s_2, u_1, u_2) do not.
+        // ∂_κ (J · g_q) = J · g_q evaluated with fr replaced by ∂_κ fr.
+        let d_kappa = if s == 0 || kappa == 0.0 {
             0.0
+        } else if analytic_first_ok {
+            let max_order = 2 * q + 1;
+            let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
+            let dfr =
+                radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, big_r, max_order);
+            // The same g_q expansion in (R, s1, s2, u1, u2) but with ∂_κ F^{(k)}
+            // in place of F^{(k)}; the (R, ..., u2) factors are κ-independent.
+            // Because g_q is linear in each F^{(k)} for q ∈ {0, 1, 2}, the
+            // partial helper applied to ∂_κ F gives ∂_κ g_q.
+            let (dg, _, _, _, _, _) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &dfr);
+            big_j_of(eta) * dg
         } else {
             (val(eta, kappa + h_kappa) - val(eta, kappa - h_kappa)) / (2.0 * h_kappa)
         };
@@ -19380,6 +19569,9 @@ pub mod closed_form_penalty {
         };
 
         // Second derivatives in η: diagonal via 3-pt stencil.
+        // (FD scratch buffers; phase-3 will replace this with analytic chain rule.)
+        let mut eta_p: EtaBuf = eta_buf_from(eta);
+        let mut eta_m: EtaBuf = eta_buf_from(eta);
         for l in 0..d {
             eta_p.copy_from_slice(eta);
             eta_m.copy_from_slice(eta);
