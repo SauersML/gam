@@ -215,9 +215,9 @@ def _manifest_path(model_path: Path) -> Path:
 
 def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
     try:
-        import pandas as pd  # type: ignore[import-not-found]
+        import pandas as pd
     except ImportError:
-        pd = None  # type: ignore[assignment]
+        pd = None
 
     if pd is not None and isinstance(data, pd.DataFrame):
         result = data.copy()
@@ -244,9 +244,9 @@ def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
         return result
 
     try:
-        import pyarrow as pa  # type: ignore[import-not-found]
+        import pyarrow as pa
     except ImportError:
-        pa = None  # type: ignore[assignment]
+        pa = None
 
     if pa is not None and isinstance(data, pa.Table):
         return data.append_column(out_column, pa.array(_to_1d_list(z)))
@@ -259,9 +259,9 @@ def _attach_z_column(data: Any, z: Any, out_column: str) -> Any:
 
 def _to_1d_list(values: Any) -> list[float]:
     try:
-        import numpy as np  # type: ignore[import-not-found]
+        import numpy as np
     except ImportError:
-        np = None  # type: ignore[assignment]
+        np = None
 
     if np is not None and isinstance(values, np.ndarray):
         return [float(v) for v in values.reshape(-1).tolist()]

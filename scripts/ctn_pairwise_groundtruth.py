@@ -96,7 +96,7 @@ C_psi2   = [[x_aa, x_ab],
 # ---------------------------------------------------------------------------
 
 def kron_per_row(R_row, C_row):
-    """Return the length-p Khatri-Rao row R_row \otimes C_row (Kronecker)."""
+    r"""Return the length-p Khatri-Rao row R_row \otimes C_row (Kronecker)."""
     return np.outer(R_row, C_row).reshape(-1)
 
 phi       = np.array([kron_per_row(response_val_basis[i],   C[i])    for i in range(n)])
@@ -250,10 +250,6 @@ for a in range(psi_dim):
 #
 # pair_b_mat[a][b] = sum_i w_i ( q_ab P_i + q_ab Q_i )
 # ---------------------------------------------------------------------------
-def sym_outer(u_mat, vmat):
-    """Per-row outer u * v^T + v * u^T, returning shape (n, p, p)."""
-    return np.einsum('ij,ik->ijk', u_mat, vmat) + np.einsum('ij,ik->ijk', vmat, u_mat)
-
 def per_row_outer(u_mat, vmat):
     """Per-row outer u * v^T (no symmetrization), shape (n, p, p)."""
     return np.einsum('ij,ik->ijk', u_mat, vmat)
