@@ -34,14 +34,7 @@ fn main() {
                 let g = if variant == "full" {
                     closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta))
                 } else {
-                    closed_form_anisotropic_pair_block_pure(
-                        centers.view(),
-                        q,
-                        m,
-                        s,
-                        kappa,
-                        Some(&eta),
-                    )
+                    closed_form_anisotropic_pair_block_pure(centers.view(), q, m, s, Some(&eta))
                 };
                 acc += g[(0, 0)];
             }

@@ -53,6 +53,7 @@ use gam::terms::basis::{
     },
 };
 use gam::terms::closed_form_operator::ClosedFormPenaltyOperator;
+use gam::terms::penalty_op::PenaltyOp;
 
 // Production-ish parameters: m=2 polyharmonic, s=8 Matérn order, κ=1, d=8.
 // η is zeroed (isotropic limit b_k=1 across axes); this still exercises the

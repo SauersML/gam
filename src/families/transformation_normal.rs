@@ -3415,15 +3415,6 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 }
 
 // ---------------------------------------------------------------------------
-// Matrix-free ψ-Hessian operator (CTN exact-Newton joint ψ Hessian)
-// ---------------------------------------------------------------------------
-
-/// Operator-form of the CTN ψ-Hessian
-///
-///   `H_ψ = (sym_val) + (sym_deriv) + (cubic)`,
-///
-/// where
-// ---------------------------------------------------------------------------
 // Response-direction basis construction
 // ---------------------------------------------------------------------------
 
