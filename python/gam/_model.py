@@ -399,10 +399,16 @@ class Model:
             import numpy as np
 
             z = np.asarray(_transformation_normal_z(columns), dtype=float)
-            if id_column is None:
+            # Default contract: bare per-row z-score array. An explicit
+            # `return_type=` or an `id_column` opts into the table-style
+            # return so the column survives a pandas/dict roundtrip.
+            if id_column is None and return_type is None:
                 return z
+            out_columns = {"z": z.tolist()}
+            if id_column is not None:
+                out_columns = {id_column: row_ids or [], **out_columns}
             return restore_output_table(
-                {id_column: row_ids or [], "z": z.tolist()},
+                out_columns,
                 requested=return_type,
                 input_kind=table_kind,
                 training_kind=self._training_table_kind,
@@ -414,10 +420,16 @@ class Model:
             probs = np.clip(
                 np.asarray(columns.get("mean", []), dtype=float), 0.0, 1.0
             )
-            if id_column is None:
+            # Default contract: bare per-row probability array. An explicit
+            # `return_type=` or an `id_column` opts into the table-style
+            # return so callers that asked for a table get one.
+            if id_column is None and return_type is None:
                 return probs
+            out_columns = {"mean": probs.tolist()}
+            if id_column is not None:
+                out_columns = {id_column: row_ids or [], **out_columns}
             return restore_output_table(
-                {id_column: row_ids or [], "mean": probs.tolist()},
+                out_columns,
                 requested=return_type,
                 input_kind=table_kind,
                 training_kind=self._training_table_kind,
