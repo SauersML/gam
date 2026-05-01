@@ -271,8 +271,15 @@ impl ClosedFormPenaltyOperator {
     /// Materialize the full constrained operator as a dense `Array2`. Useful
     /// as a fallback for callers that still expect dense penalties or for
     /// validation against the existing `closed_form_operator_penalty_in_total_basis`
-    /// pipeline.
+    /// pipeline. Uses the internal cache: the first call builds, subsequent
+    /// calls clone from the cache.
     pub fn dense_form(&self) -> Array2<f64> {
+        self.ensure_dense().clone()
+    }
+
+    /// Internal builder. Do not call directly — go through `ensure_dense` so
+    /// the result is cached.
+    fn build_dense(&self) -> Array2<f64> {
         // Build raw K×K kernel block via the existing dense path so we share
         // its cancellation-detector logic for small κ.
         let g_raw = closed_form_anisotropic_pair_block(
