@@ -7726,8 +7726,8 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         };
         let aniso_for_helper = Some(aniso_log_scales);
         let kernel_z = Some(&z_kernel);
-        let mut substitute = |q: usize,
-                              info: &mut PerOperatorInfo|
+        let substitute = |q: usize,
+                          info: &mut PerOperatorInfo|
          -> Option<Vec<Vec<Array2<f64>>>> {
             if !closed_form_converges_q_aniso(q) {
                 return None;
@@ -7864,9 +7864,9 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         op0_s_first_raw: op0_info.s_first_raw,
         op1_s_first_raw: op1_info.s_first_raw,
         op2_s_first_raw: op2_info.s_first_raw,
-        op0_cf_cross_raw: None,
-        op1_cf_cross_raw: None,
-        op2_cf_cross_raw: None,
+        op0_cf_cross_raw: None, // q=0 mass always stays on collocation.
+        op1_cf_cross_raw: op1_cf_cross_raw,
+        op2_cf_cross_raw: op2_cf_cross_raw,
     };
     let cross_ctx = std::sync::Arc::new(cross_ctx);
     let cross_provider = AnisoPenaltyCrossProvider::new(move |a: usize, b: usize| {
