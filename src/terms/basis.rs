@@ -11943,10 +11943,68 @@ fn build_duchon_operator_penalty_psi_derivatives(
 
     let (s0, s0_psi, s0_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d0, &d0_psi, &d0_psi_psi);
-    let (s1, s1_psi, s1_psi_psi) =
+    let (mut s1, mut s1_psi, mut s1_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d1, &d1_psi, &d1_psi_psi);
-    let (s2, s2_psi, s2_psi_psi) =
+    let (mut s2, mut s2_psi, mut s2_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
+
+    // Math team Letter A §9: closed-form path uses raw η directly. Per-q
+    // closed-form gate matches the value-side: nullspace=Zero AND the per-q
+    // convergence/precondition/log-Riesz predicate. q=0 stays on collocation.
+    // ψ-derivatives come from the bundle's FD-based κ-derivatives via chain
+    // rule (`pair_block_radial_with_j_second_derivatives` uses central FD
+    // with h_κ ≈ |κ|·1e-4, giving O(1e-7) precision until Tier-2 analytic
+    // κ-derivs land from closed-form-math-fix).
+    let use_closed_form_outer_psi =
+        matches!(effective_nullspace_order, DuchonNullspaceOrder::Zero);
+    let log_riesz_present_psi = d % 2 == 0 && d / 2 <= 2 * p_order;
+    let closed_form_converges_q_psi = |q: usize| -> bool {
+        let four_ms = 4 * (p_order + s_order);
+        let dp2q = d + 2 * q;
+        let four_m = 4 * p_order;
+        four_ms > dp2q
+            && dp2q > four_m
+            && 2 * p_order >= q + 1
+            && !log_riesz_present_psi
+    };
+    if use_closed_form_outer_psi {
+        let kappa = 1.0 / length_scale.max(1e-300);
+        let aniso = spec.aniso_log_scales.as_deref();
+        if closed_form_converges_q_psi(1) {
+            let (cf_s, cf_s_psi, cf_s_psi_psi) =
+                closed_form_psi_derivatives_in_total_basis(
+                    centers,
+                    1,
+                    p_order,
+                    s_order,
+                    kappa,
+                    aniso,
+                    Some(&z_kernel),
+                    poly_cols,
+                    identifiability_transform,
+                );
+            s1 = cf_s;
+            s1_psi = cf_s_psi;
+            s1_psi_psi = cf_s_psi_psi;
+        }
+        if closed_form_converges_q_psi(2) {
+            let (cf_s, cf_s_psi, cf_s_psi_psi) =
+                closed_form_psi_derivatives_in_total_basis(
+                    centers,
+                    2,
+                    p_order,
+                    s_order,
+                    kappa,
+                    aniso,
+                    Some(&z_kernel),
+                    poly_cols,
+                    identifiability_transform,
+                );
+            s2 = cf_s;
+            s2_psi = cf_s_psi;
+            s2_psi_psi = cf_s_psi_psi;
+        }
+    }
 
     let (s0_norm, s0_norm_psi, s0_norm_psi_psi, c0) =
         normalize_penaltywith_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
@@ -18382,7 +18440,7 @@ pub mod closed_form_penalty {
         assert!(ell >= 1);
         assert!(kappa > 0.0);
         assert!(r > 0.0);
-        assert!(max_order <= 4, "matern_block_radial_derivatives: max_order ≤ 4");
+        assert!(max_order <= 6, "matern_block_radial_derivatives: max_order ≤ 6");
 
         let nu = ell as f64 - d as f64 / 2.0;
         // Prefactor κ^{d/2-ℓ} / ((2π)^{d/2} 2^{ℓ-1} Γ(ℓ))
@@ -18553,7 +18611,7 @@ pub mod closed_form_penalty {
     ) -> Vec<f64> {
         assert!(r > 0.0, "radial_derivatives_of_isotropic_duchon: r must be > 0");
         assert!(2 * m >= 1, "radial_derivatives_of_isotropic_duchon: need m ≥ 1");
-        assert!(max_order <= 4, "radial_derivatives_of_isotropic_duchon: max_order ≤ 4");
+        assert!(max_order <= 6, "radial_derivatives_of_isotropic_duchon: max_order ≤ 6");
 
         // a = 2m (we differentiate f = isotropic Duchon at q=0; the q is
         // applied externally via Δ_B^q in g_q).  Match isotropic_duchon_penalty(q=0).
@@ -18899,7 +18957,7 @@ pub mod closed_form_penalty {
         max_order: usize,
     ) -> Vec<f64> {
         assert!(r > 0.0);
-        assert!(max_order <= 4);
+        assert!(max_order <= 6);
         let mut total = vec![0.0_f64; max_order + 1];
         if s == 0 || kappa == 0.0 {
             // No Matérn or κ → 0 limit (Riesz pure) — both κ-independent.

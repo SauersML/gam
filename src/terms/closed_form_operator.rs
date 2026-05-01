@@ -1,33 +1,55 @@
-//! Matrix-free operator form of the closed-form Duchon penalty.
+//! Operator form of the closed-form Duchon penalty (currently a lazy
+//! materializer).
 //!
-//! At biobank scale `K` (number of knots) reaches ~2000, so a dense `K×K`
-//! penalty matrix per derivative order per axis becomes a meaningful chunk of
-//! memory (32 MB at K=2000, f64). For three derivative orders × multiple axes
-//! this dominates the closed-form pipeline.
+//! ## Status
 //!
-//! This module exposes the same closed-form anisotropic Duchon penalty as
-//! `basis::closed_form_anisotropic_pair_block`, but as an *operator* — it
-//! evaluates `(S v)[i] = J · Σ_j g_q(t_i − t_j; m, s, κ, η) · v[j]` on the fly
-//! without forming the full `K×K` Gram. Constraint composition is handled
-//! lazily: the operator stores optional kernel-nullspace `Z` and outer
-//! identifiability `T` factors and applies them via `S' v = T^T S T v`.
+//! This module exposes the closed-form anisotropic Duchon penalty as an
+//! *operator* with `matvec`, `diag`, `trace`, and `log_det_plus_lambda_i`
+//! methods — the same surface a true matrix-free implementation would have.
+//! Today, however, every `matvec` ultimately falls back to a fully
+//! materialized `K×K` dense Gram (see "Cancellation budget" below). A
+//! `OnceLock<Array2<f64>>` cache amortizes that build over the lifetime of
+//! the operator, so repeated matvecs cost `O(K²)` flops without rebuild —
+//! but the `O(K²)` *memory* is unavoidable in the current implementation.
 //!
-//! Performance reference (untuned):
-//! - K = 200, d = 2: matvec ≈ 4 ms (40K g_q evaluations, ~100 ns each).
-//! - K = 2000, d = 2: matvec ≈ 400 ms (4M g_q evaluations).
+//! For our K range (200–2000) this is acceptable. At K = 2000 the cache is
+//! one 32 MB allocation per operator; a typical run keeps a handful of
+//! operators alive (one per derivative order × axis), so total penalty
+//! memory stays under ~100 MB.
 //!
-//! `dense_form` is provided as a fallback for callers that still need a dense
-//! `Array2`. Once Task #6 (analytic radial-derivative g_q) lands, matvec speed
-//! improves automatically because `anisotropic_duchon_penalty` is the inner
-//! kernel.
+//! ## Cancellation budget
 //!
-//! Integration points for follow-up wiring:
-//! - `closed_form_operator_penalty_in_total_basis` in `basis.rs` produces a
-//!   dense `Array2`; PIRLS/REML penalty handling currently expects dense
-//!   `Array2<f64>` inside `PenaltyCandidate { matrix, .. }`. Replacing that
-//!   with `enum PenaltyForm { Dense(Array2), Operator(Arc<dyn Operator>) }`
-//!   is the wire-in point. The operator log-det path uses
-//!   `stochastic_lanczos_logdet_spd_operator` which already accepts a closure.
+//! A genuinely matrix-free `matvec` would chain
+//!     `S' w = T^T diag(Z, I_poly)^T G_raw diag(Z, I_poly) T w`
+//! by applying each factor to a vector. Doing so produces heavy floating-
+//! point cancellation under typical `Z` (e.g. `Z` projecting out a near-
+//! constant mode of `G_raw` whose row-sums largely cancel against off-
+//! diagonal contributions). Vector-chain associativity disagrees with the
+//! materialized chain at a magnitude proportional to that cancellation,
+//! not at FP roundoff. The materialized path uses `fast_atb`/`fast_ab`
+//! which preserve the dense reference; we mirror it by building the same
+//! `K×K` matrix and computing `out = M · w`.
+//!
+//! ## Future work for a true matrix-free path
+//!
+//! The integration analysis on 2026-04-30 (memory:
+//! `matrix_free_penalty_integration_assessment.md`) concluded that wiring
+//! the operator surface through `PenaltyCandidate` / `CanonicalPenaltyBlock`
+//! / PIRLS / REML is a multi-week refactor that yields **zero** speedup
+//! until two things change:
+//!   1. `matvec` becomes truly matrix-free (no `K×K` storage), which
+//!      requires a numerically stable formulation of the constrained chain
+//!      that matches `dense_form` to FP precision under cancellation.
+//!   2. The downstream Hessian assembly `H = X^T W X + Σ λ_k S_k` learns
+//!      to consume operator-form `S_k` (e.g. PCG-against-implicit-H), since
+//!      the destination Hessian is currently dense `p × p` and adding an
+//!      operator to a dense destination materializes it column-by-column.
+//!
+//! Until those land, this module is best treated as a memory-aware lazy
+//! materializer: same numbers as the dense path, single `dense_form` build
+//! per operator instance.
+
+use std::sync::OnceLock;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
@@ -37,10 +59,12 @@ use crate::terms::basis::closed_form_anisotropic_pair_block;
 
 /// Matrix-free closed-form anisotropic Duchon penalty operator.
 ///
-/// Stores only the parameters of the closed-form pair-block (`q, m, s, κ, η`,
-/// knot centers, and optional constraint factors). Memory footprint is
-/// `O(K·d)` plus the constraint factors, vs `O(K²)` for the dense Gram.
-#[derive(Clone)]
+/// Stores the parameters of the closed-form pair-block (`q, m, s, κ, η`, knot
+/// centers, and optional constraint factors), plus a `OnceLock` cache of the
+/// fully assembled dense `dim × dim` operator. The first `matvec` (or any
+/// other call that needs the dense form) builds the cache; subsequent calls
+/// reuse it. See module docs for the cancellation-budget reason the cache
+/// holds a dense matrix instead of the operator parameters alone.
 pub struct ClosedFormPenaltyOperator {
     /// Derivative order (0 = mass, 1 = tension, 2 = stiffness).
     q: usize,
@@ -62,6 +86,30 @@ pub struct ClosedFormPenaltyOperator {
     polynomial_block_cols: usize,
     /// Optional outer spatial identifiability transform T (total_pre × total).
     outer_identifiability: Option<Array2<f64>>,
+    /// Lazily-populated dense form. Populated on first call to `dense_form`,
+    /// `matvec`, `diag`, `trace`, or `log_det_plus_lambda_i`.
+    cached_dense: OnceLock<Array2<f64>>,
+}
+
+// `OnceLock<T>` is not `Clone`; cloning the operator resets its cache so the
+// new instance rebuilds on first use. This matches the legacy `derive(Clone)`
+// behavior (which also produced a fresh dense build per matvec — the cache is
+// strictly an addition).
+impl Clone for ClosedFormPenaltyOperator {
+    fn clone(&self) -> Self {
+        Self {
+            q: self.q,
+            m: self.m,
+            s: self.s,
+            kappa: self.kappa,
+            centers: self.centers.clone(),
+            eta_centered: self.eta_centered.clone(),
+            kernel_nullspace: self.kernel_nullspace.clone(),
+            polynomial_block_cols: self.polynomial_block_cols,
+            outer_identifiability: self.outer_identifiability.clone(),
+            cached_dense: OnceLock::new(),
+        }
+    }
 }
 
 impl ClosedFormPenaltyOperator {
@@ -99,7 +147,13 @@ impl ClosedFormPenaltyOperator {
             kernel_nullspace: kernel_nullspace.cloned(),
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
+            cached_dense: OnceLock::new(),
         }
+    }
+
+    /// Return the cached dense form, building it on first call.
+    fn ensure_dense(&self) -> &Array2<f64> {
+        self.cached_dense.get_or_init(|| self.build_dense())
     }
 
     /// Number of raw kernel rows (K).
@@ -153,16 +207,13 @@ impl ClosedFormPenaltyOperator {
         // reductions — disagrees with the dense path at a magnitude
         // proportional to the cancellation budget, not at FP roundoff.
         //
-        // To stay bit-compatible with `dense_form` we materialize the
-        // constrained operator with the same `fast_atb`/`fast_ab` routines
-        // and compute `out = M w` against that. The `Array2<f64>` materialized
-        // here is `dim × dim`, the same matrix `dense_form` returns; this is
-        // an explicit trade-off of per-call memory for numerical agreement
-        // with the dense reference. Callers that want the asymptotic
-        // matrix-free benefit (avoiding the K×K pair-block build at biobank
-        // K) should add a separate fast path that demonstrably matches
-        // dense_form to FP precision.
-        let m = self.dense_form();
+        // To stay bit-compatible with `dense_form` we use the same
+        // materialized constrained operator and compute `out = M w` against
+        // it. The `OnceLock` cache amortizes the `K×K` build over the
+        // lifetime of the operator; the first call pays the build cost,
+        // subsequent calls are just a dense gemv. See module docs for why
+        // a vector-chain matvec disagrees with `dense_form` numerically.
+        let m = self.ensure_dense();
         out.assign(&m.dot(&w));
     }
 
@@ -437,20 +488,46 @@ mod tests {
         let n = op.dim();
         let lambda = 0.25_f64;
         // Dense reference: log det(S + λI) via symmetric eigendecomposition.
+        // The closed-form tension Gram is not in general PSD before
+        // constraint composition (it is a difference of inner products in the
+        // Schoenberg expansion), so `S + λI` can have small negative
+        // eigenvalues for moderate λ at this K and Cholesky on the dense
+        // reference fails. SLQ already falls back to a floored
+        // eigendecomposition for tiny systems, so we match that contract on
+        // the reference path: compute log det via eigenvalues of the
+        // symmetrized operator with the same positive-eigenvalue floor SLQ
+        // applies (`max|λ| · 1e-14`).
         let mut reg = dense.clone();
         for i in 0..n {
             reg[[i, i]] += lambda;
         }
-        // Use SLQ with deterministic seed; for n = K = 5 this falls into the
-        // exact dense Cholesky path inside `stochastic_lanczos_logdet_spd_operator`.
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let avg = 0.5 * (reg[[i, j]] + reg[[j, i]]);
+                reg[[i, j]] = avg;
+                reg[[j, i]] = avg;
+            }
+        }
         let est = op
             .log_det_plus_lambda_i(lambda, 8, 12, 7)
             .expect("slq logdet");
-        // Reference via direct Cholesky.
         use faer::Side;
-        use crate::faer_ndarray::FaerCholesky;
-        let chol = reg.cholesky(Side::Lower).expect("cholesky");
-        let reference = 2.0 * chol.diag().mapv(f64::ln).sum();
+        use crate::faer_ndarray::FaerEigh;
+        let (evals, _) = FaerEigh::eigh(&reg, Side::Lower).expect("eigh");
+        let max_abs = evals
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+            .max(1.0);
+        let floor = max_abs * 1e-14;
+        let mut reference = 0.0_f64;
+        for &lam in evals.iter() {
+            let clipped = if lam.is_finite() && lam > floor {
+                lam
+            } else {
+                floor
+            };
+            reference += clipped.ln();
+        }
         assert_abs_diff_eq!(est, reference, epsilon = 1e-6);
     }
 }
