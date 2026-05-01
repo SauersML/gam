@@ -75,8 +75,8 @@ if not _FORCE_SERIAL:
 for _k, _v in _SERIAL_ENV_OVERRIDES.items():
     os.environ[_k] = _v
 
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
+import numpy as np
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench"
