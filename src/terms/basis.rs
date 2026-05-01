@@ -8826,8 +8826,7 @@ pub fn operator_penalty_candidates_closed_form(
     // implicit-H, Hutchinson EDF) can reuse the operator's matvec without
     // rebuilding the dense Gram. Below threshold, dense-only is preserved
     // (Cholesky on the small materialized H is faster).
-    let operator_form_threshold = closed_form_operator_threshold();
-    let emit_operator = centers.nrows() > operator_form_threshold;
+    let emit_operator = centers.nrows() > CLOSED_FORM_OPERATOR_THRESHOLD;
 
     let s1_raw = if closed_form_converges(1) {
         closed_form_operator_penalty_in_total_basis(
@@ -8932,25 +8931,15 @@ pub fn operator_penalty_candidates_closed_form(
     out
 }
 
-/// Configurable threshold above which the closed-form factory emits an
-/// operator-form `op` handle alongside the dense matrix. Default 1500 raw
-/// kernel rows; set via env var `GAM_CLOSED_FORM_OP_THRESHOLD`. Below the
-/// threshold, only the dense form is emitted — direct Cholesky on the small
-/// materialized H is faster than PCG-against-implicit-H. The 1500 default
-/// was selected from `bench_hessian_solve_dense_vs_implicit` in
-/// `benches/closed_form_criterion.rs`: the implicit PCG path crosses below
-/// dense Cholesky around K ≈ 1500 on the synthetic SPD-with-coupled-penalty
-/// fixture there. Production callers can override the env var to retune
-/// after a real workload bench.
-fn closed_form_operator_threshold() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("GAM_CLOSED_FORM_OP_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1500)
-    })
-}
+/// Threshold above which the closed-form factory emits an operator-form `op`
+/// handle alongside the dense matrix. Above 1500 raw kernel rows, downstream
+/// consumers (PCG-against-implicit-H, Hutchinson EDF) reuse the operator's
+/// matvec without rebuilding the dense Gram. Below it, only the dense form is
+/// emitted — direct Cholesky on the small materialized H is faster than
+/// PCG-against-implicit-H. The crossover was measured by
+/// `bench_hessian_solve_dense_vs_implicit` in `benches/closed_form_criterion.rs`
+/// against the synthetic SPD-with-coupled-penalty fixture there.
+const CLOSED_FORM_OPERATOR_THRESHOLD: usize = 1500;
 
 /// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
 /// [`closed_form_operator_penalty_in_total_basis`]. Uses
