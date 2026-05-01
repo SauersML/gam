@@ -252,10 +252,17 @@ pub fn build_predict_input_for_model(
             // `β₁(x_i) + δ_k(x_i) ≥ EPS` for every training x_i and every
             // non-degenerate basis index k. This makes the loose bound the
             // sharpest single-pass certifier the predict path can run.
-            // Outside the basis support, the B-spline first derivative
-            // clamps to its boundary value, which is itself in this convex
-            // combination — so the same lower bound covers extrapolation.
-            // No tail-guard heuristic, no grid sampling needed.
+            // The y-direction is fully covered: outside the response basis
+            // support, the B-spline first derivative clamps to its boundary
+            // value, which is itself in this convex combination — so the
+            // same lower bound covers y-extrapolation with no tail-guard
+            // heuristic. The covariate-direction concern (predict-time x
+            // outside the training row cloud but inside the axis-aligned
+            // box reached after `axis_clip_to_training_ranges`) is handled
+            // at fit time: `build_monotonicity_derivative_grid_kron`
+            // appends `2 · p_cov` axis-extreme covariate rows so the
+            // optimizer satisfies `β₁(x) + δ_k(x) ≥ ε` at every corner of
+            // the box, not only at training rows.
             let kn = resp_knots
                 .as_slice()
                 .ok_or_else(|| "internal error: response knots are not contiguous".to_string())?;
