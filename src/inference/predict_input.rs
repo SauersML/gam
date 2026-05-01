@@ -3,13 +3,17 @@ use std::collections::HashMap;
 use ndarray::Array1;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+use crate::basis::{
+    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
+};
 use crate::estimate::{BlockRole, PredictInput};
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
-use crate::families::transformation_normal::TRANSFORMATION_MONOTONICITY_EPS;
+use crate::families::transformation_normal::{
+    TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_NORMAL_H_ABS_MAX,
+};
 use crate::inference::model::{FittedModel, PredictModelClass};
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
@@ -195,17 +199,43 @@ pub fn build_predict_input_for_model(
                 response_new.view(),
                 KnotSource::Provided(resp_knots.view()),
                 response_degree,
-                BasisOptions::value(),
+                BasisOptions::i_spline(),
             )
             .map_err(|e| e.to_string())?;
             let raw_val = raw_val_basis.as_ref().clone();
-            let dev_val = raw_val.dot(&resp_transform);
-            let dev_dim = resp_transform.ncols();
-            let p_resp = 2 + dev_dim;
+            if raw_val.ncols() != resp_transform.nrows() {
+                return Err(format!(
+                    "saved transformation-normal response transform shape mismatch: raw I-spline cols={} transform rows={}",
+                    raw_val.ncols(),
+                    resp_transform.nrows()
+                ));
+            }
+            let shape_val = raw_val.dot(&resp_transform);
+            let p_shape = resp_transform.ncols();
+            let p_resp = 1 + p_shape;
             let mut resp_val = ndarray::Array2::<f64>::zeros((n, p_resp));
             resp_val.column_mut(0).fill(1.0);
-            resp_val.column_mut(1).assign(&response_new);
-            resp_val.slice_mut(ndarray::s![.., 2..]).assign(&dev_val);
+            resp_val.slice_mut(ndarray::s![.., 1..]).assign(&shape_val);
+
+            let raw_deriv = create_ispline_derivative_dense(
+                response_new.view(),
+                &resp_knots,
+                response_degree,
+                1,
+            )
+            .map_err(|e| e.to_string())?;
+            if raw_deriv.ncols() != resp_transform.nrows() {
+                return Err(format!(
+                    "saved transformation-normal derivative transform shape mismatch: raw M-spline cols={} transform rows={}",
+                    raw_deriv.ncols(),
+                    resp_transform.nrows()
+                ));
+            }
+            let shape_deriv = raw_deriv.dot(&resp_transform);
+            let mut resp_deriv = ndarray::Array2::<f64>::zeros((n, p_resp));
+            resp_deriv
+                .slice_mut(ndarray::s![.., 1..])
+                .assign(&shape_deriv);
 
             let fit_saved = model
                 .unified()
@@ -229,118 +259,27 @@ pub fn build_predict_input_for_model(
                 .try_row_chunk(0..n)
                 .map_err(|e| e.to_string())?;
 
-            // Continuous monotonicity check (no grid sampling).
-            //
-            // CTN response design has columns `[1, y, dev_val(y)]` where
-            // `dev_val_j(y) = Σ_k B_{k,d}(y) · resp_transform[k, j]`. So
-            //   h(y, x)  = β₀(x) + y β₁(x) + Σ_k A_k(x) B_{k,d}(y)
-            //   h'(y, x) = β₁(x) + Σ_k A_k(x) B'_{k,d}(y)
-            // with `A_k(x) = Σ_j resp_transform[k,j] · β_{2+j}(x)`.
-            //
-            // Standard B-spline derivative + reindex gives
-            //   h'(y, x) = β₁(x) + Σ_{k=1}^{p_basis-1} δ_k(x) N_{k,d-1}(y),
-            //   δ_k(x)   = d/(t_{k+d}-t_k) · (A_k(x) - A_{k-1}(x)).
-            // Because `Σ_{k=1}^{p_basis-1} N_{k,d-1}(y) = 1` on the basis
-            // support [t_d, t_{p_basis}], h'(y, x) is a convex combination of
-            // `{β₁(x) + δ_k(x)}`. The pointwise minimum lower bound is
-            //   h'_min(x) = β₁(x) + min_k δ_k(x).
-            // The fit-time monotonicity barrier in
-            // `TransformationNormalFamily::max_feasible_step_size` evaluates
-            // exactly this quantity on every training row through the loose-
-            // bound rows appended by `build_monotonicity_derivative_grid_kron`,
-            // so the optimizer-accepted β is guaranteed to satisfy
-            // `β₁(x_i) + δ_k(x_i) ≥ EPS` for every training x_i and every
-            // non-degenerate basis index k. This makes the loose bound the
-            // sharpest single-pass certifier the predict path can run.
-            // The y-direction is fully covered: outside the response basis
-            // support, the B-spline first derivative clamps to its boundary
-            // value, which is itself in this convex combination — so the
-            // same lower bound covers y-extrapolation with no tail-guard
-            // heuristic. The covariate-direction concern (predict-time x
-            // outside the training row cloud but inside the axis-aligned
-            // box reached after `axis_clip_to_training_ranges`) is handled
-            // at fit time: `build_monotonicity_derivative_grid_kron`
-            // appends `2 · p_cov` axis-extreme covariate rows so the
-            // optimizer satisfies `β₁(x) + δ_k(x) ≥ ε` at every corner of
-            // the box, not only at training rows.
-            let kn = resp_knots
-                .as_slice()
-                .ok_or_else(|| "internal error: response knots are not contiguous".to_string())?;
-            let p_basis = resp_transform.nrows();
-            let dim_dev = resp_transform.ncols();
-            let expected_knot_len = p_basis + response_degree + 1;
-            if kn.len() < expected_knot_len {
-                return Err(format!(
-                    "saved transformation-normal knots length {} < expected {} (p_basis={}, degree={})",
-                    kn.len(),
-                    expected_knot_len,
-                    p_basis,
-                    response_degree
-                ));
-            }
             let monotonicity_eps = TRANSFORMATION_MONOTONICITY_EPS;
-            // Parallel reduction over observation rows. The per-row state
-            // (β₁(x), γ_j(x), A_k(x), running h'_lb) is fully thread-local —
-            // no shared mutable state — so this is a straight rayon
-            // par_iter().fold/reduce over min.
-            let resp_transform_ref = &resp_transform;
             let beta_mat_ref = &beta_mat;
             let cov_mat_ref = &cov_mat;
-            let kn_ref = kn;
+            let resp_deriv_ref = &resp_deriv;
             let min_h_prime: f64 = (0..n)
                 .into_par_iter()
-                .fold(
-                    || {
-                        (
-                            f64::INFINITY,
-                            vec![0.0f64; dim_dev.max(1)],
-                            vec![0.0f64; p_basis.max(1)],
-                        )
-                    },
-                    |(mut local_min, mut gamma, mut a_coef), i| {
-                        let cov_row = cov_mat_ref.row(i);
-                        let beta1_x = beta_mat_ref.row(1).dot(&cov_row);
-                        for j in 0..dim_dev {
-                            gamma[j] = beta_mat_ref.row(2 + j).dot(&cov_row);
-                        }
-                        for k in 0..p_basis {
-                            let mut sum = 0.0;
-                            for j in 0..dim_dev {
-                                sum += resp_transform_ref[[k, j]] * gamma[j];
-                            }
-                            a_coef[k] = sum;
-                        }
-                        // h'_min(x) = β₁(x) + min_{k ∈ [1, p_basis-1]} δ_k(x).
-                        // Knots with multiplicity (zero denominator) make
-                        // N_{k,d-1} identically zero, so they contribute
-                        // nothing — skip them.
-                        let mut h_prime_lb = beta1_x;
-                        let mut found_any = false;
-                        for k in 1..p_basis {
-                            let denom = kn_ref[k + response_degree] - kn_ref[k];
-                            if denom <= 0.0 {
-                                continue;
-                            }
-                            let delta_k =
-                                (response_degree as f64) / denom * (a_coef[k] - a_coef[k - 1]);
-                            let bound_k = beta1_x + delta_k;
-                            if !found_any || bound_k < h_prime_lb {
-                                h_prime_lb = bound_k;
-                                found_any = true;
-                            }
-                        }
-                        if h_prime_lb < local_min {
-                            local_min = h_prime_lb;
-                        }
-                        (local_min, gamma, a_coef)
-                    },
-                )
-                .map(|(local_min, _, _)| local_min)
+                .map(|i| {
+                    let cov_row = cov_mat_ref.row(i);
+                    let resp_row = resp_deriv_ref.row(i);
+                    let mut hp = resp_row[0] * beta_mat_ref.row(0).dot(&cov_row);
+                    for r in 1..p_resp {
+                        let gamma = beta_mat_ref.row(r).dot(&cov_row);
+                        hp += resp_row[r] * gamma * gamma;
+                    }
+                    hp
+                })
                 .reduce(|| f64::INFINITY, f64::min);
             if min_h_prime < monotonicity_eps {
                 return Err(format!(
                     "prediction failed: transformation-normal fit is non-monotone in y \
-                     for at least one observation. Analytic lower bound on h'(y, x) is \
+                     for at least one observation. Minimum evaluated h'(y, x) is \
                      {min_h_prime:.3e}, threshold {monotonicity_eps:.0e}. The model β \
                      admits a region where h(y, x) decreases in y, which contradicts the \
                      CTN conditional-Gaussianization contract. Refit with stronger \
@@ -349,28 +288,31 @@ pub fn build_predict_input_for_model(
                 ));
             }
 
-            // h_i = Σ_{r,c} resp_row[i,r] · cov_row[i,c] · β_mat[r,c]
-            //     = resp_row[i] · (β_mat · cov_row[i])
+            // h_i = b(x_i) + Σ_{r>=1} resp_row[i,r] · γ_r(x_i)^2.
             // The bilinear form is independent across i, so par_map_collect.
-            let h_vec: Vec<f64> = (0..n)
+            let h_vec: Vec<Result<f64, String>> = (0..n)
                 .into_par_iter()
                 .map(|i| {
                     let resp_row = resp_val.row(i);
                     let cov_row = cov_mat.row(i);
-                    let mut val = 0.0;
-                    for r in 0..p_resp {
-                        let a = resp_row[r];
-                        if a == 0.0 {
-                            continue;
-                        }
-                        for c in 0..p_cov {
-                            val += a * cov_row[c] * beta_mat[[r, c]];
-                        }
+                    let mut val = resp_row[0] * beta_mat.row(0).dot(&cov_row);
+                    let mut max_abs_gamma = beta_mat.row(0).dot(&cov_row).abs();
+                    for r in 1..p_resp {
+                        let gamma = beta_mat.row(r).dot(&cov_row);
+                        max_abs_gamma = max_abs_gamma.max(gamma.abs());
+                        val += resp_row[r] * gamma * gamma;
                     }
-                    val
+                    if !val.is_finite() || val.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX {
+                        let max_abs_cov = cov_row.iter().copied().map(f64::abs).fold(0.0, f64::max);
+                        return Err(format!(
+                            "prediction failed: transformation-normal h at row {i} is {val:.6e}, outside the standard-normal bound ±{TRANSFORMATION_NORMAL_H_ABS_MAX}; max_abs_covariate_basis={max_abs_cov:.6e}, max_abs_gamma={max_abs_gamma:.6e}"
+                        ));
+                    }
+                    Ok(val)
                 })
                 .collect();
-            let h = ndarray::Array1::<f64>::from_vec(h_vec);
+            let h =
+                ndarray::Array1::<f64>::from_vec(h_vec.into_iter().collect::<Result<Vec<_>, _>>()?);
             Ok(PredictInput {
                 design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
                 offset: h + offset,

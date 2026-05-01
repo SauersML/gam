@@ -1,0 +1,435 @@
+[INFO] [STAGE] runtime threads | rayon_current_num_threads=8 | std_available_parallelism=8
+[RUNNING] fit | parsing csv and inferring schema | elapsed=0s
+Workflow: Fit |   0% ▕                ▏
+[RUNNING] fit | parsing csv and inferring schema | elapsed=0s
+Workflow: Fit |   0% ▕                ▏
+Inner: Data Loading |   0% ▕                ▏
+[RUNNING] fit | building transformation-normal covariate specification | elapsed=0s
+Workflow: Fit |  20% ▕███▎            ▏
+Inner: Data Loading |  33% ▕█████▍          ▏
+[RUNNING] fit | optimizing transformation-normal model | elapsed=0s
+Workflow: Fit |  20% ▕███▎            ▏
+Inner: Data Loading |  33% ▕█████▍          ▏
+[INFO] [transformation-normal] exact joint setup: rho_dim=5 log_kappa_dim=5 dims_per_term=[5]
+[INFO] [transformation-normal] skipping baseline custom-family prefit before exact joint optimization (rho_dim=5, log_kappa_dim=5, rho0_range=[1.007, 3.862]); using CTN warm start and penalty-scale rho seed
+[INFO] [transformation-normal] entering exact joint outer optimization (analytic_gradient=true, analytic_hessian=false)
+[INFO] [OUTER] n-block exact-joint spatial: n_params=10, gradient=Analytic, hessian=Unavailable -> solver=Bfgs, hessian_source=BfgsApprox [solver=Bfgs;hessian=BfgsApprox;matrix-free=false] [no Hessian: BFGS approximation]
+[INFO] [STAGE] smooth basis rebuild (term 0, 'duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=6, order=1, power=8, length_scale=1)', cols=5): 0.000s
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.017s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.436e0 alpha_grid=1.206e0 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=inf elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=inf alpha_grid=3.016e5 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.009s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.006s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.000s cost=3.566677e2 |g|=5.198e0 (first-order bridge)
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.005s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.564e0 alpha_grid=5.882e-1 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.230e0 alpha_grid=6.942e-3 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.283e0 alpha_grid=3.495e-5 elapsed=0.006s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.283e0 alpha_grid=1.748e-7 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.283e0 alpha_grid=8.738e-10 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.008s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.010s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.008s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.003s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.005s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.290s cost=3.422776e2 |g|=2.981e0 (first-order bridge)
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=7.099e0 alpha_grid=5.630e0 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.120e1 alpha_grid=3.451e1 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.557e3 alpha_grid=1.404e3 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.891e5 alpha_grid=2.676e5 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.003s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.004s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.007s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.009s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.327s cost=3.063323e2 |g|=1.905e1 (first-order bridge)
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.009s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.145e1 alpha_grid=1.721e1 elapsed=0.010s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.159e3 alpha_grid=1.810e3 elapsed=0.018s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.067e5 alpha_grid=3.462e5 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.010s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.003s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.013s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.007s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.279s cost=3.018244e2 |g|=2.136e1 (first-order bridge)
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.959e1 alpha_grid=1.910e0 elapsed=0.008s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.113e4 alpha_grid=1.812e2 elapsed=0.009s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.254e6 alpha_grid=3.605e4 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.005s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.006s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.279s cost=3.017323e2 |g|=2.141e1 (first-order bridge)
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[WARN] [BFGS] Max iterations reached: iters=3, f=3.017323e2, ||g||=3.776e-1, fe=9, ge=5, Δ=4.834e0
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=4.949e0 alpha_grid=4.081e-2 elapsed=0.005s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.134e0 alpha_grid=2.125e-4 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=5.135e0 alpha_grid=1.063e-6 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.009s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.014s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.006s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.000s cost=3.040662e2 |g|=2.091e1 (first-order bridge)
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.110e1 alpha_grid=1.145e-8 elapsed=0.006s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.005s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=1.110e1 alpha_grid=5.725e-11 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.004s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.009s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.322s cost=3.021562e2 |g|=2.118e1 (first-order bridge)
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=6.797e0 alpha_grid=5.908e0 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.276e3 alpha_grid=1.743e3 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=3.833e5 alpha_grid=2.762e5 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.004s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.004s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.012s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.009s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.301s cost=3.013756e2 |g|=2.158e1 (first-order bridge)
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [STAGE] ensure_theta (n-block, 1 blocks, 1 realizers): 0.000s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=2.556e1 alpha_grid=6.991e-1 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.277e1 alpha_grid=1.147e-2 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.371e1 alpha_grid=5.802e-5 elapsed=0.004s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.372e1 alpha_grid=2.901e-7 elapsed=0.007s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.003s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=10 (first-order bridge)
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.372e1 alpha_grid=1.451e-9 elapsed=0.005s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=0 psi_index=0 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=1 psi_index=1 elapsed=0.006s
+[INFO] [STAGE] CTN psi first-order terms axis=2 psi_index=2 elapsed=0.004s
+[INFO] [STAGE] CTN psi first-order terms axis=3 psi_index=3 elapsed=0.005s
+[INFO] [STAGE] CTN psi first-order terms axis=4 psi_index=4 elapsed=0.004s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.240s cost=3.011763e2 |g|=2.162e1 (first-order bridge)
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[WARN] [BFGS] Max iterations reached: iters=3, f=3.011763e2, ||g||=1.697e-1, fe=7, ge=4, Δ=4.834e0
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.003s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.004s
+[INFO] [STAGE] CTN monotonicity certificate miss (cache_fresh=false) → full grid scan over 176592 (i,g) pairs
+[INFO] [STAGE] CTN monotonicity grid scan alpha_obs=8.372e1 alpha_grid=7.256e-12 elapsed=0.003s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.001s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.004s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.006s
+[INFO] [STAGE] CTN row_quantities (h, h', 1/h', powers) n=300 elapsed=0.000s
+[INFO] [STAGE] CTN gradient terms n=300 p=84 elapsed=0.002s
+[INFO] [STAGE] CTN hessian terms (weighted_gram) n=300 p=84 flops~2116800 elapsed=0.005s
+[INFO] [STAGE] CTN evaluate end n=300 p=84 elapsed=0.007s
+[INFO] [spatial-kappa] term 0 ("duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=6, order=1, power=8, length_scale=1)"): anisotropic length scales optimized (global length_scale=1.0000)
+  axis 0: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 1: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 2: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 3: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 4: eta=+0.0000, length=1.0000, kappa=1.0000
+[RUNNING] fit | optimizing transformation-normal model | elapsed=4s
+Workflow: Fit |  60% ▕█████████▋      ▏ | ETA: 3s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+model fit complete | family=transformation-normal | outer_iter=0 | converged=true
+[spatial-kappa] term 0 ("duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, centers=6, order=1, power=8, length_scale=1)"): anisotropic length scales (global length_scale=1.0000)
+  axis 0: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 1: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 2: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 3: eta=+0.0000, length=1.0000, kappa=1.0000
+  axis 4: eta=+0.0000, length=1.0000, kappa=1.0000
+[RUNNING] fit | writing transformation-normal model | elapsed=4s
+Workflow: Fit |  80% ▕████████████▊   ▏ | ETA: 1s
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+saved model: /Users/user/gam/bench/aniso_demo/model_aniso.json
+[RUNNING] fit | writing transformation-normal model | elapsed=4s
+Workflow: Fit | 100% ▕████████████████▏
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+Note: transformation-normal fit complete
+[RUNNING] fit | writing transformation-normal model | elapsed=4s
+Workflow: Fit | 100% ▕████████████████▏
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+Note: transformation-normal fit complete
+[RUNNING] fit | writing transformation-normal model | elapsed=4s
+Workflow: Fit | 100% ▕████████████████▏
+Inner: Data Loading |  33% ▕█████▍          ▏ | ETA: 9s
+Note: transformation-normal fit complete

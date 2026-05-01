@@ -67,8 +67,7 @@ const D_TYPICAL: usize = 8;
 /// otherwise trigger the self-pair epsilon path uniformly) while keeping the
 /// bench reproducible.
 fn synthetic_centers(k: usize, d: usize) -> Array2<f64> {
-    const PRIMES: [usize; 16] =
-        [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53];
+    const PRIMES: [usize; 16] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53];
     let mut centers = Array2::<f64>::zeros((k, d));
     for axis in 0..d {
         let p = PRIMES[axis % PRIMES.len()];
@@ -160,11 +159,7 @@ fn bench_isotropic_kernel(c: &mut Criterion) {
     group.bench_function("small_r_regime", |b| {
         b.iter(|| {
             let v = isotropic_duchon_penalty(
-                /* q = */ 2,
-                D_TYPICAL,
-                M_TYPICAL,
-                S_TYPICAL,
-                /* kappa = */ 0.05,
+                /* q = */ 2, D_TYPICAL, M_TYPICAL, S_TYPICAL, /* kappa = */ 0.05,
                 /* r = */ 1e-4,
             );
             black_box(v)
