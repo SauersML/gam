@@ -1,4 +1,5 @@
 pub mod basis;
+pub mod closed_form_operator;
 pub mod construction;
 pub mod hull;
 pub mod layout;
