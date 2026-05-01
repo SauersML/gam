@@ -54,14 +54,14 @@ def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str
 
 
 @dataclass
-class _BaseGAMEstimator(BaseEstimator):
+class _BaseGAMEstimator(BaseEstimator):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat BaseEstimator as Any
     formula: str
     family: str = "auto"
     offset: str | None = None
     weights: str | None = None
     config: dict[str, Any] | None = None
 
-    def _fit_model(self, X: Any, y: Any = None):
+    def _fit_model(self, X: Any, y: Any = None) -> "_BaseGAMEstimator":
         training_data, fit_formula, feature_names = _prepare_fit_input(X, y, self.formula)
         self.model_ = fit_model(
             training_data,
@@ -76,22 +76,22 @@ class _BaseGAMEstimator(BaseEstimator):
         self.n_features_in_ = len(feature_names)
         return self
 
-    def summary(self):
+    def summary(self) -> Any:
         check_is_fitted(self, "model_")
         return self.model_.summary()
 
-    def report(self, path: str):
+    def report(self, path: str) -> Any:
         check_is_fitted(self, "model_")
         return self.model_.report(path)
 
-    def check(self, X: Any):
+    def check(self, X: Any) -> Any:
         check_is_fitted(self, "model_")
         return self.model_.check(X)
 
 
-class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
-    def fit(self, X: Any, y: Any = None):
-        return self._fit_model(X, y)
+class GAMRegressor(_BaseGAMEstimator, RegressorMixin):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat RegressorMixin as Any
+    def fit(self, X: Any, y: Any = None) -> "GAMRegressor":
+        return self._fit_model(X, y)  # type: ignore[return-value]
 
     def predict(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "model_")
@@ -102,11 +102,11 @@ class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
         return float(r2_score(np.asarray(y, dtype=float), self.predict(X)))
 
 
-class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
-    def fit(self, X: Any, y: Any = None):
+class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat ClassifierMixin as Any
+    def fit(self, X: Any, y: Any = None) -> "GAMClassifier":
         fitted = self._fit_model(X, y)
         self.classes_ = np.asarray([0, 1])
-        return fitted
+        return fitted  # type: ignore[return-value]
 
     def predict_proba(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "model_")
