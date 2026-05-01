@@ -21596,50 +21596,92 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_duchon_zero_nullspace_uses_operator_penalty_triplet() {
-        // End-to-end: pure-Duchon (length_scale=None) with Zero nullspace
-        // routes through the closed-form path and must still produce all
-        // three active operator penalties (mass, tension, stiffness).
+    fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
+        // The pure-Duchon `operator_penalty_candidates_closed_form_pure`
+        // factory must keep all three active candidates (mass, tension,
+        // stiffness) finite and non-zero even when the closed-form
+        // Lebesgue penalty is in a divergent regime (UV or IR), by falling
+        // back to collocation `D_q^T D_q` for that q.
         //
-        // Config: d=2, p=1 (Zero nullspace ⇒ m=1), s=2.
-        //   D1 collocation: 2(p+s) = 6 > d+1 = 3 ✓
-        //   D2 collocation: 2(p+s) = 6 > d+2 = 4 ✓
-        //   Closed-form UV (q=2): 4(m+s) = 12 > d+2q = 6 ✓
-        //   Closed-form IR (q=2): d+2q = 6 > 4m = 4 ✓
-        // Both collocation precondition and closed-form convergence hold,
-        // so the closed-form path produces all 3 active penalties.
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: None,
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Zero,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        // Pure-Duchon Zero nullspace cannot satisfy {pure-Duchon CPD
+        // adequacy `2s < d`, D2 collocation `2(p+s) > d+2`, closed-form
+        // UV `4(m+s) > d+2q`, closed-form IR `d+2q > 4m`} for all
+        // q ∈ {0,1,2} simultaneously — the conditions are arithmetically
+        // incompatible. So we don't drive this test through
+        // `build_duchon_basis` (which validates everything up-front);
+        // instead we feed the factory hand-built D0/D1/D2 and confirm
+        // its per-q convergence-gating logic preserves the candidate
+        // count even when the closed-form Lebesgue penalty is zero.
+        //
+        // Picks (m=2, s=1, d=3): closed-form q=2 IR fails (d+2q = 7 < 4m
+        // = 8) so the factory must fall back to collocation `D_2^T D_2`
+        // for stiffness; q=1 UV/IR both hold, so closed-form is used.
+        use ndarray::Array2 as A2;
+        let k = 16usize;
+        let d = 3usize;
+        let mut state: u64 = 0xDEADBEEF;
+        let mut next_unit = || -> f64 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract()
         };
-        let out = build_duchon_basis(data.view(), &spec)
-            .expect("Duchon basis with Zero nullspace should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penaltyinfo[0].source,
-            PenaltySource::OperatorMass
-        ));
-        assert!(matches!(
-            out.penaltyinfo[1].source,
-            PenaltySource::OperatorTension
-        ));
-        assert!(matches!(
-            out.penaltyinfo[2].source,
-            PenaltySource::OperatorStiffness
-        ));
+        let mut centers = A2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = next_unit();
+            }
+        }
+        // Hand-built non-trivial operator matrices in K-dim (no kernel
+        // projection, no polynomial padding, no outer identifiability).
+        let p = k;
+        let mut d0 = A2::<f64>::zeros((p, p));
+        let mut d1 = A2::<f64>::zeros((p * d, p));
+        let mut d2 = A2::<f64>::zeros((p * d * d, p));
+        for i in 0..p {
+            d0[[i, i]] = 1.0;
+            for axis in 0..d {
+                d1[[i * d + axis, i]] = 1.0 + 0.1 * axis as f64;
+                d2[[(i * d + axis) * d + axis, i]] = 1.0;
+            }
+        }
+        let p_order = 2usize;
+        let s_order = 1usize;
+        let candidates = operator_penalty_candidates_closed_form_pure(
+            centers.view(),
+            &d0,
+            &d1,
+            &d2,
+            &DuchonOperatorPenaltySpec::default(),
+            p_order,
+            s_order,
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(
+            candidates.len(),
+            3,
+            "factory must return all three candidates including divergent-regime fallback"
+        );
+        for (i, expected) in [
+            PenaltySource::OperatorMass,
+            PenaltySource::OperatorTension,
+            PenaltySource::OperatorStiffness,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let m = &candidates[i].matrix;
+            let frob_sq: f64 = m.iter().map(|v| v * v).sum();
+            assert!(
+                frob_sq > 0.0,
+                "candidate {i} (source={expected:?}) is identically zero"
+            );
+            assert!(
+                m.iter().all(|v| v.is_finite()),
+                "candidate {i} has non-finite entries"
+            );
+        }
     }
 
     #[test]
