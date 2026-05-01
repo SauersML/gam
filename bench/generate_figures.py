@@ -79,8 +79,8 @@ ACCENT_COLORS = [
 # Figure generation
 # ---------------------------------------------------------------------------
 
-def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
-    by_scenario: dict[str, list[dict]] = defaultdict(list)
+def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Path) -> list[Path]:
+    by_scenario: dict[str, list[dict[str, typing.Any]]] = defaultdict(list)
     for r in results:
         if r.get("status") == "ok":
             by_scenario[r["scenario_name"]].append(r)

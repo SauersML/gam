@@ -5530,20 +5530,6 @@ pub fn filter_active_penalty_candidates(
             None
         };
         let active = dropped_reason.is_none();
-        eprintln!(
-            "DEBUG_FILTER: idx={} source={:?} rank={} iszero={} nrows={} fro2={:.3e} active={}",
-            original_index,
-            candidate.source,
-            analysis.rank,
-            analysis.iszero,
-            analysis.sym_penalty.nrows(),
-            analysis
-                .sym_penalty
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>(),
-            active,
-        );
         let kronecker_factors =
             validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         if active {
@@ -14290,54 +14276,52 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    // Closed-form Lebesgue penalty: both hybrid (κ>0) and pure-Duchon (κ=0)
-    // route through the analytic radial-derivative path. The radial form is
-    // finite for R > 0; self-pair (R=0) entries are ε-regularized inside
-    // `closed_form_anisotropic_pair_block` and its `_pure` counterpart.
-    let candidates = if let Some(length_scale) = spec.length_scale {
-        operator_penalty_candidates_closed_form(
-            centers.view(),
-            &ops.d0,
-            &spec.operator_penalties,
-            p_order,
-            spec.power,
-            length_scale,
-            aniso.as_deref(),
-            Some(&kernel_transform),
-            poly_cols,
-            identifiability_transform.as_ref(),
-        )
+    // Closed-form Lebesgue penalty: only available when the nullspace contains
+    // constants alone. With non-constant polynomials in the nullspace (Linear
+    // or higher), the polynomial-block contribution to the L²-Lebesgue
+    // operator penalty diverges (e.g. ∫|∇x_k|² dx = ∞ over R^d), so the
+    // closed-form pad-with-zeros is mathematically a different object than
+    // the collocation D^T D Gram matrix. Restricting to Zero ensures the
+    // closed-form and collocation paths agree on the same penalty matrix.
+    let use_closed_form = matches!(effective_nullspace_order, DuchonNullspaceOrder::Zero);
+    let candidates = if use_closed_form {
+        if let Some(length_scale) = spec.length_scale {
+            operator_penalty_candidates_closed_form(
+                centers.view(),
+                &ops.d0,
+                &spec.operator_penalties,
+                p_order,
+                spec.power,
+                length_scale,
+                aniso.as_deref(),
+                Some(&kernel_transform),
+                poly_cols,
+                identifiability_transform.as_ref(),
+            )
+        } else {
+            operator_penalty_candidates_closed_form_pure(
+                centers.view(),
+                &ops.d0,
+                &ops.d1,
+                &ops.d2,
+                &spec.operator_penalties,
+                p_order,
+                spec.power,
+                aniso.as_deref(),
+                Some(&kernel_transform),
+                poly_cols,
+                identifiability_transform.as_ref(),
+            )
+        }
     } else {
-        operator_penalty_candidates_closed_form_pure(
-            centers.view(),
+        operator_penalty_candidates_from_collocation(
             &ops.d0,
             &ops.d1,
             &ops.d2,
             &spec.operator_penalties,
-            p_order,
-            spec.power,
-            aniso.as_deref(),
-            Some(&kernel_transform),
-            poly_cols,
-            identifiability_transform.as_ref(),
         )
     };
-    eprintln!(
-        "DEBUG_DUCHON_GATE: length_scale={:?} candidates_len={} sources={:?}",
-        spec.length_scale,
-        candidates.len(),
-        candidates
-            .iter()
-            .map(|c| format!("{:?}", c.source))
-            .collect::<Vec<_>>(),
-    );
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
-    eprintln!(
-        "DEBUG_DUCHON_GATE: after filter penalties_len={} penaltyinfo_len={} active={:?}",
-        penalties.len(),
-        penaltyinfo.len(),
-        penaltyinfo.iter().map(|p| p.active).collect::<Vec<_>>(),
-    );
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -21361,6 +21345,50 @@ mod tests {
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 3);
         assert_eq!(out.penaltyinfo.len(), 3);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
+        assert!(matches!(
+            out.penaltyinfo[0].source,
+            PenaltySource::OperatorMass
+        ));
+        assert!(matches!(
+            out.penaltyinfo[1].source,
+            PenaltySource::OperatorTension
+        ));
+        assert!(matches!(
+            out.penaltyinfo[2].source,
+            PenaltySource::OperatorStiffness
+        ));
+    }
+
+    #[test]
+    fn test_pure_duchon_zero_nullspace_uses_operator_penalty_triplet() {
+        // End-to-end: pure-Duchon (length_scale=None) with Zero nullspace
+        // routes through the closed-form path and must still produce all
+        // three active operator penalties (mass, tension, stiffness).
+        // Verifies that the per-q convergence gating in
+        // `operator_penalty_candidates_closed_form_pure` falls back to
+        // collocation when the closed-form Lebesgue penalty would vanish
+        // (IR regime) — keeping behavior parity with the pre-closed-form
+        // collocation path.
+        let data = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec)
+            .expect("Duchon basis with Zero nullspace should build");
+        assert_eq!(out.penalties.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
             out.penaltyinfo[0].source,
