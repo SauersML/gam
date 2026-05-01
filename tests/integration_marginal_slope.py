@@ -75,7 +75,7 @@ def _validate_prediction_output(name: typing.Any, path: typing.Any) -> None:
     values = []
     for r in rows_out:
         v = r.get(column)
-        if not _is_finite(v):
+        if v is None or not _is_finite(v):
             raise RuntimeError(
                 f"{name} prediction column {column} has non-finite entry: {v}"
             )

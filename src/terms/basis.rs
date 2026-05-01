@@ -21491,6 +21491,59 @@ mod tests {
     }
 
     #[test]
+    fn test_duchon_zero_nullspace_uses_closed_form() {
+        // Lock-in: with `nullspace_order = Zero` (constants only) and a hybrid
+        // length_scale, the gate routes to the closed-form path and produces
+        // three active penalties matching collocation arity.
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [0.75, 0.25],
+            [0.5, 0.0],
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out =
+            build_duchon_basis(data.view(), &spec).expect("Zero-nullspace Duchon basis should build");
+        assert_eq!(out.penaltyinfo.len(), 3);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
+    }
+
+    #[test]
+    fn test_duchon_linear_nullspace_uses_collocation() {
+        // Lock-in: with `nullspace_order = Linear`, the closed-form path's
+        // pad-with-zeros over the polynomial block produces a non-PSD penalty
+        // matrix (the polynomial-block L²-Lebesgue contribution diverges for
+        // q ≥ 1 over R^d). The gate must fall back to collocation so all
+        // three penalties stay active and PSD.
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+        };
+        let out = build_duchon_basis(data.view(), &spec)
+            .expect("Linear-nullspace Duchon basis should build via collocation fallback");
+        assert_eq!(out.penaltyinfo.len(), 3);
+        assert!(out.penaltyinfo.iter().all(|info| info.active));
+    }
+
+    #[test]
     fn filter_active_penalty_candidates_preserves_matching_kronecker_factors() {
         let s = array![[1.0, -1.0], [-1.0, 1.0]];
         let identity = Array2::<f64>::eye(2);

@@ -17,7 +17,7 @@ sys.modules[_SPEC.name] = _RUNNER
 _SPEC.loader.exec_module(_RUNNER)
 
 
-def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_csv(path: Path, rows: typing.Sequence[typing.Mapping[str, object]]) -> None:
     fieldnames = list(rows[0].keys())
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -215,7 +215,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         test_rows: list[dict[str, object]] = []
         for target, base in ((train_rows, 10.0), (test_rows, 20.0)):
             for idx in range(3):
-                row = {
+                row: dict[str, object] = {
                     "age_entry": base + idx,
                     "lat_final": base + idx + 1.0,
                     "lon_final": base + idx + 2.0,
@@ -377,13 +377,13 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
         train_rows = self._survival_contract_train_rows()
         test_rows = self._survival_contract_test_rows()
-        snapshots: dict[str, object] = {}
+        snapshots: dict[str, typing.Any] = {}
         orig_load_bin = _RUNNER.load_or_build_rust_binary
         orig_run_cmd = _RUNNER.run_cmd_stream
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
-            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> None:
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
                 if cmd[1] == "fit":
                     fit_input = Path(cmd[-2])
                     snapshots["fit_formula"] = cmd[-1]
@@ -506,7 +506,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
-            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> None:
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
                 if cmd[1] == "fit":
                     Path(cmd[cmd.index("--out") + 1]).write_text("{}", encoding="utf-8")
                     return 0, "", ""

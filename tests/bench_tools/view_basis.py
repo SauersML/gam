@@ -1,11 +1,13 @@
 import typing
+import importlib
 import sys
 import subprocess
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import tomllib as tomli
+
+tomli: typing.Any = importlib.import_module("tomllib")
 
 # --- 1. Define Paths and Parameters ---
 SCRIPT_DIR = Path(__file__).resolve().parent
