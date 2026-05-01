@@ -1870,15 +1870,19 @@ def _scenario_downsample_factor(name: str) -> int | None:
 
 
 def _fixed_joint_spatial_pc_count(family: str, n_pcs: int) -> int:
+    """Number of PCs to include in the joint smooth for `family`.
+
+    The joint-PC contract says PCs always enter the model as a single multi-D
+    object — so this returns the FULL `n_pcs` (with a per-family validation
+    check, not a cap). Earlier revisions returned `min(3, n_pcs)` etc., but
+    that left the trailing PC4..PC16 either unused or as separate linear
+    terms, which violated the contract. The scenario family is still
+    validated so unsupported families surface clearly.
+    """
     n_pcs = int(max(1, n_pcs))
     family = str(family)
-    # Root-cause fix: joint spatial smooth dimensionality is part of scenario
-    # design, not a function of basis size `k`. Keep the embedding low-dimensional
-    # and fixed per benchmark family so `k` only controls the number of centers.
-    if family in {"geo_disease", "papuan_oce", "geo_subpop16"}:
-        return min(3, n_pcs)
-    if family == "geo_latlon":
-        return min(2, n_pcs)
+    if family in {"geo_disease", "papuan_oce", "geo_subpop16", "geo_latlon"}:
+        return n_pcs
     raise RuntimeError(f"unsupported joint spatial benchmark family: {family}")
 
 
@@ -3171,11 +3175,138 @@ def _is_joint_spatial_basis(basis: str) -> bool:
     return _canonical_smooth_basis(basis) in {"thinplate", "tps", "duchon", "matern"}
 
 
+# ---------------------------------------------------------------------------
+# Joint-PC contract
+#
+# PCs are ALWAYS a single joint smooth, never N independent 1D smooths and
+# never a mixture of smoothed-leading-PCs + linear-trailing-PCs. The PC
+# eigenbasis has been deliberately decorrelated, so per-axis additivity is
+# both statistically misspecified (the meaningful heterogeneity lives on the
+# joint manifold) and a wallclock disaster at biobank scale (16 separate
+# `s(pcN, ...)` blocks instead of one multi-D Duchon).
+#
+# Every formula builder in this file routes PC-named columns through these
+# helpers so the contract is enforced from a single place rather than at
+# every call site.
+# ---------------------------------------------------------------------------
+
+_PC_COL_PATTERN = re.compile(r"^pc\d+(?:_std)?$")
+
+
+def _is_pc_column(name: typing.Any) -> bool:
+    """A column is a PC ancestry axis iff its name matches `pc{N}` or `pc{N}_std`."""
+    return bool(_PC_COL_PATTERN.match(str(name).strip()))
+
+
+def _split_pc_columns(cols: typing.Any) -> tuple[list[str], list[str]]:
+    """Return (pc_cols, other_cols) preserving original order."""
+    pc_cols: list[str] = []
+    other_cols: list[str] = []
+    for c in cols or []:
+        s = str(c)
+        if _is_pc_column(s):
+            pc_cols.append(s)
+        else:
+            other_cols.append(s)
+    return pc_cols, other_cols
+
+
+def _joint_pc_basis(requested_basis: typing.Any) -> str:
+    """Choose the basis used when emitting the joint-PC smooth.
+
+    Multi-D-capable bases (thinplate, duchon, matern) pass through unchanged.
+    1D-only picks like `ps` are routed to `duchon`, which supports arbitrary
+    dimension and is the canonical joint-PC contract.
+    """
+    canonical = _canonical_smooth_basis(requested_basis)
+    if canonical in {"thinplate", "tps", "duchon", "matern"}:
+        return canonical
+    return "duchon"
+
+
+def _backend_supports_joint_pc(backend: str) -> bool:
+    """Return True iff the backend can fit a single multi-D smooth over PCs.
+
+    `r_gamlss` and `gamboostlss` do not have a clean multi-D smoother in
+    their standard formula DSLs (gamlss only exposes 1D `pb()` / `cs()` /
+    `pbm()` reliably; gamboostlss's `bspatial()` is 2D-only). Lanes targeting
+    those backends on PC scenarios should be filtered out at the harness
+    level rather than emitting per-axis workarounds that violate the
+    joint-PC contract.
+    """
+    return backend in {"rust", "mgcv", "bamlss", "brms"}
+
+
+def _emit_joint_pc_term(
+    backend: str,
+    pc_cols: list[str],
+    *,
+    knot_count: int,
+    pc_basis: str,
+    double_penalty: bool = True,
+) -> str:
+    """Build a single joint multi-D smooth over the PC ancestry axes for `backend`.
+
+    Returns one term string. Always emits a multi-D term — never N separate
+    1D smooths. Raises if the backend can't represent a multi-D smooth in
+    its standard formula DSL.
+    """
+    if not _backend_supports_joint_pc(backend):
+        raise RuntimeError(
+            f"backend '{backend}' has no clean multi-D smoother for the "
+            f"joint-PC contract; this lane must be filtered out at the "
+            f"harness level (PCs cannot be split into per-axis smooths)"
+        )
+    cols = ", ".join(pc_cols)
+    pc_basis = _canonical_smooth_basis(pc_basis)
+    if backend == "rust":
+        dp = ", double_penalty=true" if double_penalty else ", double_penalty=false"
+        if pc_basis in {"thinplate", "tps"}:
+            return f"thinplate({cols}, centers={knot_count}{dp})"
+        if pc_basis == "duchon":
+            return (
+                f"duchon({cols}, centers={knot_count}, "
+                f"order=1, power={max(1, len(pc_cols) // 2)}, length_scale=1.0)"
+            )
+        if pc_basis == "matern":
+            return f"matern({cols}, centers={knot_count}{dp})"
+        raise RuntimeError(f"unsupported joint-PC rust basis '{pc_basis}'")
+    # mgcv / bamlss / brms all use mgcv-style `s(...)`. brms's `bf(...)` and
+    # bamlss's formula DSL accept the same surface here.
+    k_expr = f"min({knot_count}, nrow(train_df)-1)"
+    if pc_basis in {"thinplate", "tps"}:
+        return f"s({cols}, bs='tp', k={k_expr})"
+    if pc_basis == "duchon":
+        return f"s({cols}, bs='ds', m=c(1,0), k={k_expr})"
+    if pc_basis == "matern":
+        return f"s({cols}, bs='gp', m=c(-4,1.0), k={k_expr})"
+    raise RuntimeError(f"unsupported joint-PC mgcv-family basis '{pc_basis}'")
+
+
 def _requires_joint_spatial_term(cfg: dict[str, typing.Any] | None) -> bool:
+    """A scenario requires a joint multi-D smooth iff:
+
+    * its declared `smooth_basis` is multi-D-capable AND there are 2+ smooth
+      columns (the original criterion), OR
+    * its smooth columns include 2+ PCs (the joint-PC contract — the basis
+      may be `ps` in the YAML for legacy reasons but the runtime emission
+      will route to `_emit_joint_pc_term`, which is multi-D).
+
+    `linear_cols` containing PCs also flips this true: those columns get
+    folded into the joint smooth by the formula builders, so the effective
+    fit has a multi-D term even if `smooth_cols` alone wouldn't trigger it.
+    """
     if not cfg:
         return False
     smooth_cols = list(cfg.get("smooth_cols") or [])
-    return _is_joint_spatial_basis(cfg.get("smooth_basis", "ps")) and len(smooth_cols) >= 2
+    linear_cols = list(cfg.get("linear_cols") or [])
+    pc_smooth = [c for c in smooth_cols if _is_pc_column(c)]
+    pc_linear = [c for c in linear_cols if _is_pc_column(c)]
+    if len(pc_smooth) + len(pc_linear) >= 2:
+        return True
+    if _is_joint_spatial_basis(cfg.get("smooth_basis", "ps")) and len(smooth_cols) >= 2:
+        return True
+    return False
 
 
 def _rust_duchon_options_for_dimension(dimension: int) -> str:
@@ -3212,6 +3343,21 @@ def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg
     if cfg is None:
         raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
+    # Fold any PC linear_cols into the joint-PC smooth — PCs are always one
+    # joint object, never partly smooth and partly linear.
+    raw_linear = list(cfg.get("linear_cols", []))
+    pc_linear, true_linear = _split_pc_columns(raw_linear)
+    raw_smooth = list(cfg.get("smooth_cols") or [])
+    if pc_linear:
+        # Move PC linear terms into smooth_cols so they participate in the
+        # joint smooth below.
+        existing = set(str(c) for c in raw_smooth)
+        for c in pc_linear:
+            if c not in existing:
+                raw_smooth.append(c)
+        cfg = dict(cfg)
+        cfg["smooth_cols"] = raw_smooth
+        cfg["linear_cols"] = true_linear
     terms = [f"linear({c})" for c in cfg.get("linear_cols", [])]
     basis = _canonical_smooth_basis(cfg.get("smooth_basis", "ps"))
     knot_count = int(cfg.get("knots", 8))
@@ -3224,24 +3370,37 @@ def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg
     dp_opt = f", double_penalty={'true' if use_double_penalty else 'false'}"
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
-        if _is_joint_spatial_basis(basis) and len(smooth_cols) >= 2:
-            terms.append(_rust_joint_spatial_term(basis, smooth_cols, knot_count, dp_opt))
-        else:
-            for col in smooth_cols:
-                if basis in {"ps", "bspline", "p-spline"}:
-                    terms.append(f"s({col}, type=ps, knots={knot_count}{dp_opt})")
-                elif basis in {"thinplate", "tps"}:
-                    terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
-                elif basis == "duchon":
-                    terms.append(
-                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
-                    )
-                elif basis == "matern":
-                    terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
-                else:
-                    raise RuntimeError(
-                        f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
-                    )
+        # PCs are always a single joint object regardless of the scenario's
+        # nominal basis. If the scenario asked for `ps` over PC columns, route
+        # them through a joint multi-D smooth (default duchon) — never N
+        # independent 1D smooths.
+        pc_smooth_cols, other_smooth_cols = _split_pc_columns(smooth_cols)
+        if len(pc_smooth_cols) >= 2:
+            pc_basis = _joint_pc_basis(basis)
+            terms.append(_rust_joint_spatial_term(pc_basis, pc_smooth_cols, knot_count, dp_opt))
+        elif len(pc_smooth_cols) == 1:
+            # Only one PC — emit the single-axis smooth using the scenario basis.
+            other_smooth_cols = pc_smooth_cols + other_smooth_cols
+            pc_smooth_cols = []
+        if other_smooth_cols:
+            if _is_joint_spatial_basis(basis) and len(other_smooth_cols) >= 2:
+                terms.append(_rust_joint_spatial_term(basis, other_smooth_cols, knot_count, dp_opt))
+            else:
+                for col in other_smooth_cols:
+                    if basis in {"ps", "bspline", "p-spline"}:
+                        terms.append(f"s({col}, type=ps, knots={knot_count}{dp_opt})")
+                    elif basis in {"thinplate", "tps"}:
+                        terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
+                    elif basis == "duchon":
+                        terms.append(
+                            f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
+                        )
+                    elif basis == "matern":
+                        terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
+                    else:
+                        raise RuntimeError(
+                            f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
+                        )
     else:
         col = cfg.get("smooth_col")
         if col:
@@ -3353,6 +3512,19 @@ def _mgcv_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any) -> typ
     if cfg is None:
         raise RuntimeError(f"No shared smooth mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
+    # Fold any PC linear_cols into the joint-PC smooth — PCs are always one
+    # joint object, never partly smooth and partly linear.
+    raw_linear = list(cfg.get("linear_cols", []))
+    pc_linear, true_linear = _split_pc_columns(raw_linear)
+    raw_smooth = list(cfg.get("smooth_cols") or [])
+    if pc_linear:
+        existing = set(str(c) for c in raw_smooth)
+        for c in pc_linear:
+            if c not in existing:
+                raw_smooth.append(c)
+        cfg = dict(cfg)
+        cfg["smooth_cols"] = raw_smooth
+        cfg["linear_cols"] = true_linear
     terms = [str(c) for c in cfg.get("linear_cols", [])]
     basis = _canonical_smooth_basis(cfg.get("smooth_basis", "ps"))
     knot_count = int(cfg.get("knots", 8))
@@ -3379,20 +3551,29 @@ def _mgcv_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any) -> typ
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
         k_val = knot_count + 4 if bs_code == "ps" else knot_count
-        if _is_joint_spatial_basis(basis) and len(smooth_cols) >= 2:
-            terms.append(_mgcv_joint_spatial_term(basis, smooth_cols, k_val))
-        else:
-            for col in smooth_cols:
-                if basis == "matern":
-                    terms.append(
-                        f"s({col}, bs='gp', m=c(-4,1.0), k=min({k_val}, nrow(train_df)-1))"
-                    )
-                elif basis == "duchon":
-                    terms.append(
-                        f"s({col}, bs='ds', m=c(1,0), k=min({k_val}, nrow(train_df)-1))"
-                    )
-                else:
-                    terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
+        # Mirror the rust contract: PCs always enter as a single joint smooth.
+        pc_smooth_cols, other_smooth_cols = _split_pc_columns(smooth_cols)
+        if len(pc_smooth_cols) >= 2:
+            pc_basis = _joint_pc_basis(basis)
+            terms.append(_mgcv_joint_spatial_term(pc_basis, pc_smooth_cols, k_val))
+        elif len(pc_smooth_cols) == 1:
+            other_smooth_cols = pc_smooth_cols + other_smooth_cols
+            pc_smooth_cols = []
+        if other_smooth_cols:
+            if _is_joint_spatial_basis(basis) and len(other_smooth_cols) >= 2:
+                terms.append(_mgcv_joint_spatial_term(basis, other_smooth_cols, k_val))
+            else:
+                for col in other_smooth_cols:
+                    if basis == "matern":
+                        terms.append(
+                            f"s({col}, bs='gp', m=c(-4,1.0), k=min({k_val}, nrow(train_df)-1))"
+                        )
+                    elif basis == "duchon":
+                        terms.append(
+                            f"s({col}, bs='ds', m=c(1,0), k=min({k_val}, nrow(train_df)-1))"
+                        )
+                    else:
+                        terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
     else:
         col = cfg.get("smooth_col")
         if col:
@@ -5098,16 +5279,39 @@ def _feature_should_be_smooth(ds: dict[str, typing.Any], col: str) -> bool:
 
 
 def _sigma_feature_terms(ds: dict[str, typing.Any], *, scenario_name: str | None, backend: str) -> list[str]:
+    """Build the per-feature term list for the GAMLSS sigma block.
+
+    Contract (joint-PC, applied uniformly across backends):
+
+    * If the dataset's features include 2+ PC columns, they are emitted as
+      ONE joint multi-D smooth via `_emit_joint_pc_term`. Backends without a
+      clean multi-D smoother (gamlss, gamboostlss) raise — the harness must
+      filter those lanes out rather than fall back to per-axis 1D fits.
+
+    * Non-PC features keep their existing per-feature smooth/linear treatment.
+
+    * Single-PC scenarios (rare; only `pc1`) fall through to the per-feature
+      branch since there's nothing to "join".
+
+    The DoF budget computation for mgcv/brms/bamlss counts the joint PC term
+    as ONE smooth regardless of dimension; this matches the actual GAM model
+    structure rather than the surface formula syntax.
+    """
     knot_count = _scenario_knot_count(scenario_name)
     knot_expr = f"max(1, min({knot_count}, nrow(train_df)-1))"
-    # For gaulss-type models the sigma smooths share DoF budget with the mu
-    # smooths.  Cap per-smooth k so that total basis (mu + sigma) stays below
-    # ~80% of training rows.  Assumes mu has roughly the same number of
-    # smooths as sigma (common case).
-    n_sigma_smooth = sum(
-        1 for col in [str(c) for c in ds.get("features", [])]
-        if _feature_should_be_smooth(ds, col)
-    )
+    features = [str(c) for c in ds.get("features", [])]
+    pc_features, other_features = _split_pc_columns(features)
+    smoothed_pc = [c for c in pc_features if _feature_should_be_smooth(ds, c)]
+    smoothed_other = [c for c in other_features if _feature_should_be_smooth(ds, c)]
+
+    cfg = _effective_scenario_fit_mapping(scenario_name) if scenario_name else None
+    pc_basis = _joint_pc_basis((cfg or {}).get("smooth_basis", "ps"))
+    use_joint_pc = len(smoothed_pc) >= 2
+
+    # Total smooth-block count for GAULSS-style total-DoF caps. The joint PC
+    # term counts as 1 regardless of dimension because it shares one λ in
+    # the mu+sigma optimization; per-axis on `other_features` each count as 1.
+    n_sigma_smooth = (1 if use_joint_pc else len(smoothed_pc)) + len(smoothed_other)
     gaulss_total = 2 * max(1, n_sigma_smooth)
     mgcv_k = (
         f"min({knot_count + 4}, "
@@ -5117,8 +5321,24 @@ def _sigma_feature_terms(ds: dict[str, typing.Any], *, scenario_name: str | None
         f"min({knot_count}, "
         f"max(4L, as.integer(floor(nrow(train_df) * 0.8 / {gaulss_total}))))"
     )
+
     terms: list[str] = []
-    for col in [str(c) for c in ds.get("features", [])]:
+
+    if use_joint_pc:
+        terms.append(
+            _emit_joint_pc_term(
+                backend,
+                smoothed_pc,
+                knot_count=knot_count,
+                pc_basis=pc_basis,
+                double_penalty=True,
+            )
+        )
+
+    # Per-feature smooth/linear treatment for non-PC features (and for the
+    # rare 1-PC case where there's nothing to join).
+    leftover = (smoothed_pc if not use_joint_pc else []) + other_features
+    for col in leftover:
         if _feature_should_be_smooth(ds, col):
             if backend == "rust":
                 terms.append(f"s({col}, type=ps, knots={knot_count})")
