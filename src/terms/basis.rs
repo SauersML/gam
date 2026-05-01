@@ -5283,6 +5283,7 @@ pub fn build_bspline_basis_1d(
                             source: candidate.source,
                             normalization_scale: candidate.normalization_scale,
                             kronecker_factors: None,
+                            op: None,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -5308,6 +5309,7 @@ pub fn build_bspline_basis_1d(
                             source: candidate.source,
                             normalization_scale: candidate.normalization_scale,
                             kronecker_factors: None,
+                            op: None,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -5338,6 +5340,7 @@ pub fn build_bspline_basis_1d(
                         source: candidate.source,
                         normalization_scale: candidate.normalization_scale,
                         kronecker_factors: None,
+                        op: None,
                     })
                 },
             )
@@ -5829,6 +5832,7 @@ pub fn build_thin_plate_basiswithworkspace(
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
+                op: None,
             });
         }
         (design, identifiability_transform, candidates)
@@ -5867,6 +5871,7 @@ pub fn build_thin_plate_basiswithworkspace(
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
+                op: None,
             });
         }
         (design, identifiability_transform, candidates)
@@ -5883,6 +5888,7 @@ pub fn build_thin_plate_basiswithworkspace(
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
                     kronecker_factors: None,
+                    op: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -7082,6 +7088,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
@@ -7089,6 +7096,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
@@ -7096,6 +7104,7 @@ fn build_matern_operator_penalty_aniso_derivatives(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -7867,6 +7876,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
@@ -7874,6 +7884,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
@@ -7881,6 +7892,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -9036,6 +9048,7 @@ fn normalize_penalty_candidate(
         source,
         normalization_scale,
         kronecker_factors: None,
+        op: None,
     }
 }
 
@@ -11993,6 +12006,7 @@ fn build_matern_operator_penalty_psi_derivatives(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
@@ -12000,6 +12014,7 @@ fn build_matern_operator_penalty_psi_derivatives(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
@@ -12007,6 +12022,7 @@ fn build_matern_operator_penalty_psi_derivatives(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         },
     ];
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
@@ -12336,6 +12352,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s1_norm,
@@ -12343,6 +12360,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         },
         PenaltyCandidate {
             matrix: s2_norm,
@@ -12350,6 +12368,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         },
     ];
 
@@ -18783,14 +18802,31 @@ pub mod closed_form_penalty {
             bessel_table[idx]
         };
 
-        // Evaluate current term list at scalar r
+        // Evaluate current term list at scalar r. When d is even, ν is
+        // an integer and every successive derivative leaves `a` integer-
+        // valued; we then use `r.powi` (≈5–10× faster than `powf`).
+        // For odd d (half-integer ν), fall back to `powf`.
+        let a_is_integer = d % 2 == 0;
         let evaluate = |terms: &Vec<(f64, f64, i32)>| -> f64 {
             let mut sum = 0.0_f64;
-            for &(c, a, b) in terms {
-                if c == 0.0 {
-                    continue;
+            if a_is_integer {
+                for &(c, a, b) in terms {
+                    if c == 0.0 {
+                        continue;
+                    }
+                    debug_assert!(
+                        a.fract() == 0.0,
+                        "matern_block_radial_derivatives: expected integer exponent for even d"
+                    );
+                    sum += c * r.powi(a as i32) * bessel(b);
                 }
-                sum += c * r.powf(a) * bessel(b);
+            } else {
+                for &(c, a, b) in terms {
+                    if c == 0.0 {
+                        continue;
+                    }
+                    sum += c * r.powf(a) * bessel(b);
+                }
             }
             sum
         };
@@ -18890,18 +18926,21 @@ pub mod closed_form_penalty {
             return out;
         }
 
-        // Non-log case: c · r^p with p = 2j - d (real exponent).
+        // Non-log case: c · r^p with p = 2j - d (integer exponent — both
+        // 2j and d are integers, so all successive derivatives keep the
+        // exponent integer-valued). Use `powi` for ~5–10× speedup over
+        // the transcendental `powf` on this hot path.
         let c = gamma_fn(half_d - j as f64)
             / (4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64));
-        let p = 2.0 * j as f64 - d as f64;
+        let p_int: i32 = 2 * j as i32 - d as i32;
         let mut coef = c;
-        let mut exp = p;
-        out.push(coef * r.powf(exp));
+        let mut exp_i: i32 = p_int;
+        out.push(coef * r.powi(exp_i));
         for _ in 0..max_order {
             // d/dr[c · r^p] = c·p · r^{p-1}
-            coef *= exp;
-            exp -= 1.0;
-            out.push(coef * r.powf(exp));
+            coef *= exp_i as f64;
+            exp_i -= 1;
+            out.push(coef * r.powi(exp_i));
         }
         out
     }
@@ -22719,6 +22758,7 @@ mod tests {
             source: PenaltySource::TensorMarginal { dim: 0 },
             normalization_scale: 1.0,
             kronecker_factors: Some(vec![s.clone(), identity.clone()]),
+            op: None,
         }])
         .expect("matching Kronecker factors should be retained");
 
@@ -22744,6 +22784,7 @@ mod tests {
             source: PenaltySource::TensorMarginal { dim: 0 },
             normalization_scale: 1.0,
             kronecker_factors: Some(vec![s, identity]),
+            op: None,
         }])
         .expect("projected penalty should still analyze");
 
