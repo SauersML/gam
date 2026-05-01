@@ -59,10 +59,15 @@ default-features = false
 num-dual = "0.13.6"
 autodiff = "0.7.0"
 ad_trait = "0.2.2"
+criterion = "0.5"
 
 [[bin]]
 name = "gam"
 path = "src/main.rs"
+
+[[bench]]
+name = "closed_form_pair_block"
+harness = false
 
 [profile.release]
 lto = "thin"
