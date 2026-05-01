@@ -23,7 +23,7 @@ DEFAULT_LOCAL_TZ = "America/Chicago"
 PAGE_SIZE = 100
 
 
-def run_cmd(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess:
+def run_cmd(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, check=False, text=True, capture_output=capture)
 
 

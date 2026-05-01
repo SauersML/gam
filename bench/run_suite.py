@@ -2,6 +2,7 @@
 import typing
 import argparse
 from collections import deque
+import importlib
 import json
 import math
 import os
@@ -93,33 +94,42 @@ _MAX_CAPTURE_CHARS = 200000
 
 
 def _require_lifelines_survival_helpers() -> typing.Any:
-    from lifelines import CoxPHFitter, KaplanMeierFitter
+    lifelines: typing.Any = importlib.import_module("lifelines")
+    CoxPHFitter = lifelines.CoxPHFitter
+    KaplanMeierFitter = lifelines.KaplanMeierFitter
 
     return CoxPHFitter, KaplanMeierFitter
 
 
 def _require_lifelines_coxph() -> typing.Any:
-    from lifelines import CoxPHFitter
-    from lifelines.exceptions import ConvergenceWarning
+    lifelines: typing.Any = importlib.import_module("lifelines")
+    lifelines_exceptions: typing.Any = importlib.import_module("lifelines.exceptions")
+    CoxPHFitter = lifelines.CoxPHFitter
+    ConvergenceWarning = lifelines_exceptions.ConvergenceWarning
 
     return CoxPHFitter, ConvergenceWarning
 
 
 def _require_lifelines_aft_fitters() -> typing.Any:
-    from lifelines import LogNormalAFTFitter, WeibullAFTFitter
-    from lifelines.exceptions import ConvergenceWarning
+    lifelines: typing.Any = importlib.import_module("lifelines")
+    lifelines_exceptions: typing.Any = importlib.import_module("lifelines.exceptions")
+    LogNormalAFTFitter = lifelines.LogNormalAFTFitter
+    WeibullAFTFitter = lifelines.WeibullAFTFitter
+    ConvergenceWarning = lifelines_exceptions.ConvergenceWarning
 
     return LogNormalAFTFitter, WeibullAFTFitter, ConvergenceWarning
 
 
 def _require_lifelines_kaplan_meier() -> typing.Any:
-    from lifelines import KaplanMeierFitter
+    lifelines: typing.Any = importlib.import_module("lifelines")
+    KaplanMeierFitter = lifelines.KaplanMeierFitter
 
     return KaplanMeierFitter
 
 
 def _require_lifelines_concordance_index() -> typing.Any:
-    from lifelines.utils import concordance_index
+    lifelines_utils: typing.Any = importlib.import_module("lifelines.utils")
+    concordance_index = lifelines_utils.concordance_index
 
     return concordance_index
 
@@ -6967,8 +6977,10 @@ def run_external_sksurv_rsf_cv(scenario: typing.Any, *, ds: dict[str, typing.Any
     if ds["family"] != "survival":
         return None
     try:
-        from sksurv.ensemble import RandomSurvivalForest
-        from sksurv.util import Surv
+        sksurv_ensemble: typing.Any = importlib.import_module("sksurv.ensemble")
+        sksurv_util: typing.Any = importlib.import_module("sksurv.util")
+        RandomSurvivalForest = sksurv_ensemble.RandomSurvivalForest
+        Surv = sksurv_util.Surv
     except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_sksurv_rsf",
@@ -7058,8 +7070,10 @@ def run_external_sksurv_coxnet_cv(scenario: typing.Any, *, ds: dict[str, typing.
     if ds["family"] != "survival":
         return None
     try:
-        from sksurv.linear_model import CoxnetSurvivalAnalysis
-        from sksurv.util import Surv
+        sksurv_linear_model: typing.Any = importlib.import_module("sksurv.linear_model")
+        sksurv_util: typing.Any = importlib.import_module("sksurv.util")
+        CoxnetSurvivalAnalysis = sksurv_linear_model.CoxnetSurvivalAnalysis
+        Surv = sksurv_util.Surv
     except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_sksurv_coxnet",

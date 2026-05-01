@@ -37,11 +37,13 @@ Setup (mirrors the teammate brief):
 """
 import typing
 
+import importlib
 import json
 from pathlib import Path
 
 import numpy as np
-import sympy as sp
+
+sp: typing.Any = importlib.import_module("sympy")
 
 # ---------------------------------------------------------------------------
 # 1. Toy fixtures
