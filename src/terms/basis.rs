@@ -18116,6 +18116,162 @@ pub mod closed_form_penalty {
             .map(|(p, n)| (p - n) / (2.0 * eps))
             .collect()
     }
+
+    /// Bundled value + first/second derivatives of the radial-form
+    /// anisotropic pair-block `J · g_q`, drop-in replacement for the
+    /// Schoenberg-quadrature `pair_block_with_j_second_derivatives`.
+    ///
+    /// Implementation status (Task #6):
+    ///   * Value:                 fully analytic via the radial form
+    ///                            (`anisotropic_duchon_penalty_radial`).
+    ///   * ∂η, ∂κ, ∂²η, ∂η∂κ, ∂²κ: computed via central finite differences
+    ///                            of the value-side radial form. This still
+    ///                            avoids the Schoenberg 80-node quadrature
+    ///                            entirely (each FD evaluation is O(d) +
+    ///                            cost of one `radial_derivatives_of_…`
+    ///                            call ≪ 80-node quadrature cost), and is
+    ///                            sufficient for wire-in tasks that depend
+    ///                            on the radial form.
+    ///
+    /// A purely-analytic chain-rule implementation is mechanical but long
+    /// (requires `f^{(0..6)}` for q = 2 Hessian) and is left as
+    /// follow-up work; the math team's letter (eq. 3.8) gives the
+    /// invariant decomposition (R, s_1, s_2, u_1, u_2, J) that lets the
+    /// chain rule close in those scalars plus radial derivatives of f.
+    pub fn pair_block_radial_with_j_second_derivatives(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> PairBlockBundle {
+        assert_eq!(
+            eta.len(),
+            r.len(),
+            "pair_block_radial_with_j_second_derivatives: eta and r dimension mismatch"
+        );
+        assert!(
+            !r.is_empty(),
+            "pair_block_radial_with_j_second_derivatives: empty input"
+        );
+        assert!(
+            q <= 2,
+            "pair_block_radial_with_j_second_derivatives: q must be in {{0,1,2}}"
+        );
+        let d = eta.len();
+        let big_j_of = |eta: &[f64]| -> f64 { eta.iter().sum::<f64>().exp() };
+        let val = |eta: &[f64], kappa: f64| -> f64 {
+            big_j_of(eta) * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
+        };
+
+        // Value at the base point.
+        let value = val(eta, kappa);
+
+        // Step sizes. Use central FD with step scaled by parameter magnitude.
+        let h_eta = 1e-4_f64;
+        let h_kappa = (kappa.abs().max(1.0)) * 1e-4;
+
+        // First derivatives ∂_{η_l} (J · g_q) and ∂_κ (J · g_q).
+        let mut d_eta = vec![0.0_f64; d];
+        let mut d2_eta = vec![vec![0.0_f64; d]; d];
+        let mut d2_eta_kappa = vec![0.0_f64; d];
+
+        // For first deriv ∂η_l: 2-point central FD.
+        let mut eta_p = eta.to_vec();
+        let mut eta_m = eta.to_vec();
+        for l in 0..d {
+            eta_p.copy_from_slice(eta);
+            eta_m.copy_from_slice(eta);
+            eta_p[l] += h_eta;
+            eta_m[l] -= h_eta;
+            d_eta[l] = (val(&eta_p, kappa) - val(&eta_m, kappa)) / (2.0 * h_eta);
+        }
+
+        // ∂_κ
+        let d_kappa = if s == 0 {
+            0.0
+        } else {
+            (val(eta, kappa + h_kappa) - val(eta, kappa - h_kappa)) / (2.0 * h_kappa)
+        };
+
+        // ∂²_κ
+        let d2_kappa = if s == 0 {
+            0.0
+        } else {
+            (val(eta, kappa + h_kappa) - 2.0 * value + val(eta, kappa - h_kappa))
+                / (h_kappa * h_kappa)
+        };
+
+        // Second derivatives in η: diagonal via 3-pt stencil.
+        for l in 0..d {
+            eta_p.copy_from_slice(eta);
+            eta_m.copy_from_slice(eta);
+            eta_p[l] += h_eta;
+            eta_m[l] -= h_eta;
+            d2_eta[l][l] = (val(&eta_p, kappa) - 2.0 * value + val(&eta_m, kappa))
+                / (h_eta * h_eta);
+        }
+        // Off-diagonal: 4-pt stencil.
+        for k in 0..d {
+            for l in (k + 1)..d {
+                let mut e_pp = eta.to_vec();
+                let mut e_pm = eta.to_vec();
+                let mut e_mp = eta.to_vec();
+                let mut e_mm = eta.to_vec();
+                e_pp[k] += h_eta;
+                e_pp[l] += h_eta;
+                e_pm[k] += h_eta;
+                e_pm[l] -= h_eta;
+                e_mp[k] -= h_eta;
+                e_mp[l] += h_eta;
+                e_mm[k] -= h_eta;
+                e_mm[l] -= h_eta;
+                let off = (val(&e_pp, kappa) - val(&e_pm, kappa) - val(&e_mp, kappa)
+                    + val(&e_mm, kappa))
+                    / (4.0 * h_eta * h_eta);
+                d2_eta[k][l] = off;
+                d2_eta[l][k] = off;
+            }
+        }
+
+        // Mixed ∂²_{η_l, κ} via 4-pt stencil.
+        if s != 0 {
+            for l in 0..d {
+                let mut e_p = eta.to_vec();
+                let mut e_m = eta.to_vec();
+                e_p[l] += h_eta;
+                e_m[l] -= h_eta;
+                d2_eta_kappa[l] = (val(&e_p, kappa + h_kappa)
+                    - val(&e_p, kappa - h_kappa)
+                    - val(&e_m, kappa + h_kappa)
+                    + val(&e_m, kappa - h_kappa))
+                    / (4.0 * h_eta * h_kappa);
+            }
+        }
+
+        PairBlockBundle {
+            value,
+            d_eta,
+            d_kappa,
+            d2_eta,
+            d2_eta_kappa,
+            d2_kappa,
+        }
+    }
+
+    /// First-derivative bundle convenience wrapper for the radial form.
+    pub fn pair_block_radial_with_j_derivatives(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> (f64, Vec<f64>, f64) {
+        let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        (bundle.value, bundle.d_eta, bundle.d_kappa)
+    }
 }
 
 // Unit tests are crucial for a mathematical library like this.
