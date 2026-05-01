@@ -203,7 +203,7 @@ def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path) -> None:
     df2.to_csv(out_path, sep="\t", index=False)
 
 
-def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict) -> float:
+def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict[str, typing.Any]) -> float:
     """Run perf record with sensible defaults and automatic fallback for mmap limit.
     Returns wall time in seconds. Exits on non-recoverable errors.
     """

@@ -13,7 +13,7 @@ _FUZZ_PATH = _REPO_ROOT / "bench" / "fuzz_vs_mgcv.py"
 _SPEC = importlib.util.spec_from_file_location("bench_fuzz_vs_mgcv", _FUZZ_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load fuzz benchmark module from {_FUZZ_PATH}")
-_FUZZ = importlib.util.module_from_spec(_SPEC)
+_FUZZ: typing.Any = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _FUZZ
 _SPEC.loader.exec_module(_FUZZ)
 

@@ -186,7 +186,7 @@ def _coerce_positive_survival_times(df: pd.DataFrame, time_col: str, dataset_nam
     return adjusted
 
 
-def _coerce_positive_survival_dataset_inplace(ds: dict, dataset_name: str) -> dict:
+def _coerce_positive_survival_dataset_inplace(ds: dict[str, typing.Any], dataset_name: str) -> dict[str, typing.Any]:
     if ds.get("family") != "survival":
         return ds
     time_col = ds["time_col"]
@@ -1628,7 +1628,7 @@ def _synthetic_continuous_order_dataset(
     seed: int = 20260501,
     true_nu: float | None = None,
     true_kappa2: float | None = None,
-) -> dict:
+) -> dict[str, typing.Any]:
     n = int(max(128, n))
     rng = np.random.default_rng(int(seed))
     x = np.linspace(-1.0, 1.0, n, dtype=float)
@@ -2503,12 +2503,12 @@ def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
 
 
 def _downsample_binomial_dataset(
-    ds: dict,
+    ds: dict[str, typing.Any],
     *,
     n: int,
     seed: int,
     min_class_count: int,
-) -> dict:
+) -> dict[str, typing.Any]:
     rows = list(ds["rows"])
     target = str(ds["target"])
     n = int(n)
@@ -2619,7 +2619,7 @@ def folds_for_dataset(ds: typing.Any) -> typing.Any:
 
 
 def build_shared_fold_artifacts(
-    ds: dict,
+    ds: dict[str, typing.Any],
     folds: list[Fold],
     root_dir: Path,
 ) -> list[SharedFoldArtifact]:
@@ -2710,7 +2710,7 @@ def aggregate_cv_rows(cv_rows: typing.Any, family: typing.Any) -> typing.Any:
     }
 
 
-def _init_plot_payload(ds: dict) -> dict:
+def _init_plot_payload(ds: dict[str, typing.Any]) -> dict[str, typing.Any]:
     family = str(ds["family"])
     features = [str(c) for c in ds.get("features", [])]
     primary_feature = features[0] if len(features) == 1 else None
@@ -2742,7 +2742,7 @@ def _init_plot_payload(ds: dict) -> dict:
     return payload
 
 
-def _append_supervised_plot_fold(payload: dict, test_df: pd.DataFrame, pred: np.ndarray, target_col: str) -> None:
+def _append_supervised_plot_fold(payload: dict[str, typing.Any], test_df: pd.DataFrame, pred: np.ndarray, target_col: str) -> None:
     y_true = test_df[target_col].to_numpy(dtype=float).reshape(-1)
     y_pred = np.asarray(pred, dtype=float).reshape(-1)
     if y_true.shape[0] != y_pred.shape[0]:
@@ -2758,7 +2758,7 @@ def _append_supervised_plot_fold(payload: dict, test_df: pd.DataFrame, pred: np.
 
 
 def _append_survival_plot_fold(
-    payload: dict,
+    payload: dict[str, typing.Any],
     test_df: pd.DataFrame,
     *,
     time_col: str,
@@ -2790,7 +2790,7 @@ def _append_survival_plot_fold(
         payload["pred_time"].extend(float(v) for v in pred_time_arr)
 
 
-def _finalize_plot_payload(payload: dict) -> dict | None:
+def _finalize_plot_payload(payload: dict[str, typing.Any]) -> dict[str, typing.Any] | None:
     family = payload.get("family")
     if family == "survival":
         n = len(payload.get("time", []))
@@ -2810,11 +2810,11 @@ def _finalize_cv_result(
     contender: str,
     scenario_name: str,
     family: str,
-    cv_rows: list[dict],
-    plot_payload: dict | None,
+    cv_rows: list[dict[str, typing.Any]],
+    plot_payload: dict[str, typing.Any] | None,
     model_spec: str,
-    extra_metrics: dict | None = None,
-) -> dict:
+    extra_metrics: dict[str, typing.Any] | None = None,
+) -> dict[str, typing.Any]:
     metrics = aggregate_cv_rows(cv_rows, family)
     if extra_metrics:
         metrics.update(extra_metrics)
@@ -2849,7 +2849,7 @@ def _finalize_cv_result(
     return result
 
 
-def _normalize_result_metadata(results: list[dict]) -> None:
+def _normalize_result_metadata(results: list[dict[str, typing.Any]]) -> None:
     for result in results:
         if result.get("status") != "ok":
             continue
@@ -2861,7 +2861,7 @@ def _normalize_result_metadata(results: list[dict]) -> None:
                 pass
 
 
-def _validate_result_metadata(results: list[dict]) -> None:
+def _validate_result_metadata(results: list[dict[str, typing.Any]]) -> None:
     for result in results:
         if result.get("status") != "ok":
             continue
@@ -3136,7 +3136,7 @@ def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
     }.get(scenario_name)
 
 
-def _effective_scenario_fit_mapping(scenario_name: str, override: dict | None = None) -> typing.Any:
+def _effective_scenario_fit_mapping(scenario_name: str, override: dict[str, typing.Any] | None = None) -> typing.Any:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None
@@ -3159,7 +3159,7 @@ def _is_joint_spatial_basis(basis: str) -> bool:
     return _canonical_smooth_basis(basis) in {"thinplate", "tps", "duchon", "matern"}
 
 
-def _requires_joint_spatial_term(cfg: dict | None) -> bool:
+def _requires_joint_spatial_term(cfg: dict[str, typing.Any] | None) -> bool:
     if not cfg:
         return False
     smooth_cols = list(cfg.get("smooth_cols") or [])
@@ -3195,7 +3195,7 @@ def _mgcv_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int
     raise RuntimeError(f"Unsupported joint mgcv spatial basis '{basis}'")
 
 
-def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg_override: dict | None = None) -> typing.Any:
+def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg_override: dict[str, typing.Any] | None = None) -> typing.Any:
     cfg = _effective_scenario_fit_mapping(scenario_name, cfg_override)
     if cfg is None:
         raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
@@ -3256,7 +3256,7 @@ def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg
     return cfg["family"], formula
 
 
-def _cfg_with_excluded_columns(cfg: dict, excluded_cols: typing.Any) -> dict:
+def _cfg_with_excluded_columns(cfg: dict[str, typing.Any], excluded_cols: typing.Any) -> dict[str, typing.Any]:
     excluded = {str(col) for col in (excluded_cols or [])}
     if not excluded:
         return dict(cfg)
@@ -3286,7 +3286,7 @@ def _formula_rhs_text(formula: str) -> str:
     return rhs
 
 
-def _select_marginal_slope_z_column(scenario_name: str, ds: dict) -> str:
+def _select_marginal_slope_z_column(scenario_name: str, ds: dict[str, typing.Any]) -> str:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No marginal-slope mapping configured for scenario '{scenario_name}'")
@@ -3319,7 +3319,7 @@ def _apply_exact_train_fold_standardization(
     test_df[column] = (test_raw[column].to_numpy(dtype=float) - mu) / sd
 
 
-def _rust_marginal_slope_formulas_for_scenario(scenario_name: str, ds: dict) -> tuple[str, str, str]:
+def _rust_marginal_slope_formulas_for_scenario(scenario_name: str, ds: dict[str, typing.Any]) -> tuple[str, str, str]:
     base_cfg = _effective_scenario_fit_mapping(scenario_name) or {}
     z_column = _select_marginal_slope_z_column(scenario_name, ds)
     marginal_cfg = _cfg_with_excluded_columns(base_cfg, [z_column])
@@ -3400,7 +3400,7 @@ def _mgcv_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any) -> typ
     return f"{target} ~ " + " + ".join(terms)
 
 
-def _survival_formula_mapping(scenario_name: str) -> dict:
+def _survival_formula_mapping(scenario_name: str) -> dict[str, typing.Any]:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No survival formula mapping configured for scenario '{scenario_name}'")
@@ -3434,14 +3434,14 @@ def _rust_survival_formula_for_scenario(scenario_name: str, *, exclude_cols: typ
 
 def _rust_survival_marginal_slope_formulas_for_scenario(
     scenario_name: str,
-    ds: dict,
+    ds: dict[str, typing.Any],
 ) -> tuple[str, str, str]:
     z_column = _select_marginal_slope_z_column(scenario_name, ds)
     rhs = _rust_survival_formula_for_scenario(scenario_name, exclude_cols=[z_column])
     return z_column, rhs, rhs
 
 
-def _coxph_survival_formula_for_scenario(scenario_name: str, ds: dict) -> str:
+def _coxph_survival_formula_for_scenario(scenario_name: str, ds: dict[str, typing.Any]) -> str:
     cfg = _survival_formula_mapping(scenario_name)
     terms = list(cfg["linear_cols"])
     terms.extend(
@@ -3450,7 +3450,7 @@ def _coxph_survival_formula_for_scenario(scenario_name: str, ds: dict) -> str:
     return f"Surv({ds['time_col']}, {ds['event_col']}) ~ " + " + ".join(terms)
 
 
-def _mgcv_survival_formula_for_scenario(scenario_name: str, ds: dict) -> str:
+def _mgcv_survival_formula_for_scenario(scenario_name: str, ds: dict[str, typing.Any]) -> str:
     cfg = _survival_formula_mapping(scenario_name)
     k_val = cfg["knots"] + 4
     terms = list(cfg["linear_cols"])
@@ -3503,7 +3503,7 @@ def _is_matern_rust_scenario(s_cfg: typing.Any) -> bool:
 def _make_far_ood_frame(
     train_df: pd.DataFrame,
     *,
-    ds: dict,
+    ds: dict[str, typing.Any],
     smooth_cols: list[str],
     linear_cols: list[str],
     n_points: int = 64,
@@ -3541,7 +3541,7 @@ def _compute_continuous_order_from_lambdas(
     lambda_tilde: list[float] | tuple[float, ...] | np.ndarray,
     normalization_scale: list[float] | tuple[float, ...] | np.ndarray | None = None,
     eps: float = 1e-12,
-) -> dict:
+) -> dict[str, typing.Any]:
     if len(lambda_tilde) < 3:
         return {
             "status": "UndefinedZeroLambda",
@@ -3614,7 +3614,7 @@ def _rank_corr(a: np.ndarray, b: np.ndarray) -> float | None:
 
 
 def _thread3_cliff_gradient_magnitude(
-    collocation_points: np.ndarray, *, feature_cols: list[int], ds: dict
+    collocation_points: np.ndarray, *, feature_cols: list[int], ds: dict[str, typing.Any]
 ) -> np.ndarray | None:
     coeff_map = ds.get("thread3_cliff_coefficients")
     if not isinstance(coeff_map, dict):
@@ -3639,7 +3639,7 @@ def _thread3_cliff_gradient_magnitude(
     return deta_dz_abs * coeff_norm
 
 
-def _extract_thread3_adaptive_fold_metrics(model_payload: dict | None, ds: dict) -> dict:
+def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] | None, ds: dict[str, typing.Any]) -> dict[str, typing.Any]:
     if not isinstance(model_payload, dict):
         return {}
     diag = model_payload.get("adaptive_regularization_diagnostics")
@@ -3823,10 +3823,10 @@ def run_rust_scenario_cv(
     *,
     contender_name: str = "rust_gam",
     binomial_link: str | None = None,
-    ds: dict | None = None,
+    ds: dict[str, typing.Any] | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
-    rust_cfg_override: dict | None = None,
+    rust_cfg_override: dict[str, typing.Any] | None = None,
     eval_ood: bool = False,
     collect_continuous_order: bool = False,
     collect_adaptive_diagnostics: bool = False,
@@ -4240,7 +4240,7 @@ def _run_rust_gamlss_scenario_cv_variant(
     contender_name: str,
     binomial_cli_family: str,
     gaussian_formula_link: str | None = None,
-    ds: dict | None = None,
+    ds: dict[str, typing.Any] | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
 ) -> typing.Any:
@@ -4465,7 +4465,7 @@ def run_rust_gamlss_scenario_cv(
     contender_name: str = "rust_gamlss",
     binomial_cli_family: str = "binomial-probit",
     gaussian_formula_link: str | None = None,
-    ds: dict | None = None,
+    ds: dict[str, typing.Any] | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
 ) -> typing.Any:
@@ -4484,7 +4484,7 @@ def run_rust_gamlss_marginal_slope_cv(
     scenario: typing.Any,
     *,
     contender_name: str = "rust_gamlss_marginal_slope",
-    ds: dict | None = None,
+    ds: dict[str, typing.Any] | None = None,
     folds: list[Fold] | None = None,
     rust_fit_extra_args: list[str] | None = None,
 ) -> typing.Any:
@@ -4645,7 +4645,7 @@ def run_rust_gamlss_survival_cv(
     *,
     contender_name: str = "rust_gamlss_survival",
     survival_link: str | None = None,
-    ds: dict | None = None,
+    ds: dict[str, typing.Any] | None = None,
     folds: list[Fold] | None = None,
 ) -> typing.Any:
     """Run the Rust binary with --survival-likelihood location-scale for survival scenarios."""
@@ -4828,7 +4828,7 @@ def run_rust_gamlss_survival_marginal_slope_cv(
     scenario: typing.Any,
     *,
     contender_name: str = "rust_gamlss_survival_marginal_slope",
-    ds: dict | None = None,
+    ds: dict[str, typing.Any] | None = None,
     folds: list[Fold] | None = None,
 ) -> typing.Any:
     scenario_name = scenario["name"]
@@ -5063,7 +5063,7 @@ def _scenario_knot_count(scenario_name: str | None, default: int = 8) -> int:
     return max(4, int(cfg.get("knots", default)))
 
 
-def _feature_should_be_smooth(ds: dict, col: str) -> bool:
+def _feature_should_be_smooth(ds: dict[str, typing.Any], col: str) -> bool:
     vals = pd.to_numeric(pd.Series([row.get(col) for row in ds["rows"]]), errors="coerce").dropna()
     if vals.empty:
         return False
@@ -5071,7 +5071,7 @@ def _feature_should_be_smooth(ds: dict, col: str) -> bool:
     return unique_vals.size > 2
 
 
-def _sigma_feature_terms(ds: dict, *, scenario_name: str | None, backend: str) -> list[str]:
+def _sigma_feature_terms(ds: dict[str, typing.Any], *, scenario_name: str | None, backend: str) -> list[str]:
     knot_count = _scenario_knot_count(scenario_name)
     knot_expr = f"max(1, min({knot_count}, nrow(train_df)-1))"
     # For gaulss-type models the sigma smooths share DoF budget with the mu
@@ -5118,7 +5118,7 @@ def _sigma_feature_terms(ds: dict, *, scenario_name: str | None, backend: str) -
     return terms
 
 
-def _sigma_feature_formula(ds: dict, *, scenario_name: str | None, backend: str) -> str:
+def _sigma_feature_formula(ds: dict[str, typing.Any], *, scenario_name: str | None, backend: str) -> str:
     terms = _sigma_feature_terms(ds, scenario_name=scenario_name, backend=backend)
     if backend == "r_gamlss" and not terms:
         raise RuntimeError(
@@ -5128,7 +5128,7 @@ def _sigma_feature_formula(ds: dict, *, scenario_name: str | None, backend: str)
     return "~ " + (" + ".join(terms) if terms else "1")
 
 
-def run_external_r_gamlss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_r_gamlss_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     scenario_name = scenario["name"]
     if not _is_gamlss_benchmark_scenario(scenario_name):
         return None
@@ -5403,7 +5403,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_mgcv_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_mgcv_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if folds is None:
@@ -5759,7 +5759,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_mgcv_gaulss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_mgcv_gaulss_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6047,7 +6047,7 @@ def _gamboostlss_formulas_for_scenario(scenario_name: str, ds: typing.Any) -> ty
     return mu_formula, sigma_formula
 
 
-def run_external_r_gamboostlss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_r_gamboostlss_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6336,7 +6336,7 @@ def _brms_formulas_for_scenario(scenario_name: str, ds: typing.Any) -> typing.An
     return mu_formula, sigma_formula
 
 
-def run_external_r_bamlss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_r_bamlss_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6560,7 +6560,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_r_brms_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_r_brms_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6776,7 +6776,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_mgcv_survival_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_mgcv_survival_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -6961,7 +6961,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_sksurv_rsf_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_sksurv_rsf_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7052,7 +7052,7 @@ def run_external_sksurv_rsf_cv(scenario: typing.Any, *, ds: dict | None = None, 
     )
 
 
-def run_external_sksurv_coxnet_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_sksurv_coxnet_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7138,7 +7138,7 @@ def run_external_sksurv_coxnet_cv(scenario: typing.Any, *, ds: dict | None = Non
     )
 
 
-def run_external_lifelines_coxph_enet_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_lifelines_coxph_enet_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7239,7 +7239,7 @@ def run_external_lifelines_coxph_enet_cv(scenario: typing.Any, *, ds: dict | Non
     )
 
 
-def run_external_glmnet_cox_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_glmnet_cox_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7439,7 +7439,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_sksurv_gb_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_sksurv_gb_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7579,7 +7579,7 @@ def run_external_sksurv_gb_cv(scenario: typing.Any, *, ds: dict | None = None, f
     ]
 
 
-def run_external_lifelines_aft_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_lifelines_aft_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7728,7 +7728,7 @@ def run_external_lifelines_aft_cv(scenario: typing.Any, *, ds: dict | None = Non
     ]
 
 
-def run_external_xgboost_aft_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
+def run_external_xgboost_aft_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7839,7 +7839,7 @@ def run_external_xgboost_aft_cv(scenario: typing.Any, *, ds: dict | None = None,
     )
 
 
-def _assert_basis_parity_for_scenario(s_cfg: typing.Any, *, ds: dict | None = None) -> None:
+def _assert_basis_parity_for_scenario(s_cfg: typing.Any, *, ds: dict[str, typing.Any] | None = None) -> None:
     # Fairness guard: if Rust mapping requests a named spline family, mgcv must
     # emit the equivalent basis for the same scenario.
     if ds is None:
@@ -7873,7 +7873,7 @@ def _is_contender_enabled(s_cfg: typing.Any, contender: str) -> bool:
     return contender not in excluded
 
 
-def _append_enabled_result_rows(results: list[dict], rows: typing.Any, s_cfg: typing.Any) -> None:
+def _append_enabled_result_rows(results: list[dict[str, typing.Any]], rows: typing.Any, s_cfg: typing.Any) -> None:
     if rows is None:
         return
     if not isinstance(rows, list):
@@ -7889,7 +7889,7 @@ def _append_enabled_result_rows(results: list[dict], rows: typing.Any, s_cfg: ty
 
 
 def _append_contender_result_if_enabled(
-    results: list[dict],
+    results: list[dict[str, typing.Any]],
     s_cfg: typing.Any,
     contender: str,
     build_row: typing.Any,
@@ -7901,18 +7901,18 @@ def _append_contender_result_if_enabled(
         results.append(row)
 
 
-def _required_contender_for_scenario(s_cfg: typing.Any, ds: dict) -> str | None:
+def _required_contender_for_scenario(s_cfg: typing.Any, ds: dict[str, typing.Any]) -> str | None:
     contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
     if not _is_contender_enabled(s_cfg, contender):
         return None
     return contender
 
 
-def _is_non_blocking_failure(row: dict) -> bool:
+def _is_non_blocking_failure(row: dict[str, typing.Any]) -> bool:
     return str(row.get("contender", "")) in NON_BLOCKING_FAILURE_CONTENDERS
 
 
-def _format_blocking_failure(row: dict) -> str:
+def _format_blocking_failure(row: dict[str, typing.Any]) -> str:
     contender = str(row.get("contender", "?"))
     scenario_name = str(row.get("scenario_name", "?"))
     error = str(row.get("error", "unknown error")).strip()
@@ -8431,7 +8431,7 @@ def _subsample_plot_df(df: pd.DataFrame, max_points: int, seed: int = 42) -> pd.
     return df.iloc[keep].copy()
 
 
-def _plot_single_predictor_gaussian(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_single_predictor_gaussian(ax: typing.Any, payload: dict[str, typing.Any], *, accent: str, text_color: str) -> None:
     df = pd.DataFrame(
         {
             "x": payload["x"],
@@ -8447,7 +8447,7 @@ def _plot_single_predictor_gaussian(ax: typing.Any, payload: dict, *, accent: st
     ax.text(0.02, 0.96, "actual points + OOF prediction", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_single_predictor_binomial(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_single_predictor_binomial(ax: typing.Any, payload: dict[str, typing.Any], *, accent: str, text_color: str) -> None:
     df = pd.DataFrame(
         {
             "x": payload["x"],
@@ -8480,7 +8480,7 @@ def _plot_single_predictor_binomial(ax: typing.Any, payload: dict, *, accent: st
     ax.text(0.02, 0.96, "jittered class points + OOF probability", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_actual_vs_predicted(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_actual_vs_predicted(ax: typing.Any, payload: dict[str, typing.Any], *, accent: str, text_color: str) -> None:
     df = pd.DataFrame({"actual": payload["actual"], "predicted": payload["predicted"]})
     pts = _subsample_plot_df(df, max_points=3000)
     ax.scatter(pts["actual"], pts["predicted"], s=14, color=accent, alpha=0.5, linewidths=0, zorder=3)
@@ -8492,7 +8492,7 @@ def _plot_actual_vs_predicted(ax: typing.Any, payload: dict, *, accent: str, tex
     ax.text(0.02, 0.96, "OOF predictions", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_binary_probability(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_binary_probability(ax: typing.Any, payload: dict[str, typing.Any], *, accent: str, text_color: str) -> None:
     df = pd.DataFrame({"actual": payload["actual"], "predicted": payload["predicted"]}).sort_values("predicted")
     pts = _subsample_plot_df(df, max_points=2500)
     rng = np.random.default_rng(42)
@@ -8519,7 +8519,7 @@ def _plot_binary_probability(ax: typing.Any, payload: dict, *, accent: str, text
     ax.text(0.02, 0.96, "jittered datapoints + binned event rate", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_survival_panel(ax: typing.Any, payload: dict, *, text_color: str) -> None:
+def _plot_survival_panel(ax: typing.Any, payload: dict[str, typing.Any], *, text_color: str) -> None:
     df = pd.DataFrame(
         {
             "time": payload["time"],
@@ -8567,7 +8567,7 @@ def _plot_survival_panel(ax: typing.Any, payload: dict, *, text_color: str) -> N
     ax.text(0.02, 0.96, summary, transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def generate_scenario_datapoint_figures(results: list[dict], out_dir: Path) -> list[Path]:
+def generate_scenario_datapoint_figures(results: list[dict[str, typing.Any]], out_dir: Path) -> list[Path]:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -8578,7 +8578,7 @@ def generate_scenario_datapoint_figures(results: list[dict], out_dir: Path) -> l
 
     from collections import defaultdict
 
-    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    by_scenario: dict[str, list[dict[str, typing.Any]]] = defaultdict(list)
     for r in results:
         if r.get("status") == "ok" and r.get("plot_payload"):
             by_scenario[r["scenario_name"]].append(r)
@@ -8637,7 +8637,7 @@ def generate_scenario_datapoint_figures(results: list[dict], out_dir: Path) -> l
     return paths
 
 
-def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
+def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Path) -> list[Path]:
     """Create one beautiful comparison PNG per scenario."""
     try:
         import matplotlib
@@ -8649,7 +8649,7 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
 
     # Group results by scenario.
     from collections import defaultdict
-    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    by_scenario: dict[str, list[dict[str, typing.Any]]] = defaultdict(list)
     for r in results:
         if r.get("status") == "ok":
             by_scenario[r["scenario_name"]].append(r)

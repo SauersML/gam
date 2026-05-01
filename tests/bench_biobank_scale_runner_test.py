@@ -12,7 +12,7 @@ _RUNNER_PATH = _REPO_ROOT / "bench" / "biobank_scale" / "runner.py"
 _SPEC = importlib.util.spec_from_file_location("bench_biobank_scale_runner", _RUNNER_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load biobank benchmark runner from {_RUNNER_PATH}")
-_RUNNER = importlib.util.module_from_spec(_SPEC)
+_RUNNER: typing.Any = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _RUNNER
 _SPEC.loader.exec_module(_RUNNER)
 

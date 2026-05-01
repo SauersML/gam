@@ -12,7 +12,7 @@ _RUN_SUITE_PATH = _REPO_ROOT / "bench" / "run_suite.py"
 _SPEC = importlib.util.spec_from_file_location("bench_run_suite", _RUN_SUITE_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load benchmark runner from {_RUN_SUITE_PATH}")
-_RUN_SUITE = importlib.util.module_from_spec(_SPEC)
+_RUN_SUITE: typing.Any = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_RUN_SUITE)
 _GITIGNORE_PATH = _REPO_ROOT / ".gitignore"
 _BENCH_DATASET_DIR = _REPO_ROOT / "bench" / "datasets"
