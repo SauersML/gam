@@ -9967,4 +9967,109 @@ mod root_cause_tests {
             assert_deviance_monotone(&trace, &format!("Logistic(seed={})", seed));
         }
     }
+
+    #[test]
+    fn solve_newton_direction_implicit_matches_dense_at_k500() {
+        // Phase 2C equivalence test: PCG-against-implicit-H must produce the
+        // same Newton direction as dense Cholesky on the same fully-assembled
+        // Hessian H = X^T W X + ridge·I + λ·S, where S is provided in
+        // operator form via `ClosedFormPenaltyOperator`. This pins the
+        // contract that future refactors of `solve_newton_direction_implicit`
+        // cannot silently drift from the dense path.
+        use crate::terms::closed_form_operator::ClosedFormPenaltyOperator;
+        use crate::terms::penalty_op::PenaltyOp;
+
+        const K: usize = 500;
+        const D: usize = 4;
+
+        // Synthetic centers in [0,1]^D via deterministic LCG.
+        let mut state: u64 = 0xDEADBEEF_CAFEBABE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut centers = Array2::<f64>::zeros((K, D));
+        for i in 0..K {
+            for j in 0..D {
+                centers[[i, j]] = next();
+            }
+        }
+        let op = std::sync::Arc::new(ClosedFormPenaltyOperator::new(
+            centers.view(),
+            /* q = */ 2,
+            /* m = */ 2,
+            /* s = */ 1,
+            /* kappa = */ 1.0,
+            None,
+            None,
+            0,
+            None,
+        ));
+        let p = op.dim();
+        assert_eq!(p, K);
+        let s_dense = op.as_dense();
+
+        // Synthetic well-conditioned X^T W X (diag-dominant SPD).
+        let mut xtwx = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..=i {
+                let v = if i == j {
+                    2.0 + ((i as f64) * 0.07).sin() * 0.3
+                } else {
+                    (((i as f64 - j as f64) * 0.13).cos()) * 0.02
+                        / (((i + 1) as f64).sqrt())
+                };
+                xtwx[[i, j]] = v;
+                xtwx[[j, i]] = v;
+            }
+        }
+        let xtwx_diag: Array1<f64> = (0..p).map(|i| xtwx[[i, i]]).collect();
+        let lambda = 0.1_f64;
+        let ridge = 0.0_f64;
+        let gradient = Array1::<f64>::from_shape_fn(p, |i| ((i as f64) * 0.31).sin());
+
+        // Dense reference: form full H = X^T W X + λ S, factor and solve.
+        let mut h_dense = xtwx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                h_dense[[i, j]] += lambda * s_dense[[i, j]];
+            }
+        }
+        let mut dense_dir = Array1::<f64>::zeros(p);
+        super::solve_newton_direction_dense(&h_dense, &gradient, &mut dense_dir)
+            .expect("dense Newton solve should succeed on synthetic SPD");
+
+        // Implicit path: PCG against operator H = X^T W X + λ·op.matvec.
+        let xtwx_for_closure = xtwx.clone();
+        let apply_xtwx = move |v: &Array1<f64>| -> Array1<f64> { xtwx_for_closure.dot(v) };
+        let op_pen: &dyn PenaltyOp = op.as_ref();
+        let mut implicit_dir = Array1::<f64>::zeros(p);
+        super::solve_newton_direction_implicit(
+            apply_xtwx,
+            xtwx_diag.view(),
+            &[],
+            &[(lambda, op_pen)],
+            &gradient,
+            &mut implicit_dir,
+            ridge,
+            /* rel_tol = */ 1e-12,
+            /* max_iter = */ 4 * p,
+        )
+        .expect("implicit Newton solve should succeed on synthetic SPD");
+
+        let dense_norm: f64 = dense_dir.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let mut diff_sq = 0.0_f64;
+        for i in 0..p {
+            let d = implicit_dir[i] - dense_dir[i];
+            diff_sq += d * d;
+        }
+        let rel = diff_sq.sqrt() / dense_norm.max(1e-300);
+        assert!(
+            rel < 1e-9,
+            "implicit-PCG vs dense-Cholesky Newton direction relative diff {} exceeds 1e-9",
+            rel
+        );
+    }
 }

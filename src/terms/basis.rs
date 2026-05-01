@@ -1976,7 +1976,7 @@ pub enum BasisMetadata {
 }
 
 /// Standardized basis build result for engine-level composition.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BasisBuildResult {
     pub design: DesignMatrix,
     pub penalties: Vec<Array2<f64>>,
@@ -1987,6 +1987,24 @@ pub struct BasisBuildResult {
     /// bases. When present, downstream code can keep the design operator-backed
     /// instead of forcing a fully materialized `n x prod(q_j)` block.
     pub kronecker_factored: Option<KroneckerFactoredBasis>,
+    /// Per-active-penalty operator handles (parallel to `penalties`). Each entry
+    /// is `Some(op)` when the closed-form factory emitted an op-form penalty
+    /// bit-equivalent to the dense matrix; `None` for ordinary dense penalties.
+    pub ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+}
+
+impl std::fmt::Debug for BasisBuildResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasisBuildResult")
+            .field("design", &self.design)
+            .field("penalties", &self.penalties)
+            .field("nullspace_dims", &self.nullspace_dims)
+            .field("penaltyinfo", &self.penaltyinfo)
+            .field("metadata", &self.metadata)
+            .field("kronecker_factored", &self.kronecker_factored)
+            .field("ops_present", &self.ops.iter().map(|o| o.is_some()).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Factored tensor-product basis metadata for operator-backed downstream use.
@@ -5367,8 +5385,8 @@ pub fn build_bspline_basis_1d(
             identifiability_transform,
         )
     };
-    let (penalties, nullspace_dims, penaltyinfo) =
-        filter_active_penalty_candidates(transformed_candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(transformed_candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -5379,6 +5397,7 @@ pub fn build_bspline_basis_1d(
             identifiability_transform,
         },
         kronecker_factored: None,
+        ops,
     })
 }
 
@@ -5912,12 +5931,14 @@ pub fn build_thin_plate_basiswithworkspace(
             })
             .collect::<Result<Vec<_>, _>>()?;
     }
-    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
         penaltyinfo,
+        ops,
         metadata: BasisMetadata::ThinPlate {
             centers,
             length_scale: spec.length_scale,
@@ -8228,6 +8249,210 @@ pub fn closed_form_anisotropic_pair_block_pure(
     g
 }
 
+/// Closed-form pair-block penalty for the thin-plate spline (TPS) basis.
+///
+/// TPS is the s=0, κ=0 specialization of Duchon with `m = thin_plate_penalty_order(d)`
+/// (the smallest m with 2m > d). The kernel is the polyharmonic
+/// φ_m(r) ~ r^{2m-d} (or r^{2(m-d/2)}·log r in the log-Riesz boundary cases).
+///
+/// q semantics:
+/// - `q = 0`: RKHS-Gram form `S_{ij} = φ_m(|c_i - c_j| / length_scale)`. This is
+///   the m-th order Sobolev seminorm `α^T K_CC α`, identical to mgcv's TPS
+///   penalty for the unconstrained kernel coefficients.
+/// - `q ≥ 1`: Lebesgue pair-block via the existing pure-Duchon path. With
+///   s = 0 the convergence gate `4(m+s) > d+2q && d+2q > 4m` collapses to a
+///   contradiction, so the q≥1 closed-form Gram has no convergent regime
+///   (Fourier integrand `|ρ|^{2q-4m}` is never L¹). Caller must route q≥1
+///   to the collocation `D_q^T D_q` Gram instead — this routine returns
+///   `None` to surface the gating decision.
+pub fn closed_form_thin_plate_pair_block(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    length_scale: f64,
+    aniso_log_scales: Option<&[f64]>,
+) -> Option<Array2<f64>> {
+    assert!(
+        length_scale.is_finite() && length_scale > 0.0,
+        "closed_form_thin_plate_pair_block: length_scale must be finite and positive"
+    );
+    let k = centers.nrows();
+    let d = centers.ncols();
+    if d == 0 || k == 0 {
+        return Some(Array2::<f64>::zeros((k, k)));
+    }
+    let m = thin_plate_penalty_order(d);
+
+    if q == 0 {
+        // K_CC RKHS Gram: φ_m at scaled inter-center distance. Matches the
+        // bending-energy block built by `build_thin_plate_penalty_matrices`
+        // before the kernel nullspace transform.
+        let length_scale_sq = length_scale * length_scale;
+        let mut g = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in i..k {
+                let mut dist2 = 0.0_f64;
+                for axis in 0..d {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                let v = thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
+                    .expect("thin_plate_kernel_from_dist2: finite, non-negative input");
+                g[[i, j]] = v;
+                if i != j {
+                    g[[j, i]] = v;
+                }
+            }
+        }
+        return Some(g);
+    }
+
+    // q ≥ 1: Lebesgue closed-form gate. With s = 0 the pure-Duchon
+    // convergence predicate `4m > d + 2q && d + 2q > 4m` is a contradiction,
+    // and additionally the log-Riesz branch `d % 2 == 0 && d/2 ≤ 2m` fires
+    // for the standard TPS choice m = d/2 + 1 in even d. In either case the
+    // closed-form Lebesgue Gram is not PSD-by-construction; caller must use
+    // `D_q^T D_q` collocation instead.
+    let log_riesz_present = d % 2 == 0 && d / 2 <= 2 * m;
+    let four_m = 4 * m;
+    let dp2q = d + 2 * q;
+    let convergent = four_m > dp2q && dp2q > four_m && 2 * m >= q + 1 && !log_riesz_present;
+    if !convergent {
+        return None;
+    }
+    // Unreachable in practice (the && of `four_m > dp2q` and `dp2q > four_m`
+    // is false), but kept for parity with the pure-Duchon factory call shape.
+    Some(closed_form_anisotropic_pair_block_pure(
+        centers,
+        q,
+        m,
+        0,
+        aniso_log_scales,
+    ))
+}
+
+/// Closed-form pair-block penalty for the pure Matérn basis at operator order
+/// `q ∈ {0, 1, 2}`.
+///
+/// Spectral form: the Matérn kernel has Fourier symbol `K̂(ρ) = c · (κ² + ρ²)^{-ℓ}`
+/// with `ℓ = ν + d/2`. For half-integer `MaternNu`, `2ℓ = 2ν + d` is always
+/// a positive integer (even when ℓ itself is half-integer in even d). The
+/// pair-block penalty is
+///
+///   `g_q(R; κ) = F^{-1}{|ρ|^{2q} / (κ² + ρ²)^{2ℓ}}(R)`.
+///
+/// Using the binomial expansion `|ρ|^{2q} = ((κ² + ρ²) − κ²)^q`:
+///
+///   `g_q(R; κ) = Σ_{j=0}^{q} C(q,j) (−κ²)^{q−j} · M_{2ℓ−j}^d(R; κ)`,
+///
+/// where each `M_ℓ'^d(R; κ)` is supplied by
+/// [`closed_form_penalty::matern_kernel_value`]. Convergence (finite block at
+/// R = 0) requires `4ℓ − 2q > d`, i.e. the Sobolev order strictly exceeds
+/// the operator order plus dimension/2; otherwise the spectral integrand is
+/// not integrable and the resulting matrix is not PSD-by-construction.
+///
+/// Length scale enters as `κ = √(2ν) / length_scale` (the standard Matérn
+/// parameterization that makes `length_scale` the practical correlation
+/// scale). Anisotropy is handled via `aniso_log_scales` by rescaling lags:
+/// `r_axis ← r_axis · exp(η_axis)`. The spectral form is invariant under
+/// this rescaling (Schoenberg) so the penalty matrix remains PSD when the
+/// gate accepts.
+///
+/// Returns `None` when `q > 2` or when the spectral integral diverges
+/// (`4ℓ ≤ 2q + d`); the caller should fall back to the collocation
+/// `D_q^T D_q` path in those regimes.
+pub fn closed_form_matern_pair_block(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    length_scale: f64,
+    nu: MaternNu,
+    aniso_log_scales: Option<&[f64]>,
+) -> Option<Array2<f64>> {
+    assert!(
+        length_scale.is_finite() && length_scale > 0.0,
+        "closed_form_matern_pair_block: length_scale must be finite and positive"
+    );
+    if q > 2 {
+        return None;
+    }
+    let k = centers.nrows();
+    let d = centers.ncols();
+    if d == 0 || k == 0 {
+        return Some(Array2::<f64>::zeros((k, k)));
+    }
+
+    // Convert MaternNu (half-integer ν) to integer 2ν, then 2ℓ = 2ν + d.
+    let two_nu: usize = match nu {
+        MaternNu::Half => 1,
+        MaternNu::ThreeHalves => 3,
+        MaternNu::FiveHalves => 5,
+        MaternNu::SevenHalves => 7,
+        MaternNu::NineHalves => 9,
+    };
+    let two_ell = two_nu + d;
+
+    // IR convergence: 2·(2ℓ) > 2q + d.
+    if 2 * two_ell <= 2 * q + d {
+        return None;
+    }
+    // Each building block requires `2ℓ - j ≥ 1` for j ∈ [0, q].
+    if two_ell < q + 1 {
+        return None;
+    }
+
+    // Standard Matérn parameterization: κ = √(2ν) / length_scale.
+    let kappa = (two_nu as f64).sqrt() / length_scale;
+    let kappa_sq = kappa * kappa;
+
+    // Per-axis multiplicative scale for anisotropic lags.
+    let scale_per_axis: Option<Vec<f64>> = aniso_log_scales.map(|eta| {
+        assert_eq!(
+            eta.len(),
+            d,
+            "closed_form_matern_pair_block: aniso_log_scales length must match d"
+        );
+        eta.iter().map(|v| v.exp()).collect()
+    });
+
+    // Coefficients C(q, j) · (−κ²)^{q−j} for j = 0..q.
+    let mut binom_coeffs: Vec<f64> = Vec::with_capacity(q + 1);
+    for j in 0..=q {
+        let cqj = crate::probability::binomial_coefficient_f64(q, j);
+        let sign_pow = if (q - j) % 2 == 0 { 1.0 } else { -1.0 };
+        let coeff = cqj * sign_pow * kappa_sq.powi((q - j) as i32);
+        binom_coeffs.push(coeff);
+    }
+
+    let mut g = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            // Anisotropic distance: r_eff² = Σ_a (Δ_a · exp(η_a))².
+            let mut r2 = 0.0_f64;
+            for axis in 0..d {
+                let delta = centers[[i, axis]] - centers[[j, axis]];
+                let scaled = if let Some(sc) = &scale_per_axis {
+                    delta * sc[axis]
+                } else {
+                    delta
+                };
+                r2 += scaled * scaled;
+            }
+            let r = r2.sqrt();
+
+            let mut acc = 0.0_f64;
+            for jj in 0..=q {
+                let order = two_ell - jj; // ≥ 1 by the gate
+                acc += binom_coeffs[jj]
+                    * closed_form_penalty::matern_kernel_value(d, order, kappa, r);
+            }
+            g[[i, j]] = acc;
+            if i != j {
+                g[[j, i]] = acc;
+            }
+        }
+    }
+    Some(g)
+}
+
 /// Median off-diagonal anisotropic lag scaled by 1e-6, used for
 /// regularizing self-pair R=0 evaluations in pure-Duchon (κ=0) closed-form
 /// penalties. Matches the magnitude used by hybrid κ>0 collocation builders
@@ -8692,17 +8917,22 @@ pub fn operator_penalty_candidates_closed_form(
 }
 
 /// Configurable threshold above which the closed-form factory emits an
-/// operator-form `op` handle alongside the dense matrix. Default 500 raw
-/// kernel rows. Set the env var `GAM_CLOSED_FORM_OP_THRESHOLD` to override
-/// (e.g. for benchmarking). Below threshold, only dense form is emitted —
-/// Cholesky on the small materialized H is faster than PCG on the implicit H.
+/// operator-form `op` handle alongside the dense matrix. Default 1500 raw
+/// kernel rows; set via env var `GAM_CLOSED_FORM_OP_THRESHOLD`. Below the
+/// threshold, only the dense form is emitted — direct Cholesky on the small
+/// materialized H is faster than PCG-against-implicit-H. The 1500 default
+/// was selected from `bench_hessian_solve_dense_vs_implicit` in
+/// `benches/closed_form_criterion.rs`: the implicit PCG path crosses below
+/// dense Cholesky around K ≈ 1500 on the synthetic SPD-with-coupled-penalty
+/// fixture there. Production callers can override the env var to retune
+/// after a real workload bench.
 fn closed_form_operator_threshold() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("GAM_CLOSED_FORM_OP_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(500)
+            .unwrap_or(1500)
     })
 }
 
@@ -11541,7 +11771,8 @@ pub fn build_matern_basiswithworkspace(
         };
         (design, candidates)
     };
-    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -11557,6 +11788,7 @@ pub fn build_matern_basiswithworkspace(
             aniso_log_scales: aniso,
         },
         kronecker_factored: None,
+        ops,
     })
 }
 
@@ -14986,12 +15218,14 @@ pub fn build_duchon_basiswithworkspace(
             &spec.operator_penalties,
         )
     };
-    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
         penaltyinfo,
+        ops,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
@@ -19070,13 +19304,28 @@ pub mod closed_form_penalty {
         // Hybrid: partial-fraction expansion (mirrors isotropic_duchon_penalty).
         let b = 2 * s;
         let kappa_sq = kappa * kappa;
+        // Per-order max-term tracker for the χ-gate (mirrors
+        // `isotropic_duchon_penalty`): the literal partial-fraction sum of
+        // Riesz + Matérn blocks loses ≈ log10(χ_k) digits at radial-derivative
+        // order k when χ_k = max|term|/|sum|. Once χ_k > 1e4 the literal sum
+        // has fewer than ~12 reliable digits — already enough to violate the
+        // κ→0 monotone-convergence contract callers (and the radial g_q chain)
+        // rely on. In that regime we substitute the small-κR ₁F₂ / Taylor
+        // recurrence per derivative order, which captures the finite-part
+        // value of every order to roundoff (no cancellation).
+        let mut max_term_per_order = vec![0.0_f64; max_order + 1];
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let block = riesz_block_radial_derivatives(d, j, r, max_order);
             for (k, v) in block.into_iter().enumerate() {
-                total[k] += coeff * v;
+                let term = coeff * v;
+                total[k] += term;
+                let abs_term = term.abs();
+                if abs_term > max_term_per_order[k] {
+                    max_term_per_order[k] = abs_term;
+                }
             }
         }
         let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
@@ -19085,11 +19334,142 @@ pub mod closed_form_penalty {
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
             let block = matern_block_radial_derivatives(d, ell, kappa, r, max_order);
             for (k, v) in block.into_iter().enumerate() {
-                total[k] += coeff * v;
+                let term = coeff * v;
+                total[k] += term;
+                let abs_term = term.abs();
+                if abs_term > max_term_per_order[k] {
+                    max_term_per_order[k] = abs_term;
+                }
+            }
+        }
+
+        // χ-gate: switch any cancelled order to the Taylor recurrence
+        // (per-derivative-order analogue of `isotropic_duchon_penalty`'s
+        // χ-gate at value level). We replace order-by-order so the
+        // well-conditioned orders keep the literal sum.
+        let kappa_r = kappa * r;
+        let x_taylor = kappa_r * kappa_r;
+        if x_taylor < 1.5 {
+            for k in 0..=max_order {
+                let chi_k = if total[k].abs() > 0.0 {
+                    max_term_per_order[k] / total[k].abs()
+                } else {
+                    f64::INFINITY
+                };
+                if chi_k > 1.0e4 {
+                    if let Some(taylor_k) =
+                        finite_part_duchon_taylor_odd_d_derivative(d, a, b, kappa, r, k)
+                    {
+                        total[k] = taylor_k;
+                    } else if kappa_r < 0.5 {
+                        let limit_block = riesz_block_radial_derivatives(d, a + b, r, max_order);
+                        if let Some(&v) = limit_block.get(k) {
+                            if v.is_finite() {
+                                total[k] = v;
+                            }
+                        }
+                    }
+                }
             }
         }
 
         total
+    }
+
+    /// Per-derivative-order analogue of `finite_part_duchon_taylor_odd_d`:
+    /// returns the k-th radial derivative
+    ///
+    ///   ∂_R^k g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · ∂_R^k R_{N+n}^d(R)
+    ///
+    /// for the same `(d, a, b, κ, R)` regime where the literal partial-fraction
+    /// sum loses precision via cancellation. Each Riesz-block derivative is a
+    /// pure power for odd `d`, so the term-ratio recurrence
+    ///
+    ///   T_{n+1}^{(k)} / T_n^{(k)} = (b + n) · x / [4 · (n + 1) · (N + n) · (N + 1 − d/2 + n)]
+    ///                              × (2(N+n)-d)! / (2(N+n)-d-k)!  factor cancellation
+    ///
+    /// is awkward at the derivative level; instead we evaluate each Taylor
+    /// term as `coeff_n · [R_{N+n}^d]^{(k)}(R)` directly, which is benign for
+    /// any derivative order since each block is `c · R^p` with non-negative
+    /// finite power.
+    fn finite_part_duchon_taylor_odd_d_derivative(
+        d: usize,
+        a: usize,
+        b: usize,
+        kappa: f64,
+        r: f64,
+        k: usize,
+    ) -> Option<f64> {
+        if d % 2 != 1 {
+            return None;
+        }
+        if !(r > 0.0) || !(kappa > 0.0) {
+            return None;
+        }
+        if a == 0 || b == 0 {
+            return None;
+        }
+        let big_n = a + b;
+        let half_d = d as f64 / 2.0;
+        let denom_d = big_n as f64 + 1.0 - half_d;
+        if !(denom_d > 0.0) {
+            return None;
+        }
+
+        let x = (kappa * r) * (kappa * r);
+        // Coefficient n=0: 1; the recurrence on the κ²-Pochhammer-factorial
+        // factor C_n = (-1)^n · (b)_n / n! · κ^{2n} is
+        //   C_{n+1} / C_n = -(b + n) · κ² / (n + 1).
+        // Within each n we need the k-th derivative of `R_{N+n}^d`, which is
+        // the k-th entry of `riesz_block_radial_derivatives(d, N+n, r, k)`.
+        let mut c_n = 1.0_f64;
+        let block0 = riesz_block_radial_derivatives(d, big_n, r, k);
+        let t0 = *block0.get(k)?;
+        if !t0.is_finite() {
+            return None;
+        }
+        let mut sum = c_n * t0;
+        let max_iters = 256usize;
+        for n in 0..max_iters {
+            let nf = n as f64;
+            // Update C_n → C_{n+1}.
+            c_n *= -(b as f64 + nf) / (nf + 1.0) * kappa * kappa;
+            // The block-derivative ratio (k-th derivative of R_{N+n+1}^d over
+            // k-th derivative of R_{N+n}^d) is, for non-log Riesz blocks
+            //   c_{j+1}/c_j · falling(2j'+2-d, k) · R^{2j'+2-d-k}
+            //                / [falling(2j'-d, k) · R^{2j'-d-k}]
+            //   = c_{j+1}/c_j · (2j'+2-d) · (2j'+1-d) / 1  (if k is small)
+            //                · R²
+            // but rather than carrying the algebra symbolically we just
+            // re-evaluate the block analytically — k is bounded by 6 and
+            // each call is O(k) flops.
+            let big_n_step = big_n + n + 1;
+            let block = riesz_block_radial_derivatives(d, big_n_step, r, k);
+            let block_k = match block.get(k) {
+                Some(&v) if v.is_finite() => v,
+                _ => return None,
+            };
+            let term = c_n * block_k;
+            if !term.is_finite() {
+                return None;
+            }
+            sum += term;
+            if !sum.is_finite() {
+                return None;
+            }
+            if n >= 4 && term.abs() <= 1.0e-16 * sum.abs().max(t0.abs()) {
+                return Some(sum);
+            }
+            // Safety: if the block-derivative magnitude is collapsing (e.g.
+            // κR very small), stop early. The denominator in (κR)² ≪ 1
+            // makes each `c_n · block_k` shrink quickly, but x_taylor < 1.5
+            // is the reliable basin.
+            if x < 1e-12 && term.abs() < 1e-30 * sum.abs() {
+                return Some(sum);
+            }
+            let _ = block_k;
+        }
+        None
     }
 
     /// Radial-form anisotropic Duchon pair-block penalty
@@ -19398,6 +19778,38 @@ pub mod closed_form_penalty {
         }
 
         (r2.sqrt(), s1, s2, u1, u2)
+    }
+
+    /// Scalar reference implementation of `aniso_invariants` used as a
+    /// baseline in the SIMD pair-block benchmark. Returns (R, s_1, s_2,
+    /// u_1, u_2) with no `wide::f64x4` lane parallelism. Numerically
+    /// identical to the SIMD path up to floating-point summation order
+    /// (lane reductions vs sequential).
+    pub fn aniso_invariants_scalar(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
+        assert_eq!(eta.len(), r.len());
+        let mut s1 = 0.0_f64;
+        let mut s2 = 0.0_f64;
+        let mut r2 = 0.0_f64;
+        let mut u1 = 0.0_f64;
+        let mut u2 = 0.0_f64;
+        for k in 0..eta.len() {
+            let b = (-2.0 * eta[k]).exp();
+            let b2 = b * b;
+            let rk2 = r[k] * r[k];
+            s1 += b;
+            s2 += b2;
+            r2 += b * rk2;
+            u1 += b2 * rk2;
+            u2 += b2 * b * rk2;
+        }
+        (r2.sqrt(), s1, s2, u1, u2)
+    }
+
+    /// SIMD path of `aniso_invariants` exposed under a stable name for the
+    /// pair-block SIMD-vs-scalar benchmark. Forwards to the private
+    /// implementation used in production hot paths.
+    pub fn aniso_invariants_simd(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
+        aniso_invariants(eta, r)
     }
 
     /// κ-partial of `radial_derivatives_of_isotropic_duchon`: returns
@@ -28170,6 +28582,169 @@ mod tests {
                          bundle={:.6e} richardson={:.6e} rel={rel:.3e}",
                         bundle.d_eta[l],
                         de_richardson
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pair_block_analytic_d2kappa_matches_fd() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+        };
+
+        let mut seed = 0x1234_5678_u64;
+        let cases: &[(usize, usize, usize, usize, f64)] =
+            &[(0, 3, 1, 1, 1.0), (1, 3, 1, 1, 0.9), (1, 5, 1, 2, 0.7), (2, 5, 2, 2, 0.85)];
+
+        for &(q, d, m, s, kappa) in cases {
+            for _ in 0..3 {
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.5 + 1.0 * det_rand(&mut seed)).collect();
+
+                let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+
+                let big_j = eta.iter().sum::<f64>().exp();
+                let v_at = |kk: f64| -> f64 {
+                    big_j * anisotropic_duchon_penalty_radial(q, m, s, kk, &eta, &r)
+                };
+                let v0 = v_at(kappa);
+                let h1 = 1e-3 * kappa;
+                let h2 = 0.5 * h1;
+                let dd1 = (v_at(kappa + h1) - 2.0 * v0 + v_at(kappa - h1)) / (h1 * h1);
+                let dd2 = (v_at(kappa + h2) - 2.0 * v0 + v_at(kappa - h2)) / (h2 * h2);
+                let dd_richardson = (4.0 * dd2 - dd1) / 3.0;
+
+                let denom = dd_richardson.abs().max(bundle.d2_kappa.abs()).max(1e-8);
+                let rel = (bundle.d2_kappa - dd_richardson).abs() / denom;
+                assert!(
+                    rel < 1e-6,
+                    "bundle ∂²_κ vs Richardson FD: q={q} d={d} m={m} s={s} κ={kappa} \
+                     bundle={:.6e} richardson={:.6e} rel={rel:.3e}",
+                    bundle.d2_kappa,
+                    dd_richardson
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pair_block_analytic_d2eta_matches_fd() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+        };
+
+        let mut seed = 0xFEED_FACE_u64;
+        let cases: &[(usize, usize, usize, usize, f64)] = &[
+            (0, 2, 1, 1, 1.0),
+            (1, 3, 1, 1, 0.8),
+            (2, 3, 2, 2, 1.0),
+        ];
+
+        for &(q, d, m, s, kappa) in cases {
+            for _trial in 0..2 {
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.4 + 1.2 * det_rand(&mut seed)).collect();
+
+                let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+
+                let v_at = |eta_use: &[f64]| -> f64 {
+                    eta_use.iter().sum::<f64>().exp()
+                        * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta_use, &r)
+                };
+                let v0 = v_at(&eta);
+                let h = 1e-3_f64;
+                // Diagonal: 2nd central FD.
+                for l in 0..d {
+                    let mut e_p = eta.clone();
+                    let mut e_m = eta.clone();
+                    e_p[l] += h;
+                    e_m[l] -= h;
+                    let dd_fd = (v_at(&e_p) - 2.0 * v0 + v_at(&e_m)) / (h * h);
+                    let denom = dd_fd.abs().max(bundle.d2_eta[l][l].abs()).max(1e-8);
+                    let rel = (bundle.d2_eta[l][l] - dd_fd).abs() / denom;
+                    assert!(
+                        rel < 1e-5,
+                        "bundle ∂²_{{η_{l}η_{l}}} vs FD: q={q} d={d} m={m} s={s} κ={kappa} \
+                         bundle={:.6e} fd={:.6e} rel={rel:.3e}",
+                        bundle.d2_eta[l][l],
+                        dd_fd
+                    );
+                }
+                // Off-diagonal: 4-point cross stencil.
+                for k in 0..d {
+                    for l in (k + 1)..d {
+                        let mut epp = eta.clone();
+                        let mut epm = eta.clone();
+                        let mut emp = eta.clone();
+                        let mut emm = eta.clone();
+                        epp[k] += h; epp[l] += h;
+                        epm[k] += h; epm[l] -= h;
+                        emp[k] -= h; emp[l] += h;
+                        emm[k] -= h; emm[l] -= h;
+                        let off_fd = (v_at(&epp) - v_at(&epm) - v_at(&emp) + v_at(&emm))
+                            / (4.0 * h * h);
+                        let denom = off_fd.abs().max(bundle.d2_eta[k][l].abs()).max(1e-8);
+                        let rel = (bundle.d2_eta[k][l] - off_fd).abs() / denom;
+                        assert!(
+                            rel < 1e-5,
+                            "bundle ∂²_{{η_{k}η_{l}}} vs FD: q={q} d={d} m={m} s={s} κ={kappa} \
+                             bundle={:.6e} fd={:.6e} rel={rel:.3e}",
+                            bundle.d2_eta[k][l],
+                            off_fd
+                        );
+                        // Symmetry sanity.
+                        let sym = (bundle.d2_eta[k][l] - bundle.d2_eta[l][k]).abs();
+                        assert!(sym < 1e-10, "Hessian symmetry violated: ({k},{l}) Δ={sym:.3e}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pair_block_analytic_d2etakappa_matches_fd() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+        };
+
+        let mut seed = 0xDEAD_BEEF_u64;
+        let cases: &[(usize, usize, usize, usize, f64)] =
+            &[(1, 3, 1, 1, 0.8), (2, 3, 2, 2, 0.9)];
+
+        for &(q, d, m, s, kappa) in cases {
+            for _ in 0..2 {
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.5 + 1.0 * det_rand(&mut seed)).collect();
+
+                let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+
+                let v_at = |eta_use: &[f64], kk: f64| -> f64 {
+                    eta_use.iter().sum::<f64>().exp()
+                        * anisotropic_duchon_penalty_radial(q, m, s, kk, eta_use, &r)
+                };
+                let h_e = 1e-3_f64;
+                let h_k = 1e-3 * kappa;
+
+                for l in 0..d {
+                    let mut e_p = eta.clone();
+                    let mut e_m = eta.clone();
+                    e_p[l] += h_e;
+                    e_m[l] -= h_e;
+                    let cross_fd = (v_at(&e_p, kappa + h_k)
+                        - v_at(&e_p, kappa - h_k)
+                        - v_at(&e_m, kappa + h_k)
+                        + v_at(&e_m, kappa - h_k))
+                        / (4.0 * h_e * h_k);
+                    let denom = cross_fd.abs().max(bundle.d2_eta_kappa[l].abs()).max(1e-8);
+                    let rel = (bundle.d2_eta_kappa[l] - cross_fd).abs() / denom;
+                    assert!(
+                        rel < 1e-5,
+                        "bundle ∂²_{{η_{l}κ}} vs FD: q={q} d={d} m={m} s={s} κ={kappa} \
+                         bundle={:.6e} fd={:.6e} rel={rel:.3e}",
+                        bundle.d2_eta_kappa[l],
+                        cross_fd
                     );
                 }
             }
