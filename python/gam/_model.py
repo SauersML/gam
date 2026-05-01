@@ -70,8 +70,6 @@ class SurvivalPrediction:
         ``*_at`` helpers.
     parameter_names:
         Column names corresponding to ``parameters``, in order.
-    baseline_times:
-        Optional per-sample baseline evaluation grid (if the FFI reports one).
     times:
         Shared 1-D time grid at which the hazard surfaces were evaluated.
     hazard:
@@ -87,7 +85,6 @@ class SurvivalPrediction:
     model_class: str
     parameters: Any
     parameter_names: Sequence[str] = field(default_factory=tuple)
-    baseline_times: Any | None = None
     times: Any | None = None
     hazard: Any | None = None
     survival: Any | None = None
@@ -751,13 +748,10 @@ def _survival_prediction_from_columns(
     stacked = np.column_stack(
         [np.asarray(columns[name], dtype=float) for name in parameter_names]
     )
-    baseline = columns.get("baseline_times")
-    baseline_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
     return SurvivalPrediction(
         model_class=model_class,
         parameters=stacked,
         parameter_names=tuple(parameter_names),
-        baseline_times=baseline_arr,
         id_column=id_column,
         row_ids=row_ids,
     )
@@ -788,13 +782,10 @@ def _survival_prediction_from_ffi_payload(
         )
     else:
         stacked = linear_predictor.reshape(-1, 1) if linear_predictor.size else np.zeros((0, 0))
-    baseline = columns.get("baseline_times")
-    baseline_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
     return SurvivalPrediction(
         model_class=model_class,
         parameters=stacked,
         parameter_names=parameter_names,
-        baseline_times=baseline_arr,
         times=times if times.size else None,
         hazard=hazard,
         survival=survival,

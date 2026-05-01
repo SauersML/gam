@@ -140,7 +140,7 @@ def beta_star(theta: typing.Any, beta_init_local: typing.Any=None, tol: typing.A
     if beta_init_local is None:
         beta_init_local = beta_init
     b = np.array(beta_init_local, dtype=float)
-    for it in range(max_iter):
+    for _ in range(max_iter):
         args = (*b, *theta)
         g = np.array(F_beta_fn(*args), dtype=float).reshape(p)
         if np.linalg.norm(g) < tol:
@@ -217,7 +217,7 @@ def laml_gradient_terms(theta: typing.Any, b: typing.Any=None) -> typing.Any:
     }
     return g, parts
 
-g0, parts0 = laml_gradient_terms(theta0, beta_at_theta0)
+g0, _ = laml_gradient_terms(theta0, beta_at_theta0)
 print(f"[grad ] g(theta0) = {g0}")
 
 # ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ def hessian_via_fd(theta: typing.Any, h: typing.Any=1e-5) -> typing.Any:
                     "logdet_H_part": H_lH, "logdet_S_part": H_lS}
 
 # Use Richardson (two step sizes) to confirm FD precision.
-H_h1, parts_H_h1 = hessian_via_fd(theta0, h=1e-4)
+H_h1, _ = hessian_via_fd(theta0, h=1e-4)
 H_h2, parts_H_h2 = hessian_via_fd(theta0, h=1e-5)
 asym_h1 = np.max(np.abs(H_h1 - H_h1.T))
 asym_h2 = np.max(np.abs(H_h2 - H_h2.T))
@@ -334,7 +334,9 @@ out = {
     "intermediate_quantities": {
         "F_beta_at_beta_star": F_beta_at_star.tolist(),
         "H_eigenvalues": H_eigs,
+        "H_logdet_sign": float(sign_H),
         "S_logdet_pseudo": float(S_logdet),
+        "S_logdet_pseudo_sign": float(sign_S),
         "H_logdet": float(H_logdet),
         "FD_step_used": 1e-5,
         "FD_richardson_diff_h1e-4_vs_h1e-5_max": float(diff_h),

@@ -74,7 +74,6 @@ def _append_routing_lines(path: Path, captured_stderr: str) -> None:
 ROUTINE_SURVIVAL_HORIZONS = (1.0, 2.0, 5.0, 10.0)
 SURVIVAL_ENTRY_COLUMN = "__entry"
 F64_BYTES = 8
-F32_BYTES = 4
 
 
 def _detect_host_memory_bytes() -> int:
@@ -127,7 +126,6 @@ def _detect_host_memory_bytes() -> int:
 
 
 DEFAULT_BIOBANK_RAM_BUDGET_BYTES = _detect_host_memory_bytes()
-BIOBANK_PREFLIGHT_DEFAULT_MAX_PEAK_BYTES = int(0.80 * DEFAULT_BIOBANK_RAM_BUDGET_BYTES)
 BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
 BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
 BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
@@ -192,7 +190,6 @@ class MethodSpec:
 class BiobankPreflightReport:
     status: str
     lines: list[str]
-    estimated_peak_bytes: int
     largest_single_allocation_bytes: int
     chunk_rows: int | None = None
 
@@ -304,7 +301,7 @@ def preflight_marginal_slope_biobank(
         _preflight_status_line(status),
     ]
     lines.extend(f"failure: {failure}" for failure in failures)
-    return BiobankPreflightReport(status, lines, estimated_peak, largest)
+    return BiobankPreflightReport(status, lines, largest)
 
 
 def preflight_ctn_score_warp(
@@ -336,7 +333,11 @@ def preflight_ctn_score_warp(
         _preflight_status_line(status),
     ]
     lines.extend(f"route note: {failure}" for failure in failures)
-    return BiobankPreflightReport(status, lines, estimated_peak, max(factored_bytes, p_response * p_cov * F64_BYTES))
+    return BiobankPreflightReport(
+        status,
+        lines,
+        max(factored_bytes, p_response * p_cov * F64_BYTES),
+    )
 
 
 def preflight_survival_prediction(
@@ -368,7 +369,7 @@ def preflight_survival_prediction(
         _preflight_status_line(status),
     ]
     lines.extend(f"route note: {failure}" for failure in failures)
-    return BiobankPreflightReport(status, lines, estimated_peak, chunked_bytes, chunk_rows=chunk_rows)
+    return BiobankPreflightReport(status, lines, chunked_bytes, chunk_rows=chunk_rows)
 
 
 def load_config(path: Path) -> dict[str, Any]:

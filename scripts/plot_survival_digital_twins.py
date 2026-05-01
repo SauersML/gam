@@ -332,6 +332,8 @@ def _fit_survival_model(
         str(train_df),
         fit_formula,
     ]
+    for key, value in ds.fit_opts.items():
+        fit_args.extend([f"--{key.replace('_', '-')}", value])
 
     if likelihood == "transformation":
         _run_cmd(fit_args, cwd=ROOT)
