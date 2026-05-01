@@ -7831,22 +7831,29 @@ pub fn closed_form_anisotropic_pair_block(
     kappa: f64,
     aniso_log_scales: Option<&[f64]>,
 ) -> Array2<f64> {
+    // Math team Letter A §9: G_q(η_raw, κ) ≠ G_q(η_centered, κ) in general;
+    // the relation involves an exp((2d-4m-4s)μ) prefactor and a κ rescaling
+    // that don't reduce to a uniform Jacobian. Use raw η directly so the
+    // pair-block matches the closed-form Lebesgue penalty's natural raw-η
+    // parameterization, and so its η-derivatives (computed elsewhere via
+    // `pair_block_radial_with_j_second_derivatives` with raw η) are already
+    // ∂G_q/∂η_raw without any chain-rule conversion.
     let k = centers.nrows();
     let d = centers.ncols();
-    let eta_centered: Vec<f64> = if let Some(eta) = aniso_log_scales {
-        let mean = centered_aniso_log_scale_mean(eta);
-        eta.iter()
-            .map(|&v| centered_aniso_log_scale(v, mean))
-            .collect()
-    } else {
-        vec![0.0_f64; d]
+    let zeros: Vec<f64>;
+    let eta_raw: &[f64] = match aniso_log_scales {
+        Some(eta) => eta,
+        None => {
+            zeros = vec![0.0_f64; d];
+            &zeros
+        }
     };
-    let j_prefactor = eta_centered.iter().sum::<f64>().exp();
+    let j_prefactor = eta_raw.iter().sum::<f64>().exp();
     // Self-pair regularization: the analytic radial form is singular at R=0,
     // and the Schoenberg integral also diverges at R=0 in routine (m,s,d,q)
     // regimes. Use the same median-lag·1e-6 ε-displacement strategy as the
     // pure-Duchon variant (`closed_form_anisotropic_pair_block_pure`).
-    let r_eps = pure_duchon_diagonal_epsilon(centers, &eta_centered);
+    let r_eps = pure_duchon_diagonal_epsilon(centers, eta_raw);
     let mut g = Array2::<f64>::zeros((k, k));
     let mut r_buf = vec![0.0_f64; d];
     for i in 0..k {
@@ -7857,7 +7864,7 @@ pub fn closed_form_anisotropic_pair_block(
             let val = if i == j {
                 let mut r_eps_buf = vec![0.0_f64; d];
                 if d > 0 {
-                    r_eps_buf[0] = r_eps * eta_centered[0].exp();
+                    r_eps_buf[0] = r_eps * eta_raw[0].exp();
                 }
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial(
@@ -7865,7 +7872,7 @@ pub fn closed_form_anisotropic_pair_block(
                         m,
                         s,
                         kappa,
-                        &eta_centered,
+                        eta_raw,
                         &r_eps_buf,
                     )
             } else {
@@ -7875,7 +7882,7 @@ pub fn closed_form_anisotropic_pair_block(
                         m,
                         s,
                         kappa,
-                        &eta_centered,
+                        eta_raw,
                         &r_buf,
                     )
             };
@@ -21461,22 +21468,25 @@ mod tests {
         // End-to-end: pure-Duchon (length_scale=None) with Zero nullspace
         // routes through the closed-form path and must still produce all
         // three active operator penalties (mass, tension, stiffness).
-        // Verifies that the per-q convergence gating in
-        // `operator_penalty_candidates_closed_form_pure` falls back to
-        // collocation when the closed-form Lebesgue penalty would vanish
-        // (IR regime) — keeping behavior parity with the pre-closed-form
-        // collocation path.
+        //
+        // Config: d=2, p=1 (Zero nullspace ⇒ m=1), s=2.
+        //   D1 collocation: 2(p+s) = 6 > d+1 = 3 ✓
+        //   D2 collocation: 2(p+s) = 6 > d+2 = 4 ✓
+        //   Closed-form UV (q=2): 4(m+s) = 12 > d+2q = 6 ✓
+        //   Closed-form IR (q=2): d+2q = 6 > 4m = 4 ✓
+        // Both collocation precondition and closed-form convergence hold,
+        // so the closed-form path produces all 3 active penalties.
         let data = array![
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0]
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5]
         ];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
             length_scale: None,
-            power: 1,
+            power: 2,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
