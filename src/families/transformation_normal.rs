@@ -3264,43 +3264,57 @@ fn augment_covariate_design_with_axis_extremes(
     if n_train == 0 || p_cov == 0 {
         return Ok(covariate_design.clone());
     }
-    let dense = covariate_design
-        .try_to_dense_by_chunks(
-            "build_monotonicity_derivative_grid_kron axis-extreme augmentation",
-        )
-        .map_err(|e| {
-            format!(
-                "monotonicity grid axis-extreme augmentation: failed to materialize covariate design: {e}"
-            )
-        })?;
-
-    // Per-column training mean / min / max.
-    let mut col_mean = Array1::<f64>::zeros(p_cov);
+    // Per-column training mean / min / max via chunked row scan, so giant
+    // sparse designs never densify in one shot.
+    let mut col_sum = Array1::<f64>::zeros(p_cov);
     let mut col_min = Array1::<f64>::from_elem(p_cov, f64::INFINITY);
     let mut col_max = Array1::<f64>::from_elem(p_cov, f64::NEG_INFINITY);
-    let inv_n = 1.0 / n_train as f64;
-    for j in 0..p_cov {
-        let mut sum = 0.0;
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for i in 0..n_train {
-            let v = dense[[i, j]];
-            sum += v;
-            if v < lo {
-                lo = v;
+    let chunk_rows = 4096usize.min(n_train.max(1));
+    for start in (0..n_train).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n_train);
+        let chunk = covariate_design.try_row_chunk(start..end).map_err(|e| {
+            format!(
+                "monotonicity grid axis-extreme augmentation: failed to read row chunk \
+                 [{start},{end}): {e}"
+            )
+        })?;
+        for j in 0..p_cov {
+            let col = chunk.column(j);
+            let mut sum = 0.0;
+            let mut lo = col_min[j];
+            let mut hi = col_max[j];
+            for &v in col.iter() {
+                sum += v;
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
             }
-            if v > hi {
-                hi = v;
-            }
+            col_sum[j] += sum;
+            col_min[j] = lo;
+            col_max[j] = hi;
         }
-        col_mean[j] = sum * inv_n;
-        col_min[j] = lo;
-        col_max[j] = hi;
     }
+    let inv_n = 1.0 / n_train as f64;
+    let col_mean = col_sum.mapv(|s| s * inv_n);
 
+    // Build the augmented dense matrix: original rows on top, axis-extreme
+    // rows on the bottom. The original rows are streamed back in chunks to
+    // avoid a redundant n × p_cov peak.
     let extra_rows = 2 * p_cov;
     let mut augmented = Array2::<f64>::zeros((n_train + extra_rows, p_cov));
-    augmented.slice_mut(s![..n_train, ..]).assign(&dense);
+    for start in (0..n_train).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n_train);
+        let chunk = covariate_design.try_row_chunk(start..end).map_err(|e| {
+            format!(
+                "monotonicity grid axis-extreme augmentation: failed to copy row chunk \
+                 [{start},{end}): {e}"
+            )
+        })?;
+        augmented.slice_mut(s![start..end, ..]).assign(&chunk);
+    }
     for j in 0..p_cov {
         let mut row_min = augmented.row_mut(n_train + j);
         row_min.assign(&col_mean);
