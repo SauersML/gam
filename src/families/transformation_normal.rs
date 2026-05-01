@@ -3054,8 +3054,7 @@ fn build_monotonicity_derivative_grid_kron(
         if !loose_rows.is_empty() {
             let original_rows = response_deriv_grid.nrows();
             let p_resp = response_deriv_grid.ncols();
-            let mut combined =
-                Array2::<f64>::zeros((original_rows + loose_rows.len(), p_resp));
+            let mut combined = Array2::<f64>::zeros((original_rows + loose_rows.len(), p_resp));
             combined
                 .slice_mut(s![..original_rows, ..])
                 .assign(&response_deriv_grid);
