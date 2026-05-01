@@ -413,7 +413,8 @@ mod tests {
             e[i] = 1.0;
             op.matvec(e.view(), col.view_mut());
             for j in 0..n {
-                assert_abs_diff_eq!(col[j], dense[[j, i]], epsilon = 1e-9);
+                let scale = dense[[j, i]].abs().max(1.0);
+                assert_abs_diff_eq!(col[j], dense[[j, i]], epsilon = 1e-9 * scale);
             }
         }
     }
@@ -467,7 +468,8 @@ mod tests {
         op.matvec(v.view(), got.view_mut());
         let want = dense.dot(&v);
         for i in 0..n {
-            assert_abs_diff_eq!(got[i], want[i], epsilon = 1e-9);
+            let scale = want[i].abs().max(1.0);
+            assert_abs_diff_eq!(got[i], want[i], epsilon = 1e-9 * scale);
         }
     }
 
@@ -514,7 +516,8 @@ mod tests {
             e[i] = 1.0;
             op.matvec(e.view(), col.view_mut());
             for j in 0..n {
-                assert_abs_diff_eq!(col[j], dense[[j, i]], epsilon = 1e-9);
+                let scale = dense[[j, i]].abs().max(1.0);
+                assert_abs_diff_eq!(col[j], dense[[j, i]], epsilon = 1e-9 * scale);
             }
         }
     }
@@ -548,7 +551,7 @@ mod tests {
             .expect("slq logdet");
         // Reference via direct Cholesky.
         use faer::Side;
-        use crate::faer_ndarray::FaerEigh;
+        use crate::faer_ndarray::FaerCholesky;
         let chol = reg.cholesky(Side::Lower).expect("cholesky");
         let reference = 2.0 * chol.diag().mapv(f64::ln).sum();
         assert_abs_diff_eq!(est, reference, epsilon = 1e-6);

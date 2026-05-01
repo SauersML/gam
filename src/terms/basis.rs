@@ -7867,6 +7867,117 @@ pub fn closed_form_anisotropic_pair_block(
     g
 }
 
+/// Pure-Duchon (κ=0) variant of [`closed_form_anisotropic_pair_block`].
+///
+/// Uses the analytic radial-derivative path
+/// [`closed_form_penalty::anisotropic_duchon_penalty_radial`] which handles
+/// κ=0 cleanly by delegating to pure-Riesz radial derivatives. The
+/// Schoenberg path is undefined at κ=0 in low dimensions, so this variant
+/// must be used in place of [`closed_form_anisotropic_pair_block`] for
+/// `length_scale = None` (pure-Duchon) penalty assembly.
+///
+/// Self-pairs (R=0) are ε-regularized using a small fraction of the median
+/// off-diagonal lag, since the radial form is singular at R=0 and the pure
+/// Riesz Schoenberg fallback also doesn't converge for κ=0.
+pub fn closed_form_anisotropic_pair_block_pure(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    m: usize,
+    s: usize,
+    aniso_log_scales: Option<&[f64]>,
+) -> Array2<f64> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let eta_centered: Vec<f64> = if let Some(eta) = aniso_log_scales {
+        let mean = centered_aniso_log_scale_mean(eta);
+        eta.iter()
+            .map(|&v| centered_aniso_log_scale(v, mean))
+            .collect()
+    } else {
+        vec![0.0_f64; d]
+    };
+    let j_prefactor = eta_centered.iter().sum::<f64>().exp();
+
+    // Median off-diagonal anisotropic distance for diagonal regularization.
+    let r_eps = pure_duchon_diagonal_epsilon(centers, &eta_centered);
+
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut r_buf = vec![0.0_f64; d];
+    for i in 0..k {
+        for j in 0..=i {
+            for axis in 0..d {
+                r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
+            }
+            let val = if i == j {
+                // Self-pair: ε-regularize by using a small displacement
+                // along axis 0 with magnitude r_eps · exp(η_0). This keeps
+                // R > 0 in the pure-Riesz radial form.
+                let mut r_eps_buf = vec![0.0_f64; d];
+                if d > 0 {
+                    r_eps_buf[0] = r_eps * eta_centered[0].exp();
+                }
+                j_prefactor
+                    * closed_form_penalty::anisotropic_duchon_penalty_radial(
+                        q,
+                        m,
+                        s,
+                        0.0,
+                        &eta_centered,
+                        &r_eps_buf,
+                    )
+            } else {
+                j_prefactor
+                    * closed_form_penalty::anisotropic_duchon_penalty_radial(
+                        q,
+                        m,
+                        s,
+                        0.0,
+                        &eta_centered,
+                        &r_buf,
+                    )
+            };
+            g[[i, j]] = val;
+            if i != j {
+                g[[j, i]] = val;
+            }
+        }
+    }
+    g
+}
+
+/// Median off-diagonal anisotropic lag scaled by 1e-6, used for
+/// regularizing self-pair R=0 evaluations in pure-Duchon (κ=0) closed-form
+/// penalties. Matches the magnitude used by hybrid κ>0 collocation builders
+/// where the ε-regularization is implicit in the Matérn kernel finiteness.
+fn pure_duchon_diagonal_epsilon(centers: ArrayView2<'_, f64>, eta_centered: &[f64]) -> f64 {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    if k <= 1 || d == 0 {
+        return 1e-12;
+    }
+    let mut lags = Vec::with_capacity(k * (k - 1) / 2);
+    for i in 0..k {
+        for j in 0..i {
+            let mut acc = 0.0_f64;
+            for axis in 0..d {
+                let delta = centers[[i, axis]] - centers[[j, axis]];
+                let b = (-2.0 * eta_centered[axis]).exp();
+                acc += b * delta * delta;
+            }
+            let r = acc.sqrt();
+            if r > 0.0 {
+                lags.push(r);
+            }
+        }
+    }
+    if lags.is_empty() {
+        return 1e-12;
+    }
+    lags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = lags[lags.len() / 2];
+    (median * 1e-6).max(1e-12)
+}
+
 pub fn closed_form_operator_penalty_in_total_basis(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -7943,6 +8054,129 @@ pub fn operator_penalty_candidates_closed_form(
         p_order,
         s_order,
         kappa,
+        aniso_log_scales,
+        kernel_nullspace,
+        polynomial_block_cols,
+        outer_identifiability,
+    );
+    let (s2, c2) = normalize_penalty(&s2_raw);
+    let mut out = Vec::new();
+    if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
+            matrix: s0,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorMass,
+            normalization_scale: c0,
+            kronecker_factors: None,
+        });
+    }
+    if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
+            matrix: s1,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorTension,
+            normalization_scale: c1,
+            kronecker_factors: None,
+        });
+    }
+    if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
+            matrix: s2,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorStiffness,
+            normalization_scale: c2,
+            kronecker_factors: None,
+        });
+    }
+    out
+}
+
+/// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
+/// [`closed_form_operator_penalty_in_total_basis`]. Uses
+/// [`closed_form_anisotropic_pair_block_pure`] to evaluate the closed-form
+/// penalty via analytic radial derivatives of the pure-Riesz kernel, which
+/// is finite for R > 0 in any (m, s, d, q) regime where
+/// `radial_derivatives_of_isotropic_duchon` is defined. Self-pair (R=0)
+/// regularization is handled inside the pair-block routine.
+pub fn closed_form_operator_penalty_in_total_basis_pure(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    p_order: usize,
+    s_order: usize,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Array2<f64> {
+    let g_raw = closed_form_anisotropic_pair_block_pure(
+        centers,
+        q,
+        p_order,
+        s_order,
+        aniso_log_scales,
+    );
+    let g_kernel = if let Some(z) = kernel_nullspace {
+        let zt_g = fast_atb(z, &g_raw);
+        fast_ab(&zt_g, z)
+    } else {
+        g_raw
+    };
+    let kernel_cols = g_kernel.nrows();
+    let total_pre_cols = kernel_cols + polynomial_block_cols;
+    let g_padded = if polynomial_block_cols == 0 {
+        g_kernel
+    } else {
+        let mut padded = Array2::<f64>::zeros((total_pre_cols, total_pre_cols));
+        padded
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&g_kernel);
+        padded
+    };
+    let g_total = if let Some(t) = outer_identifiability {
+        let tt_g = fast_atb(t, &g_padded);
+        fast_ab(&tt_g, t)
+    } else {
+        g_padded
+    };
+    symmetrize(&g_total)
+}
+
+/// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
+/// [`operator_penalty_candidates_closed_form`].
+///
+/// Builds the three operator penalty candidates (mass, tension, stiffness)
+/// from the pure-Duchon closed-form path, which is a polyharmonic of order
+/// `m + s = p_order + s_order` with no Matérn factor. `q ∈ {0,1,2}` rolls
+/// the penalty differential order — same as the hybrid path.
+pub fn operator_penalty_candidates_closed_form_pure(
+    centers: ArrayView2<'_, f64>,
+    d0: &Array2<f64>,
+    spec: &DuchonOperatorPenaltySpec,
+    p_order: usize,
+    s_order: usize,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Vec<PenaltyCandidate> {
+    let s0_raw = symmetrize(&fast_ata(d0));
+    let (s0, c0) = normalize_penalty(&s0_raw);
+    let s1_raw = closed_form_operator_penalty_in_total_basis_pure(
+        centers,
+        1,
+        p_order,
+        s_order,
+        aniso_log_scales,
+        kernel_nullspace,
+        polynomial_block_cols,
+        outer_identifiability,
+    );
+    let (s1, c1) = normalize_penalty(&s1_raw);
+    let s2_raw = closed_form_operator_penalty_in_total_basis_pure(
+        centers,
+        2,
+        p_order,
+        s_order,
         aniso_log_scales,
         kernel_nullspace,
         polynomial_block_cols,
