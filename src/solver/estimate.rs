@@ -3480,6 +3480,40 @@ impl UnifiedFitResult {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
+        let beta = flatten_block_betas(&parts.blocks);
+        Self {
+            blocks: parts.blocks,
+            log_lambdas: parts.log_lambdas,
+            lambdas: parts.lambdas,
+            likelihood_family: parts.likelihood_family,
+            likelihood_scale: parts.likelihood_scale,
+            log_likelihood_normalization: parts.log_likelihood_normalization,
+            log_likelihood: parts.log_likelihood,
+            deviance: parts.deviance,
+            reml_score: parts.reml_score,
+            stable_penalty_term: parts.stable_penalty_term,
+            penalized_objective: parts.penalized_objective,
+            outer_iterations: parts.outer_iterations,
+            outer_converged: parts.outer_converged,
+            outer_gradient_norm: parts.outer_gradient_norm,
+            standard_deviation: parts.standard_deviation,
+            covariance_conditional: parts.covariance_conditional,
+            covariance_corrected: parts.covariance_corrected,
+            inference: parts.inference,
+            fitted_link: parts.fitted_link,
+            geometry: parts.geometry,
+            block_states: parts.block_states,
+            beta,
+            pirls_status: parts.pirls_status,
+            max_abs_eta: parts.max_abs_eta,
+            constraint_kkt: parts.constraint_kkt,
+            artifacts: parts.artifacts,
+            inner_cycles: parts.inner_cycles,
+        }
+    }
+
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
         let expected_beta = flatten_block_betas(&self.blocks);
         if !array1_values_equal(&self.beta, &expected_beta) {

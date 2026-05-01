@@ -561,6 +561,8 @@ impl TransformationNormalFamily {
             response,
             weights,
             offset,
+            &x_val_kron,
+            &x_deriv_kron,
             &covariate_design,
             &covariate_penalties,
             p_resp,
@@ -622,6 +624,7 @@ impl TransformationNormalFamily {
     /// For the outer loop where the response basis is precomputed once and reused
     /// across κ iterations.
     pub fn from_prebuilt_response_basis(
+        response: &Array1<f64>,
         response_val_basis: Array2<f64>,
         response_deriv_basis: Array2<f64>,
         response_penalties: Vec<Array2<f64>>,
@@ -636,6 +639,13 @@ impl TransformationNormalFamily {
         warm_start: Option<&TransformationWarmStart>,
     ) -> Result<Self, String> {
         let n = response_val_basis.nrows();
+        if response.len() != n {
+            return Err(format!(
+                "response length {} != response basis rows {}",
+                response.len(),
+                n
+            ));
+        }
         if covariate_design.nrows() != n {
             return Err(format!(
                 "response basis rows {} != covariate design rows {}",
@@ -695,11 +705,8 @@ impl TransformationNormalFamily {
         debug_assert_eq!(x_val_kron.ncols(), p_total);
         debug_assert_eq!(x_deriv_kron.ncols(), p_total);
 
-        // Warm start: need response values for location-scale init.
-        // Extract response from column 1 of response_val_basis (which stores y).
-        let response_approx = response_val_basis.column(1).to_owned();
         let x_deriv_grid_kron = build_monotonicity_derivative_grid_kron(
-            &response_approx,
+            response,
             &response_knots,
             response_degree,
             &response_transform,
@@ -712,9 +719,11 @@ impl TransformationNormalFamily {
             "x_deriv_grid_kron must be the Kronecker variant — KhatriRao re-introduces O(n_cov*n_grid*p_total) row-replicated materialization",
         );
         let initial_beta = compute_warm_start(
-            &response_approx,
+            response,
             weights,
             offset,
+            &x_val_kron,
+            &x_deriv_kron,
             &covariate_design,
             &covariate_penalties,
             p_resp,
@@ -736,8 +745,8 @@ impl TransformationNormalFamily {
         let initial_log_lambdas =
             ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
 
-        // Compute response median from column 1 (y values)
-        let mut sorted_resp = response_approx.to_vec();
+        // Compute response median.
+        let mut sorted_resp = response.to_vec();
         sorted_resp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let resp_median = if sorted_resp.len() % 2 == 1 {
             sorted_resp[sorted_resp.len() / 2]
@@ -823,8 +832,13 @@ impl TransformationNormalFamily {
             }
         }
 
-        let h = self.x_val_kron.forward_mul(beta) + self.offset.as_ref();
-        let h_prime = self.x_deriv_kron.forward_mul(beta);
+        // SCOP-CTN: h(y, x) = Σ_k γ_k(x)² · I_k(y), with γ_k(x) = ψ(x)ᵀ Γ_{k,:}
+        // and h'(y, x) = Σ_k γ_k(x)² · M_k(y). The squaring is post-operator
+        // pointwise: the underlying Khatri-Rao operator stays linear, but the
+        // forward image squares γ on the response axis before the I/M-spline
+        // contraction. See [scop_spline_ctn_spec.md].
+        let h = self.x_val_kron.scop_squared_forward(beta) + self.offset.as_ref();
+        let h_prime = self.x_deriv_kron.scop_squared_forward(beta);
         // Hard monotonicity / finiteness gate: the reciprocal powers `1/h'^k`
         // for k ∈ {1,2,3,4} feed the gradient, Hessian, and psi-psi outer
         // Hessian formulas. A non-finite or non-positive h' produces +∞ /
@@ -3721,6 +3735,90 @@ impl KroneckerDesign {
         }
     }
 
+    /// SCOP-CTN squared forward: compute `Σ_k left[i, k] · γ_k(x_i)²`
+    /// where `γ_k(x_i) = (right · β_mat[k, :])[i]` and
+    /// `β_mat[k, j] = beta[k * p_cov + j]` (row-major reshape into
+    /// `p_resp × p_cov`).
+    ///
+    /// Equivalent to forming `γ_mat = right · β_matᵀ` (shape `n × p_resp`),
+    /// pointwise squaring it, and contracting against the corresponding
+    /// response basis row. The squaring is post-operator pointwise — the
+    /// underlying `right` operator and the row-replicated Khatri-Rao image
+    /// are never materialized. Storage cost matches `forward_mul`: an
+    /// intermediate `n × p_resp` `right_beta` plus the `n` output.
+    fn scop_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
+        match self {
+            KroneckerDesign::KhatriRao { left, right } => {
+                let pa = left.ncols();
+                let pb = right.ncols();
+                let n = left.nrows();
+                debug_assert_eq!(beta.len(), pa * pb);
+                let beta_mat = beta.view().into_shape_with_order((pa, pb)).unwrap();
+                let mut result = Array1::zeros(n);
+                if let Some(right_dense) = right.as_dense_ref() {
+                    // right_beta[i, k] = γ_k(x_i)
+                    let right_beta = fast_ab(right_dense, &beta_mat.t().to_owned());
+                    ndarray::Zip::from(&mut result)
+                        .and(left.rows())
+                        .and(right_beta.rows())
+                        .par_for_each(|r, l_row, gamma_row| {
+                            let mut acc = 0.0;
+                            for k in 0..pa {
+                                let g = gamma_row[k];
+                                acc += l_row[k] * g * g;
+                            }
+                            *r = acc;
+                        });
+                    return result;
+                }
+                // Sparse-right fallback: materialize γ_k column-by-column.
+                let mut gamma_cols = Array2::<f64>::zeros((n, pa));
+                for k in 0..pa {
+                    let cov_part = right.apply(&beta_mat.row(k).to_owned());
+                    gamma_cols.column_mut(k).assign(&cov_part);
+                }
+                ndarray::Zip::from(&mut result)
+                    .and(left.rows())
+                    .and(gamma_cols.rows())
+                    .par_for_each(|r, l_row, gamma_row| {
+                        let mut acc = 0.0;
+                        for k in 0..pa {
+                            let g = gamma_row[k];
+                            acc += l_row[k] * g * g;
+                        }
+                        *r = acc;
+                    });
+                result
+            }
+            KroneckerDesign::Kronecker {
+                response_grid,
+                covariate,
+            } => {
+                let n_cov = covariate.nrows();
+                let n_grid = response_grid.nrows();
+                let p_resp = response_grid.ncols();
+                let p_cov = covariate.ncols();
+                debug_assert_eq!(beta.len(), p_resp * p_cov);
+                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                // gamma[i, k] = γ_k(x_i) — covariate-side per response component.
+                let mut gamma = Array2::<f64>::zeros((n_cov, p_resp));
+                for k in 0..p_resp {
+                    let cov_part = covariate.apply(&beta_mat.row(k).to_owned());
+                    gamma.column_mut(k).assign(&cov_part);
+                }
+                // gamma_sq[i, k] = γ_k(x_i)²
+                let gamma_sq = &gamma * &gamma;
+                // result_2d[i, g] = Σ_k gamma_sq[i, k] · response_grid[g, k]
+                //                 = (gamma_sq · response_gridᵀ)[i, g].
+                let mut result_2d = Array2::<f64>::zeros((n_cov, n_grid));
+                fast_ab_into(&gamma_sq, &response_grid.t(), &mut result_2d);
+                result_2d
+                    .into_shape_with_order((n_cov * n_grid,))
+                    .expect("row-major Array2 flattens to Array1 of length n_cov*n_grid")
+            }
+        }
+    }
+
     /// Streaming fraction-to-boundary reduction.
     ///
     /// Returns the smallest positive α for which there exists a virtual row
@@ -4430,15 +4528,24 @@ fn build_tensor_penalties_kronecker(
 // Warm start
 // ---------------------------------------------------------------------------
 
-/// Compute initial β so that h(y|x) ≈ (y - μ(x)) / τ(x).
+/// Compute initial γ so that the SCOP-CTN model produces h(y|x) ≈ (y - μ(x)) / τ(x).
 ///
-/// If no warm start is provided, estimate a penalized conditional location-scale
-/// surrogate on the covariate design and project that affine normalizer back
-/// into the transformation basis.
+/// Solves the joint value+derivative least-squares system
+///
+///   minimize  ||W^{1/2}(X_val·γ - t_h)||² + ||W^{1/2}(X_deriv·γ - t_hp)||² + λ||γ||²
+///
+/// where t_h_i = (y_i - μ(x_i))/τ(x_i) - offset_i (so X_val·γ + offset = (y - μ)/τ)
+/// and   t_hp_i = 1/τ(x_i).
+///
+/// Pinning both value and derivative targets gives a well-defined γ even when the
+/// I-spline span is wider than the affine residual, and reproduces the affine
+/// normalizer exactly when the basis is rich enough to represent it.
 fn compute_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
     offset: &Array1<f64>,
+    x_val_kron: &KroneckerDesign,
+    x_deriv_kron: &KroneckerDesign,
     covariate_design: &DesignMatrix,
     covariate_penalties: &[PenaltyMatrix],
     p_resp: usize,
@@ -4447,19 +4554,11 @@ fn compute_warm_start(
 ) -> Result<Array1<f64>, String> {
     let n = response.len();
     let p_total = p_resp * p_cov;
-    let mut beta = Array1::zeros(p_total);
     if p_resp < 2 {
         return Err(format!(
-            "transformation warm start requires at least 2 response basis rows, got {p_resp}"
+            "transformation warm start requires at least 2 response basis columns, got {p_resp}"
         ));
     }
-
-    // Target: for the intercept row (j=0),
-    //         Θ[0,:] · cov[i,:] = -μ(x_i)/τ(x_i) - offset[i]
-    //         so h_i = offset[i] + Θ[0,:]·cov[i,:] + y_i Θ[1,:]·cov[i,:]
-    //         starts at (y_i - μ(x_i))/τ(x_i).
-    //         For the linear row (j=1), Θ[1,:] · cov[i,:] = 1/τ(x_i).
-    //         For deviation rows (j≥2), Θ[j,:] = 0.
 
     let default_ws;
     let ws = match warm_start {
@@ -4477,48 +4576,61 @@ fn compute_warm_start(
     if ws.location.len() != n || ws.scale.len() != n {
         return Err("warm start location/scale length mismatch".to_string());
     }
-    let mut target_intercept = Array1::zeros(n);
-    let mut target_slope = Array1::zeros(n);
-    ndarray::Zip::from(&mut target_intercept)
-        .and(&mut target_slope)
-        .and(&ws.scale)
-        .and(&ws.location)
-        .and(offset)
-        .par_for_each(|ti, ts, &sc, &lc, &of| {
-            let tau = sc.max(1e-12);
-            let inv_tau = 1.0 / tau;
-            *ti = -lc * inv_tau - of;
-            *ts = inv_tau;
-        });
 
-    let projection_log_lambdas = Array1::zeros(covariate_penalties.len());
-    let zero_offset = Array1::zeros(n);
-    // Use the minimum ridge that `solve_penalizedweighted_projection` keeps as
-    // its own numerical floor (1e-12). A larger ridge here biases the
-    // projection and prevents the warm start from exactly absorbing the
-    // offset into the affine seed even when X'WX is perfectly conditioned.
-    let coeff_int = solve_penalizedweighted_projection(
-        covariate_design,
-        &zero_offset,
-        &target_intercept,
-        weights,
-        covariate_penalties,
-        &projection_log_lambdas,
-        1e-12,
-    )?;
-    let coeff_slope = solve_penalizedweighted_projection(
-        covariate_design,
-        &zero_offset,
-        &target_slope,
-        weights,
-        covariate_penalties,
-        &projection_log_lambdas,
-        1e-12,
-    )?;
+    // Per-row affine targets for the I-spline value and M-spline derivative bases.
+    let mut target_h = Array1::<f64>::zeros(n);
+    let mut target_hp = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let tau = ws.scale[i].max(1e-12);
+        let inv_tau = 1.0 / tau;
+        target_h[i] = (response[i] - ws.location[i]) * inv_tau - offset[i];
+        target_hp[i] = inv_tau;
+    }
 
-    beta.slice_mut(s![0..p_cov]).assign(&coeff_int);
-    beta.slice_mut(s![p_cov..2 * p_cov]).assign(&coeff_slope);
+    // Joint normal equations: (X_val^T W X_val + X_deriv^T W X_deriv + λI) γ
+    //                        = X_val^T W t_h + X_deriv^T W t_hp.
+    let policy = ResourcePolicy::default_library();
+    let gram_val = x_val_kron.weighted_gram(weights, &policy);
+    let gram_deriv = x_deriv_kron.weighted_gram(weights, &policy);
+    let mut a = gram_val + gram_deriv;
 
+    let mut weighted_t_h = Array1::<f64>::zeros(n);
+    let mut weighted_t_hp = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        weighted_t_h[i] = weights[i] * target_h[i];
+        weighted_t_hp[i] = weights[i] * target_hp[i];
+    }
+    let rhs = x_val_kron.transpose_mul(&weighted_t_h)
+        + x_deriv_kron.transpose_mul(&weighted_t_hp);
+
+    // Light ridge sized to the diagonal scale so the solve is stable even when
+    // p_total > rank(X_val ⊕ X_deriv) (e.g. n < p_total in unit tests). The
+    // ridge magnitude is well below the affine target's energy and does not
+    // perturb (y - μ)/τ recovery to within the assertion tolerances of the
+    // warm-start contract.
+    let mut diag_trace = 0.0;
+    for j in 0..p_total {
+        diag_trace += a[[j, j]];
+    }
+    let ridge = if p_total > 0 {
+        (diag_trace / p_total as f64).max(1.0) * 1e-10
+    } else {
+        1e-10
+    };
+    for j in 0..p_total {
+        a[[j, j]] += ridge;
+    }
+
+    use crate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+    let factor = a
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("warm-start joint LSQ Cholesky failed: {e:?}"))?;
+    let beta = factor.solvevec(&rhs);
+    if beta.iter().any(|v| !v.is_finite()) {
+        return Err("warm-start joint LSQ produced non-finite coefficients".to_string());
+    }
+    let _ = covariate_penalties; // unused under the joint LSQ formulation
     Ok(beta)
 }
 
@@ -7393,6 +7505,7 @@ pub fn fit_transformation_normal(
         let cov_spec_resolved = boot_spec;
 
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            response,
             resp_val,
             resp_deriv,
             resp_penalties,
@@ -7461,6 +7574,7 @@ pub fn fit_transformation_normal(
 
     // Build an initial family + blocks for capability probing.
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
+        response,
         resp_val.clone(),
         resp_deriv.clone(),
         resp_penalties.clone(),
