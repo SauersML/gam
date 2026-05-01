@@ -6116,62 +6116,41 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     let rho_dim = retained_penalties.len();
     let operator_slots_end = rho_dim + runtime_caches.len() * 3;
-    const EPSILON_LOG_WINDOW: f64 = 6.0;
-    // Operator-λ box is anchored to the baseline REML log-lambda with a
-    // symmetric window. The previous absolute floor of exp(-10) ≈ 4.5e-5
-    // was scale-blind: at small n with k_basis comparable to n, that floor
-    // still admits near-interpolation because S_mass = D0'D0 = K_CC² has
-    // tiny eigenvalues on weakly-identified directions in the kernel block,
-    // and a constant log-λ floor doesn't track the n-dependent noise floor
-    // of J. Anchoring on baseline_log_lambda inherits the baseline REML's
-    // own scale calibration: at n=300K production scale the baseline is
-    // already in the right neighbourhood, and at small-n fuzz the baseline
-    // is too. The overlay is then allowed to refine within a ±WINDOW
-    // band around it (~exp(±6) ≈ 400× either way), which is wide enough
-    // for genuine adaptive refinement and tight enough that the overlay
-    // cannot blow through the baseline's well-posed regime into the
-    // L_tilde-unbounded interpolation regime that produces R²=−19995.
-    // The absolute -10 floor is retained as a backstop against pathological
-    // baselines whose own log-lambda is already far into the unstable
-    // regime.
-    const OPERATOR_LAMBDA_LOG_WINDOW: f64 = 6.0;
+    // Every slot's box is `initial_theta[idx] ± WINDOW` clamped into a
+    // per-slot [floor, cap]. Retained-λ previously used a scale-blind
+    // ±30 absolute interval, which on small-n / weakly-identified Duchon
+    // fits let those lambdas wander to the exp(-30) floor and produce
+    // near-interpolant solutions. Anchoring on baseline log-λ inherits the
+    // baseline REML's scale calibration so the overlay can only refine
+    // within an exp(±6) ≈ 400× band of the well-posed baseline regime,
+    // matching the discipline already applied to operator and epsilon
+    // slots.
+    const UNIFIED_LOG_WINDOW: f64 = 6.0;
+    const RETAINED_LAMBDA_LOG_LOWER_FLOOR: f64 = -30.0;
+    const RETAINED_LAMBDA_LOG_UPPER_CAP: f64 = 30.0;
     const OPERATOR_LAMBDA_LOG_LOWER_FLOOR: f64 = -10.0;
     const OPERATOR_LAMBDA_LOG_UPPER_CAP: f64 = 30.0;
-    // Box bounds must satisfy `lower ≤ upper` per slot (the downstream
-    // `f64::clamp` panics on inverted bounds). The natural ±WINDOW interval
-    // around `initial_theta[idx]` is non-decreasing, so clamping BOTH
-    // endpoints into the same `[floor, cap]` range preserves order. A
-    // separate one-sided floor on the lower endpoint (without a matching
-    // cap on the upper) is what produced the inverted-bound panic when a
-    // pathological baseline pushed `initial_theta[idx] + WINDOW` below the
-    // floor: the lower endpoint snapped up to the floor while the upper
-    // stayed beneath it.
-    let eps_lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
+    let epsilon_floor_log = adaptive_opts.min_epsilon.max(1e-12).ln();
+    let anchored_bound = |idx: usize, sign: f64| -> f64 {
+        let raw = initial_theta[idx] + sign * UNIFIED_LOG_WINDOW;
         if idx < rho_dim {
-            -30.0_f64
+            raw.clamp(
+                RETAINED_LAMBDA_LOG_LOWER_FLOOR,
+                RETAINED_LAMBDA_LOG_UPPER_CAP,
+            )
         } else if idx < operator_slots_end {
-            (initial_theta[idx] - OPERATOR_LAMBDA_LOG_WINDOW).clamp(
+            raw.clamp(
                 OPERATOR_LAMBDA_LOG_LOWER_FLOOR,
                 OPERATOR_LAMBDA_LOG_UPPER_CAP,
             )
         } else {
-            let eps_floor = adaptive_opts.min_epsilon.max(1e-12).ln();
-            (initial_theta[idx] - EPSILON_LOG_WINDOW).max(eps_floor)
+            raw.max(epsilon_floor_log)
         }
-    }));
-    let eps_upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
-        if idx < rho_dim {
-            30.0_f64
-        } else if idx < operator_slots_end {
-            (initial_theta[idx] + OPERATOR_LAMBDA_LOG_WINDOW).clamp(
-                OPERATOR_LAMBDA_LOG_LOWER_FLOOR,
-                OPERATOR_LAMBDA_LOG_UPPER_CAP,
-            )
-        } else {
-            let eps_floor = adaptive_opts.min_epsilon.max(1e-12).ln();
-            (initial_theta[idx] + EPSILON_LOG_WINDOW).max(eps_floor)
-        }
-    }));
+    };
+    let eps_lower =
+        Array1::from_iter((0..initial_theta.len()).map(|idx| anchored_bound(idx, -1.0)));
+    let eps_upper =
+        Array1::from_iter((0..initial_theta.len()).map(|idx| anchored_bound(idx, 1.0)));
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: baseline.design.design.clone(),
