@@ -47,6 +47,8 @@ pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
+wide = "0.7"
+smallvec = "1"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
