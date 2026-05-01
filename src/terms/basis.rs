@@ -17779,6 +17779,25 @@ pub mod closed_form_penalty {
         let b = 2 * s;
         let kappa_sq = kappa * kappa;
 
+        // Math team Letter B: for x = (κR)² < ~1.5 the literal partial-fraction
+        // sum Σ A_j R_j^d + Σ B_ℓ M_ℓ suffers catastrophic cancellation (the
+        // individual κ^{-2(N-j)} terms grow as κ → 0 while the analytic limit
+        // is the finite-part Riesz block R_N^d(R)). The χ = max|term|/|sum|
+        // detector is too coarse — at moderate cancellation (κR ∈ [10⁻³, 0.5])
+        // χ may sit below 1e8 yet the sum has already lost 6+ digits.
+        // Use the Taylor / ₁F₂ recurrence as the primary path in this regime.
+        // For odd d the Riesz blocks are pure powers and the recurrence is
+        // term-by-term exact; for even d log-Riesz blocks intervene and the
+        // closed-form log series is left as a follow-up — fall through to the
+        // literal sum + χ-gate fallback.
+        let kappa_r = kappa * r;
+        let x_taylor = kappa_r * kappa_r;
+        if x_taylor < 1.5 && d % 2 == 1 {
+            if let Some(tay) = finite_part_duchon_taylor_odd_d(d, a, b, kappa, r) {
+                return tay;
+            }
+        }
+
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
         let mut sum = 0.0_f64;
         let mut max_term = 0.0_f64;
@@ -17851,9 +17870,11 @@ pub mod closed_form_penalty {
         // healthy χ the literal sum already gives the consistent value.
         // For even d log-Riesz blocks the legacy leading-term band-aid
         // stands in for the (unimplemented) log finite-part series.
+        // χ-gate fallback: Taylor was either unavailable (even d, log-Riesz
+        // case) or returned None (recurrence stalled). For severe cancellation
+        // in the literal sum, last-resort substitute the leading-term limit
+        // R_N^d(R) when very deep into the small-κR regime.
         let limit = riesz_kernel_value(d, a + b, r);
-        let kappa_r = kappa * r;
-        let x_taylor = kappa_r * kappa_r;
         let chi = if sum.abs() > 0.0 {
             max_term / sum.abs()
         } else {
@@ -17862,11 +17883,6 @@ pub mod closed_form_penalty {
         let small_kappa_regime = x_taylor < 1.5;
         let cancellation_lost = chi > 1.0e8;
         if small_kappa_regime && cancellation_lost {
-            if d % 2 == 1 {
-                if let Some(tay) = finite_part_duchon_taylor_odd_d(d, a, b, kappa, r) {
-                    return tay;
-                }
-            }
             if kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
                 return limit;
             }
