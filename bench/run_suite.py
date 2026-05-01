@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import typing
 import argparse
 from collections import deque
 import json
@@ -91,33 +92,33 @@ HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 _MAX_CAPTURE_CHARS = 200000
 
 
-def _require_lifelines_survival_helpers():
+def _require_lifelines_survival_helpers() -> typing.Any:
     from lifelines import CoxPHFitter, KaplanMeierFitter
 
     return CoxPHFitter, KaplanMeierFitter
 
 
-def _require_lifelines_coxph():
+def _require_lifelines_coxph() -> typing.Any:
     from lifelines import CoxPHFitter
     from lifelines.exceptions import ConvergenceWarning
 
     return CoxPHFitter, ConvergenceWarning
 
 
-def _require_lifelines_aft_fitters():
+def _require_lifelines_aft_fitters() -> typing.Any:
     from lifelines import LogNormalAFTFitter, WeibullAFTFitter
     from lifelines.exceptions import ConvergenceWarning
 
     return LogNormalAFTFitter, WeibullAFTFitter, ConvergenceWarning
 
 
-def _require_lifelines_kaplan_meier():
+def _require_lifelines_kaplan_meier() -> typing.Any:
     from lifelines import KaplanMeierFitter
 
     return KaplanMeierFitter
 
 
-def _require_lifelines_concordance_index():
+def _require_lifelines_concordance_index() -> typing.Any:
     from lifelines.utils import concordance_index
 
     return concordance_index
@@ -197,14 +198,14 @@ def _coerce_positive_survival_dataset_inplace(ds: dict, dataset_name: str) -> di
     return ds
 
 
-def _fmt_kib(kib):
+def _fmt_kib(kib: typing.Any) -> typing.Any:
     if kib is None:
         return "n/a"
     gib = float(kib) / (1024.0 * 1024.0)
     return f"{gib:.2f} GiB"
 
 
-def _fmt_cpu_total_pct(cpu_pct):
+def _fmt_cpu_total_pct(cpu_pct: typing.Any) -> typing.Any:
     if cpu_pct in (None, "n/a"):
         return "n/a"
     try:
@@ -214,7 +215,7 @@ def _fmt_cpu_total_pct(cpu_pct):
     return f"{cpu_val:.1f}"
 
 
-def _fmt_pct(numer, denom):
+def _fmt_pct(numer: typing.Any, denom: typing.Any) -> typing.Any:
     try:
         if numer is None or denom in (None, 0):
             return "n/a"
@@ -223,7 +224,7 @@ def _fmt_pct(numer, denom):
         return "n/a"
 
 
-def _mem_used_kib(meminfo):
+def _mem_used_kib(meminfo: typing.Any) -> typing.Any:
     total = meminfo.get("MemTotal")
     avail = meminfo.get("MemAvailable")
     if total is None or avail is None:
@@ -232,7 +233,7 @@ def _mem_used_kib(meminfo):
     return max(used, 0)
 
 
-def _read_meminfo():
+def _read_meminfo() -> typing.Any:
     out = {}
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as fh:
@@ -248,7 +249,7 @@ def _read_meminfo():
     return out
 
 
-def _read_proc_status_kib(pid, key):
+def _read_proc_status_kib(pid: typing.Any, key: typing.Any) -> typing.Any:
     try:
         with open(f"/proc/{pid}/status", "r", encoding="utf-8") as fh:
             prefix = f"{key}:"
@@ -262,7 +263,7 @@ def _read_proc_status_kib(pid, key):
     return None
 
 
-def _read_cgroup_memory_kib():
+def _read_cgroup_memory_kib() -> typing.Any:
     paths = [
         ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
         ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
@@ -284,7 +285,7 @@ def _read_cgroup_memory_kib():
     return None, None
 
 
-def _read_disk_usage_kib(path):
+def _read_disk_usage_kib(path: typing.Any) -> typing.Any:
     try:
         usage = disk_usage(path)
     except Exception:
@@ -292,7 +293,7 @@ def _read_disk_usage_kib(path):
     return usage.total // 1024, usage.used // 1024, usage.free // 1024
 
 
-def _read_ps_snapshot(pid):
+def _read_ps_snapshot(pid: typing.Any) -> typing.Any:
     try:
         proc = subprocess.run(
             ["ps", "-p", str(pid), "-o", "pid=,%cpu=,%mem=,rss=,vsz=,etimes=,stat=,comm="],
@@ -329,7 +330,7 @@ def _read_ps_snapshot(pid):
         return {}
 
 
-def _collect_heartbeat_snapshot(proc, cmd_preview, stats, start):
+def _collect_heartbeat_snapshot(proc: typing.Any, cmd_preview: typing.Any, stats: typing.Any, start: typing.Any) -> typing.Any:
     ps = _read_ps_snapshot(proc.pid)
     rss_kib = ps.get("rss_kib")
     if isinstance(rss_kib, int):
@@ -390,7 +391,7 @@ def _collect_heartbeat_snapshot(proc, cmd_preview, stats, start):
     )
 
 
-def _heartbeat_loop(proc, cmd, stop_event, stats):
+def _heartbeat_loop(proc: typing.Any, cmd: typing.Any, stop_event: typing.Any, stats: typing.Any) -> None:
     cmd_preview = " ".join(str(x) for x in cmd[:5])
     if len(cmd) > 5:
         cmd_preview += " ..."
@@ -410,11 +411,11 @@ def _heartbeat_loop(proc, cmd, stop_event, stats):
         print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
 
 
-def _workspace_tempdir(prefix: str):
+def _workspace_tempdir(prefix: str) -> typing.Any:
     return tempfile.TemporaryDirectory(prefix=prefix, dir=str(BENCH_DIR))
 
 
-def run_cmd(cmd, cwd=None):
+def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
     env = os.environ.copy()
     env.update(_SERIAL_ENV_OVERRIDES)
     env["PYTHONUNBUFFERED"] = "1"
@@ -448,7 +449,7 @@ def run_cmd(cmd, cwd=None):
             current_chars -= len(buf.popleft())
         return current_chars
 
-    def _pump(pipe, sink, buf, char_count_name):
+    def _pump(pipe: typing.Any, sink: typing.Any, buf: typing.Any, char_count_name: typing.Any) -> None:
         nonlocal out_chars, err_chars
         try:
             while True:
@@ -519,7 +520,7 @@ def run_cmd(cmd, cwd=None):
     return rc, "".join(out_buf), "".join(err_buf)
 
 
-def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: bool = False):
+def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: bool = False) -> typing.Any:
     n = int(len(y))
     if n < n_splits:
         raise ValueError(f"Need at least {n_splits} rows for {n_splits}-fold CV; got {n}")
@@ -1075,7 +1076,7 @@ def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
     return args
 
 
-def _load_lidar_dataset():
+def _load_lidar_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "lidar.csv")
     d = d[["range", "logratio"]].dropna()
     rows = [{"range": float(r), "y": float(y)} for r, y in zip(d["range"], d["logratio"])]
@@ -1087,7 +1088,7 @@ def _load_lidar_dataset():
     }
 
 
-def _load_bone_dataset():
+def _load_bone_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "bone.csv")
     d = d[["trt", "t", "d"]].dropna()
     rows = [
@@ -1106,7 +1107,7 @@ def _load_bone_dataset():
     }
 
 
-def _load_prostate_dataset():
+def _load_prostate_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "prostate.csv")
     d = d[["pc1", "pc2", "y"]].dropna()
     rows = [{"pc1": float(a), "pc2": float(b), "y": float(y)} for a, b, y in zip(d["pc1"], d["pc2"], d["y"])]
@@ -1118,7 +1119,7 @@ def _load_prostate_dataset():
     }
 
 
-def _load_wine_dataset():
+def _load_wine_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "wine.csv")
     d = d[["year", "h_rain", "w_rain", "h_temp", "s_temp", "price"]]
     d = d.replace({"NA": np.nan}).dropna(subset=["price"])
@@ -1143,7 +1144,7 @@ def _load_wine_dataset():
     }
 
 
-def _load_wine_temp_vs_year_dataset():
+def _load_wine_temp_vs_year_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "wine.csv")
     d = d[["year", "s_temp"]].dropna()
     rows = [{"year": float(y), "s_temp": float(t)} for y, t in zip(d["year"], d["s_temp"])]
@@ -1155,7 +1156,7 @@ def _load_wine_temp_vs_year_dataset():
     }
 
 
-def _load_wine_price_vs_temp_dataset():
+def _load_wine_price_vs_temp_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "wine.csv")
     d = d[["s_temp", "price"]].replace({"NA": np.nan}).dropna()
     rows = [{"temp": float(t), "price": float(p)} for t, p in zip(d["s_temp"], d["price"])]
@@ -1167,7 +1168,7 @@ def _load_wine_price_vs_temp_dataset():
     }
 
 
-def _load_horse_dataset():
+def _load_horse_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "horse.csv")
     d = d[["outcome", "pulse", "rectal_temp", "packed_cell_volume"]].copy()
     d["outcome"] = d["outcome"].astype(str).str.strip().str.lower()
@@ -1194,7 +1195,7 @@ def _load_horse_dataset():
     }
 
 
-def _parse_f64_opt(raw):
+def _parse_f64_opt(raw: typing.Any) -> typing.Any:
     if raw is None:
         return None
     s = str(raw).strip()
@@ -1222,7 +1223,7 @@ def _encode_edema(raw: str) -> float:
     return 0.0
 
 
-def _load_cirrhosis_survival_dataset():
+def _load_cirrhosis_survival_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "cirrhosis.csv")
     numeric_cols = [
         "Age",
@@ -1331,7 +1332,7 @@ def _normalize_us48_timestamp_to_hour(ts: str) -> float:
     return float(dt.hour)
 
 
-def _load_us48_demand_dataset(filename: str):
+def _load_us48_demand_dataset(filename: str) -> typing.Any:
     d = pd.read_csv(DATASET_DIR / filename)
     needed = [
         "Timestamp (Hour Ending)",
@@ -1370,7 +1371,7 @@ def _load_us48_demand_dataset(filename: str):
     }
 
 
-def _load_haberman_dataset():
+def _load_haberman_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "haberman.csv")
     d = d.iloc[:, :4].copy()
     d.columns = ["age", "op_year", "axil_nodes", "status"]
@@ -1396,7 +1397,7 @@ def _load_haberman_dataset():
     }
 
 
-def _load_icu_survival_death_dataset():
+def _load_icu_survival_death_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "icu_survival_death.csv")
     d = d[["time", "age", "bmi", "hr_max", "sysbp_min", "event"]].dropna()
     d = _coerce_positive_survival_times(d, time_col="time", dataset_name="icu_survival_death")
@@ -1424,7 +1425,7 @@ def _load_icu_survival_death_dataset():
     }
 
 
-def _load_icu_survival_los_dataset():
+def _load_icu_survival_los_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "icu_survival_los.csv")
     d = d[["age", "bmi", "hr_max", "sysbp_min", "temp_apache", "time", "event"]].dropna()
     d = _coerce_positive_survival_times(d, time_col="time", dataset_name="icu_survival_los")
@@ -1453,7 +1454,7 @@ def _load_icu_survival_los_dataset():
     }
 
 
-def _load_heart_failure_survival_dataset():
+def _load_heart_failure_survival_dataset() -> typing.Any:
     d = pd.read_csv(DATASET_DIR / "heart_failure_clinical_records_dataset.csv")
     cols = [
         "time",
@@ -1519,7 +1520,7 @@ def _load_heart_failure_survival_dataset():
     }
 
 
-def _synthetic_binomial_dataset(n, p, seed):
+def _synthetic_binomial_dataset(n: typing.Any, p: typing.Any, seed: typing.Any) -> typing.Any:
     p = max(int(p), 3)
     rng = np.random.default_rng(int(seed))
     x = np.zeros((int(n), p), dtype=float)
@@ -1552,7 +1553,7 @@ _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS = {
 }
 
 
-def _synthetic_geo_disease_dataset(n=4000, seed=20260226):
+def _synthetic_geo_disease_dataset(n: typing.Any=4000, seed: typing.Any=20260226) -> typing.Any:
     n = int(max(500, n))
     rng = np.random.default_rng(int(seed))
 
@@ -1671,7 +1672,7 @@ def _synthetic_continuous_order_dataset(
     return out
 
 
-def _synthetic_thread3_admixture_cliff_dataset(n=6000, seed=20260601):
+def _synthetic_thread3_admixture_cliff_dataset(n: typing.Any=6000, seed: typing.Any=20260601) -> typing.Any:
     n = int(max(500, n))
     rng = np.random.default_rng(int(seed))
 
@@ -1735,7 +1736,7 @@ def _synthetic_thread3_admixture_cliff_dataset(n=6000, seed=20260601):
     }
 
 
-def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
+def _synthetic_geo_disease_eas_dataset(n: typing.Any=6000, seed: typing.Any=20260301, n_pcs: typing.Any=16) -> typing.Any:
     n = int(max(5, n))
     n_pcs = int(max(3, n_pcs))
     rng = np.random.default_rng(int(seed))
@@ -1802,7 +1803,7 @@ def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
     }
 
 
-def _geo_disease_eas_scenario_cfg(name):
+def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
     m = re.match(
         r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)(?:_downsample[0-9]+x)?(?:_holdout)?$",
         str(name),
@@ -1871,7 +1872,7 @@ def _fixed_joint_spatial_pc_count(family: str, n_pcs: int) -> int:
     raise RuntimeError(f"unsupported joint spatial benchmark family: {family}")
 
 
-def _papuan_oce_scenario_cfg(name):
+def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
     m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
     if m is None:
         return None
@@ -1900,7 +1901,7 @@ def _papuan_oce_scenario_cfg(name):
     }
 
 
-def _compute_pcs_from_genotypes(g, n_pcs=16):
+def _compute_pcs_from_genotypes(g: typing.Any, n_pcs: typing.Any=16) -> typing.Any:
     # Proper PCA from standardized genotype-like matrix using SVD.
     n = g.shape[0]
     x = g.astype(float)
@@ -1918,7 +1919,7 @@ def _compute_pcs_from_genotypes(g, n_pcs=16):
     return (pcs - pcs_mu) / pcs_sd
 
 
-def _synthetic_papuan_oce_dataset(n=6000, seed=20260315, n_pcs=16):
+def _synthetic_papuan_oce_dataset(n: typing.Any=6000, seed: typing.Any=20260315, n_pcs: typing.Any=16) -> typing.Any:
     n = int(max(1200, n))
     rng = np.random.default_rng(int(seed))
 
@@ -1988,7 +1989,7 @@ def _synthetic_papuan_oce_dataset(n=6000, seed=20260315, n_pcs=16):
     }
 
 
-def _geo_subpop16_scenario_cfg(name):
+def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
     m = re.match(r"^geo_subpop16_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
     if m is None:
         return None
@@ -2015,7 +2016,7 @@ def _geo_subpop16_scenario_cfg(name):
     }
 
 
-def _geo_latlon_scenario_cfg(name):
+def _geo_latlon_scenario_cfg(name: typing.Any) -> typing.Any:
     m = re.match(r"^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
     if m is None:
         return None
@@ -2045,7 +2046,7 @@ def _geo_latlon_scenario_cfg(name):
     }
 
 
-def _synthetic_hgdp_1kg_pc_panel():
+def _synthetic_hgdp_1kg_pc_panel() -> typing.Any:
     global _SYNTHETIC_PC_PANEL
     if _SYNTHETIC_PC_PANEL is not None:
         return _SYNTHETIC_PC_PANEL.copy()
@@ -2117,7 +2118,7 @@ def _synthetic_hgdp_1kg_pc_panel():
     return _SYNTHETIC_PC_PANEL.copy()
 
 
-def _load_hgdp_pc_with_imputed_latlon():
+def _load_hgdp_pc_with_imputed_latlon() -> typing.Any:
     raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     required = {"sample_id", "Superpopulation", "Subpopulation", "Latitude", "Longitude", *pc_cols}
@@ -2182,7 +2183,7 @@ def _load_hgdp_pc_with_imputed_latlon():
     return d
 
 
-def _geo_latlon_dataset(mode_code, seed=20260401, prevalence_min=0.01, prevalence_max=0.10):
+def _geo_latlon_dataset(mode_code: typing.Any, seed: typing.Any=20260401, prevalence_min: typing.Any=0.01, prevalence_max: typing.Any=0.10) -> typing.Any:
     mode_code = str(mode_code)
     if mode_code not in {"superpopnoise", "equatornoise"}:
         raise RuntimeError(f"unsupported geo_latlon mode: {mode_code}")
@@ -2223,7 +2224,7 @@ def _geo_latlon_dataset(mode_code, seed=20260401, prevalence_min=0.01, prevalenc
     }
 
 
-def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.40):
+def _geo_subpop16_dataset(seed: typing.Any=20260330, prevalence_min: typing.Any=0.02, prevalence_max: typing.Any=0.40) -> typing.Any:
     rng = np.random.default_rng(int(seed))
     raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
@@ -2288,12 +2289,12 @@ def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.4
 
 
 def _geo_subpop16_randomprev_randomscale_dataset(
-    seed=20260701,
-    prevalence_min=0.02,
-    prevalence_max=0.40,
-    noise_scale_min=0.25,
-    noise_scale_max=0.85,
-):
+    seed: typing.Any=20260701,
+    prevalence_min: typing.Any=0.02,
+    prevalence_max: typing.Any=0.40,
+    noise_scale_min: typing.Any=0.25,
+    noise_scale_max: typing.Any=0.85,
+) -> typing.Any:
     rng = np.random.default_rng(int(seed))
     raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
@@ -2340,7 +2341,7 @@ def _geo_subpop16_randomprev_randomscale_dataset(
     }
 
 
-def _validate_dataset_schema(ds, scenario_name):
+def _validate_dataset_schema(ds: typing.Any, scenario_name: typing.Any) -> None:
     if not isinstance(ds, dict):
         raise RuntimeError(f"{scenario_name}: dataset loader must return a dict")
     if "family" not in ds:
@@ -2396,7 +2397,7 @@ def _validate_dataset_schema(ds, scenario_name):
             raise RuntimeError(f"{scenario_name}: column '{col}' is not fully numeric/coercible: {e}") from e
 
 
-def _dataset_for_scenario_unvalidated(s):
+def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
     name = s["name"]
     if name in {"small_dense", "medium", "pathological_ill_conditioned"}:
         cfg = _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS[name]
@@ -2546,7 +2547,7 @@ def _downsample_binomial_dataset(
     return out
 
 
-def dataset_for_scenario(s):
+def dataset_for_scenario(s: typing.Any) -> typing.Any:
     name = s["name"]
     ds = _dataset_for_scenario_unvalidated(s)
     downsample_factor = _scenario_downsample_factor(name)
@@ -2568,7 +2569,7 @@ def dataset_for_scenario(s):
     return ds
 
 
-def folds_for_dataset(ds):
+def folds_for_dataset(ds: typing.Any) -> typing.Any:
     n_splits = int(ds.get("_cv_splits", CV_SPLITS))
     if ds["family"] == "survival":
         _coerce_positive_survival_dataset_inplace(ds, dataset_name=ds.get("name", "survival_dataset"))
@@ -2652,11 +2653,11 @@ def build_shared_fold_artifacts(
     return artifacts
 
 
-def aggregate_cv_rows(cv_rows, family):
+def aggregate_cv_rows(cv_rows: typing.Any, family: typing.Any) -> typing.Any:
     fit_sec = float(sum(float(r["fit_sec"]) for r in cv_rows))
     predict_sec = float(sum(float(r["predict_sec"]) for r in cv_rows))
 
-    def wavg(key):
+    def wavg(key: typing.Any) -> typing.Any:
         if key == "mse":
             valid_rmse = [(r.get("rmse"), int(r["n_test"])) for r in cv_rows if r.get("rmse") is not None]
             if valid_rmse:
@@ -2881,7 +2882,7 @@ def _validate_result_metadata(results: list[dict]) -> None:
             )
 
 
-def _scenario_fit_mapping(scenario_name):
+def _scenario_fit_mapping(scenario_name: typing.Any) -> typing.Any:
     geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
     papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
     subpop_cfg = _geo_subpop16_scenario_cfg(scenario_name)
@@ -3135,7 +3136,7 @@ def _scenario_fit_mapping(scenario_name):
     }.get(scenario_name)
 
 
-def _effective_scenario_fit_mapping(scenario_name: str, override: dict | None = None):
+def _effective_scenario_fit_mapping(scenario_name: str, override: dict | None = None) -> typing.Any:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None
@@ -3146,7 +3147,7 @@ def _effective_scenario_fit_mapping(scenario_name: str, override: dict | None = 
     return merged
 
 
-def _canonical_smooth_basis(basis):
+def _canonical_smooth_basis(basis: typing.Any) -> typing.Any:
     b = str(basis or "ps").strip().lower()
     # Legacy alias used to mean one P-spline per feature; canonical basis is "ps".
     if b == "bspline_per_pc":
@@ -3194,7 +3195,7 @@ def _mgcv_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int
     raise RuntimeError(f"Unsupported joint mgcv spatial basis '{basis}'")
 
 
-def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None = None):
+def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg_override: dict | None = None) -> typing.Any:
     cfg = _effective_scenario_fit_mapping(scenario_name, cfg_override)
     if cfg is None:
         raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
@@ -3255,7 +3256,7 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
     return cfg["family"], formula
 
 
-def _cfg_with_excluded_columns(cfg: dict, excluded_cols) -> dict:
+def _cfg_with_excluded_columns(cfg: dict, excluded_cols: typing.Any) -> dict:
     excluded = {str(col) for col in (excluded_cols or [])}
     if not excluded:
         return dict(cfg)
@@ -3335,7 +3336,7 @@ def _rust_marginal_slope_formulas_for_scenario(scenario_name: str, ds: dict) -> 
     return z_column, marginal_formula, _formula_rhs_text(logslope_formula)
 
 
-def _mgcv_formula_for_scenario(scenario_name, ds):
+def _mgcv_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any) -> typing.Any:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No shared smooth mapping configured for scenario '{scenario_name}'")
@@ -3424,7 +3425,7 @@ def _survival_formula_mapping(scenario_name: str) -> dict:
     }
 
 
-def _rust_survival_formula_for_scenario(scenario_name: str, *, exclude_cols=None) -> str:
+def _rust_survival_formula_for_scenario(scenario_name: str, *, exclude_cols: typing.Any=None) -> str:
     cfg = _cfg_with_excluded_columns(_survival_formula_mapping(scenario_name), exclude_cols or [])
     terms = [f"linear({c})" for c in cfg["linear_cols"]]
     terms.extend(f"s({c}, type=ps, knots={cfg['knots']})" for c in cfg["smooth_cols"])
@@ -3492,7 +3493,7 @@ def _default_rust_formula_link_for_family(family: str) -> str:
     raise RuntimeError(f"unsupported family for flexible-link benchmark companion: {family}")
 
 
-def _is_matern_rust_scenario(s_cfg) -> bool:
+def _is_matern_rust_scenario(s_cfg: typing.Any) -> bool:
     cfg = _scenario_fit_mapping(s_cfg["name"])
     if cfg is None:
         return False
@@ -3656,7 +3657,7 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict | None, ds: dict)
     if not isinstance(maps, list):
         return out
 
-    def _json_ndarray(value):
+    def _json_ndarray(value: typing.Any) -> typing.Any:
         if isinstance(value, dict) and isinstance(value.get("data"), list):
             arr = np.asarray(value.get("data"), dtype=float)
             dim = value.get("dim")
@@ -3715,7 +3716,7 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict | None, ds: dict)
     return out
 
 
-def _rust_survival_fit_options_for_scenario(scenario_name):
+def _rust_survival_fit_options_for_scenario(scenario_name: typing.Any) -> typing.Any:
     # Survival time effects must use a structurally monotone basis so the
     # fitted cumulative baseline cannot violate survival semantics.
     if scenario_name in {"icu_survival_death", "icu_survival_los"}:
@@ -3795,7 +3796,7 @@ def _rust_native_survival_matrix_from_model(
     return surv.reshape(grid.size, n).T
 
 
-def _ensure_rust_binary():
+def _ensure_rust_binary() -> typing.Any:
     global _RUST_BIN_PATH
     if _RUST_BIN_PATH is not None:
         return _RUST_BIN_PATH
@@ -3818,7 +3819,7 @@ def _ensure_rust_binary():
 
 
 def run_rust_scenario_cv(
-    scenario,
+    scenario: typing.Any,
     *,
     contender_name: str = "rust_gam",
     binomial_link: str | None = None,
@@ -3831,7 +3832,7 @@ def run_rust_scenario_cv(
     collect_adaptive_diagnostics: bool = False,
     rust_fit_extra_args: list[str] | None = None,
     formula_link: str | None = None,
-):
+) -> typing.Any:
     scenario_name = scenario["name"]
     if ds is None:
         ds = dataset_for_scenario(scenario)
@@ -4234,7 +4235,7 @@ def run_rust_scenario_cv(
 
 
 def _run_rust_gamlss_scenario_cv_variant(
-    scenario,
+    scenario: typing.Any,
     *,
     contender_name: str,
     binomial_cli_family: str,
@@ -4242,7 +4243,7 @@ def _run_rust_gamlss_scenario_cv_variant(
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
-):
+) -> typing.Any:
     scenario_name = scenario["name"]
     # Run for any scenario with a valid formula mapping (not just geo scenarios).
     if _scenario_fit_mapping(scenario_name) is None:
@@ -4459,7 +4460,7 @@ def _run_rust_gamlss_scenario_cv_variant(
 
 
 def run_rust_gamlss_scenario_cv(
-    scenario,
+    scenario: typing.Any,
     *,
     contender_name: str = "rust_gamlss",
     binomial_cli_family: str = "binomial-probit",
@@ -4467,7 +4468,7 @@ def run_rust_gamlss_scenario_cv(
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
-):
+) -> typing.Any:
     return _run_rust_gamlss_scenario_cv_variant(
         scenario,
         contender_name=contender_name,
@@ -4480,13 +4481,13 @@ def run_rust_gamlss_scenario_cv(
 
 
 def run_rust_gamlss_marginal_slope_cv(
-    scenario,
+    scenario: typing.Any,
     *,
     contender_name: str = "rust_gamlss_marginal_slope",
     ds: dict | None = None,
     folds: list[Fold] | None = None,
     rust_fit_extra_args: list[str] | None = None,
-):
+) -> typing.Any:
     scenario_name = scenario["name"]
     if _scenario_fit_mapping(scenario_name) is None:
         return None
@@ -4640,13 +4641,13 @@ def run_rust_gamlss_marginal_slope_cv(
 
 
 def run_rust_gamlss_survival_cv(
-    scenario,
+    scenario: typing.Any,
     *,
     contender_name: str = "rust_gamlss_survival",
     survival_link: str | None = None,
     ds: dict | None = None,
     folds: list[Fold] | None = None,
-):
+) -> typing.Any:
     """Run the Rust binary with --survival-likelihood location-scale for survival scenarios."""
     scenario_name = scenario["name"]
     if ds is None:
@@ -4824,12 +4825,12 @@ def run_rust_gamlss_survival_cv(
 
 
 def run_rust_gamlss_survival_marginal_slope_cv(
-    scenario,
+    scenario: typing.Any,
     *,
     contender_name: str = "rust_gamlss_survival_marginal_slope",
     ds: dict | None = None,
     folds: list[Fold] | None = None,
-):
+) -> typing.Any:
     scenario_name = scenario["name"]
     if ds is None:
         ds = dataset_for_scenario(scenario)
@@ -5025,7 +5026,7 @@ def _is_gamlss_benchmark_scenario(scenario_name: str) -> bool:
     return not _requires_joint_spatial_term(cfg)
 
 
-def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
+def _gamlss_mu_formula_for_scenario(scenario_name: str, ds: typing.Any) -> typing.Any:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None
@@ -5127,7 +5128,7 @@ def _sigma_feature_formula(ds: dict, *, scenario_name: str | None, backend: str)
     return "~ " + (" + ".join(terms) if terms else "1")
 
 
-def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_r_gamlss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     scenario_name = scenario["name"]
     if not _is_gamlss_benchmark_scenario(scenario_name):
         return None
@@ -5402,7 +5403,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_mgcv_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_mgcv_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if folds is None:
@@ -5758,7 +5759,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_mgcv_gaulss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6017,7 +6018,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
+def _gamboostlss_formulas_for_scenario(scenario_name: str, ds: typing.Any) -> typing.Any:
     cfg = _scenario_fit_mapping(scenario_name)
     if cfg is None:
         return None, None
@@ -6046,7 +6047,7 @@ def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
     return mu_formula, sigma_formula
 
 
-def run_external_r_gamboostlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_r_gamboostlss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6292,7 +6293,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def _bamlss_formulas_for_scenario(scenario_name: str, ds):
+def _bamlss_formulas_for_scenario(scenario_name: str, ds: typing.Any) -> typing.Any:
     if ds["family"] != "gaussian":
         return None, None
     mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
@@ -6314,7 +6315,7 @@ def _bamlss_formulas_for_scenario(scenario_name: str, ds):
     return mu_formula, sigma_formula
 
 
-def _brms_formulas_for_scenario(scenario_name: str, ds):
+def _brms_formulas_for_scenario(scenario_name: str, ds: typing.Any) -> typing.Any:
     if ds["family"] != "gaussian":
         return None, None
     mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
@@ -6335,7 +6336,7 @@ def _brms_formulas_for_scenario(scenario_name: str, ds):
     return mu_formula, sigma_formula
 
 
-def run_external_r_bamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_r_bamlss_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6559,7 +6560,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_r_brms_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_r_brms_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
@@ -6775,7 +6776,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_mgcv_survival_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_mgcv_survival_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -6960,7 +6961,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_sksurv_rsf_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7051,7 +7052,7 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
     )
 
 
-def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_sksurv_coxnet_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7137,7 +7138,7 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
     )
 
 
-def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_lifelines_coxph_enet_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7238,7 +7239,7 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
     )
 
 
-def run_external_glmnet_cox_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_glmnet_cox_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7438,7 +7439,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     )
 
 
-def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_sksurv_gb_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7578,7 +7579,7 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
     ]
 
 
-def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_lifelines_aft_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7727,7 +7728,7 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
     ]
 
 
-def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+def run_external_xgboost_aft_cv(scenario: typing.Any, *, ds: dict | None = None, folds: list[Fold] | None = None) -> typing.Any:
     if ds is None:
         ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
@@ -7838,7 +7839,7 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
     )
 
 
-def _assert_basis_parity_for_scenario(s_cfg, *, ds: dict | None = None):
+def _assert_basis_parity_for_scenario(s_cfg: typing.Any, *, ds: dict | None = None) -> None:
     # Fairness guard: if Rust mapping requests a named spline family, mgcv must
     # emit the equivalent basis for the same scenario.
     if ds is None:
@@ -7866,13 +7867,13 @@ def _extra_excluded_contenders_for_profile() -> set[str]:
     return set()
 
 
-def _is_contender_enabled(s_cfg, contender: str) -> bool:
+def _is_contender_enabled(s_cfg: typing.Any, contender: str) -> bool:
     excluded = set(s_cfg.get("exclude_contenders", []))
     excluded.update(_extra_excluded_contenders_for_profile())
     return contender not in excluded
 
 
-def _append_enabled_result_rows(results: list[dict], rows, s_cfg) -> None:
+def _append_enabled_result_rows(results: list[dict], rows: typing.Any, s_cfg: typing.Any) -> None:
     if rows is None:
         return
     if not isinstance(rows, list):
@@ -7889,9 +7890,9 @@ def _append_enabled_result_rows(results: list[dict], rows, s_cfg) -> None:
 
 def _append_contender_result_if_enabled(
     results: list[dict],
-    s_cfg,
+    s_cfg: typing.Any,
     contender: str,
-    build_row,
+    build_row: typing.Any,
 ) -> None:
     if not _is_contender_enabled(s_cfg, contender):
         return
@@ -7900,7 +7901,7 @@ def _append_contender_result_if_enabled(
         results.append(row)
 
 
-def _required_contender_for_scenario(s_cfg, ds: dict) -> str | None:
+def _required_contender_for_scenario(s_cfg: typing.Any, ds: dict) -> str | None:
     contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
     if not _is_contender_enabled(s_cfg, contender):
         return None
@@ -7924,7 +7925,7 @@ def _format_blocking_failure(row: dict) -> str:
     return f"{contender} / {scenario_name}: {error or 'unknown error'}"
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run GAM benchmark suite with leakage-safe evaluation.")
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
     parser.add_argument("--out", type=Path, default=BENCH_DIR / "results.json")
@@ -8374,7 +8375,7 @@ def main():
 # Per-scenario comparison figures
 # ---------------------------------------------------------------------------
 
-def _metric_display_config(family: str):
+def _metric_display_config(family: str) -> typing.Any:
     """Return (metric_key, display_label, higher_is_better) tuples for a family."""
     if family == "binomial":
         return [
@@ -8409,7 +8410,7 @@ def _short_contender_label(name: str) -> str:
     )
 
 
-def _style_plot_ax(ax, *, bg_card: str, text_color: str, grid_color: str) -> None:
+def _style_plot_ax(ax: typing.Any, *, bg_card: str, text_color: str, grid_color: str) -> None:
     ax.set_facecolor(bg_card)
     ax.tick_params(colors=text_color, which="both")
     ax.spines["top"].set_visible(False)
@@ -8430,7 +8431,7 @@ def _subsample_plot_df(df: pd.DataFrame, max_points: int, seed: int = 42) -> pd.
     return df.iloc[keep].copy()
 
 
-def _plot_single_predictor_gaussian(ax, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_single_predictor_gaussian(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
     df = pd.DataFrame(
         {
             "x": payload["x"],
@@ -8446,7 +8447,7 @@ def _plot_single_predictor_gaussian(ax, payload: dict, *, accent: str, text_colo
     ax.text(0.02, 0.96, "actual points + OOF prediction", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_single_predictor_binomial(ax, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_single_predictor_binomial(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
     df = pd.DataFrame(
         {
             "x": payload["x"],
@@ -8479,7 +8480,7 @@ def _plot_single_predictor_binomial(ax, payload: dict, *, accent: str, text_colo
     ax.text(0.02, 0.96, "jittered class points + OOF probability", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_actual_vs_predicted(ax, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_actual_vs_predicted(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
     df = pd.DataFrame({"actual": payload["actual"], "predicted": payload["predicted"]})
     pts = _subsample_plot_df(df, max_points=3000)
     ax.scatter(pts["actual"], pts["predicted"], s=14, color=accent, alpha=0.5, linewidths=0, zorder=3)
@@ -8491,7 +8492,7 @@ def _plot_actual_vs_predicted(ax, payload: dict, *, accent: str, text_color: str
     ax.text(0.02, 0.96, "OOF predictions", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_binary_probability(ax, payload: dict, *, accent: str, text_color: str) -> None:
+def _plot_binary_probability(ax: typing.Any, payload: dict, *, accent: str, text_color: str) -> None:
     df = pd.DataFrame({"actual": payload["actual"], "predicted": payload["predicted"]}).sort_values("predicted")
     pts = _subsample_plot_df(df, max_points=2500)
     rng = np.random.default_rng(42)
@@ -8518,7 +8519,7 @@ def _plot_binary_probability(ax, payload: dict, *, accent: str, text_color: str)
     ax.text(0.02, 0.96, "jittered datapoints + binned event rate", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
 
 
-def _plot_survival_panel(ax, payload: dict, *, text_color: str) -> None:
+def _plot_survival_panel(ax: typing.Any, payload: dict, *, text_color: str) -> None:
     df = pd.DataFrame(
         {
             "time": payload["time"],

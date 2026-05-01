@@ -12,6 +12,7 @@ What it does:
 Outputs are written under tests/bench_tools and tests/bench_tools/bench_workdir.
 Run simply as:  python3 tests/bench_tools/bench.py
 """
+import typing
 
 import os
 import subprocess
@@ -39,7 +40,7 @@ EXECUTABLE_PATH = WORKSPACE_ROOT / "target" / "profiling" / "gnomon"
 PERF_PERCENT_LIMIT = 5
 
 
-def build_profiling_binary():
+def build_profiling_binary() -> None:
     env = os.environ.copy()
     # Always rebuild to ensure latest changes are profiled
     print("--- Building profiling binary (symbols kept) ---")
@@ -47,7 +48,7 @@ def build_profiling_binary():
     run_or_die(["cargo", "build", "--profile", "profiling"], cwd=WORKSPACE_ROOT, env=env)
 
 
-def run_or_die(cmd, cwd=None, env=None, stream=True):
+def run_or_die(cmd: typing.Any, cwd: typing.Any=None, env: typing.Any=None, stream: typing.Any=True) -> typing.Any:
     print(f"$ {' '.join(map(str, cmd))}")
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env,
@@ -64,7 +65,7 @@ def run_or_die(cmd, cwd=None, env=None, stream=True):
     return ret
 
 
-def run_capture(cmd, cwd=None, env=None):
+def run_capture(cmd: typing.Any, cwd: typing.Any=None, env: typing.Any=None) -> typing.Any:
     """Run a command and capture stdout into a list of lines without exiting on non-zero."""
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env,
@@ -167,7 +168,7 @@ def _dedup_label_blocks(lines: list[str]) -> list[str]:
                 normed.append(s)
         return "\n".join(normed)
 
-    def flush():
+    def flush() -> None:
         nonlocal buf, last_norm
         if not buf:
             return
@@ -189,7 +190,7 @@ def _dedup_label_blocks(lines: list[str]) -> list[str]:
     return out
 
 
-def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
+def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path) -> None:
     # Map mgcv columns -> calibrate training schema
     mapping = {
         "variable_two": "PC1",     # penalized PC-like
@@ -248,7 +249,7 @@ def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict) -> float:
     return 0.0
 
 
-def train_with_perf(train_tsv: Path, tag: str):
+def train_with_perf(train_tsv: Path, tag: str) -> typing.Any:
     # Compose the train command with realistic defaults
     cmd = [
         str(EXECUTABLE_PATH), "train",
@@ -481,7 +482,7 @@ def condensed_hot_paths(perf_data_path: Path) -> tuple[bool, str]:
     return True, "\n".join(lines_out)
 
 
-def main():
+def main() -> None:
     # 1) Build profiling binary
     build_profiling_binary()
     # No DSO priming needed (no annotate section)

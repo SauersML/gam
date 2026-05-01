@@ -35,6 +35,7 @@ Setup (mirrors the teammate brief):
   Outer LAML:
       V(theta) = F(beta*(theta), theta) + 1/2 log|H| - 1/2 log_pseudo|S|
 """
+import typing
 
 import json
 from pathlib import Path
@@ -73,24 +74,24 @@ psi_syms = sp.symbols('psi0 psi1', real=True)
 theta_syms = (rho_sym, psi_syms[0], psi_syms[1])  # ordered (rho, psi_0, psi_1)
 
 # Response basis (constant in psi).
-def R(a, y):  return 1 if a == 0 else y
-def Rp(a):    return 0 if a == 0 else 1
+def R(a: typing.Any, y: typing.Any) -> typing.Any:  return 1 if a == 0 else y
+def Rp(a: typing.Any) -> typing.Any:    return 0 if a == 0 else 1
 
 # Covariate basis with Gaussian length scales.
 centers_cov = [0.0, 1.0]
-def C(b, x):
+def C(b: typing.Any, x: typing.Any) -> typing.Any:
     return sp.exp(-psi_syms[b] * (x - centers_cov[b])**2)
 
-def kr(a, b):
+def kr(a: typing.Any, b: typing.Any) -> typing.Any:
     return a * p_cov + b
 
 # Per-observation h, h'.
-def h_obs(i):
+def h_obs(i: typing.Any) -> typing.Any:
     xi, yi = x_vals[i], y_vals[i]
     return sum(R(a, yi) * C(b, xi) * beta_syms[kr(a, b)]
                for a in range(p_resp) for b in range(p_cov))
 
-def hp_obs(i):
+def hp_obs(i: typing.Any) -> typing.Any:
     xi, yi = x_vals[i], y_vals[i]
     return sum(Rp(a) * C(b, xi) * beta_syms[kr(a, b)]
                for a in range(p_resp) for b in range(p_cov))
@@ -133,7 +134,7 @@ print("[setup] symbolic F and analytic gradient pieces lambdified.")
 # 3. beta*(theta): inner Newton on F_beta = 0
 # ---------------------------------------------------------------------------
 
-def beta_star(theta, beta_init_local=None, tol=1e-13, max_iter=80):
+def beta_star(theta: typing.Any, beta_init_local: typing.Any=None, tol: typing.Any=1e-13, max_iter: typing.Any=80) -> typing.Any:
     if beta_init_local is None:
         beta_init_local = beta_init
     b = np.array(beta_init_local, dtype=float)
@@ -158,7 +159,7 @@ print(f"[check] ||F_beta(beta*)|| = {np.linalg.norm(F_beta_at_star):.3e}")
 # 4. Analytic LAML gradient g(theta), broken into the four terms.
 # ---------------------------------------------------------------------------
 
-def laml_gradient_terms(theta, b=None):
+def laml_gradient_terms(theta: typing.Any, b: typing.Any=None) -> typing.Any:
     """Return (g, parts) where g is the q-vector outer gradient and parts is a
     dict with the four contributing pieces (each q-vector):
         F_theta_part     : F_{theta_i}(beta*, theta)
@@ -226,7 +227,7 @@ print(f"[grad ] g(theta0) = {g0}")
 # decomposition of the HVP.
 # ---------------------------------------------------------------------------
 
-def hessian_via_fd(theta, h=1e-5):
+def hessian_via_fd(theta: typing.Any, h: typing.Any=1e-5) -> typing.Any:
     """Centered FD of g around theta. Also returns per-term Hessians."""
     H_full = np.zeros((q, q))
     H_obj  = np.zeros((q, q))

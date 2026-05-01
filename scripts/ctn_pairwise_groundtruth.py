@@ -32,6 +32,7 @@ Indexing convention: beta is a length-p vector with p = p_resp * p_cov, and
 beta[j*p_cov + k] is the coefficient for response basis component j and
 covariate basis component k (matches Rust Khatri-Rao layout).
 """
+import typing
 
 import json
 from pathlib import Path
@@ -95,7 +96,7 @@ C_psi2   = [[x_aa, x_ab],
 # (and analogously for phi_prime via R_deriv).
 # ---------------------------------------------------------------------------
 
-def kron_per_row(R_row, C_row):
+def kron_per_row(R_row: typing.Any, C_row: typing.Any) -> typing.Any:
     r"""Return the length-p Khatri-Rao row R_row \otimes C_row (Kronecker)."""
     return np.outer(R_row, C_row).reshape(-1)
 
@@ -250,7 +251,7 @@ for a in range(psi_dim):
 #
 # pair_b_mat[a][b] = sum_i w_i ( q_ab P_i + q_ab Q_i )
 # ---------------------------------------------------------------------------
-def per_row_outer(u_mat, vmat):
+def per_row_outer(u_mat: typing.Any, vmat: typing.Any) -> typing.Any:
     """Per-row outer u * v^T (no symmetrization), shape (n, p, p)."""
     return np.einsum('ij,ik->ijk', u_mat, vmat)
 
@@ -341,7 +342,7 @@ H_eigs = np.linalg.eigvalsh(0.5 * (H_lik + H_lik.T)).tolist()
 # 11. Cross-check a, g, b via centered FD on the analytic per-row pieces.
 # We FD F_lik (and grad_beta, Hess_beta) wrt psi to ensure analytic matches.
 # ---------------------------------------------------------------------------
-def lik_pieces(psi_local, beta_local):
+def lik_pieces(psi_local: typing.Any, beta_local: typing.Any) -> typing.Any:
     C_loc = (x0 + psi_local[0]*x_a + psi_local[1]*x_b
              + 0.5*psi_local[0]**2 * x_aa + psi_local[0]*psi_local[1] * x_ab
              + 0.5*psi_local[1]**2 * x_bb)
@@ -358,7 +359,7 @@ def lik_pieces(psi_local, beta_local):
                            + np.outer(phi_prime_loc[i], phi_prime_loc[i]) / (hp_loc[i]**2))
     return F, g, H
 
-def fd_pair(a, b, h_step=1e-4):
+def fd_pair(a: typing.Any, b: typing.Any, h_step: typing.Any=1e-4) -> typing.Any:
     """Centered FD for d^2/d psi_a d psi_b of (F, g, H). Uses the 2D 4-point
     centered cross stencil for off-diagonal and centered second-difference
     for diagonal."""

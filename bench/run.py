@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import typing
 import argparse
 import json
 import os
@@ -25,14 +26,14 @@ SERIAL_ENV_OVERRIDES = {
 }
 
 
-def run_cmd(cmd):
+def run_cmd(cmd: typing.Any) -> typing.Any:
     env = os.environ.copy()
     env.update(SERIAL_ENV_OVERRIDES)
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def fmt(v):
+def fmt(v: typing.Any) -> typing.Any:
     if v is None:
         return "-"
     if isinstance(v, float):
@@ -40,7 +41,7 @@ def fmt(v):
     return str(v)
 
 
-def main():
+def main() -> typing.Any:
     p = argparse.ArgumentParser(
     )
     p.add_argument(

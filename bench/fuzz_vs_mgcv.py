@@ -44,6 +44,7 @@ Usage:
 """
 
 from __future__ import annotations
+import typing
 
 # Force unbuffered stdout so per-trial output appears in real time
 import sys
@@ -91,17 +92,17 @@ DEFAULT_RUST_TIMEOUT = 180
 # SMOOTH FUNCTION LIBRARY — 35+ functions
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _f_sine(x, rng):
+def _f_sine(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.sin(rng.uniform(0.5, 8) * x + rng.uniform(0, 2*np.pi))
 
-def _f_cosine_beat(x, rng):
+def _f_cosine_beat(x: typing.Any, rng: typing.Any) -> typing.Any:
     f1, f2 = rng.uniform(2, 6), rng.uniform(5, 10)
     return np.cos(f1 * x) * np.cos(f2 * x)
 
-def _f_poly(x, rng):
+def _f_poly(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.polyval(rng.randn(rng.randint(2, 7) + 1), x)
 
-def _f_step(x, rng):
+def _f_step(x: typing.Any, rng: typing.Any) -> typing.Any:
     cuts = np.sort(rng.uniform(np.percentile(x, 5), np.percentile(x, 95), rng.randint(1, 8)))
     levels = rng.randn(len(cuts) + 1) * 2
     out = np.full_like(x, levels[0])
@@ -109,57 +110,57 @@ def _f_step(x, rng):
         out = np.where(x > c, levels[i + 1], out)
     return out
 
-def _f_spike(x, rng):
+def _f_spike(x: typing.Any, rng: typing.Any) -> typing.Any:
     c = rng.uniform(np.percentile(x, 15), np.percentile(x, 85))
     w = rng.uniform(0.01, 0.2) * (np.ptp(x) + 1e-8)
     return rng.uniform(2, 10) * np.exp(-0.5 * ((x - c) / w)**2)
 
-def _f_multi_spike(x, rng):
+def _f_multi_spike(x: typing.Any, rng: typing.Any) -> typing.Any:
     return sum(_f_spike(x, rng) for _ in range(rng.randint(2, 5)))
 
-def _f_plateau(x, rng):
+def _f_plateau(x: typing.Any, rng: typing.Any) -> typing.Any:
     lo = rng.uniform(np.percentile(x, 5), np.percentile(x, 40))
     hi = rng.uniform(np.percentile(x, 60), np.percentile(x, 95))
     s = rng.uniform(5, 40) / (np.ptp(x) + 1e-8)
     return rng.uniform(1, 5) * (1/(1+np.exp(-s*(x-lo))) - 1/(1+np.exp(-s*(x-hi))))
 
-def _f_wiggly(x, rng):
+def _f_wiggly(x: typing.Any, rng: typing.Any) -> typing.Any:
     return sum(rng.uniform(.2, 2)*np.sin(rng.uniform(1, 20)*x + rng.uniform(0, 2*np.pi))
                for _ in range(rng.randint(4, 12)))
 
-def _f_linear(x, rng):
+def _f_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(-3, 3) * x
 
-def _f_quadratic(x, rng):
+def _f_quadratic(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.randn() * x**2 + rng.randn() * x + rng.randn()
 
-def _f_cubic(x, rng):
+def _f_cubic(x: typing.Any, rng: typing.Any) -> typing.Any:
     c = rng.randn(4); return c[0]*x**3 + c[1]*x**2 + c[2]*x + c[3]
 
-def _f_sqrt_abs(x, rng):
+def _f_sqrt_abs(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(1, 5) * np.sign(x) * np.sqrt(np.abs(x))
 
-def _f_log_abs(x, rng):
+def _f_log_abs(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(0.5, 3) * np.log1p(np.abs(x))
 
-def _f_sawtooth(x, rng):
+def _f_sawtooth(x: typing.Any, rng: typing.Any) -> typing.Any:
     f = rng.uniform(1, 6)
     return 2 * (f*x/(2*np.pi) - np.floor(0.5 + f*x/(2*np.pi)))
 
-def _f_chirp(x, rng):
+def _f_chirp(x: typing.Any, rng: typing.Any) -> typing.Any:
     f0, f1 = rng.uniform(0.5, 2), rng.uniform(4, 15)
     t = (x - x.min()) / (np.ptp(x) + 1e-8)
     return np.sin(2*np.pi*(f0*t + (f1-f0)*t**2/2))
 
-def _f_runge(x, rng):
+def _f_runge(x: typing.Any, rng: typing.Any) -> typing.Any:
     c = rng.uniform(-0.5, 0.5) * np.ptp(x)
     s = rng.uniform(0.05, 0.3) * np.ptp(x)
     return 1 / (1 + ((x - c) / s)**2)
 
-def _f_abs_sin(x, rng):
+def _f_abs_sin(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.abs(np.sin(rng.uniform(1, 6) * x))
 
-def _f_piecewise_linear(x, rng):
+def _f_piecewise_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
     breaks = np.sort(rng.uniform(x.min(), x.max(), rng.randint(2, 7)))
     slopes = rng.randn(len(breaks) + 1) * 2
     out = np.zeros_like(x); prev = x.min(); val = 0.0
@@ -169,71 +170,71 @@ def _f_piecewise_linear(x, rng):
     out[x >= prev] = val + slopes[-1]*(x[x >= prev]-prev)
     return out
 
-def _f_exp_decay(x, rng):
+def _f_exp_decay(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(1, 5) * np.exp(-rng.uniform(0.5, 5) * (x - x.min()) / (np.ptp(x)+1e-8))
 
-def _f_logistic(x, rng):
+def _f_logistic(x: typing.Any, rng: typing.Any) -> typing.Any:
     c = rng.uniform(np.percentile(x, 20), np.percentile(x, 80))
     s = rng.uniform(0.05, 0.5) * np.ptp(x)
     return rng.uniform(1, 5) / (1 + np.exp(-(x - c) / s))
 
-def _f_interaction_proxy(x, rng):
+def _f_interaction_proxy(x: typing.Any, rng: typing.Any) -> typing.Any:
     mid = np.median(x)
     return np.sin(rng.uniform(2, 6)*x)*(x < mid) + rng.uniform(.3, 2)*x*(x >= mid)
 
-def _f_modulated_sine(x, rng):
+def _f_modulated_sine(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.sin(rng.uniform(3, 10)*x) * np.cos(rng.uniform(0.5, 2)*x)
 
-def _f_cauchy_bump(x, rng):
+def _f_cauchy_bump(x: typing.Any, rng: typing.Any) -> typing.Any:
     c = rng.uniform(np.percentile(x, 20), np.percentile(x, 80))
     w = rng.uniform(0.02, 0.15) * np.ptp(x)
     return rng.uniform(1, 5) / (1 + ((x - c)/w)**2)
 
-def _f_triangle_wave(x, rng):
+def _f_triangle_wave(x: typing.Any, rng: typing.Any) -> typing.Any:
     f = rng.uniform(1, 6)
     return 2*np.abs(2*(f*x/(2*np.pi) - np.floor(f*x/(2*np.pi) + 0.5))) - 1
 
-def _f_double_well(x, rng):
+def _f_double_well(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(0.5, 3) * (x**4 - 2*x**2)
 
-def _f_near_flat_edge(x, rng):
+def _f_near_flat_edge(x: typing.Any, rng: typing.Any) -> typing.Any:
     edge = rng.choice([x.min(), x.max()])
     w = 0.05 * np.ptp(x)
     return rng.uniform(3, 10) * np.exp(-((x - edge)/w)**2)
 
-def _f_heterogeneous(x, rng):
+def _f_heterogeneous(x: typing.Any, rng: typing.Any) -> typing.Any:
     q = np.percentile(x, [25, 50, 75])
     return (np.sin(5*x)*(x<q[0]) + 2.0*(x>=q[0])*(x<q[1])
             - 3*(x-q[2])*(x>=q[1])*(x<q[2]) + np.cos(8*x)*(x>=q[2]))
 
-def _f_linear_wiggle(x, rng):
+def _f_linear_wiggle(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(-3, 3)*x + rng.uniform(0.05, 0.3)*np.sin(rng.uniform(5, 15)*x)
 
-def _f_sinc(x, rng):
+def _f_sinc(x: typing.Any, rng: typing.Any) -> typing.Any:
     s = rng.uniform(2, 8)
     u = s * x
     safe_u = np.where(np.abs(u) < 1e-8, 1.0, u)
     return np.where(np.abs(u) < 1e-8, 1.0, np.sin(safe_u) / safe_u) * rng.uniform(1, 5)
 
-def _f_wavelet(x, rng):
+def _f_wavelet(x: typing.Any, rng: typing.Any) -> typing.Any:
     s = rng.uniform(0.1, 0.5) * np.ptp(x)
     c = rng.uniform(np.percentile(x, 20), np.percentile(x, 80))
     t = (x - c) / s
     return (1 - t**2) * np.exp(-0.5 * t**2) * rng.uniform(2, 8)
 
-def _f_fractal_sum(x, rng):
+def _f_fractal_sum(x: typing.Any, rng: typing.Any) -> typing.Any:
     """Self-similar multi-scale oscillation."""
     out = np.zeros_like(x)
     for k in range(1, rng.randint(4, 8)):
         out += np.sin(2**k * x + rng.uniform(0, 2*np.pi)) / 2**k
     return out * rng.uniform(2, 5)
 
-def _f_smooth_then_jump(x, rng):
+def _f_smooth_then_jump(x: typing.Any, rng: typing.Any) -> typing.Any:
     jump_at = rng.uniform(np.percentile(x, 30), np.percentile(x, 70))
     jump_size = rng.uniform(2, 8) * rng.choice([-1, 1])
     return np.sin(2*x) + jump_size * (x > jump_at).astype(float)
 
-def _f_polynomial_ratio(x, rng):
+def _f_polynomial_ratio(x: typing.Any, rng: typing.Any) -> typing.Any:
     return (rng.randn()*x**2 + rng.randn()*x) / (1 + x**2)
 
 SMOOTH_FN = {
@@ -256,54 +257,54 @@ SMOOTH_FN = {
 # 2D / MULTIDIMENSIONAL SMOOTH FUNCTIONS (for Duchon / TPS)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _f2d_saddle(x1, x2, rng):
+def _f2d_saddle(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(1, 4) * (x1**2 - x2**2)
 
-def _f2d_dome(x1, x2, rng):
+def _f2d_dome(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(2, 6) * np.exp(-0.5*(x1**2 + x2**2))
 
-def _f2d_ridge(x1, x2, rng):
+def _f2d_ridge(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     angle = rng.uniform(0, np.pi)
     u = np.cos(angle)*x1 + np.sin(angle)*x2
     return _f_wiggly(u, rng)
 
-def _f2d_spiral(x1, x2, rng):
+def _f2d_spiral(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     r = np.sqrt(x1**2 + x2**2)
     theta = np.arctan2(x2, x1)
     return np.sin(rng.uniform(1, 4)*r + theta) * rng.uniform(1, 4)
 
-def _f2d_checkerboard(x1, x2, rng):
+def _f2d_checkerboard(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     freq = rng.uniform(1, 4)
     return np.sign(np.sin(freq*np.pi*x1) * np.sin(freq*np.pi*x2))
 
-def _f2d_manifold_1d(x1, x2, rng):
+def _f2d_manifold_1d(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     """Signal lives on a 1D manifold in 2D space."""
     u = rng.uniform(-1, 1)*x1 + rng.uniform(-1, 1)*x2
     return _f_wiggly(u, rng)
 
-def _f2d_radial_wave(x1, x2, rng):
+def _f2d_radial_wave(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     r = np.sqrt(x1**2 + x2**2 + 0.01)
     return np.sin(rng.uniform(2, 8)*r) / r * rng.uniform(1, 5)
 
-def _f2d_product(x1, x2, rng):
+def _f2d_product(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     """Pure interaction: f(x1) * g(x2)."""
     f1_name = rng.choice(list(SMOOTH_FN.keys()))
     f2_name = rng.choice(list(SMOOTH_FN.keys()))
     return SMOOTH_FN[f1_name](x1, rng) * SMOOTH_FN[f2_name](x2, rng)
 
-def _f2d_additive_plus_interaction(x1, x2, rng):
+def _f2d_additive_plus_interaction(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     main1 = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))](x1, rng)
     main2 = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))](x2, rng)
     interaction = rng.uniform(0.2, 1.5) * x1 * x2
     return main1 + main2 + interaction
 
-def _f2d_cliff(x1, x2, rng):
+def _f2d_cliff(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     """Sharp boundary in 2D."""
     angle = rng.uniform(0, np.pi)
     u = np.cos(angle)*x1 + np.sin(angle)*x2
     return rng.uniform(3, 8) / (1 + np.exp(-rng.uniform(5, 30)*u))
 
-def _f2d_volcano(x1, x2, rng):
+def _f2d_volcano(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
     r = np.sqrt(x1**2 + x2**2)
     peak_r = rng.uniform(0.3, 1.5)
     return rng.uniform(2, 6) * np.exp(-((r - peak_r)/0.3)**2)
@@ -320,44 +321,44 @@ SMOOTH_FN_2D = {
 # NOISE GENERATORS — 15 types
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _n_gaussian(n, sd, rng, **kw):     return rng.randn(n) * sd
-def _n_t(n, sd, rng, **kw):
+def _n_gaussian(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:     return rng.randn(n) * sd
+def _n_t(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     df = rng.uniform(2.5, 8); return rng.standard_t(df, n) * sd / np.sqrt(df/(df-2))
-def _n_laplace(n, sd, rng, **kw):      return rng.laplace(0, sd/np.sqrt(2), n)
-def _n_cauchy(n, sd, rng, **kw):       return rng.standard_cauchy(n) * sd * 0.3
-def _n_skew(n, sd, rng, **kw):
+def _n_laplace(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:      return rng.laplace(0, sd/np.sqrt(2), n)
+def _n_cauchy(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:       return rng.standard_cauchy(n) * sd * 0.3
+def _n_skew(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     a = rng.uniform(2, 8)*rng.choice([-1, 1]); z = rng.randn(n); u = rng.randn(n)
     raw = np.where(u < a*z, z, -z); return raw * sd/(np.std(raw)+1e-8)
-def _n_mixture(n, sd, rng, **kw):
+def _n_mixture(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     mix = rng.uniform(.1, .4); s2 = rng.uniform(3, 10)
     noise = rng.randn(n)*sd; noise[rng.random(n) < mix] *= s2; return noise
-def _n_uniform(n, sd, rng, **kw):      return rng.uniform(-sd*np.sqrt(3), sd*np.sqrt(3), n)
-def _n_hetero(n, sd, rng, x=None, **kw):
+def _n_uniform(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:      return rng.uniform(-sd*np.sqrt(3), sd*np.sqrt(3), n)
+def _n_hetero(n: typing.Any, sd: typing.Any, rng: typing.Any, x: typing.Any=None, **kw: typing.Any) -> typing.Any:
     if x is None: x = np.linspace(0, 1, n)
     t = (x - x.min())/(np.ptp(x)+1e-8); return rng.randn(n)*sd*(0.2 + 2*t)
-def _n_periodic_het(n, sd, rng, x=None, **kw):
+def _n_periodic_het(n: typing.Any, sd: typing.Any, rng: typing.Any, x: typing.Any=None, **kw: typing.Any) -> typing.Any:
     if x is None: x = np.linspace(0, 1, n)
     t = (x - x.min())/(np.ptp(x)+1e-8)
     return rng.randn(n)*sd*(0.5 + np.abs(np.sin(rng.uniform(2, 6)*np.pi*t)))
-def _n_lognormal(n, sd, rng, **kw):
+def _n_lognormal(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     raw = rng.lognormal(0, 1, n); raw -= raw.mean(); return raw*sd/(np.std(raw)+1e-8)
-def _n_sparse_outlier(n, sd, rng, **kw):
+def _n_sparse_outlier(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     noise = rng.randn(n)*sd
     k = max(1, int(n*rng.uniform(.01, .05)))
     noise[rng.choice(n, k, replace=False)] = rng.randn(k)*sd*rng.uniform(10, 50)
     return noise
-def _n_quantized(n, sd, rng, **kw):
+def _n_quantized(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     lev = rng.uniform(5, 20); return np.round(rng.randn(n)*sd*lev)/lev
-def _n_ar1(n, sd, rng, **kw):
+def _n_ar1(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     """Autocorrelated noise."""
     phi = rng.uniform(0.3, 0.95); e = rng.randn(n)*sd*np.sqrt(1-phi**2)
     out = np.zeros(n); out[0] = e[0]
     for i in range(1, n): out[i] = phi*out[i-1] + e[i]
     return out
-def _n_bimodal(n, sd, rng, **kw):
+def _n_bimodal(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     mask = rng.random(n) < 0.5
     return np.where(mask, rng.randn(n)*sd - sd*1.5, rng.randn(n)*sd + sd*1.5)
-def _n_contaminated(n, sd, rng, **kw):
+def _n_contaminated(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     """Normal with 5% contamination from a different mean."""
     noise = rng.randn(n)*sd
     k = max(1, int(n*0.05))
@@ -377,29 +378,29 @@ NOISE_FN = {
 # X DISTRIBUTIONS — 12 types
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _x_uniform(n, k, rng):         return rng.uniform(-1, 1, (n, k))
-def _x_normal(n, k, rng):          return rng.randn(n, k)
-def _x_skewed(n, k, rng):          r = rng.exponential(1, (n, k)); return r - r.mean(0)
-def _x_heavy(n, k, rng):           return rng.standard_t(3, (n, k))
-def _x_clustered(n, k, rng):
+def _x_uniform(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:         return rng.uniform(-1, 1, (n, k))
+def _x_normal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:          return rng.randn(n, k)
+def _x_skewed(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:          r = rng.exponential(1, (n, k)); return r - r.mean(0)
+def _x_heavy(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:           return rng.standard_t(3, (n, k))
+def _x_clustered(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     nc = rng.randint(2, 6); c = rng.randn(nc, k)*3
     return c[rng.randint(0, nc, n)] + rng.randn(n, k)*0.3
-def _x_bimodal(n, k, rng):
+def _x_bimodal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     m = rng.random((n, k)) < 0.5; return np.where(m, rng.randn(n, k)-2, rng.randn(n, k)+2)
-def _x_uniform_wide(n, k, rng):    return rng.uniform(-10, 10, (n, k))
-def _x_sparse(n, k, rng):
+def _x_uniform_wide(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:    return rng.uniform(-10, 10, (n, k))
+def _x_sparse(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     r = rng.randn(n, k); r[rng.random((n, k)) < 0.8] *= 0.1; return r
-def _x_grid(n, k, rng):
+def _x_grid(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     lev = rng.randint(5, 15); return np.round(rng.uniform(-1, 1, (n, k))*lev)/lev
-def _x_correlated(n, k, rng):
+def _x_correlated(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     z = rng.randn(n, k); L = rng.randn(k, k)*0.3; np.fill_diagonal(L, 1.0); return z @ L
-def _x_low_dim_manifold(n, k, rng):
+def _x_low_dim_manifold(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     """Features live on a low-dimensional manifold (intrinsic dim < k)."""
     intrinsic = max(1, k // 2)
     z = rng.randn(n, intrinsic)
     A = rng.randn(intrinsic, k)
     return z @ A + rng.randn(n, k) * 0.05
-def _x_mixture_of_lines(n, k, rng):
+def _x_mixture_of_lines(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     """Points clustered along random lines in feature space."""
     n_lines = rng.randint(2, 5)
     out = np.zeros((n, k))
@@ -424,22 +425,22 @@ XDIST_FN = {
 # SIGMA (VARIANCE) FUNCTIONS — for GAMLSS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _sigma_constant(x, rng):
+def _sigma_constant(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.ones_like(x[:, 0]) * rng.uniform(0.3, 3.0)
 
-def _sigma_linear(x, rng):
+def _sigma_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.exp(rng.uniform(-1, 1) * x[:, 0])
 
-def _sigma_smooth(x, rng):
+def _sigma_smooth(x: typing.Any, rng: typing.Any) -> typing.Any:
     fn = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
     raw = fn(x[:, 0], rng)
     return np.exp(raw / (np.std(raw) + 1e-8) * 0.5)
 
-def _sigma_bimodal(x, rng):
+def _sigma_bimodal(x: typing.Any, rng: typing.Any) -> typing.Any:
     mid = np.median(x[:, 0])
     return np.where(x[:, 0] < mid, rng.uniform(0.3, 1.0), rng.uniform(1.5, 5.0))
 
-def _sigma_periodic(x, rng):
+def _sigma_periodic(x: typing.Any, rng: typing.Any) -> typing.Any:
     return np.exp(0.5 * np.sin(rng.uniform(1, 5) * x[:, 0]))
 
 SIGMA_FN = {
@@ -452,7 +453,7 @@ SIGMA_FN = {
 # SIGNAL STRUCTURE GENERATORS — how smooth components combine
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _build_additive_signal(X, smooth_kinds, rng):
+def _build_additive_signal(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
     """Standard additive: f1(x1) + f2(x2) + ..."""
     eta = np.zeros(X.shape[0])
     for j, kind in enumerate(smooth_kinds):
@@ -462,7 +463,7 @@ def _build_additive_signal(X, smooth_kinds, rng):
         eta += contrib
     return eta
 
-def _build_additive_with_interactions(X, smooth_kinds, rng):
+def _build_additive_with_interactions(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
     """Additive + pairwise interactions."""
     eta = _build_additive_signal(X, smooth_kinds, rng)
     k = X.shape[1]
@@ -474,7 +475,7 @@ def _build_additive_with_interactions(X, smooth_kinds, rng):
             eta += strength * X[:, i] * X[:, j]
     return eta
 
-def _build_2d_surface(X, smooth_kinds, rng):
+def _build_2d_surface(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
     """Use 2D smooth functions on pairs of features."""
     eta = np.zeros(X.shape[0])
     k = X.shape[1]
@@ -495,7 +496,7 @@ def _build_2d_surface(X, smooth_kinds, rng):
         eta += contrib
     return eta
 
-def _build_low_dim_manifold(X, smooth_kinds, rng):
+def _build_low_dim_manifold(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
     """Signal depends on a low-dim projection of features."""
     k = X.shape[1]
     dim = max(1, min(k // 2, 3))
@@ -511,14 +512,14 @@ def _build_low_dim_manifold(X, smooth_kinds, rng):
         eta += contrib
     return eta
 
-def _build_stacked(X, smooth_kinds, rng):
+def _build_stacked(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
     """Composition: g(f1(x1) + f2(x2))."""
     inner = _build_additive_signal(X, smooth_kinds, rng)
     outer_fn = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
     inner_norm = inner / (np.std(inner) + 1e-8)
     return outer_fn(inner_norm, rng)
 
-def _build_regime(X, smooth_kinds, rng):
+def _build_regime(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
     """Different functions in different regions of feature space."""
     k = X.shape[1]
     split_dim = rng.randint(0, k)
@@ -601,7 +602,7 @@ def estimate_scenario_cost(sc: FuzzScenario) -> float:
     return cost
 
 
-def generate_scenario(seed: int, family_filter=None, model_type_filter=None) -> FuzzScenario:
+def generate_scenario(seed: int, family_filter: typing.Any=None, model_type_filter: typing.Any=None) -> FuzzScenario:
     rng = np.random.RandomState(seed)
     choice = lambda lst: lst[rng.randint(0, len(lst))]
 
@@ -764,7 +765,7 @@ def select_scenarios(
 # DATA GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_data(sc: FuzzScenario):
+def generate_data(sc: FuzzScenario) -> typing.Any:
     """Returns (train_df, test_df, feature_cols)."""
     rng = np.random.RandomState(sc.seed)
     n, k = sc.n_obs, sc.n_smooths
@@ -811,15 +812,15 @@ def generate_data(sc: FuzzScenario):
 # FORMULA GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _rhs_from_terms(terms):
+def _rhs_from_terms(terms: typing.Any) -> typing.Any:
     return " + ".join(terms) if terms else "1"
 
 
-def _formula_from_terms(response, terms):
+def _formula_from_terms(response: typing.Any, terms: typing.Any) -> typing.Any:
     return f"{response} ~ {_rhs_from_terms(terms)}"
 
 
-def _duchon_dims_for_centers(cols, sc, centers: int) -> int:
+def _duchon_dims_for_centers(cols: typing.Any, sc: typing.Any, centers: int) -> int:
     dims = min(max(int(sc.n_duchon_dims), 2), len(cols))
     order = int(sc.duchon_order)
     if order >= 1:
@@ -833,7 +834,7 @@ def _duchon_dims_for_centers(cols, sc, centers: int) -> int:
     return dims
 
 
-def _rust_mean_terms(cols, sc):
+def _rust_mean_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
@@ -847,11 +848,11 @@ def _rust_mean_terms(cols, sc):
         return [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols]
 
 
-def rust_mean_formula(cols, sc):
+def rust_mean_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
     return _formula_from_terms("y", _rust_mean_terms(cols, sc))
 
 
-def rust_noise_terms(cols, sc):
+def rust_noise_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
     """Noise terms for GAMLSS; --predict-noise expects only the RHS."""
     dp = "true" if sc.double_penalty else "false"
     if sc.basis_type == "duchon" and len(cols) >= 2:
@@ -869,7 +870,7 @@ def rust_noise_terms(cols, sc):
     return f"s({cols[0]}, type=ps, knots={max(3, sc.knots // 2)}, double_penalty={dp})"
 
 
-def build_rust_fit_cmd(sc, train_csv, model_json, cols):
+def build_rust_fit_cmd(sc: typing.Any, train_csv: typing.Any, model_json: typing.Any, cols: typing.Any) -> typing.Any:
     fit_cmd = [str(RUST_BINARY), "fit", "--out", model_json]
     if sc.model_type == "gamlss":
         fit_cmd += ["--predict-noise", rust_noise_terms(cols, sc)]
@@ -877,7 +878,7 @@ def build_rust_fit_cmd(sc, train_csv, model_json, cols):
     return fit_cmd
 
 
-def mgcv_formula(cols, sc):
+def mgcv_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
     if sc.basis_type == "duchon":
         dims = _duchon_dims_for_centers(cols, sc, sc.knots)
         d_cols = cols[:dims]
@@ -905,7 +906,7 @@ def mgcv_formula(cols, sc):
         return "y ~ " + " + ".join(terms)
 
 
-def mgcv_sigma_formula(cols, sc):
+def mgcv_sigma_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
     if sc.basis_type == "duchon" and len(cols) >= 2:
         # Mirror rust_noise_terms: poly-block + 2 floor satisfies both rust
         # (no auto-degrade) and mgcv (no "basis dimension reset" warning).
@@ -935,7 +936,7 @@ def mgcv_sigma_formula(cols, sc):
 # RUNNERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout):
+def run_rust(sc: typing.Any, train_df: typing.Any, test_df: typing.Any, cols: typing.Any, tmpdir: typing.Any, rust_timeout: typing.Any) -> typing.Any:
     train_csv = os.path.join(tmpdir, "train.csv")
     test_csv = os.path.join(tmpdir, "test.csv")
     model_json = os.path.join(tmpdir, "model.json")
@@ -998,7 +999,7 @@ def run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout):
         return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
 
-def run_mgcv(sc, train_df, test_df, cols, tmpdir, r_timeout):
+def run_mgcv(sc: typing.Any, train_df: typing.Any, test_df: typing.Any, cols: typing.Any, tmpdir: typing.Any, r_timeout: typing.Any) -> typing.Any:
     train_csv = os.path.join(tmpdir, "mgcv_train.csv")
     test_csv = os.path.join(tmpdir, "mgcv_test.csv")
     out_json = os.path.join(tmpdir, "mgcv_out.json")
@@ -1125,7 +1126,7 @@ tryCatch({{
         return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
 
 
-def _compute_metrics(family, y_test, y_train, preds):
+def _compute_metrics(family: typing.Any, y_test: typing.Any, y_train: typing.Any, preds: typing.Any) -> typing.Any:
     m = {}
     if family == "gaussian":
         m["r2"] = r2_score(y_test, preds)
@@ -1153,7 +1154,7 @@ class FuzzResult:
     primary_gap: Optional[float] = None
     primary_metric: Optional[str] = None
 
-    def compute_gap(self):
+    def compute_gap(self) -> None:
         fam = self.scenario["family"]
         if fam == "gaussian":
             self.primary_metric = "r2"
@@ -1253,7 +1254,7 @@ MIN_VALID_TRIAL_FRACTION = 0.80
 NAN_GATED_METRICS = ("r2", "auc", "rmse", "logloss", "mae", "brier")
 
 
-def _metric_is_nonfinite(value) -> bool:
+def _metric_is_nonfinite(value: typing.Any) -> bool:
     if value is None:
         return False
     try:
@@ -1263,7 +1264,7 @@ def _metric_is_nonfinite(value) -> bool:
     return not math.isfinite(f)
 
 
-def _metric_is_finite(value) -> bool:
+def _metric_is_finite(value: typing.Any) -> bool:
     if value is None:
         return False
     try:
@@ -1274,7 +1275,7 @@ def _metric_is_finite(value) -> bool:
 
 
 def compute_ci_gates(
-    results,
+    results: typing.Any,
     requested_trials: int,
     skipped_count: int = 0,
     baseline: Optional[dict] = None,
@@ -1441,7 +1442,7 @@ def compute_ci_gates(
     }
 
 
-def run_trial(sc, rust_timeout, r_timeout):
+def run_trial(sc: typing.Any, rust_timeout: typing.Any, r_timeout: typing.Any) -> typing.Any:
     train_df, test_df, cols = generate_data(sc)
     with tempfile.TemporaryDirectory(prefix="gam_fuzz_") as tmpdir:
         rust_out = run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout)
@@ -1455,7 +1456,7 @@ def run_trial(sc, rust_timeout, r_timeout):
 # REPORTING
 # ═══════════════════════════════════════════════════════════════════════════
 
-def print_leaderboard(results, top_n=25):
+def print_leaderboard(results: typing.Any, top_n: typing.Any=25) -> None:
     groups = {}
     for r in results:
         key = (r.scenario["family"], r.scenario["model_type"], r.scenario["basis_type"])
@@ -1569,7 +1570,7 @@ def _default_n_trials() -> int:
     return _DEPTH_DEFAULTS.get(depth, _DEPTH_DEFAULTS["default"])
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Adversarial fuzzer: Rust GAM vs mgcv")
     parser.add_argument("--n-trials", type=int, default=_default_n_trials(),
                         help="Number of trials. Defaults track FUZZ_DEPTH "

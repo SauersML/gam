@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import typing
 
 import argparse
 import math
@@ -49,7 +50,7 @@ class SurvivalDataset:
     fit_opts: dict[str, str]
 
 
-def _parse_f64_opt(v) -> float | None:
+def _parse_f64_opt(v: typing.Any) -> float | None:
     try:
         x = float(v)
     except (TypeError, ValueError):

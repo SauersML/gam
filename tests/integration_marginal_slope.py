@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """End-to-end integration test for marginal-slope and latent survival configs."""
+import typing
 
 import csv, math, os, random, shutil, subprocess, sys, tempfile
 
 GAM_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "gam")
 
 
-def generate_data(n=300, seed=42):
+def generate_data(n: typing.Any=300, seed: typing.Any=42) -> typing.Any:
     rng = random.Random(seed)
     raw_z = [rng.gauss(0, 1) for _ in range(n)]
     mu_z = sum(raw_z) / n
@@ -38,7 +39,7 @@ def generate_data(n=300, seed=42):
     return rows
 
 
-def _is_finite(v):
+def _is_finite(v: typing.Any) -> typing.Any:
     try:
         f = float(v)
     except (TypeError, ValueError):
@@ -46,7 +47,7 @@ def _is_finite(v):
     return f == f and f not in (float("inf"), float("-inf"))
 
 
-def _validate_prediction_output(name, path):
+def _validate_prediction_output(name: typing.Any, path: typing.Any) -> None:
     """Read the prediction CSV produced by gam predict and assert it
     looks like a valid probability or survival output. Raises RuntimeError
     on contract violation so the caller treats it as a failed run."""
@@ -102,14 +103,14 @@ def _validate_prediction_output(name, path):
         )
 
 
-def write_csv(rows, path):
+def write_csv(rows: typing.Any, path: typing.Any) -> None:
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
 
 
-def run(args, label, timeout=240):
+def run(args: typing.Any, label: typing.Any, timeout: typing.Any=240) -> typing.Any:
     cmd = [GAM_BIN] + args
     print(f"\n{'='*60}\n{label}\n{'='*60}")
     try:
@@ -128,7 +129,7 @@ def run(args, label, timeout=240):
     return True
 
 
-def main():
+def main() -> typing.Any:
     if not os.path.exists(GAM_BIN):
         print(f"Binary not found: {GAM_BIN}")
         sys.exit(1)
@@ -142,21 +143,21 @@ def main():
     print(f"Data: {len(rows)} rows, {ne} events ({100*ne//len(rows)}%), {nd} disease ({100*nd//len(rows)}%)")
 
     R = {}
-    def mp(name): return os.path.join(tmpdir, f"{name}.gam")
+    def mp(name: typing.Any) -> typing.Any: return os.path.join(tmpdir, f"{name}.gam")
 
-    def bern(name, logslope_formula, extra):
+    def bern(name: typing.Any, logslope_formula: typing.Any, extra: typing.Any) -> None:
         R[name] = run(
             ["fit", dp, "disease ~ s(bmi)", "--z-column", "z",
              "--logslope-formula", logslope_formula, "--out", mp(name)] + extra, name)
 
-    def surv(name, rhs, extra, logslope_formula=None):
+    def surv(name: typing.Any, rhs: typing.Any, extra: typing.Any, logslope_formula: typing.Any=None) -> None:
         args = ["fit", dp, f"Surv(age_entry, age_exit, event) ~ {rhs}"]
         if logslope_formula is not None:
             args += ["--logslope-formula", logslope_formula]
         args += ["--out", mp(name)] + extra
         R[name] = run(args, name)
 
-    def pred(name):
+    def pred(name: typing.Any) -> None:
         if R.get(name) and os.path.exists(mp(name)):
             out = os.path.join(tmpdir, f"{name}_pred.csv")
             R[f"pred_{name}"] = run(

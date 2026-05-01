@@ -5,6 +5,7 @@ This script runs inside the GitHub Actions workflow and asks Jules to improve
 existing Lean files in the repository. It only commits patches that modify
 existing `*.lean` files and do not regress a previously passing Lean check.
 """
+import typing
 import datetime
 import os
 import re
@@ -24,13 +25,13 @@ DIRECT_PR_ERROR = (
 )
 
 
-def strip_ansi(text):
+def strip_ansi(text: typing.Any) -> typing.Any:
     """Remove ANSI escape sequences from a log string."""
     ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
     return ansi_escape.sub("", text)
 
 
-def run_command(cmd, check=False):
+def run_command(cmd: typing.Any, check: typing.Any=False) -> typing.Any:
     """Run a shell command and return stripped stdout, stderr, and exit code."""
     if isinstance(cmd, list):
         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
@@ -43,7 +44,7 @@ def run_command(cmd, check=False):
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
-def filter_noise(logs):
+def filter_noise(logs: typing.Any) -> typing.Any:
     """Drop routine build noise from Lean logs."""
     noise_patterns = [
         "Replayed Mathlib.",
@@ -59,7 +60,7 @@ def filter_noise(logs):
     return "\n".join(filtered_lines)
 
 
-def get_run_info():
+def get_run_info() -> typing.Any:
     """Read the latest local build status and filtered logs from the environment."""
     local_log_file = os.environ["LOCAL_LOG_FILE"]
     local_status = os.environ["LOCAL_BUILD_STATUS"]
@@ -72,7 +73,7 @@ def get_run_info():
     return local_status, logs
 
 
-def verify_lean_build():
+def verify_lean_build() -> typing.Any:
     """Run the local Lean check script and report whether it succeeded."""
     _, stderr, code = run_command("./scripts/lean-check-all.sh")
     if code != 0 and stderr:
@@ -80,7 +81,7 @@ def verify_lean_build():
     return code == 0
 
 
-def call_jules(prompt, attempt):
+def call_jules(prompt: typing.Any, attempt: typing.Any) -> typing.Any:
     """Submit a prompt to Jules and poll until a changeset is available."""
     api_key = os.environ["JULES_API_KEY"]
     repo = os.environ["GITHUB_REPOSITORY"]
@@ -132,7 +133,7 @@ def call_jules(prompt, attempt):
     return None
 
 
-def validate_patch(patch):
+def validate_patch(patch: typing.Any) -> typing.Any:
     """Reject patches that violate the repository's mutation rules."""
     additions = 0
     deletions = 0
@@ -171,7 +172,7 @@ def validate_patch(patch):
     return True, ""
 
 
-def build_prompt(conclusion, logs):
+def build_prompt(conclusion: typing.Any, logs: typing.Any) -> typing.Any:
     """Build the Jules prompt for the current build outcome."""
     # Common restrictions for all prompts
     version_restriction = (
@@ -250,7 +251,7 @@ def build_prompt(conclusion, logs):
     return prompt
 
 
-def get_changeset(prompt):
+def get_changeset(prompt: typing.Any) -> typing.Any:
     """Retry Jules until a changeset is returned or retries are exhausted."""
     for attempt in range(1, MAX_RETRIES + 1):
         changeset = call_jules(prompt, attempt)
@@ -261,7 +262,7 @@ def get_changeset(prompt):
     return None
 
 
-def apply_patch_on_branch(patch):
+def apply_patch_on_branch(patch: typing.Any) -> typing.Any:
     """Write, validate, and apply the generated patch on a fresh branch."""
     with open("jules.patch", "w", encoding="utf-8") as handle:
         handle.write(patch)
@@ -280,7 +281,7 @@ def apply_patch_on_branch(patch):
     return branch_name
 
 
-def create_pull_request(message, branch_name):
+def create_pull_request(message: typing.Any, branch_name: typing.Any) -> None:
     """Push the branch and open a pull request with the commit message."""
     run_command(["git", "commit", "-m", message], check=True)
     run_command(f"git push origin {branch_name}", check=True)
@@ -315,7 +316,7 @@ def create_pull_request(message, branch_name):
     )
 
 
-def main():
+def main() -> None:
     """Run the Jules improvement loop and open a PR for accepted changes."""
     conclusion, logs = get_run_info()
     prompt = build_prompt(conclusion, logs)

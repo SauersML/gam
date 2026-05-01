@@ -1,3 +1,4 @@
+import typing
 import csv
 import importlib.util
 import sys
@@ -382,7 +383,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
-            def _fake_run_cmd(cmd, cwd=None):
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> None:
                 if cmd[1] == "fit":
                     fit_input = Path(cmd[-2])
                     snapshots["fit_formula"] = cmd[-1]
@@ -505,7 +506,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
-            def _fake_run_cmd(cmd, cwd=None):
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> None:
                 if cmd[1] == "fit":
                     Path(cmd[cmd.index("--out") + 1]).write_text("{}", encoding="utf-8")
                     return 0, "", ""

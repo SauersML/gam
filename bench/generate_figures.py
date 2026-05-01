@@ -9,6 +9,7 @@ Reads a merged results JSON, generates one PNG per scenario, and bundles
 them into a single .zip for easy download from GitHub Actions.
 """
 from __future__ import annotations
+import typing
 
 import json
 import sys
@@ -25,7 +26,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 # Metric config per family
 # ---------------------------------------------------------------------------
 
-def _metric_display_config(family: str):
+def _metric_display_config(family: str) -> typing.Any:
     if family == "binomial":
         return [
             ("auc", "AUC", True),
@@ -226,7 +227,7 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
     return paths
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 4:
         print(f"Usage: {sys.argv[0]} <results.json> <fig_dir> <figures.zip>")
         sys.exit(1)

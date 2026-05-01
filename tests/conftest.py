@@ -14,6 +14,7 @@ kind of data through two different entry points.
 """
 
 from __future__ import annotations
+import typing
 
 import numpy as np
 import pandas as pd
@@ -88,7 +89,7 @@ def synthetic_biobank() -> pd.DataFrame:
 
 
 @pytest.fixture
-def synthetic_biobank_factory():
+def synthetic_biobank_factory() -> typing.Any:
     """Factory form for tests that want a custom (seed, n)."""
     def _factory(seed: int = 0, n: int = 200) -> pd.DataFrame:
         return _build_synthetic_biobank(seed=seed, n=n)

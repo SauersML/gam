@@ -29,6 +29,7 @@ Run order:
     2. python3 scripts/ctn_pairwise_verifier.py
        (loads the Rust JSON, computes the reference, diffs)
 """
+import typing
 
 import json
 import os
@@ -37,7 +38,7 @@ import sys
 import numpy as np
 
 
-def main():
+def main() -> typing.Any:
     # ── Toy fixture (must match transformation_normal.rs:tests exactly) ──
     psi = np.array([0.15, -0.10])
     beta = np.array([0.15, -0.05, 0.80, 0.30])
@@ -86,7 +87,7 @@ def main():
     n = 4
     beta_jk = beta.reshape(p_resp, p_cov)  # β_jk = β[j*p_cov+k]
 
-    def lifted_forward(resp_basis, cov_mat):
+    def lifted_forward(resp_basis: typing.Any, cov_mat: typing.Any) -> typing.Any:
         # returns n-vector: Σ_j R[i,j] · (cov_mat @ β_jk_j)[i]
         out = np.zeros(n)
         for j in range(p_resp):

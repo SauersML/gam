@@ -1,3 +1,4 @@
+import typing
 import importlib.util
 import os
 import sys
@@ -17,7 +18,7 @@ sys.modules[_SPEC.name] = _FUZZ
 _SPEC.loader.exec_module(_FUZZ)
 
 
-def _scenario(**overrides):
+def _scenario(**overrides: typing.Any) -> typing.Any:
     base = {
         "double_penalty": True,
         "basis_type": "ps",
@@ -113,9 +114,9 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertLess(_FUZZ.estimate_scenario_cost(small), 75_000)
 
 
-def _trial(*, family="gaussian", model_type="gam", basis="ps",
-           gap=None, rust_metric=None, mgcv_metric=None,
-           rust=None, mgcv=None, seed=0):
+def _trial(*, family: typing.Any="gaussian", model_type: typing.Any="gam", basis: typing.Any="ps",
+           gap: typing.Any=None, rust_metric: typing.Any=None, mgcv_metric: typing.Any=None,
+           rust: typing.Any=None, mgcv: typing.Any=None, seed: typing.Any=0) -> typing.Any:
     primary_metric = "r2" if family == "gaussian" else "auc"
     rv = rust_metric if rust_metric is not None else (None if gap is None else 0.5)
     mv = mgcv_metric if mgcv_metric is not None else (None if gap is None else (rv + gap if rv is not None else None))

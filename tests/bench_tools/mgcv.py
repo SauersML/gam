@@ -1,3 +1,4 @@
+import typing
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,7 +17,7 @@ N_BINS = 20
 NOISE_BLEND_FACTOR = 0.4
 
 
-def generate_data(n_samples, alpha, linear_mode=False, noise_mode=False):
+def generate_data(n_samples: typing.Any, alpha: typing.Any, linear_mode: typing.Any=False, noise_mode: typing.Any=False) -> typing.Any:
     """
     Generates data by explicitly blending a clean signal with a 50/50
     noise probability. This provides a structured, interpretable way to
@@ -72,7 +73,7 @@ def generate_data(n_samples, alpha, linear_mode=False, noise_mode=False):
     return df
 
 
-def create_binned_plots(df, alpha, linear_mode=False, noise_mode=False):
+def create_binned_plots(df: typing.Any, alpha: typing.Any, linear_mode: typing.Any=False, noise_mode: typing.Any=False) -> None:
     """
     Creates plots showing the binned probability of outcome=1 against each
     independent variable, adapted for the generation mode. It now also plots
@@ -121,7 +122,7 @@ def create_binned_plots(df, alpha, linear_mode=False, noise_mode=False):
     plt.show()
 
 
-def main():
+def main() -> None:
     """
     Parses command-line arguments and runs the data generation and plotting.
     """
