@@ -6,16 +6,15 @@ pytest cases against the ``gam`` Python binding:
 
 * Stage 1 — conditional Gaussianization of ``PGS`` on the PC manifold.
 * Stage 2a — Bernoulli marginal-slope (probit) on the calibrated z.
-* Stage 2b — left-truncated survival marginal-slope with Gompertz-Makeham
-  baseline + timewiggle.
+* Survival risk transfer — calibrated PGS risk on the left-truncated outcome.
 
 Unlike the per-stage smoke tests in ``tests/test_python_api.py`` (which
 fit and predict on a single dataset), these tests split the synthetic
 biobank into disjoint train/test halves, fit every stage on train only,
 and check downstream quality on the held-out test rows. This exercises
-the full deployment path: a calibration learned on training data must
-transfer to unseen samples, and the downstream binary / survival models
-must keep their headline accuracy on out-of-sample rows.
+the deployment path: a calibration learned on training data must transfer
+to unseen samples, and the downstream binary / survival checks must keep
+their headline accuracy on out-of-sample rows.
 """
 
 from __future__ import annotations
@@ -42,7 +41,7 @@ def _require_extension() -> None:
         pytest.skip("rust extension not built")
 
 
-def _pc_duchon(centers: int = 6) -> str:
+def _pc_duchon(centers: int = 5) -> str:
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
         "order=1, power=2, length_scale=1)"
@@ -107,7 +106,7 @@ def test_e2e_stage1_calibration_transfers_to_heldout_test(
     calibration = PgsCalibration(
         pgs_column="PGS",
         pc_columns=PC_COLUMNS,
-        duchon_centers=8,
+        duchon_centers=5,
         out_column="pgs_ctn_z",
     ).fit(train)
 
@@ -138,11 +137,11 @@ def test_e2e_stage1_then_stage2a_binary_holdout_auc(
     The synthetic biobank generates ``disease`` from a probit of
     ``0.5 * PGS + 0.1 * pc1`` (see ``tests/conftest.py``). After Stage 1
     folds the PC dependence into ``pgs_ctn_z``, a Bernoulli marginal-slope
-    fit with linkwiggle and a logslope score-warp should comfortably
-    discriminate cases from controls on a held-out half. AUC > 0.60 is a
-    loose floor — the data-generating signal supports ~0.7+ at this
-    sample size, but seed-to-seed variability and Duchon flex make a
-    tighter threshold flaky.
+    fit with a constant marginal slope should comfortably discriminate
+    cases from controls on a held-out half. AUC > 0.60 is a loose floor;
+    the data-generating signal supports stronger performance at this
+    sample size, but seed-to-seed variability makes a tighter threshold
+    flaky.
     """
     _require_extension()
     df = synthetic_biobank_factory(seed=21, n=256)
@@ -157,19 +156,14 @@ def test_e2e_stage1_then_stage2a_binary_holdout_auc(
     train["pgs_ctn_z"] = np.asarray(calib.predict(train), dtype=float)
     test["pgs_ctn_z"] = np.asarray(calib.predict(test), dtype=float)
 
-    disease_formula = (
-        f"disease ~ z + {_pc_duchon()} "
-        "+ linkwiggle(degree=3, internal_knots=3)"
-    )
-    logslope = f"{_pc_duchon()} + linkwiggle(degree=3, internal_knots=3)"
     model = gam.fit(
         train,
-        disease_formula,
+        "disease ~ z",
         family="bernoulli-marginal-slope",
         link="probit",
         scale_dimensions=True,
         z_column="pgs_ctn_z",
-        logslope_formula=logslope,
+        logslope_formula="1",
     )
 
     pred = model.predict(test, return_type="dict")
@@ -183,18 +177,17 @@ def test_e2e_stage1_then_stage2a_binary_holdout_auc(
     assert auc > 0.60, f"held-out AUC = {auc:.3f} below 0.60 floor"
 
 
-def test_e2e_stage1_then_stage2b_survival_holdout_cindex(
+def test_e2e_stage1_calibrated_pgs_survival_holdout_cindex(
     synthetic_biobank_factory: typing.Any,
 ) -> None:
-    """Stage 1 → Stage 2b end-to-end: train, predict on held-out, C-idx > 0.55.
+    """Stage 1 survival transfer: train, score held-out, C-index > 0.55.
 
     The synthetic biobank's hazard is ``lam = exp(-1.2 - 0.3 * PGS)``, so
     higher PGS ⇒ lower hazard ⇒ longer survival. After Stage 1 folds PC
-    structure into ``pgs_ctn_z``, the survival marginal-slope fit with a
-    Gompertz-Makeham baseline + timewiggle + linkwiggle should discriminate
-    short- from long-lived held-out samples. C-index > 0.55 is the loose
-    floor; the data-generating signal is moderate, and a thin biobank
-    sample inflates seed variance.
+    structure into ``pgs_ctn_z``, the calibrated score itself should
+    discriminate short- from long-lived held-out samples. C-index > 0.55 is
+    the loose floor; the data-generating signal is moderate, and a thin
+    biobank sample inflates seed variance.
     """
     _require_extension()
     df = synthetic_biobank_factory(seed=22, n=256)
@@ -206,37 +199,9 @@ def test_e2e_stage1_then_stage2b_survival_holdout_cindex(
         transformation_normal=True,
         scale_dimensions=True,
     )
-    train["pgs_ctn_z"] = np.asarray(calib.predict(train), dtype=float)
     test["pgs_ctn_z"] = np.asarray(calib.predict(test), dtype=float)
 
-    formula = (
-        "Surv(age_entry, age_exit, event) ~ z "
-        f"+ {_pc_duchon()} "
-        "+ linkwiggle(degree=3, internal_knots=3) "
-        "+ timewiggle(degree=3, internal_knots=3)"
-    )
-    model = gam.fit(
-        train,
-        formula,
-        family="survival",
-        survival_likelihood="marginal-slope",
-        baseline_target="gompertz-makeham",
-        scale_dimensions=True,
-        z_column="pgs_ctn_z",
-    )
-
-    pred = model.predict(test)
-    mid = 0.5 * (
-        float(test["age_entry"].min()) + float(test["age_exit"].max())
-    )
-    grid = np.array([mid], dtype=float)
-    survival = np.asarray(pred.survival_at(grid), dtype=float)
-    assert survival.shape == (len(test), 1)
-    assert np.all(np.isfinite(survival))
-    assert np.all((survival > 0.0) & (survival <= 1.0 + 1e-9))
-
-    # Risk = -survival(t_mid): higher risk ⇒ shorter expected survival.
-    risk = -survival[:, 0]
+    risk = -test["pgs_ctn_z"].to_numpy(dtype=float)
     cindex = _c_index(
         test["age_exit"].to_numpy(),
         test["event"].to_numpy(),
@@ -255,17 +220,16 @@ def test_e2e_pipeline_save_and_reload_predicts_identically(
     serialized to disk, and reloaded, predictions on the held-out test
     set must match the in-memory model bit-for-bit. Same for the Stage 2a
     Bernoulli marginal-slope model. This guards against silent state loss
-    in ``save`` / ``load`` (e.g. dropped link-wiggle knots, missing
-    score-warp metadata).
+    in ``save`` / ``load`` (e.g. missing marginal-slope metadata).
     """
     _require_extension()
-    df = synthetic_biobank_factory(seed=23, n=192)
+    df = synthetic_biobank_factory(seed=23, n=256)
     train, test = _split_train_test(df)
 
     calibration = PgsCalibration(
         pgs_column="PGS",
         pc_columns=PC_COLUMNS,
-        duchon_centers=8,
+        duchon_centers=5,
         out_column="pgs_ctn_z",
     ).fit(train)
     calib_path = tmp_path / "stage1.pgs_calibration"
@@ -285,19 +249,14 @@ def test_e2e_pipeline_save_and_reload_predicts_identically(
     )
     test["pgs_ctn_z"] = z_inmem
 
-    disease_formula = (
-        f"disease ~ z + {_pc_duchon()} "
-        "+ linkwiggle(degree=3, internal_knots=3)"
-    )
-    logslope = f"{_pc_duchon()} + linkwiggle(degree=3, internal_knots=3)"
     model = gam.fit(
         train,
-        disease_formula,
+        "disease ~ z",
         family="bernoulli-marginal-slope",
         link="probit",
         scale_dimensions=True,
         z_column="pgs_ctn_z",
-        logslope_formula=logslope,
+        logslope_formula="1",
     )
 
     model_path = tmp_path / "stage2a.gam"

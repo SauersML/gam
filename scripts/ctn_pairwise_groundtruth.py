@@ -258,13 +258,10 @@ def per_row_outer(u_mat: typing.Any, vmat: typing.Any) -> typing.Any:
 pair_b_mat = np.zeros((psi_dim, psi_dim, p, p))
 
 # Cache rank-1 outers we reuse.
-P_outer       = per_row_outer(phi, phi)                        # phi phi^T
-Pp_outer      = [per_row_outer(phi_psi[m], phi) for m in range(psi_dim)]      # (q_m phi) phi^T
 R_outer       = per_row_outer(phi_prime, phi_prime)            # phi' phi'^T
 Rp_outer      = [per_row_outer(phip_psi[m], phi_prime) for m in range(psi_dim)]  # (q_m phi') phi'^T
 
 v_scalar    = inv_hp2
-v_a   = [-2.0 * hp_m[m] * inv_hp3 for m in range(psi_dim)]
 # v_ab depends on (a,b); compute inside the loop.
 
 for a in range(psi_dim):
@@ -435,6 +432,7 @@ out = {
         "hp_per_row":           hp.tolist(),
         "grad_beta_neglogL":    g_lik.tolist(),
         "Hess_beta_neglogL":    H_lik.tolist(),
+        "Hess_beta_logdet_sign": float(sign_H),
         "Hess_beta_logdet":     float(H_logdet),
         "Hess_beta_eigvals":    H_eigs,
     },

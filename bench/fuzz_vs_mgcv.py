@@ -403,14 +403,14 @@ def _x_low_dim_manifold(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing
 def _x_mixture_of_lines(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     """Points clustered along random lines in feature space."""
     n_lines = rng.randint(2, 5)
+    directions = rng.randn(n_lines, k)
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True) + 1e-8
+    origins = rng.randn(n_lines, k) * 2
     out = np.zeros((n, k))
     for i in range(n):
         line_id = rng.randint(0, n_lines)
-        direction = rng.randn(k)
-        direction /= np.linalg.norm(direction) + 1e-8
-        origin = rng.randn(k) * 2
         t = rng.randn() * 2
-        out[i] = origin + t * direction + rng.randn(k) * 0.1
+        out[i] = origins[line_id] + t * directions[line_id] + rng.randn(k) * 0.1
     return out
 
 XDIST_FN = {

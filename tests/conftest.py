@@ -1,11 +1,9 @@
 """Shared pytest fixtures for the Python test suite.
 
-The ``synthetic_biobank`` fixture provides a compact biobank-like DataFrame
-with PCs, a raw PGS, a binary disease outcome, and left-truncated survival
-columns. It is the single source of truth for the three pipeline smoke
-tests in ``tests/test_python_api.py`` and for the demo in
-``examples/pgs_calibration_pipeline.py`` (which imports it through
-``load_biobank_sample``).
+The ``synthetic_biobank_factory`` fixture builds compact biobank-like
+DataFrames with PCs, a raw PGS, a binary disease outcome, and left-truncated
+survival columns. It is the single source of truth for the pipeline smoke
+tests in ``tests/test_python_api.py`` and ``tests/test_e2e_pgs_pipeline.py``.
 
 The column schema is intentionally the same schema the CLI-based
 integration tests at ``tests/integration_pit_pipeline.py`` exercise, so
@@ -80,13 +78,6 @@ def _build_synthetic_biobank(seed: int = 0, n: int = 200) -> pd.DataFrame:
             "event": event,
         }
     )
-
-
-@pytest.fixture
-def synthetic_biobank() -> pd.DataFrame:
-    """Default fixture: seed=0, n=200."""
-    return _build_synthetic_biobank(seed=0, n=200)
-
 
 @pytest.fixture
 def synthetic_biobank_factory() -> typing.Any:
