@@ -8071,13 +8071,15 @@ pub fn operator_penalty_candidates_closed_form(
     let kappa = 1.0 / length_scale.max(1e-300);
 
     // Per-q Duchon convergence regime: closed-form Lebesgue kernel matrix is
-    // PSD only when both UV `4(m+s) > d + 2q` and IR `d + 2q > 4m` hold.
-    // Outside this regime the analytic radial-derivative finite-part value can
-    // produce non-PSD matrices (rank=0 / negative eigenvalues), so fall back
-    // to per-q collocation D_q^T D_q. Predicate matches the pure-Duchon path
-    // for consistency; hybrid κ>0 has strictly larger convergence region but
-    // we use the conservative shared predicate to avoid silently shipping
-    // non-PSD penalties.
+    // PSD only when both UV `4(m+s) > d + 2q` and IR `d + 2q > 4m` hold,
+    // AND the partial-fraction expansion in `isotropic_duchon_penalty`
+    // requires `2m - q ≥ 1` (asserted at basis.rs:16953). Outside this
+    // regime the analytic radial-derivative finite-part value can produce
+    // non-PSD matrices (rank=0 / negative eigenvalues) or panic outright,
+    // so fall back to per-q collocation D_q^T D_q. Hybrid κ>0 has a
+    // strictly larger PSD-convergence region than pure-Riesz but we keep
+    // the conservative shared predicate to avoid silently shipping non-PSD
+    // penalties.
     let m = p_order;
     let s = s_order;
     let d = centers.ncols();
@@ -8085,7 +8087,7 @@ pub fn operator_penalty_candidates_closed_form(
         let four_ms = 4 * (m + s);
         let dp2q = d + 2 * q;
         let four_m = 4 * m;
-        four_ms > dp2q && dp2q > four_m
+        four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1
     };
 
     let s1_raw = if closed_form_converges(1) {
