@@ -48,7 +48,7 @@ import typing
 
 # Force unbuffered stdout so per-trial output appears in real time
 import sys
-sys.stdout.reconfigure(line_buffering=True)
+typing.cast(typing.Any, sys.stdout).reconfigure(line_buffering=True)
 
 import argparse
 import inspect
@@ -604,7 +604,9 @@ def estimate_scenario_cost(sc: FuzzScenario) -> float:
 
 def generate_scenario(seed: int, family_filter: typing.Any=None, model_type_filter: typing.Any=None) -> FuzzScenario:
     rng = np.random.RandomState(seed)
-    choice = lambda lst: lst[rng.randint(0, len(lst))]
+
+    def choice(values: typing.Sequence[typing.Any]) -> typing.Any:
+        return values[int(rng.randint(0, len(values)))]
 
     family = family_filter or choice(["gaussian"]*3 + ["binomial"]*2)
     model_type = model_type_filter or choice(["gam"]*4 + ["gamlss"]*2)
@@ -1310,18 +1312,18 @@ def compute_ci_gates(
         })
 
     # Gate 2: cohort median gap regressions.
-    cohorts: dict[str, typing.Any] = {}
+    cohorts: dict[tuple[typing.Any, typing.Any, typing.Any], list[FuzzResult]] = {}
     for r in valid_trials:
-        key = (
+        cohort = (
             r.scenario.get("family", "?"),
             r.scenario.get("model_type", "?"),
             r.scenario.get("basis_type", "?"),
         )
-        cohorts.setdefault(key, []).append(r)
+        cohorts.setdefault(cohort, []).append(r)
 
     cohort_median_offenders = []
     cohort_net_wins_offenders = []
-    for key, members in cohorts.items():
+    for cohort, members in cohorts.items():
         if len(members) < COHORT_MIN_TRIALS:
             continue
         gaps = [r.primary_gap for r in members if r.primary_gap is not None]
@@ -1330,7 +1332,7 @@ def compute_ci_gates(
         median_gap = float(np.median(gaps))
         if median_gap > COHORT_MEDIAN_FAIL_GAP:
             cohort_median_offenders.append({
-                "cohort": key,
+                "cohort": cohort,
                 "median_gap": median_gap,
                 "n": len(gaps),
             })
@@ -1339,7 +1341,7 @@ def compute_ci_gates(
         net = mgcv_wins - rust_wins
         if net > COHORT_NET_WINS_FAIL:
             cohort_net_wins_offenders.append({
-                "cohort": key,
+                "cohort": cohort,
                 "mgcv_wins": mgcv_wins,
                 "rust_wins": rust_wins,
                 "net": net,
@@ -1404,8 +1406,8 @@ def compute_ci_gates(
         baseline_offenders = []
         baseline_threshold = float(baseline.get("threshold", 0.05))
         cohort_baselines = baseline.get("cohorts", {}) or {}
-        for key, members in cohorts.items():
-            cohort_key = "/".join(key)
+        for cohort, members in cohorts.items():
+            cohort_key = "/".join(str(part) for part in cohort)
             base_gap = cohort_baselines.get(cohort_key)
             if base_gap is None:
                 continue
@@ -1416,7 +1418,7 @@ def compute_ci_gates(
             delta = current_median - float(base_gap)
             if delta > baseline_threshold:
                 baseline_offenders.append({
-                    "cohort": key,
+                    "cohort": cohort,
                     "current_median_gap": current_median,
                     "baseline_median_gap": float(base_gap),
                     "delta": delta,
@@ -1457,7 +1459,7 @@ def run_trial(sc: typing.Any, rust_timeout: typing.Any, r_timeout: typing.Any) -
 # ═══════════════════════════════════════════════════════════════════════════
 
 def print_leaderboard(results: typing.Any, top_n: typing.Any=25) -> None:
-    groups = {}
+    groups: dict[tuple[typing.Any, typing.Any, typing.Any], list[typing.Any]] = {}
     for r in results:
         key = (r.scenario["family"], r.scenario["model_type"], r.scenario["basis_type"])
         groups.setdefault(key, []).append(r)
