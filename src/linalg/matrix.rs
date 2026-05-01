@@ -2864,7 +2864,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
                     .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
                 match bytes {
                     Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                        Some(Arc::new(self.row_chunk_combined(0..self.n)))
+                        Some(Arc::new(self.build_row_chunk_combined(0..self.n)))
                     }
                     _ => None,
                 }
@@ -3022,11 +3022,19 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
 }
 
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
-    /// Combined row chunk: [kernel_chunk | poly_chunk].
+    /// Combined row chunk: [kernel_chunk | poly_chunk]. Reuses the cached
+    /// materialization when available to avoid recomputing kernel evaluations.
     fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         if let Some(combined) = self.materialized_combined() {
             return combined.slice(s![rows, ..]).to_owned();
         }
+        self.build_row_chunk_combined(rows)
+    }
+
+    /// Build a combined row chunk from scratch, bypassing the cache. Used by
+    /// `row_chunk_combined` on a cache miss and by `materialized_combined`'s
+    /// initializer (which must avoid re-entering the OnceLock).
+    fn build_row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_eff = self
             .constraint_transform

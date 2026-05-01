@@ -2036,7 +2036,7 @@ pub struct PenaltyInfo {
     pub kronecker_factors: Option<Vec<Array2<f64>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PenaltyCandidate {
     pub matrix: Array2<f64>,
     pub nullspace_dim_hint: usize,
@@ -2046,9 +2046,28 @@ pub struct PenaltyCandidate {
     /// When present, spectral decomposition can be done per-factor
     /// (O(Σ q_j³) instead of O((Π q_j)³)).
     pub kronecker_factors: Option<Vec<Array2<f64>>>,
+    /// Optional operator-form handle whose `as_dense()` matches `matrix`. When
+    /// populated by the closed-form factories, this is propagated through to
+    /// `CanonicalPenaltyBlock` so downstream consumers (PCG-against-implicit-H,
+    /// SLQ log-det, Hutchinson trace) can use matvec without rebuilding the
+    /// dense Gram. When `None`, only the dense `matrix` path is available.
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for PenaltyCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PenaltyCandidate")
+            .field("matrix", &format_args!("{}×{}", self.matrix.nrows(), self.matrix.ncols()))
+            .field("nullspace_dim_hint", &self.nullspace_dim_hint)
+            .field("source", &self.source)
+            .field("normalization_scale", &self.normalization_scale)
+            .field("kronecker_factors", &self.kronecker_factors.as_ref().map(|v| v.len()))
+            .field("op", &self.op.as_ref().map(|o| o.dim()))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct CanonicalPenaltyBlock {
     pub sym_penalty: Array2<f64>,
     /// Eigenvalues from spectral decomposition (retained to avoid recomputation).
@@ -2059,6 +2078,25 @@ pub struct CanonicalPenaltyBlock {
     pub nullity: usize,
     pub tol: f64,
     pub iszero: bool,
+    /// Optional operator-form handle that is bit-equivalent to `sym_penalty`.
+    /// Propagated from `PenaltyCandidate.op` when present so downstream
+    /// consumers can use matvec without rebuilding the dense Gram.
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+}
+
+impl std::fmt::Debug for CanonicalPenaltyBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalPenaltyBlock")
+            .field("sym_penalty", &format_args!("{}×{}", self.sym_penalty.nrows(), self.sym_penalty.ncols()))
+            .field("eigenvalues", &self.eigenvalues)
+            .field("eigenvectors", &format_args!("{}×{}", self.eigenvectors.nrows(), self.eigenvectors.ncols()))
+            .field("rank", &self.rank)
+            .field("nullity", &self.nullity)
+            .field("tol", &self.tol)
+            .field("iszero", &self.iszero)
+            .field("op", &self.op.as_ref().map(|o| o.dim()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5476,6 +5514,13 @@ fn validate_psd_penalty(
 }
 
 pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBlock, BasisError> {
+    analyze_penalty_block_with_op(penalty, None)
+}
+
+pub fn analyze_penalty_block_with_op(
+    penalty: &Array2<f64>,
+    op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+) -> Result<CanonicalPenaltyBlock, BasisError> {
     if penalty.nrows() != penalty.ncols() {
         return Err(BasisError::DimensionMismatch(
             "penalty matrix must be square when analyzing penalty".to_string(),
@@ -5490,6 +5535,7 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
             nullity: 0,
             tol: 1e-10,
             iszero: true,
+            op,
         });
     }
 
@@ -5509,18 +5555,46 @@ pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBl
         nullity,
         tol,
         iszero: max_abs_eigenvalue <= tol,
+        op,
     })
 }
 
 pub fn filter_active_penalty_candidates(
     candidates: Vec<PenaltyCandidate>,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
+    let (penalties, nullspace_dims, penaltyinfo, _ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok((penalties, nullspace_dims, penaltyinfo))
+}
+
+/// Same filtering pass as [`filter_active_penalty_candidates`] but also
+/// returns the per-active-penalty operator handles when the originating
+/// `PenaltyCandidate.op` was populated. The ops vector is parallel to the
+/// `penalties` vector (same length, same order). Each entry is `Some(op)`
+/// when the candidate carried an operator-form handle bit-equivalent to its
+/// dense matrix, and `None` for ordinary dense penalties. Consumers in the
+/// PIRLS/REML pipeline that want operator-form matvec for PCG-against-
+/// implicit-H call this and route through the `Some` entries.
+pub fn filter_active_penalty_candidates_with_ops(
+    candidates: Vec<PenaltyCandidate>,
+) -> Result<
+    (
+        Vec<Array2<f64>>,
+        Vec<usize>,
+        Vec<PenaltyInfo>,
+        Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+    ),
+    BasisError,
+> {
     let mut penalties = Vec::with_capacity(candidates.len());
     let mut nullspace_dims = Vec::with_capacity(candidates.len());
     let mut penaltyinfo = Vec::with_capacity(candidates.len());
+    let mut active_ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>> =
+        Vec::with_capacity(candidates.len());
 
     for (original_index, candidate) in candidates.into_iter().enumerate() {
-        let analysis = analyze_penalty_block(&candidate.matrix)?;
+        let analysis =
+            analyze_penalty_block_with_op(&candidate.matrix, candidate.op.clone())?;
         let dropped_reason = if analysis.rank == 0 {
             Some(if analysis.iszero {
                 PenaltyDropReason::ZeroMatrix
@@ -5535,14 +5609,16 @@ pub fn filter_active_penalty_candidates(
             validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         if active {
             log::debug!(
-                "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={}",
+                "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={} has_op={}",
                 candidate.source,
                 original_index,
                 analysis.rank,
-                analysis.nullity
+                analysis.nullity,
+                analysis.op.is_some(),
             );
             penalties.push(analysis.sym_penalty);
             nullspace_dims.push(analysis.nullity);
+            active_ops.push(analysis.op);
         } else {
             log::debug!(
                 "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
@@ -5563,7 +5639,7 @@ pub fn filter_active_penalty_candidates(
         });
     }
 
-    Ok((penalties, nullspace_dims, penaltyinfo))
+    Ok((penalties, nullspace_dims, penaltyinfo, active_ops))
 }
 
 fn validated_kronecker_factors(
@@ -5628,6 +5704,7 @@ fn build_nullspace_shrinkage_penalty(
         nullity: 0,
         tol,
         iszero: false,
+        op: None,
     }))
 }
 
