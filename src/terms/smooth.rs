@@ -3213,17 +3213,27 @@ pub fn build_smooth_design_withworkspace(
                 }
                 let mut x = select_columns(data, feature_cols)?;
                 // Auto-standardize multivariate inputs: use stored scales (prediction)
-                // or compute fresh ones (training).
-                let scales = if let Some(s) = input_scales {
+                // or compute fresh ones (training). Same standardization-vs-
+                // length-scale compensation as Matérn / hybrid Duchon: divide
+                // the user's L by σ_geom so kernel(‖x_std − c_std‖/L_eff)
+                // matches the original-coord kernel for uniform σ.
+                let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    Some(s.clone())
+                    (Some(s.clone()), spec.length_scale)
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                    let sigma_geom = geometric_mean_scale(&s);
                     apply_input_standardization(&mut x, &s);
-                    Some(s)
+                    let l_eff = if sigma_geom > 0.0 && sigma_geom.is_finite() {
+                        spec.length_scale / sigma_geom
+                    } else {
+                        spec.length_scale
+                    };
+                    (Some(s), l_eff)
                 } else {
-                    None
+                    (None, spec.length_scale)
                 };
                 let mut spec_local = spec.clone();
+                spec_local.length_scale = length_scale_eff;
                 if matches!(
                     spec_local.identifiability,
                     SpatialIdentifiability::OrthogonalToParametric
@@ -3310,16 +3320,38 @@ pub fn build_smooth_design_withworkspace(
                     shape_axis_col = Some(feature_cols[0]);
                 }
                 let mut x = select_columns(data, feature_cols)?;
-                let scales = if let Some(s) = input_scales {
+                // Hybrid Duchon (length_scale=Some) is governed by the same
+                // standardization-vs-length-scale equivalence as Matérn: the
+                // user's `length_scale` is interpreted in original data
+                // coordinates, but auto-standardization (per-axis division by
+                // σ_a) reinterprets it as σ_geom · L. Pre-multiply by 1/σ_geom
+                // so kernel(‖x_std − c_std‖/L_eff) reproduces the user's
+                // original-coord kernel exactly for uniform σ_a, and reduces
+                // to standard Mahalanobis preconditioning for anisotropic σ.
+                // Pure Duchon (length_scale=None) is scale-free and needs no
+                // compensation.
+                let (scales, length_scale_eff) = if let Some(s) = input_scales {
                     apply_input_standardization(&mut x, s);
-                    Some(s.clone())
+                    (Some(s.clone()), spec.length_scale)
                 } else if let Some(s) = compute_spatial_input_scales(x.view()) {
+                    let l_eff = match spec.length_scale {
+                        Some(l_user) => {
+                            let sigma_geom = geometric_mean_scale(&s);
+                            if sigma_geom > 0.0 && sigma_geom.is_finite() {
+                                Some(l_user / sigma_geom)
+                            } else {
+                                Some(l_user)
+                            }
+                        }
+                        None => None,
+                    };
                     apply_input_standardization(&mut x, &s);
-                    Some(s)
+                    (Some(s), l_eff)
                 } else {
-                    None
+                    (None, spec.length_scale)
                 };
                 let mut spec_local = spec.clone();
+                spec_local.length_scale = length_scale_eff;
                 if matches!(
                     spec_local.identifiability,
                     SpatialIdentifiability::OrthogonalToParametric
