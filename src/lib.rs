@@ -4,9 +4,11 @@
 
 include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
 
-/// Initialize faer's global parallelism backend to a Rayon pool. Honors
-/// `RAYON_NUM_THREADS` then `FAER_NUM_THREADS` (parsed as `usize`); otherwise
-/// passes `0`, which faer interprets as `rayon::current_num_threads()`.
+/// Initialize faer's global parallelism backend to a Rayon pool sized at
+/// `rayon::current_num_threads()`. Rayon's pool itself honors the standard
+/// `RAYON_NUM_THREADS` environment variable on first use, so callers that
+/// need to constrain the worker count (e.g. the benchmark harnesses) set it
+/// once on the spawned subprocess and rayon picks it up natively.
 ///
 /// Idempotent: only the first call has effect (guarded by `std::sync::Once`).
 /// Without this, faer's global default is `Par::Seq` and matmul/factorizations
@@ -14,16 +16,7 @@ include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
 pub fn init_parallelism() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let threads = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .or_else(|| {
-                std::env::var("FAER_NUM_THREADS")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        faer::set_global_parallelism(faer::Par::rayon(threads));
+        faer::set_global_parallelism(faer::Par::rayon(0));
     });
 }
 
