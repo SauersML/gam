@@ -17351,11 +17351,21 @@ pub mod closed_form_penalty {
         // cancellation — fall back to that limit, whose own truncation
         // error in the omitted Matérn correction is O((κr)²) and tends to
         // zero as κ → 0.
+        //
+        // The detector must only fire in the small-κr regime where the
+        // κ → 0 Riesz limit is genuinely a faithful approximation of the
+        // partial-fraction sum. For κr ≳ O(1) the sum is the correct
+        // answer (it has departed from the κ → 0 limit by an O(1) factor),
+        // and the ratio |sum|/|limit| can legitimately be large without
+        // any roundoff problem. Triggering there overrides good results
+        // with the wrong limit.
         let limit = riesz_kernel_value(d, a + b, r);
-        if limit.is_finite()
+        let kappa_r = kappa * r;
+        if kappa_r < 0.01
+            && limit.is_finite()
             && limit.abs() > 0.0
-            && sum.abs() > 1e3 * limit.abs()
-            && max_term > 1e6 * limit.abs()
+            && sum.abs() > 1e6 * limit.abs()
+            && max_term > 1e9 * limit.abs()
         {
             return limit;
         }
@@ -18354,6 +18364,33 @@ pub mod closed_form_penalty {
             return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
         }
 
+        // Log-Riesz regime check. When the Riesz building block R_j^d falls
+        // in the polyharmonic log regime (2j ≥ d and (2j - d) is even), it
+        // has the form c · r^{2n} · ln r. Iterated radial derivatives of
+        // this expression are individually correct, but composing them
+        // with the anisotropic Laplacian Δ_B and the q-fold operator
+        // (-Δ_B)^q leaves a null-space polynomial residue (degree ≤
+        // 2(m-1)) that does not appear in the unique log-typed
+        // fundamental solution R_{a+b-q}^d that the closed-form
+        // `isotropic_duchon_penalty` returns. Concretely at d=4, m=2, s=0,
+        // q=2: the radial chain (-Δ)² R_4^4 picks up a constant residue
+        // -7/(48π²) that R_2^4 = -ln(R)/(8π²) does not contain.
+        //
+        // Two fallbacks are possible. For η = 0 the anisotropic Laplacian
+        // collapses to the ordinary radial Laplacian and the unique
+        // closed-form `isotropic_duchon_penalty(q, d, m, s, κ, R)` is
+        // exact, so we use it directly. For η ≠ 0 we route to the
+        // Schoenberg heat-kernel quadrature, which is integrated from
+        // the heat representation and is therefore unaffected by the
+        // null-space polynomial ambiguity (its accuracy is the
+        // quadrature-truncation precision of `anisotropic_duchon_penalty`).
+        if relevant_block_is_log_riesz(d, m, s, kappa) {
+            if eta.iter().all(|&e| e == 0.0) {
+                return isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+            }
+            return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+        }
+
         // Radial derivatives of f at R, up to order 4 (sufficient for q ≤ 2).
         let max_order = match q {
             0 => 0,
@@ -18415,6 +18452,31 @@ pub mod closed_form_penalty {
         let part_s2 = s2 * (2.0 * fr[2] / r2 - 2.0 * fr[1] / r3);
 
         part_u1sq + part_s1u1 + part_s1sq + part_u2 + part_s2
+    }
+
+    /// Returns `true` iff some Riesz building block contributing to the
+    /// isotropic Duchon kernel `g_q^iso(R; d, m, s, κ)` falls in the
+    /// polyharmonic log regime (`2j ≥ d` and `(2j − d)` even, where
+    /// `j` indexes the Riesz block). In that regime the radial-derivative
+    /// chain in `anisotropic_duchon_penalty_radial` produces a null-space
+    /// polynomial residue that the unique log-typed fundamental solution
+    /// returned by `isotropic_duchon_penalty` does not have, so the radial
+    /// form is mathematically wrong there and callers should fall back to
+    /// the Schoenberg quadrature path.
+    fn relevant_block_is_log_riesz(d: usize, m: usize, s: usize, kappa: f64) -> bool {
+        let is_log = |j: usize| -> bool {
+            let two_j = 2 * j;
+            two_j >= d && (two_j - d) % 2 == 0
+        };
+        if s == 0 {
+            return is_log(2 * m);
+        }
+        if kappa == 0.0 {
+            return is_log(2 * m + 2 * s);
+        }
+        // Hybrid: any Riesz block j ∈ {1, …, 2m} can be log-typed; if so the
+        // partial-fraction sum of derivatives carries the residue through.
+        (1..=2 * m).any(is_log)
     }
 
     /// Anisotropic invariants used by the radial form:
