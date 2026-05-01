@@ -10,7 +10,7 @@ The helper encodes the following default choices, each of which can be
 overridden at construction time:
 
 * A Duchon radial basis over the PC columns with ``len(pc_columns) + 20``
-  centers, order ``1``, power ``1``, and triple operator regularization.
+  centers, order ``1``, power ``2``, and triple operator regularization.
 * A fixed Duchon ``length_scale`` so per-axis anisotropy is identifiable
   separately from the global smoothing scale.
 * Per-axis anisotropic scaling (``scale_dimensions=True``).
@@ -49,7 +49,7 @@ class PgsCalibration:
     duchon_order:
         Duchon radial-basis order (``m``). Defaults to ``1``.
     duchon_power:
-        Duchon radial-basis power (``s``). Defaults to ``1``.
+        Duchon radial-basis power (``s``). Defaults to ``2``.
     duchon_length_scale:
         Fixed Duchon radial length scale. Defaults to ``1.0`` so anisotropic
         PC scaling is active but does not duplicate the global smoothing scale.
@@ -78,7 +78,7 @@ class PgsCalibration:
     pgs_column: str = "PGS"
     duchon_centers: int | None = None
     duchon_order: int = 1
-    duchon_power: int = 1
+    duchon_power: int = 2
     duchon_length_scale: float = 1.0
     scale_dimensions: bool | None = True
     out_column: str = "pgs_ctn_z"
@@ -181,7 +181,7 @@ class PgsCalibration:
             kwargs.setdefault("out_column", manifest.get("out_column", "pgs_ctn_z"))
             kwargs.setdefault("duchon_centers", manifest.get("duchon_centers"))
             kwargs.setdefault("duchon_order", manifest.get("duchon_order", 1))
-            kwargs.setdefault("duchon_power", manifest.get("duchon_power", 1))
+            kwargs.setdefault("duchon_power", manifest.get("duchon_power", 2))
             kwargs.setdefault("duchon_length_scale", manifest.get("duchon_length_scale", 1.0))
             kwargs.setdefault("scale_dimensions", manifest.get("scale_dimensions", True))
         if pc_columns is None:
