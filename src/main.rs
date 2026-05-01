@@ -387,6 +387,12 @@ struct PredictArgs {
     covariance_mode: CovarianceModeArg,
     #[arg(long = "mode", value_enum, default_value_t = PredictModeArg::PosteriorMean)]
     mode: PredictModeArg,
+    /// Disable the O(n⁻¹) frequentist bias correction at prediction time.
+    /// By default the corrected predictor η̂ + s_*^T H⁻¹ S(λ̂) β̂ is reported,
+    /// improving credible-interval coverage from O(1) to O(n⁻¹) without
+    /// changing the standard errors at first order.
+    #[arg(long = "no-bias-correction", default_value_t = false)]
+    no_bias_correction: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2099,6 +2105,7 @@ fn run_predict_unified(
             covariance_mode: infer_covariance_mode(args.covariance_mode),
             mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
+            apply_bias_correction: !args.no_bias_correction,
         };
         let pred = predictor
             .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
@@ -3146,6 +3153,7 @@ fn run_predict_survival(
                         covariance_mode: infer_covariance_mode(args.covariance_mode),
                         mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
                         includeobservation_interval: false,
+                        apply_bias_correction: !args.no_bias_correction,
                     },
                 )
                 .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
@@ -3287,6 +3295,7 @@ fn run_predict_survival(
                 covariance_mode: infer_covariance_mode(args.covariance_mode),
                 mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
                 includeobservation_interval: false,
+                apply_bias_correction: !args.no_bias_correction,
             },
         )
         .map_err(|e| format!("survival uncertainty prediction failed: {e}"))?;
@@ -7177,6 +7186,7 @@ fn core_saved_fit_result(
             beta_standard_errors: None,
             beta_covariance_corrected,
             beta_standard_errors_corrected: None,
+            bias_correction_beta: None,
         };
         let covariance_conditional = inf.beta_covariance.clone();
         let covariance_corrected = inf.beta_covariance_corrected.clone();
@@ -9896,6 +9906,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::PosteriorMean,
+            no_bias_correction: false,
         })
         .expect("saved survival posterior-mean predict should succeed");
 
@@ -10065,6 +10076,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::PosteriorMean,
+            no_bias_correction: false,
         })
         .expect("default posterior-mean marginal-slope predict should succeed");
 
@@ -10431,6 +10443,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::PosteriorMean,
+            no_bias_correction: false,
         };
         run_predict(predict_args).expect("default posterior-mean predict should succeed");
 
@@ -10521,6 +10534,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::PosteriorMean,
+            no_bias_correction: false,
         };
         run_predict(predict_args)
             .expect("default posterior-mean predict should succeed after Firth fit");
@@ -10734,6 +10748,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::PosteriorMean,
+            no_bias_correction: false,
         };
         run_predict(args).expect("predict binomial location-scale");
         csv_mean_at(&out_path, 0)
@@ -11041,6 +11056,7 @@ mod tests {
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
+                bias_correction_beta: None,
             }),
             fitted_link: FittedLinkState::Standard(Some(LinkFunction::Logit)),
             geometry: Some(FitGeometry {
@@ -11838,6 +11854,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::Map,
+            no_bias_correction: false,
         })
         .expect("saved marginal-slope predict should succeed");
 
@@ -13377,6 +13394,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::Map,
+            no_bias_correction: false,
         };
         let mut progress = gam::visualizer::VisualizerSession::new(false);
         super::run_predict_survival(
@@ -13522,6 +13540,7 @@ mod tests {
             level: 0.95,
             covariance_mode: CovarianceModeArg::Corrected,
             mode: PredictModeArg::Map,
+            no_bias_correction: false,
         };
 
         let mut progress = gam::visualizer::VisualizerSession::new(false);

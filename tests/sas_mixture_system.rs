@@ -289,6 +289,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
+        apply_bias_correction: false,
     };
 
     let pred_logit = predict_gamwith_uncertainty(
