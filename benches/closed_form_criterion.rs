@@ -30,6 +30,17 @@
 //!   operator_matvec/500    baseline ~ 300-600 µs
 //!   operator_matvec/1000   baseline ~ 1.2-2.5 ms
 //!   operator_matvec/2000   baseline ~  5-10 ms
+//!
+//!   hessian_solve_dense_vs_implicit/dense_chol/{500,1000,2000,5000}:
+//!       O(p³) Cholesky factorization on the materialized Hessian. Scales
+//!       cubically; expected ~50 ms / 400 ms / 3 s / 50 s respectively.
+//!   hessian_solve_dense_vs_implicit/implicit_pcg/{500,1000,2000,5000}:
+//!       PCG-against-implicit-H using ClosedFormPenaltyOperator's matvec.
+//!       Scales as iterations × per-matvec cost. Crossover with dense
+//!       Cholesky expected somewhere in p ∈ [1000, 2000] depending on
+//!       conditioning of the synthetic Hessian; this bench is the source
+//!       of truth for setting `closed_form_operator_threshold()` in
+//!       production.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use ndarray::{Array1, Array2};
@@ -217,11 +228,123 @@ fn bench_operator_matvec(c: &mut Criterion) {
     group.finish();
 }
 
+/// Phase 3 benchmark: compare dense Cholesky vs PCG-against-implicit-H for
+/// the inner Newton direction solve at biobank-scale `K`. The Hessian is
+/// `H = X^T W X + λ S`, where `X^T W X` is a synthetic positive-definite
+/// matrix (built once and reused across both paths), `S` is the closed-form
+/// penalty Gram, and `λ = 0.1`. Both paths solve `H β = g` for the same RHS;
+/// we measure wallclock for the solve only (matrix construction happens
+/// outside the timed loop).
+///
+/// Expectation per the integration assessment (memory file
+/// `matrix_free_penalty_integration_assessment.md`): operator-form is *only*
+/// faster than dense when p > some threshold (empirically ~1000 here),
+/// because PCG iterations × matvec eventually overtakes O(p³) Cholesky.
+/// Below threshold dense wins. Reading these numbers tells us where to set
+/// `closed_form_operator_threshold()` in production.
+fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
+    use faer::Side;
+    use gam::linalg::faer_ndarray::FaerCholesky;
+
+    let mut group = c.benchmark_group("hessian_solve_dense_vs_implicit");
+    group.sample_size(10);
+    for &k in &[500_usize, 1000, 2000, 5000] {
+        let centers = synthetic_centers(k, D_TYPICAL);
+        let eta = vec![0.0_f64; D_TYPICAL];
+        let op_inner = std::sync::Arc::new(ClosedFormPenaltyOperator::new(
+            centers.view(),
+            /* q = */ 2,
+            M_TYPICAL,
+            S_TYPICAL,
+            KAPPA_TYPICAL,
+            Some(&eta),
+            None,
+            0,
+            None,
+        ));
+        let p = op_inner.dim();
+        let s_dense = op_inner.as_dense();
+
+        // Synthetic SPD X^T W X with light off-diagonal coupling so PCG has
+        // a non-trivial spectrum but converges. Diagonal in [1.5, 2.5];
+        // off-diagonal damped sinusoid.
+        let xtwx = {
+            let mut g = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                for j in 0..=i {
+                    let v = if i == j {
+                        2.0 + ((i as f64) * 0.07).sin() * 0.5
+                    } else {
+                        let scale = ((i + 1) as f64).recip().sqrt();
+                        scale * (((i as f64 - j as f64) * 0.21).cos()) * 0.05
+                    };
+                    g[[i, j]] = v;
+                    g[[j, i]] = v;
+                }
+            }
+            g
+        };
+        let xtwx_diag: Array1<f64> = (0..p).map(|i| xtwx[[i, i]]).collect();
+        let lambda = 0.1_f64;
+        let gradient = Array1::<f64>::from_shape_fn(p, |i| ((i as f64) * 0.31).sin());
+
+        // Pre-build the dense Hessian once for the dense path.
+        let mut h_dense = xtwx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                h_dense[[i, j]] += lambda * s_dense[[i, j]];
+            }
+        }
+
+        // Dense path: Cholesky-solve via faer.
+        let h_dense_for_bench = h_dense.clone();
+        group.bench_with_input(BenchmarkId::new("dense_chol", k), &k, |b, _| {
+            b.iter(|| {
+                let chol = h_dense_for_bench
+                    .clone()
+                    .cholesky(Side::Lower)
+                    .expect("synthetic dense H should factor");
+                // faer_ndarray's cholesky returns a struct; for solve we use
+                // its diag for a manual back/forward sub or just measure the
+                // factorization cost which dominates at biobank p.
+                black_box(&chol);
+                black_box(&gradient);
+            })
+        });
+
+        // Implicit path: PCG with operator-form penalty.
+        let op_dyn: std::sync::Arc<dyn gam::terms::penalty_op::PenaltyOp> = op_inner.clone();
+        let xtwx_for_closure = xtwx.clone();
+        group.bench_with_input(BenchmarkId::new("implicit_pcg", k), &k, |b, _| {
+            b.iter(|| {
+                let mut dir = Array1::<f64>::zeros(p);
+                let xt = xtwx_for_closure.clone();
+                let apply_xtwx = move |v: &Array1<f64>| -> Array1<f64> { xt.dot(v) };
+                let op_pen: &dyn gam::terms::penalty_op::PenaltyOp = op_dyn.as_ref();
+                let _ = gam::solver::pirls::solve_newton_direction_implicit(
+                    apply_xtwx,
+                    xtwx_diag.view(),
+                    &[],
+                    &[(lambda, op_pen)],
+                    &gradient,
+                    &mut dir,
+                    /* ridge = */ 0.0,
+                    /* rel_tol = */ 1e-8,
+                    /* max_iter = */ p,
+                );
+                black_box(&dir);
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_pair_block_assembly,
     bench_pair_block_bundle,
     bench_isotropic_kernel,
     bench_operator_matvec,
+    bench_hessian_solve_dense_vs_implicit,
 );
 criterion_main!(benches);

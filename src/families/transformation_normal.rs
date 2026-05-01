@@ -21,9 +21,10 @@
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    create_ispline_derivative_dense,
 };
 use crate::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ab, fast_ab_into, fast_atb, fast_av, rrqr_nullspace_basis,
+    fast_ab, fast_ab_into, fast_atb, fast_av,
 };
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -2982,9 +2983,12 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
 // Response-direction basis construction
 // ---------------------------------------------------------------------------
 
-/// Build the response-direction basis: `[1, y, anchored deviations]`.
+/// Build the response-direction basis: I-spline values `I_k(y)` with
+/// derivatives `M_k(y) = I'_k(y)`.
 ///
-/// Returns (value_basis, derivative_basis, penalties, knots, transform).
+/// Returns (value_basis = I_k, derivative_basis = M_k, penalties on the
+/// I-spline coefficient block, regenerated I-spline knots, identity
+/// coef_transform of size p_resp × p_resp).
 fn build_response_basis(
     response: &Array1<f64>,
     config: &TransformationNormalConfig,
@@ -3008,76 +3012,69 @@ fn build_response_basis(
         }
     }
 
-    // --- Build B-spline knots for the deviation part ---
-    let knots = initializewiggle_knots_from_seed(
-        response.view(),
-        config.response_degree,
-        config.response_num_internal_knots,
-    )?;
+    let response_degree = config.response_degree;
+    if response_degree < 1 {
+        return Err(format!(
+            "response_degree must be >= 1 for the I-spline basis, got {response_degree}"
+        ));
+    }
+    let k_internal = config.response_num_internal_knots;
+    let k_prime = k_internal.checked_sub(2).ok_or_else(|| {
+        format!(
+            "response_num_internal_knots = {k_internal}; I-spline contract \
+             requires K' = K − 2 ≥ 0, so need K ≥ 2"
+        )
+    })?;
 
-    // --- Deviation transform: project out value and first derivative at the median ---
-    let transform = response_deviation_transform(&knots, config.response_degree, response)?;
-    let raw_dim = transform.nrows();
-    let dev_dim = transform.ncols();
+    // Regenerate clamped knots. The I-spline builder integrates a degree
+    // `(response_degree + 1)` B-spline basis into a degree-`response_degree`
+    // value basis, so the seed-time degree passed here is `response_degree + 1`.
+    let knots =
+        initializewiggle_knots_from_seed(response.view(), response_degree + 1, k_prime)?;
 
-    // --- Evaluate full B-spline basis at response values ---
-    let (raw_val_basis, _) = create_basis::<Dense>(
+    // I-spline value basis I_k(y).
+    let (i_val_basis, _) = create_basis::<Dense>(
         response.view(),
         KnotSource::Provided(knots.view()),
-        config.response_degree,
-        BasisOptions::value(),
+        response_degree,
+        BasisOptions::i_spline(),
     )
     .map_err(|e| e.to_string())?;
-    let raw_val = raw_val_basis.as_ref().clone();
+    let resp_val = i_val_basis.as_ref().clone();
+    let p_resp = resp_val.ncols();
 
-    let (raw_deriv_basis, _) = create_basis::<Dense>(
-        response.view(),
-        KnotSource::Provided(knots.view()),
-        config.response_degree,
-        BasisOptions::first_derivative(),
-    )
-    .map_err(|e| e.to_string())?;
-    let raw_deriv = raw_deriv_basis.as_ref().clone();
+    // M-spline derivative basis M_k(y) = I'_k(y).
+    let resp_deriv =
+        create_ispline_derivative_dense(response.view(), &knots, response_degree, 1)
+            .map_err(|e| e.to_string())?;
+    if resp_deriv.ncols() != p_resp {
+        return Err(format!(
+            "I-spline derivative column count {} does not match value basis {p_resp}",
+            resp_deriv.ncols()
+        ));
+    }
+    if resp_deriv.nrows() != n {
+        return Err(format!(
+            "I-spline derivative row count {} does not match n = {n}",
+            resp_deriv.nrows()
+        ));
+    }
 
-    // --- Apply deviation transform: dev = raw · Z ---
-    let dev_val = fast_ab(&raw_val, &transform); // n × dev_dim
-    let dev_deriv = fast_ab(&raw_deriv, &transform); // n × dev_dim
+    // SCOP-CTN coef-transform is identity: I-splines have no constant in
+    // their span, and squaring γ removes the per-component sign null direction.
+    let transform = Array2::<f64>::eye(p_resp);
 
-    // --- Assemble full response basis: [1, y, dev] ---
-    let p_resp = 2 + dev_dim;
-    let mut resp_val = Array2::<f64>::zeros((n, p_resp));
-    let mut resp_deriv = Array2::<f64>::zeros((n, p_resp));
-
-    // Column 0: intercept (value = 1, derivative = 0)
-    resp_val.column_mut(0).fill(1.0);
-    // resp_deriv column 0 stays 0
-
-    // Column 1: y (value = y, derivative = 1)
-    resp_val.column_mut(1).assign(&response.view());
-    resp_deriv.column_mut(1).fill(1.0);
-
-    // Columns 2..: deviations
-    resp_val.slice_mut(s![.., 2..]).assign(&dev_val);
-    resp_deriv.slice_mut(s![.., 2..]).assign(&dev_deriv);
-
-    // --- Response-direction penalties ---
-    // Penalty acts on the deviation part only; affine columns [1, y] are in the nullspace.
+    // Difference penalties act directly on the I-spline coefficient vector.
     let mut resp_penalties = Vec::new();
-
     let add_penalty = |order: usize, penalties: &mut Vec<Array2<f64>>| -> Result<(), String> {
-        if order == 0 || order >= raw_dim {
+        if order == 0 || order >= p_resp {
             return Ok(());
         }
-        let raw_pen =
-            create_difference_penalty_matrix(raw_dim, order, None).map_err(|e| e.to_string())?;
-        let dev_pen = fast_ab(&fast_atb(&transform, &raw_pen), &transform); // dev_dim × dev_dim
-        // Embed in full response basis: zeros for [1, y], dev_pen for deviation part.
-        let mut full_pen = Array2::<f64>::zeros((p_resp, p_resp));
-        full_pen.slice_mut(s![2.., 2..]).assign(&dev_pen);
-        penalties.push(full_pen);
+        let pen = create_difference_penalty_matrix(p_resp, order, None)
+            .map_err(|e| e.to_string())?;
+        penalties.push(pen);
         Ok(())
     };
-
     add_penalty(config.response_penalty_order, &mut resp_penalties)?;
     for &order in &config.response_extra_penalty_orders {
         if order == config.response_penalty_order {
@@ -3089,6 +3086,13 @@ fn build_response_basis(
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
 }
 
+/// Evaluate the M-spline derivative basis `M_k(y) = I'_k(y)` at `values`.
+///
+/// `transform` is the SCOP-CTN coef-transform; under the I-spline response
+/// basis it is the identity (size p_resp × p_resp), but it is still applied
+/// to handle the (atypical) case of a non-identity caller-provided transform
+/// without requiring the call sites to be aware of it. The output has shape
+/// `values.len() × transform.ncols()`.
 fn evaluate_response_derivative_basis(
     values: &Array1<f64>,
     knots: &Array1<f64>,
@@ -3102,38 +3106,27 @@ fn evaluate_response_derivative_basis(
             ));
         }
     }
-
-    let dev_dim = transform.ncols();
-    let p_resp = 2 + dev_dim;
-    let mut resp_deriv = Array2::<f64>::zeros((values.len(), p_resp));
-    resp_deriv.column_mut(1).fill(1.0);
-
-    if dev_dim == 0 {
-        return Ok(resp_deriv);
-    }
     if knots.is_empty() {
-        return Err(
-            "response derivative grid needs knots when deviation columns are present".to_string(),
-        );
+        return Err("response derivative grid needs knots".to_string());
     }
-    let (raw_deriv_basis, _) = create_basis::<Dense>(
-        values.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .map_err(|e| e.to_string())?;
-    let raw_deriv = raw_deriv_basis.as_ref().clone();
-    if raw_deriv.ncols() != transform.nrows() {
+    if degree < 1 {
         return Err(format!(
-            "response derivative transform shape mismatch: raw cols={} transform rows={}",
-            raw_deriv.ncols(),
+            "response degree must be >= 1 for I-spline derivative, got {degree}"
+        ));
+    }
+
+    // M_k(y) = I'_k(y) at the grid points.
+    let raw_m = create_ispline_derivative_dense(values.view(), knots, degree, 1)
+        .map_err(|e| e.to_string())?;
+
+    if raw_m.ncols() != transform.nrows() {
+        return Err(format!(
+            "response derivative transform shape mismatch: M_k cols={} transform rows={}",
+            raw_m.ncols(),
             transform.nrows()
         ));
     }
-    let dev_deriv = fast_ab(&raw_deriv, transform);
-    resp_deriv.slice_mut(s![.., 2..]).assign(&dev_deriv);
-    Ok(resp_deriv)
+    Ok(fast_ab(&raw_m, transform))
 }
 
 fn transformation_monotonicity_response_grid(
@@ -3391,8 +3384,9 @@ fn effective_response_num_internal_knots(
     n_obs: usize,
     p_cov: usize,
 ) -> usize {
-    let sample_cap = (n_obs / 10).max(1);
-    let min_internal = 1usize;
+    // I-spline contract requires K' = K − 2 ≥ 0, i.e. K ≥ 2 internal knots.
+    let min_internal = 2usize;
+    let sample_cap = (n_obs / 10).max(min_internal);
     let tensor_width_cap = (BASE_TRANSFORMATION_TENSOR_WIDTH + n_obs / 25)
         .min(LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH);
     let max_resp_cols_from_tensor =
@@ -3405,57 +3399,6 @@ fn effective_response_num_internal_knots(
         .min(sample_cap)
         .min(tensor_cap)
         .max(min_internal)
-}
-
-/// Build the nullspace projection that anchors B-spline deviations at the response
-/// median (value = 0 and first derivative = 0 at the median).
-fn response_deviation_transform(
-    knots: &Array1<f64>,
-    degree: usize,
-    response: &Array1<f64>,
-) -> Result<Array2<f64>, String> {
-    // Compute median.
-    let mut sorted = response.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = if sorted.is_empty() {
-        0.0
-    } else if sorted.len() % 2 == 1 {
-        sorted[sorted.len() / 2]
-    } else {
-        0.5 * (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2])
-    };
-    let anchor = Array1::from_vec(vec![median]);
-
-    // Evaluate basis value and first derivative at anchor.
-    let (val_basis, _) = create_basis::<Dense>(
-        anchor.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::value(),
-    )
-    .map_err(|e| e.to_string())?;
-    let (d1_basis, _) = create_basis::<Dense>(
-        anchor.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let k = val_basis.ncols();
-    let mut c = Array2::<f64>::zeros((2, k));
-    c.row_mut(0).assign(&val_basis.row(0));
-    c.row_mut(1).assign(&d1_basis.row(0));
-
-    let (z, rank) = rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha())
-        .map_err(|e| format!("response deviation RRQR failed: {e}"))?;
-    if rank >= k || z.ncols() == 0 {
-        return Err(
-            "response deviation anchor constraints removed all columns; increase basis richness"
-                .to_string(),
-        );
-    }
-    Ok(z)
 }
 
 // ---------------------------------------------------------------------------
