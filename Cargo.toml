@@ -69,6 +69,10 @@ path = "src/main.rs"
 name = "closed_form_pair_block"
 harness = false
 
+[[bench]]
+name = "closed_form_criterion"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
