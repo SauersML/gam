@@ -21,9 +21,10 @@
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    create_ispline_derivative_dense,
 };
-use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb, fast_av};
+use crate::faer_ndarray::{
+    default_rrqr_rank_alpha, fast_ab, fast_ab_into, fast_atb, fast_av, rrqr_nullspace_basis,
+};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,

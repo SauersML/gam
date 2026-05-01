@@ -19746,9 +19746,21 @@ pub mod closed_form_penalty {
             (val(eta, kappa + h_kappa) - val(eta, kappa - h_kappa)) / (2.0 * h_kappa)
         };
 
-        // ∂²_κ
-        let d2_kappa = if s == 0 {
+        // ∂²_κ. Analytic via the second κ-partial of the radial derivative
+        // table. The invariants (R, s_1, s_2, u_1, u_2) are κ-independent, so
+        // ∂²_κ (J · g_q) = J · g_q evaluated with fr replaced by ∂²_κ fr.
+        // Linearity of g_q in each f^{(k)} for q ∈ {0, 1, 2} lets us reuse
+        // `radial_g_q_partials` directly on the second-κ-partial table.
+        let d2_kappa = if s == 0 || kappa == 0.0 {
             0.0
+        } else if analytic_first_ok {
+            let max_order = 2 * q + 1;
+            let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
+            let ddfr = radial_derivatives_of_isotropic_duchon_kappa_partial2(
+                d, m, s, kappa, big_r, max_order,
+            );
+            let (ddg, _, _, _, _, _) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &ddfr);
+            big_j_of(eta) * ddg
         } else {
             (val(eta, kappa + h_kappa) - 2.0 * value + val(eta, kappa - h_kappa))
                 / (h_kappa * h_kappa)

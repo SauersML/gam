@@ -2554,6 +2554,147 @@ fn solve_newton_direction_dense(
     ))
 }
 
+/// Solve the Newton direction implicitly via PCG against an operator-form
+/// Hessian. Bypasses materialization of the `p × p` Hessian when at least one
+/// penalty is operator-form and `p` is large enough that the implicit-matvec
+/// cost amortizes against avoiding a dense Cholesky.
+///
+/// `apply_xtwx`: closure computing `(X^T W X) v`.
+/// `xtwx_diag`: diagonal of `X^T W X`, used in the Jacobi preconditioner.
+/// `dense_penalties`: pairs `(λ_k, S_k)` for penalties whose dense matrix is
+/// the only available representation; their contribution to `H v` is computed
+/// as `λ_k · S_k.dot(v)` and their diagonal contribution to the preconditioner
+/// is `λ_k · diag(S_k)`.
+/// `op_penalties`: pairs `(λ_k, op)` for penalties carrying a `PenaltyOp`
+/// handle; their contribution to `H v` is `λ_k · op.matvec(v)` and their
+/// diagonal is `λ_k · op.diag()`.
+/// `ridge`: nonnegative ridge added to the Hessian diagonal for stabilization.
+///
+/// On success the negated solution `−H⁻¹ g` is written into `direction_out`,
+/// matching the sign convention of `solve_newton_direction_dense`.
+pub(crate) fn solve_newton_direction_implicit<F>(
+    apply_xtwx: F,
+    xtwx_diag: ArrayView1<'_, f64>,
+    dense_penalties: &[(f64, &Array2<f64>)],
+    op_penalties: &[(f64, &dyn crate::terms::penalty_op::PenaltyOp)],
+    gradient: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+    ridge: f64,
+    rel_tol: f64,
+    max_iter: usize,
+) -> Result<(), EstimationError>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    let p = gradient.len();
+    if xtwx_diag.len() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "solve_newton_direction_implicit: xtwx_diag length {} != gradient length {}",
+            xtwx_diag.len(),
+            p
+        )));
+    }
+    for (_, s) in dense_penalties.iter() {
+        if s.nrows() != p || s.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "solve_newton_direction_implicit: dense penalty dim {}×{} != p={}",
+                s.nrows(),
+                s.ncols(),
+                p
+            )));
+        }
+    }
+    for (_, op) in op_penalties.iter() {
+        if op.dim() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "solve_newton_direction_implicit: op penalty dim {} != p={}",
+                op.dim(),
+                p
+            )));
+        }
+    }
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+
+    let pcg_start = std::time::Instant::now();
+
+    let mut precond_diag = xtwx_diag.to_owned();
+    if ridge > 0.0 {
+        precond_diag.mapv_inplace(|d| d + ridge);
+    }
+    for (lambda, s) in dense_penalties.iter() {
+        if *lambda == 0.0 {
+            continue;
+        }
+        for i in 0..p {
+            precond_diag[i] += *lambda * s[[i, i]];
+        }
+    }
+    for (lambda, op) in op_penalties.iter() {
+        if *lambda == 0.0 {
+            continue;
+        }
+        let d = op.diag();
+        for i in 0..p {
+            precond_diag[i] += *lambda * d[i];
+        }
+    }
+
+    // SAFETY: `apply_xtwx`, `dense_penalties`, and `op_penalties` are passed
+    // by reference into the closure. The PCG closure runs synchronously within
+    // this function, so the borrows live for the duration of the call.
+    let apply_h = |v: &Array1<f64>| -> Array1<f64> {
+        let mut hv = apply_xtwx(v);
+        if ridge > 0.0 {
+            hv.zip_mut_with(v, |h, &x| *h += ridge * x);
+        }
+        for (lambda, s) in dense_penalties.iter() {
+            if *lambda == 0.0 {
+                continue;
+            }
+            let sv = s.dot(v);
+            hv.scaled_add(*lambda, &sv);
+        }
+        for (lambda, op) in op_penalties.iter() {
+            if *lambda == 0.0 {
+                continue;
+            }
+            let mut sv = Array1::<f64>::zeros(p);
+            op.matvec(v.view(), sv.view_mut());
+            hv.scaled_add(*lambda, &sv);
+        }
+        hv
+    };
+
+    let solution = crate::linalg::utils::solve_spd_pcg(
+        apply_h,
+        gradient,
+        &precond_diag,
+        rel_tol,
+        max_iter,
+    )
+    .ok_or(EstimationError::LinearSystemSolveFailed(
+        FaerLinalgError::FactorizationFailed,
+    ))?;
+
+    direction_out.assign(&solution);
+    direction_out.mapv_inplace(|v| -v);
+    if !array1_is_finite(direction_out) {
+        return Err(EstimationError::LinearSystemSolveFailed(
+            FaerLinalgError::FactorizationFailed,
+        ));
+    }
+    log::info!(
+        "[STAGE] PIRLS implicit (PCG) newton solve p={} dense_pens={} op_pens={} elapsed={:.3}s",
+        p,
+        dense_penalties.len(),
+        op_penalties.len(),
+        pcg_start.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+
 fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
     for i in 0..beta.len() {
         let lb = lower_bounds[i];
