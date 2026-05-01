@@ -14271,7 +14271,22 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform.as_ref(),
         )
     };
+    eprintln!(
+        "DEBUG_DUCHON_GATE: length_scale={:?} candidates_len={} sources={:?}",
+        spec.length_scale,
+        candidates.len(),
+        candidates
+            .iter()
+            .map(|c| format!("{:?}", c.source))
+            .collect::<Vec<_>>(),
+    );
     let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    eprintln!(
+        "DEBUG_DUCHON_GATE: after filter penalties_len={} penaltyinfo_len={} active={:?}",
+        penalties.len(),
+        penaltyinfo.len(),
+        penaltyinfo.iter().map(|p| p.active).collect::<Vec<_>>(),
+    );
     Ok(BasisBuildResult {
         design,
         penalties,
