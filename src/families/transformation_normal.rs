@@ -53,7 +53,6 @@ use crate::smooth::{
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
@@ -203,13 +202,6 @@ pub struct TransformationNormalFamily {
     response_degree: usize,
     response_median: f64,
 
-    // --- Resource policy for chunked dense materialization ---
-    /// Resource policy threaded through factored weighted-cross helpers and the
-    /// `KroneckerDesign::weighted_gram` callers inside this family. Stored on
-    /// the struct because the `CustomFamily` trait surface cannot grow new
-    /// parameters per call.
-    policy: ResourcePolicy,
-
     /// Last row-space transformation quantities for an exact beta vector.
     ///
     /// CTN line searches and exact-Newton workspace construction frequently ask
@@ -218,39 +210,6 @@ pub struct TransformationNormalFamily {
     /// and reciprocal powers behind a single exact-keyed entry instead of
     /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
     row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
-
-    /// Per-axis ψ first-derivative n-vectors `v_val[axis] = ∂(Xβ)/∂ψ[axis]` and
-    /// `v_deriv[axis] = ∂(X'β)/∂ψ[axis]`, lazily populated and reused across
-    /// the q first-order calls and q² second-order pair calls within a single
-    /// outer evaluation. Each pair call currently re-evaluates `forward_mul`
-    /// and `forward_mul_deriv` for both its axes; sharing the slots collapses
-    /// the per-axis cost from O(q²) (= 256 calls at q=16) back to O(q) (= 16).
-    /// The cache is keyed on β bit-pattern so it invalidates atomically when
-    /// the line search advances.
-    psi_axis_vector_cache: Arc<Mutex<Option<PsiAxisVectorCache>>>,
-}
-
-#[derive(Clone)]
-struct PsiAxisVectorCache {
-    beta: Arc<Array1<f64>>,
-    /// Per-axis `forward_mul(axis, β)` (value-basis). `None` slot ⇒ not yet evaluated.
-    forward_val: Vec<Option<Arc<Array1<f64>>>>,
-    /// Per-axis `forward_mul_deriv(axis, β)` (derivative-basis).
-    forward_deriv: Vec<Option<Arc<Array1<f64>>>>,
-}
-
-impl PsiAxisVectorCache {
-    fn new(beta: &Array1<f64>, q: usize) -> Self {
-        Self {
-            beta: Arc::new(beta.clone()),
-            forward_val: vec![None; q],
-            forward_deriv: vec![None; q],
-        }
-    }
-
-    fn matches_beta(&self, beta: &Array1<f64>) -> bool {
-        beta_bits_match(&self.beta, beta)
-    }
 }
 
 #[derive(Clone)]
@@ -258,25 +217,11 @@ struct TransformationNormalRowQuantityCache {
     beta: Arc<Array1<f64>>,
     h: Arc<Array1<f64>>,
     h_prime: Arc<Array1<f64>>,
-    inv_h_prime: Arc<Array1<f64>>,
-    inv_h_prime_sq: Arc<Array1<f64>>,
-    inv_h_prime_cu: Arc<Array1<f64>>,
-    inv_h_prime_qu: Arc<Array1<f64>>,
-    weighted_h: Arc<Array1<f64>>,
-    weighted_inv_h_prime: Arc<Array1<f64>>,
-    weighted_inv_h_prime_sq: Arc<Array1<f64>>,
     log_likelihood: f64,
 }
 
 #[derive(Debug)]
 struct TransformationNormalRowDerived {
-    inv_h_prime: Array1<f64>,
-    inv_h_prime_sq: Array1<f64>,
-    inv_h_prime_cu: Array1<f64>,
-    inv_h_prime_qu: Array1<f64>,
-    weighted_h: Array1<f64>,
-    weighted_inv_h_prime: Array1<f64>,
-    weighted_inv_h_prime_sq: Array1<f64>,
     log_likelihood: f64,
 }
 
@@ -295,87 +240,7 @@ fn build_transformation_row_derived(
     debug_assert_eq!(h.len(), n);
     debug_assert_eq!(weights.len(), n);
 
-    let mut inv_h_prime = Array1::<f64>::zeros(n);
-    let mut inv_h_prime_sq = Array1::<f64>::zeros(n);
-    let mut inv_h_prime_cu = Array1::<f64>::zeros(n);
-    let mut inv_h_prime_qu = Array1::<f64>::zeros(n);
-    let mut weighted_h = Array1::<f64>::zeros(n);
-    let mut weighted_inv_h_prime = Array1::<f64>::zeros(n);
-    let mut weighted_inv_h_prime_sq = Array1::<f64>::zeros(n);
-
-    let log_likelihood = {
-        use rayon::prelude::*;
-        inv_h_prime
-            .as_slice_mut()
-            .expect("CTN inv_h_prime is contiguous")
-            .par_iter_mut()
-            .zip(
-                inv_h_prime_sq
-                    .as_slice_mut()
-                    .expect("CTN inv_h_prime_sq is contiguous")
-                    .par_iter_mut(),
-            )
-            .zip(
-                inv_h_prime_cu
-                    .as_slice_mut()
-                    .expect("CTN inv_h_prime_cu is contiguous")
-                    .par_iter_mut(),
-            )
-            .zip(
-                inv_h_prime_qu
-                    .as_slice_mut()
-                    .expect("CTN inv_h_prime_qu is contiguous")
-                    .par_iter_mut(),
-            )
-            .zip(
-                weighted_h
-                    .as_slice_mut()
-                    .expect("CTN weighted_h is contiguous")
-                    .par_iter_mut(),
-            )
-            .zip(
-                weighted_inv_h_prime
-                    .as_slice_mut()
-                    .expect("CTN weighted_inv_h_prime is contiguous")
-                    .par_iter_mut(),
-            )
-            .zip(
-                weighted_inv_h_prime_sq
-                    .as_slice_mut()
-                    .expect("CTN weighted_inv_h_prime_sq is contiguous")
-                    .par_iter_mut(),
-            )
-            .zip(h.as_slice().expect("CTN h is contiguous").par_iter())
-            .zip(
-                h_prime
-                    .as_slice()
-                    .expect("CTN h_prime is contiguous")
-                    .par_iter(),
-            )
-            .zip(
-                weights
-                    .as_slice()
-                    .expect("CTN weights are contiguous")
-                    .par_iter(),
-            )
-            .map(
-                |(((((((((inv, inv_sq), inv_cu), inv_qu), wh), wih), wih2), &hi), &hp), &wi)| {
-                    let inv_v = 1.0 / hp;
-                    let inv_sq_v = inv_v * inv_v;
-                    let inv_cu_v = inv_sq_v * inv_v;
-                    let inv_qu_v = inv_sq_v * inv_sq_v;
-                    *inv = inv_v;
-                    *inv_sq = inv_sq_v;
-                    *inv_cu = inv_cu_v;
-                    *inv_qu = inv_qu_v;
-                    *wh = wi * hi;
-                    *wih = wi * inv_v;
-                    *wih2 = wi * inv_sq_v;
-                    wi * (-0.5 * hi * hi + hp.ln())
-                },
-            )
-            .sum::<f64>()
-    };
+    let mut log_likelihood = 0.0;
 
     if let Some((i, value)) = h
         .iter()
@@ -397,20 +262,24 @@ fn build_transformation_row_derived(
             "TransformationNormalFamily row_quantities: weight[{i}] = {value} is not finite"
         ));
     }
-    if !log_likelihood.is_finite() {
-        return Err(format!(
-            "TransformationNormalFamily row_quantities: log-likelihood is not finite ({log_likelihood})"
-        ));
-    }
     for i in 0..n {
+        let hp = h_prime[i];
+        let inv_h_prime = 1.0 / hp;
+        let inv_h_prime_sq = inv_h_prime * inv_h_prime;
+        let inv_h_prime_cu = inv_h_prime_sq * inv_h_prime;
+        let inv_h_prime_qu = inv_h_prime_sq * inv_h_prime_sq;
+        let weighted_h = weights[i] * h[i];
+        let weighted_inv_h_prime = weights[i] * inv_h_prime;
+        let weighted_inv_h_prime_sq = weights[i] * inv_h_prime_sq;
+        log_likelihood += weights[i] * (-0.5 * h[i] * h[i] + hp.ln());
         let derived_values = [
-            ("1/h'", inv_h_prime[i]),
-            ("1/h'^2", inv_h_prime_sq[i]),
-            ("1/h'^3", inv_h_prime_cu[i]),
-            ("1/h'^4", inv_h_prime_qu[i]),
-            ("w*h", weighted_h[i]),
-            ("w/h'", weighted_inv_h_prime[i]),
-            ("w/h'^2", weighted_inv_h_prime_sq[i]),
+            ("1/h'", inv_h_prime),
+            ("1/h'^2", inv_h_prime_sq),
+            ("1/h'^3", inv_h_prime_cu),
+            ("1/h'^4", inv_h_prime_qu),
+            ("w*h", weighted_h),
+            ("w/h'", weighted_inv_h_prime),
+            ("w/h'^2", weighted_inv_h_prime_sq),
         ];
         for (name, value) in derived_values {
             if !value.is_finite() {
@@ -421,17 +290,13 @@ fn build_transformation_row_derived(
             }
         }
     }
+    if !log_likelihood.is_finite() {
+        return Err(format!(
+            "TransformationNormalFamily row_quantities: log-likelihood is not finite ({log_likelihood})"
+        ));
+    }
 
-    Ok(TransformationNormalRowDerived {
-        inv_h_prime,
-        inv_h_prime_sq,
-        inv_h_prime_cu,
-        inv_h_prime_qu,
-        weighted_h,
-        weighted_inv_h_prime,
-        weighted_inv_h_prime_sq,
-        log_likelihood,
-    })
+    Ok(TransformationNormalRowDerived { log_likelihood })
 }
 
 // ---------------------------------------------------------------------------
@@ -590,9 +455,7 @@ impl TransformationNormalFamily {
             response_transform: resp_transform,
             response_degree: config.response_degree,
             response_median: resp_median,
-            policy,
             row_quantity_cache: Arc::new(Mutex::new(None)),
-            psi_axis_vector_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -748,9 +611,7 @@ impl TransformationNormalFamily {
             response_transform: response_transform.clone(),
             response_degree,
             response_median: resp_median,
-            policy,
             row_quantity_cache: Arc::new(Mutex::new(None)),
-            psi_axis_vector_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -868,13 +729,6 @@ impl TransformationNormalFamily {
             beta: Arc::new(beta.clone()),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
-            inv_h_prime: Arc::new(derived.inv_h_prime),
-            inv_h_prime_sq: Arc::new(derived.inv_h_prime_sq),
-            inv_h_prime_cu: Arc::new(derived.inv_h_prime_cu),
-            inv_h_prime_qu: Arc::new(derived.inv_h_prime_qu),
-            weighted_h: Arc::new(derived.weighted_h),
-            weighted_inv_h_prime: Arc::new(derived.weighted_inv_h_prime),
-            weighted_inv_h_prime_sq: Arc::new(derived.weighted_inv_h_prime_sq),
             log_likelihood: derived.log_likelihood,
         };
 
@@ -2037,9 +1891,9 @@ impl TransformationNormalFamily {
                                 + hp_a_dir * hppsi_b
                                 + hp_a * hppsi_b_dir;
                             let barrier_product = hp_a * hp_b * hp_psi;
-                            let barrier_product_dir =
-                                hp_a_dir * hp_b * hp_psi + hp_a * hp_b_dir * hp_psi
-                                    + hp_a * hp_b * hp_psi_dir;
+                            let barrier_product_dir = hp_a_dir * hp_b * hp_psi
+                                + hp_a * hp_b_dir * hp_psi
+                                + hp_a * hp_b * hp_psi_dir;
                             let value = hpsi_a_dir * h_b
                                 + hpsi_a * h_b_dir
                                 + h_a_dir * hpsi_b
@@ -2048,8 +1902,9 @@ impl TransformationNormalFamily {
                                 + h_dir * hpsi_ab
                                 + numerator_dir * inv_hp_sq
                                 + numerator * d_inv_hp_sq
-                                - 2.0 * (barrier_product_dir * inv_hp_cu
-                                    + barrier_product * d_inv_hp_cu)
+                                - 2.0
+                                    * (barrier_product_dir * inv_hp_cu
+                                        + barrier_product * d_inv_hp_cu)
                                 - hppsi_ab * d_inv_hp
                                 + hp_ab * hp_psi_dir * inv_hp_sq
                                 + hp_ab * hp_psi * d_inv_hp_sq;
@@ -2061,113 +1916,6 @@ impl TransformationNormalFamily {
         }
 
         Ok(0.5 * (&out + &out.t()))
-    }
-
-    /// Cached per-axis `forward_mul(axis, β)` against the value response basis.
-    ///
-    /// First call for a given β allocates a `PsiAxisVectorCache` with `q` empty
-    /// slots; subsequent calls for the same β bit-pattern reuse the per-slot
-    /// `Arc<Array1<f64>>`. Calls with a different β invalidate the cache and
-    /// re-allocate (the new β is the new accepted iterate or a fresh
-    /// line-search probe).
-    fn cached_psi_axis_forward_val(
-        &self,
-        op: &TensorKroneckerPsiOperator,
-        axis: usize,
-        beta: &Array1<f64>,
-    ) -> Result<Arc<Array1<f64>>, String> {
-        let q = op.covariate_derivs.len();
-        {
-            let mut cache_guard = self
-                .psi_axis_vector_cache
-                .lock()
-                .expect("CTN psi axis vector cache mutex poisoned");
-            let needs_init = match cache_guard.as_ref() {
-                Some(c) => !c.matches_beta(beta) || c.forward_val.len() != q,
-                None => true,
-            };
-            if needs_init {
-                *cache_guard = Some(PsiAxisVectorCache::new(beta, q));
-            }
-            let cache = cache_guard
-                .as_ref()
-                .expect("PsiAxisVectorCache initialized above");
-            if let Some(slot) = cache.forward_val.get(axis).and_then(|s| s.as_ref()) {
-                return Ok(Arc::clone(slot));
-            }
-        }
-        // Route per-axis fetch through the directional kernel with the unit
-        // basis vector e_axis. The kernel skips zero entries, so this loops
-        // once over `axis` and produces the same n-vector that
-        // `op.forward_mul(axis, β)` would — at no extra arithmetic — while
-        // making the directional kernel a live, exercised production caller.
-        let mut unit = Array1::<f64>::zeros(q);
-        unit[axis] = 1.0;
-        let computed = op
-            .forward_directional(&unit.view(), &beta.view())
-            .map_err(|e| format!("tensor psi forward_mul failed: {e}"))?;
-        let arc = Arc::new(computed);
-        let mut cache_guard = self
-            .psi_axis_vector_cache
-            .lock()
-            .expect("CTN psi axis vector cache mutex poisoned");
-        if let Some(cache) = cache_guard.as_mut()
-            && cache.matches_beta(beta)
-            && cache.forward_val.len() == q
-        {
-            cache.forward_val[axis] = Some(Arc::clone(&arc));
-        }
-        Ok(arc)
-    }
-
-    /// Cached per-axis `forward_mul_deriv(axis, β)` against the derivative
-    /// response basis. See [`cached_psi_axis_forward_val`] for the cache contract.
-    fn cached_psi_axis_forward_deriv(
-        &self,
-        op: &TensorKroneckerPsiOperator,
-        axis: usize,
-        beta: &Array1<f64>,
-    ) -> Result<Arc<Array1<f64>>, String> {
-        let q = op.covariate_derivs.len();
-        {
-            let mut cache_guard = self
-                .psi_axis_vector_cache
-                .lock()
-                .expect("CTN psi axis vector cache mutex poisoned");
-            let needs_init = match cache_guard.as_ref() {
-                Some(c) => !c.matches_beta(beta) || c.forward_deriv.len() != q,
-                None => true,
-            };
-            if needs_init {
-                *cache_guard = Some(PsiAxisVectorCache::new(beta, q));
-            }
-            let cache = cache_guard
-                .as_ref()
-                .expect("PsiAxisVectorCache initialized above");
-            if let Some(slot) = cache.forward_deriv.get(axis).and_then(|s| s.as_ref()) {
-                return Ok(Arc::clone(slot));
-            }
-        }
-        // Same unit-vector dispatch as `cached_psi_axis_forward_val`, against
-        // the derivative response basis. Keeps the directional kernel as the
-        // single production path for per-axis ψ derivative evaluation.
-        let mut unit = Array1::<f64>::zeros(q);
-        unit[axis] = 1.0;
-        let computed = op
-            .forward_directional_deriv(&unit.view(), &beta.view())
-            .map_err(|e| format!("tensor psi derivative forward_mul failed: {e}"))?;
-        let arc = Arc::new(computed);
-        let mut cache_guard = self
-            .psi_axis_vector_cache
-            .lock()
-            .expect("CTN psi axis vector cache mutex poisoned");
-        if let Some(cache) = cache_guard.as_mut()
-            && cache.matches_beta(beta)
-            && cache.forward_deriv.len() == q
-        {
-            cache.forward_deriv[axis] = Some(Arc::clone(&arc));
-        }
-        Ok(arc)
     }
 }
 
@@ -2764,15 +2512,16 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv_j = &psi_derivs[0][psi_j];
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta)?;
-        let h = row.h.as_ref();
-        let n = h.len();
-        let inv_h_prime = row.inv_h_prime.as_ref();
-        let inv_h_prime_sq = row.inv_h_prime_sq.as_ref();
-        let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
-        let inv_h_prime_qu = row.inv_h_prime_qu.as_ref();
-        let weighted_h = row.weighted_h.as_ref();
-        let weighted_inv_h_prime = row.weighted_inv_h_prime.as_ref();
-        let weighted_inv_h_prime_sq = row.weighted_inv_h_prime_sq.as_ref();
+        let n = row.h.len();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "SCOP psi-psi terms beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+                beta.len()
+            ));
+        }
 
         let op = deriv_i
             .implicit_operator
@@ -2785,219 +2534,209 @@ impl CustomFamily for TransformationNormalFamily {
         let axis_i = deriv_i.implicit_axis;
         let axis_j = deriv_j.implicit_axis;
 
-        let v_i_val_arc = self.cached_psi_axis_forward_val(op, axis_i, beta)?;
-        let v_j_val_arc = self.cached_psi_axis_forward_val(op, axis_j, beta)?;
-        let v_i_val: &Array1<f64> = v_i_val_arc.as_ref();
-        let v_j_val: &Array1<f64> = v_j_val_arc.as_ref();
-        let v_ij_val = if axis_i == axis_j {
-            op.forward_mul_second_diag(axis_i, &beta.view())
-        } else {
-            op.forward_mul_second_cross(axis_i, axis_j, &beta.view())
-        }
-        .map_err(|e| format!("tensor psi second-order forward_mul(value second) failed: {e}"))?;
-
-        let v_i_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis_i, beta)?;
-        let v_j_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis_j, beta)?;
-        let v_i_deriv: &Array1<f64> = v_i_deriv_arc.as_ref();
-        let v_j_deriv: &Array1<f64> = v_j_deriv_arc.as_ref();
-        let v_ij_deriv = op
-            .forward_mul_second_deriv(axis_i, axis_j, &beta.view())
-            .map_err(|e| {
-                format!("tensor psi second-order forward_mul(derivative second) failed: {e}")
-            })?;
-
-        let objective_psi_psi = {
-            let weights = self.weights.as_ref();
-            (0..n)
-                .into_par_iter()
-                .map(|row| {
-                    weights[row]
-                        * (v_i_val[row] * v_j_val[row] + h[row] * v_ij_val[row]
-                            - inv_h_prime[row] * v_ij_deriv[row]
-                            + inv_h_prime_sq[row] * v_i_deriv[row] * v_j_deriv[row])
-                })
-                .sum::<f64>()
-        };
-
-        let score_psi_psi = {
-            let term1 = op
-                .transpose_mul(axis_i, &(v_j_val * self.weights.as_ref()).view())
-                .map_err(|e| format!("tensor psi second-order transpose_mul(i) failed: {e}"))?;
-            let term2 = op
-                .transpose_mul(axis_j, &(v_i_val * self.weights.as_ref()).view())
-                .map_err(|e| format!("tensor psi second-order transpose_mul(j) failed: {e}"))?;
-            let term3 = if axis_i == axis_j {
-                op.transpose_mul_second_diag(axis_i, &weighted_h.view())
-            } else {
-                op.transpose_mul_second_cross(axis_i, axis_j, &weighted_h.view())
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi-psi beta reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP psi-psi terms require covariate row chunk: {e}"))?;
+        let cov_i = op
+            .materialize_cov_first_axis(axis_i)
+            .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(i) failed: {e}"))?;
+        let cov_j = op
+            .materialize_cov_first_axis(axis_j)
+            .map_err(|e| format!("tensor psi-psi materialize_cov_first_axis(j) failed: {e}"))?;
+        let cov_ij = op
+            .materialize_cov_second_axis(axis_i, axis_j)
+            .map_err(|e| format!("tensor psi-psi materialize_cov_second_axis failed: {e}"))?;
+        for (name, mat) in [
+            ("cov", &cov),
+            ("cov_i", &cov_i),
+            ("cov_j", &cov_j),
+            ("cov_ij", &cov_ij),
+        ] {
+            if mat.nrows() != n || mat.ncols() != p_cov {
+                return Err(format!(
+                    "SCOP psi-psi {name} shape {}x{} != expected {}x{}",
+                    mat.nrows(),
+                    mat.ncols(),
+                    n,
+                    p_cov
+                ));
             }
-            .map_err(|e| {
-                format!("tensor psi second-order transpose_mul(value second) failed: {e}")
-            })?;
-            let term4 = self
-                .x_val_kron
-                .transpose_mul(&(&v_ij_val * self.weights.as_ref()));
-            let term5 = op
-                .transpose_mul_deriv(axis_i, &(v_j_deriv * weighted_inv_h_prime_sq))
-                .map_err(|e| {
-                    format!("tensor psi second-order transpose_mul_deriv(i) failed: {e}")
-                })?;
-            let term6 = op
-                .transpose_mul_deriv(axis_j, &(v_i_deriv * weighted_inv_h_prime_sq))
-                .map_err(|e| {
-                    format!("tensor psi second-order transpose_mul_deriv(j) failed: {e}")
-                })?;
-            let term7 = op
-                .transpose_mul_second_deriv(axis_i, axis_j, &weighted_inv_h_prime.view())
-                .map_err(|e| {
-                    format!("tensor psi second-order transpose_mul(derivative second) failed: {e}")
-                })?
-                .mapv(|v| -v);
-            let term8 = self
-                .x_deriv_kron
-                .transpose_mul(&(&v_ij_deriv * weighted_inv_h_prime_sq));
-            let cubic = ((v_i_deriv * v_j_deriv) * inv_h_prime_cu * self.weights.as_ref())
-                .mapv(|v| -2.0 * v);
-            let term9 = self.x_deriv_kron.transpose_mul(&cubic);
-            term1 + &term2 + &term3 + &term4 + &term5 + &term6 + &term7 + &term8 + &term9
-        };
+        }
 
-        let hessian_psi_psi = {
-            // Stay factored: keep (response_basis, covariate_factor) pairs and
-            // never materialize n x (p_resp * p_cov) rowwise-Kronecker matrices.
-            // The resource policy is the one stored on the family so chunk
-            // sizing matches the surrounding workload.
-            let policy: &ResourcePolicy = &self.policy;
-            let cov_design_dense = op.covariate_design.as_dense_ref().ok_or_else(|| {
-                "TransformationNormalFamily exact Hessian requires dense covariate design"
-                    .to_string()
-            })?;
-            let cov_i = op.materialize_cov_first(axis_i).map_err(|e| {
-                format!("tensor psi second-order materialize_cov_first(i) failed: {e}")
-            })?;
-            let cov_j = op.materialize_cov_first(axis_j).map_err(|e| {
-                format!("tensor psi second-order materialize_cov_first(j) failed: {e}")
-            })?;
-            let cov_ij = op.materialize_cov_second(axis_i, axis_j).map_err(|e| {
-                format!("tensor psi second-order materialize_cov_second failed: {e}")
-            })?;
+        #[derive(Clone)]
+        struct Jet2 {
+            value: f64,
+            grad: Array1<f64>,
+            hess: Array2<f64>,
+        }
 
-            let resp_val = op.response_val_basis.as_ref();
-            let resp_deriv = op.response_deriv_basis.as_ref();
-            let w_view = self.weights.view();
-            let w_inv_h2_view = weighted_inv_h_prime_sq.view();
+        impl Jet2 {
+            fn zero(p: usize) -> Self {
+                Self {
+                    value: 0.0,
+                    grad: Array1::<f64>::zeros(p),
+                    hess: Array2::<f64>::zeros((p, p)),
+                }
+            }
 
-            let mut hess =
-                factored_weighted_cross(resp_val, &cov_i, w_view, resp_val, &cov_j, policy)?;
-            hess += &factored_weighted_cross(resp_val, &cov_j, w_view, resp_val, &cov_i, policy)?;
-            hess += &factored_weighted_cross(
-                resp_val,
-                &cov_ij,
-                w_view,
-                resp_val,
-                cov_design_dense,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_val,
-                cov_design_dense,
-                w_view,
-                resp_val,
-                &cov_ij,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                &cov_i,
-                w_inv_h2_view,
-                resp_deriv,
-                &cov_j,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                &cov_j,
-                w_inv_h2_view,
-                resp_deriv,
-                &cov_i,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                &cov_ij,
-                w_inv_h2_view,
-                resp_deriv,
-                cov_design_dense,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                cov_design_dense,
-                w_inv_h2_view,
-                resp_deriv,
-                &cov_ij,
-                policy,
-            )?;
+            fn linear_block(
+                value: f64,
+                p_total: usize,
+                p_cov: usize,
+                block: usize,
+                row: ArrayView1<'_, f64>,
+            ) -> Self {
+                let mut out = Self::zero(p_total);
+                out.value = value;
+                let offset = block * p_cov;
+                for c in 0..p_cov {
+                    out.grad[offset + c] = row[c];
+                }
+                out
+            }
 
-            let cubic_i = ((v_j_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                &cov_i,
-                cubic_i.view(),
-                resp_deriv,
-                cov_design_dense,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                cov_design_dense,
-                cubic_i.view(),
-                resp_deriv,
-                &cov_i,
-                policy,
-            )?;
+            fn add_scaled_assign(&mut self, scale: f64, rhs: &Self) {
+                self.value += scale * rhs.value;
+                self.grad.scaled_add(scale, &rhs.grad);
+                self.hess.scaled_add(scale, &rhs.hess);
+            }
 
-            let cubic_j = ((v_i_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                &cov_j,
-                cubic_j.view(),
-                resp_deriv,
-                cov_design_dense,
-                policy,
-            )?;
-            hess += &factored_weighted_cross(
-                resp_deriv,
-                cov_design_dense,
-                cubic_j.view(),
-                resp_deriv,
-                &cov_j,
-                policy,
-            )?;
+            fn add(&self, rhs: &Self) -> Self {
+                let mut out = self.clone();
+                out.add_scaled_assign(1.0, rhs);
+                out
+            }
 
-            let cubic_second =
-                ((&v_ij_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            hess += &self.x_deriv_kron.weighted_gram(&cubic_second, policy);
+            fn scaled(&self, scale: f64) -> Self {
+                let mut out = self.clone();
+                out.value *= scale;
+                out.grad.mapv_inplace(|v| scale * v);
+                out.hess.mapv_inplace(|v| scale * v);
+                out
+            }
 
-            let quartic = ((v_i_deriv * v_j_deriv) * inv_h_prime_qu * self.weights.as_ref())
-                .mapv(|v| 6.0 * v);
-            hess += &self.x_deriv_kron.weighted_gram(&quartic, policy);
-            0.5 * (&hess + &hess.t())
-        };
+            fn mul(&self, rhs: &Self) -> Self {
+                let p = self.grad.len();
+                let mut hess = &self.hess * rhs.value + &(&rhs.hess * self.value);
+                for a in 0..p {
+                    let self_a = self.grad[a];
+                    let rhs_a = rhs.grad[a];
+                    for b in 0..p {
+                        hess[[a, b]] += self_a * rhs.grad[b] + rhs_a * self.grad[b];
+                    }
+                }
+                Self {
+                    value: self.value * rhs.value,
+                    grad: &self.grad * rhs.value + &(&rhs.grad * self.value),
+                    hess,
+                }
+            }
 
-        // Result-validation gate. The formula above can still produce NaN
-        // when an input that bypasses the `row_quantities` reciprocal-power
-        // check overflows — for example, the second-order spatial-basis
-        // term `v_ij_deriv = op.forward_mul_second_deriv(axis_i, axis_j, β)`
-        // for tightly anisotropic Duchon length scales, or the materialized
-        // `cov_ij = materialize_cov_second(axis_i, axis_j)` when its second
-        // derivative blows up at extreme ψ. Surfacing the infeasibility as
-        // an Err lets the outer REML evaluator return +∞ cost / retreat
-        // through its existing PerfectSeparation/PirlsDidNotConverge-style
-        // handling instead of forwarding a NaN dense Hessian into the
-        // unified evaluator (observed: the entire 238×238 dense `b_mat` is
-        // NaN on the κ_i-κ_i diagonals of the 16-axis aniso Duchon
-        // margslope CTN run, with `pair.a=NaN` `pair.ld_s=NaN`).
+            fn recip(&self) -> Self {
+                let inv = 1.0 / self.value;
+                let inv_sq = inv * inv;
+                let inv_cu = inv_sq * inv;
+                let p = self.grad.len();
+                let mut hess = &self.hess * (-inv_sq);
+                for a in 0..p {
+                    for b in 0..p {
+                        hess[[a, b]] += 2.0 * self.grad[a] * self.grad[b] * inv_cu;
+                    }
+                }
+                Self {
+                    value: inv,
+                    grad: self.grad.mapv(|v| -v * inv_sq),
+                    hess,
+                }
+            }
+        }
+
+        let weights = self.weights.as_ref();
+        let mut objective_psi_psi = 0.0;
+        let mut score_psi_psi = Array1::<f64>::zeros(p_total);
+        let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let cov_i_row = cov_i.row(i);
+            let cov_j_row = cov_j.row(i);
+            let cov_ij_row = cov_ij.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+
+            let mut h = Jet2::zero(p_total);
+            let mut hp = Jet2::zero(p_total);
+            let mut h_i = Jet2::zero(p_total);
+            let mut h_j = Jet2::zero(p_total);
+            let mut h_ij = Jet2::zero(p_total);
+            let mut hp_i = Jet2::zero(p_total);
+            let mut hp_j = Jet2::zero(p_total);
+            let mut hp_ij = Jet2::zero(p_total);
+
+            for k in 0..p_resp {
+                let gamma = beta_mat.row(k).dot(&cov_row);
+                let gamma_i = beta_mat.row(k).dot(&cov_i_row);
+                let gamma_j = beta_mat.row(k).dot(&cov_j_row);
+                let gamma_ij = beta_mat.row(k).dot(&cov_ij_row);
+                let g = Jet2::linear_block(gamma, p_total, p_cov, k, cov_row);
+                let gi = Jet2::linear_block(gamma_i, p_total, p_cov, k, cov_i_row);
+                let gj = Jet2::linear_block(gamma_j, p_total, p_cov, k, cov_j_row);
+                let gij = Jet2::linear_block(gamma_ij, p_total, p_cov, k, cov_ij_row);
+
+                if k == 0 {
+                    h.add_scaled_assign(rv[k], &g);
+                    hp.add_scaled_assign(rd[k], &g);
+                    h_i.add_scaled_assign(rv[k], &gi);
+                    h_j.add_scaled_assign(rv[k], &gj);
+                    h_ij.add_scaled_assign(rv[k], &gij);
+                    hp_i.add_scaled_assign(rd[k], &gi);
+                    hp_j.add_scaled_assign(rd[k], &gj);
+                    hp_ij.add_scaled_assign(rd[k], &gij);
+                } else {
+                    let g_sq = g.mul(&g);
+                    let g_gi = g.mul(&gi);
+                    let g_gj = g.mul(&gj);
+                    let psi_cross = gj.mul(&gi).add(&g.mul(&gij));
+
+                    h.add_scaled_assign(rv[k], &g_sq);
+                    hp.add_scaled_assign(rd[k], &g_sq);
+                    h_i.add_scaled_assign(2.0 * rv[k], &g_gi);
+                    h_j.add_scaled_assign(2.0 * rv[k], &g_gj);
+                    h_ij.add_scaled_assign(2.0 * rv[k], &psi_cross);
+                    hp_i.add_scaled_assign(2.0 * rd[k], &g_gi);
+                    hp_j.add_scaled_assign(2.0 * rd[k], &g_gj);
+                    hp_ij.add_scaled_assign(2.0 * rd[k], &psi_cross);
+                }
+            }
+
+            let inv_hp = hp.recip();
+            let inv_hp_sq = inv_hp.mul(&inv_hp);
+            // For one row of negative log likelihood V = 0.5 h^2 - log(h'),
+            // ∂²V/∂ψ_i∂ψ_j =
+            // h_i h_j + h h_ij - h'_ij/h' + h'_i h'_j/(h')².
+            let value = h_i
+                .mul(&h_j)
+                .add(&h.mul(&h_ij))
+                .add(&hp_ij.mul(&inv_hp).scaled(-1.0))
+                .add(&hp_i.mul(&hp_j).mul(&inv_hp_sq));
+            let wi = weights[i];
+            objective_psi_psi += wi * value.value;
+            score_psi_psi.scaled_add(wi, &value.grad);
+            hessian_psi_psi.scaled_add(wi, &value.hess);
+        }
+
+        hessian_psi_psi = 0.5 * (&hessian_psi_psi + &hessian_psi_psi.t());
+
+        // Result-validation gate. A trial point can still make the SCOP row
+        // terms non-finite through an invalid h' or an exploding ψ second
+        // derivative in the covariate basis. Surface that as an infeasible
+        // exact-Newton evaluation instead of passing NaNs into the unified
+        // outer evaluator.
         if !objective_psi_psi.is_finite()
             || !score_psi_psi.iter().all(|v| v.is_finite())
             || !hessian_psi_psi.iter().all(|v| v.is_finite())
@@ -3053,7 +2792,8 @@ impl CustomFamily for TransformationNormalFamily {
             })?;
         let axis = deriv.implicit_axis;
         let row = self.row_quantities(beta)?;
-        let hess = self.scop_psi_hessian_directional_derivative(beta, d_beta_flat, &row, op, axis)?;
+        let hess =
+            self.scop_psi_hessian_directional_derivative(beta, d_beta_flat, &row, op, axis)?;
         Ok(Some(hess))
     }
 
@@ -5263,7 +5003,6 @@ fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
 #[derive(Clone)]
 struct TensorKroneckerPsiOperator {
     response_val_basis: Arc<Array2<f64>>,
-    response_deriv_basis: Arc<Array2<f64>>,
     covariate_design: DesignMatrix,
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
 }
@@ -5644,44 +5383,6 @@ impl TensorKroneckerPsiOperator {
         rowwise_kronecker(resp_basis, cov)
     }
 
-    fn transpose_mul_deriv(
-        &self,
-        axis: usize,
-        v: &Array1<f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
-        unit[axis] = 1.0;
-        self.transpose_directional_deriv(&unit.view(), &v.view())
-    }
-
-    fn forward_mul_second_deriv(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        u: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let q = self.covariate_derivs.len();
-        let mut unit_d = Array1::<f64>::zeros(q);
-        let mut unit_e = Array1::<f64>::zeros(q);
-        unit_d[axis_d] = 1.0;
-        unit_e[axis_e] = 1.0;
-        self.forward_second_directional_deriv(&unit_d.view(), &unit_e.view(), u)
-    }
-
-    fn transpose_mul_second_deriv(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        v: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let q = self.covariate_derivs.len();
-        let mut unit_d = Array1::<f64>::zeros(q);
-        let mut unit_e = Array1::<f64>::zeros(q);
-        unit_d[axis_d] = 1.0;
-        unit_e[axis_e] = 1.0;
-        self.transpose_second_directional_deriv(&unit_d.view(), &unit_e.view(), v)
-    }
-
     /// Internal directional accumulator on a chosen response basis:
     /// returns `Σ_j v_psi[j] · lifted_forward(resp_basis, j, β)`.
     ///
@@ -5829,18 +5530,6 @@ impl TensorKroneckerPsiOperator {
         self.lifted_forward_directional(&resp_basis, v_psi, beta)
     }
 
-    /// Directional `Σ_j v_psi[j] · ∂(X' · β)/∂ψ_j` on the derivative response basis.
-    /// Calling with `v_psi = e_k` matches [`forward_mul_deriv`](Self::forward_mul_deriv)
-    /// at axis `k`.
-    fn forward_directional_deriv(
-        &self,
-        v_psi: &ndarray::ArrayView1<'_, f64>,
-        beta: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let resp_basis = self.response_deriv_basis.clone();
-        self.lifted_forward_directional(&resp_basis, v_psi, beta)
-    }
-
     /// Directional transpose against the value response basis.
     /// Calling with `v_psi = e_k` matches the per-axis `transpose_mul(k, residual)`
     /// surface on the trait.
@@ -5850,18 +5539,6 @@ impl TensorKroneckerPsiOperator {
         residual: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let resp_basis = self.response_val_basis.clone();
-        self.lifted_transpose_directional(&resp_basis, v_psi, residual)
-    }
-
-    /// Directional transpose against the derivative response basis.
-    /// Calling with `v_psi = e_k` matches [`transpose_mul_deriv`](Self::transpose_mul_deriv)
-    /// at axis `k`.
-    fn transpose_directional_deriv(
-        &self,
-        v_psi: &ndarray::ArrayView1<'_, f64>,
-        residual: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let resp_basis = self.response_deriv_basis.clone();
         self.lifted_transpose_directional(&resp_basis, v_psi, residual)
     }
 
@@ -5878,18 +5555,6 @@ impl TensorKroneckerPsiOperator {
         self.lifted_forward_second_directional(&resp_basis, v_psi, w_psi, beta)
     }
 
-    /// Bilinear directional second-order forward on the derivative response basis.
-    /// With `v_psi = e_a, w_psi = e_b` matches `forward_mul_second_deriv(a, b)`.
-    fn forward_second_directional_deriv(
-        &self,
-        v_psi: &ndarray::ArrayView1<'_, f64>,
-        w_psi: &ndarray::ArrayView1<'_, f64>,
-        beta: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let resp_basis = self.response_deriv_basis.clone();
-        self.lifted_forward_second_directional(&resp_basis, v_psi, w_psi, beta)
-    }
-
     /// Bilinear directional second-order transpose on the value response basis.
     /// With `v_psi = e_a, w_psi = e_b` matches the per-axis-pair
     /// `transpose_mul_second_diag(a)` (when a==b) or `transpose_mul_second_cross(a,b)`.
@@ -5900,18 +5565,6 @@ impl TensorKroneckerPsiOperator {
         residual: &ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         let resp_basis = self.response_val_basis.clone();
-        self.lifted_transpose_second_directional(&resp_basis, v_psi, w_psi, residual)
-    }
-
-    /// Bilinear directional second-order transpose on the derivative response basis.
-    /// With `v_psi = e_a, w_psi = e_b` matches `transpose_mul_second_deriv(a, b)`.
-    fn transpose_second_directional_deriv(
-        &self,
-        v_psi: &ndarray::ArrayView1<'_, f64>,
-        w_psi: &ndarray::ArrayView1<'_, f64>,
-        residual: &ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let resp_basis = self.response_deriv_basis.clone();
         self.lifted_transpose_second_directional(&resp_basis, v_psi, w_psi, residual)
     }
 }
@@ -6003,7 +5656,9 @@ mod tests {
     fn toy_probe_vector(p_total: usize, seed: u64) -> Array1<f64> {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
         Array1::from_iter((0..p_total).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let bits = (state >> 11) as f64 / (1u64 << 53) as f64;
             (bits - 0.5) * 0.8
         }))
@@ -6088,20 +5743,7 @@ mod tests {
         let mut expected_ll = 0.0;
         for i in 0..direct_h.len() {
             let hp = direct_h_prime[i];
-            let inv = 1.0 / hp;
-            let inv_sq = inv * inv;
-            let inv_cu = inv_sq * inv;
-            let inv_qu = inv_sq * inv_sq;
             expected_ll += weights[i] * (-0.5 * direct_h[i] * direct_h[i] + hp.ln());
-
-            let tol = 1.0e-14;
-            assert!((row.inv_h_prime[i] - inv).abs() <= tol);
-            assert!((row.inv_h_prime_sq[i] - inv_sq).abs() <= tol);
-            assert!((row.inv_h_prime_cu[i] - inv_cu).abs() <= tol);
-            assert!((row.inv_h_prime_qu[i] - inv_qu).abs() <= tol);
-            assert!((row.weighted_h[i] - weights[i] * direct_h[i]).abs() <= tol);
-            assert!((row.weighted_inv_h_prime[i] - weights[i] * inv).abs() <= tol);
-            assert!((row.weighted_inv_h_prime_sq[i] - weights[i] * inv_sq).abs() <= tol);
         }
 
         assert!(
@@ -6122,10 +5764,7 @@ mod tests {
             .row_quantities(&state.beta)
             .expect("same beta row quantity lookup");
         assert!(Arc::ptr_eq(&row_a.h, &row_a_again.h));
-        assert!(Arc::ptr_eq(
-            &row_a.weighted_inv_h_prime_sq,
-            &row_a_again.weighted_inv_h_prime_sq
-        ));
+        assert!(Arc::ptr_eq(&row_a.h_prime, &row_a_again.h_prime));
 
         let mut beta_b = state.beta.clone();
         beta_b[0] += 0.125;
@@ -7694,7 +7333,6 @@ pub fn build_tensor_psi_derivatives(
     let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> =
         Arc::new(TensorKroneckerPsiOperator {
             response_val_basis: Arc::new(family.response_val_basis.clone()),
-            response_deriv_basis: Arc::new(family.response_deriv_basis.clone()),
             covariate_design: family.covariate_design.clone(),
             covariate_derivs: covariate_psi_derivs.to_vec(),
         });
