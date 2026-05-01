@@ -7115,6 +7115,16 @@ struct DuchonCrossPenaltyContext {
     op0_s_first_raw: Vec<Array2<f64>>,
     op1_s_first_raw: Vec<Array2<f64>>,
     op2_s_first_raw: Vec<Array2<f64>>,
+    // Closed-form cross-axis matrices per q. When `Some`, `compute_pair`
+    // returns the precomputed closed-form cross-axis derivative for that q
+    // and bypasses both `gram_cross_psi_derivative_from_operator` and the
+    // value_share/operator_share corrections (those corrections are for the
+    // centered-η chain rule used by collocation; the closed-form path uses
+    // raw η directly per math team Letter A §9). Indexed [a][b] across all
+    // (a, b) pairs (symmetric).
+    op0_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>>,
+    op1_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>>,
+    op2_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>>,
 }
 
 impl DuchonCrossPenaltyContext {
@@ -7246,40 +7256,61 @@ impl DuchonCrossPenaltyContext {
             d2_cross_proj -= &(&self.d2 * (operator_share * operator_share));
         }
 
-        let s0_cross = normalize_penalty_cross_psi_derivative(
-            &self.op0_s_raw,
-            &self.op0_s_first_raw[axis_a],
-            &self.op0_s_first_raw[axis_b],
-            &gram_cross_psi_derivative_from_operator(
+        // Per-q cross-axis Gram derivative source: closed-form (precomputed
+        // from `pair_block_radial_with_j_second_derivatives` raw-η Hessian)
+        // when `op_q_cf_cross_raw` is `Some`; collocation otherwise. Both
+        // routes feed `normalize_penalty_cross_psi_derivative` with the
+        // matching `op_q_s_raw` and `op_q_s_first_raw` already substituted
+        // upstream so the source is consistent within each q.
+        let cross_gram_q0 = if let Some(cf) = &self.op0_cf_cross_raw {
+            cf[axis_a][axis_b].clone()
+        } else {
+            gram_cross_psi_derivative_from_operator(
                 &self.d0,
                 &self.d0_eta_proj[axis_a],
                 &self.d0_eta_proj[axis_b],
                 &d0_cross_proj,
-            ),
+            )
+        };
+        let cross_gram_q1 = if let Some(cf) = &self.op1_cf_cross_raw {
+            cf[axis_a][axis_b].clone()
+        } else {
+            gram_cross_psi_derivative_from_operator(
+                &self.d1,
+                &self.d1_eta_proj[axis_a],
+                &self.d1_eta_proj[axis_b],
+                &d1_cross_proj,
+            )
+        };
+        let cross_gram_q2 = if let Some(cf) = &self.op2_cf_cross_raw {
+            cf[axis_a][axis_b].clone()
+        } else {
+            gram_cross_psi_derivative_from_operator(
+                &self.d2,
+                &self.d2_eta_proj[axis_a],
+                &self.d2_eta_proj[axis_b],
+                &d2_cross_proj,
+            )
+        };
+        let s0_cross = normalize_penalty_cross_psi_derivative(
+            &self.op0_s_raw,
+            &self.op0_s_first_raw[axis_a],
+            &self.op0_s_first_raw[axis_b],
+            &cross_gram_q0,
             self.op0_c,
         );
         let s1_cross = normalize_penalty_cross_psi_derivative(
             &self.op1_s_raw,
             &self.op1_s_first_raw[axis_a],
             &self.op1_s_first_raw[axis_b],
-            &gram_cross_psi_derivative_from_operator(
-                &self.d1,
-                &self.d1_eta_proj[axis_a],
-                &self.d1_eta_proj[axis_b],
-                &d1_cross_proj,
-            ),
+            &cross_gram_q1,
             self.op1_c,
         );
         let s2_cross = normalize_penalty_cross_psi_derivative(
             &self.op2_s_raw,
             &self.op2_s_first_raw[axis_a],
             &self.op2_s_first_raw[axis_b],
-            &gram_cross_psi_derivative_from_operator(
-                &self.d2,
-                &self.d2_eta_proj[axis_a],
-                &self.d2_eta_proj[axis_b],
-                &d2_cross_proj,
-            ),
+            &cross_gram_q2,
             self.op2_c,
         );
 
@@ -7654,8 +7685,90 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         };
 
     let op0_info = compute_operator_info(&d0, &d0_eta_proj, &d0_eta2_proj);
-    let op1_info = compute_operator_info(&d1, &d1_eta_proj, &d1_eta2_proj);
-    let op2_info = compute_operator_info(&d2, &d2_eta_proj, &d2_eta2_proj);
+    let mut op1_info = compute_operator_info(&d1, &d1_eta_proj, &d1_eta2_proj);
+    let mut op2_info = compute_operator_info(&d2, &d2_eta_proj, &d2_eta2_proj);
+
+    // Closed-form aniso wire-in: per math team Letter A §9, when the gate
+    // fires for a given q, substitute the (s_raw, c, s_first[a],
+    // s_second[a]) tuple with closed-form values computed from
+    // `pair_block_radial_with_j_second_derivatives` using raw η directly
+    // (no centering, no `apply_raw_psi_scaling`). Cross-axis matrices for
+    // that q are precomputed upfront and stashed in `op_q_cf_cross_raw`
+    // for the cross-provider's `compute_pair`.
+    //
+    // q=0 mass always stays on collocation (closed-form Lebesgue at q=0 is
+    // the kernel itself, not the canonical operator-mass penalty). The
+    // gate is identical to the value-side path: nullspace=Zero, per-q
+    // convergence (UV+IR+precondition), and !log_riesz_present.
+    //
+    // Note: for q=2 the bundle's `d2_eta` is FD-on-η of the analytic value
+    // (O(1e-7) precision); analytic Hessian arrives with closed-form-
+    // math-fix's Tier-3 F^{(6)} extension.
+    let aniso_dim = aniso_log_scales.len();
+    let use_closed_form_outer_aniso =
+        matches!(nullspace_order, DuchonNullspaceOrder::Zero);
+    let log_riesz_present_aniso = d % 2 == 0 && d / 2 <= 2 * p_order;
+    let closed_form_converges_q_aniso = |q: usize| -> bool {
+        let four_ms = 4 * (p_order + s_order);
+        let dp2q = d + 2 * q;
+        let four_m = 4 * p_order;
+        four_ms > dp2q
+            && dp2q > four_m
+            && 2 * p_order >= q + 1
+            && !log_riesz_present_aniso
+    };
+    let mut op1_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>> = None;
+    let mut op2_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>> = None;
+    if use_closed_form_outer_aniso {
+        let kappa_for_aniso = match length_scale {
+            Some(ls) => 1.0 / ls.max(1e-300),
+            None => 0.0,
+        };
+        let aniso_for_helper = Some(aniso_log_scales);
+        let kernel_z = Some(&z_kernel);
+        let mut substitute = |q: usize,
+                              info: &mut PerOperatorInfo|
+         -> Option<Vec<Vec<Array2<f64>>>> {
+            if !closed_form_converges_q_aniso(q) {
+                return None;
+            }
+            let (cf_s, cf_first, cf_second_diag, cf_cross) =
+                closed_form_aniso_psi_derivatives_in_total_basis(
+                    centers,
+                    q,
+                    p_order,
+                    s_order,
+                    kappa_for_aniso,
+                    aniso_for_helper,
+                    kernel_z,
+                    poly_cols,
+                    identifiability_transform,
+                );
+            let fro2: f64 = cf_s.iter().map(|v| v * v).sum();
+            let c = fro2.sqrt();
+            let mut s_first = Vec::with_capacity(aniso_dim);
+            let mut s_second = Vec::with_capacity(aniso_dim);
+            let mut s_first_raw_new = Vec::with_capacity(aniso_dim);
+            for a in 0..aniso_dim {
+                let (_, sa_norm, sa2_norm, _) = normalize_penaltywith_psi_derivatives(
+                    &cf_s,
+                    &cf_first[a],
+                    &cf_second_diag[a],
+                );
+                s_first.push(sa_norm);
+                s_second.push(sa2_norm);
+                s_first_raw_new.push(cf_first[a].clone());
+            }
+            info.s_raw = cf_s;
+            info.c = c;
+            info.s_first = s_first;
+            info.s_second = s_second;
+            info.s_first_raw = s_first_raw_new;
+            Some(cf_cross)
+        };
+        op1_cf_cross_raw = substitute(1, &mut op1_info);
+        op2_cf_cross_raw = substitute(2, &mut op2_info);
+    }
 
     // Build penalty candidates and determine which are active.
     let (s0_norm, c0) = if op0_info.c > 1e-12 {
@@ -7751,6 +7864,9 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         op0_s_first_raw: op0_info.s_first_raw,
         op1_s_first_raw: op1_info.s_first_raw,
         op2_s_first_raw: op2_info.s_first_raw,
+        op0_cf_cross_raw: None,
+        op1_cf_cross_raw: None,
+        op2_cf_cross_raw: None,
     };
     let cross_ctx = std::sync::Arc::new(cross_ctx);
     let cross_provider = AnisoPenaltyCrossProvider::new(move |a: usize, b: usize| {
