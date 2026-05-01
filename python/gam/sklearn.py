@@ -101,7 +101,13 @@ class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
         return np.asarray(predicted["mean"], dtype=float)
 
     def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
-        return float(r2_score(np.asarray(y, dtype=float), self.predict(X)))
+        return float(
+            r2_score(
+                np.asarray(y, dtype=float),
+                self.predict(X),
+                sample_weight=sample_weight,
+            )
+        )
 
 
 class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
@@ -121,4 +127,10 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
     def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
-        return float(accuracy_score(np.asarray(y, dtype=int), self.predict(X)))
+        return float(
+            accuracy_score(
+                np.asarray(y, dtype=int),
+                self.predict(X),
+                sample_weight=sample_weight,
+            )
+        )

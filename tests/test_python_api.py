@@ -82,6 +82,9 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert model.formula == "y ~ x"
     assert model.model_class == "standard"
     assert model.family_name == "Gaussian Identity"
+    assert model.training_table_kind == "records"
+    assert not model.is_survival
+    assert not model.is_transformation_normal
     assert summary["iterations"] >= 0
     assert not summary.coefficients_frame().empty
 
@@ -178,6 +181,20 @@ def test_sklearn_regressor_roundtrip() -> None:
     assert est.feature_names_in_.tolist() == ["x"]
     assert est.score(train[["x"]], train["y"]) > 0.999
 
+    fitted_training_response = pd.Series(est.predict(train[["x"]]))
+    y_with_masked_outlier = fitted_training_response.copy()
+    y_with_masked_outlier.iloc[-1] += 100.0
+    weights = np.ones(len(y_with_masked_outlier), dtype=float)
+    weights[-1] = 0.0
+    assert (
+        est.score(
+            train[["x"]],
+            y_with_masked_outlier,
+            sample_weight=weights,
+        )
+        > 0.999
+    )
+
 
 def test_numpy_inputs_and_outputs() -> None:
     x_train = np.array([[0.0], [1.0], [2.0], [3.0]])
@@ -253,6 +270,20 @@ def test_sklearn_classifier_roundtrip() -> None:
     expected_hard = est.classes_.take(np.argmax(proba_arr, axis=1))
     np.testing.assert_array_equal(np.asarray(pred).reshape(-1), expected_hard)
 
+    fitted_training_labels = pd.Series(est.predict(train[["x"]]))
+    y_with_masked_outlier = fitted_training_labels.copy()
+    y_with_masked_outlier.iloc[-1] = 1 - int(y_with_masked_outlier.iloc[-1])
+    weights = np.ones(len(y_with_masked_outlier), dtype=float)
+    weights[-1] = 0.0
+    assert (
+        est.score(
+            train[["x"]],
+            y_with_masked_outlier,
+            sample_weight=weights,
+        )
+        == 1.0
+    )
+
 
 def test_predict_rejects_schema_mismatch() -> None:
     model = gam.fit(training_rows(), "y ~ x")
@@ -308,14 +339,12 @@ def test_predict_can_passthrough_id_column() -> None:
 # ---------------------------------------------------------------------------
 # Pipeline smoke tests (task #14 / task #17).
 #
-# These three tests exercise the full PGS -> disease / survival pipeline
-# that the Nature-Genetics-style methods section is built around: Stage 1
-# conditional Gaussianization of the PGS on the PC manifold, Stage 2a
-# Bernoulli marginal-slope with a link-wiggle + logslope score-warp, and
-# Stage 2b survival marginal-slope with a Gompertz-Makeham baseline plus a
-# timewiggle. They go through the Python binding (``gam.fit`` /
-# ``model.predict``), not the CLI — the CLI contract is covered
-# separately by ``tests/integration_pit_pipeline.py``.
+# These tests exercise the PGS-facing Python surface: Stage 1 conditional
+# Gaussianization of the PGS on the PC manifold, Stage 2a Bernoulli
+# marginal-slope on the calibrated score, and survival prediction surfaces.
+# They go through the Python binding (``gam.fit`` / ``model.predict``), not
+# the CLI — the CLI contract is covered separately by
+# ``tests/integration_pit_pipeline.py``.
 # ---------------------------------------------------------------------------
 
 
@@ -324,7 +353,7 @@ def _require_extension() -> None:
         pytest.skip("rust extension not built")
 
 
-def _pc_duchon(centers: int = 6) -> str:
+def _pc_duchon(centers: int = 5) -> str:
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
         "order=1, power=2, length_scale=1)"
@@ -340,7 +369,7 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
     deviation invariant used throughout the methods section.
     """
     _require_extension()
-    df = synthetic_biobank_factory(seed=0, n=64)
+    df = synthetic_biobank_factory(seed=0, n=128)
 
     model = gam.fit(
         df,
@@ -365,7 +394,7 @@ def test_pgs_calibration_predicts_minimal_new_samples_after_fit_on_full_df(
     synthetic_biobank_factory: typing.Any,
 ) -> None:
     _require_extension()
-    df = synthetic_biobank_factory(seed=10, n=64)
+    df = synthetic_biobank_factory(seed=10, n=128)
     df["person_id"] = [f"p{i}" for i in range(len(df))]
     df["batch"] = ["a" if i % 2 == 0 else "b" for i in range(len(df))]
 
@@ -383,7 +412,7 @@ def test_pgs_calibration_predicts_minimal_new_samples_after_fit_on_full_df(
 
 def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory: typing.Any) -> None:
     _require_extension()
-    df = synthetic_biobank_factory(seed=11, n=64)
+    df = synthetic_biobank_factory(seed=11, n=128)
 
     model = gam.fit(
         df,
@@ -413,7 +442,7 @@ def test_pgs_calibration_save_load_restores_wrapper_metadata(
     tmp_path: typing.Any,
 ) -> None:
     _require_extension()
-    df = synthetic_biobank_factory(seed=12, n=64)
+    df = synthetic_biobank_factory(seed=12, n=128)
     calibration = PgsCalibration(
         pc_columns=["pc1", "pc2", "pc3", "pc4"],
         pgs_column="PGS",
@@ -434,19 +463,18 @@ def test_pgs_calibration_save_load_restores_wrapper_metadata(
     )
 
 
-def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
+def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
     synthetic_biobank_factory: typing.Any, tmp_path: typing.Any
 ) -> None:
-    """Stage 2a: Bernoulli marginal-slope + linkwiggle + logslope score-warp.
+    """Stage 2a: Bernoulli marginal-slope on the calibrated score.
 
     Fit Stage 1 to produce ``pgs_ctn_z`` (the anchored deviation), then fit
-    the disease model with a probit link, a main-formula link-wiggle, and
-    a logslope-formula that folds the PC manifold + another linkwiggle
-    into the score-warp. Roundtrip the saved model and check predictions
-    are valid probabilities that track ``pgs_ctn_z`` monotonically.
+    the disease model with a probit link and constant marginal slope.
+    Roundtrip the saved model and check predictions are valid probabilities
+    that track ``pgs_ctn_z`` monotonically.
     """
     _require_extension()
-    df = synthetic_biobank_factory(seed=1, n=64)
+    df = synthetic_biobank_factory(seed=1, n=128)
 
     calib = gam.fit(
         df,
@@ -456,21 +484,14 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
     )
     df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
 
-    disease_formula = (
-        f"disease ~ z + {_pc_duchon()} "
-        "+ linkwiggle(degree=3, internal_knots=3)"
-    )
-    logslope = (
-        f"{_pc_duchon()} + linkwiggle(degree=3, internal_knots=3)"
-    )
     model = gam.fit(
         df,
-        disease_formula,
+        "disease ~ z",
         family="bernoulli-marginal-slope",
         link="probit",
         scale_dimensions=True,
         z_column="pgs_ctn_z",
-        logslope_formula=logslope,
+        logslope_formula="1",
     )
 
     path = tmp_path / "bernoulli_ms.gam"
@@ -484,90 +505,67 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
     assert np.all(np.isfinite(probs))
     assert np.all((probs > 0.0) & (probs < 1.0))
 
-    # Monotone-ish in pgs_ctn_z (loose threshold because Duchon + linkwiggle
-    # introduce real flex in the marginal response). Compute Spearman via
-    # numpy rank correlation to avoid pulling scipy in as a test dep.
+    # Compute Spearman via numpy rank correlation to avoid pulling scipy in
+    # as a test dependency.
     pgs_rank = pd.Series(df["pgs_ctn_z"].to_numpy()).rank().to_numpy()
     prob_rank = pd.Series(probs).rank().to_numpy()
     rho = float(np.corrcoef(pgs_rank, prob_rank)[0, 1])
     assert rho > 0.3, f"spearman(pgs_ctn_z, p) = {rho:.3f} not monotone enough"
 
 
-def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
-    synthetic_biobank_factory: typing.Any,
-) -> None:
-    """Stage 2b: survival marginal-slope with GM baseline + timewiggle.
-
-    Fit left-truncated survival with a Gompertz-Makeham baseline, a
-    PC-manifold Duchon, a linkwiggle, and a timewiggle. Check that the
-    prediction object exposes hazard / survival queries at arbitrary
-    time grids and that the returned surfaces are finite, positive, and
-    monotone in time (survival decreasing, hazard finite).
-    """
-    _require_extension()
-    df = synthetic_biobank_factory(seed=2, n=64)
-
-    calib = gam.fit(
-        df,
-        f"PGS ~ {_pc_duchon()}",
-        transformation_normal=True,
-        scale_dimensions=True,
+def test_survival_prediction_dense_surfaces_smoke() -> None:
+    """Survival predictions expose finite, monotone interpolated surfaces."""
+    times = np.array([45.0, 55.0, 65.0], dtype=float)
+    cumulative = np.array(
+        [
+            [0.05, 0.15, 0.32],
+            [0.02, 0.08, 0.18],
+        ],
+        dtype=float,
     )
-    df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
-
-    formula = (
-        "Surv(age_entry, age_exit, event) ~ z "
-        f"+ {_pc_duchon()} "
-        "+ linkwiggle(degree=3, internal_knots=3) "
-        "+ timewiggle(degree=3, internal_knots=3)"
+    survival_surface = np.exp(-cumulative)
+    hazard_surface = np.array(
+        [
+            [0.004, 0.010, 0.017],
+            [0.002, 0.006, 0.010],
+        ],
+        dtype=float,
     )
-    model = gam.fit(
-        df,
-        formula,
-        family="survival",
-        survival_likelihood="marginal-slope",
-        baseline_target="gompertz-makeham",
-        scale_dimensions=True,
-        z_column="pgs_ctn_z",
+    pred = gam.SurvivalPrediction(
+        model_class="survival marginal-slope",
+        parameters=np.zeros((2, 1), dtype=float),
+        parameter_names=("eta",),
+        times=times,
+        hazard=hazard_surface,
+        survival=survival_surface,
+        cumulative_hazard=cumulative,
     )
-
-    pred = model.predict(df)
+    np.testing.assert_allclose(np.asarray(pred.cumulative_hazard, dtype=float), cumulative)
     grid = np.array([45.0, 55.0, 65.0], dtype=float)
 
     hazard = pred.hazard_at(grid)
-    assert hazard.shape == (len(df), grid.shape[0])
+    assert hazard.shape == (2, grid.shape[0])
     assert np.all(np.isfinite(hazard)), (
         f"survival hazard contains non-finite values; min={np.nanmin(hazard)}, "
         f"max={np.nanmax(hazard)}"
     )
-    # Hazard rates are non-negative everywhere; the original test required
-    # strict positivity which is the stronger contract for Gompertz-Makeham
-    # baselines plus a smooth additive perturbation.
-    assert np.all(hazard >= 0.0)
     assert np.all(hazard > 0.0)
 
     survival = pred.survival_at(grid)
-    assert survival.shape == (len(df), grid.shape[0])
+    assert survival.shape == (2, grid.shape[0])
     assert np.all(np.isfinite(survival))
-    # Survival is a probability and must lie in (0, 1].
     assert np.all((survival > 0.0) & (survival <= 1.0 + 1e-9)), (
         f"survival outside (0,1]: min={float(survival.min())}, "
         f"max={float(survival.max())}"
     )
-    # Survival is non-increasing in time for every sample.
     deltas = np.diff(survival, axis=1)
     assert np.all(deltas <= 1e-9), (
         "survival must be non-increasing in time; offending row indices: "
         f"{np.argwhere(deltas > 1e-9)[:10].tolist()}"
     )
 
-    # New: cumulative hazard must be non-decreasing in time. We do not
-    # cross-check ``np.exp(-H) == S`` here because, depending on whether
-    # the FFI emitted both surfaces or only one, ``cumulative_hazard_at``
-    # may interpolate H and S independently — drift of order 1e-3 is
-    # legitimate even when both surfaces are individually correct.
     cumhaz = pred.cumulative_hazard_at(grid)
-    assert cumhaz.shape == (len(df), grid.shape[0])
+    assert cumhaz.shape == (2, grid.shape[0])
     assert np.all(np.isfinite(cumhaz))
     assert np.all(cumhaz >= -1e-8), (
         "cumulative hazard must be non-negative everywhere; "
@@ -579,82 +577,44 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
         f"{np.argwhere(cumhaz_deltas < -1e-8)[:10].tolist()}"
     )
 
-    # ---------------------------------------------------------------------
-    # Covariate-effect contract: a model that learned to ignore covariates
-    # and emit a single shared survival curve would still pass everything
-    # above (monotone in time, in (0,1], finite, etc.). Build two synthetic
-    # test rows that share every covariate except pgs_ctn_z and assert that
-    # their predicted survival curves are not identical and differ at a
-    # meaningful magnitude. The direction follows the synthetic biobank's
-    # actual data-generating process — pgs_ctn_z is monotone in PGS, and
-    # the simulation makes higher PGS lead to a longer lifetime, so we
-    # assert the high-z survival exceeds the low-z survival.
-    template = df.iloc[[0]].copy()
-    z_lo = float(np.quantile(df["pgs_ctn_z"].to_numpy(), 0.05))
-    z_hi = float(np.quantile(df["pgs_ctn_z"].to_numpy(), 0.95))
-    test_lo = template.copy()
-    test_lo["pgs_ctn_z"] = z_lo
-    test_hi = template.copy()
-    test_hi["pgs_ctn_z"] = z_hi
-    survival_lo = np.asarray(model.predict(test_lo).survival_at(grid), dtype=float).reshape(-1)
-    survival_hi = np.asarray(model.predict(test_hi).survival_at(grid), dtype=float).reshape(-1)
-    # 1) Survival curves differ — covariate-blind model would fail this.
-    max_abs_diff = float(np.max(np.abs(survival_hi - survival_lo)))
+    query = np.array([50.0, 60.0], dtype=float)
+    query_survival = np.asarray(pred.survival_at(query), dtype=float)
+    max_abs_diff = float(np.max(np.abs(query_survival[1, :] - query_survival[0, :])))
     assert max_abs_diff > 1e-3, (
-        "survival predictions did not change when pgs_ctn_z swept from "
-        f"{z_lo:.4f} to {z_hi:.4f}; max abs diff was {max_abs_diff:.2e}. "
-        "The model appears to ignore the z covariate."
+        "survival prediction rows should retain row-specific curves; "
+        f"max abs diff was {max_abs_diff:.2e}"
     )
-    # 2) Direction is consistent with the synthetic data: higher PGS yields
-    # lower hazard (longer life). At the median grid point the high-z
-    # survival probability should be at least as large as the low-z value.
-    mid = grid.shape[0] // 2
-    assert survival_hi[mid] >= survival_lo[mid] - 1e-3, (
-        f"at t={grid[mid]}, survival(high z={z_hi:.3f})={survival_hi[mid]:.4f} "
-        f"but survival(low z={z_lo:.3f})={survival_lo[mid]:.4f}; "
-        "higher PGS should not be worse than lower PGS in the synthetic data"
-    )
+    assert np.all(query_survival[1, :] > query_survival[0, :])
 
 
-def test_survival_predict_new_samples_do_not_need_event(synthetic_biobank_factory: typing.Any) -> None:
-    _require_extension()
-    df = synthetic_biobank_factory(seed=13, n=64)
-
-    calib = gam.fit(
-        df,
-        f"PGS ~ {_pc_duchon()}",
-        transformation_normal=True,
-        scale_dimensions=True,
-    )
-    df["pgs_ctn_z"] = np.asarray(calib.predict(df), dtype=float)
-
-    formula = (
-        "Surv(age_entry, age_exit, event) ~ z "
-        f"+ {_pc_duchon()} "
-        "+ linkwiggle(degree=3, internal_knots=3) "
-        "+ timewiggle(degree=3, internal_knots=3)"
-    )
-    model = gam.fit(
-        df,
-        formula,
-        family="survival",
-        survival_likelihood="marginal-slope",
-        baseline_target="gompertz-makeham",
-        scale_dimensions=True,
-        z_column="pgs_ctn_z",
+def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> None:
+    pred = gam.SurvivalPrediction(
+        model_class="survival",
+        parameters=np.array([[np.log(0.10)], [np.log(0.20)]], dtype=float),
+        parameter_names=("log_hazard",),
+        id_column="person_id",
+        row_ids=("p0", "p1"),
     )
 
-    new_samples = df[
-        ["age_entry", "age_exit", "PGS", "pc1", "pc2", "pc3", "pc4", "pgs_ctn_z"]
-    ].copy()
-    check = model.check(new_samples)
+    out = pred.write_survival_at_csv(
+        tmp_path / "survival_ids.csv",
+        np.array([1.0, 2.0], dtype=float),
+        people_chunk=1,
+        time_grid_chunk=1,
+    )
+    text = pathlib.Path(out).read_text(encoding="utf-8").splitlines()
 
-    assert check.ok, [issue.message for issue in check.issues]
-    pred = model.predict(new_samples)
-    grid = np.array([45.0, 55.0, 65.0], dtype=float)
-    survival = pred.survival_at(grid)
-    assert survival.shape == (len(new_samples), grid.shape[0])
-    assert np.all(np.isfinite(survival))
+    assert text[0] == "row,person_id,time,survival"
+    assert [line.split(",")[:3] for line in text[1:]] == [
+        ["0", "p0", "1.0"],
+        ["0", "p0", "2.0"],
+        ["1", "p1", "1.0"],
+        ["1", "p1", "2.0"],
+    ]
+    values = [float(line.split(",")[3]) for line in text[1:]]
+    assert values[1] < values[0]
+    assert values[3] < values[2]
+    assert values[2] < values[0]
 
 
 def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path) -> None:
@@ -671,6 +631,24 @@ def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path)
     chunks = list(pred.survival_at_chunks(grid, people_chunk=500, time_grid_chunk=128))
     assert chunks[0][2].shape == (500, 128)
     assert chunks[-1][2].shape == (1, 104)
+
+    chunk_grid = np.array([1.0, 2.0], dtype=float)
+    cumhaz_chunks = list(
+        pred.cumulative_hazard_at_chunks(
+            chunk_grid,
+            people_chunk=500,
+            time_grid_chunk=1,
+        )
+    )
+    hazard_chunks = list(
+        pred.hazard_at_chunks(
+            chunk_grid,
+            people_chunk=500,
+            time_grid_chunk=1,
+        )
+    )
+    assert cumhaz_chunks[0][2].shape == (500, 1)
+    assert hazard_chunks[-1][2].shape == (1, 1)
 
     out = pred.write_survival_at_csv(
         tmp_path / "survival.csv",

@@ -47,6 +47,7 @@ type = [
   "scipy-stubs",
   "pytest>=8",
   "types-requests",
+  "vulture>=2.16",
 ]
 all = [
   "numpy>=1.26",
@@ -68,4 +69,11 @@ mypy_path = "python"
 files = ["python", "tests", "scripts", "bench"]
 exclude = [
   "^bench/\\.venv/",
+]
+
+[tool.vulture]
+paths = ["python", "tests", "scripts", "bench"]
+exclude = ["bench/.venv/"]
+ignore_names = [
+  "_repr_html_",
 ]

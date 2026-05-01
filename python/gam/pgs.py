@@ -9,7 +9,7 @@ to population-calibrated z-scores.
 The helper encodes the following default choices, each of which can be
 overridden at construction time:
 
-* A Duchon radial basis over the PC columns with ``len(pc_columns) + 20``
+* A Duchon radial basis over the PC columns with ``len(pc_columns) + 1``
   centers, order ``1``, power ``2``, and triple operator regularization.
 * A fixed Duchon ``length_scale`` so per-axis anisotropy is identifiable
   separately from the global smoothing scale.
@@ -45,7 +45,7 @@ class PgsCalibration:
     pgs_column:
         Name of the raw polygenic-score column to calibrate.
     duchon_centers:
-        Number of Duchon basis centers. Defaults to ``len(pc_columns) + 20``.
+        Number of Duchon basis centers. Defaults to ``len(pc_columns) + 1``.
     duchon_order:
         Duchon radial-basis order (``m``). Defaults to ``1``.
     duchon_power:
@@ -95,7 +95,7 @@ class PgsCalibration:
         self._resolved_centers = (
             self.duchon_centers
             if self.duchon_centers is not None
-            else len(self.pc_columns) + 20
+            else len(self.pc_columns) + 1
         )
 
     @property
