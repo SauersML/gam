@@ -118,7 +118,6 @@ F_beta_theta_sym = [sp.Matrix([sp.diff(F_beta_sym[k], t) for k in range(p)]) for
 # Lambdify everything to fast numerical functions of (beta, theta).
 all_syms = list(beta_syms) + list(theta_syms)
 
-F_fn       = sp.lambdify(all_syms, F_sym,         'numpy')
 F_beta_fn  = sp.lambdify(all_syms, F_beta_sym,    'numpy')
 F_bb_fn    = sp.lambdify(all_syms, F_bb_sym,      'numpy')
 F_theta_fn = [sp.lambdify(all_syms, F_theta_sym[i], 'numpy') for i in range(q)]

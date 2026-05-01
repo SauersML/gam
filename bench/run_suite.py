@@ -593,12 +593,6 @@ def _evaluation_suffix(folds: list[Fold]) -> str:
     return f"[{len(folds)}-fold CV]"
 
 
-def _evaluation_label(folds: list[Fold]) -> str:
-    if len(folds) == 1:
-        return "holdout"
-    return f"{len(folds)}-fold CV"
-
-
 def _evaluation_label_for_n_folds(n_folds: int) -> str:
     if n_folds <= 0:
         raise RuntimeError(f"cross-validation result requires at least one fold, got {n_folds}")
@@ -2069,7 +2063,7 @@ def _synthetic_hgdp_1kg_pc_panel():
     sample_idx = 0
     pc_cols = [f"PC{i}" for i in range(1, 17)]
 
-    for super_idx, spec in enumerate(superpop_specs):
+    for spec in superpop_specs:
         superpop_shift = rng.normal(loc=0.0, scale=0.85, size=16)
         for sub_idx in range(4):
             sub_name = f"{spec['name']}_SUB{sub_idx + 1:02d}"
@@ -8648,7 +8642,6 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from matplotlib.ticker import MaxNLocator
     except ImportError:
         print("WARNING: matplotlib not available — skipping figure generation.")
         return []

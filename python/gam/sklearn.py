@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
@@ -12,6 +12,8 @@ from ._api import fit as fit_model
 from ._tables import attach_target, response_column_name, table_columns
 
 __all__ = ["GAMClassifier", "GAMRegressor"]
+
+_BaseT = TypeVar("_BaseT", bound="_BaseGAMEstimator")
 
 # No GAMSurvival wrapper: survival responses (e.g. Surv(time, event)) are a
 # two-column construct that does not fit scikit-learn's (X, y) contract, and
@@ -61,7 +63,7 @@ class _BaseGAMEstimator(BaseEstimator):  # type: ignore[misc]  # sklearn stubs m
     weights: str | None = None
     config: dict[str, Any] | None = None
 
-    def _fit_model(self, X: Any, y: Any = None) -> "_BaseGAMEstimator":
+    def _fit_model(self: _BaseT, X: Any, y: Any = None) -> _BaseT:
         training_data, fit_formula, feature_names = _prepare_fit_input(X, y, self.formula)
         self.model_ = fit_model(
             training_data,
@@ -91,7 +93,7 @@ class _BaseGAMEstimator(BaseEstimator):  # type: ignore[misc]  # sklearn stubs m
 
 class GAMRegressor(_BaseGAMEstimator, RegressorMixin):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat RegressorMixin as Any
     def fit(self, X: Any, y: Any = None) -> "GAMRegressor":
-        return self._fit_model(X, y)  # type: ignore[return-value]
+        return self._fit_model(X, y)
 
     def predict(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "model_")
@@ -106,7 +108,7 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):  # type: ignore[misc]  
     def fit(self, X: Any, y: Any = None) -> "GAMClassifier":
         fitted = self._fit_model(X, y)
         self.classes_ = np.asarray([0, 1])
-        return fitted  # type: ignore[return-value]
+        return fitted
 
     def predict_proba(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "model_")
