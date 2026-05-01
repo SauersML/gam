@@ -8189,6 +8189,132 @@ pub fn closed_form_psi_derivatives_in_total_basis(
     (transform(g), transform(g_psi), transform(g_psi_psi))
 }
 
+/// Closed-form anisotropic penalty `S_q` and its raw-η derivatives — full
+/// d×d Hessian materialized — in the final (post-transform) basis space.
+/// Returns `(S_q, S_q_eta_a per axis, S_q_eta_a_a per axis, S_q_eta_a_b for
+/// (a, b) with a < b)`. All derivatives are with respect to raw η components
+/// directly per math team Letter A §9 — no centering, no apply_raw_psi_scaling.
+///
+/// Bundle is computed via `pair_block_radial_with_j_second_derivatives`,
+/// which uses central FD for η/κ derivatives (h_η ≈ 1e-4, O(1e-7) precision)
+/// until closed-form-math-fix's analytic-derivative tier lands.
+pub fn closed_form_aniso_psi_derivatives_in_total_basis(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    p_order: usize,
+    s_order: usize,
+    kappa: f64,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> (
+    Array2<f64>,
+    Vec<Array2<f64>>,
+    Vec<Array2<f64>>,
+    Vec<Vec<Array2<f64>>>,
+) {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let zeros: Vec<f64>;
+    let eta_raw: &[f64] = match aniso_log_scales {
+        Some(eta) => eta,
+        None => {
+            zeros = vec![0.0_f64; d];
+            &zeros
+        }
+    };
+    let r_eps = pure_duchon_diagonal_epsilon(centers, eta_raw);
+
+    // Allocate raw K×K matrices: value, per-axis first, per-axis diagonal
+    // second, and full d×d cross matrix indexed as cross[a][b] (we fill all
+    // (a, b) pairs to avoid branching downstream; symmetric in a, b).
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut g_eta: Vec<Array2<f64>> = (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
+    let mut g_eta2_diag: Vec<Array2<f64>> =
+        (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
+    let mut g_eta2_cross: Vec<Vec<Array2<f64>>> = (0..d)
+        .map(|_| (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect())
+        .collect();
+
+    let mut r_buf = vec![0.0_f64; d];
+    for i in 0..k {
+        for j in 0..=i {
+            for axis in 0..d {
+                r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
+            }
+            let bundle = if i == j {
+                let mut r_eps_buf = vec![0.0_f64; d];
+                if d > 0 {
+                    r_eps_buf[0] = r_eps * eta_raw[0].exp();
+                }
+                closed_form_penalty::pair_block_radial_with_j_second_derivatives(
+                    q, p_order, s_order, kappa, eta_raw, &r_eps_buf,
+                )
+            } else {
+                closed_form_penalty::pair_block_radial_with_j_second_derivatives(
+                    q, p_order, s_order, kappa, eta_raw, &r_buf,
+                )
+            };
+            g[[i, j]] = bundle.value;
+            for a in 0..d {
+                g_eta[a][[i, j]] = bundle.d_eta[a];
+                g_eta2_diag[a][[i, j]] = bundle.d2_eta[a][a];
+                for b in 0..d {
+                    g_eta2_cross[a][b][[i, j]] = bundle.d2_eta[a][b];
+                }
+            }
+            if i != j {
+                g[[j, i]] = bundle.value;
+                for a in 0..d {
+                    g_eta[a][[j, i]] = bundle.d_eta[a];
+                    g_eta2_diag[a][[j, i]] = bundle.d2_eta[a][a];
+                    for b in 0..d {
+                        g_eta2_cross[a][b][[j, i]] = bundle.d2_eta[a][b];
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply Z + poly-pad + T to a raw K×K matrix.
+    let transform = |raw: &Array2<f64>| -> Array2<f64> {
+        let kernel_block = if let Some(z) = kernel_nullspace {
+            let zt = fast_atb(z, raw);
+            fast_ab(&zt, z)
+        } else {
+            raw.clone()
+        };
+        let kernel_cols = kernel_block.nrows();
+        let total_pre = kernel_cols + polynomial_block_cols;
+        let padded = if polynomial_block_cols == 0 {
+            kernel_block
+        } else {
+            let mut padded = Array2::<f64>::zeros((total_pre, total_pre));
+            padded
+                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(&kernel_block);
+            padded
+        };
+        let total = if let Some(t) = outer_identifiability {
+            let tt = fast_atb(t, &padded);
+            fast_ab(&tt, t)
+        } else {
+            padded
+        };
+        symmetrize(&total)
+    };
+
+    let s = transform(&g);
+    let s_first: Vec<Array2<f64>> = g_eta.iter().map(transform).collect();
+    let s_second_diag: Vec<Array2<f64>> = g_eta2_diag.iter().map(transform).collect();
+    let s_second_cross: Vec<Vec<Array2<f64>>> = g_eta2_cross
+        .iter()
+        .map(|row| row.iter().map(transform).collect())
+        .collect();
+    (s, s_first, s_second_diag, s_second_cross)
+}
+
 pub fn operator_penalty_candidates_closed_form(
     centers: ArrayView2<'_, f64>,
     d0: &Array2<f64>,
