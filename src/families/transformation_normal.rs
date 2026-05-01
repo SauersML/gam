@@ -21,10 +21,9 @@
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    create_ispline_derivative_dense,
 };
-use crate::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ab, fast_ab_into, fast_atb, fast_av, rrqr_nullspace_basis,
-};
+use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb, fast_av};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
@@ -1835,15 +1834,14 @@ impl CustomFamily for TransformationNormalFamily {
             .as_ref()
             .expect("psi op presence checked above")
             .clone();
-        let hessian_psi_operator: Arc<dyn HyperOperator> = Arc::new(
-            TransformationNormalPsiHessianOperator {
+        let hessian_psi_operator: Arc<dyn HyperOperator> =
+            Arc::new(TransformationNormalPsiHessianOperator {
                 family: Arc::new(self.clone()),
                 psi_op: psi_op_arc,
                 axis,
                 weighted_inv_h_prime_sq: row.weighted_inv_h_prime_sq.clone(),
                 w_cubic,
-            },
-        );
+            });
 
         log::info!(
             "[STAGE] CTN psi first-order terms axis={} psi_index={} elapsed={:.3}s",
@@ -2840,7 +2838,10 @@ impl TransformationNormalPsiHessianOperator {
             .and(&lifted_deriv)
             .and(weighted_inv_hp_sq)
             .par_for_each(|o, &lv, &w| *o = w * lv);
-        out += &self.family.x_deriv_kron.transpose_mul(&weighted_lifted_deriv);
+        out += &self
+            .family
+            .x_deriv_kron
+            .transpose_mul(&weighted_lifted_deriv);
 
         let xderiv_image = self.family.x_deriv_kron.forward_mul(v);
         debug_assert_eq!(xderiv_image.len(), n);
@@ -3236,8 +3237,7 @@ fn build_monotonicity_derivative_grid_kron(
     // training design was built in — we read training stats directly out
     // of `covariate_design` and emit values in that same coordinate
     // system, so no extra transform is applied.
-    let augmented_covariate_design =
-        augment_covariate_design_with_axis_extremes(covariate_design)?;
+    let augmented_covariate_design = augment_covariate_design_with_axis_extremes(covariate_design)?;
     // Build the operator factored: the small (n_grid × p_resp) response-side
     // factor and the augmented covariate design. The implied virtual row
     // space is (n_cov + 2·p_cov) × n_grid — never materialized.
