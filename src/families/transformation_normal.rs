@@ -26,7 +26,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
     create_ispline_derivative_dense,
 };
-use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb, fast_av};
+use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
@@ -56,20 +56,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
-
-// ---------------------------------------------------------------------------
-// Phase-2 outer-derivative gate
-// ---------------------------------------------------------------------------
-
-/// Returns true while the spatial-ψ outer derivative stack is still using the
-/// historical linear-h formulas. The coefficient-side family below is SCOP:
-/// h(y,x)=b(x)+Σ_k I_k(y) γ_k(x)^2, h'(y,x)=Σ_k M_k(y) γ_k(x)^2. κ/ψ
-/// optimization must therefore use numeric outer derivatives until the full ψ
-/// chain rule includes the 2γ factors and second derivatives.
-#[inline]
-fn scop_phase2_outer_pending() -> bool {
-    true
-}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -1129,6 +1115,597 @@ impl TransformationNormalFamily {
         Ok(0.5 * (&out + &out.t()))
     }
 
+    /// Second directional derivative of the SCOP negative Hessian.
+    ///
+    /// Reuse the notation from `scop_hessian_directional_derivative`, with
+    /// two beta-space directions `u` and `v`. Since each shape component is
+    /// quadratic in `g_k`, all third beta derivatives of `h` and `hp` are zero,
+    /// while the mixed second directional derivatives are
+    ///
+    /// `Huv  = Σ_{k>0} 2 r_k u_k v_k`
+    /// `HPuv = Σ_{k>0} 2 m_k u_k v_k`.
+    ///
+    /// Differentiating
+    /// `D H_ab[u] = w[(D h_a)h_b + h_a(D h_b) + Hu h_ab
+    ///              + ((D hp_a)hp_b + hp_a(D hp_b))/hp^2
+    ///              - 2 hp_a hp_b HPu/hp^3 + hp_ab HPu/hp^2]`
+    /// once more in direction `v` gives the expression implemented below:
+    ///
+    /// `D²H_ab[u,v] = w[
+    ///      h_{a,u} h_{b,v} + h_{a,v} h_{b,u} + Huv h_ab
+    ///    + (hp_{a,u} hp_{b,v} + hp_{a,v} hp_{b,u})/hp²
+    ///    - 2(hp_{a,u} hp_b + hp_a hp_{b,u}) HPv/hp³
+    ///    - 2(hp_{a,v} hp_b + hp_a hp_{b,v}) HPu/hp³
+    ///    - 2 hp_a hp_b HPuv/hp³
+    ///    + 6 hp_a hp_b HPu HPv/hp⁴
+    ///    + hp_ab HPuv/hp²
+    ///    - 2 hp_ab HPu HPv/hp³ ]`.
+    fn scop_hessian_second_directional_derivative(
+        &self,
+        beta: &Array1<f64>,
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total
+            || direction_u.len() != p_total
+            || direction_v.len() != p_total
+        {
+            return Err(format!(
+                "SCOP Hessian second directional derivative length mismatch: beta={}, u={}, v={}, expected={p_total}",
+                beta.len(),
+                direction_u.len(),
+                direction_v.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let dir_u_mat = direction_u
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP u direction reshape failed: {e}"))?;
+        let dir_v_mat = direction_v
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
+        let cov = self.covariate_design.try_row_chunk(0..n).map_err(|e| {
+            format!("SCOP Hessian second directional derivative requires row chunk: {e}")
+        })?;
+        let weights = self.weights.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut out = Array2::<f64>::zeros((p_total, p_total));
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+            let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_u = vec![0.0; p_resp];
+            let mut gamma_v = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
+                gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
+            }
+
+            let mut hp_u = rd[0] * gamma_u[0];
+            let mut hp_v = rd[0] * gamma_v[0];
+            let mut h_uv = 0.0;
+            let mut hp_uv = 0.0;
+            for k in 1..p_resp {
+                hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
+                hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
+                h_uv += 2.0 * rv[k] * gamma_u[k] * gamma_v[k];
+                hp_uv += 2.0 * rd[k] * gamma_u[k] * gamma_v[k];
+            }
+
+            let mut h_factor = vec![0.0; p_resp];
+            let mut hp_factor = vec![0.0; p_resp];
+            let mut h_factor_u = vec![0.0; p_resp];
+            let mut hp_factor_u = vec![0.0; p_resp];
+            let mut h_factor_v = vec![0.0; p_resp];
+            let mut hp_factor_v = vec![0.0; p_resp];
+            h_factor[0] = rv[0];
+            hp_factor[0] = rd[0];
+            for k in 1..p_resp {
+                h_factor[k] = 2.0 * rv[k] * gamma[k];
+                hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                h_factor_u[k] = 2.0 * rv[k] * gamma_u[k];
+                hp_factor_u[k] = 2.0 * rd[k] * gamma_u[k];
+                h_factor_v[k] = 2.0 * rv[k] * gamma_v[k];
+                hp_factor_v[k] = 2.0 * rd[k] * gamma_v[k];
+            }
+
+            for k in 0..p_resp {
+                for l in 0..p_resp {
+                    let same_shape = k == l && k > 0;
+                    for c in 0..p_cov {
+                        let row_idx = k * p_cov + c;
+                        let hp_a = hp_factor[k] * cov_row[c];
+                        let dh_a_u = h_factor_u[k] * cov_row[c];
+                        let dhp_a_u = hp_factor_u[k] * cov_row[c];
+                        let dh_a_v = h_factor_v[k] * cov_row[c];
+                        let dhp_a_v = hp_factor_v[k] * cov_row[c];
+                        for d in 0..p_cov {
+                            let col_idx = l * p_cov + d;
+                            let hp_b = hp_factor[l] * cov_row[d];
+                            let dh_b_u = h_factor_u[l] * cov_row[d];
+                            let dhp_b_u = hp_factor_u[l] * cov_row[d];
+                            let dh_b_v = h_factor_v[l] * cov_row[d];
+                            let dhp_b_v = hp_factor_v[l] * cov_row[d];
+                            let (h_ab, hp_ab) = if same_shape {
+                                (
+                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
+                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
+                                )
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            let value = dh_a_u * dh_b_v
+                                + dh_a_v * dh_b_u
+                                + h_uv * h_ab
+                                + (dhp_a_u * dhp_b_v + dhp_a_v * dhp_b_u) * inv_hp_sq
+                                - 2.0
+                                    * (dhp_a_u * hp_b + hp_a * dhp_b_u)
+                                    * hp_v
+                                    * inv_hp_cu
+                                - 2.0
+                                    * (dhp_a_v * hp_b + hp_a * dhp_b_v)
+                                    * hp_u
+                                    * inv_hp_cu
+                                - 2.0 * hp_a * hp_b * hp_uv * inv_hp_cu
+                                + 6.0 * hp_a * hp_b * hp_u * hp_v * inv_hp_qu
+                                + hp_ab * hp_uv * inv_hp_sq
+                                - 2.0 * hp_ab * hp_u * hp_v * inv_hp_cu;
+                            out[[row_idx, col_idx]] += wi * value;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(0.5 * (&out + &out.t()))
+    }
+
+    fn scop_hessian_matvec(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        probe: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || probe.len() != p_total {
+            return Err(format!(
+                "SCOP Hessian matvec length mismatch: beta={}, probe={}, expected={p_total}",
+                beta.len(),
+                probe.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let probe_mat = probe
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP Hessian matvec requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut out = Array1::<f64>::zeros(p_total);
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut probe_gamma = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                probe_gamma[k] = probe_mat.row(k).dot(&cov_row);
+            }
+
+            let mut h_probe = rv[0] * probe_gamma[0];
+            let mut hp_probe = rd[0] * probe_gamma[0];
+            for k in 1..p_resp {
+                h_probe += 2.0 * rv[k] * gamma[k] * probe_gamma[k];
+                hp_probe += 2.0 * rd[k] * gamma[k] * probe_gamma[k];
+            }
+
+            for k in 0..p_resp {
+                let h_factor = if k == 0 {
+                    rv[0]
+                } else {
+                    2.0 * rv[k] * gamma[k]
+                };
+                let hp_factor = if k == 0 {
+                    rd[0]
+                } else {
+                    2.0 * rd[k] * gamma[k]
+                };
+                let second_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * (hi * rv[k] - rd[k] * inv_hp) * probe_gamma[k]
+                };
+                let scalar =
+                    wi * (h_factor * h_probe + hp_factor * hp_probe * inv_hp_sq + second_probe);
+                for c in 0..p_cov {
+                    out[k * p_cov + c] += scalar * cov_row[c];
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn scop_hessian_directional_matvec(
+        &self,
+        beta: &Array1<f64>,
+        direction: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        probe: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || direction.len() != p_total || probe.len() != p_total {
+            return Err(format!(
+                "SCOP dH matvec length mismatch: beta={}, direction={}, probe={}, expected={p_total}",
+                beta.len(),
+                direction.len(),
+                probe.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let dir_mat = direction
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
+        let probe_mat = probe
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP dH matvec requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut out = Array1::<f64>::zeros(p_total);
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_dir = vec![0.0; p_resp];
+            let mut gamma_probe = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+                gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+            }
+
+            let mut h_dir = rv[0] * gamma_dir[0];
+            let mut hp_dir = rd[0] * gamma_dir[0];
+            let mut h_probe = rv[0] * gamma_probe[0];
+            let mut hp_probe = rd[0] * gamma_probe[0];
+            let mut h_dir_probe = 0.0;
+            let mut hp_dir_probe = 0.0;
+            for k in 1..p_resp {
+                h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
+                hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
+                h_probe += 2.0 * rv[k] * gamma[k] * gamma_probe[k];
+                hp_probe += 2.0 * rd[k] * gamma[k] * gamma_probe[k];
+                h_dir_probe += 2.0 * rv[k] * gamma_dir[k] * gamma_probe[k];
+                hp_dir_probe += 2.0 * rd[k] * gamma_dir[k] * gamma_probe[k];
+            }
+
+            for k in 0..p_resp {
+                let h_factor = if k == 0 {
+                    rv[0]
+                } else {
+                    2.0 * rv[k] * gamma[k]
+                };
+                let hp_factor = if k == 0 {
+                    rd[0]
+                } else {
+                    2.0 * rd[k] * gamma[k]
+                };
+                let h_factor_dir = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rv[k] * gamma_dir[k]
+                };
+                let hp_factor_dir = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rd[k] * gamma_dir[k]
+                };
+                let h_second_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rv[k] * gamma_probe[k]
+                };
+                let hp_second_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rd[k] * gamma_probe[k]
+                };
+                let scalar = wi
+                    * (h_factor_dir * h_probe
+                        + h_factor * h_dir_probe
+                        + h_dir * h_second_probe
+                        + (hp_factor_dir * hp_probe + hp_factor * hp_dir_probe) * inv_hp_sq
+                        - 2.0 * hp_factor * hp_probe * hp_dir * inv_hp_cu
+                        + hp_second_probe * hp_dir * inv_hp_sq);
+                for c in 0..p_cov {
+                    out[k * p_cov + c] += scalar * cov_row[c];
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn scop_hessian_second_directional_matvec(
+        &self,
+        beta: &Array1<f64>,
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        probe: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total
+            || direction_u.len() != p_total
+            || direction_v.len() != p_total
+            || probe.len() != p_total
+        {
+            return Err(format!(
+                "SCOP d2H matvec length mismatch: beta={}, u={}, v={}, probe={}, expected={p_total}",
+                beta.len(),
+                direction_u.len(),
+                direction_v.len(),
+                probe.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let dir_u_mat = direction_u
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP u direction reshape failed: {e}"))?;
+        let dir_v_mat = direction_v
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
+        let probe_mat = probe
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP probe reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP d2H matvec requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut out = Array1::<f64>::zeros(p_total);
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+            let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_u = vec![0.0; p_resp];
+            let mut gamma_v = vec![0.0; p_resp];
+            let mut gamma_probe = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
+                gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
+                gamma_probe[k] = probe_mat.row(k).dot(&cov_row);
+            }
+
+            let mut hp_u = rd[0] * gamma_u[0];
+            let mut hp_v = rd[0] * gamma_v[0];
+            let mut hp_probe = rd[0] * gamma_probe[0];
+            let mut h_uv = 0.0;
+            let mut hp_uv = 0.0;
+            let mut h_u_probe = 0.0;
+            let mut hp_u_probe = 0.0;
+            let mut h_v_probe = 0.0;
+            let mut hp_v_probe = 0.0;
+            for k in 1..p_resp {
+                hp_u += 2.0 * rd[k] * gamma[k] * gamma_u[k];
+                hp_v += 2.0 * rd[k] * gamma[k] * gamma_v[k];
+                hp_probe += 2.0 * rd[k] * gamma[k] * gamma_probe[k];
+                h_uv += 2.0 * rv[k] * gamma_u[k] * gamma_v[k];
+                hp_uv += 2.0 * rd[k] * gamma_u[k] * gamma_v[k];
+                h_u_probe += 2.0 * rv[k] * gamma_u[k] * gamma_probe[k];
+                hp_u_probe += 2.0 * rd[k] * gamma_u[k] * gamma_probe[k];
+                h_v_probe += 2.0 * rv[k] * gamma_v[k] * gamma_probe[k];
+                hp_v_probe += 2.0 * rd[k] * gamma_v[k] * gamma_probe[k];
+            }
+
+            for k in 0..p_resp {
+                let hp_factor = if k == 0 {
+                    rd[0]
+                } else {
+                    2.0 * rd[k] * gamma[k]
+                };
+                let h_factor_u = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rv[k] * gamma_u[k]
+                };
+                let hp_factor_u = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rd[k] * gamma_u[k]
+                };
+                let h_factor_v = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rv[k] * gamma_v[k]
+                };
+                let hp_factor_v = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rd[k] * gamma_v[k]
+                };
+                let h_second_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rv[k] * gamma_probe[k]
+                };
+                let hp_second_probe = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * rd[k] * gamma_probe[k]
+                };
+                let scalar = wi
+                    * (h_factor_u * h_v_probe
+                        + h_factor_v * h_u_probe
+                        + h_uv * h_second_probe
+                        + (hp_factor_u * hp_v_probe + hp_factor_v * hp_u_probe) * inv_hp_sq
+                        - 2.0
+                            * (hp_factor_u * hp_probe + hp_factor * hp_u_probe)
+                            * hp_v
+                            * inv_hp_cu
+                        - 2.0
+                            * (hp_factor_v * hp_probe + hp_factor * hp_v_probe)
+                            * hp_u
+                            * inv_hp_cu
+                        - 2.0 * hp_factor * hp_probe * hp_uv * inv_hp_cu
+                        + 6.0 * hp_factor * hp_probe * hp_u * hp_v * inv_hp_qu
+                        + hp_second_probe * hp_uv * inv_hp_sq
+                        - 2.0 * hp_second_probe * hp_u * hp_v * inv_hp_cu);
+                for c in 0..p_cov {
+                    out[k * p_cov + c] += scalar * cov_row[c];
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn scop_hessian_diagonal(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "SCOP Hessian diagonal beta length {} != expected {p_total}",
+                beta.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP Hessian diagonal requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut diag = Array1::<f64>::zeros(p_total);
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let mut gamma = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+            }
+            for k in 0..p_resp {
+                let h_factor = if k == 0 {
+                    rv[0]
+                } else {
+                    2.0 * rv[k] * gamma[k]
+                };
+                let hp_factor = if k == 0 {
+                    rd[0]
+                } else {
+                    2.0 * rd[k] * gamma[k]
+                };
+                let second = if k == 0 {
+                    0.0
+                } else {
+                    2.0 * (hi * rv[k] - rd[k] * inv_hp)
+                };
+                for c in 0..p_cov {
+                    let cc = cov_row[c] * cov_row[c];
+                    diag[k * p_cov + c] +=
+                        wi * ((h_factor * h_factor + hp_factor * hp_factor * inv_hp_sq) * cc
+                            + second * cc);
+                }
+            }
+        }
+        Ok(diag)
+    }
+
     /// First derivative of the profiled objective pieces with respect to one
     /// covariate-basis deformation axis `psi`.
     ///
@@ -2092,40 +2669,15 @@ impl CustomFamily for TransformationNormalFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Phase 2: SCOP outer derivatives pending. Linear-h' formula
-        // `6 X_derivᵀ diag(w · Du · Dv / h'⁴) X_deriv` is invalid under SCOP.
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let h_prime = row_quantities.h_prime.as_ref();
-        let d_h_prime_u = self.x_deriv_kron.forward_mul(d_beta_u_flat);
-        let d_h_prime_v = self.x_deriv_kron.forward_mul(d_beta_v_flat);
-
-        // H(β) = X_valᵀ W X_val + X_derivᵀ diag(w / h'²) X_deriv
-        // so D²H[u,v] = 6 X_derivᵀ diag(w (X_deriv u)(X_deriv v) / h'⁴) X_deriv.
-        let n = h_prime.len();
-        let mut weight = Array1::zeros(n);
-        {
-            use rayon::prelude::*;
-            let weights = self.weights.as_ref();
-            weight
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .zip(h_prime.as_slice().unwrap().par_iter())
-                .zip(d_h_prime_u.as_slice().unwrap().par_iter())
-                .zip(d_h_prime_v.as_slice().unwrap().par_iter())
-                .zip(weights.as_slice().unwrap().par_iter())
-                .for_each(|((((w, &hp), &du), &dv), &wi)| {
-                    *w = 6.0 * wi * du * dv / (hp * hp * hp * hp);
-                });
-        }
-        Ok(Some(self.x_deriv_kron.weighted_gram(&weight, &self.policy)))
+        let d2 = self.scop_hessian_second_directional_derivative(
+            beta,
+            d_beta_u_flat,
+            d_beta_v_flat,
+            &row_quantities,
+        )?;
+        Ok(Some(d2))
     }
 
     fn exact_newton_joint_psi_terms(
@@ -2171,12 +2723,6 @@ impl CustomFamily for TransformationNormalFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        // Phase 2: SCOP outer derivatives pending. The 9-term score and
-        // 13-term Hessian below are the linear-h derivation; symmetrization
-        // hides any chain-rule asymmetry.
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -2459,11 +3005,6 @@ impl CustomFamily for TransformationNormalFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Phase 2: SCOP outer derivatives pending. Same family of
-        // linear-h' kernels as 1740/1682.
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -2542,9 +3083,8 @@ impl CustomFamily for TransformationNormalFamily {
         let row_quantities = self.row_quantities(beta)?;
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
-            row_quantities.weighted_inv_h_prime_sq.as_ref().clone(),
-            Arc::clone(&row_quantities.inv_h_prime_cu),
-            Arc::clone(&row_quantities.inv_h_prime_qu),
+            beta.clone(),
+            row_quantities.clone(),
         )?;
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
@@ -2552,18 +3092,9 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        if scop_phase2_outer_pending() {
-            return false;
-        }
-        // CTN's coefficient-space joint Hessian is supplied as a matrix-free Hv
-        // operator: `exact_newton_joint_hessian_workspace` above unconditionally
-        // returns a `TransformationNormalJointHessianWorkspace` for any single
-        // block (the `block_states.len() != 1` guard surfaces a panic, never a
-        // `None`), so the unified outer evaluator will see
-        // `JointHessianSource::Operator` rather than a dense coefficient
-        // matrix as soon as `use_joint_matrix_free_path` fires on `(p, n)`.
-        // This advertises β-space representation only, not a profiled outer
-        // θθ Hessian-vector product over the rho/anisotropy coordinates.
+        // CTN's SCOP coefficient-space joint Hessian is supplied as a
+        // row-streaming matrix-free Hv operator. This advertises β-space
+        // representation only, not a profiled outer θθ Hessian-vector product.
         true
     }
 
@@ -2579,45 +3110,33 @@ impl CustomFamily for TransformationNormalFamily {
 // Matrix-free joint Hessian workspace (Khatri-Rao operator-only)
 // ---------------------------------------------------------------------------
 
-/// Per-evaluation workspace for the CTN joint Hessian.
+/// Per-evaluation workspace for the SCOP-CTN joint Hessian.
 ///
-/// Caches the row-space quantities needed to apply
-///   H = X_val^T diag(w) X_val + X_deriv^T diag(w / h'^2) X_deriv
-/// without materializing X_val, X_deriv, or H itself. All matvecs go through
-/// the Khatri-Rao operator primitives on `KroneckerDesign`, which run in
-/// `O(n * p_resp * p_cov) = O(n * p)` per call. This avoids both the
-/// `O(n * p^2)` cost of the dense weighted Gram and the `O(p^2)` storage of
-/// the materialized joint Hessian.
+/// The old linear-`h` CTN Hessian had the form
+/// `X_val' W X_val + X_deriv' diag(w / h'^2) X_deriv`. SCOP is nonlinear in
+/// the shape rows, so `H v` must be evaluated through the rowwise chain rule.
+/// This workspace keeps the accepted `β` and row quantities and applies
+/// `H`, `D H[u]`, and `D²H[u,v]` without materializing a dense p×p matrix.
 struct TransformationNormalJointHessianWorkspace {
     /// Shared family handle. Cloning the workspace's family for each downstream
     /// matrix-free operator (dH, d²H per psi coord and per pair) would copy
     /// the full row-space Kronecker designs (~hundreds of MiB at biobank
     /// scale) per call. Arc-sharing makes operator construction O(1).
     family: Arc<TransformationNormalFamily>,
-    /// Row weights w / h'^2 for the X_deriv^T diag(·) X_deriv summand.
-    weighted_inv_hp_sq: Array1<f64>,
-    /// `1 / h'^3` cached per accepted β. Reused as the per-row factor in the
-    /// matrix-free dH operator kernel `-2 w_i (Du)_i / h'_i^3`. Arc-shared so
-    /// each derived dH operator clones a pointer rather than rebuilding the
-    /// per-row reciprocals.
-    inv_hp_cu: Arc<Array1<f64>>,
-    /// `1 / h'^4` cached per accepted β. Reused by the matrix-free d²H operator
-    /// kernel `6 w_i (Du)_i (Dw)_i / h'_i^4`.
-    inv_hp_qu: Arc<Array1<f64>>,
+    beta: Array1<f64>,
+    row_quantities: TransformationNormalRowQuantityCache,
 }
 
 impl TransformationNormalJointHessianWorkspace {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        weighted_inv_hp_sq: Array1<f64>,
-        inv_hp_cu: Arc<Array1<f64>>,
-        inv_hp_qu: Arc<Array1<f64>>,
+        beta: Array1<f64>,
+        row_quantities: TransformationNormalRowQuantityCache,
     ) -> Result<Self, String> {
         Ok(Self {
             family,
-            weighted_inv_hp_sq,
-            inv_hp_cu,
-            inv_hp_qu,
+            beta,
+            row_quantities,
         })
     }
 
@@ -2633,131 +3152,14 @@ impl TransformationNormalJointHessianWorkspace {
                 self.p_total()
             ));
         }
-        // Term 1: (X_val^T W X_val) · v.
-        //
-        // The val gram is constant in β (the weights are the family's row
-        // weights, not the β-dependent 1/h'² kernel), so the family caches it
-        // once at construction. Dense gemv via faer on the cached p×p matrix.
-        let mut out = fast_av(&self.family.x_val_weighted_gram, v);
-
-        // Term 2: factored (X_deriv^T diag(w/h'²) X_deriv) · v.
-        //
-        // The deriv kernel changes with β, so we apply it through the
-        // Khatri-Rao factor pair `(response_deriv_basis, covariate_design)`.
-        // Dense covariates take the fused path that allocates one
-        // `(n × p_resp)` buffer; sparse / operator-backed covariates fall
-        // through to the existing factored apply on `x_deriv_kron`, which
-        // uses the operator's `apply` / `apply_transpose` chunk primitives.
-        out += &self.factored_deriv_apply(v);
-        Ok(out)
-    }
-
-    /// Factored apply of `X_deriv^T diag(weighted_inv_hp_sq) X_deriv` to `v`.
-    ///
-    /// Selects the fused dense-covariate path when available; otherwise calls
-    /// through `KroneckerDesign::forward_mul` / `transpose_mul`.
-    fn factored_deriv_apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
-            fused_khatri_rao_weighted_gram_apply(
-                &self.family.response_deriv_basis,
-                cov_dense,
-                &self.weighted_inv_hp_sq,
-                v,
-            )
-        } else {
-            let mut deriv_image = self.family.x_deriv_kron.forward_mul(v);
-            deriv_image *= &self.weighted_inv_hp_sq;
-            self.family.x_deriv_kron.transpose_mul(&deriv_image)
-        }
+        self.family
+            .scop_hessian_matvec(&self.beta, &self.row_quantities, v)
     }
 
     /// Exact diagonal of the unpenalized joint Hessian.
-    ///
-    /// `H = (X_val^T W X_val) + (X_deriv^T diag(w/h'²) X_deriv)`. The first
-    /// term's diagonal is a single `diag()` extraction off the cached
-    /// `x_val_weighted_gram`; the second term is the Khatri–Rao identity
-    ///
-    ///   `H_deriv_(a,b),(a,b) = Σ_i (w/h'²)_i · A_deriv[i,a]² · B[i,b]²`,
-    ///
-    /// which we compute as `(M_w)^T · B²` block-by-block over row chunks,
-    /// where `M_w[i,a] = (w/h'²)_i · A_deriv[i,a]²`. Each chunk is one
-    /// `fast_atb` BLAS call, the chunks are reduced in parallel, and the
-    /// covariate design is consumed via `try_row_chunk` so sparse covariates
-    /// stream without densifying.
     fn compute_diagonal(&self) -> Result<Array1<f64>, String> {
-        let p_resp = self.family.response_deriv_basis.ncols();
-        let p_cov = self.family.covariate_design.ncols();
-        let total = p_resp * p_cov;
-        let cached_diag = self.family.x_val_weighted_gram.diag();
-        if cached_diag.len() != total {
-            return Err(format!(
-                "CTN diagonal: cached val gram diag length {} != p_total {}",
-                cached_diag.len(),
-                total
-            ));
-        }
-        // Term 1: precomputed val diagonal — one Array1 clone, no recomputation.
-        let mut diag = cached_diag.to_owned();
-
-        // Term 2: factored deriv diagonal, streamed in row chunks.
-        let n = self.family.weights.len();
-        if n == 0 {
-            return Ok(diag);
-        }
-        let policy = &self.family.policy;
-        let rows_per_chunk = crate::resource::rows_for_target_bytes(
-            policy.row_chunk_target_bytes,
-            (p_cov + p_resp).max(1),
-        )
-        .max(1);
-        let chunks: Vec<(usize, usize)> = (0..n)
-            .step_by(rows_per_chunk)
-            .map(|s| (s, (s + rows_per_chunk).min(n)))
-            .collect();
-        let resp_deriv = &self.family.response_deriv_basis;
-        let cov_design = &self.family.covariate_design;
-        let weighted_inv_hp_sq = &self.weighted_inv_hp_sq;
-
-        let partial: Array2<f64> = chunks
-            .into_par_iter()
-            .try_fold(
-                || Array2::<f64>::zeros((p_resp, p_cov)),
-                |mut local, (start, end)| -> Result<Array2<f64>, String> {
-                    let m = end - start;
-                    // Pre-square the covariate row chunk in place — the row_chunk
-                    // helper already returns an owned Array2 we are free to mutate.
-                    let mut cov_sq_chunk = cov_design
-                        .try_row_chunk(start..end)
-                        .map_err(|e| format!("CTN diagonal covariate row_chunk: {e}"))?;
-                    cov_sq_chunk.mapv_inplace(|v| v * v);
-                    // M_w[i, a] = (w/h'²)_{start+i} · A_deriv[start+i, a]².
-                    let mut m_w = Array2::<f64>::zeros((m, p_resp));
-                    for i_local in 0..m {
-                        let i = start + i_local;
-                        let c = weighted_inv_hp_sq[i];
-                        for a in 0..p_resp {
-                            let d = resp_deriv[[i, a]];
-                            m_w[[i_local, a]] = c * d * d;
-                        }
-                    }
-                    // (p_resp × p_cov) += M_w^T · B² — one BLAS gemm per chunk.
-                    local += &fast_atb(&m_w, &cov_sq_chunk);
-                    Ok(local)
-                },
-            )
-            .try_reduce(
-                || Array2::<f64>::zeros((p_resp, p_cov)),
-                |mut a, b| {
-                    a += &b;
-                    Ok(a)
-                },
-            )?;
-        // Flatten (p_resp × p_cov) into the row-major p_total layout.
-        for a in 0..p_resp {
-            let mut slice = diag.slice_mut(s![a * p_cov..(a + 1) * p_cov]);
-            slice += &partial.row(a);
-        }
-        Ok(diag)
+        self.family
+            .scop_hessian_diagonal(&self.beta, &self.row_quantities)
     }
 }
 
@@ -2772,29 +3174,20 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
 
     fn directional_derivative(
         &self,
-        _d_beta_flat: &Array1<f64>,
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Dense form is reached only when a caller forces materialization via
-        // `into_operator().to_dense()`. Returning `None` keeps consumers on the
-        // operator path supplied below; legacy callers that explicitly need a
-        // p×p matrix fall through to `family.exact_newton_joint_hessian_directional_derivative_with_specs`
-        // (the dense `weighted_gram` route) at the call site, so behavior is
-        // preserved without forcing a dense build here.
-        Ok(None)
+        let out = self.family.scop_hessian_directional_derivative(
+            &self.beta,
+            d_beta_flat,
+            &self.row_quantities,
+        )?;
+        Ok(Some(out))
     }
 
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        // Phase 2: SCOP outer derivatives pending. The dH operator's per-row
-        // kernel `-2 w_i (X_deriv v)_i / h'_i³` assumes h' is linear in β;
-        // under SCOP-CTN h' = Σ_k γ_k(x)² M_k(y), so additional `2 γ_k(x)`
-        // chain-rule legs are required. Returning `Ok(None)` keeps the
-        // unified outer evaluator on the BFGS+BfgsApprox fallback.
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         let p_total = self.p_total();
         if d_beta_flat.len() != p_total {
             return Err(format!(
@@ -2803,21 +3196,27 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
                 p_total
             ));
         }
-        let d_h_prime = self.family.x_deriv_kron.forward_mul(d_beta_flat);
         let op = TransformationNormalDhMatrixFreeOperator::new(
             Arc::clone(&self.family),
-            Arc::clone(&self.inv_hp_cu),
-            d_h_prime,
+            self.beta.clone(),
+            self.row_quantities.clone(),
+            d_beta_flat.clone(),
         );
         Ok(Some(Arc::new(op) as Arc<dyn HyperOperator>))
     }
 
     fn second_directional_derivative(
         &self,
-        _u: &Array1<f64>,
-        _v: &Array1<f64>,
+        u: &Array1<f64>,
+        v: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        let out = self.family.scop_hessian_second_directional_derivative(
+            &self.beta,
+            u,
+            v,
+            &self.row_quantities,
+        )?;
+        Ok(Some(out))
     }
 
     fn second_directional_derivative_operator(
@@ -2825,11 +3224,6 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        // Phase 2: SCOP outer derivatives pending. d²H linear-h' kernel
-        // `6 w_i (X_deriv u)_i (X_deriv v)_i / h'_i⁴` is invalid under SCOP.
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         let p_total = self.p_total();
         if d_beta_u.len() != p_total || d_beta_v.len() != p_total {
             return Err(format!(
@@ -2839,13 +3233,12 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
                 p_total
             ));
         }
-        let d_h_prime_u = self.family.x_deriv_kron.forward_mul(d_beta_u);
-        let d_h_prime_v = self.family.x_deriv_kron.forward_mul(d_beta_v);
         let op = TransformationNormalD2hMatrixFreeOperator::new(
             Arc::clone(&self.family),
-            Arc::clone(&self.inv_hp_qu),
-            d_h_prime_u,
-            d_h_prime_v,
+            self.beta.clone(),
+            self.row_quantities.clone(),
+            d_beta_u.clone(),
+            d_beta_v.clone(),
         );
         Ok(Some(Arc::new(op) as Arc<dyn HyperOperator>))
     }
@@ -2853,39 +3246,29 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
 
 /// Matrix-free directional derivative of the CTN joint Hessian.
 ///
-/// Encodes
-///   `dH[v_dir] = -2 X_derivᵀ diag(w · (X_deriv v_dir) / h'³) X_deriv`
-/// by caching the per-row weight kernel
-///   `c_i = -2 w_i (X_deriv v_dir)_i / h'_i³`
-/// at construction time. Each `mul_vec(w)` call costs `Θ(n (p_resp + p_cov))`
-/// via the same Khatri-Rao primitives the joint Hessian matvec uses, so the
-/// O(p²) dense `weighted_gram` build is never performed and stochastic
-/// trace estimators (`MatrixFreeSpdOperator::trace_logdet_operator`) consume
-/// the operator directly without materialization.
+/// SCOP makes the derivative row-dependent through `γ_k(x)`, so this operator
+/// evaluates `D H[direction] · v` by streaming rows through the exact chain
+/// rule instead of using the old scalar-weighted `X_deriv' diag(.) X_deriv`
+/// identity.
 struct TransformationNormalDhMatrixFreeOperator {
     family: Arc<TransformationNormalFamily>,
-    weight_kernel: Array1<f64>,
+    beta: Array1<f64>,
+    row_quantities: TransformationNormalRowQuantityCache,
+    direction: Array1<f64>,
 }
 
 impl TransformationNormalDhMatrixFreeOperator {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        inv_hp_cu: Arc<Array1<f64>>,
-        d_h_prime: Array1<f64>,
+        beta: Array1<f64>,
+        row_quantities: TransformationNormalRowQuantityCache,
+        direction: Array1<f64>,
     ) -> Self {
-        let n = inv_hp_cu.len();
-        debug_assert_eq!(d_h_prime.len(), n);
-        let weights = family.weights.as_ref();
-        // weight_kernel[i] = -2 · w_i · d_h_prime[i] · inv_hp_cu[i]
-        // (cached `1/h'^3` factor from the workspace; barrier formula
-        // `D(∇²B)[u]v = -2 μ Dᵀ((Du)(Dv)/c³)` with μ = w).
-        let weight_kernel = ndarray::Zip::from(weights.view())
-            .and(&*inv_hp_cu)
-            .and(&d_h_prime)
-            .par_map_collect(|&w, &inv3, &dhp| -2.0 * w * dhp * inv3);
         Self {
             family,
-            weight_kernel,
+            beta,
+            row_quantities,
+            direction,
         }
     }
 
@@ -2893,25 +3276,15 @@ impl TransformationNormalDhMatrixFreeOperator {
         self.family.x_deriv_kron.ncols()
     }
 
-    /// `(dH) · v = X_deriv^T diag(weight_kernel) X_deriv v`.
-    ///
-    /// Dense covariate: single fused (n × p_resp) buffer (see
-    /// `fused_khatri_rao_weighted_gram_apply`). Sparse/operator covariate:
-    /// fall through to `forward_mul → in-place scale → transpose_mul` on
-    /// the cached `KroneckerDesign`. Two BLAS gemms either way.
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
-            fused_khatri_rao_weighted_gram_apply(
-                &self.family.response_deriv_basis,
-                cov_dense,
-                &self.weight_kernel,
+        self.family
+            .scop_hessian_directional_matvec(
+                &self.beta,
+                &self.direction,
+                &self.row_quantities,
                 v,
             )
-        } else {
-            let mut image = self.family.x_deriv_kron.forward_mul(v);
-            image *= &self.weight_kernel;
-            self.family.x_deriv_kron.transpose_mul(&image)
-        }
+            .expect("validated CTN dH operator inputs should not fail")
     }
 }
 
@@ -2925,49 +3298,30 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
         self.apply(v)
     }
 
-    /// Batched apply: collapses K matvecs into two BLAS3 matmuls when the
-    /// covariate is dense. `projected_operator` calls this with K = `rank`,
-    /// so at biobank scale K ≈ p ≈ 100 and we replace 100 small per-column
-    /// dispatches with one fused row-pass.
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
-            fused_khatri_rao_weighted_gram_apply_batched(
-                &self.family.response_deriv_basis,
-                cov_dense,
-                &self.weight_kernel,
-                factor,
-            )
-        } else {
-            // Sparse / operator covariate: no fused dense path. Fall back
-            // to per-column matvec but still pay for it in parallel.
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let p = factor.nrows();
-            let k = factor.ncols();
-            let cols: Vec<Array1<f64>> = (0..k)
-                .into_par_iter()
-                .map(|c| self.apply(&factor.column(c).to_owned()))
-                .collect();
-            let mut out = Array2::<f64>::zeros((p, k));
-            for (c, bv) in cols.into_iter().enumerate() {
-                out.column_mut(c).assign(&bv);
-            }
-            out
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let p = factor.nrows();
+        let k = factor.ncols();
+        let cols: Vec<Array1<f64>> = (0..k)
+            .into_par_iter()
+            .map(|c| self.apply(&factor.column(c).to_owned()))
+            .collect();
+        let mut out = Array2::<f64>::zeros((p, k));
+        for (c, bv) in cols.into_iter().enumerate() {
+            out.column_mut(c).assign(&bv);
         }
+        out
     }
 
-    /// Materialize `dH` as a dense p×p matrix using the analytic identity
-    /// `dH = X_deriv^T diag(weight_kernel) X_deriv`.
-    ///
-    /// Reuses `KroneckerDesign::weighted_gram`, which performs the symmetric
-    /// Khatri–Rao gram in `Θ(p_resp² · n · p_cov²)` BLAS work — strictly fewer
-    /// FLOPs than `p` separate matvecs (which would each repeat both gemms
-    /// without amortizing across the symmetric structure). Reached only when
-    /// a legacy consumer goes through `DriftDerivResult::into_operator().to_dense()`.
     fn to_dense(&self) -> Array2<f64> {
         self.family
-            .x_deriv_kron
-            .weighted_gram(&self.weight_kernel, &self.family.policy)
+            .scop_hessian_directional_derivative(
+                &self.beta,
+                &self.direction,
+                &self.row_quantities,
+            )
+            .expect("validated CTN dH operator inputs should not fail")
     }
 
     fn is_implicit(&self) -> bool {
@@ -2977,38 +3331,31 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 
 /// Matrix-free second directional derivative of the CTN joint Hessian.
 ///
-/// Encodes
-///   `d²H[u, v] = 6 X_derivᵀ diag(w (X_deriv u)(X_deriv v) / h'⁴) X_deriv`
-/// with the same factored apply pattern as `TransformationNormalDhMatrixFreeOperator`.
-/// Used by the unified evaluator's second-order trace identities and second
-/// directional drift evaluations on the outer Hessian.
+/// This is the SCOP rowwise chain-rule operator for `D²H[u, v] · w`; it keeps
+/// the memory profile of matrix-free REML while matching the dense exact
+/// second derivative.
 struct TransformationNormalD2hMatrixFreeOperator {
     family: Arc<TransformationNormalFamily>,
-    weight_kernel: Array1<f64>,
+    beta: Array1<f64>,
+    row_quantities: TransformationNormalRowQuantityCache,
+    direction_u: Array1<f64>,
+    direction_v: Array1<f64>,
 }
 
 impl TransformationNormalD2hMatrixFreeOperator {
     fn new(
         family: Arc<TransformationNormalFamily>,
-        inv_hp_qu: Arc<Array1<f64>>,
-        d_h_prime_u: Array1<f64>,
-        d_h_prime_v: Array1<f64>,
+        beta: Array1<f64>,
+        row_quantities: TransformationNormalRowQuantityCache,
+        direction_u: Array1<f64>,
+        direction_v: Array1<f64>,
     ) -> Self {
-        let n = inv_hp_qu.len();
-        debug_assert_eq!(d_h_prime_u.len(), n);
-        debug_assert_eq!(d_h_prime_v.len(), n);
-        let weights = family.weights.as_ref();
-        // weight_kernel[i] = 6 · w_i · d_h_prime_u[i] · d_h_prime_v[i] · inv_hp_qu[i]
-        // (cached `1/h'^4` factor; barrier formula
-        // `D²(∇²B)[u,w]v = 6 μ Dᵀ((Du)(Dw)(Dv)/c⁴)` with μ = w).
-        let weight_kernel = ndarray::Zip::from(weights.view())
-            .and(&*inv_hp_qu)
-            .and(&d_h_prime_u)
-            .and(&d_h_prime_v)
-            .par_map_collect(|&w, &inv4, &dhp_u, &dhp_v| 6.0 * w * dhp_u * dhp_v * inv4);
         Self {
             family,
-            weight_kernel,
+            beta,
+            row_quantities,
+            direction_u,
+            direction_v,
         }
     }
 
@@ -3016,23 +3363,16 @@ impl TransformationNormalD2hMatrixFreeOperator {
         self.family.x_deriv_kron.ncols()
     }
 
-    /// `(d²H) · w = X_deriv^T diag(weight_kernel) X_deriv w`.
-    ///
-    /// Same fused dense-covariate path / KroneckerDesign fallback as the dH
-    /// apply.
     fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
-            fused_khatri_rao_weighted_gram_apply(
-                &self.family.response_deriv_basis,
-                cov_dense,
-                &self.weight_kernel,
+        self.family
+            .scop_hessian_second_directional_matvec(
+                &self.beta,
+                &self.direction_u,
+                &self.direction_v,
+                &self.row_quantities,
                 v,
             )
-        } else {
-            let mut image = self.family.x_deriv_kron.forward_mul(v);
-            image *= &self.weight_kernel;
-            self.family.x_deriv_kron.transpose_mul(&image)
-        }
+            .expect("validated CTN d2H operator inputs should not fail")
     }
 }
 
@@ -3046,40 +3386,31 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
         self.apply(v)
     }
 
-    /// Batched apply: same Khatri–Rao fused path as `dH`, with the second-order
-    /// `weight_kernel`.
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        if let Some(cov_dense) = self.family.covariate_design.as_dense_ref() {
-            fused_khatri_rao_weighted_gram_apply_batched(
-                &self.family.response_deriv_basis,
-                cov_dense,
-                &self.weight_kernel,
-                factor,
-            )
-        } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let p = factor.nrows();
-            let k = factor.ncols();
-            let cols: Vec<Array1<f64>> = (0..k)
-                .into_par_iter()
-                .map(|c| self.apply(&factor.column(c).to_owned()))
-                .collect();
-            let mut out = Array2::<f64>::zeros((p, k));
-            for (c, bv) in cols.into_iter().enumerate() {
-                out.column_mut(c).assign(&bv);
-            }
-            out
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let p = factor.nrows();
+        let k = factor.ncols();
+        let cols: Vec<Array1<f64>> = (0..k)
+            .into_par_iter()
+            .map(|c| self.apply(&factor.column(c).to_owned()))
+            .collect();
+        let mut out = Array2::<f64>::zeros((p, k));
+        for (c, bv) in cols.into_iter().enumerate() {
+            out.column_mut(c).assign(&bv);
         }
+        out
     }
 
-    /// Dense form via `KroneckerDesign::weighted_gram` — see
-    /// `TransformationNormalDhMatrixFreeOperator::to_dense` for the
-    /// FLOP-count rationale.
     fn to_dense(&self) -> Array2<f64> {
         self.family
-            .x_deriv_kron
-            .weighted_gram(&self.weight_kernel, &self.family.policy)
+            .scop_hessian_second_directional_derivative(
+                &self.beta,
+                &self.direction_u,
+                &self.direction_v,
+                &self.row_quantities,
+            )
+            .expect("validated CTN d2H operator inputs should not fail")
     }
 
     fn is_implicit(&self) -> bool {
