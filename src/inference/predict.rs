@@ -4923,4 +4923,865 @@ mod tests {
             assert!((recovered[i] - bc[i]).abs() < 1e-15);
         }
     }
+
+    // ─── Stronger, adversarial bias-correction tests ──────────────────────
+
+    /// Solve a small symmetric 3x3 SPD system H y = r by closed-form 3x3
+    /// inverse via the cofactor / adjugate formula. Used to compute the
+    /// expected bias_correction_beta = H^{-1} S β̂ by hand.
+    fn solve_3x3_spd(h: &Array2<f64>, r: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(h.nrows(), 3);
+        assert_eq!(h.ncols(), 3);
+        let m = |i: usize, j: usize| h[[i, j]];
+        let det = m(0, 0) * (m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1))
+            - m(0, 1) * (m(1, 0) * m(2, 2) - m(1, 2) * m(2, 0))
+            + m(0, 2) * (m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0));
+        assert!(det.abs() > 1e-12, "singular matrix in solve_3x3_spd");
+        // Cofactor matrix; inverse = adj/det = transpose(cof)/det.
+        let cof = array![
+            [
+                m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1),
+                -(m(1, 0) * m(2, 2) - m(1, 2) * m(2, 0)),
+                m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0)
+            ],
+            [
+                -(m(0, 1) * m(2, 2) - m(0, 2) * m(2, 1)),
+                m(0, 0) * m(2, 2) - m(0, 2) * m(2, 0),
+                -(m(0, 0) * m(2, 1) - m(0, 1) * m(2, 0))
+            ],
+            [
+                m(0, 1) * m(1, 2) - m(0, 2) * m(1, 1),
+                -(m(0, 0) * m(1, 2) - m(0, 2) * m(1, 0)),
+                m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0)
+            ]
+        ];
+        // adj = cof^T
+        let mut y = Array1::<f64>::zeros(3);
+        for i in 0..3 {
+            let mut acc = 0.0;
+            for j in 0..3 {
+                acc += cof[[j, i]] * r[j];
+            }
+            y[i] = acc / det;
+        }
+        y
+    }
+
+    /// Tiny deterministic LCG for reproducibility without an external crate.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn unif(&mut self) -> f64 {
+            // Take top 53 bits → [0, 1).
+            ((self.next_u64() >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        /// Box–Muller standard normal.
+        fn normal(&mut self) -> f64 {
+            let u1 = self.unif().max(1e-300);
+            let u2 = self.unif();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        }
+    }
+
+    /// Test 1: η̂_BC at x = I_p columns equals β̂ + b̂ component-wise,
+    /// where b̂ = H⁻¹ S β̂ is computed by hand.
+    #[test]
+    fn test_bias_correction_matches_explicit_formula() {
+        // p = 3. Pick H SPD (= XᵀWX + S in spirit), S, β̂, then solve H b = S β̂.
+        let h = array![
+            [4.0_f64, 0.5, 0.2],
+            [0.5, 3.0, 0.1],
+            [0.2, 0.1, 2.0]
+        ];
+        let s_pen = array![
+            [1.0_f64, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 0.0, 2.0]
+        ];
+        let beta = array![0.7_f64, -1.3, 0.4];
+        let s_beta = s_pen.dot(&beta);
+        let b_hat = solve_3x3_spd(&h, &s_beta);
+
+        // Cov is just a placeholder for the SE machinery; not used in this assertion.
+        let cov = Array2::<f64>::eye(3);
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(b_hat.clone()));
+
+        // Predict at the standard-basis rows: η_raw = β, η_BC = β + b_hat.
+        let x = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let offset = array![0.0, 0.0, 0.0];
+
+        let pred_raw = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(false),
+        )
+        .expect("raw predict");
+        let pred_bc = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("bc predict");
+
+        for i in 0..3 {
+            assert!(
+                (pred_raw.eta[i] - beta[i]).abs() < 1e-12,
+                "raw eta[{i}] = {} expected {}",
+                pred_raw.eta[i],
+                beta[i]
+            );
+            let expected = beta[i] + b_hat[i];
+            assert!(
+                (pred_bc.eta[i] - expected).abs() < 1e-12,
+                "BC eta[{i}] = {} expected β+b̂ = {} (b̂[{i}] = {})",
+                pred_bc.eta[i],
+                expected,
+                b_hat[i]
+            );
+        }
+    }
+
+    /// Test 2: S = 0 ⇒ b̂ = H⁻¹ · 0 · β̂ = 0; corrected prediction equals raw.
+    #[test]
+    fn test_bias_correction_zero_for_zero_penalty() {
+        // With S = 0, the canonical fit-time computation produces b̂ = 0.
+        // Inject a zero bias_correction_beta and verify η_BC == η_raw exactly.
+        let beta = array![0.5_f64, -0.4, 1.7];
+        let bc_zero = Array1::<f64>::zeros(3);
+        let cov = Array2::<f64>::eye(3);
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(bc_zero));
+
+        let x = array![[1.0, 2.0, -0.5], [0.3, -0.7, 1.2], [2.0, 0.1, 0.0]];
+        let offset = array![0.0, 0.0, 0.0];
+
+        let pred_raw = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(false),
+        )
+        .expect("raw predict");
+        let pred_bc = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("bc predict");
+
+        for i in 0..3 {
+            assert!(
+                (pred_bc.eta[i] - pred_raw.eta[i]).abs() < 1e-15,
+                "S=0 ⇒ BC must be a no-op; got Δ={} at i={i}",
+                pred_bc.eta[i] - pred_raw.eta[i]
+            );
+        }
+    }
+
+    /// Test 3: ‖η̂_BC − η̂_raw‖ is monotone-increasing in the scalar λ
+    /// multiplier of S. Specifically, for fixed H_base = XᵀWX, set
+    /// H(λ) = H_base + λI and S(λ) = λI, so b̂(λ) = H(λ)⁻¹ (λI) β̂.
+    #[test]
+    fn test_bias_correction_increases_with_penalty_strength() {
+        // Use p = 3 and the same H_base / β̂ across runs.
+        let h_base = array![
+            [3.0_f64, 0.4, 0.1],
+            [0.4, 2.5, 0.2],
+            [0.1, 0.2, 4.0]
+        ];
+        let beta = array![1.2_f64, -0.8, 0.5];
+        let x = array![[1.0, 0.5, -0.2], [0.3, -0.4, 0.9], [0.7, 0.7, 0.7]];
+        let offset = array![0.0, 0.0, 0.0];
+
+        let lambdas = [0.1_f64, 1.0, 10.0];
+        let mut deltas = Vec::with_capacity(lambdas.len());
+        for &lam in &lambdas {
+            // H(λ) = H_base + λ I; S(λ) = λ I.
+            let mut h = h_base.clone();
+            for k in 0..3 {
+                h[[k, k]] += lam;
+            }
+            let s_beta = beta.mapv(|v| lam * v);
+            let b_hat = solve_3x3_spd(&h, &s_beta);
+
+            let cov = Array2::<f64>::eye(3);
+            let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(b_hat));
+
+            let pred_raw = predict_gamwith_uncertainty(
+                x.clone(),
+                beta.view(),
+                offset.view(),
+                crate::types::LikelihoodFamily::GaussianIdentity,
+                &fit,
+                &bc_options(false),
+            )
+            .expect("raw predict");
+            let pred_bc = predict_gamwith_uncertainty(
+                x.clone(),
+                beta.view(),
+                offset.view(),
+                crate::types::LikelihoodFamily::GaussianIdentity,
+                &fit,
+                &bc_options(true),
+            )
+            .expect("bc predict");
+
+            let mut sumsq = 0.0;
+            for i in 0..3 {
+                let d = pred_bc.eta[i] - pred_raw.eta[i];
+                sumsq += d * d;
+            }
+            deltas.push(sumsq.sqrt());
+        }
+
+        assert!(
+            deltas[0] < deltas[1],
+            "‖η_BC − η_raw‖ must grow with λ: λ={} gave {}, λ={} gave {}",
+            lambdas[0], deltas[0], lambdas[1], deltas[1]
+        );
+        assert!(
+            deltas[1] < deltas[2],
+            "‖η_BC − η_raw‖ must grow with λ: λ={} gave {}, λ={} gave {}",
+            lambdas[1], deltas[1], lambdas[2], deltas[2]
+        );
+        // And there should be a meaningful gap, not numerical noise.
+        assert!(
+            deltas[2] > 10.0 * deltas[0],
+            "expected order-of-magnitude growth in BC magnitude across λ ∈ {{0.1,1,10}}; got {:?}",
+            deltas
+        );
+    }
+
+    /// Test 4: under strong shrinkage, the bias-corrected predictor moves
+    /// closer to the unpenalized OLS predictor than the raw penalized
+    /// predictor. We hand-construct a fixture where:
+    ///   β̂   = small-shrunk version of β_OLS,
+    ///   H   = XᵀX + S,  with S = λI,
+    ///   b̂   = H⁻¹ S β̂.
+    /// At ≥90% of test points, |η_OLS − η_BC| < |η_OLS − η_raw|.
+    #[test]
+    fn test_bias_correction_recovers_unpenalized_in_simulation() {
+        let n = 200usize;
+        let p = 5usize;
+        let mut rng = Lcg::new(0xC0FFEE_u64);
+
+        // Design matrix X (n × p) with column 0 = 1 (intercept-like).
+        let mut x_data = vec![0.0_f64; n * p];
+        for i in 0..n {
+            x_data[i * p] = 1.0;
+            for j in 1..p {
+                x_data[i * p + j] = rng.normal();
+            }
+        }
+        let x = Array2::from_shape_vec((n, p), x_data).expect("X shape");
+
+        // True beta and (unpenalized) OLS beta from y = Xβ_true + ε.
+        let beta_true = array![0.5_f64, 1.0, -0.7, 0.3, 0.8];
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut eta = 0.0;
+            for j in 0..p {
+                eta += x[[i, j]] * beta_true[j];
+            }
+            y[i] = eta + 0.3 * rng.normal();
+        }
+        // β_OLS = (XᵀX)⁻¹ Xᵀy. Use ndarray-via-explicit approach: solve via LU
+        // by leveraging the existing 3x3 helper is impossible at p=5; instead
+        // form the Cholesky-like solve via faer-free Gauss elimination.
+        let xtx = x.t().dot(&x);
+        let xty = x.t().dot(&y);
+        let beta_ols = solve_dense_spd(&xtx, &xty);
+
+        // Pretend the penalized fit shrunk OLS by factor 0.6: β̂ = 0.6·β_OLS.
+        let shrink = 0.6_f64;
+        let beta_hat = beta_ols.mapv(|v| shrink * v);
+
+        // S = λ I with λ chosen so shrinkage matches the target. Exact match
+        // is not required; we just need a consistent (H, S, β̂) triple.
+        let lambda = 100.0_f64;
+        let mut h = xtx.clone();
+        for k in 0..p {
+            h[[k, k]] += lambda;
+        }
+        let s_beta = beta_hat.mapv(|v| lambda * v);
+        let b_hat = solve_dense_spd(&h, &s_beta);
+
+        let cov = Array2::<f64>::eye(p);
+        let fit = test_fit_with_bias_correction(beta_hat.clone(), cov, Some(b_hat.clone()));
+
+        // Test points: a held-out random batch of 50 rows.
+        let m = 50usize;
+        let mut xt_data = vec![0.0_f64; m * p];
+        for i in 0..m {
+            xt_data[i * p] = 1.0;
+            for j in 1..p {
+                xt_data[i * p + j] = rng.normal();
+            }
+        }
+        let xt = Array2::from_shape_vec((m, p), xt_data).expect("Xtest shape");
+        let offset = Array1::<f64>::zeros(m);
+
+        let pred_raw = predict_gamwith_uncertainty(
+            xt.clone(),
+            beta_hat.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(false),
+        )
+        .expect("raw predict");
+        let pred_bc = predict_gamwith_uncertainty(
+            xt.clone(),
+            beta_hat.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("bc predict");
+        let eta_ols = xt.dot(&beta_ols);
+
+        let mut closer = 0usize;
+        for i in 0..m {
+            let raw_gap = (eta_ols[i] - pred_raw.eta[i]).abs();
+            let bc_gap = (eta_ols[i] - pred_bc.eta[i]).abs();
+            if bc_gap < raw_gap {
+                closer += 1;
+            }
+        }
+        let frac = closer as f64 / m as f64;
+        assert!(
+            frac >= 0.9,
+            "BC must close the OLS gap at ≥90% of test points; got {}/{} = {:.2}",
+            closer, m, frac
+        );
+    }
+
+    /// Test 5: bias is O(n⁻¹) — it should shrink as n grows when λ is held
+    /// at a fixed (n-independent) value. We simulate at n ∈ {200, 1000, 5000}
+    /// over multiple seeds, hand-build (β̂, H, S) per simulation, and require
+    /// |E[η̂_BC − η*]| / |E[η̂_raw − η*]| < 0.5 at n=5000 with the ratio
+    /// monotonically decreasing.
+    #[test]
+    fn test_bias_correction_bias_drops_with_n_simulation() {
+        let p = 4usize;
+        let beta_true = array![0.4_f64, 0.9, -0.5, 0.6];
+        let lambda = 5.0_f64; // fixed λ across n; bias scales as λ/(n+λ)
+        let seeds: [u64; 12] = [
+            1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+        ];
+        let ns = [200usize, 1000, 5000];
+
+        // Held-out test points are reused across n (they are just probes).
+        let m = 32usize;
+        let mut probe_rng = Lcg::new(424242);
+        let mut xt_data = vec![0.0_f64; m * p];
+        for i in 0..m {
+            xt_data[i * p] = 1.0;
+            for j in 1..p {
+                xt_data[i * p + j] = probe_rng.normal();
+            }
+        }
+        let xt = Array2::from_shape_vec((m, p), xt_data).expect("Xtest shape");
+        let eta_true = xt.dot(&beta_true);
+        let offset = Array1::<f64>::zeros(m);
+
+        let mut mean_abs_raw_bias = [0.0_f64; 3];
+        let mut mean_abs_bc_bias = [0.0_f64; 3];
+
+        for (kn, &n) in ns.iter().enumerate() {
+            // Average the per-test-point bias estimate across seeds.
+            let mut sum_eta_raw = Array1::<f64>::zeros(m);
+            let mut sum_eta_bc = Array1::<f64>::zeros(m);
+            for &seed in &seeds {
+                let mut rng = Lcg::new(seed.wrapping_add(7919 * n as u64));
+                let mut x_data = vec![0.0_f64; n * p];
+                for i in 0..n {
+                    x_data[i * p] = 1.0;
+                    for j in 1..p {
+                        x_data[i * p + j] = rng.normal();
+                    }
+                }
+                let x = Array2::from_shape_vec((n, p), x_data).expect("X shape");
+                let mut y = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let mut e = 0.0;
+                    for j in 0..p {
+                        e += x[[i, j]] * beta_true[j];
+                    }
+                    y[i] = e + 0.5 * rng.normal();
+                }
+                let xtx = x.t().dot(&x);
+                let xty = x.t().dot(&y);
+                let mut h = xtx.clone();
+                for k in 0..p {
+                    h[[k, k]] += lambda;
+                }
+                // Penalized estimator β̂ = H⁻¹ Xᵀy.
+                let beta_hat = solve_dense_spd(&h, &xty);
+                let s_beta = beta_hat.mapv(|v| lambda * v);
+                let b_hat = solve_dense_spd(&h, &s_beta);
+
+                let cov = Array2::<f64>::eye(p);
+                let fit =
+                    test_fit_with_bias_correction(beta_hat.clone(), cov, Some(b_hat));
+
+                let pred_raw = predict_gamwith_uncertainty(
+                    xt.clone(),
+                    beta_hat.view(),
+                    offset.view(),
+                    crate::types::LikelihoodFamily::GaussianIdentity,
+                    &fit,
+                    &bc_options(false),
+                )
+                .expect("raw predict");
+                let pred_bc = predict_gamwith_uncertainty(
+                    xt.clone(),
+                    beta_hat.view(),
+                    offset.view(),
+                    crate::types::LikelihoodFamily::GaussianIdentity,
+                    &fit,
+                    &bc_options(true),
+                )
+                .expect("bc predict");
+                sum_eta_raw += &pred_raw.eta;
+                sum_eta_bc += &pred_bc.eta;
+            }
+            let nseeds = seeds.len() as f64;
+            let mean_raw = &sum_eta_raw / nseeds;
+            let mean_bc = &sum_eta_bc / nseeds;
+            let mut acc_raw = 0.0;
+            let mut acc_bc = 0.0;
+            for i in 0..m {
+                acc_raw += (mean_raw[i] - eta_true[i]).abs();
+                acc_bc += (mean_bc[i] - eta_true[i]).abs();
+            }
+            mean_abs_raw_bias[kn] = acc_raw / m as f64;
+            mean_abs_bc_bias[kn] = acc_bc / m as f64;
+        }
+
+        // Raw bias should itself be decreasing in n (sanity check; otherwise
+        // the test conditions are wrong, not the BC).
+        assert!(
+            mean_abs_raw_bias[2] < mean_abs_raw_bias[0],
+            "raw penalized bias should shrink with n: got {:?}",
+            mean_abs_raw_bias
+        );
+        // The headline claim: BC is much smaller than raw at large n.
+        let ratio_large = mean_abs_bc_bias[2] / mean_abs_raw_bias[2].max(1e-300);
+        assert!(
+            ratio_large < 0.5,
+            "BC must reduce bias by >2× at n={}; raw={}, bc={}, ratio={}",
+            ns[2], mean_abs_raw_bias[2], mean_abs_bc_bias[2], ratio_large
+        );
+        // And the BC/raw ratio should decrease (or at least not grow) with n.
+        let ratio_small = mean_abs_bc_bias[0] / mean_abs_raw_bias[0].max(1e-300);
+        assert!(
+            ratio_large <= ratio_small + 1e-6,
+            "BC/raw ratio should not grow with n: small-n ratio={}, large-n ratio={}",
+            ratio_small, ratio_large
+        );
+    }
+
+    /// Test 6: invariance under invertible reparameterization. If β = Q θ,
+    /// the design becomes X̃ = X Q⁻¹ in coefficient-θ space and the penalty
+    /// becomes S̃ = Q⁻ᵀ S Q⁻¹. Then η̂_BC must equal η̂_BC(original) for any
+    /// row x. We verify that swapping (β, b_hat, X) ↔ (θ, b̃, X̃) gives the
+    /// same prediction.
+    #[test]
+    fn test_bias_correction_identity_in_basis_change() {
+        // Original parameterization (p = 3).
+        let h = array![
+            [4.0_f64, 0.5, 0.2],
+            [0.5, 3.0, 0.1],
+            [0.2, 0.1, 2.5]
+        ];
+        let s_pen = array![
+            [0.7_f64, 0.1, 0.0],
+            [0.1, 0.5, 0.05],
+            [0.0, 0.05, 1.2]
+        ];
+        let beta = array![0.6_f64, -0.4, 1.1];
+        let s_beta = s_pen.dot(&beta);
+        let b_hat = solve_3x3_spd(&h, &s_beta);
+
+        // Pick an invertible Q (upper-triangular with unit diagonal).
+        let q = array![
+            [1.0_f64, 0.3, -0.2],
+            [0.0, 1.0, 0.5],
+            [0.0, 0.0, 1.0]
+        ];
+        // θ = Q⁻¹ β; with this triangular Q we can solve directly.
+        let qinv = invert_upper_triangular_3(&q);
+        let theta = qinv.dot(&beta);
+        // b̃ = Q⁻¹ b̂.
+        let b_tilde = qinv.dot(&b_hat);
+
+        // Test row x; in θ-space the row becomes x̃ = Q⁻ᵀ x  → but predicted
+        // η is xᵀβ = xᵀ Q θ ⇒ x̃ = Qᵀ x. Use that form.
+        let x_row = array![[0.4_f64, -0.7, 0.9]];
+        let mut x_tilde = Array2::<f64>::zeros((1, 3));
+        for j in 0..3 {
+            let mut acc = 0.0;
+            for i in 0..3 {
+                acc += q[[i, j]] * x_row[[0, i]];
+            }
+            x_tilde[[0, j]] = acc;
+        }
+        let offset = array![0.0_f64];
+
+        let cov = Array2::<f64>::eye(3);
+        let fit_orig =
+            test_fit_with_bias_correction(beta.clone(), cov.clone(), Some(b_hat));
+        let fit_repar =
+            test_fit_with_bias_correction(theta.clone(), cov, Some(b_tilde));
+
+        let pred_orig = predict_gamwith_uncertainty(
+            x_row,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit_orig,
+            &bc_options(true),
+        )
+        .expect("orig predict");
+        let pred_repar = predict_gamwith_uncertainty(
+            x_tilde,
+            theta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit_repar,
+            &bc_options(true),
+        )
+        .expect("repar predict");
+
+        assert!(
+            (pred_orig.eta[0] - pred_repar.eta[0]).abs() < 1e-12,
+            "BC must be invariant under reparameterization: orig η={} repar η={} Δ={}",
+            pred_orig.eta[0],
+            pred_repar.eta[0],
+            (pred_orig.eta[0] - pred_repar.eta[0]).abs()
+        );
+    }
+
+    /// Test 7: stronger no-SE-leakage check. Across 100 random test rows,
+    /// the SE with BC enabled and SE with BC disabled differ by < 1e-14
+    /// (relative magnitude). Catches accidental contamination of the
+    /// variance pipeline by bias_correction_beta.
+    #[test]
+    fn test_bias_correction_does_not_inflate_se() {
+        let p = 4usize;
+        let beta = array![0.5_f64, -0.7, 1.1, 0.3];
+        // Non-trivial covariance.
+        let cov = array![
+            [2.0_f64, 0.3, 0.1, 0.0],
+            [0.3, 1.5, 0.2, 0.05],
+            [0.1, 0.2, 1.8, 0.1],
+            [0.0, 0.05, 0.1, 2.2]
+        ];
+        let bc = array![0.2_f64, -0.15, 0.05, 0.1];
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(bc));
+
+        let m = 100usize;
+        let mut rng = Lcg::new(0xBEEFCAFE_u64);
+        let mut x_data = vec![0.0_f64; m * p];
+        for i in 0..m {
+            for j in 0..p {
+                x_data[i * p + j] = rng.normal();
+            }
+        }
+        let x = Array2::from_shape_vec((m, p), x_data).expect("X shape");
+        let offset = Array1::<f64>::zeros(m);
+
+        let pred_off = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(false),
+        )
+        .expect("predict no-bc");
+        let pred_on = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("predict bc");
+
+        for i in 0..m {
+            let a = pred_off.eta_standard_error[i];
+            let b = pred_on.eta_standard_error[i];
+            let rel = (a - b).abs() / a.abs().max(b.abs()).max(1e-300);
+            assert!(
+                rel < 1e-14,
+                "SE leakage detected at i={}: off={}, on={}, relΔ={}",
+                i, a, b, rel
+            );
+        }
+    }
+
+    /// Test 8: pathological β̂ (NaN/Inf entries) must not panic. NaNs
+    /// propagate into η rather than triggering an unwrap.
+    #[test]
+    fn test_bias_correction_finite_for_pathological_inputs() {
+        let beta = array![1.0_f64, f64::NAN, 0.5];
+        let bc = array![0.1_f64, 0.2, f64::INFINITY];
+        let cov = Array2::<f64>::eye(3);
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(bc));
+
+        let x = array![[1.0_f64, 1.0, 1.0]];
+        let offset = array![0.0_f64];
+        let pred = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("pathological predict should not error, only propagate NaN/Inf");
+        assert!(
+            !pred.eta[0].is_finite(),
+            "expected non-finite η to propagate; got η = {}",
+            pred.eta[0]
+        );
+    }
+
+    /// Test 9: with apply_bias_correction = false, η̂ == β̂·x_* up to
+    /// 1e-15 even when bias_correction_beta is loaded onto the fit.
+    #[test]
+    fn test_bias_correction_disabled_via_options_returns_raw() {
+        let beta = array![1.5_f64, -0.7];
+        let bc = array![0.4_f64, -0.3];
+        let cov = Array2::<f64>::eye(2);
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(bc.clone()));
+
+        let x = array![[1.0_f64, 0.5], [0.7, -0.3]];
+        let offset = array![0.0_f64, 0.0];
+        let pred = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(false),
+        )
+        .expect("predict no-bc");
+
+        // Raw η = X β.
+        let expected = x.dot(&beta);
+        for i in 0..2 {
+            let d = (pred.eta[i] - expected[i]).abs();
+            assert!(
+                d < 1e-15,
+                "apply_bias_correction=false must return raw plug-in: η[{i}]={} expected={} Δ={}",
+                pred.eta[i], expected[i], d
+            );
+        }
+    }
+
+    /// Test 10: bias correction must use the *penalized* Hessian H = XᵀWX + S,
+    /// not the inverse of the supplied covariance. We construct a fixture
+    /// where the supplied covariance ≠ H⁻¹ (we deliberately pass a different
+    /// covariance into FitInference) and verify that prediction still uses
+    /// the externally-supplied bias_correction_beta verbatim — i.e. the
+    /// prediction code does NOT recompute b̂ from cov⁻¹ S β.
+    #[test]
+    fn test_bias_correction_with_nonidentity_covariance_uses_correct_h() {
+        // True (XᵀWX + S) implied by the fit:
+        let h_true = array![
+            [5.0_f64, 0.7, 0.2],
+            [0.7, 4.0, 0.3],
+            [0.2, 0.3, 3.5]
+        ];
+        let s_pen = array![
+            [0.8_f64, 0.0, 0.0],
+            [0.0, 1.2, 0.0],
+            [0.0, 0.0, 0.6]
+        ];
+        let beta = array![0.9_f64, -1.1, 0.4];
+        let s_beta = s_pen.dot(&beta);
+        let b_hat_correct = solve_3x3_spd(&h_true, &s_beta);
+
+        // Also compute the WRONG b̂ that one would get if the code used
+        // covariance⁻¹ instead of H. We pick a covariance that is clearly
+        // not H⁻¹: a tridiagonal SPD matrix.
+        let cov_wrong = array![
+            [2.0_f64, 0.4, 0.0],
+            [0.4, 1.5, 0.3],
+            [0.0, 0.3, 1.8]
+        ];
+        // cov_wrong is not equal to H_true^{-1}.
+        let h_inv = invert_3x3_spd(&h_true);
+        let mut diff = 0.0;
+        for i in 0..3 {
+            for j in 0..3 {
+                diff += (h_inv[[i, j]] - cov_wrong[[i, j]]).abs();
+            }
+        }
+        assert!(
+            diff > 0.5,
+            "test setup error: cov_wrong should be far from H_true⁻¹ (diff={})",
+            diff
+        );
+
+        // Build the fit with the WRONG covariance but the CORRECT bias vector.
+        // Predictions must reflect b_hat_correct (not whatever the code might
+        // compute from cov_wrong).
+        let fit = test_fit_with_bias_correction(
+            beta.clone(),
+            cov_wrong,
+            Some(b_hat_correct.clone()),
+        );
+
+        let x = array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let offset = array![0.0_f64, 0.0, 0.0];
+        let pred = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("predict bc");
+
+        for i in 0..3 {
+            let expected = beta[i] + b_hat_correct[i];
+            assert!(
+                (pred.eta[i] - expected).abs() < 1e-12,
+                "prediction must use the supplied bias_correction_beta verbatim: \
+                 η[{i}]={} expected={} (β+b̂_correct[{i}]={})",
+                pred.eta[i], expected, b_hat_correct[i]
+            );
+        }
+    }
+
+    /// Test 11: bias_correction_beta survives serde JSON round-trip.
+    /// Catches missing serde fields or skip_serializing attributes.
+    #[test]
+    fn test_bias_correction_propagates_through_unified_fit_result() {
+        let beta = array![0.7_f64, -0.4, 1.2];
+        let bc = array![0.123456789_f64, -0.987654321, 0.5];
+        let cov = Array2::<f64>::eye(3);
+        let fit = test_fit_with_bias_correction(beta, cov, Some(bc.clone()));
+
+        let json = serde_json::to_string(&fit).expect("serialize unified fit");
+        let decoded: UnifiedFitResult =
+            serde_json::from_str(&json).expect("deserialize unified fit");
+        let recovered = decoded
+            .bias_correction_beta()
+            .expect("bias_correction_beta must survive JSON round-trip");
+        assert_eq!(recovered.len(), bc.len(), "bc length changed across round-trip");
+        for i in 0..bc.len() {
+            assert!(
+                (recovered[i] - bc[i]).abs() < 1e-15,
+                "bc[{i}] drifted across JSON round-trip: in={}, out={}",
+                bc[i], recovered[i]
+            );
+        }
+    }
+
+    // ─── Local linear-algebra helpers for the bias-correction tests ──────
+
+    /// Solve H y = r for general dense SPD H (small p) via Gauss elimination
+    /// with partial pivoting. Used in the simulation tests where p > 3 makes
+    /// the closed-form 3×3 helper insufficient.
+    fn solve_dense_spd(h: &Array2<f64>, r: &Array1<f64>) -> Array1<f64> {
+        let n = h.nrows();
+        assert_eq!(h.ncols(), n);
+        assert_eq!(r.len(), n);
+        let mut a = Array2::<f64>::zeros((n, n + 1));
+        for i in 0..n {
+            for j in 0..n {
+                a[[i, j]] = h[[i, j]];
+            }
+            a[[i, n]] = r[i];
+        }
+        for k in 0..n {
+            // Partial pivot.
+            let mut piv = k;
+            let mut best = a[[k, k]].abs();
+            for i in (k + 1)..n {
+                if a[[i, k]].abs() > best {
+                    best = a[[i, k]].abs();
+                    piv = i;
+                }
+            }
+            assert!(best > 1e-14, "near-singular system in solve_dense_spd");
+            if piv != k {
+                for j in 0..=n {
+                    let tmp = a[[k, j]];
+                    a[[k, j]] = a[[piv, j]];
+                    a[[piv, j]] = tmp;
+                }
+            }
+            for i in (k + 1)..n {
+                let factor = a[[i, k]] / a[[k, k]];
+                for j in k..=n {
+                    a[[i, j]] -= factor * a[[k, j]];
+                }
+            }
+        }
+        let mut y = Array1::<f64>::zeros(n);
+        for i in (0..n).rev() {
+            let mut acc = a[[i, n]];
+            for j in (i + 1)..n {
+                acc -= a[[i, j]] * y[j];
+            }
+            y[i] = acc / a[[i, i]];
+        }
+        y
+    }
+
+    /// Invert a 3x3 SPD matrix using the same cofactor formula as solve_3x3_spd.
+    fn invert_3x3_spd(h: &Array2<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((3, 3));
+        for col in 0..3 {
+            let mut e = Array1::<f64>::zeros(3);
+            e[col] = 1.0;
+            let v = solve_3x3_spd(h, &e);
+            for row in 0..3 {
+                out[[row, col]] = v[row];
+            }
+        }
+        out
+    }
+
+    /// Invert a 3x3 unit-diagonal upper-triangular matrix exactly.
+    fn invert_upper_triangular_3(q: &Array2<f64>) -> Array2<f64> {
+        // Q is upper triangular with unit diagonal:
+        //   [1  a  b]
+        //   [0  1  c]
+        //   [0  0  1]
+        // Q⁻¹ = [[1, -a, ac-b], [0, 1, -c], [0, 0, 1]].
+        let a = q[[0, 1]];
+        let b = q[[0, 2]];
+        let c = q[[1, 2]];
+        array![
+            [1.0, -a, a * c - b],
+            [0.0, 1.0, -c],
+            [0.0, 0.0, 1.0]
+        ]
+    }
 }

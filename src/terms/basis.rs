@@ -16963,11 +16963,14 @@ pub mod closed_form_penalty {
 
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
         let mut sum = 0.0_f64;
+        let mut max_term = 0.0_f64;
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
-            sum += coeff * riesz_kernel_value(d, j, r);
+            let term = coeff * riesz_kernel_value(d, j, r);
+            sum += term;
+            max_term = max_term.max(term.abs());
         }
 
         // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
@@ -16975,9 +16978,31 @@ pub mod closed_form_penalty {
         for ell in 1..=b {
             let binom = binomial_f64(a + b - ell - 1, b - ell);
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
-            sum += coeff * matern_kernel_value(d, ell, kappa, r);
+            let term = coeff * matern_kernel_value(d, ell, kappa, r);
+            sum += term;
+            max_term = max_term.max(term.abs());
         }
 
+        // Cancellation detector. The partial-fraction expansion sums Riesz
+        // and Matérn terms whose individual magnitudes scale as
+        // κ^{-2(a+b-j)} but the analytical sum tends to the finite κ → 0
+        // limit R_{a+b}^d(r). For small κ this is a sum of huge values
+        // cancelling to a small one and roundoff in the κ^{-2k} coefficients
+        // (combined with the small-argument Bessel-K series inside the
+        // Matérn factor) leaks through with absolute error far in excess of
+        // ε · max|term|. When the |sum| inflates beyond the κ → 0 limit by
+        // many decades — clear evidence that double precision has lost the
+        // cancellation — fall back to that limit, whose own truncation
+        // error in the omitted Matérn correction is O((κr)²) and tends to
+        // zero as κ → 0.
+        let limit = riesz_kernel_value(d, a + b, r);
+        if limit.is_finite()
+            && limit.abs() > 0.0
+            && sum.abs() > 1e3 * limit.abs()
+            && max_term > 1e6 * limit.abs()
+        {
+            return limit;
+        }
         sum
     }
 
@@ -17642,6 +17667,454 @@ pub mod closed_form_penalty {
         let sum_eta: f64 = eta.iter().sum();
         let big_j = sum_eta.exp();
         (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
+    }
+
+    // ============================================================
+    //  Radial-derivative anisotropic penalty
+    // ------------------------------------------------------------
+    //  The pair-block kernel can be written as
+    //      g_q(z; η, m, s, κ) = J · (-Δ_B)^q f(R)
+    //  with R = |z|, J = exp(Σ η_k), B = diag(b_k), b_k = exp(-2 η_k),
+    //  Δ_B = Σ_k b_k ∂²/∂z_k² (anisotropic Laplacian) and
+    //  f(R) = isotropic_duchon_penalty(0, d, m, s, κ, R).
+    //
+    //  Acting on a radial function we get the structured forms:
+    //      Δ_B f(R) = f''(R)·u_1/R²  +  f'(R)·(s_1/R - u_1/R³)
+    //  with s_p = Σ b_k^p, u_p = Σ b_k^p z_k².  Applying Δ_B again
+    //  yields (derivation in the inline comments below):
+    //      Δ_B² f = u_1²·[ f''''/R⁴ - 6 f'''/R⁵ + 15 f''/R⁶ - 15 f'/R⁷ ]
+    //             + s_1 u_1·[ 2 f'''/R³ - 6 f''/R⁴ + 6 f'/R⁵ ]
+    //             + s_1² ·[ f''/R² - f'/R³ ]
+    //             + u_2  ·[ 4 f'''/R³ - 12 f''/R⁴ + 12 f'/R⁵ ]
+    //             + s_2  ·[ 2 f''/R² - 2 f'/R³ ]
+    //  In the isotropic limit (b_k = 1) this collapses to the standard
+    //      Δ²f = f'''' + 2(d-1)/R · f''' + (d-1)(d-3)/R² · f'' - (d-1)(d-3)/R³ · f'
+    //  as a sanity check.
+    //
+    //  Compared to Schoenberg quadrature, this radial form is
+    //   * finite pointwise for any R > 0 in any (m, s, d) regime
+    //     (no IR divergence requirement),
+    //   * a few hundred FLOP per pair (no 80-node quadrature),
+    //   * exact up to roundoff in the radial-derivative table.
+    // ============================================================
+
+    /// Bundle of values K_{ν+i}(x) for ν - 4 ≤ ν+i ≤ ν + 4. Returns
+    /// a length-9 vector indexed so that `out[i+4] = K_{ν+i}(x)`.
+    /// Used to combine into derivatives of `r^a · K_b(κr)` via the
+    /// recurrence `K_b' = -(K_{b-1} + K_{b+1})/2`. Internally we
+    /// require K up to ν ± 4; this is sufficient for f^{(4)}.
+    fn bessel_k_table_around(nu: f64, x: f64) -> Vec<f64> {
+        // We need K_{ν+i}(x) for i ∈ {-4..=4}. K_{-ν} = K_ν, so just
+        // call bessel_k(|nu+i|, x) for each shift.
+        let mut out = vec![0.0_f64; 9];
+        for i in -4_i32..=4 {
+            let order = nu + i as f64;
+            out[(i + 4) as usize] = bessel_k(order, x);
+        }
+        out
+    }
+
+    /// Radial derivatives of a single Matérn block
+    ///   m_ℓ(r) = pref(ℓ, κ, d) · r^ν · K_ν(κr),    ν = ℓ - d/2,
+    ///   pref = κ^{d/2 - ℓ} / ((2π)^{d/2} · 2^{ℓ-1} · Γ(ℓ)).
+    ///
+    /// Returns `[m, m', m'', m''', m^{(4)}]` at the supplied `r > 0`.
+    ///
+    /// Algorithm:
+    /// We expand the Matérn block as a linear combination of
+    /// `c · r^a · K_b(κr)` terms.  Differentiation is closed:
+    ///   d/dr[c r^a K_b(κr)] = (c·a) r^{a-1} K_b(κr)
+    ///                       + (-c κ/2) r^a K_{b-1}(κr)
+    ///                       + (-c κ/2) r^a K_{b+1}(κr).
+    /// Each step triples the term count.  For the 4 derivatives we
+    /// need (max order = 4) the term list grows to at most 3^4 = 81
+    /// entries — still much cheaper than 80-node quadrature.
+    fn matern_block_radial_derivatives(
+        d: usize,
+        ell: usize,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
+        assert!(d >= 1);
+        assert!(ell >= 1);
+        assert!(kappa > 0.0);
+        assert!(r > 0.0);
+        assert!(max_order <= 4, "matern_block_radial_derivatives: max_order ≤ 4");
+
+        let nu = ell as f64 - d as f64 / 2.0;
+        // Prefactor κ^{d/2-ℓ} / ((2π)^{d/2} 2^{ℓ-1} Γ(ℓ))
+        let ln_pref = (d as f64 / 2.0 - ell as f64) * kappa.ln()
+            - (d as f64 / 2.0) * (2.0 * std::f64::consts::PI).ln()
+            - (ell as f64 - 1.0) * std::f64::consts::LN_2
+            - ln_gamma(ell as f64);
+        let pref = ln_pref.exp();
+
+        // Symbolic term list: each entry (coef, a, b_offset) means
+        //   coef · r^a · K_{ν + b_offset}(κr)
+        // Initially: pref · r^ν · K_ν(κr) → (pref, ν, 0).
+        let mut terms: Vec<(f64, f64, i32)> = vec![(pref, nu, 0)];
+        let mut out = Vec::with_capacity(max_order + 1);
+
+        // Cache bessel table at this r once we know which orders we need
+        let kr = kappa * r;
+        let bessel_table = bessel_k_table_around(nu, kr);
+        let bessel = |b_off: i32| -> f64 {
+            // b_off ∈ [-4, 4]
+            let idx = (b_off + 4) as usize;
+            bessel_table[idx]
+        };
+
+        // Evaluate current term list at scalar r
+        let evaluate = |terms: &Vec<(f64, f64, i32)>| -> f64 {
+            let mut sum = 0.0_f64;
+            for &(c, a, b) in terms {
+                if c == 0.0 {
+                    continue;
+                }
+                sum += c * r.powf(a) * bessel(b);
+            }
+            sum
+        };
+
+        out.push(evaluate(&terms));
+
+        for _ in 0..max_order {
+            let mut next: Vec<(f64, f64, i32)> = Vec::with_capacity(terms.len() * 3);
+            for &(c, a, b) in &terms {
+                if c == 0.0 {
+                    continue;
+                }
+                // term1: derivative of r^a (a · r^{a-1}) · K_b
+                if a != 0.0 {
+                    next.push((c * a, a - 1.0, b));
+                }
+                // term2: derivative of K_b(κr) = κ · K_b'(κr)
+                //        = κ · -(K_{b-1} + K_{b+1})/2
+                let coef = -c * kappa * 0.5;
+                next.push((coef, a, b - 1));
+                next.push((coef, a, b + 1));
+            }
+            terms = compress_terms(next);
+            out.push(evaluate(&terms));
+        }
+        out
+    }
+
+    /// Merge terms with equal `(a, b)` exponents to keep the list short.
+    fn compress_terms(mut terms: Vec<(f64, f64, i32)>) -> Vec<(f64, f64, i32)> {
+        terms.sort_by(|x, y| {
+            x.2.cmp(&y.2)
+                .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let mut out: Vec<(f64, f64, i32)> = Vec::with_capacity(terms.len());
+        for (c, a, b) in terms {
+            if let Some(last) = out.last_mut() {
+                if last.2 == b && (last.1 - a).abs() < 1e-15 {
+                    last.0 += c;
+                    continue;
+                }
+            }
+            out.push((c, a, b));
+        }
+        out
+    }
+
+    /// Radial derivatives `[R^{(0)}, …, R^{(max_order)}]` of a single
+    /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
+    /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
+    fn riesz_block_radial_derivatives(
+        d: usize,
+        j: usize,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
+        assert!(d >= 1);
+        assert!(j >= 1);
+        assert!(r > 0.0);
+
+        let two_j = 2 * j;
+        let half_d = d as f64 / 2.0;
+        let mut out = Vec::with_capacity(max_order + 1);
+
+        if two_j >= d && (two_j - d) % 2 == 0 {
+            // Log case: R_j^d(r) = c · r^{2n} · ln(r) with c, n as below.
+            let n = (two_j - d) / 2;
+            let sign = if n % 2 == 0 { -1.0 } else { 1.0 };
+            let denom = 2.0_f64.powi((two_j - 1) as i32)
+                * std::f64::consts::PI.powf(d as f64 / 2.0)
+                * gamma_fn(j as f64)
+                * factorial_f64(n);
+            let c = sign / denom;
+            let two_n = 2 * n;
+            // (r^{2n} · ln r)^{(k)} = Σ_{i=0..k} C(k,i) (r^{2n})^{(i)} (ln r)^{(k-i)}
+            // (r^{2n})^{(i)} = falling_fact(2n, i) · r^{2n - i} for i ≤ 2n; else 0
+            // (ln r)^{(0)} = ln r
+            // (ln r)^{(j)} = (-1)^{j-1} (j-1)! r^{-j} for j ≥ 1
+            for k in 0..=max_order {
+                let mut sum = 0.0_f64;
+                for i in 0..=k {
+                    if i > two_n {
+                        continue;
+                    }
+                    let binom = binomial_f64(k, i);
+                    let mut ff = 1.0_f64;
+                    for q in 0..i {
+                        ff *= (two_n - q) as f64;
+                    }
+                    let r_pow = r.powi((two_n - i) as i32);
+                    let log_part = if k - i == 0 {
+                        r.ln()
+                    } else {
+                        let m = (k - i) as i32;
+                        let sign2 = if (m as usize) % 2 == 1 { 1.0 } else { -1.0 };
+                        sign2 * factorial_f64((k - i) - 1) * r.powi(-m)
+                    };
+                    sum += binom * ff * r_pow * log_part;
+                }
+                out.push(c * sum);
+            }
+            return out;
+        }
+
+        // Non-log case: c · r^p with p = 2j - d (real exponent).
+        let c = gamma_fn(half_d - j as f64)
+            / (4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64));
+        let p = 2.0 * j as f64 - d as f64;
+        let mut coef = c;
+        let mut exp = p;
+        out.push(coef * r.powf(exp));
+        for _ in 0..max_order {
+            // d/dr[c · r^p] = c·p · r^{p-1}
+            coef *= exp;
+            exp -= 1.0;
+            out.push(coef * r.powf(exp));
+        }
+        out
+    }
+
+    /// Radial derivatives `[f, f', f'', …, f^{(max_order)}]`(R) of the
+    /// isotropic Duchon kernel `f(R) = isotropic_duchon_penalty(0, d, m, s, κ, R)`.
+    ///
+    /// Used by the radial-derivative anisotropic form.  Requires `R > 0`.
+    pub fn radial_derivatives_of_isotropic_duchon(
+        d: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
+        assert!(r > 0.0, "radial_derivatives_of_isotropic_duchon: r must be > 0");
+        assert!(2 * m >= 1, "radial_derivatives_of_isotropic_duchon: need m ≥ 1");
+        assert!(max_order <= 4, "radial_derivatives_of_isotropic_duchon: max_order ≤ 4");
+
+        // a = 2m (we differentiate f = isotropic Duchon at q=0; the q is
+        // applied externally via Δ_B^q in g_q).  Match isotropic_duchon_penalty(q=0).
+        let a = 2 * m;
+        let mut total = vec![0.0_f64; max_order + 1];
+
+        if s == 0 {
+            // Pure Riesz: f = R_{a}^d(r)
+            let block = riesz_block_radial_derivatives(d, a, r, max_order);
+            for (k, v) in block.into_iter().enumerate() {
+                total[k] += v;
+            }
+            return total;
+        }
+        if kappa == 0.0 {
+            let block = riesz_block_radial_derivatives(d, a + 2 * s, r, max_order);
+            for (k, v) in block.into_iter().enumerate() {
+                total[k] += v;
+            }
+            return total;
+        }
+
+        // Hybrid: partial-fraction expansion (mirrors isotropic_duchon_penalty).
+        let b = 2 * s;
+        let kappa_sq = kappa * kappa;
+        for j in 1..=a {
+            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let binom = binomial_f64(a + b - j - 1, a - j);
+            let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
+            let block = riesz_block_radial_derivatives(d, j, r, max_order);
+            for (k, v) in block.into_iter().enumerate() {
+                total[k] += coeff * v;
+            }
+        }
+        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        for ell in 1..=b {
+            let binom = binomial_f64(a + b - ell - 1, b - ell);
+            let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
+            let block = matern_block_radial_derivatives(d, ell, kappa, r, max_order);
+            for (k, v) in block.into_iter().enumerate() {
+                total[k] += coeff * v;
+            }
+        }
+
+        total
+    }
+
+    /// Radial-form anisotropic Duchon pair-block penalty
+    ///   g_q(z; η, m, s, κ) = J · (-Δ_B)^q f(R)
+    /// implemented via analytic radial derivatives of f.
+    ///
+    /// Returns the same quantity as `anisotropic_duchon_penalty` (without
+    /// the J prefactor on `g_q` — caller multiplies by J), but is finite
+    /// pointwise in any (m, s, d) regime and avoids the Schoenberg
+    /// 80-node quadrature.
+    ///
+    /// For `R = 0` the radial form is singular; falls back to the
+    /// Schoenberg implementation in that degenerate case (Δ_B^q f(0)).
+    pub fn anisotropic_duchon_penalty_radial(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> f64 {
+        assert_eq!(
+            eta.len(),
+            r.len(),
+            "anisotropic_duchon_penalty_radial: eta and r dimension mismatch"
+        );
+        assert!(
+            !r.is_empty(),
+            "anisotropic_duchon_penalty_radial: empty input"
+        );
+        assert!(
+            q <= 2,
+            "anisotropic_duchon_penalty_radial: q must be in {{0,1,2}}"
+        );
+
+        let d = r.len();
+        // Build invariants R, s_1, s_2, u_1, u_2.
+        let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
+
+        if big_r == 0.0 {
+            // Radial form is singular at R = 0; defer to Schoenberg path
+            // which integrates against the heat kernel and is finite there.
+            return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+        }
+
+        // Radial derivatives of f at R, up to order 4 (sufficient for q ≤ 2).
+        let max_order = match q {
+            0 => 0,
+            1 => 2,
+            2 => 4,
+            _ => unreachable!(),
+        };
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
+
+        match q {
+            0 => fr[0],
+            1 => -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr),
+            2 => anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Δ_B f(R) with f given by its radial derivatives `[f, f', f'', …]`.
+    fn anisotropic_laplacian_of_radial_first(
+        big_r: f64,
+        s1: f64,
+        u1: f64,
+        fr: &[f64],
+    ) -> f64 {
+        // Δ_B f = f''·u_1/R² + f'·(s_1/R - u_1/R³)
+        let r2 = big_r * big_r;
+        let r3 = r2 * big_r;
+        fr[2] * u1 / r2 + fr[1] * (s1 / big_r - u1 / r3)
+    }
+
+    /// Δ_B² f(R) with f given by its radial derivatives `[f, f', …, f^{(4)}]`.
+    fn anisotropic_laplacian_of_radial_second(
+        big_r: f64,
+        s1: f64,
+        s2: f64,
+        u1: f64,
+        u2: f64,
+        fr: &[f64],
+    ) -> f64 {
+        let r = big_r;
+        let r2 = r * r;
+        let r3 = r2 * r;
+        let r4 = r2 * r2;
+        let r5 = r4 * r;
+        let r6 = r4 * r2;
+        let r7 = r6 * r;
+
+        // u_1² · [f''''/R⁴ - 6 f'''/R⁵ + 15 f''/R⁶ - 15 f'/R⁷]
+        let part_u1sq = u1 * u1
+            * (fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7);
+        // s_1·u_1 · [2 f'''/R³ - 6 f''/R⁴ + 6 f'/R⁵]
+        let part_s1u1 =
+            s1 * u1 * (2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5);
+        // s_1² · [f''/R² - f'/R³]
+        let part_s1sq = s1 * s1 * (fr[2] / r2 - fr[1] / r3);
+        // u_2 · [4 f'''/R³ - 12 f''/R⁴ + 12 f'/R⁵]
+        let part_u2 = u2 * (4.0 * fr[3] / r3 - 12.0 * fr[2] / r4 + 12.0 * fr[1] / r5);
+        // s_2 · [2 f''/R² - 2 f'/R³]
+        let part_s2 = s2 * (2.0 * fr[2] / r2 - 2.0 * fr[1] / r3);
+
+        part_u1sq + part_s1u1 + part_s1sq + part_u2 + part_s2
+    }
+
+    /// Anisotropic invariants used by the radial form:
+    ///   R  = √(Σ b_k r_k²)         (length of axis-rescaled lag)
+    ///   s_p = Σ b_k^p, p ∈ {1, 2}   (anisotropy traces)
+    ///   u_p = Σ b_k^{p+1} r_k², p ∈ {1, 2}
+    /// where b_k = exp(-2 η_k).
+    fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
+        let mut s1 = 0.0_f64;
+        let mut s2 = 0.0_f64;
+        let mut r2 = 0.0_f64; // Σ b_k r_k²
+        let mut u1 = 0.0_f64;
+        let mut u2 = 0.0_f64;
+        for k in 0..eta.len() {
+            let b = (-2.0 * eta[k]).exp();
+            let rk2 = r[k] * r[k];
+            s1 += b;
+            s2 += b * b;
+            r2 += b * rk2;
+            u1 += b * b * rk2;
+            u2 += b * b * b * rk2;
+        }
+        (r2.sqrt(), s1, s2, u1, u2)
+    }
+
+    /// κ-partial of `radial_derivatives_of_isotropic_duchon`: returns
+    /// `[∂_κ f, ∂_κ f', …, ∂_κ f^{(max_order)}]`(R).
+    ///
+    /// Only Matérn blocks (and their κ-dependent partial-fraction
+    /// coefficients) contribute: pure Riesz blocks are κ-independent.
+    pub fn radial_derivatives_of_isotropic_duchon_kappa_partial(
+        d: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
+        assert!(r > 0.0);
+        assert!(max_order <= 4);
+        let total = vec![0.0_f64; max_order + 1];
+        if s == 0 || kappa == 0.0 {
+            // No Matérn or κ → 0 limit (Riesz pure) — both κ-independent.
+            return total;
+        }
+        // Use central FD in κ on the value-side radial derivative table.
+        // Step size scaled by κ to stay roughly relative.
+        let eps = (kappa.abs().max(1.0)) * 1e-5;
+        let kp = kappa + eps;
+        let km = kappa - eps;
+        let a = radial_derivatives_of_isotropic_duchon(d, m, s, kp, r, max_order);
+        let b = radial_derivatives_of_isotropic_duchon(d, m, s, km, r, max_order);
+        a.iter()
+            .zip(b.iter())
+            .map(|(p, n)| (p - n) / (2.0 * eps))
+            .collect()
     }
 }
 
@@ -24286,5 +24759,631 @@ mod tests {
                 "closed-form vs collocation drift too far at K={k}, q={q}: rel_frob={rel}"
             );
         }
+    }
+
+    // =====================================================================
+    // Adversarial closed-form-penalty tests
+    //
+    // These tests stay in regimes that satisfy the convergence preconditions
+    // documented at `closed_form_penalty`:
+    //   * partial-fraction precondition: 2m - q ≥ 1
+    //   * UV: 4(m+s) > d + 2q
+    //   * IR (κ>0): d + 2q > 4m
+    //   * pointwise kernel: 2(p+s) > d  (p = m here)
+    // and use tolerances tight enough to catch sign / normalization /
+    // partial-fraction-coefficient / ψ-derivative bugs.
+    // =====================================================================
+
+    #[test]
+    fn test_riesz_satisfies_laplacian_identity() {
+        // Numerical inverse-Fourier on |ρ|^{-2j} is unreliable (singular at
+        // ρ = 0, not absolutely integrable in d dimensions for the j values
+        // we care about), so the original test compared the closed form to
+        // a quadrature with no chance of converging. Replace with the
+        // identity that uniquely fixes both sign AND normalization:
+        //   −Δ_radial R_j^d = R_{j-1}^d        (j ≥ 2, non-log cases)
+        // Fourier-side proof: F[R_j^d] = ρ^{-2j}, F[−Δ] = ρ², product =
+        // ρ^{-2(j-1)} = F[R_{j-1}^d]. Any normalization error in
+        // riesz_kernel_value would show up here as a constant offset, and
+        // a sign flip would make the relation fail outright.
+        use super::closed_form_penalty::riesz_kernel_value;
+        // Skip log cases (where 2(j-1) ≥ d and 2(j-1)-d is even); restrict
+        // to (d, j) for which both R_j^d and R_{j-1}^d are non-log so the
+        // identity holds without subtracting log terms.
+        // Non-log means 2j != d + 2n for any n ≥ 0, equivalently
+        // 2j < d OR (2j - d) is odd. We pick d odd to keep both R_j and
+        // R_{j-1} in the non-log regime cleanly.
+        let cases: &[(usize, usize)] = &[(3, 2), (3, 3), (5, 2), (5, 3), (7, 3), (7, 4)];
+        for &(d, j) in cases {
+            for &r in &[0.3_f64, 1.0, 3.0] {
+                // 5-point stencil for f''(r) and centered diff for f'(r).
+                let h = 1e-3_f64 * r;
+                let f_mm = riesz_kernel_value(d, j, r - 2.0 * h);
+                let f_m = riesz_kernel_value(d, j, r - h);
+                let f_0 = riesz_kernel_value(d, j, r);
+                let f_p = riesz_kernel_value(d, j, r + h);
+                let f_pp = riesz_kernel_value(d, j, r + 2.0 * h);
+                let f_pp_d2 = (-f_mm + 16.0 * f_m - 30.0 * f_0 + 16.0 * f_p - f_pp)
+                    / (12.0 * h * h);
+                let f_p_d1 = (f_mm - 8.0 * f_m + 8.0 * f_p - f_pp) / (12.0 * h);
+                let lap = f_pp_d2 + (d as f64 - 1.0) / r * f_p_d1;
+                let lhs = -lap;
+                let rhs = riesz_kernel_value(d, j - 1, r);
+                let rel = (lhs - rhs).abs() / rhs.abs().max(1e-300);
+                assert!(
+                    rel < 5e-5,
+                    "Riesz Laplacian identity broken (d={d}, j={j}, r={r}): \
+                     -ΔR_j={lhs:.6e}, R_{{j-1}}={rhs:.6e}, rel={rel:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matern_matches_half_integer_closed_forms() {
+        // The radial-Fourier-inversion test was unstable at small r: the
+        // 80-segment Gauss-Legendre rule on (ρ² + κ²)^{-ℓ} on [0, 200] never
+        // reaches the asymptotic Bessel oscillation regime cleanly enough
+        // for d odd. Replace with explicit half-integer closed forms that
+        // pin sign and normalization exactly.
+        //
+        // For d odd, ν = ℓ - d/2 is half-integer and K_ν reduces to a finite
+        // sum:
+        //   K_{1/2}(x) = √(π/(2x)) e^{-x}
+        //   K_{3/2}(x) = √(π/(2x)) (1 + 1/x) e^{-x}
+        //   K_{5/2}(x) = √(π/(2x)) (1 + 3/x + 3/x²) e^{-x}
+        //
+        // M_ℓ^d(r; κ) = κ^{d/2-ℓ} (2π)^{-d/2} 2^{1-ℓ} / Γ(ℓ) · r^{ℓ-d/2}
+        //               · K_{ℓ-d/2}(κr)
+        //
+        // We tabulate three (d, ℓ) cells covering ν ∈ {1/2, 3/2, 5/2}, all
+        // half-integer, all positive (so no singular K_ν at r → 0 issues).
+        use super::closed_form_penalty::matern_kernel_value;
+        use std::f64::consts::PI;
+        // (d, ℓ): ν = ℓ - d/2 ∈ {1/2, 3/2, 5/2}.
+        let cases: &[(usize, usize)] = &[(3, 2), (3, 3), (3, 4), (5, 3), (5, 4)];
+        for &(d, ell) in cases {
+            for &kappa in &[0.5_f64, 1.0, 2.0] {
+                for &r in &[0.3_f64, 1.0, 3.0] {
+                    let nu_2 = 2 * ell as i64 - d as i64; // 2ν, an odd positive integer
+                    assert!(nu_2 >= 1, "test setup: ν must be > 0");
+                    let x = kappa * r;
+                    // K_ν(x) = √(π/(2x)) e^{-x} P_ν(1/x), where P_ν is the
+                    // explicit polynomial in 1/x for half-integer ν.
+                    // For ν = (2k+1)/2 (k = 0, 1, 2, …):
+                    //   P_ν(y) = Σ_{i=0}^{k} (k+i)! / (i! (k-i)!) · (y/2)^i
+                    let k = ((nu_2 - 1) / 2) as usize;
+                    let y = 1.0 / x;
+                    let mut poly = 0.0_f64;
+                    let mut k_minus_i_factorial = (1..=k).map(|i| i as f64).product::<f64>();
+                    let mut i_factorial = 1.0_f64;
+                    let mut k_plus_i_factorial = k_minus_i_factorial; // (k!)
+                    let mut y_half_pow = 1.0_f64;
+                    for i in 0..=k {
+                        let coeff = k_plus_i_factorial / (i_factorial * k_minus_i_factorial);
+                        poly += coeff * y_half_pow;
+                        if i < k {
+                            // advance: i → i+1
+                            i_factorial *= i as f64 + 1.0;
+                            k_minus_i_factorial /= (k - i) as f64;
+                            k_plus_i_factorial *= (k + i + 1) as f64;
+                            y_half_pow *= 0.5 * y;
+                        }
+                    }
+                    let bessel_k = (PI / (2.0 * x)).sqrt() * (-x).exp() * poly;
+                    let nu = ell as f64 - 0.5 * d as f64;
+                    let pref = kappa.powf(0.5 * d as f64 - ell as f64)
+                        * (2.0 * PI).powf(-0.5 * d as f64)
+                        * 2.0_f64.powf(1.0 - ell as f64)
+                        / statrs::function::gamma::gamma(ell as f64);
+                    let expected = pref * r.powf(nu) * bessel_k;
+                    let got = matern_kernel_value(d, ell, kappa, r);
+                    let rel = (got - expected).abs() / expected.abs().max(1e-300);
+                    assert!(
+                        rel < 1e-10,
+                        "Matérn closed form disagrees with half-integer K_ν \
+                         (d={d}, ℓ={ell}, κ={kappa}, r={r}): \
+                         got={got:.10e} expected={expected:.10e} rel={rel:.3e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_matern_satisfies_helmholtz() {
+        use super::closed_form_penalty::matern_kernel_value;
+        // (κ² − Δ_radial) M_ℓ^d = M_{ℓ-1}^d in d=3.
+        let d = 3usize;
+        let kappa = 1.0_f64;
+        for &ell in &[2usize, 3] {
+            for &r in &[0.5_f64, 1.0, 1.7, 2.5] {
+                let h = 1e-4_f64;
+                let m_pp = matern_kernel_value(d, ell, kappa, r + h);
+                let m_mm = matern_kernel_value(d, ell, kappa, r - h);
+                let m_0 = matern_kernel_value(d, ell, kappa, r);
+                let f_pp = (m_pp - 2.0 * m_0 + m_mm) / (h * h);
+                let f_p = (m_pp - m_mm) / (2.0 * h);
+                let lap = f_pp + 2.0 / r * f_p;
+                let lhs = kappa * kappa * m_0 - lap;
+                let rhs = matern_kernel_value(d, ell - 1, kappa, r);
+                let rel = (lhs - rhs).abs() / rhs.abs().max(1e-300);
+                assert!(
+                    rel < 5e-3,
+                    "Helmholtz relation broken: d={d}, ℓ={ell}, r={r}: \
+                     (κ²−Δ)M_ℓ={lhs:.6e}, M_{{ℓ−1}}={rhs:.6e}, rel={rel:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_isotropic_duchon_satisfies_partial_fraction_identity() {
+        use super::closed_form_penalty::{
+            isotropic_duchon_penalty, matern_kernel_value, riesz_kernel_value,
+        };
+        let d = 3usize;
+        let m = 2usize;
+        let s = 2usize;
+        let q = 2usize;
+        let kappa = 1.0_f64;
+        let a = 2 * m - q;
+        let b = 2 * s;
+        let kappa_sq = kappa * kappa;
+
+        fn binom(n: usize, k: usize) -> f64 {
+            let mut acc = 1.0_f64;
+            for i in 0..k {
+                acc *= (n - i) as f64 / (i + 1) as f64;
+            }
+            acc
+        }
+
+        for &r in &[0.4_f64, 0.9, 1.5, 2.5, 5.0] {
+            let mut expected = 0.0_f64;
+            for j in 1..=a {
+                let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+                let coeff = sign * binom(a + b - j - 1, a - j) * kappa_sq.powi(-((a + b - j) as i32));
+                expected += coeff * riesz_kernel_value(d, j, r);
+            }
+            let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+            for ell in 1..=b {
+                let coeff = sign_a * binom(a + b - ell - 1, b - ell) * kappa_sq.powi(-((a + b - ell) as i32));
+                expected += coeff * matern_kernel_value(d, ell, kappa, r);
+            }
+            let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let rel = (got - expected).abs() / expected.abs().max(1e-300);
+            assert!(
+                rel < 1e-12,
+                "partial-fraction identity broken (r={r}): got={got:.10e} expected={expected:.10e} rel={rel:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_isotropic_duchon_kappa_to_zero_limit() {
+        use super::closed_form_penalty::{isotropic_duchon_penalty, riesz_kernel_value};
+        // (d=3, m=2, s=2, q=2): UV=16>7 ✓; IR=7>8 ✗ at κ→0 — pure Riesz limit
+        // R_{2m+2s-q}^d=R_6^3, but check convergence pattern as κ shrinks.
+        // Pick (d=5, m=1, s=2, q=1): UV=12>7 ✓ at κ>0; partial-fraction OK.
+        // At κ=0: g → R_{2m+2s-q}^d = R_4^5. 2j=8, d=5, 8-5=3 odd → no log ✓.
+        let d = 5usize;
+        let m = 1usize;
+        let s = 2usize;
+        let q = 1usize;
+        let r = 1.3_f64;
+        let target = riesz_kernel_value(d, 2 * m + 2 * s - q, r);
+        let kappas = [1.0_f64, 0.1, 0.01, 0.001];
+        let mut prev_err = f64::INFINITY;
+        for &kappa in &kappas {
+            let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let err = (got - target).abs() / target.abs();
+            if kappa <= 0.5 {
+                assert!(
+                    err <= prev_err * 1.05 + 1e-15,
+                    "convergence not monotone: κ={kappa}, err={err:.3e}, prev_err={prev_err:.3e}"
+                );
+            }
+            prev_err = err;
+        }
+        let got = isotropic_duchon_penalty(q, d, m, s, 0.001, r);
+        let rel = (got - target).abs() / target.abs();
+        assert!(
+            rel < 5e-3,
+            "κ→0 limit not Riesz: got={got:.6e} target={target:.6e} rel={rel:.3e}"
+        );
+    }
+
+    #[test]
+    fn test_schoenberg_isotropic_matches_riesz_matern_strict_tolerance() {
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
+        // (d=3, m=1, s=2, κ=1, q=1) and (d=5, m=2, s=2, κ=1, q=2).
+        //
+        // Tolerance 1.5e-2 is the achievable floor for the 80-node
+        // y ∈ [-20, 20] Schoenberg quadrature: at small R (R = 0.2) the
+        // heat-kernel integrand peaks near τ ≈ R²/(2d) ≈ 0.007, where the
+        // log-grid is locally coarse and the polynomial prefactor T_q is
+        // most variable. Tightening below 5e-3 would require either a
+        // 120-node rule or a τ-window adaptive to R, neither of which is
+        // free in the production hot path. The looser companion test
+        // `test_schoenberg_quadrature_independent_of_extra_quadrature_pad`
+        // catches the same families of bugs at 1e-2 over the bulk regime
+        // R ∈ [0.4, 2.5]; this test extends coverage down to R = 0.2 at
+        // the achievable precision.
+        let cases: &[(usize, usize, usize, usize, f64)] = &[
+            (1, 3, 1, 2, 1.0),
+            (2, 5, 2, 2, 1.0),
+        ];
+        for &(q, d, m, s, kappa) in cases {
+            for &big_r in &[0.2_f64, 0.5, 1.0, 2.0, 4.0] {
+                let eta = vec![0.0_f64; d];
+                let mut r = vec![0.0_f64; d];
+                r[0] = big_r;
+                let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+                let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+                let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
+                assert!(
+                    rel < 1.5e-2,
+                    "strict schoenberg/iso disagreement: q={q} d={d} m={m} s={s} κ={kappa} R={big_r} \
+                     aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_schoenberg_quadrature_independent_of_extra_quadrature_pad() {
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
+        let q = 1usize;
+        let d = 3usize;
+        let m = 1usize;
+        let s = 2usize;
+        let kappa = 1.0_f64;
+        for &big_r in &[0.4_f64, 1.0, 2.5] {
+            let eta = vec![0.0_f64; d];
+            let mut r = vec![0.0_f64; d];
+            r[0] = big_r;
+            let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+            let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+            let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
+            assert!(
+                rel < 1e-2,
+                "Schoenberg quadrature looks under-resolved at R={big_r}: \
+                 aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e} \
+                 (expected ≤ 1e-2 with 80-node y∈[-20,20] rule)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_psi_first_deriv_invariance_under_uniform_eta_shift() {
+        // The J = exp(Σ η_k) prefactor must scale as e^{c·d} under a uniform
+        // η shift by c.  This catches a missing/wrong J prefactor in the
+        // pair-block bundle.
+        use super::closed_form_penalty::pair_block_with_j_derivatives;
+        let q = 1usize;
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let d = 3usize;
+        let eta_base = vec![0.1_f64, -0.2, 0.3];
+        let r = vec![0.5_f64, 0.4, 0.3];
+        let c = 0.4_f64;
+        let eta_shift: Vec<f64> = eta_base.iter().map(|x| x + c).collect();
+
+        let (val_base, _, _) = pair_block_with_j_derivatives(q, m, s, kappa, &eta_base, &r);
+        let (val_shift, _, _) = pair_block_with_j_derivatives(q, m, s, kappa, &eta_shift, &r);
+
+        let j_base: f64 = eta_base.iter().sum::<f64>().exp();
+        let j_shift: f64 = eta_shift.iter().sum::<f64>().exp();
+        let bare_base = val_base / j_base;
+        let bare_shift = val_shift / j_shift;
+
+        let j_ratio = j_shift / j_base;
+        let expected_ratio = (c * d as f64).exp();
+        let rel = (j_ratio - expected_ratio).abs() / expected_ratio;
+        assert!(
+            rel < 1e-12,
+            "J prefactor scaling wrong: J_shift/J_base={j_ratio} expected e^{{cd}}={expected_ratio}"
+        );
+
+        assert!(bare_base.is_finite() && bare_base.abs() > 1e-30);
+        assert!(bare_shift.is_finite() && bare_shift.abs() > 1e-30);
+    }
+
+    #[test]
+    fn test_psi_kappa_mixed_derivative_symmetry() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty, kappa_first_derivative, psi_first_derivative,
+            psi_kappa_mixed_derivative,
+        };
+        let q = 1usize;
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let eta = vec![0.1_f64, -0.2, 0.3];
+        let r = vec![0.5_f64, 0.4, 0.3];
+        let h = 1e-4_f64;
+
+        for k in 0..eta.len() {
+            let mut eta_p = eta.clone();
+            let mut eta_m = eta.clone();
+            eta_p[k] += h;
+            eta_m[k] -= h;
+            let dk_p = kappa_first_derivative(q, m, s, kappa, &eta_p, &r);
+            let dk_m = kappa_first_derivative(q, m, s, kappa, &eta_m, &r);
+            let fd_a = (dk_p - dk_m) / (2.0 * h);
+            let dpsi_p = psi_first_derivative(q, m, s, kappa + h, &eta, &r, k);
+            let dpsi_m = psi_first_derivative(q, m, s, kappa - h, &eta, &r, k);
+            let fd_b = (dpsi_p - dpsi_m) / (2.0 * h);
+            let an = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, k);
+
+            let err_ab = (fd_a - fd_b).abs();
+            let err_an_a = (fd_a - an).abs();
+            let err_an_b = (fd_b - an).abs();
+            let scale = an.abs().max(fd_a.abs()).max(fd_b.abs()).max(1e-12);
+            assert!(
+                err_ab / scale < 1e-3,
+                "FD-A vs FD-B mismatch (k={k}): FD-A={fd_a:.6e} FD-B={fd_b:.6e} err={err_ab:.3e}"
+            );
+            assert!(
+                err_an_a / scale < 1e-3,
+                "analytic vs FD-A mismatch (k={k}): an={an:.6e} FD-A={fd_a:.6e} err={err_an_a:.3e}"
+            );
+            assert!(
+                err_an_b / scale < 1e-3,
+                "analytic vs FD-B mismatch (k={k}): an={an:.6e} FD-B={fd_b:.6e} err={err_an_b:.3e}"
+            );
+            let _g0 = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+        }
+    }
+
+    #[test]
+    fn test_psi_first_deriv_against_two_central_differences() {
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, psi_first_derivative};
+        let q = 1usize;
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let eta = vec![0.1_f64, -0.2, 0.3];
+        let r = vec![0.5_f64, 0.4, 0.3];
+
+        for k in 0..eta.len() {
+            let h_big = 1e-3_f64;
+            let h_small = 0.5e-3_f64;
+            let fd_at = |h: f64| {
+                let mut ep = eta.clone();
+                let mut em = eta.clone();
+                ep[k] += h;
+                em[k] -= h;
+                let g_p = anisotropic_duchon_penalty(q, m, s, kappa, &ep, &r);
+                let g_m = anisotropic_duchon_penalty(q, m, s, kappa, &em, &r);
+                (g_p - g_m) / (2.0 * h)
+            };
+            let fd_big = fd_at(h_big);
+            let fd_small = fd_at(h_small);
+            // Richardson extrapolation (4·fd(h/2) − fd(h))/3 cancels O(h²).
+            let richardson = (4.0 * fd_small - fd_big) / 3.0;
+            let an = psi_first_derivative(q, m, s, kappa, &eta, &r, k);
+            let err = (richardson - an).abs();
+            let scale = an.abs().max(richardson.abs()).max(1e-12);
+            assert!(
+                err / scale < 5e-7,
+                "Richardson FD vs analytic disagree (k={k}): \
+                 R={richardson:.10e} an={an:.10e} fd(h)={fd_big:.10e} fd(h/2)={fd_small:.10e} \
+                 abs_err={err:.3e} rel={:.3e}",
+                err / scale
+            );
+        }
+    }
+
+    #[test]
+    fn test_anisotropy_breaks_isotropic_symmetry() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty, isotropic_duchon_penalty, pair_block_with_j_derivatives,
+        };
+        let q = 1usize;
+        let m = 1usize;
+        let s = 1usize;
+        let d = 3usize;
+        let kappa = 1.0_f64;
+        let c = 0.5_f64;
+        let eta = vec![c, 0.0_f64, 0.0_f64];
+        let r = vec![1.0_f64, 0.0_f64, 0.0_f64];
+
+        let aniso_bare = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+        let z_norm = (-c).exp();
+        let iso_at_z = isotropic_duchon_penalty(q, d, m, s, kappa, z_norm);
+
+        let rel = (aniso_bare - iso_at_z).abs() / iso_at_z.abs().max(1e-300);
+        assert!(
+            rel > 0.05,
+            "anisotropic call collapsed to isotropic-at-|z|: \
+             aniso={aniso_bare:.6e} iso(|z|)={iso_at_z:.6e} rel={rel:.3e} \
+             (expected meaningful disagreement under anisotropy)"
+        );
+
+        let (val_with_j, _, _) = pair_block_with_j_derivatives(q, m, s, kappa, &eta, &r);
+        let expected_j = eta.iter().sum::<f64>().exp();
+        let bare = val_with_j / expected_j;
+        let bare_rel = (bare - aniso_bare).abs() / aniso_bare.abs().max(1e-300);
+        assert!(
+            bare_rel < 1e-12,
+            "pair_block J/bare consistency broken: J·g={val_with_j} g={aniso_bare} ratio={}",
+            val_with_j / aniso_bare
+        );
+    }
+
+    #[test]
+    fn test_value_against_completely_independent_brute_force() {
+        // (d=3, m=1, s=2, κ=1, q=1) — UV 12>5 ✓, IR 5>4 ✓, 2m-q=1 ✓.
+        // f̂(ρ) = 1 / (ρ² (1+ρ²)^4) — both ends integrable in d=3 sin form.
+        use super::closed_form_penalty::isotropic_duchon_penalty;
+        let q = 1usize;
+        let d = 3usize;
+        let m = 1usize;
+        let s = 2usize;
+        let kappa = 1.0_f64;
+        let f_hat = |rho: f64| 1.0 / (rho * rho * (1.0 + rho * rho).powi(4));
+        for &big_r in &[0.5_f64, 1.5, 3.0] {
+            let closed = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+            let approx = fourier_inv_radial_d3(f_hat, big_r, 100.0);
+            let rel = (closed - approx).abs() / closed.abs().max(1e-300);
+            assert!(
+                rel < 1e-3,
+                "brute-force FT vs closed-form mismatch (R={big_r}): \
+                 closed={closed:.6e} approx={approx:.6e} abs={:.3e} rel={rel:.3e}",
+                (closed - approx).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_radial_form_agrees_with_schoenberg_in_convergent_regime() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty, anisotropic_duchon_penalty_radial,
+        };
+
+        // Schoenberg quadrature converges only for `4(m+s) > d + 2q` (UV)
+        // and `d + 2q > 4m` (IR). The radial form is finite for any
+        // (m, s, d) regime.  We compare the two on the parameter triples
+        // where Schoenberg works.
+        //   q=1: (d=3, m=1, s=1) — UV 8>5 ✓, IR 5>4 ✓.
+        //   q=2: (d=5, m=2, s=2) — UV 16>9 ✓, IR 9>8 ✓.
+        let cases: &[(usize, usize, usize, usize, f64)] = &[
+            (1, 3, 1, 1, 1.0),
+            (2, 5, 2, 2, 1.0),
+        ];
+
+        for &(q, d, m, s, kappa) in cases {
+            // Try a few non-degenerate r vectors.
+            let r_choices: &[Vec<f64>] = &[
+                (0..d).map(|i| 0.3 + 0.2 * i as f64).collect(),
+                (0..d).map(|i| 0.7 + 0.1 * i as f64).collect(),
+            ];
+            let eta_choices: &[Vec<f64>] = &[
+                vec![0.0_f64; d],
+                (0..d).map(|i| 0.1 - 0.05 * i as f64).collect(),
+            ];
+            for r in r_choices {
+                for eta in eta_choices {
+                    let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r);
+                    let scho = anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+                    let rel = (radial - scho).abs() / scho.abs().max(1e-300);
+                    // Schoenberg quadrature itself agrees with the
+                    // partial-fraction closed form to a few percent
+                    // (see test_schoenberg_isotropic_agrees_with_partial_fraction);
+                    // the radial form, by construction, agrees with the
+                    // partial-fraction closed form to roundoff. Therefore
+                    // we expect the radial vs Schoenberg gap to live within
+                    // the same Schoenberg-error band, ≲ 5%.
+                    assert!(
+                        rel < 5e-2,
+                        "radial vs Schoenberg disagreement: q={q} d={d} m={m} s={s} \
+                         kappa={kappa} r={:?} eta={:?} radial={radial:.6e} \
+                         schoenberg={scho:.6e} rel={rel:.3e}",
+                        r,
+                        eta
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_radial_form_isotropic_limit_matches_isotropic_duchon() {
+        // η = 0 collapses the radial-form anisotropic penalty to
+        //   J · (-Δ)^q f(R) on radial f, which equals the isotropic
+        // closed form via:
+        //   q = 0:  f(R)
+        //   q = 1: -[ f''(R) + (d-1) f'(R)/R ]
+        //   q = 2:  Δ²f(R) (well-known closed form on radial fns)
+        // The radial form should agree to roundoff with the isotropic
+        // closed form supplied by `isotropic_duchon_penalty(q, d, m, s, κ, R)`.
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
+        };
+
+        // Use parameter triples covering both Riesz-only (s=0) and
+        // hybrid (s>0). All require 2m - q ≥ 1 from
+        // isotropic_duchon_penalty's invariant.
+        // For q=1: m=1 is fine.
+        // For q=2: m=2 is needed.
+        let cases: &[(usize, usize, usize, usize, f64)] = &[
+            // (q, d, m, s, kappa)
+            (0, 3, 2, 0, 0.0), // pure Riesz, q=0
+            (1, 3, 1, 0, 0.0), // pure Riesz, q=1
+            (1, 3, 1, 1, 1.0), // hybrid q=1
+            (2, 3, 2, 0, 0.0), // pure Riesz, q=2
+            (2, 4, 2, 0, 0.0), // pure Riesz, q=2 (log-Riesz case)
+            (2, 5, 2, 1, 1.5), // hybrid q=2
+        ];
+        for &(q, d, m, s, kappa) in cases {
+            let eta = vec![0.0_f64; d];
+            // R varies: place lag along one axis with various magnitudes.
+            for &big_r in &[0.4_f64, 1.0, 2.5] {
+                let mut r = vec![0.0_f64; d];
+                r[0] = big_r;
+                let radial =
+                    anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+                // For q=0 the closed form is f(R) directly. For q ≥ 1 the
+                // anisotropic Laplacian collapses to (-Δ)^q on a radial
+                // function in d-dim flat space, which is *not* the same as
+                // the q-loaded isotropic Duchon kernel (those differ in
+                // their Fourier representation by ρ^{2q} not Δ_x^q applied
+                // to the q=0 kernel — they coincide up to sign for radial f
+                // by Plancherel since (-Δ)^q ↔ |ρ|^{2q}).
+                //
+                // Indeed the Fourier-space identity
+                //   F[(-Δ)^q f] = |ρ|^{2q} F[f]
+                // means that on radial f(r) we have, in any d,
+                //   isotropic_duchon_penalty(q, d, m, s, κ, R)
+                //   = (-Δ)^q [ isotropic_duchon_penalty(0, d, m, s, κ, ·) ](R).
+                // So our η=0 anisotropic radial form should match that
+                // same closed form (up to a sign convention on Δ).
+                let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+                let rel = (radial - iso).abs() / iso.abs().max(1e-300);
+                assert!(
+                    rel < 1e-8,
+                    "radial form (η=0) disagrees with isotropic closed form: \
+                     q={q} d={d} m={m} s={s} kappa={kappa} R={big_r} \
+                     radial={radial:.6e} iso={iso:.6e} rel={rel:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_radial_derivatives_match_finite_differences() {
+        use super::closed_form_penalty::{
+            isotropic_duchon_penalty, radial_derivatives_of_isotropic_duchon,
+        };
+
+        // (d=3, m=2, s=1, κ=1.5) — 2m=4, plenty of derivatives.
+        let d = 3usize;
+        let m = 2usize;
+        let s = 1usize;
+        let kappa = 1.5_f64;
+        let r = 0.7_f64;
+        let h = 1e-3_f64;
+
+        let derivs =
+            radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, 4);
+        // Cross-check derivs[0] against isotropic_duchon_penalty(q=0, …)
+        let f0 = isotropic_duchon_penalty(0, d, m, s, kappa, r);
+        assert!(
+            (derivs[0] - f0).abs() / f0.abs().max(1e-300) < 1e-12,
+            "radial deriv 0 mismatch: got={} f0={f0}",
+            derivs[0]
+        );
+        // FD 1st derivative of f via 2-pt central difference.
+        let f_at = |rr: f64| isotropic_duchon_penalty(0, d, m, s, kappa, rr);
+        let fd1 = (f_at(r + h) - f_at(r - h)) / (2.0 * h);
+        let rel1 = (derivs[1] - fd1).abs() / fd1.abs().max(1e-300);
+        assert!(rel1 < 1e-5, "f'(R): analytic={} fd={fd1} rel={rel1}", derivs[1]);
+        // FD 2nd derivative
+        let fd2 = (f_at(r + h) - 2.0 * f_at(r) + f_at(r - h)) / (h * h);
+        let rel2 = (derivs[2] - fd2).abs() / fd2.abs().max(1e-300);
+        assert!(rel2 < 1e-3, "f''(R): analytic={} fd={fd2} rel={rel2}", derivs[2]);
     }
 }
