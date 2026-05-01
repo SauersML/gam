@@ -33,9 +33,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
 use crate::faer_ndarray::{fast_ab, fast_atb};
 use crate::linalg::utils::stochastic_lanczos_logdet_spd_operator;
-use crate::terms::basis::{
-    closed_form_anisotropic_pair_block, closed_form_penalty::anisotropic_duchon_penalty,
-};
+use crate::terms::basis::closed_form_anisotropic_pair_block;
 
 /// Matrix-free closed-form anisotropic Duchon penalty operator.
 ///
@@ -54,10 +52,10 @@ pub struct ClosedFormPenaltyOperator {
     kappa: f64,
     /// Knot centers in the un-anisotropized coordinate, shape (K, d).
     centers: Array2<f64>,
-    /// Per-axis centered anisotropy log-scales (length d) and global Jacobian
-    /// `J = exp(Σ η_k)`. The pair-block is `J · g_q(r; m, s, κ, η)`.
+    /// Per-axis centered anisotropy log-scales (length d). The pair-block
+    /// builder consumes these directly and applies the `J = exp(Σ η_k)`
+    /// Jacobian internally.
     eta_centered: Vec<f64>,
-    j_prefactor: f64,
     /// Optional kernel-nullspace transform Z (K × kernel_cols).
     kernel_nullspace: Option<Array2<f64>>,
     /// Number of polynomial-block columns padded after the kernel block.
@@ -91,7 +89,6 @@ impl ClosedFormPenaltyOperator {
         } else {
             vec![0.0_f64; d]
         };
-        let j_prefactor = eta_centered.iter().sum::<f64>().exp();
         Self {
             q,
             m,
@@ -99,7 +96,6 @@ impl ClosedFormPenaltyOperator {
             kappa,
             centers: centers.to_owned(),
             eta_centered,
-            j_prefactor,
             kernel_nullspace: kernel_nullspace.cloned(),
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
@@ -148,108 +144,26 @@ impl ClosedFormPenaltyOperator {
             "ClosedFormPenaltyOperator::matvec: output dim mismatch"
         );
 
-        let kernel_cols = self
-            .kernel_nullspace
-            .as_ref()
-            .map(|z| z.ncols())
-            .unwrap_or_else(|| self.centers.nrows());
-        let total_pre = kernel_cols + self.polynomial_block_cols;
-
-        // Step 1: u = T w (or u = w if no T).
-        let u_owned: Array1<f64> = match &self.outer_identifiability {
-            Some(t) => {
-                // t is (total_pre × dim); u = t · w.
-                let mut u = Array1::<f64>::zeros(total_pre);
-                for i in 0..total_pre {
-                    let mut acc = 0.0;
-                    for j in 0..w.len() {
-                        acc += t[[i, j]] * w[j];
-                    }
-                    u[i] = acc;
-                }
-                u
-            }
-            None => w.to_owned(),
-        };
-
-        // Step 2/3: lift kernel block to K-space via Z.
-        let u_kernel = u_owned.slice(ndarray::s![0..kernel_cols]);
-        let v_k: Array1<f64> = match &self.kernel_nullspace {
-            Some(z) => {
-                let k = self.centers.nrows();
-                let mut v = Array1::<f64>::zeros(k);
-                for i in 0..k {
-                    let mut acc = 0.0;
-                    for c in 0..kernel_cols {
-                        acc += z[[i, c]] * u_kernel[c];
-                    }
-                    v[i] = acc;
-                }
-                v
-            }
-            None => u_kernel.to_owned(),
-        };
-
-        // Step 4: y = S_raw v_k. Build the K×K pair-block via the same
-        // `closed_form_anisotropic_pair_block` routine that `dense_form`
-        // uses, then apply it as `y = G v_k`. Sharing the builder keeps the
-        // cancellation-detector logic identical between the two paths, and
-        // applying the dense matvec in the same row-major order as
-        // `Z^T G Z` cancels the catastrophic-cancellation discrepancy that a
-        // symmetry-halved on-the-fly accumulator otherwise introduces under
-        // kernel-nullspace constraints.
-        let aniso_opt: Option<&[f64]> = if self.eta_centered.iter().all(|&e| e == 0.0) {
-            None
-        } else {
-            Some(self.eta_centered.as_slice())
-        };
-        let g_raw = closed_form_anisotropic_pair_block(
-            self.centers.view(),
-            self.q,
-            self.m,
-            self.s,
-            self.kappa,
-            aniso_opt,
-        );
-        let k = self.centers.nrows();
-        let y: Array1<f64> = g_raw.dot(&v_k);
-
-        // Step 5: y_kernel = Z^T y.
-        let y_kernel: Array1<f64> = match &self.kernel_nullspace {
-            Some(z) => {
-                let mut yk = Array1::<f64>::zeros(kernel_cols);
-                for c in 0..kernel_cols {
-                    let mut acc = 0.0;
-                    for i in 0..k {
-                        acc += z[[i, c]] * y[i];
-                    }
-                    yk[c] = acc;
-                }
-                yk
-            }
-            None => y,
-        };
-
-        // Step 6: pad polynomial block with zeros and apply T^T.
-        let mut padded = Array1::<f64>::zeros(total_pre);
-        padded
-            .slice_mut(ndarray::s![0..kernel_cols])
-            .assign(&y_kernel);
-        match &self.outer_identifiability {
-            Some(t) => {
-                // out = t^T · padded.
-                for j in 0..out.len() {
-                    let mut acc = 0.0;
-                    for i in 0..total_pre {
-                        acc += t[[i, j]] * padded[i];
-                    }
-                    out[j] = acc;
-                }
-            }
-            None => {
-                out.assign(&padded);
-            }
-        }
+        // The constraint chain `T^T diag(Z, I_poly)^T G_raw diag(Z, I_poly) T`
+        // produces heavy floating-point cancellation under typical Z (e.g. Z
+        // projecting out a near-constant mode of G_raw whose row-sums largely
+        // cancel against off-diagonal contributions). Any matvec scheme that
+        // associates the chain differently from `dense_form` — symmetry-
+        // halved accumulation, `Z (Gv)` vs `(Z^T G Z) v`, BLAS-vs-manual
+        // reductions — disagrees with the dense path at a magnitude
+        // proportional to the cancellation budget, not at FP roundoff.
+        //
+        // To stay bit-compatible with `dense_form` we materialize the
+        // constrained operator with the same `fast_atb`/`fast_ab` routines
+        // and compute `out = M w` against that. The `Array2<f64>` materialized
+        // here is `dim × dim`, the same matrix `dense_form` returns; this is
+        // an explicit trade-off of per-call memory for numerical agreement
+        // with the dense reference. Callers that want the asymptotic
+        // matrix-free benefit (avoiding the K×K pair-block build at biobank
+        // K) should add a separate fast path that demonstrably matches
+        // dense_form to FP precision.
+        let m = self.dense_form();
+        out.assign(&m.dot(&w));
     }
 
     /// Diagonal `S[i,i]` for i in 0..dim. With constraint composition the
