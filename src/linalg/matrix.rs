@@ -3024,6 +3024,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     /// Combined row chunk: [kernel_chunk | poly_chunk].
     fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return combined.slice(s![rows, ..]).to_owned();
+        }
         let chunk_n = rows.end - rows.start;
         let k_eff = self
             .constraint_transform
