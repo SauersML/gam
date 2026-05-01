@@ -1863,6 +1863,45 @@ where
             problem
         };
 
+        let prepass_seed: Option<Array1<f64>> = {
+            let bnds = reml_seed_config.bounds;
+            let (lo, hi) = if bnds.0 <= bnds.1 { bnds } else { (bnds.1, bnds.0) };
+            let risk_shift = match reml_seed_config.risk_profile {
+                SeedRiskProfile::Gaussian => 0.0,
+                SeedRiskProfile::GeneralizedLinear => 1.0,
+                SeedRiskProfile::Survival => 2.0,
+            };
+            let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
+                Array1::from_iter(h.iter().map(|&v| {
+                    let r = v.max(1e-12).ln();
+                    (r + risk_shift).clamp(lo, hi)
+                }))
+            } else {
+                Array1::from_elem(k, risk_shift.clamp(lo, hi))
+            };
+            let refined = crate::seeding::coarse_grid_log_lambda_seed(
+                &base,
+                (lo, hi),
+                k,
+                |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
+            );
+            if refined.iter().zip(base.iter()).any(|(&a, &b)| (a - b).abs() > 1e-12) {
+                log::info!(
+                    "[OUTER] standard REML coarse-grid pre-pass refined seed: {:?} -> {:?}",
+                    base.as_slice().unwrap_or(&[]),
+                    refined.as_slice().unwrap_or(&[])
+                );
+                Some(refined)
+            } else {
+                None
+            }
+        };
+        let problem = if let Some(seed) = prepass_seed {
+            problem.with_initial_rho(seed)
+        } else {
+            problem
+        };
+
         let mut obj = problem.build_objective_with_screening_proxy(
             &mut reml_state,
             |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
