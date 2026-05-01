@@ -321,10 +321,10 @@ def ece_randomized_quantile(y_true: typing.Any, y_prob: typing.Any, bin_counts: 
                 eces.append(abs(y.mean() - p.mean()))
                 continue
             eces.append(_ece_from_edges(y, p, edges))
-    eces = np.array(eces, dtype=float)
+    eces_arr = np.array(eces, dtype=float)
     return {
-        'ece_mean': float(np.mean(eces)),
-        'ece_std':  float(np.std(eces, ddof=1)) if len(eces) > 1 else 0.0,
+        'ece_mean': float(np.mean(eces_arr)),
+        'ece_std':  float(np.std(eces_arr, ddof=1)) if len(eces_arr) > 1 else 0.0,
         'details':  {'bin_counts': list(bin_counts), 'repeats': repeats}
     }
 
@@ -379,15 +379,16 @@ def ece_rq_shared_edges(preds_dict: typing.Any, y_true: typing.Any, bin_counts: 
     # Pool predictions (use clipped/cleaned predictions)
     pooled = np.concatenate([p for (_, p) in prepared.values()])
     
-    results, edge_sets = {}, []
+    results: dict[str, dict[str, float]] = {}
+    edge_sets: list[list[tuple[np.ndarray | None, int]]] = []
     
     # Pre-generate all edge sets from pooled predictions
     for M in bin_counts:
-        M_eff = min(M, max(1, N_min//max(1, min_per_bin)))
+        M_eff = int(min(M, max(1, N_min//max(1, min_per_bin))))
         if M_eff < 2:
             edge_sets.append([(None, M_eff)])  # marker for degenerate case
             continue
-        sets_M = []
+        sets_M: list[tuple[np.ndarray | None, int]] = []
         for _ in range(repeats):
             delta = rng.uniform(0, 1.0/M_eff)
             qs = (delta + np.arange(M_eff+1)/M_eff).clip(0,1)
@@ -406,10 +407,10 @@ def ece_rq_shared_edges(preds_dict: typing.Any, y_true: typing.Any, bin_counts: 
                     eces.append(abs(y_m.mean() - p_m.mean()))
                 else:
                     eces.append(_ece_from_edges(y_m, p_m, edges))
-        eces = np.array(eces, dtype=float)
+        eces_arr = np.array(eces, dtype=float)
         results[name] = {
-            'ece_mean': float(np.mean(eces)),
-            'ece_std': float(np.std(eces, ddof=1)) if len(eces) > 1 else 0.0
+            'ece_mean': float(np.mean(eces_arr)),
+            'ece_std': float(np.std(eces_arr, ddof=1)) if len(eces_arr) > 1 else 0.0
         }
     return results
 
@@ -436,7 +437,7 @@ def ece_rq_shared_edges_bootstrap_ci(models: typing.Any, y_true: typing.Any, n_b
     y = pd.Series(y_true).values
     preds = {k: pd.Series(v).values for k, v in models.items()}
     n = len(y)
-    stats = {k: [] for k in models}
+    stats: dict[str, list[float]] = {k: [] for k in models}
 
     for _ in range(n_boot):
         idx = rng.integers(0, n, n)  # Bootstrap sampling with replacement

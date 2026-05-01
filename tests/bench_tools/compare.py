@@ -95,7 +95,7 @@ def calibration_intercept_slope(y_true: typing.Any, y_prob: typing.Any) -> typin
     y, p = _prep(y_true, y_prob)
     logit_p = np.log(p/(1-p)).reshape(-1,1)  # logit transform
     try:
-        lr = LogisticRegression(penalty='none', solver='lbfgs', max_iter=1000).fit(logit_p, y)
+        lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000).fit(logit_p, y)
         slope = lr.coef_[0,0]
         intercept = lr.intercept_[0]
         return intercept, slope
@@ -227,10 +227,10 @@ def ece_randomized_quantile(y_true: typing.Any, y_prob: typing.Any,
                 ece += w * abs(acc - conf)
             eces.append(ece)
 
-    eces = np.array(eces, dtype=float)
+    eces_arr = np.array(eces, dtype=float)
     return {
-        "ece_mean": float(np.mean(eces)),
-        "ece_std": float(np.std(eces, ddof=1)) if len(eces) > 1 else 0.0,
+        "ece_mean": float(np.mean(eces_arr)),
+        "ece_std": float(np.std(eces_arr, ddof=1)) if len(eces_arr) > 1 else 0.0,
         "n": n,
         "details": {"bin_counts": list(bin_counts), "repeats": repeats}
     }
@@ -289,13 +289,13 @@ def bootstrap_metric_ci(y_true: typing.Any, y_prob: typing.Any, metric_fn: typin
         except Exception:
             continue
             
-    stats = np.array(stats, dtype=float)
-    stats = stats[~np.isnan(stats)]  # Remove NaNs
+    stats_arr = np.array(stats, dtype=float)
+    stats_arr = stats_arr[~np.isnan(stats_arr)]  # Remove NaNs
     
-    if len(stats) == 0:
+    if len(stats_arr) == 0:
         return (np.nan, np.nan, np.nan)
         
-    lo, hi = np.quantile(stats, [alpha/2, 1-alpha/2])
+    lo, hi = np.quantile(stats_arr, [alpha/2, 1-alpha/2])
     return (metric_fn(y, p), lo, hi)
 
 
@@ -762,7 +762,7 @@ def plot_calibrated_vs_uncalibrated(df: typing.Any) -> None:
         cbar2 = fig.colorbar(scatter2, ax=ax2, shrink=0.8)
         cbar2.set_label('Density', rotation=270, labelpad=20)
     
-    fig.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust for the suptitle
+    fig.tight_layout(rect=(0, 0, 1, 0.95))  # Adjust for the suptitle
     plt.show()
 
 def plot_model_surfaces(test_df: typing.Any) -> typing.Any:
@@ -816,8 +816,8 @@ def plot_model_surfaces(test_df: typing.Any) -> typing.Any:
     run_r_inference(grid_csv_path, r_preds_path)
     run_rust_inference(grid_csv_path, grid_tsv_path, rust_preds_path)
 
-    r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
-    rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
+    r_preds = np.asarray(pd.read_csv(r_preds_path)['r_prediction'], dtype=float).reshape(GRID_POINTS, GRID_POINTS)
+    rust_preds = np.asarray(pd.read_csv(rust_preds_path)['rust_prediction'], dtype=float).reshape(GRID_POINTS, GRID_POINTS)
     
     # D. Create plot layout
     print("\n--- Generating Model Surface Plots ---")
