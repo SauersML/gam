@@ -1,4 +1,5 @@
 use super::*;
+use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::logit_inverse_link_jet5;
 use ndarray::ShapeBuilder;
 
@@ -698,13 +699,7 @@ impl FirthDenseOperator {
         //   Bᵀ P B      via apply_hadamard_gram_to_matrix(Z, K_r, K_r, B)
         //   Bᵀ P_u B    via apply_hadamard_gram_to_matrix(Z, K_r, A_u, B), then *(-2)
         // where P = M⊙M and P_u = -2(M⊙N_u), but M/N_u are never formed explicitly.
-        for i in 0..out.nrows() {
-            for j in 0..i {
-                let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
-                out[[i, j]] = avg;
-                out[[j, i]] = avg;
-            }
-        }
+        enforce_symmetry(&mut out);
         out
     }
 

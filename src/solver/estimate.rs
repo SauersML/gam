@@ -2472,13 +2472,7 @@ where
             (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
                 let mut corrected = base_cov.clone();
                 corrected += corr;
-                for i in 0..corrected.nrows() {
-                    for j in (i + 1)..corrected.ncols() {
-                        let avg = 0.5 * (corrected[[i, j]] + corrected[[j, i]]);
-                        corrected[[i, j]] = avg;
-                        corrected[[j, i]] = avg;
-                    }
-                }
+                enforce_symmetry(&mut corrected);
                 Some(corrected)
             }
             (Some(_), Some(corr)) => {

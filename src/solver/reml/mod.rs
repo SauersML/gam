@@ -233,6 +233,7 @@ mod tests {
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
+    use crate::linalg::utils::enforce_symmetry;
     use crate::pirls::PirlsCoordinateFrame;
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
@@ -524,13 +525,7 @@ mod tests {
                 h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
             }
         }
-        for i in 0..n_dirs {
-            for j in 0..i {
-                let avg = 0.5 * (h_ttfd[[i, j]] + h_ttfd[[j, i]]);
-                h_ttfd[[i, j]] = avg;
-                h_ttfd[[j, i]] = avg;
-            }
-        }
+        enforce_symmetry(&mut h_ttfd);
         h_ttfd
     }
 
