@@ -562,7 +562,7 @@ class FuzzScenario:
     double_penalty: bool
     noise_sd: float
     noise_kind: str
-    smooth_kinds: list
+    smooth_kinds: list[typing.Any]
     x_distribution: str
     basis_type: str            # ps, tps, duchon
     collinear_strength: float
@@ -1148,9 +1148,9 @@ def _compute_metrics(family: typing.Any, y_test: typing.Any, y_train: typing.Any
 
 @dataclass
 class FuzzResult:
-    scenario: dict
-    rust: dict
-    mgcv: dict
+    scenario: dict[str, typing.Any]
+    rust: dict[str, typing.Any]
+    mgcv: dict[str, typing.Any]
     primary_gap: Optional[float] = None
     primary_metric: Optional[str] = None
 
@@ -1278,8 +1278,8 @@ def compute_ci_gates(
     results: typing.Any,
     requested_trials: int,
     skipped_count: int = 0,
-    baseline: Optional[dict] = None,
-) -> dict:
+    baseline: Optional[dict[str, typing.Any]] = None,
+) -> dict[str, typing.Any]:
     """Evaluate the four (or five, with baseline) regression gates.
 
     Returns a dict with:
@@ -1289,7 +1289,7 @@ def compute_ci_gates(
     valid_trials = [r for r in results if r.primary_gap is not None]
     valid_count = len(valid_trials)
 
-    gate_failures: list[dict] = []
+    gate_failures: list[dict[str, typing.Any]] = []
 
     # Gate 1: per-trial huge-gap regressions.
     big_gap_offenders = []
@@ -1310,7 +1310,7 @@ def compute_ci_gates(
         })
 
     # Gate 2: cohort median gap regressions.
-    cohorts: dict = {}
+    cohorts: dict[str, typing.Any] = {}
     for r in valid_trials:
         key = (
             r.scenario.get("family", "?"),
