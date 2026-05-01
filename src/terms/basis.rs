@@ -8073,21 +8073,25 @@ pub fn operator_penalty_candidates_closed_form(
     // Per-q Duchon convergence regime: closed-form Lebesgue kernel matrix is
     // PSD only when both UV `4(m+s) > d + 2q` and IR `d + 2q > 4m` hold,
     // AND the partial-fraction expansion in `isotropic_duchon_penalty`
-    // requires `2m - q ≥ 1` (asserted at basis.rs:16953). Outside this
-    // regime the analytic radial-derivative finite-part value can produce
-    // non-PSD matrices (rank=0 / negative eigenvalues) or panic outright,
-    // so fall back to per-q collocation D_q^T D_q. Hybrid κ>0 has a
-    // strictly larger PSD-convergence region than pure-Riesz but we keep
-    // the conservative shared predicate to avoid silently shipping non-PSD
-    // penalties.
+    // requires `2m - q ≥ 1` (asserted at basis.rs:16953). Additionally, the
+    // log-Riesz branch in `riesz_kernel_value` (basis.rs:16876) — which
+    // fires whenever d is even and d/2 ≤ 2m — produces a kernel with
+    // log(R) terms whose analytic radial derivatives have signs that can
+    // make the q≥1 closed-form pair-block non-PSD at the boundary. The
+    // permanent fix lands with closed-form-math-fix's Letter A log-case
+    // implementation; until then we route log-Riesz configs to collocation.
+    // Outside this regime the analytic radial-derivative finite-part value
+    // can produce non-PSD matrices (rank=0 / negative eigenvalues) or
+    // panic outright, so fall back to per-q collocation D_q^T D_q.
     let m = p_order;
     let s = s_order;
     let d = centers.ncols();
+    let log_riesz_present = d % 2 == 0 && d / 2 <= 2 * m;
     let closed_form_converges = |q: usize| -> bool {
         let four_ms = 4 * (m + s);
         let dp2q = d + 2 * q;
         let four_m = 4 * m;
-        four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1
+        four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1 && !log_riesz_present
     };
 
     let s1_raw = if closed_form_converges(1) {
@@ -8244,12 +8248,18 @@ pub fn operator_penalty_candidates_closed_form_pure(
     let s = s_order;
     // Convergence predicate also requires `isotropic_duchon_penalty`'s
     // partial-fraction precondition `2m ≥ q + 1` (basis.rs:16953); without
-    // it, closed-form panics on configs like m=1, q=2.
+    // it, closed-form panics on configs like m=1, q=2. Log-Riesz boundary
+    // (d even and d/2 ≤ 2m) is also routed to collocation — the analytic
+    // radial-derivative form's q≥1 finite-part values can be non-PSD near
+    // that boundary; closed-form-math-fix lands the log-case Letter A
+    // implementation that makes this path PSD-correct, after which the
+    // log-Riesz gate term can be removed.
+    let log_riesz_present = d % 2 == 0 && d / 2 <= 2 * m;
     let closed_form_converges = |q: usize| -> bool {
         let four_ms = 4 * (m + s);
         let dp2q = d + 2 * q;
         let four_m = 4 * m;
-        four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1
+        four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1 && !log_riesz_present
     };
 
     let s1_raw = if closed_form_converges(1) {
