@@ -12,7 +12,8 @@ use crate::basis::{
     build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivative,
     build_thin_plate_basis_log_kappasecond_derivative, center_strategy_is_auto,
     center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
-    estimate_penalty_nullity, filter_active_penalty_candidates, initial_aniso_contrasts,
+    estimate_penalty_nullity, filter_active_penalty_candidates,
+    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
     orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
     points_in_aniso_y_space, select_centers_by_strategy,
 };
@@ -2958,7 +2959,7 @@ fn build_tensor_bspline_basis(
     }
 
     let (penalties, nullspace_dims, penaltyinfo, ops) =
-        crate::terms::basis::filter_active_penalty_candidates_with_ops(candidates)?;
+        filter_active_penalty_candidates_with_ops(candidates)?;
     let design = if let Some(dense_design) = dense_design {
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense_design))
     } else {

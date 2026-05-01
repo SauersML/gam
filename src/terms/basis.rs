@@ -1996,9 +1996,12 @@ pub struct BasisBuildResult {
     /// bases. When present, downstream code can keep the design operator-backed
     /// instead of forcing a fully materialized `n x prod(q_j)` block.
     pub kronecker_factored: Option<KroneckerFactoredBasis>,
-    /// Per-active-penalty operator handles (parallel to `penalties`). Each entry
-    /// is `Some(op)` when the closed-form factory emitted an op-form penalty
-    /// bit-equivalent to the dense matrix; `None` for ordinary dense penalties.
+    /// Per-active-penalty operator handles (parallel to `penalties`). Each
+    /// entry is `Some(op)` when the closed-form factory emitted an op-form
+    /// penalty bit-equivalent to the dense matrix, `None` for ordinary dense
+    /// penalties. Downstream consumers route through the `Some` entries to
+    /// avoid materializing dense `p x p` Grams in PCG-against-implicit-H,
+    /// SLQ log-det, and Hutchinson trace estimation.
     pub ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
 }
 
@@ -2012,8 +2015,15 @@ impl std::fmt::Debug for BasisBuildResult {
             .field("metadata", &self.metadata)
             .field("kronecker_factored", &self.kronecker_factored)
             .field(
-                "ops_present",
-                &self.ops.iter().map(|o| o.is_some()).collect::<Vec<_>>(),
+                "ops",
+                &format_args!(
+                    "[{}]",
+                    self.ops
+                        .iter()
+                        .map(|o| if o.is_some() { "Some" } else { "None" })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )
             .finish()
     }
