@@ -7984,12 +7984,14 @@ pub fn closed_form_anisotropic_pair_block(
             let i = ((-1.0 + (1.0 + 8.0 * idx as f64).sqrt()) * 0.5).floor() as usize;
             let i = if i * (i + 1) / 2 > idx { i - 1 } else { i };
             let j = idx - i * (i + 1) / 2;
-            let mut r_buf = vec![0.0_f64; d];
+            let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+            r_buf.resize(d, 0.0);
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             if i == j {
-                let mut r_eps_buf = vec![0.0_f64; d];
+                let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+                r_eps_buf.resize(d, 0.0);
                 if d > 0 {
                     r_eps_buf[0] = r_eps * eta_raw[0].exp();
                 }
@@ -8064,7 +8066,8 @@ pub fn closed_form_anisotropic_pair_block_pure(
             let i = ((-1.0 + (1.0 + 8.0 * idx as f64).sqrt()) * 0.5).floor() as usize;
             let i = if i * (i + 1) / 2 > idx { i - 1 } else { i };
             let j = idx - i * (i + 1) / 2;
-            let mut r_buf = vec![0.0_f64; d];
+            let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+            r_buf.resize(d, 0.0);
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
@@ -8088,7 +8091,8 @@ pub fn closed_form_anisotropic_pair_block_pure(
                 {
                     j_prefactor * closed
                 } else {
-                    let mut r_eps_buf = vec![0.0_f64; d];
+                    let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+                    r_eps_buf.resize(d, 0.0);
                     if d > 0 {
                         r_eps_buf[0] = r_eps * eta_slice[0].exp();
                     }
