@@ -21685,15 +21685,29 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_duchon_closed_form_pair_block_finite_in_converging_regime() {
+    fn test_pure_duchon_closed_form_pair_block_finite_in_converging_regime_q1() {
         // Pure-Duchon (κ=0) closed-form pair-block should be finite,
         // symmetric, and non-zero for (m, s, d, q) inside the Duchon
         // convergence regime: 4(m+s) > d + 2q AND d + 2q > 4m.
         //
-        // Picks d=4, m=1, s=3, q=2:
-        //   UV: 4·4 = 16 > 4+4 = 8 ✓
-        //   IR: 4+4 = 8 > 4·1 = 4 ✓
-        // Also satisfies D2 collocation: 2(p+s) = 8 > d+2 = 6 ✓
+        // Closed-form-Zero (m=1) restricts q ≤ 2m-1 = 1 by the
+        // partial-fraction precondition `2m - q ≥ 1`. Stiffness (q=2)
+        // would require m≥2 but option-3 gates closed-form OFF for
+        // Linear+ nullspaces, so q=2 is outside the closed-form-Zero
+        // domain and is exercised only via the collocation fallback in
+        // `operator_penalty_candidates_closed_form_pure` (covered by
+        // `test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime`).
+        //
+        // This test exercises q=1 (tension), the maximal closed-form q
+        // for m=1: d=4, m=1, s=2, q=1.
+        //   UV: 4(m+s) = 12 > d+2q = 6 ✓
+        //   IR: d+2q = 6 > 4m = 4 ✓
+        //   Partial fraction: 2m-q = 1 ✓
+        //   Pure-Duchon CPD adequacy: 2s = 4 < d = 4 fails by equality.
+        // The pair-block primitive doesn't enforce CPD adequacy itself
+        // (that's a separate `validate_duchon_kernel_orders` step), so
+        // we can still call it directly to verify the radial form is
+        // well-defined and produces a finite, symmetric, non-zero matrix.
         use ndarray::Array2 as A2;
         let k = 32usize;
         let d = 4usize;
@@ -21709,11 +21723,11 @@ mod tests {
             }
         }
         let p_order = 1usize;
-        let s_order = 3usize;
+        let s_order = 2usize;
 
         let g = closed_form_anisotropic_pair_block_pure(
             centers.view(),
-            2,
+            1,
             p_order,
             s_order,
             None,
