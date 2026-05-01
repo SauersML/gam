@@ -56,6 +56,23 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
+// Phase-2 outer-derivative gate
+// ---------------------------------------------------------------------------
+
+/// Returns `true` while the SCOP-spline reparameterization's analytic outer
+/// derivative paths are still being rederived. CTN's directional Hessian, dH /
+/// d²H matrix-free operators, ψ first-order terms, ψ second-order terms, and
+/// the ψ-Hessian operator all currently encode the linear-h' formulas; under
+/// SCOP-CTN h(y,x) = b(x) + Σ_k γ_k(x)² I_k(y), so h' is quadratic in β and
+/// every chain-rule leg gains a `2 γ_k(x)` factor. Until the rederivations
+/// land in Phase 2, these hooks short-circuit to `Ok(None)` and the unified
+/// outer evaluator falls back to BFGS+BfgsApprox per work_cost_routing.md.
+#[inline]
+fn scop_phase2_outer_pending() -> bool {
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
