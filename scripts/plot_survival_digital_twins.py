@@ -4,6 +4,7 @@ import typing
 
 import argparse
 import math
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -284,7 +285,7 @@ def _run_cmd(cmd: list[str], cwd: Path) -> None:
 
 
 def _ensure_rust_binary() -> Path:
-    env_raw = str(subprocess.os.environ.get("BENCH_GAM_BIN", "")).strip()
+    env_raw = str(os.environ.get("BENCH_GAM_BIN", "")).strip()
     if env_raw:
         env_bin = Path(env_raw).expanduser()
         if env_bin.exists() and env_bin.is_file():
@@ -896,7 +897,7 @@ def generate_bmi_sweep_mp4_preview(
         )
 
         means_raw = {f: float(raw_df[f].mean()) for f in ds.features}
-        frame_payload = []
+        frame_payload: list[tuple[int, float, float, typing.Any, np.ndarray, np.ndarray]] = []
         for i, bmi in enumerate(bmi_values):
             profile_raw = dict(means_raw)
             profile_raw["bmi"] = float(bmi)
@@ -938,14 +939,14 @@ def generate_bmi_sweep_mp4_preview(
         y_lo = max(0.0, min_surv - 0.03)
         y_hi = min(1.02, max_surv + 0.02)
 
-        for i, bmi, percentile, color, surv, sim_paths in frame_payload:
-            frame_path = frames_dir / f"frame_{i:03d}.png"
+        for frame_i, frame_bmi, percentile, color, surv, sim_paths in frame_payload:
+            frame_path = frames_dir / f"frame_{frame_i:03d}.png"
             _plot_bmi_sweep_frame(
                 times,
                 surv,
                 sim_paths,
                 color,
-                bmi,
+                frame_bmi,
                 percentile,
                 y_lo,
                 y_hi,
