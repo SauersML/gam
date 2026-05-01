@@ -39,7 +39,7 @@
 //!       Scales as iterations × per-matvec cost. Crossover with dense
 //!       Cholesky expected somewhere in p ∈ [1000, 2000] depending on
 //!       conditioning of the synthetic Hessian; this bench is the source
-//!       of truth for setting `closed_form_operator_threshold()` in
+//!       of truth for setting `CLOSED_FORM_OPERATOR_THRESHOLD` in
 //!       production.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -236,7 +236,7 @@ fn bench_operator_matvec(c: &mut Criterion) {
 /// faster than dense when p > some threshold (empirically ~1000 here),
 /// because PCG iterations × matvec eventually overtakes O(p³) Cholesky.
 /// Below threshold dense wins. Reading these numbers tells us where to set
-/// `closed_form_operator_threshold()` in production.
+/// `CLOSED_FORM_OPERATOR_THRESHOLD` in production.
 fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
     use faer::Side;
     use gam::linalg::faer_ndarray::FaerCholesky;
