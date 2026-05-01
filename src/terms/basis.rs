@@ -17390,20 +17390,38 @@ pub mod closed_form_penalty {
         // and we keep the legacy leading-term fallback (the full log
         // finite-part series is left for a follow-up).
         let limit = riesz_kernel_value(d, a + b, r);
+        let kappa_r = kappa * r;
+        let x_taylor = kappa_r * kappa_r;
+        // Math team Letter B regime gate: when x = (κR)² ≲ 1.5 the
+        // finite-part Taylor / ₁F₂ series is the math-team-recommended
+        // primary path — its leading term is R_N^d(R) (the κ → 0 Riesz
+        // limit, faithfully captured), and higher-order κ² corrections
+        // are summed exactly without the κ^{-2(N-j)} cancellation that
+        // ruins the literal partial-fraction sum at small κR. For
+        // x ≥ 1.5 the κ^{-2k} factors in the partial-fraction expansion
+        // are O(1) so cancellation is benign and the partial-fraction
+        // sum stands.
+        //
+        // For ODD d the Riesz blocks R_{N+n}^d are pure powers and the
+        // Taylor recurrence is exact. For EVEN d log-Riesz blocks appear
+        // (the full log finite-part series is left for a follow-up); we
+        // keep a safety-net leading-term band-aid for small κR there
+        // when the cancellation condition number χ = max|term|/|sum|
+        // signals real precision loss.
         let chi = if sum.abs() > 0.0 {
             max_term / sum.abs()
         } else {
             f64::INFINITY
         };
-        let kappa_r = kappa * r;
-        let cancellation_lost = chi > 1.0e8;
-        if cancellation_lost {
+        if x_taylor < 1.5 {
             if d % 2 == 1 {
                 if let Some(tay) = finite_part_duchon_taylor_odd_d(d, a, b, kappa, r) {
                     return tay;
                 }
             }
-            if kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
+            // Even d: only swap to the leading-term band-aid when
+            // partial-fraction cancellation has actually dominated.
+            if chi > 1.0e8 && kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
                 return limit;
             }
         }
