@@ -8126,6 +8126,18 @@ pub fn closed_form_anisotropic_pair_block(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             if i == j {
+                // Odd-d hybrid R=0 closed form (math team Letter A §3 +
+                // analytic Taylor at the origin via partial-fraction blocks):
+                // every Matérn block has half-integer ν, so the r^{2q} Taylor
+                // coefficient is purely polynomial-in-r (no ln(r)). When the
+                // smoothness gate 2(p+s) > d+2q holds, f^(2q)(0) is exact and
+                // the (-Δ_B)^q chain at R=0 collapses to the symmetric form
+                //   q=0: f(0); q=1: -s_1·f''(0); q=2: (s_1²+2s_2)·f''''(0)/3.
+                // Even-d falls back to ε-displacement (would need Hadamard
+                // finite-part with digamma terms — deferred).
+                if let Some(closed) = hybrid_self_pair_value_odd_d(q, m, s, d, kappa, eta_raw) {
+                    return j_prefactor * closed;
+                }
                 let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
                 r_eps_buf.resize(d, 0.0);
                 if d > 0 {
@@ -10593,8 +10605,10 @@ fn duchon_matern_kernel_general_from_distance(
         coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         &coeffs_local
     };
-    if r == 0.0 {
-        return duchon_hybrid_kernel_collision_value(
+    let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale.max(1e-8);
+    if r <= collision_taylor_radius {
+        return duchon_hybrid_kernel_near_collision_value(
+            r,
             length_scale,
             p_order,
             s_order,
@@ -10661,6 +10675,57 @@ fn duchon_hybrid_kernel_collision_value(
     if !value.is_finite() {
         return Err(BasisError::InvalidInput(format!(
             "non-finite Duchon hybrid diagonal value for p={p_order}, s={s_order}, d={k_dim}"
+        )));
+    }
+    Ok(value)
+}
+
+fn duchon_hybrid_kernel_near_collision_value(
+    r: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<f64, BasisError> {
+    let mut value =
+        duchon_hybrid_kernel_collision_value(length_scale, p_order, s_order, k_dim, coeffs)?;
+    if r == 0.0 {
+        return Ok(value);
+    }
+
+    // Radial Taylor expansion about the center collision:
+    //
+    //   phi(r) = phi(0)
+    //          + phi''(0) r^2 / 2
+    //          + phi''''(0) r^4 / 24
+    //          + phi''''''(0) r^6 / 720 + ...
+    //
+    // Odd terms vanish for an isotropic radial kernel. A finite 2q-th
+    // derivative at zero requires spectral smoothness 2(p+s) > d + 2q.
+    // Terms whose collision derivative does not exist are omitted; this is
+    // still strictly better than evaluating the raw partial-fraction sum at a
+    // tiny nonzero radius, where large singular components cancel only after
+    // losing many digits.
+    let smoothness_order = 2 * (p_order + s_order);
+    let r2 = r * r;
+    if smoothness_order > k_dim + 2 {
+        let (phi_rr, _, _) =
+            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
+        value += 0.5 * phi_rr * r2;
+    }
+    if smoothness_order > k_dim + 4 {
+        let phi_rrrr = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)?;
+        value += (1.0 / 24.0) * phi_rrrr * r2 * r2;
+    }
+    if smoothness_order > k_dim + 6 {
+        let phi_rrrrrr =
+            duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, coeffs)?;
+        value += (1.0 / 720.0) * phi_rrrrrr * r2 * r2 * r2;
+    }
+    if !value.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Duchon hybrid near-collision value at r={r}, p={p_order}, s={s_order}, d={k_dim}"
         )));
     }
     Ok(value)
@@ -14541,6 +14606,90 @@ fn duchon_phi_even_derivative_collision(
     // φ^{(2j)}(0) = (2j)! · a_{2j}
     let factorial_2j = gamma_lanczos((2 * j + 1) as f64);
     Ok(factorial_2j * total_pure)
+}
+
+/// Closed-form self-pair (R = 0) value of the anisotropic hybrid-Duchon
+/// pair-block kernel `g_q^aniso(0; m, s, κ, η)` for ODD `d` and `q ∈ {0, 1, 2}`.
+///
+/// Math: at R = 0 the anisotropic Laplacian invariants `u_1`, `u_2` vanish, so
+/// the radial-derivative chain in `anisotropic_laplacian_of_radial_*` collapses
+/// to the symmetric form
+///
+///   q = 0:  g_0(0) = f(0)
+///   q = 1:  g_1(0) = -s_1 · f''(0)
+///   q = 2:  g_2(0) =  (s_1² + 2 s_2) · f''''(0) / 3
+///
+/// where `s_1 = Σ exp(-2η_a)`, `s_2 = Σ exp(-4η_a)`, and `f^(2q)(0)` is the
+/// even-order Taylor derivative of the hybrid radial kernel
+/// `f(R) = isotropic_duchon_penalty(0; d, m=p, s=s, κ, R)` at the origin.
+///
+/// For odd `d` (half-integer ν in every Matérn block) the partial-fraction
+/// Taylor coefficients of every block are pure powers of `r` with no `ln(r)`
+/// piece, so `duchon_phi_even_derivative_collision` returns `f^(2q)(0)`
+/// exactly. This replaces the ε-displacement diagonal regularization with the
+/// analytic finite-part value whenever it is well-defined.
+///
+/// Returns `None` when:
+/// - `d` is even (caller falls back to ε-displacement; even-d would need a
+///   Hadamard finite-part with digamma terms),
+/// - `q ∉ {0, 1, 2}`,
+/// - the smoothness gate `2(p_order + s_order) > d + 2q` fails (kernel is
+///   borderline / divergent at R = 0; the analytic Taylor coefficient is not
+///   guaranteed to converge), or
+/// - `eta.len() != d`.
+fn hybrid_self_pair_value_odd_d(
+    q: usize,
+    p_order: usize,
+    s_order: usize,
+    d: usize,
+    kappa: f64,
+    eta: &[f64],
+) -> Option<f64> {
+    if d % 2 != 1 {
+        return None;
+    }
+    if q > 2 {
+        return None;
+    }
+    if eta.len() != d {
+        return None;
+    }
+    if !(kappa > 0.0) || !kappa.is_finite() {
+        return None;
+    }
+    // Smoothness gate: 2(p+s) > d + 2q ensures the radial kernel is C^{2q}
+    // at the origin, so f^(2q)(0) exists as a finite Taylor coefficient.
+    let smoothness_order = 2 * (p_order + s_order);
+    let required = d + 2 * q;
+    if smoothness_order <= required {
+        return None;
+    }
+
+    let length_scale = 1.0 / kappa;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let f_2q_0 =
+        duchon_phi_even_derivative_collision(length_scale, p_order, s_order, d, &coeffs, q).ok()?;
+
+    if !f_2q_0.is_finite() {
+        return None;
+    }
+
+    // s_1 = Σ exp(-2 η_a),  s_2 = Σ exp(-4 η_a).
+    let mut s_1 = 0.0_f64;
+    let mut s_2 = 0.0_f64;
+    for &e in eta {
+        let bb = (-2.0 * e).exp();
+        s_1 += bb;
+        s_2 += bb * bb;
+    }
+
+    let value = match q {
+        0 => f_2q_0,
+        1 => -s_1 * f_2q_0,
+        2 => (f_2q_0 / 3.0) * (s_1 * s_1 + 2.0 * s_2),
+        _ => unreachable!(),
+    };
+    Some(value)
 }
 
 /// Assemble φ''''(0) from the partial-fraction blocks using analytic Taylor
@@ -29157,6 +29306,69 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_hybrid_r_zero_odd_d_matches_richardson_extrapolation() {
+        // Verify the analytic R=0 closed form `hybrid_self_pair_value_odd_d`
+        // matches the ε→0 limit of the existing ε-displacement diagonal path
+        // (anisotropic_duchon_penalty_radial along axis 0) within 1e-9.
+        // Richardson extrapolation: sample at ε and ε/2, extrapolate to 0;
+        // for analytic kernels the leading correction is O(ε^2), so the
+        // (4·v(ε/2) − v(ε)) / 3 estimator removes it.
+        use super::closed_form_penalty::anisotropic_duchon_penalty_radial;
+
+        // (q, d∈{3,5}, p_order=m, s_order=s, κ, eta-pattern):
+        // smoothness gate 2(p+s) > d+2q must hold for the closed form to fire.
+        let cases: &[(usize, usize, usize, usize, f64)] = &[
+            // d=3
+            (0, 3, 2, 1, 0.7),
+            (1, 3, 2, 1, 0.9),
+            (2, 3, 3, 1, 1.1),
+            (1, 3, 2, 2, 0.5),
+            (2, 3, 3, 2, 0.8),
+            // d=5
+            (0, 5, 3, 1, 0.6),
+            (1, 5, 4, 1, 1.2),
+            (2, 5, 4, 2, 0.9),
+        ];
+
+        for &(q, d, m, s, kappa) in cases {
+            // Symmetric, mildly anisotropic eta.
+            let eta: Vec<f64> = (0..d)
+                .map(|a| 0.15 * ((a as f64) - 0.5 * (d as f64 - 1.0)))
+                .collect();
+
+            let closed = super::hybrid_self_pair_value_odd_d(q, m, s, d, kappa, &eta)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "hybrid_self_pair_value_odd_d returned None: q={q} d={d} m={m} s={s} κ={kappa}"
+                    )
+                });
+
+            // Build r = (ε, 0, …, 0). The radial form depends on the
+            // Mahalanobis radius R = ε·exp(-η_0), so any ε small enough that
+            // the ln(r)/regular-power split is dominated by leading ε^0 works.
+            // We choose ε ~ 1e-2 / κ and ε/2 to do a single Richardson step.
+            let eps = 1.0e-2_f64 / kappa.max(1e-3);
+            let mut r1 = vec![0.0_f64; d];
+            r1[0] = eps;
+            let mut r2 = vec![0.0_f64; d];
+            r2[0] = 0.5 * eps;
+
+            let v1 = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r1);
+            let v2 = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r2);
+            // Leading correction is O(ε^2): extrapolant = (4 v(ε/2) − v(ε)) / 3
+            let extrap = (4.0 * v2 - v1) / 3.0;
+
+            let denom = closed.abs().max(extrap.abs()).max(1e-12);
+            let rel = (closed - extrap).abs() / denom;
+            assert!(
+                rel < 1e-6,
+                "hybrid R=0 closed-form vs Richardson: q={q} d={d} m={m} s={s} κ={kappa} \
+                 closed={closed:.6e} extrap={extrap:.6e} v(ε)={v1:.6e} v(ε/2)={v2:.6e} rel={rel:.3e}"
+            );
         }
     }
 }
