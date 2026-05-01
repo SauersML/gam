@@ -2951,6 +2951,7 @@ fn build_tensor_bspline_basis(
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale * c_new,
                     kronecker_factors: candidate.kronecker_factors.clone(),
+                    op: candidate.op.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
