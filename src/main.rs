@@ -570,6 +570,7 @@ const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
 const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
 
 fn main() {
+    gam::init_parallelism();
     if let Err(e) = run() {
         eprintln!("error: {e}");
         if let Some(advice) = e.advice() {
