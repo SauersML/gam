@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -20,7 +21,7 @@ def pairwise_dist(x: np.ndarray) -> np.ndarray:
     s = np.sum(x * x, axis=1, keepdims=True)
     d2 = s + s.T - 2.0 * (x @ x.T)
     np.maximum(d2, 0.0, out=d2)
-    return np.sqrt(d2)
+    return np.asarray(np.sqrt(d2), dtype=float)
 
 
 def path_length(path: np.ndarray, d: np.ndarray) -> float:
@@ -45,7 +46,7 @@ def nearest_neighbor_path(d: np.ndarray, start: int) -> np.ndarray:
 def two_opt_open(path: np.ndarray, d: np.ndarray, max_passes: int = 20) -> np.ndarray:
     n = len(path)
     if n < 4:
-        return path.copy()
+        return np.asarray(path.copy(), dtype=int)
     p = path.copy()
     for _ in range(max_passes):
         improved = False
@@ -60,7 +61,7 @@ def two_opt_open(path: np.ndarray, d: np.ndarray, max_passes: int = 20) -> np.nd
                     improved = True
         if not improved:
             break
-    return p
+    return np.asarray(p, dtype=int)
 
 
 def best_order(d: np.ndarray) -> np.ndarray:
@@ -79,7 +80,7 @@ def best_order(d: np.ndarray) -> np.ndarray:
 
 
 def draw_table_text(
-    ax: plt.Axes, ordered_names: list[str], prevalence: np.ndarray, n_cols: int = 3
+    ax: Axes, ordered_names: list[str], prevalence: np.ndarray, n_cols: int = 3
 ) -> None:
     lines = [
         f"{i+1:>3}. {name:<30} prev={prevalence[i]:.3f}"
