@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import math
 import os
@@ -372,7 +373,7 @@ def preflight_survival_prediction(
 def load_config(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     try:
-        return json.loads(text)
+        return dict(json.loads(text))
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             f"{path} must contain JSON-compatible YAML so this runner can parse it without external dependencies: {exc}"
@@ -545,9 +546,9 @@ def _attach_column(rows: list[dict[str, str]], column: str, values: list[float])
         raise RuntimeError(
             f"cannot attach {column}: {len(values)} values for {len(rows)} rows"
         )
-    out = []
+    out: list[dict[str, Any]] = []
     for row, value in zip(rows, values):
-        enriched = dict(row)
+        enriched: dict[str, Any] = dict(row)
         enriched[column] = float(value)
         out.append(enriched)
     return out
@@ -715,7 +716,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
 
 def logistic(x: np.ndarray) -> np.ndarray:
     x_clip = np.clip(np.asarray(x, dtype=float), -40.0, 40.0)
-    return 1.0 / (1.0 + np.exp(-x_clip))
+    return np.asarray(1.0 / (1.0 + np.exp(-x_clip)), dtype=float)
 
 
 def standardize(x: np.ndarray) -> np.ndarray:
@@ -860,7 +861,8 @@ def _repeat_survival_curve(curve: np.ndarray, n_rows: int) -> np.ndarray:
 
 def _lifelines_concordance(event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray) -> float:
     try:
-        from lifelines.utils import concordance_index
+        lifelines_utils: Any = importlib.import_module("lifelines.utils")
+        concordance_index = lifelines_utils.concordance_index
     except ModuleNotFoundError as exc:
         raise RuntimeError("lifelines is required for survival scoring") from exc
     return float(concordance_index(event_times, -np.asarray(risk_score, dtype=float), event_observed=events))
@@ -868,7 +870,8 @@ def _lifelines_concordance(event_times: np.ndarray, risk_score: np.ndarray, even
 
 def _survival_null_curve(train_times: np.ndarray, train_events: np.ndarray, grid: np.ndarray) -> np.ndarray:
     try:
-        from lifelines import KaplanMeierFitter
+        lifelines: Any = importlib.import_module("lifelines")
+        KaplanMeierFitter = lifelines.KaplanMeierFitter
     except ModuleNotFoundError as exc:
         raise RuntimeError("lifelines is required for survival scoring") from exc
     kmf = KaplanMeierFitter()
@@ -888,7 +891,9 @@ def calibrated_survival_matrix(
 ) -> np.ndarray:
     try:
         import pandas as pd
-        from lifelines import CoxPHFitter, KaplanMeierFitter
+        lifelines: Any = importlib.import_module("lifelines")
+        CoxPHFitter = lifelines.CoxPHFitter
+        KaplanMeierFitter = lifelines.KaplanMeierFitter
     except ModuleNotFoundError as exc:
         raise RuntimeError("pandas and lifelines are required for survival scoring") from exc
     tr_times = np.asarray(train_times, dtype=float)
@@ -1114,7 +1119,7 @@ def _survival_probability_column(rows: list[dict[str, str]], *, method_name: str
         raise RuntimeError(
             f"{method_name} survival prediction column '{key}' is outside [0,1]"
         )
-    return np.clip(values, 0.0, 1.0)
+    return np.asarray(np.clip(values, 0.0, 1.0), dtype=float)
 
 
 def predict_native_survival_matrix(
@@ -1365,7 +1370,7 @@ def build_pc_means(templates: list[dict[str, Any]]) -> dict[str, np.ndarray]:
 def sample_covariance(pc_means: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     jitter = rng.normal(scale=0.06, size=(16, 16))
     a = np.eye(16) * 0.55 + (jitter @ jitter.T) / 16.0
-    return a
+    return np.asarray(a, dtype=float)
 
 
 def disease_probability(lat: np.ndarray, lon: np.ndarray, pcs: np.ndarray, pgs: np.ndarray, age: np.ndarray, sex: np.ndarray) -> np.ndarray:
@@ -2438,7 +2443,8 @@ def plot_aggregate(results: list[dict[str, Any]], prep_dir: Path, out_dir: Path)
                 q = np.quantile(risk, [0.0, 0.33, 0.66, 1.0])
                 groups = np.digitize(risk, q[1:-1], right=True)
                 try:
-                    from lifelines import KaplanMeierFitter
+                    lifelines: Any = importlib.import_module("lifelines")
+                    KaplanMeierFitter = lifelines.KaplanMeierFitter
                 except ModuleNotFoundError as exc:
                     raise RuntimeError("lifelines is required for survival plotting") from exc
                 kmf = KaplanMeierFitter()

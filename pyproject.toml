@@ -34,6 +34,20 @@ numpy = ["numpy>=1.26"]
 pandas = ["pandas>=2.0", "pyarrow>=14"]
 plot = ["matplotlib>=3.8"]
 sklearn = ["scikit-learn>=1.4", "numpy>=1.26"]
+type = [
+  "mypy>=1.18",
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "pandas-stubs",
+  "pyarrow>=14",
+  "polars>=1",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.4",
+  "scikit-learn-stubs",
+  "scipy-stubs",
+  "pytest>=8",
+  "types-requests",
+]
 all = [
   "numpy>=1.26",
   "pandas>=2.0",
@@ -46,3 +60,12 @@ all = [
 manifest-path = "crates/gam-pyffi/Cargo.toml"
 module-name = "gam._rust"
 python-source = "python"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+mypy_path = "python"
+files = ["python", "tests", "scripts", "bench"]
+exclude = [
+  "^bench/\\.venv/",
+]
