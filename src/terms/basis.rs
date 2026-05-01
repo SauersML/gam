@@ -5832,20 +5832,22 @@ pub fn build_thin_plate_basiswithworkspace(
             &internal_kernel_transform,
             spec.double_penalty,
         )?;
+        let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
-            matrix: penalty_bending,
+            matrix: penalty_bending_norm,
             nullspace_dim_hint: poly_cols,
             source: PenaltySource::Primary,
-            normalization_scale: 1.0,
+            normalization_scale: c_bending,
             kronecker_factors: None,
             op: None,
         }];
         if let Some(penalty_ridge) = penalty_ridge {
+            let (penalty_ridge_norm, c_ridge) = normalize_penalty(&penalty_ridge);
             candidates.push(PenaltyCandidate {
-                matrix: penalty_ridge,
+                matrix: penalty_ridge_norm,
                 nullspace_dim_hint: 0,
                 source: PenaltySource::DoublePenaltyNullspace,
-                normalization_scale: 1.0,
+                normalization_scale: c_ridge,
                 kronecker_factors: None,
                 op: None,
             });
@@ -5871,20 +5873,22 @@ pub fn build_thin_plate_basiswithworkspace(
         } else {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(tps.basis.clone()))
         };
+        let (penalty_bending_norm, c_bending) = normalize_penalty(&tps.penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
-            matrix: tps.penalty_bending.clone(),
+            matrix: penalty_bending_norm,
             nullspace_dim_hint: tps.num_polynomial_basis,
             source: PenaltySource::Primary,
-            normalization_scale: 1.0,
+            normalization_scale: c_bending,
             kronecker_factors: None,
             op: None,
         }];
         if spec.double_penalty {
+            let (penalty_ridge_norm, c_ridge) = normalize_penalty(&tps.penalty_ridge);
             candidates.push(PenaltyCandidate {
-                matrix: tps.penalty_ridge.clone(),
+                matrix: penalty_ridge_norm,
                 nullspace_dim_hint: 0,
                 source: PenaltySource::DoublePenaltyNullspace,
-                normalization_scale: 1.0,
+                normalization_scale: c_ridge,
                 kronecker_factors: None,
                 op: None,
             });

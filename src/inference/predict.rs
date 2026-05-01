@@ -5766,4 +5766,292 @@ mod tests {
         let c = q[[1, 2]];
         array![[1.0, -a, a * c - b], [0.0, 1.0, -c], [0.0, 0.0, 1.0]]
     }
+
+    // ─── Coverage correction unit tests (Task #9) ─────────────────────────
+
+    /// Build a minimal Gaussian-identity fit (intercept-only design) with a
+    /// non-zero variance on β so prediction returns a non-degenerate
+    /// interval. Used to feed corrections without coupling to a fitter.
+    fn coverage_correction_fixture() -> (UnifiedFitResult, Array2<f64>, Array1<f64>, Array1<f64>) {
+        let beta = array![1.0];
+        let cov = array![[0.25_f64]];
+        let fit = test_fit_with_bias_correction(beta.clone(), cov.clone(), None);
+        // Single batch row with x=1 (intercept).
+        let x = array![[1.0_f64]];
+        let offset = array![0.0_f64];
+        (fit, x, beta, offset)
+    }
+
+    fn corrections_baseline_options() -> PredictUncertaintyOptions {
+        PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            apply_bias_correction: false,
+            // All four corrections OFF for the regression baseline.
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        }
+    }
+
+    #[test]
+    fn coverage_corrections_all_off_matches_legacy() {
+        // Regression baseline: with every correction OFF the output must
+        // match the un-corrected interval exactly. Locks the legacy
+        // semantics so we can detect accidental drift in the hot path.
+        let (fit, x, beta, offset) = coverage_correction_fixture();
+        let opts = corrections_baseline_options();
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &opts,
+        )
+        .expect("prediction baseline");
+
+        let z = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
+        let expected_se = (0.25_f64).sqrt();
+        assert!((pred.eta_standard_error[0] - expected_se).abs() <= 1e-12);
+        let expected_lower = 1.0 - z * expected_se;
+        let expected_upper = 1.0 + z * expected_se;
+        assert!(
+            (pred.eta_lower[0] - expected_lower).abs() <= 1e-12,
+            "baseline lower drifted: got {}, expected {}",
+            pred.eta_lower[0],
+            expected_lower
+        );
+        assert!(
+            (pred.eta_upper[0] - expected_upper).abs() <= 1e-12,
+            "baseline upper drifted: got {}, expected {}",
+            pred.eta_upper[0],
+            expected_upper
+        );
+    }
+
+    #[test]
+    fn edgeworth_one_sided_makes_interval_asymmetric_with_positive_skew() {
+        let (fit, x, beta, offset) = coverage_correction_fixture();
+        let mut opts = corrections_baseline_options();
+        opts.edgeworth_one_sided = true;
+        opts.eta_skewness_for_corrections = Some(array![0.6_f64]);
+
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &opts,
+        )
+        .expect("edgeworth prediction");
+
+        // Cornish–Fisher with κ₃ = 0.6, z ≈ 1.96: bump = (z²−1)·0.6/6 > 0
+        // ⇒ z_upper > z_central > z_lower ⇒ upper tail moves further right
+        // and the lower tail moves *closer* to η̂. Equivalently, the
+        // (η_upper − η̂) > (η̂ − η_lower).
+        let dist_upper = pred.eta_upper[0] - 1.0;
+        let dist_lower = 1.0 - pred.eta_lower[0];
+        assert!(
+            dist_upper > dist_lower + 1e-9,
+            "positive skew should push upper tail further than lower: \
+             upper-dist={dist_upper}, lower-dist={dist_lower}"
+        );
+        // Skew = 0 must reduce to the symmetric interval (parity check).
+        opts.eta_skewness_for_corrections = Some(array![0.0_f64]);
+        let pred_sym = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &opts,
+        )
+        .expect("edgeworth zero-skew prediction");
+        let sym_upper = pred_sym.eta_upper[0] - 1.0;
+        let sym_lower = 1.0 - pred_sym.eta_lower[0];
+        assert!((sym_upper - sym_lower).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn boundary_correction_widens_interval_near_edge() {
+        // Two query rows on a single axis with training support [0, 10].
+        // Row 0 lies in the interior (x=5 ⇒ d_edge=5, well outside the
+        // boundary band β·range=0.05·10=0.5). Row 1 is near the edge
+        // (x=9.9 ⇒ d_edge=0.1, inside the band) and must receive a
+        // strictly wider interval than the baseline.
+        let beta = array![1.0_f64];
+        let cov = array![[0.25_f64]];
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, None);
+        let x = array![[1.0_f64], [1.0_f64]];
+        let offset = array![0.0_f64, 0.0_f64];
+
+        let mut opts = corrections_baseline_options();
+        opts.boundary_correction = true;
+        opts.predictor_x_for_corrections = Some(array![[5.0_f64], [9.9_f64]]);
+        opts.training_support = Some(TrainingSupport {
+            axis_min: array![0.0_f64],
+            axis_max: array![10.0_f64],
+        });
+
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &opts,
+        )
+        .expect("boundary-corrected prediction");
+
+        let baseline_se = (0.25_f64).sqrt();
+        // Interior row (x=5) is outside the boundary band ⇒ no inflation.
+        assert!(
+            (pred.eta_standard_error[0] - baseline_se).abs() <= 1e-12,
+            "interior row must not be inflated: {} vs {}",
+            pred.eta_standard_error[0],
+            baseline_se
+        );
+        // Near-edge row must have strictly higher SE.
+        assert!(
+            pred.eta_standard_error[1] > baseline_se + 1e-9,
+            "near-edge row must be inflated: got {}, baseline {}",
+            pred.eta_standard_error[1],
+            baseline_se
+        );
+        // Direction: interval must be wider, not narrower.
+        let width0 = pred.eta_upper[0] - pred.eta_lower[0];
+        let width1 = pred.eta_upper[1] - pred.eta_lower[1];
+        assert!(
+            width1 > width0 + 1e-9,
+            "near-edge interval not wider: width0={width0}, width1={width1}"
+        );
+    }
+
+    #[test]
+    fn ood_inflation_widens_interval_outside_support() {
+        let beta = array![1.0_f64];
+        let cov = array![[0.25_f64]];
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, None);
+        let x = array![[1.0_f64], [1.0_f64]];
+        let offset = array![0.0_f64, 0.0_f64];
+
+        // Row 0: in-support (x=5). Row 1: well past the upper bound (x=15
+        // outside [0, 10]).
+        let mut opts = corrections_baseline_options();
+        opts.ood_inflation = true;
+        opts.predictor_x_for_corrections = Some(array![[5.0_f64], [15.0_f64]]);
+        opts.training_support = Some(TrainingSupport {
+            axis_min: array![0.0_f64],
+            axis_max: array![10.0_f64],
+        });
+
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &opts,
+        )
+        .expect("ood-inflated prediction");
+
+        let baseline_se = (0.25_f64).sqrt();
+        assert!((pred.eta_standard_error[0] - baseline_se).abs() <= 1e-12);
+        // Excess fraction = (15-10)/10 = 0.5 ⇒ factor = 1 + γ·0.25 with
+        // default γ = 1 ⇒ 1.25 ⇒ se = sqrt(0.25·1.25) = sqrt(0.3125).
+        let expected = (0.25_f64 * 1.25).sqrt();
+        assert!(
+            (pred.eta_standard_error[1] - expected).abs() <= 1e-12,
+            "ood inflation factor wrong: got {}, expected {}",
+            pred.eta_standard_error[1],
+            expected
+        );
+        assert!(pred.eta_standard_error[1] > baseline_se);
+    }
+
+    #[test]
+    fn multi_point_joint_widens_interval_relative_to_per_row() {
+        let beta = array![1.0_f64];
+        let cov = array![[0.25_f64]];
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, None);
+        // Five identical query rows; joint over m=5 must widen each
+        // interval relative to the per-row baseline, by the Bonferroni z.
+        let x = array![[1.0_f64]; 5];
+        let offset = Array1::zeros(5);
+        let mut opts = corrections_baseline_options();
+        opts.multi_point_joint = true;
+        // Don't set joint_query_count so the helper uses batch size = 5.
+
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &opts,
+        )
+        .expect("joint-adjusted prediction");
+
+        let z_per_row = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
+        let z_joint =
+            standard_normal_quantile(0.5 + 0.5 * (1.0 - 0.05_f64 / 5.0)).unwrap();
+        assert!(
+            z_joint > z_per_row + 1e-6,
+            "Bonferroni z must exceed per-row z: joint={z_joint}, per-row={z_per_row}"
+        );
+        let baseline_se = (0.25_f64).sqrt();
+        // Width per row should be 2·z_joint·se.
+        for i in 0..5 {
+            let width = pred.eta_upper[i] - pred.eta_lower[i];
+            let expected = 2.0 * z_joint * baseline_se;
+            assert!(
+                (width - expected).abs() <= 1e-12,
+                "joint row {i} width mismatch: got {width}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn edgeworth_helper_zero_skew_returns_central_z() {
+        let z = 1.96_f64;
+        let adj = edgeworth_one_sided_quantile(z, 0.0);
+        assert!((adj.z_lower - z).abs() <= 1e-12);
+        assert!((adj.z_upper - z).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn boundary_helper_returns_one_in_interior() {
+        let f = boundary_variance_inflation_factor(
+            array![5.0_f64].view(),
+            array![0.0_f64].view(),
+            array![10.0_f64].view(),
+            0.25,
+            0.05,
+        );
+        assert!((f - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn ood_helper_returns_one_inside_box() {
+        let f = ood_variance_inflation_factor(
+            array![5.0_f64].view(),
+            array![0.0_f64].view(),
+            array![10.0_f64].view(),
+            1.0,
+        );
+        assert!((f - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn multi_point_joint_z_passthrough_at_m_one() {
+        let z1 = multi_point_joint_z(0.95, 1).unwrap();
+        let z_baseline = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
+        assert!((z1 - z_baseline).abs() <= 1e-12);
+    }
 }
