@@ -429,6 +429,10 @@ impl ParametricColumnConditioning {
                 .beta_covariance_corrected
                 .as_ref()
                 .map(se_from_covariance);
+            inf.bias_correction_beta = inf
+                .bias_correction_beta
+                .take()
+                .map(|b| self.backtransform_beta(&b));
             inf.smoothing_correction = inf
                 .smoothing_correction
                 .take()
@@ -2271,6 +2275,7 @@ where
     let mut beta_standard_errors = None;
     let mut beta_covariance_corrected = None;
     let mut beta_standard_errors_corrected = None;
+    let mut bias_correction_beta = None;
 
     if opts.compute_inference {
         // EDF by block using stabilized H and penalty roots in transformed basis.
@@ -2349,6 +2354,43 @@ where
             let p_k = cp.rank() as f64;
             let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
             edf_by_block[kk] = edf_k;
+        }
+
+        // O(n⁻¹) frequentist bias correction vector b̂ = H⁻¹ S(λ̂) β̂.
+        // Computed in transformed PIRLS basis (where the factorization above lives)
+        // and then mapped to the original coefficient basis via Qs.
+        // Frequentist bias of the linear predictor at x is -s_*(x)^T b̂; the
+        // corrected predictor is η̂_BC(x) = η̂(x) + s_*(x)^T b̂.
+        let beta_t = pirls_res.beta_transformed.as_ref();
+        let mut s_beta_t = Array1::<f64>::zeros(p_dim);
+        for (kk, cp) in pirls_res
+            .reparam_result
+            .canonical_transformed
+            .iter()
+            .enumerate()
+        {
+            // S_k β: only the col_range of beta couples through local penalty.
+            let r = &cp.col_range;
+            let local = cp.local_ref();
+            let beta_block = beta_t.slice(ndarray::s![r.clone()]);
+            let local_beta = local.dot(&beta_block);
+            let lam_k = lambdas[kk];
+            let mut acc = s_beta_t.slice_mut(ndarray::s![r.clone()]);
+            acc.scaled_add(lam_k, &local_beta);
+        }
+        match factor.solve(&s_beta_t) {
+            Ok(b_t) => {
+                let qs = &pirls_res.reparam_result.qs;
+                let b_orig = qs.dot(&b_t);
+                if b_orig.iter().all(|v| v.is_finite()) {
+                    bias_correction_beta = Some(b_orig);
+                } else {
+                    log::warn!("bias-correction vector contained non-finite entries; skipping");
+                }
+            }
+            Err(e) => {
+                log::warn!("bias-correction solve failed: {e}");
+            }
         }
     }
 
@@ -2463,6 +2505,7 @@ where
         beta_standard_errors,
         beta_covariance_corrected,
         beta_standard_errors_corrected,
+        bias_correction_beta,
     });
 
     let pirls_status = pirls_res.status;
@@ -2652,6 +2695,11 @@ pub struct FitInference {
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
+    /// O(n⁻¹) frequentist bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
+    /// original (untransformed) coefficient basis. Predictions apply
+    /// η̂_BC(x) = η̂(x) + s_*(x)^T b̂ to remove first-order shrinkage bias.
+    #[serde(default)]
+    pub bias_correction_beta: Option<Array1<f64>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3043,6 +3091,12 @@ impl FitInference {
         }
         if let Some(v) = self.beta_standard_errors.as_ref() {
             validate_all_finite_estimation("fit_result.beta_standard_errors", v.iter().copied())?;
+        }
+        if let Some(v) = self.bias_correction_beta.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.bias_correction_beta",
+                v.iter().copied(),
+            )?;
         }
         if let Some(v) = self.beta_standard_errors_corrected.as_ref() {
             validate_all_finite_estimation(
@@ -3496,6 +3550,14 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inf| inf.beta_standard_errors_corrected.as_ref())
+    }
+
+    /// Get the O(n⁻¹) bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
+    /// original coefficient basis, if available.
+    pub fn bias_correction_beta(&self) -> Option<&Array1<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.bias_correction_beta.as_ref())
     }
 
     /// Get the penalized Hessian if available.
@@ -4649,6 +4711,7 @@ mod estimate_policy_tests {
                 beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
                 beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
+                bias_correction_beta: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: Some(FitGeometry {

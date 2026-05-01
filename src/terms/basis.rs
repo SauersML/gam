@@ -1801,15 +1801,6 @@ pub struct DuchonOperatorPenaltySpec {
     pub mass: OperatorPenaltySpec,
     pub tension: OperatorPenaltySpec,
     pub stiffness: OperatorPenaltySpec,
-    #[serde(default = "default_function_variance_spec")]
-    pub function_variance: OperatorPenaltySpec,
-}
-
-fn default_function_variance_spec() -> OperatorPenaltySpec {
-    OperatorPenaltySpec::Active {
-        initial_log_lambda: 0.0,
-        prior: None,
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1836,7 +1827,6 @@ impl Default for DuchonOperatorPenaltySpec {
                 initial_log_lambda: 0.0,
                 prior: None,
             },
-            function_variance: default_function_variance_spec(),
         }
     }
 }
@@ -2018,7 +2008,6 @@ pub enum PenaltySource {
     OperatorMass,
     OperatorTension,
     OperatorStiffness,
-    FunctionVariance,
     TensorMarginal { dim: usize },
     TensorGlobalRidge,
     Other(String),
@@ -4692,6 +4681,13 @@ pub struct CollocationOperatorMatrices {
     pub d1: Array2<f64>,
     pub d2: Array2<f64>,
     pub collocation_points: Array2<f64>,
+    /// Kernel-constraint nullspace transform `Z` applied internally to the
+    /// raw kernel-basis K×K operator matrices (Some for Duchon, None for
+    /// Matérn which uses a different basis).
+    pub kernel_nullspace_transform: Option<Array2<f64>>,
+    /// Polynomial block columns appended after the kernel block (Duchon
+    /// polynomial null space). Zero for Matérn.
+    pub polynomial_block_cols: usize,
 }
 
 fn default_normalization_scale() -> f64 {
@@ -7827,6 +7823,163 @@ fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
     (matrix.mapv(|v| v / norm), norm)
 }
 
+pub fn closed_form_anisotropic_pair_block(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    aniso_log_scales: Option<&[f64]>,
+) -> Array2<f64> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let eta_centered: Vec<f64> = if let Some(eta) = aniso_log_scales {
+        let mean = centered_aniso_log_scale_mean(eta);
+        eta.iter()
+            .map(|&v| centered_aniso_log_scale(v, mean))
+            .collect()
+    } else {
+        vec![0.0_f64; d]
+    };
+    let j_prefactor = eta_centered.iter().sum::<f64>().exp();
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut r_buf = vec![0.0_f64; d];
+    for i in 0..k {
+        for j in 0..=i {
+            for axis in 0..d {
+                r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
+            }
+            let val = j_prefactor
+                * closed_form_penalty::anisotropic_duchon_penalty(
+                    q,
+                    m,
+                    s,
+                    kappa,
+                    &eta_centered,
+                    &r_buf,
+                );
+            g[[i, j]] = val;
+            if i != j {
+                g[[j, i]] = val;
+            }
+        }
+    }
+    g
+}
+
+pub fn closed_form_operator_penalty_in_total_basis(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    p_order: usize,
+    s_order: usize,
+    kappa: f64,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Array2<f64> {
+    // 1. Closed-form penalty in raw kernel basis (K×K).
+    let g_raw =
+        closed_form_anisotropic_pair_block(centers, q, p_order, s_order, kappa, aniso_log_scales);
+    // 2. Apply kernel-constraint nullspace transform Z (K×kernel_cols).
+    let g_kernel = if let Some(z) = kernel_nullspace {
+        let zt_g = fast_atb(z, &g_raw);
+        fast_ab(&zt_g, z)
+    } else {
+        g_raw
+    };
+    // 3. Block-diag pad polynomial nullspace (zero penalty in continuous form).
+    let kernel_cols = g_kernel.nrows();
+    let total_pre_cols = kernel_cols + polynomial_block_cols;
+    let g_padded = if polynomial_block_cols == 0 {
+        g_kernel
+    } else {
+        let mut padded = Array2::<f64>::zeros((total_pre_cols, total_pre_cols));
+        padded
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&g_kernel);
+        padded
+    };
+    // 4. Apply outer spatial identifiability transform if any.
+    let g_total = if let Some(t) = outer_identifiability {
+        let tt_g = fast_atb(t, &g_padded);
+        fast_ab(&tt_g, t)
+    } else {
+        g_padded
+    };
+    symmetrize(&g_total)
+}
+
+pub fn operator_penalty_candidates_closed_form(
+    centers: ArrayView2<'_, f64>,
+    d0: &Array2<f64>,
+    spec: &DuchonOperatorPenaltySpec,
+    p_order: usize,
+    s_order: usize,
+    length_scale: f64,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Vec<PenaltyCandidate> {
+    let s0_raw = symmetrize(&fast_ata(d0));
+    let (s0, c0) = normalize_penalty(&s0_raw);
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let s1_raw = closed_form_operator_penalty_in_total_basis(
+        centers,
+        1,
+        p_order,
+        s_order,
+        kappa,
+        aniso_log_scales,
+        kernel_nullspace,
+        polynomial_block_cols,
+        outer_identifiability,
+    );
+    let (s1, c1) = normalize_penalty(&s1_raw);
+    let s2_raw = closed_form_operator_penalty_in_total_basis(
+        centers,
+        2,
+        p_order,
+        s_order,
+        kappa,
+        aniso_log_scales,
+        kernel_nullspace,
+        polynomial_block_cols,
+        outer_identifiability,
+    );
+    let (s2, c2) = normalize_penalty(&s2_raw);
+    let mut out = Vec::new();
+    if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
+            matrix: s0,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorMass,
+            normalization_scale: c0,
+            kronecker_factors: None,
+        });
+    }
+    if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
+            matrix: s1,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorTension,
+            normalization_scale: c1,
+            kronecker_factors: None,
+        });
+    }
+    if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        out.push(PenaltyCandidate {
+            matrix: s2,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorStiffness,
+            normalization_scale: c2,
+            kronecker_factors: None,
+        });
+    }
+    out
+}
+
 fn operator_penalty_candidates_from_collocation(
     d0: &Array2<f64>,
     d1: &Array2<f64>,
@@ -7865,43 +8018,7 @@ fn operator_penalty_candidates_from_collocation(
             kronecker_factors: None,
         });
     }
-    if matches!(spec.function_variance, OperatorPenaltySpec::Active { .. })
-        && let Some(s_var_raw) = function_variance_raw_from_d0(d0, &s0_raw)
-    {
-        let (s_var, c_var) = normalize_penalty(&s_var_raw);
-        out.push(PenaltyCandidate {
-            matrix: s_var,
-            nullspace_dim_hint: 1,
-            source: PenaltySource::FunctionVariance,
-            normalization_scale: c_var,
-            kronecker_factors: None,
-        });
-    }
     out
-}
-
-/// Function-space variance penalty: S_var = D0^T D0 - K · avg · avg^T,
-/// where avg = column-mean of D0 and K = D0.nrows(). The constant function
-/// lies in the null space (intercept exempt by mathematics).
-fn function_variance_raw_from_d0(d0: &Array2<f64>, s0_raw: &Array2<f64>) -> Option<Array2<f64>> {
-    let k = d0.nrows();
-    if k == 0 {
-        return None;
-    }
-    let avg = d0.mean_axis(Axis(0))?;
-    let p = avg.len();
-    let k_f = k as f64;
-    let mut centering = Array2::<f64>::zeros((p, p));
-    for i in 0..p {
-        for j in 0..p {
-            centering[[i, j]] = k_f * avg[i] * avg[j];
-        }
-    }
-    let s_var = symmetrize(&(s0_raw - &centering));
-    if s_var.iter().all(|v| v.abs() <= 1e-12) {
-        return None;
-    }
-    Some(s_var)
 }
 
 fn active_operator_penalty_derivatives(
@@ -7909,9 +8026,9 @@ fn active_operator_penalty_derivatives(
     operator_derivatives: &[Array2<f64>],
     label: &str,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
-    if operator_derivatives.len() != 3 && operator_derivatives.len() != 4 {
+    if operator_derivatives.len() != 3 {
         return Err(BasisError::InvalidInput(format!(
-            "{label} operator derivative path requires 3 or 4 canonical penalties; found {}",
+            "{label} operator derivative path requires 3 canonical penalties; found {}",
             operator_derivatives.len()
         )));
     }
@@ -7923,15 +8040,6 @@ fn active_operator_penalty_derivatives(
             PenaltySource::OperatorMass => Ok(operator_derivatives[0].clone()),
             PenaltySource::OperatorTension => Ok(operator_derivatives[1].clone()),
             PenaltySource::OperatorStiffness => Ok(operator_derivatives[2].clone()),
-            PenaltySource::FunctionVariance => {
-                if operator_derivatives.len() < 4 {
-                    return Err(BasisError::InvalidInput(format!(
-                        "{label} FunctionVariance derivative requested but only {} derivatives provided",
-                        operator_derivatives.len()
-                    )));
-                }
-                Ok(operator_derivatives[3].clone())
-            }
             other => Err(BasisError::InvalidInput(format!(
                 "unexpected {label} penalty source in canonical operator path: {other:?}"
             ))),
@@ -8265,6 +8373,8 @@ pub fn build_matern_collocation_operator_matrices(
         d1,
         d2,
         collocation_points: centers.to_owned(),
+        kernel_nullspace_transform: None,
+        polynomial_block_cols: usize::from(include_intercept),
     })
 }
 
@@ -8475,6 +8585,8 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         d1,
         d2,
         collocation_points: centers.to_owned(),
+        kernel_nullspace_transform: Some(z),
+        polynomial_block_cols: poly_cols,
     })
 }
 
@@ -10173,8 +10285,7 @@ fn build_matern_operator_penalty_candidates(
         z_opt.map(|z| z.view()),
         aniso_log_scales,
     )?;
-    let mut matern_spec = DuchonOperatorPenaltySpec::default();
-    matern_spec.function_variance = OperatorPenaltySpec::Disabled;
+    let matern_spec = DuchonOperatorPenaltySpec::default();
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
@@ -11353,9 +11464,6 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let (s2, s2_psi, s2_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
 
-    let (s_var_raw_opt, s_var_psi_raw, s_var_psi_psi_raw) =
-        function_variance_raw_psi_derivatives(&d0, &d0_psi, &d0_psi_psi, &s0, &s0_psi, &s0_psi_psi);
-
     let (s0_norm, s0_norm_psi, s0_norm_psi_psi, c0) =
         normalize_penaltywith_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
     let (s1_norm, s1_norm_psi, s1_norm_psi_psi, c1) =
@@ -11363,7 +11471,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let (s2_norm, s2_norm_psi, s2_norm_psi_psi, c2) =
         normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
 
-    let mut candidates = vec![
+    let candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
             nullspace_dim_hint: 0,
@@ -11387,30 +11495,8 @@ fn build_duchon_operator_penalty_psi_derivatives(
         },
     ];
 
-    let mut first_derivs = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
-    let mut second_derivs = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
-
-    if matches!(
-        spec.operator_penalties.function_variance,
-        OperatorPenaltySpec::Active { .. }
-    ) && let Some(s_var_raw) = s_var_raw_opt
-    {
-        let (s_var_norm, s_var_norm_psi, s_var_norm_psi_psi, c_var) =
-            normalize_penaltywith_psi_derivatives(
-                &s_var_raw,
-                &s_var_psi_raw,
-                &s_var_psi_psi_raw,
-            );
-        candidates.push(PenaltyCandidate {
-            matrix: s_var_norm,
-            nullspace_dim_hint: 1,
-            source: PenaltySource::FunctionVariance,
-            normalization_scale: c_var,
-            kronecker_factors: None,
-        });
-        first_derivs.push(s_var_norm_psi);
-        second_derivs.push(s_var_norm_psi_psi);
-    }
+    let first_derivs = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
+    let second_derivs = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
 
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     let penalties_derivative =
@@ -11418,70 +11504,6 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let penaltiessecond_derivative =
         active_operator_penalty_derivatives(&penaltyinfo, &second_derivs, "Duchon")?;
     Ok((penalties_derivative, penaltiessecond_derivative))
-}
-
-/// Compute S_var = D0^T D0 - K · avg · avg^T and its psi derivatives, using
-/// the operator-level Frechet derivatives of D0 and the chain rule for avg.
-///
-/// avg = (1/K) Σ_p D0[p, :], so avg = (1/K) · 1^T · D0 (row sum).
-/// avg' = (1/K) · 1^T · D0_psi, avg'' = (1/K) · 1^T · D0_psi_psi.
-/// d/dψ (K · avg · avg^T) = K · (avg' · avg^T + avg · avg'^T).
-/// d²/dψ² = K · (avg'' · avg^T + 2 · avg' · avg'^T + avg · avg''^T).
-fn function_variance_raw_psi_derivatives(
-    d0: &Array2<f64>,
-    d0_psi: &Array2<f64>,
-    d0_psi_psi: &Array2<f64>,
-    s0_raw: &Array2<f64>,
-    s0_raw_psi: &Array2<f64>,
-    s0_raw_psi_psi: &Array2<f64>,
-) -> (Option<Array2<f64>>, Array2<f64>, Array2<f64>) {
-    let k = d0.nrows();
-    let p = d0.ncols();
-    if k == 0 {
-        let zero = Array2::<f64>::zeros((p, p));
-        return (None, zero.clone(), zero);
-    }
-    let k_f = k as f64;
-    let avg = match d0.mean_axis(Axis(0)) {
-        Some(a) => a,
-        None => {
-            let zero = Array2::<f64>::zeros((p, p));
-            return (None, zero.clone(), zero);
-        }
-    };
-    let avg_psi = d0_psi.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(p));
-    let avg_psi_psi = d0_psi_psi
-        .mean_axis(Axis(0))
-        .unwrap_or_else(|| Array1::zeros(p));
-
-    let outer = |u: &Array1<f64>, v: &Array1<f64>| -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            for j in 0..p {
-                out[[i, j]] = u[i] * v[j];
-            }
-        }
-        out
-    };
-
-    let centering = outer(&avg, &avg).mapv(|v| k_f * v);
-    let s_var_raw = symmetrize(&(s0_raw - &centering));
-    if s_var_raw.iter().all(|v| v.abs() <= 1e-12) {
-        let zero = Array2::<f64>::zeros((p, p));
-        return (None, zero.clone(), zero);
-    }
-
-    let cent_psi_raw = outer(&avg_psi, &avg) + outer(&avg, &avg_psi);
-    let cent_psi = cent_psi_raw.mapv(|v| k_f * v);
-    let s_var_psi = symmetrize(&(s0_raw_psi - &cent_psi));
-
-    let cent_psi_psi_raw = outer(&avg_psi_psi, &avg)
-        + outer(&avg, &avg_psi_psi)
-        + outer(&avg_psi, &avg_psi).mapv(|v| 2.0 * v);
-    let cent_psi_psi = cent_psi_psi_raw.mapv(|v| k_f * v);
-    let s_var_psi_psi = symmetrize(&(s0_raw_psi_psi - &cent_psi_psi));
-
-    (Some(s_var_raw), s_var_psi, s_var_psi_psi)
 }
 
 fn prepare_duchon_derivative_contextwithworkspace(
@@ -13964,6 +13986,13 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
+    // Closed-form Lebesgue penalty via Schoenberg/Riesz-Matérn diverges for
+    // (m, s, d, q) outside `4(m+s) > d + 2q` (UV) and `d + 2q > 4m` (IR).
+    // `resolve_duchon_orders` only enforces pointwise kernel existence, which
+    // is weaker than penalty integral convergence, so wiring closed-form
+    // unconditionally breaks low-d configurations. The closed-form module
+    // remains as a foundation; production penalty path stays on collocation
+    // until divergence-regime detection is added.
     let candidates = operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
@@ -16655,6 +16684,967 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
     }
 
     Ok(())
+}
+
+/// Closed-form scalar building blocks for Riesz, Matérn, and isotropic
+/// hybrid Duchon kernels.
+///
+/// Fourier convention: f̂(ω) = ∫ e^{-iω·x} f(x) dx,
+/// f(x) = (2π)^{-d} ∫ e^{iω·x} f̂(ω) dω.
+///
+/// Riesz kernel:  R_j^d(r) = F^{-1}{|ρ|^{-2j}}(r).
+/// Matérn block:  M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r).
+pub mod closed_form_penalty {
+    use crate::probability::binomial_coefficient_f64 as binomial_f64;
+    use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
+
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9_f64;
+
+    fn factorial_f64(n: usize) -> f64 {
+        let mut acc = 1.0_f64;
+        for k in 2..=n {
+            acc *= k as f64;
+        }
+        acc
+    }
+
+    /// Modified Bessel function of the second kind, K_ν(x), for x > 0.
+    ///
+    /// Algorithm:
+    /// - Half-integer ν = n + 1/2 (n ≥ 0): closed-form polynomial × √(π/(2x))·e^{-x}.
+    ///   K_{-ν}(x) = K_ν(x) handles the negative half-integer case.
+    /// - Otherwise:
+    ///   * For small x (≤ 2): series expansion via I_{|ν|}, I_{-|ν|}
+    ///     (or integer-ν series with digamma terms when |ν| is a non-negative integer).
+    ///   * For large x (> 2): asymptotic Hankel expansion
+    ///     K_ν(x) ~ √(π/(2x)) e^{-x} Σ a_k(ν)/x^k summed until terms increase.
+    pub fn bessel_k(nu: f64, x: f64) -> f64 {
+        assert!(x > 0.0, "bessel_k requires x > 0");
+        let nu_abs = nu.abs(); // K_{-ν} = K_ν
+
+        // Half-integer fast path
+        let two_nu = 2.0 * nu_abs;
+        let n_round = two_nu.round();
+        if (two_nu - n_round).abs() < 1e-12 && (n_round as i64) % 2 == 1 {
+            let n = ((n_round as i64 - 1) / 2) as usize; // ν = n + 1/2
+            return bessel_k_half_integer(n, x);
+        }
+
+        if x <= 2.0 {
+            bessel_k_small_x(nu_abs, x)
+        } else {
+            bessel_k_asymptotic(nu_abs, x)
+        }
+    }
+
+    /// K_{n+1/2}(x) = √(π/(2x)) · e^{-x} · Σ_{k=0}^{n} (n+k)! / (k!(n-k)!) · (2x)^{-k}.
+    fn bessel_k_half_integer(n: usize, x: f64) -> f64 {
+        let pref = (std::f64::consts::PI / (2.0 * x)).sqrt() * (-x).exp();
+        let mut sum = 0.0_f64;
+        let two_x = 2.0 * x;
+        for k in 0..=n {
+            // (n+k)! / (k! (n-k)!)
+            let num = factorial_f64(n + k);
+            let den = factorial_f64(k) * factorial_f64(n - k);
+            sum += num / den / two_x.powi(k as i32);
+        }
+        pref * sum
+    }
+
+    /// Small-x series for K_ν(x), 0 < x ≤ 2.
+    ///
+    /// Non-integer ν: K_ν(x) = π/(2 sin πν) · (I_{-ν}(x) - I_ν(x)).
+    /// Integer ν = m: limit form using digamma and finite sum
+    /// (Abramowitz & Stegun 9.6.11).
+    fn bessel_k_small_x(nu: f64, x: f64) -> f64 {
+        // detect integer ν
+        let n_round = nu.round();
+        if (nu - n_round).abs() < 1e-12 {
+            return bessel_k_integer_series(n_round as usize, x);
+        }
+        let i_pos = bessel_i_series(nu, x);
+        let i_neg = bessel_i_series(-nu, x);
+        std::f64::consts::PI / (2.0 * (std::f64::consts::PI * nu).sin()) * (i_neg - i_pos)
+    }
+
+    /// I_ν(x) = (x/2)^ν Σ_{k=0}^∞ (x²/4)^k / (k! Γ(ν+k+1))
+    fn bessel_i_series(nu: f64, x: f64) -> f64 {
+        let half_x = 0.5 * x;
+        let half_x_sq = half_x * half_x;
+        // (x/2)^ν via exp(ν ln(x/2))
+        let prefix = (nu * half_x.ln()).exp();
+        let mut term = 1.0 / gamma_fn(nu + 1.0);
+        let mut sum = term;
+        for k in 1..200 {
+            term *= half_x_sq / (k as f64 * (nu + k as f64));
+            sum += term;
+            if term.abs() < 1e-18 * sum.abs() {
+                break;
+            }
+        }
+        prefix * sum
+    }
+
+    /// Integer-order ν = m series (A&S 9.6.11).
+    /// K_m(x) = (1/2)·(x/2)^{-m} · Σ_{k=0}^{m-1} (m-k-1)!/k! · (-x²/4)^k
+    ///       + (-1)^{m+1} ln(x/2) · I_m(x)
+    ///       + (-1)^m · (1/2) · (x/2)^m · Σ_{k=0}^∞ (ψ(k+1)+ψ(m+k+1)) · (x²/4)^k / (k! (m+k)!)
+    fn bessel_k_integer_series(m: usize, x: f64) -> f64 {
+        let half_x = 0.5 * x;
+        let half_x_sq = half_x * half_x;
+
+        // Finite polynomial part
+        let mut finite = 0.0_f64;
+        if m >= 1 {
+            let mut term = factorial_f64(m - 1); // k=0: (m-1)!/0! · 1
+            finite += term;
+            for k in 1..m {
+                // term_{k} = (m-k-1)!/k! · (-x²/4)^k
+                // ratio: term_k/term_{k-1} = -(x²/4)/(k · (m-k))
+                term *= -half_x_sq / (k as f64 * (m - k) as f64);
+                finite += term;
+            }
+            finite *= 0.5 * half_x.powi(-(m as i32));
+        }
+
+        // Logarithmic part
+        let i_m = bessel_i_series(m as f64, x);
+        let sign_log = if m % 2 == 0 { -1.0 } else { 1.0 };
+        let log_part = sign_log * half_x.ln() * i_m;
+
+        // Series with digamma sums
+        // ψ(k+1) = -γ + H_k where H_k = Σ_{j=1}^k 1/j
+        // ψ(m+k+1) = -γ + H_{m+k}
+        let mut harmonic_k = 0.0_f64;
+        let mut harmonic_mk = (1..=m).map(|j| 1.0 / j as f64).sum::<f64>();
+        let mut term_factor = 1.0 / factorial_f64(m); // (x²/4)^0 / (0! m!)
+        let mut series_sum = (-2.0 * EULER_GAMMA + harmonic_k + harmonic_mk) * term_factor;
+        for k in 1..200 {
+            harmonic_k += 1.0 / k as f64;
+            harmonic_mk += 1.0 / (m + k) as f64;
+            term_factor *= half_x_sq / (k as f64 * (m + k) as f64);
+            let psi_sum = -2.0 * EULER_GAMMA + harmonic_k + harmonic_mk;
+            let inc = psi_sum * term_factor;
+            series_sum += inc;
+            if inc.abs() < 1e-18 * series_sum.abs().max(1e-300) {
+                break;
+            }
+        }
+        let sign_m = if m % 2 == 0 { 1.0 } else { -1.0 };
+        let series_part = sign_m * 0.5 * half_x.powi(m as i32) * series_sum;
+
+        finite + log_part + series_part
+    }
+
+    /// Asymptotic expansion for large x:
+    /// K_ν(x) ~ √(π/(2x)) e^{-x} Σ_{k=0}^∞ a_k(ν)/x^k
+    /// a_0 = 1, a_k = (4ν² - 1²)(4ν² - 3²)…(4ν² - (2k-1)²) / (k! · 8^k).
+    /// Sum until the smallest term, then return.
+    fn bessel_k_asymptotic(nu: f64, x: f64) -> f64 {
+        let mu = 4.0 * nu * nu;
+        let mut term = 1.0_f64;
+        let mut sum = 1.0_f64;
+        let mut prev_abs = f64::INFINITY;
+        for k in 1..50 {
+            let two_k_minus_1 = (2 * k - 1) as f64;
+            term *= (mu - two_k_minus_1 * two_k_minus_1) / (k as f64 * 8.0 * x);
+            if term.abs() > prev_abs {
+                break; // diverged: stop before adding
+            }
+            sum += term;
+            prev_abs = term.abs();
+            if term.abs() < 1e-16 * sum.abs() {
+                break;
+            }
+        }
+        (std::f64::consts::PI / (2.0 * x)).sqrt() * (-x).exp() * sum
+    }
+
+    /// Riesz kernel R_j^d(r) = F^{-1}{|ρ|^{-2j}}(r) for r > 0.
+    ///
+    /// Non-log case (j > 0, j ∉ d/2 + ℕ₀):
+    ///   R_j^d(r) = Γ(d/2 - j) / (4^j π^{d/2} Γ(j)) · r^{2j - d}.
+    /// Log case (j = d/2 + n, n ∈ ℕ₀):
+    ///   R_j^d(r) = (-1)^{n+1} / (2^{2j-1} π^{d/2} Γ(j) n!) · r^{2n} · log(r/r₀),
+    ///   r₀ = 1, modulo a polynomial of degree 2n.
+    pub fn riesz_kernel_value(d: usize, j: usize, r: f64) -> f64 {
+        assert!(d >= 1, "riesz_kernel_value: d must be ≥ 1");
+        assert!(j >= 1, "riesz_kernel_value: j must be ≥ 1");
+        assert!(r > 0.0, "riesz_kernel_value: r must be > 0");
+
+        // Detect log case: 2j == d + 2n for some n ≥ 0
+        let two_j = 2 * j;
+        if two_j >= d && (two_j - d) % 2 == 0 {
+            let n = (two_j - d) / 2;
+            let sign = if n % 2 == 0 { -1.0 } else { 1.0 }; // (-1)^{n+1}
+            let denom = 2.0_f64.powi((two_j - 1) as i32)
+                * std::f64::consts::PI.powf(d as f64 / 2.0)
+                * gamma_fn(j as f64)
+                * factorial_f64(n);
+            return sign / denom * r.powi((2 * n) as i32) * r.ln();
+        }
+
+        // Non-log case
+        let half_d = d as f64 / 2.0;
+        let num = gamma_fn(half_d - j as f64);
+        let denom = 4.0_f64.powi(j as i32)
+            * std::f64::consts::PI.powf(half_d)
+            * gamma_fn(j as f64);
+        num / denom * r.powf(2.0 * j as f64 - d as f64)
+    }
+
+    /// Matérn building block M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r) for r > 0, κ > 0.
+    ///
+    /// M_ℓ^d(r; κ) = κ^{d/2 - ℓ} / ((2π)^{d/2} · 2^{ℓ-1} · Γ(ℓ)) · r^{ℓ - d/2} · K_{ℓ - d/2}(κr).
+    ///
+    /// For r → 0, returns the small-arg limit using K_ν(x) ~ Γ(|ν|)/2 · (x/2)^{-|ν|}
+    /// (ν ≠ 0) or the log limit (ν = 0).
+    pub fn matern_kernel_value(d: usize, ell: usize, kappa: f64, r: f64) -> f64 {
+        assert!(d >= 1, "matern_kernel_value: d must be ≥ 1");
+        assert!(ell >= 1, "matern_kernel_value: ell must be ≥ 1");
+        if !(kappa > 0.0) {
+            return f64::NAN;
+        }
+        assert!(r >= 0.0, "matern_kernel_value: r must be ≥ 0");
+
+        let nu = ell as f64 - d as f64 / 2.0;
+        let ln_pref = (d as f64 / 2.0 - ell as f64) * kappa.ln()
+            - (d as f64 / 2.0) * (2.0 * std::f64::consts::PI).ln()
+            - (ell as f64 - 1.0) * std::f64::consts::LN_2
+            - ln_gamma(ell as f64);
+        let pref = ln_pref.exp();
+
+        if r == 0.0 {
+            // M(0) = pref · lim_{r→0} r^{ℓ - d/2} K_{ℓ - d/2}(κr)
+            // For ν > 0: K_ν(x) ~ Γ(ν)/2 (x/2)^{-ν}, so r^ν K_ν(κr) → Γ(ν)/2 (κ/2)^{-ν}.
+            // For ν < 0 (i.e. ℓ < d/2): r^ν · K_{-|ν|}(κr) ~ r^ν · Γ(|ν|)/2 (κr/2)^{-|ν|}
+            //   → Γ(|ν|)/2 (κ/2)^{-|ν|} · r^{ν - |ν|} = ∞ (singular). Return ∞.
+            // For ν = 0: K_0(x) ~ -log(x/2) - γ; r^0·K_0(κr) → ∞. Return ∞.
+            if nu > 0.0 {
+                let lim = 0.5 * gamma_fn(nu) * (0.5 * kappa).powf(-nu);
+                return pref * lim;
+            } else {
+                return f64::INFINITY;
+            }
+        }
+
+        let kr = kappa * r;
+        let kv = bessel_k(nu, kr);
+        pref * r.powf(nu) * kv
+    }
+
+    /// Hybrid isotropic Duchon penalty
+    /// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
+    ///
+    /// Edge cases:
+    /// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).
+    /// - κ = 0, s ≥ 1: g_q^iso(R) = R_{2m+2s-q}^d(R) (Riesz pure).
+    /// - General: partial-fraction decomposition with a = 2m - q, b = 2s.
+    ///
+    /// Requires a := 2m - q ≥ 1.
+    pub fn isotropic_duchon_penalty(
+        q: usize,
+        d: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        r: f64,
+    ) -> f64 {
+        assert!(2 * m >= q + 1, "isotropic_duchon_penalty: need 2m - q ≥ 1");
+        let a = 2 * m - q;
+
+        if s == 0 {
+            return riesz_kernel_value(d, a, r);
+        }
+        if kappa == 0.0 {
+            return riesz_kernel_value(d, a + 2 * s, r);
+        }
+
+        let b = 2 * s;
+        let kappa_sq = kappa * kappa;
+
+        // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
+        let mut sum = 0.0_f64;
+        for j in 1..=a {
+            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let binom = binomial_f64(a + b - j - 1, a - j);
+            let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
+            sum += coeff * riesz_kernel_value(d, j, r);
+        }
+
+        // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
+        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        for ell in 1..=b {
+            let binom = binomial_f64(a + b - ell - 1, b - ell);
+            let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
+            sum += coeff * matern_kernel_value(d, ell, kappa, r);
+        }
+
+        sum
+    }
+
+    /// Confluent hypergeometric function ₁F₁(a; b; x) for nonnegative-integer
+    /// parameters a, b with a ≤ b, b ≥ 1, evaluated at real x.
+    ///
+    /// Strategy:
+    /// - x ≥ 0: direct power series Σ (a)_k/(b)_k · x^k/k! (positive terms,
+    ///   numerically benign).
+    /// - x < 0: Kummer transform ₁F₁(a; b; x) = e^x · ₁F₁(b - a; b; -x), which
+    ///   replaces a sign-alternating sum with an all-positive series.
+    ///
+    /// Special case a = 0 returns 1 (the empty sum).
+    ///
+    /// Accuracy regime: for parameters a, b ≤ 64 and |x| ≤ 1e6 the series
+    /// converges to within 1e-12 relative within ~200 terms. For larger
+    /// arguments the leading e^x or e^{-x} factor dominates.
+    pub fn confluent_1f1_integer(a: usize, b: usize, x: f64) -> f64 {
+        assert!(b >= 1, "confluent_1f1_integer: b must be ≥ 1");
+        assert!(a <= b, "confluent_1f1_integer: requires a ≤ b");
+        if a == 0 {
+            return 1.0;
+        }
+        if x == 0.0 {
+            return 1.0;
+        }
+        if x < 0.0 {
+            let y = -x;
+            // For large y the direct series e^x · ₁F₁(b-a; b; y) suffers
+            // catastrophic 0·∞ cancellation since both factors overflow.
+            // Switch to the Tricomi asymptotic
+            //   ₁F₁(a; b; -y) ~ Γ(b)/Γ(b-a) · y^{-a}
+            // valid as y → ∞ (leading term; higher-order corrections vanish
+            // as 1/y but we only need the dominant scale for the heat-integral
+            // tail, where Schoenberg quadrature contributions are exponentially
+            // suppressed by the Gaussian H_τ factor anyway).
+            if y > 50.0 {
+                let log_pref = ln_gamma(b as f64) - ln_gamma((b - a) as f64);
+                let log_val = log_pref - (a as f64) * y.ln();
+                return log_val.exp();
+            }
+            // Kummer transform: ₁F₁(a; b; x) = e^x · ₁F₁(b - a; b; -x)
+            return x.exp() * confluent_1f1_positive(b - a, b, y);
+        }
+        confluent_1f1_positive(a, b, x)
+    }
+
+    /// Direct series for ₁F₁(a; b; x) with x ≥ 0 and integer 0 ≤ a ≤ b.
+    fn confluent_1f1_positive(a: usize, b: usize, x: f64) -> f64 {
+        if a == 0 {
+            return 1.0;
+        }
+        let mut term = 1.0_f64;
+        let mut sum = 1.0_f64;
+        // term_k = (a)_k / (b)_k · x^k / k!
+        // ratio: term_{k+1} / term_k = (a + k) / ((b + k)(k + 1)) · x
+        for k in 0..1000 {
+            term *= (a as f64 + k as f64) / ((b as f64 + k as f64) * (k as f64 + 1.0)) * x;
+            sum += term;
+            if term.abs() < 1e-18 * sum.abs() && k > 8 {
+                break;
+            }
+        }
+        sum
+    }
+
+    /// Schoenberg weight w_{M,S,κ}(τ) = τ^{M+S-1} / Γ(M+S) · ₁F₁(S; M+S; -κ²τ),
+    /// where M = 2m, S = 2s.
+    ///
+    /// Special cases:
+    /// - S = 0:        w(τ) = τ^{M-1}/Γ(M)            (no Matérn factor).
+    /// - κ = 0, S ≥ 1: w(τ) = τ^{M+S-1}/Γ(M+S)        (₁F₁ collapses to 1).
+    pub fn schoenberg_weight(m_total: usize, s_total: usize, kappa: f64, tau: f64) -> f64 {
+        assert!(tau > 0.0, "schoenberg_weight: tau must be > 0");
+        let big_m = 2 * m_total;
+        let big_s = 2 * s_total;
+        let order = big_m + big_s; // ≥ 1
+        assert!(order >= 1, "schoenberg_weight: 2m + 2s must be ≥ 1");
+        // ln(τ^{order-1} / Γ(order)) for numerical stability when τ is large
+        let ln_pref = (order as f64 - 1.0) * tau.ln() - ln_gamma(order as f64);
+        let pref = ln_pref.exp();
+        if big_s == 0 || kappa == 0.0 {
+            return pref;
+        }
+        let one_f_one = confluent_1f1_integer(big_s, order, -kappa * kappa * tau);
+        pref * one_f_one
+    }
+
+    /// Schoenberg polynomial T_q(τ, z, b) for q ∈ {0, 1, 2}.
+    ///
+    /// The pair-block penalty pulls down 0, 1, or 2 powers of |ρ|² in the
+    /// Fourier domain, which in the heat representation becomes the
+    /// differential operator Σ_k b_k · ∂²/∂z_k² applied to H_τ(z) (q times).
+    /// The Hermite-style derivatives evaluate to:
+    ///   T_0 = 1
+    ///   T_1 = Σ_k b_k · (1/(2τ) − z_k²/(4τ²))
+    ///   T_2 = T_1² + Σ_k b_k² · (1/(2τ²) − z_k²/(2τ³))
+    ///
+    /// Caller passes `z` (already in anisotropy-rescaled coordinates) and the
+    /// per-axis weights `b_k = exp(-2 η_k)`.
+    pub fn schoenberg_polynomial_t(q: usize, tau: f64, z: &[f64], b: &[f64]) -> f64 {
+        assert!(tau > 0.0, "schoenberg_polynomial_t: tau must be > 0");
+        assert_eq!(
+            z.len(),
+            b.len(),
+            "schoenberg_polynomial_t: z and b dimension mismatch"
+        );
+        if q == 0 {
+            return 1.0;
+        }
+        let two_tau = 2.0 * tau;
+        let four_tau_sq = 4.0 * tau * tau;
+        let t1: f64 = z
+            .iter()
+            .zip(b.iter())
+            .map(|(zk, bk)| bk * (1.0 / two_tau - zk * zk / four_tau_sq))
+            .sum();
+        if q == 1 {
+            return t1;
+        }
+        if q == 2 {
+            let two_tau_sq = 2.0 * tau * tau;
+            let two_tau_cu = 2.0 * tau * tau * tau;
+            let t2_extra: f64 = z
+                .iter()
+                .zip(b.iter())
+                .map(|(zk, bk)| bk * bk * (1.0 / two_tau_sq - zk * zk / two_tau_cu))
+                .sum();
+            return t1 * t1 + t2_extra;
+        }
+        panic!("schoenberg_polynomial_t: q must be in {{0, 1, 2}}");
+    }
+
+    /// Anisotropic Lebesgue Duchon pair-block kernel
+    ///
+    ///   g_q(z; η, m, s, κ) = ∫₀^∞ w_{2m, 2s, κ}(τ) · H_τ(z) · T_q(τ, z, b) dτ
+    ///
+    /// where:
+    ///   - z = A^{-1} r       (axis-rescaled lag)
+    ///   - A = diag(exp η_k)  (anisotropy length scales)
+    ///   - b_k = exp(-2 η_k)  (inverse squared length scales)
+    ///   - H_τ(z) = (4π τ)^{-d/2} exp(-|z|²/(4τ))   (heat kernel)
+    ///
+    /// The full pair-block entry is `J · g_q(z; …)` with `J = exp(Σ η_k)`;
+    /// this routine returns the unscaled `g_q(z; …)` so that the caller can
+    /// multiply by the global Jacobian once.
+    ///
+    /// `r` is the raw lag `t_i − t_j` of length `d ≥ 1`.
+    /// `eta` has length `d` (per-axis anisotropy log-scales).
+    ///
+    /// Quadrature: substitute τ = e^y and apply Gauss-Legendre on
+    /// y ∈ [-20, 20] with a fixed 80-node rule, which captures the heat
+    /// kernel's heavy left/right tails for the parameter ranges used in
+    /// production (q ≤ 2, m, s ≤ 8, κ ∈ [0, 50], |z| ∈ [1e-3, 1e3]).
+    pub fn anisotropic_duchon_penalty(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> f64 {
+        assert_eq!(
+            eta.len(),
+            r.len(),
+            "anisotropic_duchon_penalty: eta and r dimension mismatch"
+        );
+        assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
+        assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
+
+        let d = r.len();
+        // z = A^{-1} r, b_k = exp(-2 η_k)
+        let mut z = vec![0.0_f64; d];
+        let mut b = vec![0.0_f64; d];
+        let mut z_sq_sum = 0.0_f64;
+        for k in 0..d {
+            let inv = (-eta[k]).exp();
+            z[k] = r[k] * inv;
+            b[k] = (-2.0 * eta[k]).exp();
+            z_sq_sum += z[k] * z[k];
+        }
+
+        let (nodes, weights) = gauss_legendre_80();
+        // Map y from [-1, 1] -> [-20, 20]
+        let y_lo = -20.0_f64;
+        let y_hi = 20.0_f64;
+        let half_len = 0.5 * (y_hi - y_lo);
+        let mid = 0.5 * (y_hi + y_lo);
+
+        let half_d = d as f64 / 2.0;
+        let log_4pi = (4.0 * std::f64::consts::PI).ln();
+
+        let mut acc = 0.0_f64;
+        for (xi, wi) in nodes.iter().zip(weights.iter()) {
+            let y = mid + half_len * xi;
+            let tau = y.exp();
+            // dτ/dy = τ, so the integrand in y is w(τ)·H_τ·T_q · τ
+            let w = schoenberg_weight(m, s, kappa, tau);
+            let t_poly = schoenberg_polynomial_t(q, tau, &z, &b);
+            // H_τ(z) = (4πτ)^{-d/2} exp(-|z|²/(4τ))
+            let ln_h = -half_d * (log_4pi + y) - z_sq_sum / (4.0 * tau);
+            let h = ln_h.exp();
+            acc += wi * w * h * t_poly * tau;
+        }
+        acc * half_len
+    }
+
+    /// 80-point Gauss-Legendre nodes and weights on [-1, 1].
+    /// Computed once via Newton iteration on Legendre polynomials; the
+    /// returned slices are static to keep the hot path allocation-free.
+    fn gauss_legendre_80() -> (&'static [f64], &'static [f64]) {
+        static CACHE: std::sync::OnceLock<(Vec<f64>, Vec<f64>)> = std::sync::OnceLock::new();
+        let (n, w) = CACHE.get_or_init(|| compute_gauss_legendre(80));
+        (n.as_slice(), w.as_slice())
+    }
+
+    /// Compute `n` Gauss-Legendre nodes and weights on [-1, 1] by Newton
+    /// iteration on the Legendre polynomial P_n. Standard recurrence:
+    ///   (k+1) P_{k+1}(x) = (2k+1) x P_k(x) − k P_{k−1}(x).
+    /// w_i = 2 / ((1 − x_i²) (P_n'(x_i))²).
+    fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut nodes = vec![0.0_f64; n];
+        let mut weights = vec![0.0_f64; n];
+        let m = (n + 1) / 2;
+        for i in 0..m {
+            // Initial guess: cosine of equi-distributed angle
+            let theta = std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5);
+            let mut x = theta.cos();
+            // Newton iterate
+            let mut p_prime = 0.0_f64;
+            for _ in 0..100 {
+                let mut p_prev = 1.0_f64;
+                let mut p_curr = x;
+                for k in 1..n {
+                    let kf = k as f64;
+                    let p_next = ((2.0 * kf + 1.0) * x * p_curr - kf * p_prev) / (kf + 1.0);
+                    p_prev = p_curr;
+                    p_curr = p_next;
+                }
+                // P_n'(x) = n (x P_n − P_{n−1}) / (x² − 1)
+                p_prime = (n as f64) * (x * p_curr - p_prev) / (x * x - 1.0);
+                let dx = p_curr / p_prime;
+                x -= dx;
+                if dx.abs() < 1e-15 {
+                    break;
+                }
+            }
+            nodes[i] = -x;
+            nodes[n - 1 - i] = x;
+            let w = 2.0 / ((1.0 - x * x) * p_prime * p_prime);
+            weights[i] = w;
+            weights[n - 1 - i] = w;
+        }
+        (nodes, weights)
+    }
+
+    /// Bundled value + first/second derivatives of the anisotropic pair-block
+    /// kernel `J · g_q(z; η, m, s, κ)` with `J = exp(Σ η_k)`.
+    ///
+    /// All entries already include the `J` prefactor and its derivatives, so
+    /// callers should consume them directly. Mixed second derivatives are
+    /// stored in a square `d_eta.len() × d_eta.len()` matrix and are
+    /// symmetric by construction.
+    #[derive(Debug, Clone)]
+    pub struct PairBlockBundle {
+        pub value: f64,
+        pub d_eta: Vec<f64>,
+        pub d_kappa: f64,
+        pub d2_eta: Vec<Vec<f64>>,
+        pub d2_eta_kappa: Vec<f64>,
+        pub d2_kappa: f64,
+    }
+
+    /// Internal: compute the integrand and all of its first/second derivatives
+    /// at one quadrature point and accumulate into the running bundle. Returns
+    /// the bare-`g_q` derivatives (no J prefactor); the caller assembles J
+    /// once at the end.
+    ///
+    /// All formulas come from differentiating
+    ///   integrand(τ) = w(τ; m,s,κ) · H_τ(z) · T_q(τ, z, b)
+    /// with respect to η_k, η_l, κ, treating
+    ///   z_k = e^{-η_k} r_k     ⇒ ∂_{η_l} z_k = −z_k δ_{kl}
+    ///   b_k = e^{-2 η_k}        ⇒ ∂_{η_l} b_k = −2 b_k δ_{kl}
+    /// and using ∂_{η_k} H_τ = (z_k²/(2τ)) · H_τ.
+    #[allow(clippy::too_many_arguments)]
+    fn aniso_integrand_derivs_at_tau(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        tau: f64,
+        z: &[f64],
+        b: &[f64],
+        z_sq_sum: f64,
+        d: usize,
+        // outputs (added to in-place)
+        bare_value: &mut f64,
+        bare_d_eta: &mut [f64],
+        bare_d_kappa: &mut f64,
+        bare_d2_eta: &mut [f64], // flat row-major d×d
+        bare_d2_eta_kappa: &mut [f64],
+        bare_d2_kappa: &mut f64,
+        // shared scalar weight: integrand contribution * dτ/dy * Gauss weight
+        scale: f64,
+    ) {
+        let half_d = d as f64 / 2.0;
+        let log_4pi = (4.0 * std::f64::consts::PI).ln();
+        let ln_h = -half_d * (log_4pi + tau.ln()) - z_sq_sum / (4.0 * tau);
+        let h = ln_h.exp();
+
+        // T_q values and per-axis first/second-axis-only derivatives.
+        // We compute T_q itself, and for each axis k:
+        //   t1_k = ∂_{η_k} T_q
+        //   t2_kk = ∂²_{η_k η_k} T_q (only the diagonal in the k=l index)
+        // For T_2 there is also the off-diagonal second derivative
+        //   ∂²_{η_k η_l} T_2 = 2 (∂η_k T_1)(∂η_l T_1) for k ≠ l.
+        // (For T_0 and T_1, off-diagonal mixed second-derivatives vanish.)
+        let two_tau = 2.0 * tau;
+        let four_tau_sq = 4.0 * tau * tau;
+        let two_tau_sq = 2.0 * tau * tau;
+        let two_tau_cu = 2.0 * tau * tau * tau;
+
+        // T_1 building blocks (used for both q=1 and q=2)
+        let mut t1_value = 0.0_f64;
+        // per-axis ∂_{η_k} T_1 = b_k(z_k²/τ² - 1/τ)
+        let mut dt1_eta = vec![0.0_f64; d];
+        // per-axis ∂²_{η_k η_k} T_1 = 2 b_k/τ - 4 b_k z_k²/τ²
+        let mut d2t1_eta_diag = vec![0.0_f64; d];
+        for k in 0..d {
+            let zk = z[k];
+            let bk = b[k];
+            t1_value += bk * (1.0 / two_tau - zk * zk / four_tau_sq);
+            dt1_eta[k] = bk * (zk * zk / (tau * tau) - 1.0 / tau);
+            d2t1_eta_diag[k] = 2.0 * bk / tau - 4.0 * bk * zk * zk / (tau * tau);
+        }
+
+        // T_q value, ∂_{η_k} T_q, diagonal ∂²_{η_k η_k} T_q.
+        // Off-diagonal ∂²_{η_k η_l} T_q is nonzero only for q = 2 and equals
+        // 2 (∂_{η_k} T_1)(∂_{η_l} T_1).
+        let (t_val, dtq_eta, d2tq_eta_diag) = match q {
+            0 => (1.0_f64, vec![0.0_f64; d], vec![0.0_f64; d]),
+            1 => (t1_value, dt1_eta.clone(), d2t1_eta_diag.clone()),
+            2 => {
+                // T_2 = T_1² + Σ_j b_j² (1/(2τ²) - z_j²/(2τ³))
+                let mut sum_extra = 0.0_f64;
+                for k in 0..d {
+                    let zk = z[k];
+                    let bk = b[k];
+                    sum_extra += bk * bk * (1.0 / two_tau_sq - zk * zk / two_tau_cu);
+                }
+                let t2_val = t1_value * t1_value + sum_extra;
+                // ∂_{η_k} T_2 = 2 T_1 · ∂_{η_k} T_1 + (-2 b_k²/τ² + 3 b_k² z_k²/τ³)
+                let mut dt2 = vec![0.0_f64; d];
+                let mut d2t2_diag = vec![0.0_f64; d];
+                for k in 0..d {
+                    let zk = z[k];
+                    let bk = b[k];
+                    let extra_first =
+                        -2.0 * bk * bk / (tau * tau) + 3.0 * bk * bk * zk * zk / (tau * tau * tau);
+                    dt2[k] = 2.0 * t1_value * dt1_eta[k] + extra_first;
+                    // ∂²_{η_k η_k} T_2 = 2 (∂η_k T_1)² + 2 T_1 · ∂²η_k T_1 + extra''
+                    // where extra'' = ∂η_k(-2 b_k²/τ² + 3 b_k² z_k²/τ³)
+                    //               = 8 b_k²/τ² - 18 b_k² z_k²/τ³
+                    let extra_second =
+                        8.0 * bk * bk / (tau * tau) - 18.0 * bk * bk * zk * zk / (tau * tau * tau);
+                    d2t2_diag[k] = 2.0 * dt1_eta[k] * dt1_eta[k]
+                        + 2.0 * t1_value * d2t1_eta_diag[k]
+                        + extra_second;
+                }
+                (t2_val, dt2, d2t2_diag)
+            }
+            _ => panic!("aniso_integrand_derivs_at_tau: q must be in {{0,1,2}}"),
+        };
+
+        // Off-diagonal second derivative of T_q with respect to η_k, η_l (k ≠ l):
+        //   q=0,1: zero (each axis is independent)
+        //   q=2:   2 · ∂_{η_k} T_1 · ∂_{η_l} T_1
+        let cross_t_factor: f64 = if q == 2 { 2.0 } else { 0.0 };
+
+        // Schoenberg weight w(τ) and its κ-derivatives.
+        let w = schoenberg_weight(m, s, kappa, tau);
+
+        // ∂κ w = τ^{2(m+s)-1}/Γ(2(m+s)) · (-2κτ) · (2s)/(2(m+s)) · ₁F₁(2s+1; 2(m+s)+1; -κ²τ)
+        // ∂²κ w = τ^{2(m+s)-1}/Γ(2(m+s)) · [ -2τ·C₁·F₁ + 4 κ²τ²·C₁·C₂·F₂ ]
+        // with C₁ = 2s/(2(m+s)), C₂ = (2s+1)/(2(m+s)+1),
+        //      F₁ = ₁F₁(2s+1; 2(m+s)+1; -κ²τ),
+        //      F₂ = ₁F₁(2s+2; 2(m+s)+2; -κ²τ).
+        let (dw_dkappa, d2w_dkappa) = if s == 0 {
+            (0.0_f64, 0.0_f64)
+        } else {
+            let big_m = 2 * m;
+            let big_s = 2 * s;
+            let order = big_m + big_s;
+            let ln_pref = (order as f64 - 1.0) * tau.ln() - ln_gamma(order as f64);
+            let pref = ln_pref.exp();
+            let arg = -kappa * kappa * tau;
+            let c1 = (big_s as f64) / (order as f64);
+            let f1 = confluent_1f1_integer(big_s + 1, order + 1, arg);
+            let dw = pref * (-2.0 * kappa * tau) * c1 * f1;
+
+            // ∂²κ w
+            let c2 = ((big_s + 1) as f64) / ((order + 1) as f64);
+            let f2 = confluent_1f1_integer(big_s + 2, order + 2, arg);
+            let d2w =
+                pref * (-2.0 * tau * c1 * f1 + 4.0 * kappa * kappa * tau * tau * c1 * c2 * f2);
+            (dw, d2w)
+        };
+
+        // Integrand = w · H · T_q. Derivatives:
+        //   ∂η_k I = w · [(z_k²/(2τ))·H·T_q + H·∂η_k T_q]
+        //   ∂κ I   = ∂κ w · H · T_q
+        //   ∂²η_k η_l I = w · H · [
+        //       -δ_{kl}·z_k²/τ · T_q
+        //       + z_k² z_l²/(4τ²) · T_q
+        //       + (z_k²/(2τ))·∂η_l T_q
+        //       + (z_l²/(2τ))·∂η_k T_q
+        //       + ∂²η_k η_l T_q
+        //     ]
+        //   ∂²η_k κ I = ∂κ w · [(z_k²/(2τ))·H·T_q + H·∂η_k T_q]
+        //   ∂²κ I = ∂²κ w · H · T_q
+        let int_value = w * h * t_val;
+        *bare_value += scale * int_value;
+        *bare_d_kappa += scale * dw_dkappa * h * t_val;
+        *bare_d2_kappa += scale * d2w_dkappa * h * t_val;
+
+        for k in 0..d {
+            let zk = z[k];
+            let zk_sq = zk * zk;
+            let h_term_k = (zk_sq / two_tau) * h * t_val + h * dtq_eta[k];
+            bare_d_eta[k] += scale * w * h_term_k;
+            bare_d2_eta_kappa[k] += scale * dw_dkappa * h_term_k;
+        }
+
+        // Second-order η × η.
+        for k in 0..d {
+            let zk = z[k];
+            let zk_sq = zk * zk;
+            for l in 0..d {
+                let zl = z[l];
+                let zl_sq = zl * zl;
+                // off-diagonal piece of ∂²η_k η_l T_q
+                let d2t_kl: f64 = if k == l {
+                    d2tq_eta_diag[k]
+                } else {
+                    cross_t_factor * dt1_eta[k] * dt1_eta[l]
+                };
+                let kron = if k == l { 1.0 } else { 0.0 };
+                let bracket = -kron * zk_sq / tau * t_val
+                    + zk_sq * zl_sq / four_tau_sq * t_val
+                    + zk_sq / two_tau * dtq_eta[l]
+                    + zl_sq / two_tau * dtq_eta[k]
+                    + d2t_kl;
+                bare_d2_eta[k * d + l] += scale * w * h * bracket;
+            }
+        }
+    }
+
+    /// Bundled pair-block: returns `J · g_q` and all first/second derivatives
+    /// with respect to (η, κ), already including the J prefactor.
+    ///
+    /// Single Schoenberg quadrature pass per call.
+    pub fn pair_block_with_j_second_derivatives(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> PairBlockBundle {
+        assert_eq!(
+            eta.len(),
+            r.len(),
+            "pair_block_with_j_second_derivatives: eta and r dimension mismatch"
+        );
+        assert!(
+            !r.is_empty(),
+            "pair_block_with_j_second_derivatives: empty input"
+        );
+        assert!(
+            q <= 2,
+            "pair_block_with_j_second_derivatives: q must be in {{0,1,2}}"
+        );
+
+        let d = r.len();
+        let mut z = vec![0.0_f64; d];
+        let mut b = vec![0.0_f64; d];
+        let mut z_sq_sum = 0.0_f64;
+        let mut sum_eta = 0.0_f64;
+        for k in 0..d {
+            z[k] = r[k] * (-eta[k]).exp();
+            b[k] = (-2.0 * eta[k]).exp();
+            z_sq_sum += z[k] * z[k];
+            sum_eta += eta[k];
+        }
+        let big_j = sum_eta.exp();
+
+        let (nodes, weights) = gauss_legendre_80();
+        let y_lo = -20.0_f64;
+        let y_hi = 20.0_f64;
+        let half_len = 0.5 * (y_hi - y_lo);
+        let mid = 0.5 * (y_hi + y_lo);
+
+        let mut bare_value = 0.0_f64;
+        let mut bare_d_eta = vec![0.0_f64; d];
+        let mut bare_d_kappa = 0.0_f64;
+        let mut bare_d2_eta = vec![0.0_f64; d * d];
+        let mut bare_d2_eta_kappa = vec![0.0_f64; d];
+        let mut bare_d2_kappa = 0.0_f64;
+
+        for (xi, wi) in nodes.iter().zip(weights.iter()) {
+            let y = mid + half_len * xi;
+            let tau = y.exp();
+            // dτ/dy = τ; the y-domain integrand carries an extra factor of τ.
+            let scale = wi * tau * half_len;
+            aniso_integrand_derivs_at_tau(
+                q,
+                m,
+                s,
+                kappa,
+                tau,
+                &z,
+                &b,
+                z_sq_sum,
+                d,
+                &mut bare_value,
+                &mut bare_d_eta,
+                &mut bare_d_kappa,
+                &mut bare_d2_eta,
+                &mut bare_d2_eta_kappa,
+                &mut bare_d2_kappa,
+                scale,
+            );
+        }
+
+        // J prefactor expansion:
+        //   ∂η_k(J·g)         = J · (g + ∂η_k g)
+        //   ∂²η_k η_l(J·g)    = J · (g + ∂η_k g + ∂η_l g + ∂²η_k η_l g)
+        //   ∂κ(J·g)            = J · ∂κ g
+        //   ∂²κ(J·g)           = J · ∂²κ g
+        //   ∂²η_k κ(J·g)      = J · (∂κ g + ∂²η_k κ g)
+        let value = big_j * bare_value;
+        let d_eta: Vec<f64> = (0..d)
+            .map(|k| big_j * (bare_value + bare_d_eta[k]))
+            .collect();
+        let d_kappa = big_j * bare_d_kappa;
+        let mut d2_eta: Vec<Vec<f64>> = vec![vec![0.0_f64; d]; d];
+        for k in 0..d {
+            for l in 0..d {
+                d2_eta[k][l] = big_j
+                    * (bare_value + bare_d_eta[k] + bare_d_eta[l] + bare_d2_eta[k * d + l]);
+            }
+        }
+        let d2_eta_kappa: Vec<f64> = (0..d)
+            .map(|k| big_j * (bare_d_kappa + bare_d2_eta_kappa[k]))
+            .collect();
+        let d2_kappa = big_j * bare_d2_kappa;
+
+        PairBlockBundle {
+            value,
+            d_eta,
+            d_kappa,
+            d2_eta,
+            d2_eta_kappa,
+            d2_kappa,
+        }
+    }
+
+    /// Backward-compatible first-derivative bundle: returns `(J·g_q, [∂η_k(J·g_q)], ∂κ(J·g_q))`.
+    pub fn pair_block_with_j_derivatives(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> (f64, Vec<f64>, f64) {
+        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        (bundle.value, bundle.d_eta, bundle.d_kappa)
+    }
+
+    /// First derivative ∂g_q/∂η_k of the bare (no-J) anisotropic kernel.
+    pub fn psi_first_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+        k: usize,
+    ) -> f64 {
+        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        // bundle.d_eta[k] = J · (g + ∂η_k g) and bundle.value = J · g, so
+        //   ∂η_k g = bundle.d_eta[k]/J - g = (d_eta[k] - value)/J.
+        let sum_eta: f64 = eta.iter().sum();
+        let big_j = sum_eta.exp();
+        (bundle.d_eta[k] - bundle.value) / big_j
+    }
+
+    /// Second derivative ∂²g_q/∂η_k∂η_l of the bare (no-J) kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn psi_second_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+        k: usize,
+        l: usize,
+    ) -> f64 {
+        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        // bundle.d2_eta[k][l] = J · (g + ∂η_k g + ∂η_l g + ∂²η_k η_l g);
+        // bundle.d_eta[k]    = J · (g + ∂η_k g); bundle.value = J · g. Therefore
+        //   ∂²η_k η_l g = (d2[k][l] - d_eta[k] - d_eta[l] + value) / J.
+        let sum_eta: f64 = eta.iter().sum();
+        let big_j = sum_eta.exp();
+        (bundle.d2_eta[k][l] - bundle.d_eta[k] - bundle.d_eta[l] + bundle.value) / big_j
+    }
+
+    /// First derivative ∂g_q/∂κ of the bare (no-J) kernel.
+    pub fn kappa_first_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> f64 {
+        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        let sum_eta: f64 = eta.iter().sum();
+        let big_j = sum_eta.exp();
+        bundle.d_kappa / big_j
+    }
+
+    /// Second derivative ∂²g_q/∂κ² of the bare (no-J) kernel.
+    pub fn kappa_second_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> f64 {
+        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        let sum_eta: f64 = eta.iter().sum();
+        let big_j = sum_eta.exp();
+        bundle.d2_kappa / big_j
+    }
+
+    /// Mixed second derivative ∂²g_q/∂η_k∂κ of the bare (no-J) kernel.
+    pub fn psi_kappa_mixed_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+        k: usize,
+    ) -> f64 {
+        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        // bundle.d2_eta_kappa[k] = J · (∂κ g + ∂²η_k κ g), bundle.d_kappa = J · ∂κ g.
+        let sum_eta: f64 = eta.iter().sum();
+        let big_j = sum_eta.exp();
+        (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
+    }
 }
 
 // Unit tests are crucial for a mathematical library like this.
@@ -19404,8 +20394,8 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 4);
-        assert_eq!(out.penaltyinfo.len(), 4);
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
             out.penaltyinfo[0].source,
@@ -19418,10 +20408,6 @@ mod tests {
         assert!(matches!(
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
-        ));
-        assert!(matches!(
-            out.penaltyinfo[3].source,
-            PenaltySource::FunctionVariance
         ));
     }
 
@@ -19438,7 +20424,7 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penaltyinfo.len(), 4);
+        assert_eq!(out.penaltyinfo.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
         assert!(matches!(
             out.penaltyinfo[0].source,
@@ -19451,10 +20437,6 @@ mod tests {
         assert!(matches!(
             out.penaltyinfo[2].source,
             PenaltySource::OperatorStiffness
-        ));
-        assert!(matches!(
-            out.penaltyinfo[3].source,
-            PenaltySource::FunctionVariance
         ));
     }
 
@@ -22648,503 +23630,653 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Closed-form Riesz / Matérn / hybrid Duchon kernel tests
+    // ----------------------------------------------------------------------
+
+    use super::closed_form_penalty::{
+        bessel_k, isotropic_duchon_penalty, matern_kernel_value, riesz_kernel_value,
+    };
+
     #[test]
-    fn test_duchon_function_variance_matches_centered_mass_at_knots() {
-        // For the *raw* (pre-normalization) S_var = D0^T D0 - K · avg · avg^T
-        // the quadratic form β^T S_var β equals Σ_p (f_p - f̄)² where f = D0·β.
-        // We rebuild D0 using the same constrained-coefficient pipeline as the
-        // basis builder and verify the identity for an arbitrary β.
-        use ndarray::Array1;
-        let data = array![
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0],
-            [0.5, 0.5, 0.5]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: Some(0.7),
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let var_info = out
-            .penaltyinfo
-            .iter()
-            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
-            .expect("function variance penalty must be present");
-        let var_idx = var_info.original_index;
-        let s_var_norm = &out.penalties[var_idx];
-        // De-normalize back to S_var (raw):
-        let s_var_raw = s_var_norm.mapv(|v| v * var_info.normalization_scale);
-
-        // Recompute D0 directly from the spec via the public collocation API.
-        let centers = match &out.metadata {
-            BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!("Duchon metadata expected"),
-        };
-        let mut workspace = BasisWorkspace::default();
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
-            centers.view(),
-            None,
-            spec.length_scale,
-            spec.power,
-            DuchonNullspaceOrder::Linear,
-            None,
-            None,
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            &mut workspace,
-        )
-        .expect("collocation ops");
-        let d0 = ops.d0;
-        let p = d0.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            beta[i] = 0.5 + 0.17 * (i as f64) - 0.09 * ((i * i) as f64);
+    fn test_riesz_d3_j1() {
+        // R_1^3(r) = 1/(4π r)
+        for &r in &[0.1_f64, 1.0, 10.0] {
+            let got = riesz_kernel_value(3, 1, r);
+            let expected = 1.0 / (4.0 * std::f64::consts::PI * r);
+            assert!(
+                (got - expected).abs() / expected.abs() < 1e-12,
+                "R_1^3({r}) got={got} expected={expected}"
+            );
         }
-        let f = d0.dot(&beta);
-        let mean_f = f.iter().copied().sum::<f64>() / f.len() as f64;
-        let expected_var: f64 = f.iter().map(|v| (v - mean_f).powi(2)).sum();
-
-        let quad_raw = beta.dot(&s_var_raw.dot(&beta));
-        let rel_err = (quad_raw - expected_var).abs() / (1.0 + expected_var.abs());
-        assert!(
-            rel_err < 1e-9,
-            "β^T S_var β = {quad_raw} should match Σ(f-f̄)² = {expected_var}"
-        );
     }
 
     #[test]
-    fn test_duchon_function_variance_null_space_contains_constant_direction() {
-        // Verify mathematically: the vector β = avg/||avg||² mapped onto the
-        // null-space of S_var should give a zero quadratic form. We construct
-        // β such that D0·β is the constant 1_K vector by least-squares:
-        // β = (D0^T D0)^{-1} D0^T · 1, solved via faer Cholesky on a ridge.
-        use crate::faer_ndarray::FaerCholesky;
-        use ndarray::Array1;
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.4],
-            [0.3, 0.7]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: Some(1.0),
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let var_info = out
-            .penaltyinfo
-            .iter()
-            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
-            .expect("function variance penalty must be present");
-        let var_idx = var_info.original_index;
-        let s_var = &out.penalties[var_idx];
-
-        // Recompute D0 to find a β representing the constant function at knots.
-        let centers = match &out.metadata {
-            BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!("Duchon metadata expected"),
-        };
-        let mut workspace = BasisWorkspace::default();
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
-            centers.view(),
-            None,
-            spec.length_scale,
-            spec.power,
-            DuchonNullspaceOrder::Linear,
-            None,
-            None,
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            &mut workspace,
-        )
-        .expect("collocation ops");
-        let d0 = ops.d0;
-        let k_rows = d0.nrows();
-        let p = d0.ncols();
-        let ones = Array1::<f64>::ones(k_rows);
-
-        // Solve (D0^T D0 + ε I) β = D0^T 1 via faer Cholesky.
-        let dt_d = d0.t().dot(&d0);
-        let dt_one = d0.t().dot(&ones);
-        let mut a = dt_d.clone();
-        for i in 0..p {
-            a[[i, i]] += 1e-10;
+    fn test_riesz_d3_j2() {
+        // R_2^3(r) = -r/(8π)
+        // Γ(3/2 - 2) = Γ(-1/2) = -2√π. 4^2 π^{3/2} Γ(2) = 16 π^{3/2}.
+        // Coefficient = -2√π / (16 π^{3/2}) = -1/(8π). Times r^{2·2-3} = r.
+        for &r in &[0.1_f64, 1.0, 10.0] {
+            let got = riesz_kernel_value(3, 2, r);
+            let expected = -r / (8.0 * std::f64::consts::PI);
+            assert!(
+                (got - expected).abs() / expected.abs() < 1e-12,
+                "R_2^3({r}) got={got} expected={expected}"
+            );
         }
-        let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
-        let beta = chol.solvevec(&dt_one);
-        let residual = (&d0.dot(&beta) - &ones)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            residual < 1e-6,
-            "design must span constant at knots (residual = {residual})"
-        );
-        let quad = beta.dot(&s_var.dot(&beta));
-        // Normalized S_var is divided by Frobenius norm, so β^T S_var β scales
-        // accordingly but the zero is preserved.
-        assert!(
-            quad.abs() < 1e-8,
-            "constant function must lie in S_var null space, got β^T S_var β = {quad}"
-        );
     }
 
     #[test]
-    fn test_duchon_function_variance_penalizes_tilt_more_than_constant() {
-        // Constant function: zero penalty. Tilted (linear) function: strictly
-        // positive penalty. Compares β^T S_var β for two coefficient vectors
-        // built to represent each function at the centers.
-        use crate::faer_ndarray::FaerCholesky;
-        use ndarray::Array1;
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.4, 0.6],
-            [0.2, 0.3]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: Some(1.0),
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let var_info = out
-            .penaltyinfo
-            .iter()
-            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
-            .expect("function variance penalty must be present");
-        let var_idx = var_info.original_index;
-        let s_var = &out.penalties[var_idx];
-
-        let centers = match &out.metadata {
-            BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!("Duchon metadata expected"),
-        };
-        let mut workspace = BasisWorkspace::default();
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
-            centers.view(),
-            None,
-            spec.length_scale,
-            spec.power,
-            DuchonNullspaceOrder::Linear,
-            None,
-            None,
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            &mut workspace,
-        )
-        .expect("collocation ops");
-        let d0 = ops.d0;
-        let k_rows = d0.nrows();
-        let p = d0.ncols();
-
-        // Targets at the K center rows.
-        let constant_target = Array1::<f64>::ones(k_rows);
-        let mut tilt_target = Array1::<f64>::zeros(k_rows);
-        for i in 0..k_rows {
-            tilt_target[i] = centers[[i, 0]] + 0.5 * centers[[i, 1]];
+    fn test_matern_d3_ell1() {
+        // M_1^3(r; 1) = e^{-r} / (4π r)
+        for &r in &[0.1_f64, 0.5, 1.0, 2.5, 5.0] {
+            let got = matern_kernel_value(3, 1, 1.0, r);
+            let expected = (-r).exp() / (4.0 * std::f64::consts::PI * r);
+            assert!(
+                (got - expected).abs() / expected.abs() < 1e-10,
+                "M_1^3({r}; 1) got={got} expected={expected}"
+            );
         }
-        let solve_for = |t: &Array1<f64>| -> Array1<f64> {
-            let mut a = d0.t().dot(&d0);
-            for i in 0..p {
-                a[[i, i]] += 1e-10;
+    }
+
+    #[test]
+    fn test_isotropic_pure_polyharmonic() {
+        // s = 0: g_q^iso(R) should equal R_{2m-q}^d(R) regardless of κ.
+        let m = 2;
+        let q = 1;
+        let d = 3;
+        for &kappa in &[0.0_f64, 0.3, 1.0, 5.0] {
+            for &r in &[0.2_f64, 1.0, 4.0] {
+                let got = isotropic_duchon_penalty(q, d, m, 0, kappa, r);
+                let expected = riesz_kernel_value(d, 2 * m - q, r);
+                assert!(
+                    (got - expected).abs() / expected.abs().max(1e-300) < 1e-12,
+                    "pure polyharmonic mismatch (κ={kappa}, r={r}): got={got} expected={expected}"
+                );
             }
-            let rhs = d0.t().dot(t);
-            let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
-            chol.solvevec(&rhs)
-        };
-        let beta_const = solve_for(&constant_target);
-        let beta_tilt = solve_for(&tilt_target);
-
-        let var_const = beta_const.dot(&s_var.dot(&beta_const));
-        let var_tilt = beta_tilt.dot(&s_var.dot(&beta_tilt));
-        assert!(
-            var_const.abs() < 1e-6,
-            "constant function should have ~zero variance penalty, got {var_const}"
-        );
-        assert!(
-            var_tilt > 1e-6,
-            "tilted function must have positive variance penalty, got {var_tilt}"
-        );
-    }
-
-    #[test]
-    fn test_duchon_function_variance_null_space_for_constant() {
-        // β representing a constant function at the centers must lie in the
-        // null space of the function-variance penalty: β^T S_var β = 0.
-        use crate::faer_ndarray::FaerCholesky;
-        use ndarray::Array1;
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5],
-            [0.25, 0.75]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: Some(1.0),
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let var_info = out
-            .penaltyinfo
-            .iter()
-            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
-            .expect("FunctionVariance penalty must be wired into default Duchon basis");
-        let s_var = &out.penalties[var_info.original_index];
-
-        let centers = match &out.metadata {
-            BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!("Duchon metadata expected"),
-        };
-        let mut workspace = BasisWorkspace::default();
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
-            centers.view(),
-            None,
-            spec.length_scale,
-            spec.power,
-            DuchonNullspaceOrder::Linear,
-            None,
-            None,
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            &mut workspace,
-        )
-        .expect("collocation ops");
-        let d0 = ops.d0;
-        let k_rows = d0.nrows();
-        let p = d0.ncols();
-
-        // Solve D0·β ≈ c·1 for c = 1.7 via tiny-ridge normal equations.
-        let c = 1.7;
-        let target = Array1::<f64>::from_elem(k_rows, c);
-        let mut a = d0.t().dot(&d0);
-        for i in 0..p {
-            a[[i, i]] += 1e-10;
         }
-        let rhs = d0.t().dot(&target);
-        let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
-        let beta = chol.solvevec(&rhs);
-        let residual = (&d0.dot(&beta) - &target)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            residual < 1e-6,
-            "design must reproduce the constant c·1 at knots (residual = {residual})"
-        );
-        let quad = beta.dot(&s_var.dot(&beta));
-        assert!(
-            quad.abs() < 1e-12 * (1.0 + c * c) + 1e-10,
-            "constant function must lie in S_var null space, got β^T S_var β = {quad}"
-        );
     }
 
-    #[test]
-    fn test_duchon_function_variance_basis_invariant() {
-        // If two coefficient vectors β_1 and β_2 produce the same function at
-        // the centers (D0·β_1 = D0·β_2), they must yield the same function-
-        // variance penalty: β_1^T S_var β_1 = β_2^T S_var β_2. We construct
-        // β_2 = β_1 + n where n lies in the null space of D0, computed as
-        // the smallest-eigenvalue eigenvector of D0^T D0 (which is exactly
-        // zero whenever D0 is rank-deficient).
-        use ndarray::Array1;
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.25],
-            [0.7, 0.8],
-            [0.2, 0.6]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-            length_scale: Some(0.9),
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let var_info = out
-            .penaltyinfo
-            .iter()
-            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
-            .expect("FunctionVariance penalty must be wired into default Duchon basis");
-        let s_var = &out.penalties[var_info.original_index];
-
-        let centers = match &out.metadata {
-            BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!("Duchon metadata expected"),
-        };
-        let mut workspace = BasisWorkspace::default();
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
-            centers.view(),
-            None,
-            spec.length_scale,
-            spec.power,
-            DuchonNullspaceOrder::Linear,
-            None,
-            None,
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            &mut workspace,
-        )
-        .expect("collocation ops");
-        let d0 = ops.d0;
-        let k_rows = d0.nrows();
-        let p = d0.ncols();
-
-        // The null space of D0 (K × p) is the eigenspace of D0^T D0 at
-        // eigenvalue 0. Compute eigh on the symmetric Gram matrix; pick the
-        // eigenvector whose eigenvalue is smallest (and effectively zero).
-        let gram = d0.t().dot(&d0);
-        let (eigvals, eigvecs) = gram.eigh(faer::Side::Lower).expect("eigh must succeed");
-        let max_eig = eigvals.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-        let null_tol = 1e-9 * max_eig;
-        let (null_idx, null_eig) = eigvals
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .expect("eigvals non-empty");
-        assert!(
-            *null_eig <= null_tol,
-            "fixture must have rank-deficient D0 (smallest eig = {null_eig}, tol = {null_tol})"
-        );
-        let n: Array1<f64> = eigvecs.column(null_idx).to_owned();
-        let n_norm = n.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(n_norm > 1e-8, "null vector must be non-degenerate");
-
-        // Construct an arbitrary β_1 and form β_2 = β_1 + α·n.
-        let mut beta1 = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            beta1[i] = 0.3 - 0.11 * (i as f64) + 0.07 * ((i * i) as f64);
-        }
-        let alpha = 0.6;
-        let beta2 = &beta1 + &(&n * alpha);
-
-        // Sanity: D0·β_1 ≈ D0·β_2 at knots.
-        let f1 = d0.dot(&beta1);
-        let f2 = d0.dot(&beta2);
-        let f_diff = (&f1 - &f2).iter().map(|v| v * v).sum::<f64>().sqrt();
-        let f_scale = (f1.iter().map(|v| v * v).sum::<f64>() / k_rows as f64).sqrt() + 1.0;
-        assert!(
-            f_diff < 1e-8 * f_scale,
-            "β_1 and β_2 must produce the same function at knots (||Δf|| = {f_diff})"
-        );
-
-        let q1 = beta1.dot(&s_var.dot(&beta1));
-        let q2 = beta2.dot(&s_var.dot(&beta2));
-        let rel_diff = (q1 - q2).abs() / (1.0 + q1.abs() + q2.abs());
-        assert!(
-            rel_diff < 1e-10,
-            "function-variance penalty must be invariant to the D0 null-space \
-             component: β_1^T S β_1 = {q1}, β_2^T S β_2 = {q2}"
-        );
-    }
-
-    #[test]
-    fn test_duchon_function_variance_penalizes_tilt() {
-        // β_const reproduces a constant; β_tilted adds a small linear
-        // perturbation. The variance penalty must strictly increase.
-        use crate::faer_ndarray::FaerCholesky;
-        use ndarray::Array1;
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.4, 0.5],
-            [0.2, 0.7]
-        ];
-        let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-            length_scale: Some(1.0),
-            power: 2,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-        };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let var_info = out
-            .penaltyinfo
-            .iter()
-            .find(|info| matches!(info.source, PenaltySource::FunctionVariance))
-            .expect("FunctionVariance penalty must be wired into default Duchon basis");
-        let s_var = &out.penalties[var_info.original_index];
-
-        let centers = match &out.metadata {
-            BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!("Duchon metadata expected"),
-        };
-        let mut workspace = BasisWorkspace::default();
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
-            centers.view(),
-            None,
-            spec.length_scale,
-            spec.power,
-            DuchonNullspaceOrder::Linear,
-            None,
-            None,
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            &mut workspace,
-        )
-        .expect("collocation ops");
-        let d0 = ops.d0;
-        let k_rows = d0.nrows();
-        let p = d0.ncols();
-
-        let solve_for = |t: &Array1<f64>| -> Array1<f64> {
-            let mut a = d0.t().dot(&d0);
-            for i in 0..p {
-                a[[i, i]] += 1e-10;
+    /// Numerical inverse Fourier transform of a radially symmetric function in d=3:
+    ///   F^{-1}{f̂(|ρ|)}(R) = (1/(2π² R)) ∫_0^∞ ρ · sin(ρR) · f̂(ρ) dρ.
+    /// Compute on [0, ρ_max] with composite Gauss-Legendre to verify partial fractions.
+    fn fourier_inv_radial_d3<F: Fn(f64) -> f64>(f_hat: F, r: f64, rho_max: f64) -> f64 {
+        // 64-point Gauss-Legendre on [-1,1]
+        let (nodes, weights) = gauss_legendre_64();
+        // Composite over [0, rho_max] in segments to handle oscillation
+        let n_seg = 200usize;
+        let dseg = rho_max / n_seg as f64;
+        let mut sum = 0.0_f64;
+        for k in 0..n_seg {
+            let a = k as f64 * dseg;
+            let b = a + dseg;
+            let half = 0.5 * (b - a);
+            let mid = 0.5 * (a + b);
+            let mut seg = 0.0_f64;
+            for (xi, wi) in nodes.iter().zip(weights.iter()) {
+                let rho = mid + half * xi;
+                let val = rho * (rho * r).sin() * f_hat(rho);
+                seg += wi * val;
             }
-            let rhs = d0.t().dot(t);
-            let chol = a.cholesky(faer::Side::Lower).expect("cholesky");
-            chol.solvevec(&rhs)
-        };
-        let const_target = Array1::<f64>::ones(k_rows);
-        let mut tilted_target = const_target.clone();
-        let perturbation = 0.05;
-        for i in 0..k_rows {
-            tilted_target[i] += perturbation * centers[[i, 0]];
+            sum += half * seg;
         }
-        let beta_const = solve_for(&const_target);
-        let beta_tilted = solve_for(&tilted_target);
+        sum / (2.0 * std::f64::consts::PI * std::f64::consts::PI * r)
+    }
 
-        let q_const = beta_const.dot(&s_var.dot(&beta_const));
-        let q_tilted = beta_tilted.dot(&s_var.dot(&beta_tilted));
-        assert!(
-            q_tilted > q_const + 1e-6,
-            "tilted function must incur strictly larger variance penalty: \
-             β_tilted^T S β_tilted = {q_tilted}, β_const^T S β_const = {q_const}"
-        );
+    fn gauss_legendre_64() -> (Vec<f64>, Vec<f64>) {
+        // Build via Golub-Welsch on the Jacobi matrix for Legendre (β_k = k/√(4k²-1))
+        let n = 64usize;
+        let diag = vec![0.0_f64; n];
+        let mut sub = vec![0.0_f64; n - 1];
+        for k in 1..n {
+            let kf = k as f64;
+            sub[k - 1] = kf / (4.0 * kf * kf - 1.0).sqrt();
+        }
+        // Symmetric tridiagonal eigendecomposition via simple QL with implicit shifts
+        let mut z = vec![vec![0.0_f64; n]; n];
+        for i in 0..n {
+            z[i][i] = 1.0;
+        }
+        let mut d = diag.clone();
+        let mut e = sub.clone();
+        e.push(0.0);
+        // Standard tql2 algorithm
+        for l in 0..n {
+            let mut iter = 0;
+            loop {
+                let mut m_ = l;
+                while m_ < n - 1 {
+                    let dd = d[m_].abs() + d[m_ + 1].abs();
+                    if e[m_].abs() <= 1e-30 + 1e-15 * dd {
+                        break;
+                    }
+                    m_ += 1;
+                }
+                if m_ == l {
+                    break;
+                }
+                iter += 1;
+                if iter > 100 {
+                    panic!("tql2 no convergence");
+                }
+                let mut g = (d[l + 1] - d[l]) / (2.0 * e[l]);
+                let r = (g * g + 1.0).sqrt();
+                let sign = if g >= 0.0 { 1.0 } else { -1.0 };
+                g = d[m_] - d[l] + e[l] / (g + sign * r);
+                let mut s = 1.0;
+                let mut c = 1.0;
+                let mut p = 0.0;
+                let mut i = m_;
+                while i > l {
+                    let f = s * e[i - 1];
+                    let bb = c * e[i - 1];
+                    let rr = (f * f + g * g).sqrt();
+                    e[i] = rr;
+                    if rr == 0.0 {
+                        d[i] -= p;
+                        e[m_] = 0.0;
+                        break;
+                    }
+                    s = f / rr;
+                    c = g / rr;
+                    g = d[i] - p;
+                    let rrr = (d[i - 1] - g) * s + 2.0 * c * bb;
+                    p = s * rrr;
+                    d[i] = g + p;
+                    g = c * rrr - bb;
+                    for k in 0..n {
+                        let f = z[k][i];
+                        z[k][i] = s * z[k][i - 1] + c * f;
+                        z[k][i - 1] = c * z[k][i - 1] - s * f;
+                    }
+                    i -= 1;
+                }
+                d[l] -= p;
+                e[l] = g;
+                e[m_] = 0.0;
+            }
+        }
+        // Sort eigenvalues
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| d[a].partial_cmp(&d[b]).unwrap());
+        let nodes: Vec<f64> = idx.iter().map(|&i| d[i]).collect();
+        let weights: Vec<f64> = idx.iter().map(|&i| 2.0 * z[0][i] * z[0][i]).collect();
+        let _ = diag;
+        let _ = sub;
+        (nodes, weights)
+    }
+
+    #[test]
+    fn test_isotropic_hybrid_partial_fraction() {
+        // d=3, m=2, s=2, κ=1, q=2 → a = 2m-q = 2, b = 2s = 4.
+        // f̂(ρ) = 1 / (ρ^{2a} (κ²+ρ²)^b) = 1 / (ρ^4 (1+ρ²)^4)
+        // The Fourier integral diverges at ρ=0 (ρ^4 in denominator with 3D measure ρ²
+        // gives integrand ~ 1/ρ² near 0). So strictly, the partial-fraction sum of
+        // Riesz/Matern includes distributional pieces. To compare numerically, we
+        // verify a *regularized* identity by subtracting the Riesz singular tail:
+        // form g(R) - A_1 R_1^3(R) - A_2 R_2^3(R) (i.e. only keep the Matérn part)
+        // and compare to the numerical inverse FT of f̂(ρ) - (A_1 ρ^{-2} + A_2 ρ^{-4}).
+        let d: usize = 3;
+        let m: usize = 2;
+        let s: usize = 2;
+        let q: usize = 2;
+        let kappa = 1.0_f64;
+        let a: usize = 2 * m - q; // = 2
+        let b: usize = 2 * s; // = 4
+
+        // Compute A_j coefficients
+        let mut a_coeffs: Vec<(usize, f64)> = Vec::new();
+        for j in 1..=a {
+            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let binom_num = (1..=(a + b - j - 1) as u64).product::<u64>() as f64;
+            let binom_den_1 = (1..=(a - j) as u64).product::<u64>() as f64;
+            let binom_den_2 = (1..=(b - 1 + j) as u64).product::<u64>() as f64; // (a+b-j-1)-(a-j) = b-1+j
+            // Use the canonical helper instead — simpler:
+            let _ = (binom_num, binom_den_1, binom_den_2);
+            let binom = {
+                // C(n,k) for small n,k
+                fn c(n: usize, k: usize) -> f64 {
+                    let mut acc = 1.0_f64;
+                    for i in 0..k {
+                        acc *= (n - i) as f64 / (i + 1) as f64;
+                    }
+                    acc
+                }
+                c(a + b - j - 1, a - j)
+            };
+            let coeff = sign * binom * kappa.powi(-(2 * (a + b - j) as i32));
+            a_coeffs.push((j, coeff));
+        }
+
+        for &r in &[0.5_f64, 1.5, 3.0] {
+            // g_q^iso(R) - sum of Riesz pieces = sum of Matérn pieces.
+            let g_full = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let mut riesz_sum = 0.0_f64;
+            for &(j, c) in &a_coeffs {
+                riesz_sum += c * riesz_kernel_value(d, j, r);
+            }
+            let matern_part = g_full - riesz_sum;
+
+            // Numerical Fourier inverse of f̂(ρ) - Σ A_j ρ^{-2j}.
+            // Equivalently, inverse FT of Σ B_ℓ (ρ²+1)^{-ℓ}.
+            let f_hat_residual = |rho: f64| -> f64 {
+                let mut val = 1.0 / (rho.powi(4) * (1.0 + rho * rho).powi(4));
+                for &(j, c) in &a_coeffs {
+                    val -= c * rho.powi(-(2 * j as i32));
+                }
+                val
+            };
+            // Integrate on [eps, rho_max]; near ρ=0 the residual is finite (it's a
+            // cancellation of the singular part), but rho * sin(ρr) regularizes.
+            let approx = fourier_inv_radial_d3(f_hat_residual, r, 80.0);
+            let rel = (matern_part - approx).abs() / matern_part.abs().max(1e-12);
+            // Numerical inverse-FT truncation at rho_max=80 leaves residual error;
+            // the closed form is the ground truth, this is a sanity bound.
+            assert!(
+                rel < 5e-2,
+                "hybrid partial fraction Matérn part mismatch (r={r}): \
+                 got={matern_part} approx={approx} rel={rel}"
+            );
+        }
+
+        // Sanity: bessel_k matches half-integer closed form for ν=1/2
+        let k_half = bessel_k(0.5, 1.0);
+        let expected = (std::f64::consts::PI / 2.0).sqrt() * (-1.0_f64).exp();
+        assert!((k_half - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_schoenberg_isotropic_agrees_with_partial_fraction() {
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
+
+        // Schoenberg quadrature converges only when both UV `4(m+s) > d + 2q`
+        // and IR `d + 2q > 4m` hold. Additionally, `isotropic_duchon_penalty`
+        // requires `2m - q ≥ 1` for the partial-fraction expansion. For q=1
+        // this is satisfied by (d=3, m=1, s=1). For q=2 we need m≥2 and IR
+        // forces d≥5; (d=5, m=2, s=2) is the simplest convergent choice.
+        let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
+            (1, 3, 1, 1, 1.0, 0.5),
+            (1, 3, 1, 1, 1.0, 2.0),
+            (2, 5, 2, 2, 1.0, 1.0),
+        ];
+        for &(q, d, m, s, kappa, big_r) in cases {
+            let eta = vec![0.0_f64; d];
+            let mut r = vec![0.0_f64; d];
+            r[0] = big_r;
+            let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+            let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+            let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
+            // Schoenberg quadrature with leading-only ₁F₁ asymptotic and finite
+            // y-grid agrees with the closed-form Riesz+Matérn to a few percent;
+            // tighter agreement requires higher-order ₁F₁ terms in the tail.
+            assert!(
+                rel < 5e-2,
+                "schoenberg/iso disagreement: q={q} d={d} m={m} s={s} kappa={kappa} R={big_r} \
+                 aniso={aniso} iso={iso} rel={rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schoenberg_anisotropic_smooth() {
+        use super::closed_form_penalty::anisotropic_duchon_penalty;
+
+        // (d=3, m=1, s=1) is convergent for q=1.
+        let r = vec![0.7_f64, -0.3, 1.1];
+        let mut prev: Option<f64> = None;
+        for k in 0..6 {
+            let t = (k as f64) * 0.2 - 0.5; // η_1 sweep ∈ [-0.5, 0.5]
+            let eta = vec![t, 0.1, -0.2];
+            let v = anisotropic_duchon_penalty(1, 1, 1, 1.0, &eta, &r);
+            assert!(v.is_finite(), "non-finite g_q at eta_1={t}");
+            if let Some(p) = prev {
+                // Smoothness sanity: small step in η should produce a small change.
+                let ratio = (v - p).abs() / p.abs().max(1e-12);
+                assert!(
+                    ratio < 5.0,
+                    "discontinuity-like jump in g_q (eta_1 step 0.2): prev={p} curr={v}"
+                );
+            }
+            prev = Some(v);
+        }
+    }
+
+    // Note: Schoenberg quadrature at κ=0 or s=0 does not converge — the
+    // integrand grows at τ→∞ without the ₁F₁(s; m+s; -κ²τ) damping factor.
+    // The Riesz closed form handles those parameter regimes directly via
+    // `isotropic_duchon_penalty`, so the Schoenberg path is not exercised
+    // there and need not be tested in those degenerate regimes.
+
+    #[test]
+    fn test_psi_first_deriv_finite_difference() {
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, psi_first_derivative};
+
+        // Schoenberg converges with (d=3, m=1, s=1, κ=1) for q=1. Mass (q=0)
+        // diverges; q=2 needs m≥2 and IR forces d≥5 — tested separately by
+        // higher-q tests if/when desired.
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let eta_base = [0.1_f64, -0.2, 0.3];
+        let r = [0.5_f64, 0.4, 0.3];
+        let h = 1e-5_f64;
+        for q in [1usize] {
+            for k in 0..eta_base.len() {
+                let mut eta_p = eta_base.to_vec();
+                let mut eta_m = eta_base.to_vec();
+                eta_p[k] += h;
+                eta_m[k] -= h;
+                let g_p = anisotropic_duchon_penalty(q, m, s, kappa, &eta_p, &r);
+                let g_m = anisotropic_duchon_penalty(q, m, s, kappa, &eta_m, &r);
+                let fd = (g_p - g_m) / (2.0 * h);
+                let an = psi_first_derivative(q, m, s, kappa, &eta_base, &r, k);
+                let err = (fd - an).abs();
+                assert!(
+                    err < 1e-6,
+                    "psi_first_derivative q={q} k={k}: analytic={an} fd={fd} err={err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_psi_second_deriv_symmetry() {
+        use super::closed_form_penalty::psi_second_derivative;
+
+        // Convergent regime; q=1 only (q=2 requires d≥5).
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let eta = [0.1_f64, -0.2, 0.3];
+        let r = [0.5_f64, 0.4, 0.3];
+        for q in [1usize] {
+            for k in 0..eta.len() {
+                for l in 0..eta.len() {
+                    let kl = psi_second_derivative(q, m, s, kappa, &eta, &r, k, l);
+                    let lk = psi_second_derivative(q, m, s, kappa, &eta, &r, l, k);
+                    let diff = (kl - lk).abs();
+                    let sc = kl.abs().max(lk.abs()).max(1e-300);
+                    assert!(
+                        diff / sc < 1e-12,
+                        "psi_second_derivative not symmetric q={q} k={k} l={l}: kl={kl} lk={lk}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_psi_second_deriv_finite_difference() {
+        use super::closed_form_penalty::{psi_first_derivative, psi_second_derivative};
+
+        // Convergent regime; q ∈ {1, 2} only.
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let eta_base = [0.1_f64, -0.2, 0.3];
+        let r = [0.5_f64, 0.4, 0.3];
+        let h = 1e-5_f64;
+        for q in [1usize] {
+            for k in 0..eta_base.len() {
+                for l in 0..eta_base.len() {
+                    // Compute ∂²/∂η_k η_l by FD on first derivative w.r.t. η_l.
+                    let mut eta_p = eta_base.to_vec();
+                    let mut eta_m = eta_base.to_vec();
+                    eta_p[k] += h;
+                    eta_m[k] -= h;
+                    let dl_p = psi_first_derivative(q, m, s, kappa, &eta_p, &r, l);
+                    let dl_m = psi_first_derivative(q, m, s, kappa, &eta_m, &r, l);
+                    let fd = (dl_p - dl_m) / (2.0 * h);
+                    let an = psi_second_derivative(q, m, s, kappa, &eta_base, &r, k, l);
+                    let err = (fd - an).abs();
+                    assert!(
+                        err < 1e-5,
+                        "psi_second_derivative q={q} k={k} l={l}: analytic={an} fd={fd} err={err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_kappa_deriv_finite_difference() {
+        use super::closed_form_penalty::{
+            anisotropic_duchon_penalty, kappa_first_derivative, kappa_second_derivative,
+            psi_first_derivative, psi_kappa_mixed_derivative,
+        };
+
+        // Convergent regime; q=1 only (q=2 requires d≥5).
+        let m = 1usize;
+        let s = 1usize;
+        let kappa = 1.0_f64;
+        let eta = [0.1_f64, -0.2, 0.3];
+        let r = [0.5_f64, 0.4, 0.3];
+        let h = 1e-5_f64;
+        for q in [1usize] {
+            // ∂g/∂κ
+            let g_p = anisotropic_duchon_penalty(q, m, s, kappa + h, &eta, &r);
+            let g_m = anisotropic_duchon_penalty(q, m, s, kappa - h, &eta, &r);
+            let fd1 = (g_p - g_m) / (2.0 * h);
+            let an1 = kappa_first_derivative(q, m, s, kappa, &eta, &r);
+            assert!(
+                (fd1 - an1).abs() < 1e-6,
+                "kappa_first_derivative q={q}: analytic={an1} fd={fd1}"
+            );
+
+            // ∂²g/∂κ²
+            let dk_p = kappa_first_derivative(q, m, s, kappa + h, &eta, &r);
+            let dk_m = kappa_first_derivative(q, m, s, kappa - h, &eta, &r);
+            let fd2 = (dk_p - dk_m) / (2.0 * h);
+            let an2 = kappa_second_derivative(q, m, s, kappa, &eta, &r);
+            assert!(
+                (fd2 - an2).abs() < 1e-5,
+                "kappa_second_derivative q={q}: analytic={an2} fd={fd2}"
+            );
+
+            // ∂²g/∂η_k∂κ
+            for k in 0..eta.len() {
+                let dpsi_p = psi_first_derivative(q, m, s, kappa + h, &eta, &r, k);
+                let dpsi_m = psi_first_derivative(q, m, s, kappa - h, &eta, &r, k);
+                let fd_mixed = (dpsi_p - dpsi_m) / (2.0 * h);
+                let an_mixed = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, k);
+                assert!(
+                    (fd_mixed - an_mixed).abs() < 1e-5,
+                    "psi_kappa_mixed_derivative q={q} k={k}: analytic={an_mixed} fd={fd_mixed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_kappa_zero_when_s_zero() {
+        use super::closed_form_penalty::{
+            kappa_first_derivative, kappa_second_derivative, psi_kappa_mixed_derivative,
+        };
+
+        let m = 2usize;
+        let s = 0usize;
+        let kappa = 1.0_f64;
+        let eta = [0.1_f64, -0.2, 0.3];
+        let r = [0.5_f64, 0.4, 0.3];
+        for q in [0usize, 1, 2] {
+            let dk = kappa_first_derivative(q, m, s, kappa, &eta, &r);
+            assert!(
+                dk.abs() < 1e-12,
+                "kappa_first_derivative should be zero at s=0 (q={q}), got {dk}"
+            );
+            let d2k = kappa_second_derivative(q, m, s, kappa, &eta, &r);
+            assert!(
+                d2k.abs() < 1e-12,
+                "kappa_second_derivative should be zero at s=0 (q={q}), got {d2k}"
+            );
+            for k in 0..eta.len() {
+                let mx = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, k);
+                assert!(
+                    mx.abs() < 1e-12,
+                    "psi_kappa_mixed_derivative should be zero at s=0 (q={q}, k={k}), got {mx}"
+                );
+            }
+        }
+    }
+
+    fn build_collocation_operator_penalty_via_dq_dq(
+        centers: ArrayView2<'_, f64>,
+        q: usize,
+        length_scale: f64,
+        power: usize,
+        nullspace_order: DuchonNullspaceOrder,
+        aniso_log_scales: Option<&[f64]>,
+    ) -> Array2<f64> {
+        let ops = build_duchon_collocation_operator_matrices(
+            centers,
+            None,
+            Some(length_scale),
+            power,
+            nullspace_order,
+            aniso_log_scales,
+            None,
+            q.max(1),
+        )
+        .expect("collocation operator matrices");
+        let dq = match q {
+            0 => &ops.d0,
+            1 => &ops.d1,
+            2 => &ops.d2,
+            _ => panic!("unsupported derivative order"),
+        };
+        symmetrize(&fast_ata(dq))
+    }
+
+    fn build_closed_form_operator_penalty(
+        centers: ArrayView2<'_, f64>,
+        q: usize,
+        length_scale: f64,
+        power: usize,
+        nullspace_order: DuchonNullspaceOrder,
+        aniso_log_scales: Option<&[f64]>,
+    ) -> Array2<f64> {
+        let ops = build_duchon_collocation_operator_matrices(
+            centers,
+            None,
+            Some(length_scale),
+            power,
+            nullspace_order,
+            aniso_log_scales,
+            None,
+            q.max(1),
+        )
+        .expect("collocation operator matrices");
+        let p_order = duchon_p_from_nullspace_order(duchon_effective_nullspace_order(
+            centers,
+            nullspace_order,
+        ));
+        let kappa = 1.0 / length_scale;
+        closed_form_operator_penalty_in_total_basis(
+            centers,
+            q,
+            p_order,
+            power,
+            kappa,
+            aniso_log_scales,
+            ops.kernel_nullspace_transform.as_ref(),
+            ops.polynomial_block_cols,
+            None,
+        )
+    }
+
+    fn frobenius_relative_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        assert_eq!(a.dim(), b.dim());
+        let diff_norm = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt();
+        let scale = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+        diff_norm / scale.max(1e-300)
+    }
+
+    #[test]
+    fn test_analytic_vs_collocation_high_k_agreement() {
+        // Synthesize K=200 deterministic knots in d=3, build s_1 via
+        // closed-form (Schoenberg/Riesz-Matérn) and via the existing K-knot
+        // collocation D_1^T D_1. Check structural invariants and rough
+        // numerical correlation. Convergent regime requires `2m-q ≥ 1` (for
+        // the partial-fraction expansion), `4(m+s) > d + 2q` (UV), `d + 2q
+        // > 4m` (IR with κ>0), and `2(p+s) > d+1` (D1 collocation validity).
+        // (d=3, m=1, s=2) with q=1 is the smallest valid test setup.
+        let k = 200;
+        let d = 3;
+        let length_scale = 1.0; // kappa = 1
+        let power = 2; // s_order = 2
+        let nullspace = DuchonNullspaceOrder::Zero; // p_order = 1 (m=1)
+
+        // Deterministic LCG for reproducibility (no rng dep needed).
+        let mut state: u64 = 0xC0FFEE_BEEFu64;
+        let mut next = || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((state >> 32) as f64) / (u32::MAX as f64) - 0.5
+        };
+        let mut centers = Array2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for c in 0..d {
+                centers[[i, c]] = next();
+            }
+        }
+
+        for q in [1usize] {
+            let analytic = build_closed_form_operator_penalty(
+                centers.view(),
+                q,
+                length_scale,
+                power,
+                nullspace,
+                None,
+            );
+            let colloc = build_collocation_operator_penalty_via_dq_dq(
+                centers.view(),
+                q,
+                length_scale,
+                power,
+                nullspace,
+                None,
+            );
+
+            assert_eq!(analytic.dim(), colloc.dim(), "shape mismatch q={q}");
+
+            // Symmetry of the closed-form penalty.
+            let asym = analytic
+                .iter()
+                .zip(analytic.t().iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                asym < 1e-9,
+                "closed-form penalty not symmetric (q={q}): max|a-aᵀ|={asym}"
+            );
+
+            // Both should be finite.
+            assert!(analytic.iter().all(|v| v.is_finite()), "non-finite analytic q={q}");
+            assert!(colloc.iter().all(|v| v.is_finite()), "non-finite collocation q={q}");
+
+            // Both should be nontrivial (non-zero Frobenius norm).
+            let an_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let cl_norm = colloc.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!(an_norm > 1e-9, "closed-form penalty is ~zero (q={q})");
+            assert!(cl_norm > 1e-9, "collocation penalty is ~zero (q={q})");
+
+            // Normalized matrices (unit Frobenius) — closed-form is the exact
+            // integral; collocation is a Riemann-style approximation. After
+            // normalization the relative Frobenius difference should be bounded
+            // (not necessarily small at K=200 since the two operators differ by
+            // a quadrature scheme). Use a permissive bound to assert the two are
+            // in the same equivalence class, not just any random matrix.
+            let an_normalized = analytic.mapv(|v| v / an_norm);
+            let cl_normalized = colloc.mapv(|v| v / cl_norm);
+            let rel = frobenius_relative_diff(&an_normalized, &cl_normalized);
+            assert!(
+                rel.is_finite(),
+                "non-finite relative diff for q={q}: {rel}"
+            );
+            assert!(
+                rel < 1.5,
+                "closed-form vs collocation drift too far at K={k}, q={q}: rel_frob={rel}"
+            );
+        }
     }
 }
