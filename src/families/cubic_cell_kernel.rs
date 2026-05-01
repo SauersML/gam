@@ -1,4 +1,4 @@
-use crate::probability::{binomial_coefficient_f64, normal_cdf};
+use crate::probability::normal_cdf;
 
 // De-nested cubic transport kernel.
 //
@@ -1135,32 +1135,60 @@ fn exp_neg_half_square(x: f64) -> f64 {
     }
 }
 
-fn truncated_gaussian_moment_raw(a: f64, b: f64, order: usize) -> f64 {
-    match order {
-        0 => {
-            let cdf = |x: f64| {
-                if x.is_infinite() {
-                    if x.is_sign_positive() { 1.0 } else { 0.0 }
-                } else {
-                    0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
-                }
-            };
-            (2.0 * std::f64::consts::PI).sqrt() * (cdf(b) - cdf(a))
+/// Fill `out[0..=max_degree]` with the raw truncated standard-normal moments
+///
+///     T_n(a, b) = ∫_a^b z^n exp(-z²/2) dz
+///
+/// using the integration-by-parts recurrence
+///
+///     T_0(a, b) = √(2π) (Φ(b) − Φ(a))
+///     T_1(a, b) = exp(−a²/2) − exp(−b²/2)
+///     T_n(a, b) = a^(n−1) e^{−a²/2} − b^(n−1) e^{−b²/2} + (n−1) T_{n−2}(a, b)
+///
+/// Computed in one forward sweep so each call evaluates `erf` and
+/// `exp(−x²/2)` exactly twice (once at `a`, once at `b`) regardless of the
+/// requested degree. The naive form — calling `T_n` recursively for each
+/// `n = 0..=max_degree` — re-evaluated `erf`/`exp` about `max_degree²/4`
+/// times per affine cell, which dominated the wall time of the
+/// transformation-normal and bernoulli-marginal-slope inner solves with
+/// `max_degree = 64` (the transport order's required degree budget).
+fn fill_truncated_gaussian_moments(a: f64, b: f64, out: &mut [f64]) {
+    if out.is_empty() {
+        return;
+    }
+    let cdf = |x: f64| -> f64 {
+        if x.is_infinite() {
+            if x.is_sign_positive() { 1.0 } else { 0.0 }
+        } else {
+            0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
         }
-        1 => exp_neg_half_square(a) - exp_neg_half_square(b),
-        n => {
-            let left = if a.is_infinite() {
-                0.0
-            } else {
-                a.powi((n - 1) as i32) * exp_neg_half_square(a)
-            };
-            let right = if b.is_infinite() {
-                0.0
-            } else {
-                b.powi((n - 1) as i32) * exp_neg_half_square(b)
-            };
-            left - right + (n as f64 - 1.0) * truncated_gaussian_moment_raw(a, b, n - 2)
-        }
+    };
+    out[0] = (2.0 * std::f64::consts::PI).sqrt() * (cdf(b) - cdf(a));
+    if out.len() == 1 {
+        return;
+    }
+    let ea = exp_neg_half_square(a);
+    let eb = exp_neg_half_square(b);
+    out[1] = ea - eb;
+    if out.len() == 2 {
+        return;
+    }
+    let a_finite = a.is_finite();
+    let b_finite = b.is_finite();
+    // For n in 2..=max_degree we need a^{n-1} e^{-a²/2} (resp. b). Carry the
+    // running powers a^{n-1}, b^{n-1} forward by a single multiply per step.
+    // Infinite endpoints contribute 0 (the integrand decays at the rate of
+    // exp(−x²/2)), matching the prior `is_infinite` branch in the recursive
+    // implementation; we still update the running power so the iteration
+    // stays branchless when both endpoints are finite.
+    let mut a_pow_n_minus_1 = a; // a^1, used at n = 2
+    let mut b_pow_n_minus_1 = b;
+    for n in 2..out.len() {
+        let left = if a_finite { a_pow_n_minus_1 * ea } else { 0.0 };
+        let right = if b_finite { b_pow_n_minus_1 * eb } else { 0.0 };
+        out[n] = left - right + (n as f64 - 1.0) * out[n - 2];
+        a_pow_n_minus_1 *= a;
+        b_pow_n_minus_1 *= b;
     }
 }
 
@@ -1193,17 +1221,31 @@ pub fn affine_anchor_moment_vector(
     };
     let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
     let mut t = vec![0.0; max_degree + 1];
-    for (k, tk) in t.iter_mut().enumerate() {
-        *tk = truncated_gaussian_moment_raw(y_left, y_right, k);
+    fill_truncated_gaussian_moments(y_left, y_right, &mut t);
+    // Build mu^k and s^{-k} tables once. The inner sum is the binomial
+    // expansion of the affine change-of-variables, and computing the
+    // binomial coefficient via Pascal's row recurrence + carrying mu/s
+    // powers eliminates the per-(n, k) `powi` and binomial calls that
+    // otherwise dominated the inner loop at large `max_degree`.
+    let mut mu_pow = vec![1.0_f64; max_degree + 1];
+    for k in 1..=max_degree {
+        mu_pow[k] = mu_pow[k - 1] * mu;
+    }
+    let inv_s = 1.0 / s;
+    let mut inv_s_pow = vec![1.0_f64; max_degree + 1];
+    for k in 1..=max_degree {
+        inv_s_pow[k] = inv_s_pow[k - 1] * inv_s;
     }
     let mut out = vec![0.0; max_degree + 1];
     for n in 0..=max_degree {
         let mut acc = 0.0;
+        // C(n, k+1) = C(n, k) · (n − k) / (k + 1).
+        let mut binom = 1.0;
         for k in 0..=n {
-            acc += binomial_coefficient_f64(n, k)
-                * mu.powi((n - k) as i32)
-                * s.powi(-(k as i32))
-                * t[k];
+            acc += binom * mu_pow[n - k] * inv_s_pow[k] * t[k];
+            if k < n {
+                binom = binom * (n - k) as f64 / (k + 1) as f64;
+            }
         }
         out[n] = anchor * acc;
     }
