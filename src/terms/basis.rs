@@ -17587,39 +17587,45 @@ pub mod closed_form_penalty {
         // Taylor recurrence is exact. For EVEN d log-Riesz blocks appear
         // and we keep the legacy leading-term fallback (the full log
         // finite-part series is left for a follow-up).
+        // Cancellation gate (math team Letter B Taylor + cancellation
+        // detector). The literal Matérn partial-fraction sum is the
+        // primary path: it represents the literal kernel (whose inverse
+        // Fourier transform `Δ_B^q f(R)` is what the radial-form
+        // anisotropic builder computes too), so callers that compose
+        // `isotropic_duchon_penalty` against the radial chain stay
+        // consistent in any regime where the sum has reliable
+        // floating-point precision.
+        //
+        // We swap to the finite-part Taylor / ₁F₂ series only when BOTH
+        //   (a) we are in the small-κR regime (x = (κR)² < ~1.5) where
+        //       Taylor convergence is rapid AND its leading term R_N^d(R)
+        //       coincides with the literal kernel as κR → 0, AND
+        //   (b) the literal partial-fraction sum has actually lost
+        //       precision (χ = max|term|/|sum| > 1e8 ⇒ < 8 reliable
+        //       digits).
+        // Outside the small-κR regime the Taylor series is not the right
+        // analytic continuation of the literal kernel (math team Letter B
+        // caveat about non-Taylor branches); inside the regime but with
+        // healthy χ the literal sum already gives the consistent value.
+        // For even d log-Riesz blocks the legacy leading-term band-aid
+        // stands in for the (unimplemented) log finite-part series.
         let limit = riesz_kernel_value(d, a + b, r);
         let kappa_r = kappa * r;
         let x_taylor = kappa_r * kappa_r;
-        // Math team Letter B regime gate: when x = (κR)² ≲ 1.5 the
-        // finite-part Taylor / ₁F₂ series is the math-team-recommended
-        // primary path — its leading term is R_N^d(R) (the κ → 0 Riesz
-        // limit, faithfully captured), and higher-order κ² corrections
-        // are summed exactly without the κ^{-2(N-j)} cancellation that
-        // ruins the literal partial-fraction sum at small κR. For
-        // x ≥ 1.5 the κ^{-2k} factors in the partial-fraction expansion
-        // are O(1) so cancellation is benign and the partial-fraction
-        // sum stands.
-        //
-        // For ODD d the Riesz blocks R_{N+n}^d are pure powers and the
-        // Taylor recurrence is exact. For EVEN d log-Riesz blocks appear
-        // (the full log finite-part series is left for a follow-up); we
-        // keep a safety-net leading-term band-aid for small κR there
-        // when the cancellation condition number χ = max|term|/|sum|
-        // signals real precision loss.
         let chi = if sum.abs() > 0.0 {
             max_term / sum.abs()
         } else {
             f64::INFINITY
         };
-        if x_taylor < 1.5 {
+        let small_kappa_regime = x_taylor < 1.5;
+        let cancellation_lost = chi > 1.0e8;
+        if small_kappa_regime && cancellation_lost {
             if d % 2 == 1 {
                 if let Some(tay) = finite_part_duchon_taylor_odd_d(d, a, b, kappa, r) {
                     return tay;
                 }
             }
-            // Even d: only swap to the leading-term band-aid when
-            // partial-fraction cancellation has actually dominated.
-            if chi > 1.0e8 && kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
+            if kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
                 return limit;
             }
         }
