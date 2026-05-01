@@ -7842,6 +7842,11 @@ pub fn closed_form_anisotropic_pair_block(
         vec![0.0_f64; d]
     };
     let j_prefactor = eta_centered.iter().sum::<f64>().exp();
+    // Self-pair regularization: the analytic radial form is singular at R=0,
+    // and the Schoenberg integral also diverges at R=0 in routine (m,s,d,q)
+    // regimes. Use the same median-lag·1e-6 ε-displacement strategy as the
+    // pure-Duchon variant (`closed_form_anisotropic_pair_block_pure`).
+    let r_eps = pure_duchon_diagonal_epsilon(centers, &eta_centered);
     let mut g = Array2::<f64>::zeros((k, k));
     let mut r_buf = vec![0.0_f64; d];
     for i in 0..k {
@@ -7849,15 +7854,31 @@ pub fn closed_form_anisotropic_pair_block(
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
-            let val = j_prefactor
-                * closed_form_penalty::anisotropic_duchon_penalty(
-                    q,
-                    m,
-                    s,
-                    kappa,
-                    &eta_centered,
-                    &r_buf,
-                );
+            let val = if i == j {
+                let mut r_eps_buf = vec![0.0_f64; d];
+                if d > 0 {
+                    r_eps_buf[0] = r_eps * eta_centered[0].exp();
+                }
+                j_prefactor
+                    * closed_form_penalty::anisotropic_duchon_penalty_radial(
+                        q,
+                        m,
+                        s,
+                        kappa,
+                        &eta_centered,
+                        &r_eps_buf,
+                    )
+            } else {
+                j_prefactor
+                    * closed_form_penalty::anisotropic_duchon_penalty_radial(
+                        q,
+                        m,
+                        s,
+                        kappa,
+                        &eta_centered,
+                        &r_buf,
+                    )
+            };
             g[[i, j]] = val;
             if i != j {
                 g[[j, i]] = val;
@@ -14220,21 +14241,22 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    // Closed-form Lebesgue penalty: hybrid (κ>0) routes through the
-    // Schoenberg/Matérn closed-form path (when wired by `wire-in-full`),
-    // pure-Duchon (κ=0) routes through the analytic radial-derivative path
-    // which is finite for R > 0 in any (m, s, d, q) regime where
-    // `radial_derivatives_of_isotropic_duchon` is defined. Self-pair (R=0)
-    // entries are ε-regularized inside `closed_form_anisotropic_pair_block_pure`.
-    let candidates = if spec.length_scale.is_some() {
-        // Hybrid path stays on collocation here; `wire-in-full` will swap
-        // this branch to `operator_penalty_candidates_closed_form` once
-        // its divergence-regime detection lands.
-        operator_penalty_candidates_from_collocation(
+    // Closed-form Lebesgue penalty: both hybrid (κ>0) and pure-Duchon (κ=0)
+    // route through the analytic radial-derivative path. The radial form is
+    // finite for R > 0; self-pair (R=0) entries are ε-regularized inside
+    // `closed_form_anisotropic_pair_block` and its `_pure` counterpart.
+    let candidates = if let Some(length_scale) = spec.length_scale {
+        operator_penalty_candidates_closed_form(
+            centers.view(),
             &ops.d0,
-            &ops.d1,
-            &ops.d2,
             &spec.operator_penalties,
+            p_order,
+            spec.power,
+            length_scale,
+            aniso.as_deref(),
+            Some(&kernel_transform),
+            poly_cols,
+            identifiability_transform.as_ref(),
         )
     } else {
         operator_penalty_candidates_closed_form_pure(
