@@ -1766,6 +1766,11 @@ impl CustomFamily for TransformationNormalFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // Phase 2: SCOP outer derivatives pending. Linear-h' formula
+        // `6 X_derivᵀ diag(w · Du · Dv / h'⁴) X_deriv` is invalid under SCOP.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
         let h_prime = row_quantities.h_prime.as_ref();
@@ -1801,6 +1806,13 @@ impl CustomFamily for TransformationNormalFamily {
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        // Phase 2: SCOP outer derivatives pending. The sym_val/sym_deriv/cubic
+        // legs and the `TransformationNormalPsiHessianOperator` constructed
+        // below all assume h, h' are linear in β. Returning Ok(None) leaves
+        // the unified outer evaluator on the BFGS+BfgsApprox fallback.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -1890,6 +1902,12 @@ impl CustomFamily for TransformationNormalFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        // Phase 2: SCOP outer derivatives pending. The 9-term score and
+        // 13-term Hessian below are the linear-h derivation; symmetrization
+        // hides any chain-rule asymmetry.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -2172,6 +2190,11 @@ impl CustomFamily for TransformationNormalFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // Phase 2: SCOP outer derivatives pending. Same family of
+        // linear-h' kernels as 1740/1682.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -2492,6 +2515,14 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        // Phase 2: SCOP outer derivatives pending. The dH operator's per-row
+        // kernel `-2 w_i (X_deriv v)_i / h'_i³` assumes h' is linear in β;
+        // under SCOP-CTN h' = Σ_k γ_k(x)² M_k(y), so additional `2 γ_k(x)`
+        // chain-rule legs are required. Returning `Ok(None)` keeps the
+        // unified outer evaluator on the BFGS+BfgsApprox fallback.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         let p_total = self.p_total();
         if d_beta_flat.len() != p_total {
             return Err(format!(
@@ -2522,6 +2553,11 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        // Phase 2: SCOP outer derivatives pending. d²H linear-h' kernel
+        // `6 w_i (X_deriv u)_i (X_deriv v)_i / h'_i⁴` is invalid under SCOP.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         let p_total = self.p_total();
         if d_beta_u.len() != p_total || d_beta_v.len() != p_total {
             return Err(format!(

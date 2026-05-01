@@ -2572,7 +2572,7 @@ fn solve_newton_direction_dense(
 ///
 /// On success the negated solution `−H⁻¹ g` is written into `direction_out`,
 /// matching the sign convention of `solve_newton_direction_dense`.
-pub(crate) fn solve_newton_direction_implicit<F>(
+pub fn solve_newton_direction_implicit<F>(
     apply_xtwx: F,
     xtwx_diag: ArrayView1<'_, f64>,
     dense_penalties: &[(f64, &Array2<f64>)],
