@@ -4,28 +4,29 @@
 //! operator, this family estimates a smooth monotone transformation h(y | x) mapping
 //! the conditional distribution of Y|x onto a standard normal.
 //!
-//! The response-direction basis is `[1, y, anchored B-spline deviations]`, tensored
-//! with an arbitrary covariate design operator. The deviations are B-splines with
-//! value and first derivative projected to zero at the response median, so setting
-//! deviation coefficients to zero recovers an affine (location-scale) transformation
-//! exactly. Monotonicity is enforced by explicit derivative lower-bound
-//! constraints on a response grid, plus the natural `log(h')` barrier in the
-//! likelihood and a fraction-to-boundary line search.
+//! The response-direction basis is `[1, I_1(y), ..., I_K(y)]`, tensored with an
+//! arbitrary covariate design operator. Column 0 is an unconstrained location
+//! component `b(x)`. The I-spline columns are shape components with squared
+//! covariate-side coefficients, giving the SCOP representation
+//! `h(y, x) = b(x) + Σ_k I_k(y) γ_k(x)^2` and
+//! `h'(y, x) = Σ_k M_k(y) γ_k(x)^2`. Monotonicity is enforced by the
+//! non-negative M-spline derivative basis, explicit derivative lower-bound
+//! constraints on a response grid, the natural `log(h')` barrier in the
+//! likelihood, and a fraction-to-boundary line search.
 //!
 //! The log-likelihood per observation is the change-of-variables density for a
 //! standard normal target:
 //!
 //!   ℓ_i = -½ h_i² + log(h'_i)
 //!
-//! where h_i = x_val[i,:] · β and h'_i = x_deriv[i,:] · β.
+//! where `h_i = b(x_i) + Σ_k I_k(y_i) γ_k(x_i)^2` and
+//! `h'_i = Σ_k M_k(y_i) γ_k(x_i)^2`.
 
 use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
     create_ispline_derivative_dense,
 };
-use crate::faer_ndarray::{
-    fast_ab, fast_ab_into, fast_atb, fast_av,
-};
+use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb, fast_av};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
@@ -46,12 +47,12 @@ use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, get_spatial_aniso_log_scales, get_spatial_length_scale,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;
-use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -60,14 +61,11 @@ use std::sync::{Arc, Mutex};
 // Phase-2 outer-derivative gate
 // ---------------------------------------------------------------------------
 
-/// Returns `true` while the SCOP-spline reparameterization's analytic outer
-/// derivative paths are still being rederived. CTN's directional Hessian, dH /
-/// d²H matrix-free operators, ψ first-order terms, ψ second-order terms, and
-/// the ψ-Hessian operator all currently encode the linear-h' formulas; under
-/// SCOP-CTN h(y,x) = b(x) + Σ_k γ_k(x)² I_k(y), so h' is quadratic in β and
-/// every chain-rule leg gains a `2 γ_k(x)` factor. Until the rederivations
-/// land in Phase 2, these hooks short-circuit to `Ok(None)` and the unified
-/// outer evaluator falls back to BFGS+BfgsApprox per work_cost_routing.md.
+/// Returns true while the spatial-ψ outer derivative stack is still using the
+/// historical linear-h formulas. The coefficient-side family below is SCOP:
+/// h(y,x)=b(x)+Σ_k I_k(y) γ_k(x)^2, h'(y,x)=Σ_k M_k(y) γ_k(x)^2. κ/ψ
+/// optimization must therefore use numeric outer derivatives until the full ψ
+/// chain rule includes the 2γ factors and second derivatives.
 #[inline]
 fn scop_phase2_outer_pending() -> bool {
     true
@@ -129,6 +127,14 @@ pub const TRANSFORMATION_GRID_RELATIVE_TOL: f64 = 1.0e-12;
 /// in sync prevents the predict path from rejecting fits that the
 /// optimizer accepted as feasible — and vice versa.
 pub const TRANSFORMATION_MONOTONICITY_EPS: f64 = 1.0e-8;
+/// Absolute bound for feasible transformation scores on the standard-normal
+/// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
+/// iterates with finite positive `h'` but astronomical `|h|` lets the objective
+/// and population calibration diagnostics overflow into meaningless values.
+/// A value of 12 is already beyond any practically observable standard-normal
+/// quantile in this model's sample sizes, so this is a domain invariant rather
+/// than statistical shrinkage.
+pub const TRANSFORMATION_NORMAL_H_ABS_MAX: f64 = 12.0;
 /// Maximum number of response quantiles drawn into the monotonicity grid.
 /// Shared between fit and predict so the grid construction is identical.
 pub const TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES: usize = 129;
@@ -183,9 +189,9 @@ pub struct TransformationNormalFamily {
     x_deriv_grid_kron: KroneckerDesign,
 
     // --- Response-direction basis (fixed, does not depend on κ) ---
-    /// Response value basis: n × p_resp. Columns: [1, y, dev_1(y), ..., dev_k(y)].
+    /// Response value basis: n × p_resp. Columns: [1, I_1(y), ..., I_k(y)].
     response_val_basis: Array2<f64>,
-    /// Response derivative basis: n × p_resp. Columns: [0, 1, dev'_1(y), ..., dev'_k(y)].
+    /// Response derivative basis: n × p_resp. Columns: [0, M_1(y), ..., M_k(y)].
     response_deriv_basis: Array2<f64>,
 
     // --- Covariate side (rebuilt on κ change) ---
@@ -220,17 +226,6 @@ pub struct TransformationNormalFamily {
     /// parameters per call.
     policy: ResourcePolicy,
 
-    // --- Active-set certificate for the monotonicity-grid line search ---
-    /// Cached `(active_pairs, m_inactive, ||r_g||, ||X_cov_i||)` summary for
-    /// `KroneckerDesign::min_step_to_boundary_with_active_set`. `Arc<Mutex<…>>`
-    /// so the `&self` `max_feasible_step_size` callsite can mutate it while
-    /// the surrounding family stays `Send + Sync + Clone` (required by
-    /// `ExactNewtonJointHessianWorkspace: Send + Sync` and the `#[derive(Clone)]`
-    /// on `TransformationNormalFamily`). The cache is purely a line-search
-    /// optimization, so sharing it across cloned families is safe and matches
-    /// the prior `RefCell` semantics (single-threaded interior mutability)
-    /// while satisfying the trait bound.
-    active_set_cache: Arc<Mutex<KroneckerActiveSetCache>>,
     /// Last row-space transformation quantities for an exact beta vector.
     ///
     /// CTN line searches and exact-Newton workspace construction frequently ask
@@ -613,7 +608,6 @@ impl TransformationNormalFamily {
             response_degree: config.response_degree,
             response_median: resp_median,
             policy,
-            active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
             row_quantity_cache: Arc::new(Mutex::new(None)),
             psi_axis_vector_cache: Arc::new(Mutex::new(None)),
         })
@@ -773,7 +767,6 @@ impl TransformationNormalFamily {
             response_degree,
             response_median: resp_median,
             policy,
-            active_set_cache: Arc::new(Mutex::new(KroneckerActiveSetCache::new())),
             row_quantity_cache: Arc::new(Mutex::new(None)),
             psi_axis_vector_cache: Arc::new(Mutex::new(None)),
         })
@@ -832,13 +825,24 @@ impl TransformationNormalFamily {
             }
         }
 
-        // SCOP-CTN: h(y, x) = Σ_k γ_k(x)² · I_k(y), with γ_k(x) = ψ(x)ᵀ Γ_{k,:}
-        // and h'(y, x) = Σ_k γ_k(x)² · M_k(y). The squaring is post-operator
-        // pointwise: the underlying Khatri-Rao operator stays linear, but the
-        // forward image squares γ on the response axis before the I/M-spline
-        // contraction. See [scop_spline_ctn_spec.md].
-        let h = self.x_val_kron.scop_squared_forward(beta) + self.offset.as_ref();
-        let h_prime = self.x_deriv_kron.scop_squared_forward(beta);
+        // SCOP-CTN: h(y, x) = b(x) + Σ_k γ_k(x)² · I_k(y), with
+        // γ_k(x) = ψ(x)ᵀ Γ_{k,:} and h'(y, x) = Σ_k γ_k(x)² · M_k(y).
+        // Response column 0 is the unconstrained affine/location component
+        // b(x); all remaining response columns are squared shape components.
+        let h = self.x_val_kron.scop_affine_squared_forward(beta) + self.offset.as_ref();
+        let h_prime = self.x_deriv_kron.scop_affine_squared_forward(beta);
+        for (i, &value) in h.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "TransformationNormalFamily row_quantities: h[{i}] = {value} is not finite"
+                ));
+            }
+            if value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX {
+                return Err(format!(
+                    "TransformationNormalFamily row_quantities: h[{i}] = {value:.6e} exceeds the standard-normal domain bound ±{TRANSFORMATION_NORMAL_H_ABS_MAX}"
+                ));
+            }
+        }
         // Hard monotonicity / finiteness gate: the reciprocal powers `1/h'^k`
         // for k ∈ {1,2,3,4} feed the gradient, Hessian, and psi-psi outer
         // Hessian formulas. A non-finite or non-positive h' produces +∞ /
@@ -898,6 +902,405 @@ impl TransformationNormalFamily {
             .expect("CTN row quantity cache mutex poisoned");
         *cache = Some(row_quantities.clone());
         Ok(row_quantities)
+    }
+
+    fn scop_gradient_and_negative_hessian(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "SCOP gradient beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+                beta.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP gradient requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut gradient = Array1::<f64>::zeros(p_total);
+        let mut hessian = Array2::<f64>::zeros((p_total, p_total));
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+
+            let mut gamma = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+            }
+
+            let mut dh_factor = vec![0.0; p_resp];
+            let mut dhp_factor = vec![0.0; p_resp];
+            let mut second_diag = vec![0.0; p_resp];
+            dh_factor[0] = rv[0];
+            dhp_factor[0] = rd[0];
+            for k in 1..p_resp {
+                dh_factor[k] = 2.0 * rv[k] * gamma[k];
+                dhp_factor[k] = 2.0 * rd[k] * gamma[k];
+                second_diag[k] = 2.0 * (hi * rv[k] - rd[k] * inv_hp);
+            }
+
+            for k in 0..p_resp {
+                let score_factor = wi * (-hi * dh_factor[k] + dhp_factor[k] * inv_hp);
+                for c in 0..p_cov {
+                    gradient[k * p_cov + c] += score_factor * cov_row[c];
+                }
+            }
+
+            for k in 0..p_resp {
+                for l in 0..p_resp {
+                    let mut block_factor =
+                        dh_factor[k] * dh_factor[l] + dhp_factor[k] * dhp_factor[l] * inv_hp_sq;
+                    if k == l {
+                        block_factor += second_diag[k];
+                    }
+                    block_factor *= wi;
+                    if block_factor == 0.0 {
+                        continue;
+                    }
+                    for c in 0..p_cov {
+                        let row_idx = k * p_cov + c;
+                        let left = block_factor * cov_row[c];
+                        for d in 0..p_cov {
+                            hessian[[row_idx, l * p_cov + d]] += left * cov_row[d];
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((gradient, hessian))
+    }
+
+    /// Directional derivative of the SCOP negative Hessian.
+    ///
+    /// For one observation with covariate row `c`, response value row `r`, and
+    /// derivative row `m`, define `g_k = beta_k·c`, `u_k = direction_k·c`,
+    ///
+    /// `h  = r_0 g_0 + Σ_{k>0} r_k g_k^2`
+    /// `hp = m_0 g_0 + Σ_{k>0} m_k g_k^2`
+    /// `Hu  = r_0 u_0 + Σ_{k>0} 2 r_k g_k u_k`
+    /// `HPu = m_0 u_0 + Σ_{k>0} 2 m_k g_k u_k`.
+    ///
+    /// For coefficient `a=(k,p)`:
+    ///
+    /// `h_a  = r_k c_p` for `k=0`, else `2 r_k g_k c_p`
+    /// `hp_a = m_k c_p` for `k=0`, else `2 m_k g_k c_p`
+    /// `D h_a[u]  = 0` for `k=0`, else `2 r_k u_k c_p`
+    /// `D hp_a[u] = 0` for `k=0`, else `2 m_k u_k c_p`.
+    ///
+    /// The per-row negative Hessian block is
+    ///
+    /// `H_ab = w [ h_a h_b + h h_ab + hp_a hp_b / hp^2 - hp_ab / hp ]`,
+    ///
+    /// where `h_ab = 2 r_k c_p c_q` and `hp_ab = 2 m_k c_p c_q` only when
+    /// `a` and `b` are in the same squared shape component `k>0`; otherwise
+    /// both second derivatives are zero. Differentiating this expression in
+    /// direction `u` gives the exact formula implemented below:
+    ///
+    /// `D H_ab[u] = w [ (D h_a)h_b + h_a(D h_b) + Hu h_ab
+    ///              + ((D hp_a)hp_b + hp_a(D hp_b))/hp^2
+    ///              - 2 hp_a hp_b HPu/hp^3 + hp_ab HPu/hp^2 ]`.
+    fn scop_hessian_directional_derivative(
+        &self,
+        beta: &Array1<f64>,
+        direction: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || direction.len() != p_total {
+            return Err(format!(
+                "SCOP Hessian directional derivative length mismatch: beta={}, direction={}, expected={p_total}",
+                beta.len(),
+                direction.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let dir_mat = direction
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP Hessian directional derivative requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut out = Array2::<f64>::zeros((p_total, p_total));
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_dir = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
+            }
+
+            let mut h_dir = rv[0] * gamma_dir[0];
+            let mut hp_dir = rd[0] * gamma_dir[0];
+            for k in 1..p_resp {
+                h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
+                hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
+            }
+
+            let mut h_factor = vec![0.0; p_resp];
+            let mut hp_factor = vec![0.0; p_resp];
+            let mut h_factor_dir = vec![0.0; p_resp];
+            let mut hp_factor_dir = vec![0.0; p_resp];
+            h_factor[0] = rv[0];
+            hp_factor[0] = rd[0];
+            for k in 1..p_resp {
+                h_factor[k] = 2.0 * rv[k] * gamma[k];
+                hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
+                hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+            }
+
+            for k in 0..p_resp {
+                for l in 0..p_resp {
+                    let same_shape = k == l && k > 0;
+                    for c in 0..p_cov {
+                        let row_idx = k * p_cov + c;
+                        let h_a = h_factor[k] * cov_row[c];
+                        let hp_a = hp_factor[k] * cov_row[c];
+                        let dh_a = h_factor_dir[k] * cov_row[c];
+                        let dhp_a = hp_factor_dir[k] * cov_row[c];
+                        for d in 0..p_cov {
+                            let col_idx = l * p_cov + d;
+                            let h_b = h_factor[l] * cov_row[d];
+                            let hp_b = hp_factor[l] * cov_row[d];
+                            let dh_b = h_factor_dir[l] * cov_row[d];
+                            let dhp_b = hp_factor_dir[l] * cov_row[d];
+                            let (h_ab, hp_ab) = if same_shape {
+                                (
+                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
+                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
+                                )
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            let value = dh_a * h_b
+                                + h_a * dh_b
+                                + h_dir * h_ab
+                                + (dhp_a * hp_b + hp_a * dhp_b) * inv_hp_sq
+                                - 2.0 * hp_a * hp_b * hp_dir * inv_hp_cu
+                                + hp_ab * hp_dir * inv_hp_sq;
+                            out[[row_idx, col_idx]] += wi * value;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(0.5 * (&out + &out.t()))
+    }
+
+    /// First derivative of the profiled objective pieces with respect to one
+    /// covariate-basis deformation axis `psi`.
+    ///
+    /// The SCOP map is the same as above, but `psi` differentiates the
+    /// covariate row, not `beta`: `g_k,psi = beta_k·c_psi`. Thus
+    /// `h_psi = r_0 g_0,psi + Σ_{k>0} 2 r_k g_k g_k,psi` and likewise for
+    /// `hp_psi`. The objective contribution is
+    ///
+    /// `L_psi = w [ h h_psi - hp_psi / hp ]`
+    ///
+    /// because the minimized criterion is `0.5 h^2 - log(hp)`. Differentiating
+    /// once with respect to `beta_a` gives `score_psi`; differentiating again
+    /// gives `hessian_psi`. The code below expands those derivatives directly,
+    /// including both paths through `c` and `c_psi` for same-component squared
+    /// shape terms.
+    fn scop_psi_terms(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        op: &TensorKroneckerPsiOperator,
+        axis: usize,
+    ) -> Result<ExactNewtonJointPsiTerms, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "SCOP psi terms beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+                beta.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi beta reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP psi terms require covariate row chunk: {e}"))?;
+        let cov_psi = op
+            .materialize_cov_first_axis(axis)
+            .map_err(|e| format!("SCOP psi materialize_cov_first failed: {e}"))?;
+        if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
+            return Err(format!(
+                "SCOP psi covariate derivative shape {}x{} != expected {}x{}",
+                cov_psi.nrows(),
+                cov_psi.ncols(),
+                n,
+                p_cov
+            ));
+        }
+
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut objective_psi = 0.0;
+        let mut score_psi = Array1::<f64>::zeros(p_total);
+        let mut hessian_psi = Array2::<f64>::zeros((p_total, p_total));
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let psi_row = cov_psi.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let hp = h_prime[i];
+            let inv_hp = 1.0 / hp;
+            let inv_hp_sq = inv_hp * inv_hp;
+            let inv_hp_cu = inv_hp_sq * inv_hp;
+
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_psi = vec![0.0; p_resp];
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+                gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+            }
+
+            let mut h_psi = rv[0] * gamma_psi[0];
+            let mut hp_psi = rd[0] * gamma_psi[0];
+            for k in 1..p_resp {
+                h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
+                hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+            }
+            objective_psi += wi * (hi * h_psi - hp_psi * inv_hp);
+
+            let mut h_factor = vec![0.0; p_resp];
+            let mut hp_factor = vec![0.0; p_resp];
+            let mut hpsi_cov_factor = vec![0.0; p_resp];
+            let mut hppsi_cov_factor = vec![0.0; p_resp];
+            let mut hpsi_psi_factor = vec![0.0; p_resp];
+            let mut hppsi_psi_factor = vec![0.0; p_resp];
+            h_factor[0] = rv[0];
+            hp_factor[0] = rd[0];
+            hpsi_psi_factor[0] = rv[0];
+            hppsi_psi_factor[0] = rd[0];
+            for k in 1..p_resp {
+                h_factor[k] = 2.0 * rv[k] * gamma[k];
+                hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
+                hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
+                hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
+                hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+            }
+
+            for k in 0..p_resp {
+                for c in 0..p_cov {
+                    let idx = k * p_cov + c;
+                    let h_a = h_factor[k] * cov_row[c];
+                    let hp_a = hp_factor[k] * cov_row[c];
+                    let hpsi_a = hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
+                    let hppsi_a =
+                        hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                    score_psi[idx] += wi
+                        * (h_a * h_psi + hi * hpsi_a - hppsi_a * inv_hp
+                            + hp_psi * hp_a * inv_hp_sq);
+                }
+            }
+
+            for k in 0..p_resp {
+                for l in 0..p_resp {
+                    let same_shape = k == l && k > 0;
+                    for c in 0..p_cov {
+                        let row_idx = k * p_cov + c;
+                        let h_a = h_factor[k] * cov_row[c];
+                        let hp_a = hp_factor[k] * cov_row[c];
+                        let hpsi_a =
+                            hpsi_cov_factor[k] * cov_row[c] + hpsi_psi_factor[k] * psi_row[c];
+                        let hppsi_a =
+                            hppsi_cov_factor[k] * cov_row[c] + hppsi_psi_factor[k] * psi_row[c];
+                        for d in 0..p_cov {
+                            let col_idx = l * p_cov + d;
+                            let h_b = h_factor[l] * cov_row[d];
+                            let hp_b = hp_factor[l] * cov_row[d];
+                            let hpsi_b =
+                                hpsi_cov_factor[l] * cov_row[d] + hpsi_psi_factor[l] * psi_row[d];
+                            let hppsi_b =
+                                hppsi_cov_factor[l] * cov_row[d] + hppsi_psi_factor[l] * psi_row[d];
+                            let (h_ab, hp_ab, hpsi_ab, hppsi_ab) = if same_shape {
+                                (
+                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
+                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
+                                    2.0 * rv[k]
+                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                    2.0 * rd[k]
+                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
+                                )
+                            } else {
+                                (0.0, 0.0, 0.0, 0.0)
+                            };
+                            let value = hpsi_a * h_b
+                                + h_a * hpsi_b
+                                + h_psi * h_ab
+                                + hi * hpsi_ab
+                                + (hppsi_a * hp_b + hp_a * hppsi_b) * inv_hp_sq
+                                - 2.0 * hp_a * hp_b * hp_psi * inv_hp_cu
+                                - hppsi_ab * inv_hp
+                                + hp_ab * hp_psi * inv_hp_sq;
+                            hessian_psi[[row_idx, col_idx]] += wi * value;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi: 0.5 * (&hessian_psi + &hessian_psi.t()),
+            hessian_psi_operator: None,
+        })
     }
 
     /// Cached per-axis `forward_mul(axis, β)` against the value response basis.
@@ -1006,20 +1409,6 @@ impl TransformationNormalFamily {
         }
         Ok(arc)
     }
-}
-
-fn weighted_crossprod_dense(
-    left: &Array2<f64>,
-    weights: &Array1<f64>,
-    right: &Array2<f64>,
-) -> Array2<f64> {
-    debug_assert_eq!(left.nrows(), weights.len());
-    debug_assert_eq!(right.nrows(), weights.len());
-    // Streaming `left^T diag(w) right`: fast_xt_diag_y allocates only one
-    // chunk-of-rows worth of weighted-Y instead of cloning the full
-    // n × right.ncols matrix. At biobank scale (n=300K, p_cov=200) that drops
-    // a transient ~480 MiB allocation per call to a few-MiB sliding chunk.
-    crate::faer_ndarray::fast_xt_diag_y(left, weights, right)
 }
 
 fn ctn_penalty_scale_log_lambdas(
@@ -1412,17 +1801,11 @@ impl CustomFamily for TransformationNormalFamily {
         let n = h.len();
 
         let log_likelihood = row_quantities.log_likelihood;
-        let weighted_h = row_quantities.weighted_h.as_ref();
-        let weighted_inv_hp = row_quantities.weighted_inv_h_prime.as_ref();
-        let weighted_inv_hp_sq = row_quantities.weighted_inv_h_prime_sq.as_ref();
-
-        // Gradient of log-likelihood: ∇ℓ = -X_val^T (w·h) + X_deriv^T (w/h')
+        // SCOP gradient and exact negative Hessian. Response column 0 is the
+        // linear location component b(x); response columns >=1 are squared
+        // γ_k(x)^2 shape components.
         let grad_start = std::time::Instant::now();
-        let grad = {
-            let xdt_inv = self.x_deriv_kron.transpose_mul(weighted_inv_hp);
-            let xvt_h = self.x_val_kron.transpose_mul(weighted_h);
-            xdt_inv - xvt_h
-        };
+        let (grad, hessian) = self.scop_gradient_and_negative_hessian(beta, &row_quantities)?;
         log::info!(
             "[STAGE] CTN gradient terms n={} p={} elapsed={:.3}s",
             n,
@@ -1430,21 +1813,11 @@ impl CustomFamily for TransformationNormalFamily {
             grad_start.elapsed().as_secs_f64(),
         );
 
-        // Negative Hessian of log-likelihood:
-        //   -∇²ℓ = X_val^T diag(w) X_val + X_deriv^T diag(w/h'²) X_deriv
-        // The first term is precomputed once as `x_val_weighted_gram`.
         let hess_start = std::time::Instant::now();
-        let hessian = {
-            let mut xtx_deriv = self
-                .x_deriv_kron
-                .weighted_gram(weighted_inv_hp_sq, &self.policy);
-            xtx_deriv += &self.x_val_weighted_gram;
-            xtx_deriv
-        };
         let p_dim = hessian.nrows() as u64;
         let n_u64 = n as u64;
         log::info!(
-            "[STAGE] CTN hessian terms (weighted_gram) n={} p={} flops~{} elapsed={:.3}s",
+            "[STAGE] CTN hessian terms (SCOP exact dense) n={} p={} flops~{} elapsed={:.3}s",
             n,
             p_dim,
             n_u64.saturating_mul(p_dim).saturating_mul(p_dim),
@@ -1522,12 +1895,7 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
         let log_likelihood = row_quantities.log_likelihood;
-        let mut gradient = self
-            .x_deriv_kron
-            .transpose_mul(row_quantities.weighted_inv_h_prime.as_ref());
-        gradient -= &self
-            .x_val_kron
-            .transpose_mul(row_quantities.weighted_h.as_ref());
+        let (gradient, _) = self.scop_gradient_and_negative_hessian(beta, &row_quantities)?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
@@ -1642,42 +2010,15 @@ impl CustomFamily for TransformationNormalFamily {
         // `forward_mul`; there is no factored projection to reuse there.
         let alpha_obs = self
             .x_deriv_kron
-            .min_step_to_boundary(beta, delta, 0.0, 1e-14);
-        // Monotonicity-grid reduction: the `Kronecker` variant lets us project
-        // β and δ through the covariate factor once per call and route the
-        // chunked (i, g) reduction through the cached entry point. The
-        // `KhatriRao` branch of `project_kronecker_factor` returns `None`, so
-        // we transparently fall back to the un-cached path for any future
-        // configuration that swaps the grid design out of the Kronecker form.
-        let alpha_grid = match (
-            self.x_deriv_grid_kron.project_kronecker_factor(beta),
-            self.x_deriv_grid_kron.project_kronecker_factor(delta),
-        ) {
-            (Some(c_beta), Some(d_delta)) => {
-                // Active-set fast path with full-grid certificate fallback.
-                // Bit-equivalent to `min_step_to_boundary_with_projections`
-                // when the certificate accepts; otherwise refreshes via a
-                // full grid scan and returns the same `α`.
-                let mut cache = self
-                    .active_set_cache
-                    .lock()
-                    .expect("active-set cache mutex poisoned");
-                self.x_deriv_grid_kron.min_step_to_boundary_with_active_set(
-                    c_beta.view(),
-                    d_delta.view(),
-                    delta,
-                    TRANSFORMATION_MONOTONICITY_EPS,
-                    1e-14,
-                    &mut cache,
-                )
-            }
-            _ => self.x_deriv_grid_kron.min_step_to_boundary(
+            .scop_affine_squared_min_step_to_boundary(beta, delta, 0.0, 1e-14);
+        let alpha_grid = self
+            .x_deriv_grid_kron
+            .scop_affine_squared_min_step_to_boundary(
                 beta,
                 delta,
                 TRANSFORMATION_MONOTONICITY_EPS,
                 1e-14,
-            ),
-        };
+            );
         let alpha_max = 1.0_f64.min(alpha_obs).min(alpha_grid);
         log::info!(
             "[STAGE] CTN monotonicity grid scan alpha_obs={:.3e} alpha_grid={:.3e} elapsed={:.3}s",
@@ -1717,38 +2058,12 @@ impl CustomFamily for TransformationNormalFamily {
         block_index: usize,
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Phase 2: SCOP outer derivatives pending. The body below assumes h' is
-        // linear in β, but under SCOP-CTN h' = Σ_k γ_k(x)² · M_k(y) is
-        // quadratic in β. Routing onto BFGS+BfgsApprox fallback via Ok(None).
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         if block_index != 0 {
             return Ok(None);
         }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let h_prime = row_quantities.h_prime.as_ref();
-        let d_h_prime = self.x_deriv_kron.forward_mul(d_beta);
-
-        // ∂H/∂β · d_beta = -2 X_deriv^T diag((X_deriv · d_beta) / h'^3) X_deriv
-        let n = h_prime.len();
-        let mut weight = Array1::zeros(n);
-        {
-            use rayon::prelude::*;
-            let weights = self.weights.as_ref();
-            weight
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .zip(h_prime.as_slice().unwrap().par_iter())
-                .zip(d_h_prime.as_slice().unwrap().par_iter())
-                .zip(weights.as_slice().unwrap().par_iter())
-                .for_each(|(((w, &hp), &dhp), &wi)| {
-                    *w = -2.0 * wi * dhp / (hp * hp * hp);
-                });
-        }
-        let dd = self.x_deriv_kron.weighted_gram(&weight, &self.policy);
+        let dd = self.scop_hessian_directional_derivative(beta, d_beta, &row_quantities)?;
         Ok(Some(dd))
     }
 
@@ -1759,12 +2074,8 @@ impl CustomFamily for TransformationNormalFamily {
         // Single block: joint Hessian = block Hessian.
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
-        let mut xtx_deriv = self.x_deriv_kron.weighted_gram(
-            row_quantities.weighted_inv_h_prime_sq.as_ref(),
-            &self.policy,
-        );
-        xtx_deriv += &self.x_val_weighted_gram;
-        Ok(Some(xtx_deriv))
+        let (_, hessian) = self.scop_gradient_and_negative_hessian(beta, &row_quantities)?;
+        Ok(Some(hessian))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -1783,6 +2094,9 @@ impl CustomFamily for TransformationNormalFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         // Phase 2: SCOP outer derivatives pending. Linear-h' formula
         // `6 X_derivᵀ diag(w · Du · Dv / h'⁴) X_deriv` is invalid under SCOP.
+        if scop_phase2_outer_pending() {
+            return Ok(None);
+        }
         if scop_phase2_outer_pending() {
             return Ok(None);
         }
@@ -1821,13 +2135,6 @@ impl CustomFamily for TransformationNormalFamily {
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        // Phase 2: SCOP outer derivatives pending. The sym_val/sym_deriv/cubic
-        // legs and the `TransformationNormalPsiHessianOperator` constructed
-        // below all assume h, h' are linear in β. Returning Ok(None) leaves
-        // the unified outer evaluator on the BFGS+BfgsApprox fallback.
-        if scop_phase2_outer_pending() {
-            return Ok(None);
-        }
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -1835,11 +2142,6 @@ impl CustomFamily for TransformationNormalFamily {
         let deriv = &psi_derivs[0][psi_index];
         let beta = &block_states[0].beta;
         let row = self.row_quantities(beta)?;
-        let inv_h_prime_cu = row.inv_h_prime_cu.as_ref();
-        let weighted_h = row.weighted_h.as_ref();
-        let weighted_inv_h_prime = row.weighted_inv_h_prime.as_ref();
-        let weighted_inv_h_prime_sq = row.weighted_inv_h_prime_sq.as_ref();
-
         let op = deriv
             .implicit_operator
             .as_ref()
@@ -1849,50 +2151,7 @@ impl CustomFamily for TransformationNormalFamily {
                     .to_string()
             })?;
         let axis = deriv.implicit_axis;
-        let v_val_arc = self.cached_psi_axis_forward_val(op, axis, beta)?;
-        let v_deriv_arc = self.cached_psi_axis_forward_deriv(op, axis, beta)?;
-        let v_val: &Array1<f64> = v_val_arc.as_ref();
-        let v_deriv: &Array1<f64> = v_deriv_arc.as_ref();
-
-        let obj_psi = weighted_h.dot(v_val) - weighted_inv_h_prime.dot(v_deriv);
-
-        let score_psi = {
-            let term1 = op
-                .transpose_mul(axis, &weighted_h.view())
-                .map_err(|e| format!("tensor psi transpose_mul failed: {e}"))?;
-            let weighted_v_val = v_val * self.weights.as_ref();
-            let term2 = self.x_val_kron.transpose_mul(&weighted_v_val);
-            let term3 = op
-                .transpose_mul_deriv(axis, weighted_inv_h_prime)
-                .map_err(|e| format!("tensor psi derivative transpose_mul failed: {e}"))?
-                .mapv(|v| -v);
-            let w_deriv = v_deriv * weighted_inv_h_prime_sq;
-            let term4 = self.x_deriv_kron.transpose_mul(&w_deriv);
-            term1 + &term2 + &term3 + &term4
-        };
-
-        // Build a matrix-free operator that composes the three Hessian pieces
-        //   (sym_val)   = X_valᵀ diag(w) (B_val ⊗_KR C_psi) + transpose
-        //   (sym_deriv) = X_derivᵀ diag(w/h'²) (B_deriv ⊗_KR C_psi) + transpose
-        //   (cubic)     = X_derivᵀ diag(-2 w v_deriv / h'³) X_deriv
-        // without materializing the (p_resp · p_cov)² dense block. The
-        // consumer at custom_family.rs:9897 prefers `hessian_psi_operator`
-        // when present and ignores the dense `hessian_psi` field, so we
-        // emit a zero placeholder there to skip the costly p×p assembly.
-        let w_cubic = ((v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-        let psi_op_arc = deriv
-            .implicit_operator
-            .as_ref()
-            .expect("psi op presence checked above")
-            .clone();
-        let hessian_psi_operator: Arc<dyn HyperOperator> =
-            Arc::new(TransformationNormalPsiHessianOperator {
-                family: Arc::new(self.clone()),
-                psi_op: psi_op_arc,
-                axis,
-                weighted_inv_h_prime_sq: row.weighted_inv_h_prime_sq.clone(),
-                w_cubic,
-            });
+        let terms = self.scop_psi_terms(beta, &row, op, axis)?;
 
         log::info!(
             "[STAGE] CTN psi first-order terms axis={} psi_index={} elapsed={:.3}s",
@@ -1901,12 +2160,7 @@ impl CustomFamily for TransformationNormalFamily {
             psi_first_start.elapsed().as_secs_f64(),
         );
 
-        Ok(Some(ExactNewtonJointPsiTerms {
-            objective_psi: obj_psi,
-            score_psi,
-            hessian_psi: Array2::zeros((0, 0)),
-            hessian_psi_operator: Some(hessian_psi_operator),
-        }))
+        Ok(Some(terms))
     }
 
     fn exact_newton_joint_psisecond_order_terms(
@@ -2298,6 +2552,9 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        if scop_phase2_outer_pending() {
+            return false;
+        }
         // CTN's coefficient-space joint Hessian is supplied as a matrix-free Hv
         // operator: `exact_newton_joint_hessian_workspace` above unconditionally
         // returns a `TransformationNormalJointHessianWorkspace` for any single
@@ -2839,170 +3096,16 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 ///   `H_ψ = (sym_val) + (sym_deriv) + (cubic)`,
 ///
 /// where
-///   `sym_val   = (X_valᵀ diag(w) (B_val ⊗_KR C_psi)) + transpose`,
-///   `sym_deriv = (X_derivᵀ diag(w/h'²) (B_deriv ⊗_KR C_psi)) + transpose`,
-///   `cubic     = X_derivᵀ diag(w_cubic) X_deriv`
-/// with `w_cubic = -2 · w · v_deriv / h'³`.
-///
-/// `mul_vec` composes the three pieces through the existing Khatri-Rao
-/// `forward_mul`/`transpose_mul` primitives on `KroneckerDesign` and the
-/// per-axis `forward_mul`/`transpose_mul`(`_deriv`) on the
-/// `TensorKroneckerPsiOperator`, never building the
-/// `(p_resp · p_cov) × (p_resp · p_cov)` dense block.
-struct TransformationNormalPsiHessianOperator {
-    family: Arc<TransformationNormalFamily>,
-    psi_op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-    axis: usize,
-    weighted_inv_h_prime_sq: Arc<Array1<f64>>,
-    w_cubic: Array1<f64>,
-}
-
-impl TransformationNormalPsiHessianOperator {
-    fn p_total(&self) -> usize {
-        self.family.x_val_kron.ncols()
-    }
-
-    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
-        self.psi_op
-            .as_any()
-            .downcast_ref::<TensorKroneckerPsiOperator>()
-            .expect("CTN ψ-Hessian operator constructed only on tensor-Kronecker ψ ops")
-    }
-
-    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let n = self.family.weights.len();
-        let weights = self.family.weights.as_ref();
-        let weighted_inv_hp_sq = self.weighted_inv_h_prime_sq.as_ref();
-        let tensor = self.tensor_op();
-
-        // sym_val · v: A_val·v + A_valᵀ·v
-        //   A_val   = (B_val ⊗_KR C_design)ᵀ · diag(w) · (B_val ⊗_KR C_psi)
-        //   so A_val·v   = x_val_kronᵀ · (w * lifted_forward_val)
-        //      A_valᵀ·v  = lifted_transpose_val(w * x_val_kron · v)
-        let lifted_val = tensor
-            .forward_mul(self.axis, &v.view())
-            .expect("tensor ψ forward_mul (val basis)");
-        debug_assert_eq!(lifted_val.len(), n);
-        let mut weighted_lifted_val = Array1::<f64>::zeros(n);
-        ndarray::Zip::from(&mut weighted_lifted_val)
-            .and(&lifted_val)
-            .and(weights)
-            .par_for_each(|o, &lv, &w| *o = w * lv);
-        let mut out = self.family.x_val_kron.transpose_mul(&weighted_lifted_val);
-
-        let xval_image = self.family.x_val_kron.forward_mul(v);
-        debug_assert_eq!(xval_image.len(), n);
-        let mut weighted_xval_image = Array1::<f64>::zeros(n);
-        ndarray::Zip::from(&mut weighted_xval_image)
-            .and(&xval_image)
-            .and(weights)
-            .par_for_each(|o, &xv, &w| *o = w * xv);
-        let a_val_t = tensor
-            .transpose_mul(self.axis, &weighted_xval_image.view())
-            .expect("tensor ψ transpose_mul (val basis)");
-        out += &a_val_t;
-
-        // sym_deriv · v: A_deriv·v + A_derivᵀ·v with weights = w/h'²
-        //   A_deriv   = (B_deriv ⊗_KR C_design)ᵀ · diag(w/h'²) · (B_deriv ⊗_KR C_psi)
-        let lifted_deriv = tensor
-            .forward_mul_deriv(self.axis, v)
-            .expect("tensor ψ forward_mul_deriv");
-        debug_assert_eq!(lifted_deriv.len(), n);
-        let mut weighted_lifted_deriv = Array1::<f64>::zeros(n);
-        ndarray::Zip::from(&mut weighted_lifted_deriv)
-            .and(&lifted_deriv)
-            .and(weighted_inv_hp_sq)
-            .par_for_each(|o, &lv, &w| *o = w * lv);
-        out += &self
-            .family
-            .x_deriv_kron
-            .transpose_mul(&weighted_lifted_deriv);
-
-        let xderiv_image = self.family.x_deriv_kron.forward_mul(v);
-        debug_assert_eq!(xderiv_image.len(), n);
-        let mut weighted_xderiv_image = Array1::<f64>::zeros(n);
-        ndarray::Zip::from(&mut weighted_xderiv_image)
-            .and(&xderiv_image)
-            .and(weighted_inv_hp_sq)
-            .par_for_each(|o, &xv, &w| *o = w * xv);
-        let a_deriv_t = tensor
-            .transpose_mul_deriv(self.axis, &weighted_xderiv_image)
-            .expect("tensor ψ transpose_mul_deriv");
-        out += &a_deriv_t;
-
-        // cubic · v = X_derivᵀ diag(w_cubic) X_deriv v
-        let mut cubic_image = self.family.x_deriv_kron.forward_mul(v);
-        debug_assert_eq!(cubic_image.len(), n);
-        cubic_image *= &self.w_cubic;
-        out += &self.family.x_deriv_kron.transpose_mul(&cubic_image);
-
-        out
-    }
-}
-
-impl HyperOperator for TransformationNormalPsiHessianOperator {
-    fn dim(&self) -> usize {
-        self.p_total()
-    }
-
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p_total());
-        self.apply(v)
-    }
-
-    /// Materialize the dense ψ-Hessian via the existing
-    /// `weighted_cross_with_cov_first` + `weighted_gram` paths. Reached only
-    /// when a legacy consumer forces dense materialization (`materialize` /
-    /// `to_dense`) on the drift; production consumers stay on the operator
-    /// matvec path.
-    fn to_dense(&self) -> Array2<f64> {
-        let tensor = self.tensor_op();
-        let weights = self.family.weights.as_ref();
-        let weighted_inv_hp_sq = self.weighted_inv_h_prime_sq.as_ref();
-
-        let xvt_xvp = tensor
-            .weighted_cross_with_cov_first(
-                &self.family.response_val_basis,
-                &self.family.response_val_basis,
-                self.axis,
-                weights,
-            )
-            .expect("tensor ψ weighted_cross(val) for to_dense");
-        let sym_val = &xvt_xvp + &xvt_xvp.t();
-
-        let xdt_xdp = tensor
-            .weighted_cross_with_cov_first(
-                &self.family.response_deriv_basis,
-                &self.family.response_deriv_basis,
-                self.axis,
-                weighted_inv_hp_sq,
-            )
-            .expect("tensor ψ weighted_cross(deriv) for to_dense");
-        let sym_deriv = &xdt_xdp + &xdt_xdp.t();
-
-        let cubic_term = self
-            .family
-            .x_deriv_kron
-            .weighted_gram(&self.w_cubic, &self.family.policy);
-
-        sym_val + &sym_deriv + &cubic_term
-    }
-
-    fn is_implicit(&self) -> bool {
-        true
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Response-direction basis construction
 // ---------------------------------------------------------------------------
 
-/// Build the response-direction basis: I-spline values `I_k(y)` with
-/// derivatives `M_k(y) = I'_k(y)`.
+/// Build the response-direction basis: an unconstrained location column plus
+/// I-spline values `I_k(y)` with derivatives `M_k(y) = I'_k(y)`.
 ///
-/// Returns (value_basis = I_k, derivative_basis = M_k, penalties on the
-/// I-spline coefficient block, regenerated I-spline knots, identity
-/// coef_transform of size p_resp × p_resp).
+/// Returns (value_basis = `[1, I_k]`, derivative_basis = `[0, M_k]`,
+/// penalties embedded with an unpenalized location row/column, regenerated
+/// I-spline knots, identity coef_transform for the I-spline shape block).
 fn build_response_basis(
     response: &Array1<f64>,
     config: &TransformationNormalConfig,
@@ -3043,8 +3146,20 @@ fn build_response_basis(
     // Regenerate clamped knots. The I-spline builder integrates a degree
     // `(response_degree + 1)` B-spline basis into a degree-`response_degree`
     // value basis, so the seed-time degree passed here is `response_degree + 1`.
-    let knots =
+    let mut knots =
         initializewiggle_knots_from_seed(response.view(), response_degree + 1, k_prime)?;
+    let response_min = response.iter().copied().fold(f64::INFINITY, f64::min);
+    let response_max = response.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let response_span = (response_max - response_min).abs().max(1.0);
+    let support_guard = response_span * 1.0e-3;
+    let boundary_repeats = response_degree + 2;
+    if knots.len() >= 2 * boundary_repeats {
+        for idx in 0..boundary_repeats {
+            knots[idx] = response_min - support_guard;
+            let right_idx = knots.len() - 1 - idx;
+            knots[right_idx] = response_max + support_guard;
+        }
+    }
 
     // I-spline value basis I_k(y).
     let (i_val_basis, _) = create_basis::<Dense>(
@@ -3054,39 +3169,49 @@ fn build_response_basis(
         BasisOptions::i_spline(),
     )
     .map_err(|e| e.to_string())?;
-    let resp_val = i_val_basis.as_ref().clone();
-    let p_resp = resp_val.ncols();
+    let shape_val = i_val_basis.as_ref().clone();
+    let p_shape = shape_val.ncols();
 
     // M-spline derivative basis M_k(y) = I'_k(y).
-    let resp_deriv =
-        create_ispline_derivative_dense(response.view(), &knots, response_degree, 1)
-            .map_err(|e| e.to_string())?;
-    if resp_deriv.ncols() != p_resp {
+    let shape_deriv = create_ispline_derivative_dense(response.view(), &knots, response_degree, 1)
+        .map_err(|e| e.to_string())?;
+    if shape_deriv.ncols() != p_shape {
         return Err(format!(
-            "I-spline derivative column count {} does not match value basis {p_resp}",
-            resp_deriv.ncols()
+            "I-spline derivative column count {} does not match value basis {p_shape}",
+            shape_deriv.ncols()
         ));
     }
-    if resp_deriv.nrows() != n {
+    if shape_deriv.nrows() != n {
         return Err(format!(
             "I-spline derivative row count {} does not match n = {n}",
-            resp_deriv.nrows()
+            shape_deriv.nrows()
         ));
     }
+
+    let p_resp = p_shape + 1;
+    let mut resp_val = Array2::<f64>::zeros((n, p_resp));
+    resp_val.column_mut(0).fill(1.0);
+    resp_val.slice_mut(s![.., 1..]).assign(&shape_val);
+    let mut resp_deriv = Array2::<f64>::zeros((n, p_resp));
+    resp_deriv.slice_mut(s![.., 1..]).assign(&shape_deriv);
 
     // SCOP-CTN coef-transform is identity: I-splines have no constant in
     // their span, and squaring γ removes the per-component sign null direction.
-    let transform = Array2::<f64>::eye(p_resp);
+    let transform = Array2::<f64>::eye(p_shape);
 
-    // Difference penalties act directly on the I-spline coefficient vector.
+    // Difference penalties act directly on the I-spline shape coefficient
+    // vector. Embed them into the full response block with an unpenalized
+    // location row/column.
     let mut resp_penalties = Vec::new();
     let add_penalty = |order: usize, penalties: &mut Vec<Array2<f64>>| -> Result<(), String> {
-        if order == 0 || order >= p_resp {
+        if order == 0 || order >= p_shape {
             return Ok(());
         }
-        let pen = create_difference_penalty_matrix(p_resp, order, None)
-            .map_err(|e| e.to_string())?;
-        penalties.push(pen);
+        let shape_pen =
+            create_difference_penalty_matrix(p_shape, order, None).map_err(|e| e.to_string())?;
+        let mut full_pen = Array2::<f64>::zeros((p_resp, p_resp));
+        full_pen.slice_mut(s![1.., 1..]).assign(&shape_pen);
+        penalties.push(full_pen);
         Ok(())
     };
     add_penalty(config.response_penalty_order, &mut resp_penalties)?;
@@ -3100,13 +3225,13 @@ fn build_response_basis(
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
 }
 
-/// Evaluate the M-spline derivative basis `M_k(y) = I'_k(y)` at `values`.
+/// Evaluate the SCOP derivative response basis `[0, M_k(y)]` at `values`.
 ///
 /// `transform` is the SCOP-CTN coef-transform; under the I-spline response
-/// basis it is the identity (size p_resp × p_resp), but it is still applied
+/// basis it is the identity (size p_shape × p_shape), but it is still applied
 /// to handle the (atypical) case of a non-identity caller-provided transform
 /// without requiring the call sites to be aware of it. The output has shape
-/// `values.len() × transform.ncols()`.
+/// `values.len() × (1 + transform.ncols())`.
 fn evaluate_response_derivative_basis(
     values: &Array1<f64>,
     knots: &Array1<f64>,
@@ -3140,7 +3265,10 @@ fn evaluate_response_derivative_basis(
             transform.nrows()
         ));
     }
-    Ok(fast_ab(&raw_m, transform))
+    let shape_deriv = fast_ab(&raw_m, transform);
+    let mut out = Array2::<f64>::zeros((values.len(), shape_deriv.ncols() + 1));
+    out.slice_mut(s![.., 1..]).assign(&shape_deriv);
+    Ok(out)
 }
 
 fn transformation_monotonicity_response_grid(
@@ -3225,73 +3353,33 @@ fn build_monotonicity_derivative_grid_kron(
     covariate_design: &DesignMatrix,
 ) -> Result<KroneckerDesign, String> {
     let response_grid = transformation_monotonicity_response_grid(response, knots)?;
-    let mut response_deriv_grid =
+    let response_deriv_grid_raw =
         evaluate_response_derivative_basis(&response_grid, knots, degree, transform)?;
-    // Append analytic loose-bound rows. The convex-combination identity
-    //   h'(y, x) = β₁(x) + Σ_{k≥1} δ_k(x) · N_{k,d-1}(y)
-    // with `Σ_{k≥1} N_{k,d-1}(y) = 1` on the basis support gives the pointwise
-    // lower bound `h'(y, x) ≥ β₁(x) + δ_k(x)` for every k with non-degenerate
-    // denominator. The fit-time barrier already enforces strict positivity of
-    // every grid-sampled `h'(y_g, x_i)`, but a B-spline basis function of
-    // degree ≥ 1 never actually reaches 1 at any interior y, so a sampled
-    // grid does not bound the convex-combination minimum tightly enough: it
-    // is possible for the optimizer to produce a `δ_k(x_i)` of magnitude
-    // 1e15+ that contributes only fractionally to any sampled `h'(y_g, x_i)`
-    // yet makes the lower bound `β₁(x_i) + δ_k(x_i)` (and therefore the
-    // analytic infimum of `h'`) hugely negative. The predict-time monotonicity
-    // check then refuses to certify, even though the optimizer-accepted β
-    // satisfied every grid-sampled feasibility constraint.
-    //
-    // To bring the fit-time and predict-time semantics into agreement we add
-    // one extra "virtual grid point" per non-degenerate basis index k that
-    // computes `β₁(x_i) + δ_k(x_i)` directly through the same Kronecker
-    // boundary scan: each row encodes the response-side functional
-    //   R_k = [0, 1, (d/(t_{k+d}−t_k)) · (T_{k,:} − T_{k−1,:})]
-    // so `R_k · β_mat · cov_row(x_i)` evaluates to exactly the loose-bound
-    // expression. The line-search now refuses any step that would drive
-    // even one such `(i, k)` pair below the strict-feasibility margin
-    // `TRANSFORMATION_MONOTONICITY_EPS`, which is precisely the constraint
-    // the predict-time bound enforces.
-    let dev_dim = transform.ncols();
-    let p_basis = transform.nrows();
-    if dev_dim > 0 && p_basis >= 2 {
-        let expected_knots = p_basis + degree + 1;
-        if knots.len() < expected_knots {
-            return Err(format!(
-                "response basis loose-bound rows need ≥ {expected_knots} knots, got {}",
-                knots.len()
-            ));
-        }
-        let mut loose_rows: Vec<Vec<f64>> = Vec::with_capacity(p_basis - 1);
-        for k in 1..p_basis {
-            let denom = knots[k + degree] - knots[k];
-            if !(denom > 0.0) {
-                continue;
-            }
-            let scale = degree as f64 / denom;
-            let mut row = vec![0.0; 2 + dev_dim];
-            row[1] = 1.0;
-            for j in 0..dev_dim {
-                row[2 + j] = scale * (transform[[k, j]] - transform[[k - 1, j]]);
-            }
-            loose_rows.push(row);
-        }
-        if !loose_rows.is_empty() {
-            let original_rows = response_deriv_grid.nrows();
-            let p_resp = response_deriv_grid.ncols();
-            let mut combined = Array2::<f64>::zeros((original_rows + loose_rows.len(), p_resp));
-            combined
-                .slice_mut(s![..original_rows, ..])
-                .assign(&response_deriv_grid);
-            for (idx, row) in loose_rows.iter().enumerate() {
-                let mut target = combined.row_mut(original_rows + idx);
-                for (j, &v) in row.iter().enumerate() {
-                    target[j] = v;
-                }
-            }
-            response_deriv_grid = combined;
-        }
+    let keep_rows: Vec<usize> = (0..response_deriv_grid_raw.nrows())
+        .filter(|&i| {
+            response_deriv_grid_raw
+                .row(i)
+                .slice(s![1..])
+                .iter()
+                .any(|&v| v > 0.0)
+        })
+        .collect();
+    if keep_rows.is_empty() {
+        return Err("SCOP monotonicity grid has no positive derivative rows".to_string());
     }
+    let mut response_deriv_grid =
+        Array2::<f64>::zeros((keep_rows.len(), response_deriv_grid_raw.ncols()));
+    for (out_i, &src_i) in keep_rows.iter().enumerate() {
+        response_deriv_grid
+            .row_mut(out_i)
+            .assign(&response_deriv_grid_raw.row(src_i));
+    }
+    // SCOP monotonicity is coefficient-side: `h'(y,x)=Σ_k M_k(y)γ_k(x)^2`.
+    // The old affine-deviation loose-bound rows encoded linear B-spline
+    // derivative identities and are invalid for squared I-spline shape
+    // components. The M-spline grid rows are therefore the entire response-side
+    // constraint set here; covariate axis-extreme rows below keep the same
+    // train/predict covariate support contract.
     // Augment the covariate side with `2 · p_cov` axis-extreme rows so the
     // loose-bound certificate `β₁(x) + δ_k(x) ≥ ε` holds at every corner of
     // the axis-aligned box `[col_min_j, col_max_j]^{p_cov}` reached after
@@ -3405,7 +3493,10 @@ fn effective_response_num_internal_knots(
         .min(LARGE_SAMPLE_TRANSFORMATION_TENSOR_WIDTH);
     let max_resp_cols_from_tensor =
         (tensor_width_cap / p_cov.max(1)).max(config.response_degree + 2);
-    let tensor_cap = max_resp_cols_from_tensor
+    // One response column is the unconstrained location; the remaining columns
+    // are the I-spline shape block controlled by response_num_internal_knots.
+    let max_shape_cols_from_tensor = max_resp_cols_from_tensor.saturating_sub(1);
+    let tensor_cap = max_shape_cols_from_tensor
         .saturating_sub(config.response_degree + 1)
         .max(min_internal);
     config
@@ -3475,33 +3566,16 @@ fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: u
 // Kronecker-aware operator for biobank-scale tensor products
 // ---------------------------------------------------------------------------
 
-/// Active-set certificate cache for the cached `min_step_to_boundary` path on
-/// the `Kronecker` variant. See `min_step_to_boundary_with_active_set` for the
-/// math and validity proof. Caller is responsible for bumping `c_version`
-/// whenever the underlying β projection changes; the certificate is otherwise
-/// invariant in δ (the refresh recomputes the inactive bound from `c` only).
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct KroneckerActiveSetCache {
-    /// Pairs `(i, g)` whose `h_{i,g} - slack ≤ τ`. Empty before first refresh.
     active_pairs: Vec<(usize, usize)>,
-    /// `min h_{i,g}` over inactive `(i,g)` (the smallest non-active feasibility
-    /// margin); `+∞` when every pair is active or the cache is unrefreshed.
     min_inactive_margin: f64,
-    /// `max_g ||r_g||₂`, response_grid invariant.
     max_response_norm: Option<f64>,
-    /// `max_i ||X_cov[i,:]||₂`, covariate-design invariant (per family).
     max_covariate_norm: Option<f64>,
-    /// Caller-managed monotone version stamp on the current `c` projection.
     c_version: u64,
-    /// `c_version` value at the most recent refresh; equals `c_version` ⇒ fresh.
     cached_for_version: u64,
-    /// Triplet fingerprint of the `c` projection at the most recent refresh.
-    /// Used to detect β changes implicitly without a hash over the full
-    /// `(n × p_resp)` matrix: corner samples `c[0,0]`, `c[mid,mid]`,
-    /// `c[n-1,p_resp-1]`. If any differ, the cache is treated as stale.
     c_fingerprint: [f64; 3],
-    /// Sentinel `(n, n_grid, p_resp, slack, dh_eps)` at refresh time, used to
-    /// invalidate the cache if any of these change between calls.
     n: usize,
     n_grid: usize,
     p_resp: usize,
@@ -3509,6 +3583,7 @@ struct KroneckerActiveSetCache {
     dh_eps: f64,
 }
 
+#[cfg(test)]
 impl KroneckerActiveSetCache {
     fn new() -> Self {
         Self {
@@ -3517,7 +3592,7 @@ impl KroneckerActiveSetCache {
             max_response_norm: None,
             max_covariate_norm: None,
             c_version: 0,
-            cached_for_version: u64::MAX, // distinct from c_version=0 ⇒ stale
+            cached_for_version: u64::MAX,
             c_fingerprint: [f64::NAN; 3],
             n: 0,
             n_grid: 0,
@@ -3615,6 +3690,62 @@ enum KroneckerDesign {
         /// (n_cov × p_cov) — original covariate design, never replicated.
         covariate: DesignMatrix,
     },
+}
+
+fn scop_quadratic_boundary_root(
+    response_row: ArrayView1<'_, f64>,
+    gamma_row: ArrayView1<'_, f64>,
+    dgamma_row: ArrayView1<'_, f64>,
+    slack: f64,
+    dh_eps: f64,
+) -> f64 {
+    let p_resp = response_row.len();
+    debug_assert_eq!(gamma_row.len(), p_resp);
+    debug_assert_eq!(dgamma_row.len(), p_resp);
+
+    let mut a = 0.0;
+    let mut b = response_row[0] * dgamma_row[0];
+    let mut c = response_row[0] * gamma_row[0] - slack;
+    for k in 1..p_resp {
+        let r = response_row[k];
+        let g = gamma_row[k];
+        let d = dgamma_row[k];
+        a += r * d * d;
+        b += 2.0 * r * g * d;
+        c += r * g * g;
+    }
+    if !(c.is_finite() && a.is_finite() && b.is_finite()) {
+        return 0.0;
+    }
+    if c <= 0.0 {
+        return 0.0;
+    }
+    if a.abs() <= dh_eps {
+        if b < -dh_eps {
+            let root = -c / b;
+            return if root.is_finite() && root > 0.0 {
+                root
+            } else {
+                f64::INFINITY
+            };
+        }
+        return f64::INFINITY;
+    }
+    let disc = b.mul_add(b, -4.0 * a * c);
+    if disc < 0.0 || !disc.is_finite() {
+        return f64::INFINITY;
+    }
+    let sqrt_disc = disc.sqrt();
+    let r1 = (-b - sqrt_disc) / (2.0 * a);
+    let r2 = (-b + sqrt_disc) / (2.0 * a);
+    let mut best = f64::INFINITY;
+    if r1.is_finite() && r1 > 0.0 {
+        best = best.min(r1);
+    }
+    if r2.is_finite() && r2 > 0.0 {
+        best = best.min(r2);
+    }
+    best
 }
 
 impl KroneckerDesign {
@@ -3735,18 +3866,19 @@ impl KroneckerDesign {
         }
     }
 
-    /// SCOP-CTN squared forward: compute `Σ_k left[i, k] · γ_k(x_i)²`
+    /// SCOP-CTN forward: compute
+    /// `left[i,0] · γ_0(x_i) + Σ_{k>=1} left[i,k] · γ_k(x_i)²`
     /// where `γ_k(x_i) = (right · β_mat[k, :])[i]` and
     /// `β_mat[k, j] = beta[k * p_cov + j]` (row-major reshape into
     /// `p_resp × p_cov`).
     ///
     /// Equivalent to forming `γ_mat = right · β_matᵀ` (shape `n × p_resp`),
-    /// pointwise squaring it, and contracting against the corresponding
-    /// response basis row. The squaring is post-operator pointwise — the
+    /// pointwise squaring columns `k>=1`, and contracting against the
+    /// corresponding response basis row. The squaring is post-operator — the
     /// underlying `right` operator and the row-replicated Khatri-Rao image
     /// are never materialized. Storage cost matches `forward_mul`: an
     /// intermediate `n × p_resp` `right_beta` plus the `n` output.
-    fn scop_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
+    fn scop_affine_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 let pa = left.ncols();
@@ -3762,8 +3894,8 @@ impl KroneckerDesign {
                         .and(left.rows())
                         .and(right_beta.rows())
                         .par_for_each(|r, l_row, gamma_row| {
-                            let mut acc = 0.0;
-                            for k in 0..pa {
+                            let mut acc = l_row[0] * gamma_row[0];
+                            for k in 1..pa {
                                 let g = gamma_row[k];
                                 acc += l_row[k] * g * g;
                             }
@@ -3781,8 +3913,8 @@ impl KroneckerDesign {
                     .and(left.rows())
                     .and(gamma_cols.rows())
                     .par_for_each(|r, l_row, gamma_row| {
-                        let mut acc = 0.0;
-                        for k in 0..pa {
+                        let mut acc = l_row[0] * gamma_row[0];
+                        for k in 1..pa {
                             let g = gamma_row[k];
                             acc += l_row[k] * g * g;
                         }
@@ -3806,15 +3938,106 @@ impl KroneckerDesign {
                     let cov_part = covariate.apply(&beta_mat.row(k).to_owned());
                     gamma.column_mut(k).assign(&cov_part);
                 }
-                // gamma_sq[i, k] = γ_k(x_i)²
-                let gamma_sq = &gamma * &gamma;
-                // result_2d[i, g] = Σ_k gamma_sq[i, k] · response_grid[g, k]
-                //                 = (gamma_sq · response_gridᵀ)[i, g].
+                // features[i,0] = γ_0(x_i); features[i,k>=1] = γ_k(x_i)².
+                let mut features = gamma;
+                for mut row in features.rows_mut() {
+                    for k in 1..p_resp {
+                        row[k] *= row[k];
+                    }
+                }
+                // result_2d[i, g] = response_grid[g,0]γ_0(x_i)
+                //               + Σ_{k>=1} response_grid[g,k]γ_k(x_i)².
                 let mut result_2d = Array2::<f64>::zeros((n_cov, n_grid));
-                fast_ab_into(&gamma_sq, &response_grid.t(), &mut result_2d);
+                fast_ab_into(&features, &response_grid.t(), &mut result_2d);
                 result_2d
                     .into_shape_with_order((n_cov * n_grid,))
                     .expect("row-major Array2 flattens to Array1 of length n_cov*n_grid")
+            }
+        }
+    }
+
+    fn scop_affine_squared_min_step_to_boundary(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+        slack: f64,
+        dh_eps: f64,
+    ) -> f64 {
+        match self {
+            KroneckerDesign::KhatriRao { left, right } => {
+                let p_resp = left.ncols();
+                let p_cov = right.ncols();
+                let n = left.nrows();
+                debug_assert_eq!(beta.len(), p_resp * p_cov);
+                debug_assert_eq!(delta.len(), p_resp * p_cov);
+                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                let delta_mat = delta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                let mut gamma = Array2::<f64>::zeros((n, p_resp));
+                let mut dgamma = Array2::<f64>::zeros((n, p_resp));
+                for k in 0..p_resp {
+                    gamma
+                        .column_mut(k)
+                        .assign(&right.apply(&beta_mat.row(k).to_owned()));
+                    dgamma
+                        .column_mut(k)
+                        .assign(&right.apply(&delta_mat.row(k).to_owned()));
+                }
+                use rayon::prelude::*;
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        scop_quadratic_boundary_root(
+                            left.row(i),
+                            gamma.row(i),
+                            dgamma.row(i),
+                            slack,
+                            dh_eps,
+                        )
+                    })
+                    .reduce(|| f64::INFINITY, f64::min)
+            }
+            KroneckerDesign::Kronecker {
+                response_grid,
+                covariate,
+            } => {
+                let n_cov = covariate.nrows();
+                let n_grid = response_grid.nrows();
+                let p_resp = response_grid.ncols();
+                let p_cov = covariate.ncols();
+                debug_assert_eq!(beta.len(), p_resp * p_cov);
+                debug_assert_eq!(delta.len(), p_resp * p_cov);
+                let beta_mat = beta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                let delta_mat = delta.view().into_shape_with_order((p_resp, p_cov)).unwrap();
+                let mut gamma = Array2::<f64>::zeros((n_cov, p_resp));
+                let mut dgamma = Array2::<f64>::zeros((n_cov, p_resp));
+                for k in 0..p_resp {
+                    gamma
+                        .column_mut(k)
+                        .assign(&covariate.apply(&beta_mat.row(k).to_owned()));
+                    dgamma
+                        .column_mut(k)
+                        .assign(&covariate.apply(&delta_mat.row(k).to_owned()));
+                }
+                use rayon::prelude::*;
+                (0..n_cov)
+                    .into_par_iter()
+                    .map(|i| {
+                        let g_row = gamma.row(i);
+                        let dg_row = dgamma.row(i);
+                        let mut best = f64::INFINITY;
+                        for grid_idx in 0..n_grid {
+                            let root = scop_quadratic_boundary_root(
+                                response_grid.row(grid_idx),
+                                g_row,
+                                dg_row,
+                                slack,
+                                dh_eps,
+                            );
+                            best = best.min(root);
+                        }
+                        best
+                    })
+                    .reduce(|| f64::INFINITY, f64::min)
             }
         }
     }
@@ -3840,6 +4063,7 @@ impl KroneckerDesign {
     ///
     /// The reduction is `f64::min`, which is associative for non-NaN inputs,
     /// so the parallel and serial reductions are bit-equivalent.
+    #[cfg(test)]
     fn min_step_to_boundary(
         &self,
         beta: &Array1<f64>,
@@ -3914,6 +4138,7 @@ impl KroneckerDesign {
     /// fresh `β` / `δ` rather than once per outer iteration. Returns `None`
     /// for the `KhatriRao` variant since that branch streams over `n`
     /// observation rows directly and benefits no caching.
+    #[cfg(test)]
     fn project_kronecker_factor(&self, beta: &Array1<f64>) -> Option<Array2<f64>> {
         match self {
             KroneckerDesign::KhatriRao { .. } => None,
@@ -3940,6 +4165,7 @@ impl KroneckerDesign {
     ///
     /// Returns `None` for the `KhatriRao` variant — it has no separate response
     /// factor to summarize.
+    #[cfg(test)]
     fn max_response_norm(&self) -> Option<f64> {
         match self {
             KroneckerDesign::KhatriRao { .. } => None,
@@ -3959,6 +4185,7 @@ impl KroneckerDesign {
     ///
     /// Streamed via `try_row_chunk` so sparse / operator-backed covariates
     /// stay chunkable. Returns `None` for the `KhatriRao` variant.
+    #[cfg(test)]
     fn max_covariate_norm(&self) -> Option<f64> {
         match self {
             KroneckerDesign::KhatriRao { .. } => None,
@@ -4014,6 +4241,7 @@ impl KroneckerDesign {
     ///   `α_A` = min over active `(i,g)` with `d_{i,g}<-dh_eps` of
     ///     `(h_{i,g} - slack)/(-d_{i,g})`. If `m_inactive - α_A · L > slack`
     ///   then no inactive constraint can bind before `α_A`, so `α_A` is exact.
+    #[cfg(test)]
     fn min_step_to_boundary_with_active_set(
         &self,
         c: ndarray::ArrayView2<'_, f64>,
@@ -4150,6 +4378,7 @@ impl KroneckerDesign {
     /// `active_pairs` collects (i, g) with `h_{i,g} - slack ≤ τ`; the
     /// `min_inactive_margin` is the smallest `h_{i,g} - slack` over inactive
     /// pairs (= the tightest non-active constraint).
+    #[cfg(test)]
     fn scan_kronecker_boundary_and_refresh_cache(
         response_grid: &Array2<f64>,
         c: ndarray::ArrayView2<'_, f64>,
@@ -4528,18 +4757,13 @@ fn build_tensor_penalties_kronecker(
 // Warm start
 // ---------------------------------------------------------------------------
 
-/// Compute initial γ so that the SCOP-CTN model produces h(y|x) ≈ (y - μ(x)) / τ(x).
+/// Compute initial β so that the SCOP-CTN model starts with a positive
+/// derivative and approximately centered transformed response.
 ///
-/// Solves the joint value+derivative least-squares system
-///
-///   minimize  ||W^{1/2}(X_val·γ - t_h)||² + ||W^{1/2}(X_deriv·γ - t_hp)||² + λ||γ||²
-///
-/// where t_h_i = (y_i - μ(x_i))/τ(x_i) - offset_i (so X_val·γ + offset = (y - μ)/τ)
-/// and   t_hp_i = 1/τ(x_i).
-///
-/// Pinning both value and derivative targets gives a well-defined γ even when the
-/// I-spline span is wider than the affine residual, and reproduces the affine
-/// normalizer exactly when the basis is rich enough to represent it.
+/// SCOP is nonlinear in the shape rows: `h'=Σ M_k(y)γ_k(x)^2`. A linear joint
+/// least-squares solve fits the wrong parameterization, so the warm start
+/// initializes shape rows to a positive constant derivative scale and then
+/// solves only the location row `b(x)` against the remaining affine target.
 fn compute_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
@@ -4577,7 +4801,7 @@ fn compute_warm_start(
         return Err("warm start location/scale length mismatch".to_string());
     }
 
-    // Per-row affine targets for the I-spline value and M-spline derivative bases.
+    // Per-row affine targets for the transformation scale.
     let mut target_h = Array1::<f64>::zeros(n);
     let mut target_hp = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -4587,50 +4811,65 @@ fn compute_warm_start(
         target_hp[i] = inv_tau;
     }
 
-    // Joint normal equations: (X_val^T W X_val + X_deriv^T W X_deriv + λI) γ
-    //                        = X_val^T W t_h + X_deriv^T W t_hp.
-    let policy = ResourcePolicy::default_library();
-    let gram_val = x_val_kron.weighted_gram(weights, &policy);
-    let gram_deriv = x_deriv_kron.weighted_gram(weights, &policy);
-    let mut a = gram_val + gram_deriv;
-
-    let mut weighted_t_h = Array1::<f64>::zeros(n);
-    let mut weighted_t_hp = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        weighted_t_h[i] = weights[i] * target_h[i];
-        weighted_t_hp[i] = weights[i] * target_hp[i];
-    }
-    let rhs = x_val_kron.transpose_mul(&weighted_t_h)
-        + x_deriv_kron.transpose_mul(&weighted_t_hp);
-
-    // Light ridge sized to the diagonal scale so the solve is stable even when
-    // p_total > rank(X_val ⊕ X_deriv) (e.g. n < p_total in unit tests). The
-    // ridge magnitude is well below the affine target's energy and does not
-    // perturb (y - μ)/τ recovery to within the assertion tolerances of the
-    // warm-start contract.
-    let mut diag_trace = 0.0;
-    for j in 0..p_total {
-        diag_trace += a[[j, j]];
-    }
-    let ridge = if p_total > 0 {
-        (diag_trace / p_total as f64).max(1.0) * 1e-10
-    } else {
-        1e-10
+    let mut beta = Array1::<f64>::zeros(p_total);
+    let weighted_inv_tau_sum: f64 = target_hp
+        .iter()
+        .zip(weights.iter())
+        .map(|(&hp, &w)| hp * w)
+        .sum();
+    let weight_sum: f64 = weights.iter().sum::<f64>().max(1e-12);
+    let mean_inv_tau = (weighted_inv_tau_sum / weight_sum).max(TRANSFORMATION_MONOTONICITY_EPS);
+    let mean_m_sum = match x_deriv_kron {
+        KroneckerDesign::KhatriRao { left, .. } if left.ncols() == p_resp => {
+            let mut total = 0.0;
+            let mut wsum = 0.0;
+            for i in 0..n {
+                let row_sum: f64 = left.row(i).slice(s![1..]).iter().sum();
+                total += weights[i] * row_sum;
+                wsum += weights[i];
+            }
+            (total / wsum.max(1e-12)).max(1e-12)
+        }
+        _ => 1.0,
     };
-    for j in 0..p_total {
-        a[[j, j]] += ridge;
+    let gamma_const = (mean_inv_tau / mean_m_sum).sqrt();
+
+    let zero_offset = Array1::<f64>::zeros(n);
+    let log_lambdas = Array1::<f64>::zeros(covariate_penalties.len());
+    let target_gamma = Array1::<f64>::from_elem(n, gamma_const);
+    for k in 1..p_resp {
+        let row_beta = solve_penalizedweighted_projection(
+            covariate_design,
+            &zero_offset,
+            &target_gamma,
+            weights,
+            covariate_penalties,
+            &log_lambdas,
+            1e-8,
+        )?;
+        for c in 0..p_cov {
+            beta[k * p_cov + c] = row_beta[c];
+        }
     }
 
-    use crate::faer_ndarray::FaerCholesky;
-    use faer::Side;
-    let factor = a
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("warm-start joint LSQ Cholesky failed: {e:?}"))?;
-    let beta = factor.solvevec(&rhs);
-    if beta.iter().any(|v| !v.is_finite()) {
-        return Err("warm-start joint LSQ produced non-finite coefficients".to_string());
+    let shape_contrib = x_val_kron.scop_affine_squared_forward(&beta);
+    let target_location = &target_h - &shape_contrib;
+    let beta_location = solve_penalizedweighted_projection(
+        covariate_design,
+        &zero_offset,
+        &target_location,
+        weights,
+        covariate_penalties,
+        &log_lambdas,
+        1e-8,
+    )?;
+    for c in 0..p_cov {
+        beta[c] = beta_location[c];
     }
-    let _ = covariate_penalties; // unused under the joint LSQ formulation
+
+    if beta.iter().any(|v| !v.is_finite()) {
+        return Err("SCOP warm start produced non-finite coefficients".to_string());
+    }
     Ok(beta)
 }
 
@@ -5122,62 +5361,6 @@ impl TensorKroneckerPsiOperator {
         let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
         unit[axis] = 1.0;
         self.transpose_directional_deriv(&unit.view(), &v.view())
-    }
-
-    fn weighted_cross_with_cov_first(
-        &self,
-        left_resp_basis: &Array2<f64>,
-        right_resp_basis: &Array2<f64>,
-        axis: usize,
-        weights: &Array1<f64>,
-    ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        let n = self.n_data();
-        let p_left_resp = left_resp_basis.ncols();
-        let p_right_resp = right_resp_basis.ncols();
-        let p_cov = self.p_cov();
-        let deriv = self.cov_deriv(axis)?;
-        let cov_psi_dense =
-            (deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p_cov).then_some(&deriv.x_psi);
-        let cov_design_dense = self.covariate_design.as_dense_ref();
-        let mut out = Array2::<f64>::zeros((p_left_resp * p_cov, p_right_resp * p_cov));
-        for a in 0..p_left_resp {
-            for b in 0..p_right_resp {
-                let mut pair_weights = Array1::<f64>::zeros(n);
-                ndarray::Zip::from(&mut pair_weights)
-                    .and(weights)
-                    .and(left_resp_basis.column(a))
-                    .and(right_resp_basis.column(b))
-                    .par_for_each(|p, &w, &la, &rb| *p = w * la * rb);
-                let block = if let (Some(cov_design), Some(cov_psi)) =
-                    (cov_design_dense, cov_psi_dense)
-                {
-                    weighted_crossprod_dense(cov_design, &pair_weights, cov_psi)
-                } else if let Some(cov_psi) = cov_psi_dense {
-                    let mut block = Array2::<f64>::zeros((p_cov, p_cov));
-                    for j in 0..p_cov {
-                        let weighted_col = &pair_weights * &cov_psi.column(j).to_owned();
-                        let col = self.covariate_design.apply_transpose(&weighted_col);
-                        block.column_mut(j).assign(&col);
-                    }
-                    block
-                } else {
-                    let mut block = Array2::<f64>::zeros((p_cov, p_cov));
-                    let mut e = Array1::<f64>::zeros(p_cov);
-                    for j in 0..p_cov {
-                        e[j] = 1.0;
-                        let col = self.cov_forward_first(axis, &e.view())?;
-                        e[j] = 0.0;
-                        let weighted_col = &pair_weights * &col;
-                        let cov_t_weighted = self.covariate_design.apply_transpose(&weighted_col);
-                        block.column_mut(j).assign(&cov_t_weighted);
-                    }
-                    block
-                };
-                out.slice_mut(s![a * p_cov..(a + 1) * p_cov, b * p_cov..(b + 1) * p_cov])
-                    .assign(&block);
-            }
-        }
-        Ok(out)
     }
 
     fn forward_mul_second_deriv(
@@ -7383,6 +7566,8 @@ pub fn build_tensor_psi_derivatives(
 #[derive(Clone)]
 struct TransformationExactGeometryCache {
     key: Vec<u64>,
+    covariate_spec_resolved: TermCollectionSpec,
+    covariate_design: TermCollectionDesign,
     family: TransformationNormalFamily,
     blocks: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
@@ -7426,25 +7611,38 @@ impl TransformationExactGeometryCache {
 fn transformation_spatial_geometry_key(
     spec: &TermCollectionSpec,
     spatial_terms: &[usize],
-) -> Vec<u64> {
-    let mut key = Vec::with_capacity(1 + spatial_terms.len() * 8);
+) -> Result<Vec<u64>, String> {
+    let mut key = Vec::new();
     key.push(spatial_terms.len() as u64);
     for &term_idx in spatial_terms {
+        let term = spec.smooth_terms.get(term_idx).ok_or_else(|| {
+            format!(
+                "transformation spatial geometry key term index {term_idx} out of range for {} smooth terms",
+                spec.smooth_terms.len()
+            )
+        })?;
         key.push(term_idx as u64);
-        key.push(
-            get_spatial_length_scale(spec, term_idx)
-                .map(f64::to_bits)
-                .unwrap_or(u64::MAX),
-        );
-        match get_spatial_aniso_log_scales(spec, term_idx) {
-            Some(eta) => {
-                key.push(eta.len() as u64);
-                key.extend(eta.into_iter().map(f64::to_bits));
+
+        // The CTN exact-family cache is valid only for an identical covariate
+        // geometry. Length-scale and anisotropy scalars are not enough: the
+        // family also embeds frozen centers, input standardization scales,
+        // identifiability transforms, and active penalty topology. Serialize
+        // the already-frozen term and store the exact bytes in the key so a
+        // cache hit means the saved prediction design will replay the same
+        // matrix used by the final inner fit.
+        let payload = serde_json::to_vec(term).map_err(|err| {
+            format!("failed to serialize transformation spatial geometry term {term_idx}: {err}")
+        })?;
+        key.push(payload.len() as u64);
+        for chunk in payload.chunks(8) {
+            let mut bytes = [0u8; 8];
+            for (dst, src) in bytes.iter_mut().zip(chunk.iter().copied()) {
+                *dst = src;
             }
-            None => key.push(u64::MAX - 1),
+            key.push(u64::from_le_bytes(bytes));
         }
     }
-    key
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -7452,6 +7650,7 @@ fn transformation_spatial_geometry_key(
 // ---------------------------------------------------------------------------
 
 /// Result of `fit_transformation_normal`.
+#[derive(Clone)]
 pub struct TransformationNormalFitResult {
     pub family: TransformationNormalFamily,
     pub fit: UnifiedFitResult,
@@ -7601,19 +7800,16 @@ pub fn fit_transformation_normal(
         kappa_dims,
     );
     let rho0 = probe_block.initial_log_lambdas.clone();
-    // Data-aware floor on the outer search range. For small-n / large-p
-    // configurations, log_lambda < 0 (i.e. λ < 1) drops the regularization
-    // below the data's information capacity and the inner solve admits
-    // wild β with predict-time monotonicity blowups (h' = ±1e15 spikes).
-    // Seed clamp `[0, 12]` already prevents COLD-starting in that regime;
-    // this floor prevents the outer BFGS from stepping there during search.
-    // For well-determined problems (n ≥ 5·p_total) the floor relaxes to the
-    // historical -12 so the optimizer can find genuinely small-λ optima.
+    // Data-aware floor on the outer search range. In small-n / large-p CTN
+    // fits, λ < 1 lets the transformation interpolate with huge h values while
+    // still satisfying monotonicity. Keep the floor only in that underdetermined
+    // regime; well-determined fits retain the broad REML search interval.
     let total_param_count = probe_block.design.ncols();
     let n_obs_for_bound = response.len();
     let rho_floor =
         if total_param_count > 0 && n_obs_for_bound < 5usize.saturating_mul(total_param_count) {
-            0.0
+            let underdetermination = 5.0 * total_param_count as f64 / n_obs_for_bound.max(1) as f64;
+            (underdetermination * underdetermination).ln().max(0.0)
         } else {
             -12.0
         };
@@ -7622,7 +7818,7 @@ pub fn fit_transformation_normal(
     let probe_blocks = vec![probe_block];
     let (_, cap_hessian) = custom_family_outer_derivatives(&probe_family, &probe_blocks, &options);
     let analytic_gradient = analytic_psi_available;
-    let analytic_hessian = analytic_psi_available
+    let analytic_hessian = analytic_gradient
         && matches!(
             cap_hessian,
             crate::solver::outer_strategy::Derivative::Analytic
@@ -7673,6 +7869,7 @@ pub fn fit_transformation_normal(
     let make_family =
         |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
             TransformationNormalFamily::from_prebuilt_response_basis(
+                response,
                 rv.clone(),
                 rd.clone(),
                 rp.clone(),
@@ -7701,7 +7898,9 @@ pub fn fit_transformation_normal(
     let ensure_exact_geometry = |spec: &TermCollectionSpec,
                                  design: &TermCollectionDesign|
      -> Result<(), String> {
-        let key = transformation_spatial_geometry_key(spec, &spatial_terms_for_cache);
+        let effective_spec = freeze_term_collection_from_design(spec, design)
+            .map_err(|e| format!("failed to freeze transformation geometry key: {e}"))?;
+        let key = transformation_spatial_geometry_key(&effective_spec, &spatial_terms_for_cache)?;
         let needs_rebuild = exact_geometry_cache
             .borrow()
             .as_ref()
@@ -7712,11 +7911,14 @@ pub fn fit_transformation_normal(
         }
 
         let geom_start = std::time::Instant::now();
-        let family = make_family(design)?;
-        let cov_psi_derivs = build_block_spatial_psi_derivatives(covariate_data, spec, design)?
-            .ok_or_else(|| {
-                "missing covariate spatial psi derivatives for transformation model".to_string()
-            })?;
+        let exact_design = build_term_collection_design(covariate_data, &effective_spec)
+            .map_err(|e| format!("failed to rebuild frozen transformation geometry: {e}"))?;
+        let family = make_family(&exact_design)?;
+        let cov_psi_derivs =
+            build_block_spatial_psi_derivatives(covariate_data, &effective_spec, &exact_design)?
+                .ok_or_else(|| {
+                    "missing covariate spatial psi derivatives for transformation model".to_string()
+                })?;
         let tensor_derivs = build_tensor_psi_derivatives(&family, &cov_psi_derivs)?;
 
         log::debug!(
@@ -7730,6 +7932,8 @@ pub fn fit_transformation_normal(
         exact_warm_start.replace(None);
         exact_geometry_cache.replace(Some(TransformationExactGeometryCache {
             key,
+            covariate_spec_resolved: effective_spec,
+            covariate_design: exact_design,
             blocks: vec![family.block_spec()],
             family,
             derivative_blocks: vec![tensor_derivs],
@@ -7782,11 +7986,43 @@ pub fn fit_transformation_normal(
                 true,
             )
             .map_err(|e| format!("transformation fit_fn: {e}"))?;
+            if let Some(block) = fit.block_states.first() {
+                *geometry
+                    .family
+                    .row_quantity_cache
+                    .lock()
+                    .expect("CTN row quantity cache mutex poisoned") = None;
+                let final_rows = geometry.family.row_quantities(&block.beta)?;
+                let max_abs_h = final_rows
+                    .h
+                    .iter()
+                    .copied()
+                    .map(f64::abs)
+                    .fold(0.0, f64::max);
+                let cov_chunk = geometry
+                    .family
+                    .covariate_design
+                    .try_row_chunk(0..response.len())
+                    .map_err(|err| {
+                        format!("final CTN covariate design validation failed: {err}")
+                    })?;
+                let max_abs_cov = cov_chunk.iter().copied().map(f64::abs).fold(0.0, f64::max);
+                log::info!(
+                    "[transformation-normal] final fixed-rho CTN validation: max_abs_h={:.6e} max_abs_covariate_basis={:.6e}",
+                    max_abs_h,
+                    max_abs_cov
+                );
+            }
             // Update warm start hints.
             if let Some(block) = fit.block_states.first() {
                 *beta_hint.borrow_mut() = Some(block.beta.clone());
             }
-            Ok((geometry.family.clone(), fit))
+            Ok(TransformationNormalFitResult {
+                family: geometry.family.clone(),
+                fit,
+                covariate_spec_resolved: geometry.covariate_spec_resolved.clone(),
+                covariate_design: geometry.covariate_design.clone(),
+            })
         },
         // exact_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
@@ -7864,13 +8100,5 @@ pub fn fit_transformation_normal(
         },
     )?;
 
-    // Extract the family and fit from the optimizer result.
-    let (family, fit) = solved.fit;
-
-    Ok(TransformationNormalFitResult {
-        family,
-        fit,
-        covariate_spec_resolved: solved.resolved_specs.into_iter().next().unwrap(),
-        covariate_design: solved.designs.into_iter().next().unwrap(),
-    })
+    Ok(solved.fit)
 }

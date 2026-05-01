@@ -6172,8 +6172,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
     let eps_lower =
         Array1::from_iter((0..initial_theta.len()).map(|idx| anchored_bound(idx, -1.0)));
-    let eps_upper =
-        Array1::from_iter((0..initial_theta.len()).map(|idx| anchored_bound(idx, 1.0)));
+    let eps_upper = Array1::from_iter((0..initial_theta.len()).map(|idx| anchored_bound(idx, 1.0)));
     let blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: baseline.design.design.clone(),

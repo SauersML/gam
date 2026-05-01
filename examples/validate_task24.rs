@@ -12,11 +12,8 @@ fn val(q: usize, m: usize, s: usize, kappa: f64, eta: &[f64], r: &[f64]) -> f64 
 
 fn main() {
     // Cases that exercise q ∈ {0, 1, 2}, s > 0, η ≠ 0, R > 0 (analytic path).
-    let cases: &[(usize, usize, usize, usize, f64)] = &[
-        (0, 3, 2, 1, 1.5),
-        (1, 3, 1, 1, 1.0),
-        (2, 5, 2, 1, 1.5),
-    ];
+    let cases: &[(usize, usize, usize, usize, f64)] =
+        &[(0, 3, 2, 1, 1.5), (1, 3, 1, 1, 1.0), (2, 5, 2, 1, 1.5)];
 
     let h_eta = 1e-4_f64;
     let h_k = 1e-4_f64;
@@ -46,12 +43,15 @@ fn main() {
         }
 
         // d_kappa FD reference
-        let dfd =
-            (val(q, m, s, kappa + h_k, &eta, &r) - val(q, m, s, kappa - h_k, &eta, &r)) / (2.0 * h_k);
+        let dfd = (val(q, m, s, kappa + h_k, &eta, &r) - val(q, m, s, kappa - h_k, &eta, &r))
+            / (2.0 * h_k);
         let dan = bundle.d_kappa;
         let rel = (dan - dfd).abs() / dfd.abs().max(1e-12);
         max.1 = max.1.max(rel);
-        println!("q={} d_kappa: fd={:+.6e} an={:+.6e} rel={:.2e}", q, dfd, dan, rel);
+        println!(
+            "q={} d_kappa: fd={:+.6e} an={:+.6e} rel={:.2e}",
+            q, dfd, dan, rel
+        );
 
         // d2_kappa FD reference (3-pt second-difference)
         let v0 = val(q, m, s, kappa, &eta, &r);
@@ -98,7 +98,8 @@ fn main() {
                 e_mp[l] += h_eta;
                 e_mm[k_] -= h_eta;
                 e_mm[l] -= h_eta;
-                let fd = (val(q, m, s, kappa, &e_pp, &r) - val(q, m, s, kappa, &e_pm, &r)
+                let fd = (val(q, m, s, kappa, &e_pp, &r)
+                    - val(q, m, s, kappa, &e_pm, &r)
                     - val(q, m, s, kappa, &e_mp, &r)
                     + val(q, m, s, kappa, &e_mm, &r))
                     / (4.0 * h_eta * h_eta);
@@ -118,7 +119,8 @@ fn main() {
             let mut e_m = eta.clone();
             e_p[l] += h_eta;
             e_m[l] -= h_eta;
-            let fd = (val(q, m, s, kappa + h_k, &e_p, &r) - val(q, m, s, kappa - h_k, &e_p, &r)
+            let fd = (val(q, m, s, kappa + h_k, &e_p, &r)
+                - val(q, m, s, kappa - h_k, &e_p, &r)
                 - val(q, m, s, kappa + h_k, &e_m, &r)
                 + val(q, m, s, kappa - h_k, &e_m, &r))
                 / (4.0 * h_eta * h_k);

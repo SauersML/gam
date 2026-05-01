@@ -453,7 +453,15 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let requested_centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let polynomial_cols = match nullspace_order {
+                DuchonNullspaceOrder::Zero => 1,
+                DuchonNullspaceOrder::Linear => cols.len() + 1,
+                DuchonNullspaceOrder::Degree(degree) => {
+                    crate::basis::duchon_nullspace_dimension(cols.len(), degree)
+                }
+            };
+            let centers = requested_centers + polynomial_cols;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {

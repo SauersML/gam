@@ -18,8 +18,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use gam::terms::basis::closed_form_penalty::{
-    aniso_invariants_scalar, aniso_invariants_simd,
-    pair_block_radial_with_j_second_derivatives,
+    aniso_invariants_scalar, aniso_invariants_simd, pair_block_radial_with_j_second_derivatives,
 };
 
 const DIMS: &[usize] = &[2, 3, 4, 6];
@@ -99,12 +98,7 @@ fn bench_pair_block_end_to_end(c: &mut Criterion) {
                     let mut acc = 0.0_f64;
                     for (eta, r) in pairs {
                         let bundle = pair_block_radial_with_j_second_derivatives(
-                            /* q = */ 2,
-                            M_FIXED,
-                            S_FIXED,
-                            KAPPA,
-                            eta,
-                            r,
+                            /* q = */ 2, M_FIXED, S_FIXED, KAPPA, eta, r,
                         );
                         acc += bundle.value;
                     }

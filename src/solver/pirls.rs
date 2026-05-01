@@ -2667,16 +2667,11 @@ where
         hv
     };
 
-    let solution = crate::linalg::utils::solve_spd_pcg(
-        apply_h,
-        gradient,
-        &precond_diag,
-        rel_tol,
-        max_iter,
-    )
-    .ok_or(EstimationError::LinearSystemSolveFailed(
-        FaerLinalgError::FactorizationFailed,
-    ))?;
+    let solution =
+        crate::linalg::utils::solve_spd_pcg(apply_h, gradient, &precond_diag, rel_tol, max_iter)
+            .ok_or(EstimationError::LinearSystemSolveFailed(
+                FaerLinalgError::FactorizationFailed,
+            ))?;
 
     direction_out.assign(&solution);
     direction_out.mapv_inplace(|v| -v);
@@ -10018,8 +10013,7 @@ mod root_cause_tests {
                 let v = if i == j {
                     2.0 + ((i as f64) * 0.07).sin() * 0.3
                 } else {
-                    (((i as f64 - j as f64) * 0.13).cos()) * 0.02
-                        / (((i + 1) as f64).sqrt())
+                    (((i as f64 - j as f64) * 0.13).cos()) * 0.02 / (((i + 1) as f64).sqrt())
                 };
                 xtwx[[i, j]] = v;
                 xtwx[[j, i]] = v;
