@@ -7706,17 +7706,13 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     // (O(1e-7) precision); analytic Hessian arrives with closed-form-
     // math-fix's Tier-3 F^{(6)} extension.
     let aniso_dim = aniso_log_scales.len();
-    let use_closed_form_outer_aniso =
-        matches!(nullspace_order, DuchonNullspaceOrder::Zero);
+    let use_closed_form_outer_aniso = matches!(nullspace_order, DuchonNullspaceOrder::Zero);
     let log_riesz_present_aniso = d % 2 == 0 && d / 2 <= 2 * p_order;
     let closed_form_converges_q_aniso = |q: usize| -> bool {
         let four_ms = 4 * (p_order + s_order);
         let dp2q = d + 2 * q;
         let four_m = 4 * p_order;
-        four_ms > dp2q
-            && dp2q > four_m
-            && 2 * p_order >= q + 1
-            && !log_riesz_present_aniso
+        four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1 && !log_riesz_present_aniso
     };
     let mut op1_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>> = None;
     let mut op2_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>> = None;
@@ -7727,9 +7723,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         };
         let aniso_for_helper = Some(aniso_log_scales);
         let kernel_z = Some(&z_kernel);
-        let substitute = |q: usize,
-                          info: &mut PerOperatorInfo|
-         -> Option<Vec<Vec<Array2<f64>>>> {
+        let substitute = |q: usize, info: &mut PerOperatorInfo| -> Option<Vec<Vec<Array2<f64>>>> {
             if !closed_form_converges_q_aniso(q) {
                 return None;
             }
@@ -7751,11 +7745,8 @@ fn build_duchon_operator_penalty_aniso_derivatives(
             let mut s_second = Vec::with_capacity(aniso_dim);
             let mut s_first_raw_new = Vec::with_capacity(aniso_dim);
             for a in 0..aniso_dim {
-                let (_, sa_norm, sa2_norm, _) = normalize_penaltywith_psi_derivatives(
-                    &cf_s,
-                    &cf_first[a],
-                    &cf_second_diag[a],
-                );
+                let (_, sa_norm, sa2_norm, _) =
+                    normalize_penaltywith_psi_derivatives(&cf_s, &cf_first[a], &cf_second_diag[a]);
                 s_first.push(sa_norm);
                 s_second.push(sa2_norm);
                 s_first_raw_new.push(cf_first[a].clone());
@@ -8352,8 +8343,7 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
     // (a, b) pairs to avoid branching downstream; symmetric in a, b).
     let mut g = Array2::<f64>::zeros((k, k));
     let mut g_eta: Vec<Array2<f64>> = (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
-    let mut g_eta2_diag: Vec<Array2<f64>> =
-        (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
+    let mut g_eta2_diag: Vec<Array2<f64>> = (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect();
     let mut g_eta2_cross: Vec<Vec<Array2<f64>>> = (0..d)
         .map(|_| (0..d).map(|_| Array2::<f64>::zeros((k, k))).collect())
         .collect();
@@ -8561,13 +8551,8 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Array2<f64> {
-    let g_raw = closed_form_anisotropic_pair_block_pure(
-        centers,
-        q,
-        p_order,
-        s_order,
-        aniso_log_scales,
-    );
+    let g_raw =
+        closed_form_anisotropic_pair_block_pure(centers, q, p_order, s_order, aniso_log_scales);
     let g_kernel = if let Some(z) = kernel_nullspace {
         let zt_g = fast_atb(z, &g_raw);
         fast_ab(&zt_g, z)
@@ -12202,51 +12187,45 @@ fn build_duchon_operator_penalty_psi_derivatives(
     // rule (`pair_block_radial_with_j_second_derivatives` uses central FD
     // with h_κ ≈ |κ|·1e-4, giving O(1e-7) precision until Tier-2 analytic
     // κ-derivs land from closed-form-math-fix).
-    let use_closed_form_outer_psi =
-        matches!(effective_nullspace_order, DuchonNullspaceOrder::Zero);
+    let use_closed_form_outer_psi = matches!(effective_nullspace_order, DuchonNullspaceOrder::Zero);
     let log_riesz_present_psi = d % 2 == 0 && d / 2 <= 2 * p_order;
     let closed_form_converges_q_psi = |q: usize| -> bool {
         let four_ms = 4 * (p_order + s_order);
         let dp2q = d + 2 * q;
         let four_m = 4 * p_order;
-        four_ms > dp2q
-            && dp2q > four_m
-            && 2 * p_order >= q + 1
-            && !log_riesz_present_psi
+        four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1 && !log_riesz_present_psi
     };
     if use_closed_form_outer_psi {
         let kappa = 1.0 / length_scale.max(1e-300);
         let aniso = spec.aniso_log_scales.as_deref();
         if closed_form_converges_q_psi(1) {
-            let (cf_s, cf_s_psi, cf_s_psi_psi) =
-                closed_form_psi_derivatives_in_total_basis(
-                    centers,
-                    1,
-                    p_order,
-                    s_order,
-                    kappa,
-                    aniso,
-                    Some(&z_kernel),
-                    poly_cols,
-                    identifiability_transform,
-                );
+            let (cf_s, cf_s_psi, cf_s_psi_psi) = closed_form_psi_derivatives_in_total_basis(
+                centers,
+                1,
+                p_order,
+                s_order,
+                kappa,
+                aniso,
+                Some(&z_kernel),
+                poly_cols,
+                identifiability_transform,
+            );
             s1 = cf_s;
             s1_psi = cf_s_psi;
             s1_psi_psi = cf_s_psi_psi;
         }
         if closed_form_converges_q_psi(2) {
-            let (cf_s, cf_s_psi, cf_s_psi_psi) =
-                closed_form_psi_derivatives_in_total_basis(
-                    centers,
-                    2,
-                    p_order,
-                    s_order,
-                    kappa,
-                    aniso,
-                    Some(&z_kernel),
-                    poly_cols,
-                    identifiability_transform,
-                );
+            let (cf_s, cf_s_psi, cf_s_psi_psi) = closed_form_psi_derivatives_in_total_basis(
+                centers,
+                2,
+                p_order,
+                s_order,
+                kappa,
+                aniso,
+                Some(&z_kernel),
+                poly_cols,
+                identifiability_transform,
+            );
             s2 = cf_s;
             s2_psi = cf_s_psi;
             s2_psi_psi = cf_s_psi_psi;
@@ -18682,7 +18661,10 @@ pub mod closed_form_penalty {
         assert!(ell >= 1);
         assert!(kappa > 0.0);
         assert!(r > 0.0);
-        assert!(max_order <= 6, "matern_block_radial_derivatives: max_order ≤ 6");
+        assert!(
+            max_order <= 6,
+            "matern_block_radial_derivatives: max_order ≤ 6"
+        );
 
         let nu = ell as f64 - d as f64 / 2.0;
         // Prefactor κ^{d/2-ℓ} / ((2π)^{d/2} 2^{ℓ-1} Γ(ℓ))
@@ -18769,12 +18751,7 @@ pub mod closed_form_penalty {
     /// Radial derivatives `[R^{(0)}, …, R^{(max_order)}]` of a single
     /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
     /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
-    fn riesz_block_radial_derivatives(
-        d: usize,
-        j: usize,
-        r: f64,
-        max_order: usize,
-    ) -> Vec<f64> {
+    fn riesz_block_radial_derivatives(d: usize, j: usize, r: f64, max_order: usize) -> Vec<f64> {
         assert!(d >= 1);
         assert!(j >= 1);
         assert!(r > 0.0);
@@ -18851,9 +18828,18 @@ pub mod closed_form_penalty {
         r: f64,
         max_order: usize,
     ) -> Vec<f64> {
-        assert!(r > 0.0, "radial_derivatives_of_isotropic_duchon: r must be > 0");
-        assert!(2 * m >= 1, "radial_derivatives_of_isotropic_duchon: need m ≥ 1");
-        assert!(max_order <= 6, "radial_derivatives_of_isotropic_duchon: max_order ≤ 6");
+        assert!(
+            r > 0.0,
+            "radial_derivatives_of_isotropic_duchon: r must be > 0"
+        );
+        assert!(
+            2 * m >= 1,
+            "radial_derivatives_of_isotropic_duchon: need m ≥ 1"
+        );
+        assert!(
+            max_order <= 6,
+            "radial_derivatives_of_isotropic_duchon: max_order ≤ 6"
+        );
 
         // a = 2m (we differentiate f = isotropic Duchon at q=0; the q is
         // applied externally via Δ_B^q in g_q).  Match isotropic_duchon_penalty(q=0).
@@ -19071,12 +19057,7 @@ pub mod closed_form_penalty {
     }
 
     /// Δ_B f(R) with f given by its radial derivatives `[f, f', f'', …]`.
-    fn anisotropic_laplacian_of_radial_first(
-        big_r: f64,
-        s1: f64,
-        u1: f64,
-        fr: &[f64],
-    ) -> f64 {
+    fn anisotropic_laplacian_of_radial_first(big_r: f64, s1: f64, u1: f64, fr: &[f64]) -> f64 {
         // Δ_B f = f''·u_1/R² + f'·(s_1/R - u_1/R³)
         let r2 = big_r * big_r;
         let r3 = r2 * big_r;
@@ -19101,11 +19082,10 @@ pub mod closed_form_penalty {
         let r7 = r6 * r;
 
         // u_1² · [f''''/R⁴ - 6 f'''/R⁵ + 15 f''/R⁶ - 15 f'/R⁷]
-        let part_u1sq = u1 * u1
-            * (fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7);
+        let part_u1sq =
+            u1 * u1 * (fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7);
         // s_1·u_1 · [2 f'''/R³ - 6 f''/R⁴ + 6 f'/R⁵]
-        let part_s1u1 =
-            s1 * u1 * (2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5);
+        let part_s1u1 = s1 * u1 * (2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5);
         // s_1² · [f''/R² - f'/R³]
         let part_s1sq = s1 * s1 * (fr[2] / r2 - fr[1] / r3);
         // u_2 · [4 f'''/R³ - 12 f''/R⁴ + 12 f'/R⁵]
@@ -19334,9 +19314,10 @@ pub mod closed_form_penalty {
                 //   d/dR[-f''·u1/R²] = -f'''·u1/R² + 2 f''·u1/R³
                 //   d/dR[-f'·s1/R]   = -f''·s1/R + f'·s1/R²
                 //   d/dR[ f'·u1/R³]  =  f''·u1/R³ - 3 f'·u1/R⁴
-                let g_r = -fr[3] * u1 / r2 + 2.0 * fr[2] * u1 / r3
-                    - fr[2] * s1 / r + fr[1] * s1 / r2
-                    + fr[2] * u1 / r3 - 3.0 * fr[1] * u1 / r4;
+                let g_r = -fr[3] * u1 / r2 + 2.0 * fr[2] * u1 / r3 - fr[2] * s1 / r
+                    + fr[1] * s1 / r2
+                    + fr[2] * u1 / r3
+                    - 3.0 * fr[1] * u1 / r4;
                 // Combine the two u1/R³ terms:
                 //   2 f''·u1/R³ + f''·u1/R³ = 3 f''·u1/R³.
                 // Final form (kept above as raw sum for clarity; algebra:
@@ -19360,13 +19341,13 @@ pub mod closed_form_penalty {
                 //   dF3/dR = f'''/R² - 3 f''/R³ + 3 f'/R⁴
                 //   dF4/dR = 4 f''''/R³ - 24 f'''/R⁴ + 60 f''/R⁵ - 60 f'/R⁶
                 //   dF5/dR = 2 f'''/R² - 6 f''/R³ + 6 f'/R⁴
-                let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6
-                    - 105.0 * fr[2] / r7 + 105.0 * fr[1] / r8;
-                let df2 = 2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5
-                    - 30.0 * fr[1] / r6;
+                let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6 - 105.0 * fr[2] / r7
+                    + 105.0 * fr[1] / r8;
+                let df2 =
+                    2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5 - 30.0 * fr[1] / r6;
                 let df3 = fr[3] / r2 - 3.0 * fr[2] / r3 + 3.0 * fr[1] / r4;
-                let df4 = 4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5
-                    - 60.0 * fr[1] / r6;
+                let df4 =
+                    4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5 - 60.0 * fr[1] / r6;
                 let df5 = 2.0 * fr[3] / r2 - 6.0 * fr[2] / r3 + 6.0 * fr[1] / r4;
 
                 let g_r = u1 * u1 * df1 + s1 * u1 * df2 + s1 * s1 * df3 + u2 * df4 + s2 * df5;
@@ -19433,9 +19414,7 @@ pub mod closed_form_penalty {
             du1_de[l] = -4.0 * b_l_sq * r_l_sq;
             du2_de[l] = -6.0 * b_l_cu * r_l_sq;
         }
-        (
-            big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de,
-        )
+        (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de)
     }
 
     /// Bundled value + first/second derivatives of the radial-form
@@ -19499,18 +19478,8 @@ pub mod closed_form_penalty {
             // Need radial derivatives up to order 2q + 1 because g_R contains
             // f^{(2q+1)} (one extra differentiation beyond what g_q itself uses).
             let max_order = 2 * q + 1;
-            let (
-                big_r,
-                s1,
-                s2,
-                u1,
-                u2,
-                dr_de,
-                ds1_de,
-                ds2_de,
-                du1_de,
-                du2_de,
-            ) = aniso_invariants_eta_jacobian(eta, r);
+            let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
+                aniso_invariants_eta_jacobian(eta, r);
             let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
             let (g, g_r, g_s1, g_s2, g_u1, g_u2) =
                 radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
@@ -19548,8 +19517,9 @@ pub mod closed_form_penalty {
         } else if analytic_first_ok {
             let max_order = 2 * q + 1;
             let (big_r, s1, s2, u1, u2) = aniso_invariants(eta, r);
-            let dfr =
-                radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, big_r, max_order);
+            let dfr = radial_derivatives_of_isotropic_duchon_kappa_partial(
+                d, m, s, kappa, big_r, max_order,
+            );
             // The same g_q expansion in (R, s1, s2, u1, u2) but with ∂_κ F^{(k)}
             // in place of F^{(k)}; the (R, ..., u2) factors are κ-independent.
             // Because g_q is linear in each F^{(k)} for q ∈ {0, 1, 2}, the
@@ -19577,8 +19547,8 @@ pub mod closed_form_penalty {
             eta_m.copy_from_slice(eta);
             eta_p[l] += h_eta;
             eta_m[l] -= h_eta;
-            d2_eta[l][l] = (val(&eta_p, kappa) - 2.0 * value + val(&eta_m, kappa))
-                / (h_eta * h_eta);
+            d2_eta[l][l] =
+                (val(&eta_p, kappa) - 2.0 * value + val(&eta_m, kappa)) / (h_eta * h_eta);
         }
         // Off-diagonal: 4-pt stencil.
         let mut e_pp: EtaBuf = eta_buf_from(eta);
@@ -22542,13 +22512,7 @@ mod tests {
         let p_order = 1usize;
         let s_order = 2usize;
 
-        let g = closed_form_anisotropic_pair_block_pure(
-            centers.view(),
-            1,
-            p_order,
-            s_order,
-            None,
-        );
+        let g = closed_form_anisotropic_pair_block_pure(centers.view(), 1, p_order, s_order, None);
 
         assert_eq!(g.nrows(), k);
         assert_eq!(g.ncols(), k);
@@ -22625,8 +22589,8 @@ mod tests {
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
         };
-        let out =
-            build_duchon_basis(data.view(), &spec).expect("Zero-nullspace Duchon basis should build");
+        let out = build_duchon_basis(data.view(), &spec)
+            .expect("Zero-nullspace Duchon basis should build");
         assert_eq!(out.penaltyinfo.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
     }
@@ -26546,8 +26510,8 @@ mod tests {
                 let f_0 = riesz_kernel_value(d, j, r);
                 let f_p = riesz_kernel_value(d, j, r + h);
                 let f_pp = riesz_kernel_value(d, j, r + 2.0 * h);
-                let f_pp_d2 = (-f_mm + 16.0 * f_m - 30.0 * f_0 + 16.0 * f_p - f_pp)
-                    / (12.0 * h * h);
+                let f_pp_d2 =
+                    (-f_mm + 16.0 * f_m - 30.0 * f_0 + 16.0 * f_p - f_pp) / (12.0 * h * h);
                 let f_p_d1 = (f_mm - 8.0 * f_m + 8.0 * f_p - f_pp) / (12.0 * h);
                 let lap = f_pp_d2 + (d as f64 - 1.0) / r * f_p_d1;
                 let lhs = -lap;
@@ -26686,12 +26650,15 @@ mod tests {
             let mut expected = 0.0_f64;
             for j in 1..=a {
                 let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
-                let coeff = sign * binom(a + b - j - 1, a - j) * kappa_sq.powi(-((a + b - j) as i32));
+                let coeff =
+                    sign * binom(a + b - j - 1, a - j) * kappa_sq.powi(-((a + b - j) as i32));
                 expected += coeff * riesz_kernel_value(d, j, r);
             }
             let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
             for ell in 1..=b {
-                let coeff = sign_a * binom(a + b - ell - 1, b - ell) * kappa_sq.powi(-((a + b - ell) as i32));
+                let coeff = sign_a
+                    * binom(a + b - ell - 1, b - ell)
+                    * kappa_sq.powi(-((a + b - ell) as i32));
                 expected += coeff * matern_kernel_value(d, ell, kappa, r);
             }
             let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
@@ -26753,10 +26720,7 @@ mod tests {
         // catches the same families of bugs at 1e-2 over the bulk regime
         // R ∈ [0.4, 2.5]; this test extends coverage down to R = 0.2 at
         // the achievable precision.
-        let cases: &[(usize, usize, usize, usize, f64)] = &[
-            (1, 3, 1, 2, 1.0),
-            (2, 5, 2, 2, 1.0),
-        ];
+        let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 2, 1.0), (2, 5, 2, 2, 1.0)];
         for &(q, d, m, s, kappa) in cases {
             for &big_r in &[0.2_f64, 0.5, 1.0, 2.0, 4.0] {
                 let eta = vec![0.0_f64; d];
@@ -26993,10 +26957,7 @@ mod tests {
         // where Schoenberg works.
         //   q=1: (d=3, m=1, s=1) — UV 8>5 ✓, IR 5>4 ✓.
         //   q=2: (d=5, m=2, s=2) — UV 16>9 ✓, IR 9>8 ✓.
-        let cases: &[(usize, usize, usize, usize, f64)] = &[
-            (1, 3, 1, 1, 1.0),
-            (2, 5, 2, 2, 1.0),
-        ];
+        let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 1, 1.0), (2, 5, 2, 2, 1.0)];
 
         for &(q, d, m, s, kappa) in cases {
             // Try a few non-degenerate r vectors.
@@ -27067,8 +27028,7 @@ mod tests {
             for &big_r in &[0.4_f64, 1.0, 2.5] {
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let radial =
-                    anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+                let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
                 // For q=0 the closed form is f(R) directly. For q ≥ 1 the
                 // anisotropic Laplacian collapses to (-Δ)^q on a radial
                 // function in d-dim flat space, which is *not* the same as
@@ -27110,8 +27070,7 @@ mod tests {
         let r = 0.7_f64;
         let h = 1e-3_f64;
 
-        let derivs =
-            radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, 4);
+        let derivs = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, 4);
         // Cross-check derivs[0] against isotropic_duchon_penalty(q=0, …)
         let f0 = isotropic_duchon_penalty(0, d, m, s, kappa, r);
         assert!(
@@ -27123,11 +27082,19 @@ mod tests {
         let f_at = |rr: f64| isotropic_duchon_penalty(0, d, m, s, kappa, rr);
         let fd1 = (f_at(r + h) - f_at(r - h)) / (2.0 * h);
         let rel1 = (derivs[1] - fd1).abs() / fd1.abs().max(1e-300);
-        assert!(rel1 < 1e-5, "f'(R): analytic={} fd={fd1} rel={rel1}", derivs[1]);
+        assert!(
+            rel1 < 1e-5,
+            "f'(R): analytic={} fd={fd1} rel={rel1}",
+            derivs[1]
+        );
         // FD 2nd derivative
         let fd2 = (f_at(r + h) - 2.0 * f_at(r) + f_at(r - h)) / (h * h);
         let rel2 = (derivs[2] - fd2).abs() / fd2.abs().max(1e-300);
-        assert!(rel2 < 1e-3, "f''(R): analytic={} fd={fd2} rel={rel2}", derivs[2]);
+        assert!(
+            rel2 < 1e-3,
+            "f''(R): analytic={} fd={fd2} rel={rel2}",
+            derivs[2]
+        );
     }
 
     // ------------------------------------------------------------------
@@ -27135,7 +27102,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn det_rand(seed: &mut u64) -> f64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*seed >> 11) as f64) / ((1u64 << 53) as f64)
     }
 
@@ -27154,27 +27123,20 @@ mod tests {
         let mut seed = 0xC0FFEE_u64;
         for &(q, d, m, s, kappa) in cases {
             for _trial in 0..6 {
-                let eta_raw: Vec<f64> = (0..d)
-                    .map(|_| (det_rand(&mut seed) - 0.5) * 1.6)
-                    .collect();
-                let r: Vec<f64> = (0..d)
-                    .map(|_| 0.4 + 1.6 * det_rand(&mut seed))
-                    .collect();
+                let eta_raw: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 1.6).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.4 + 1.6 * det_rand(&mut seed)).collect();
 
                 let mu: f64 = eta_raw.iter().sum::<f64>() / d as f64;
                 let eta_c: Vec<f64> = eta_raw.iter().map(|&e| e - mu).collect();
                 let kappa_new = kappa * (-mu).exp();
 
                 let j_raw = eta_raw.iter().sum::<f64>().exp();
-                let g_raw = j_raw
-                    * anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta_raw, &r);
+                let g_raw = j_raw * anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta_raw, &r);
 
                 let j_c = eta_c.iter().sum::<f64>().exp();
-                let g_c =
-                    j_c * anisotropic_duchon_penalty_radial(q, m, s, kappa_new, &eta_c, &r);
+                let g_c = j_c * anisotropic_duchon_penalty_radial(q, m, s, kappa_new, &eta_c, &r);
 
-                let prefactor =
-                    (((2 * d) as f64 - (4 * m) as f64 - (4 * s) as f64) * mu).exp();
+                let prefactor = (((2 * d) as f64 - (4 * m) as f64 - (4 * s) as f64) * mu).exp();
                 let predicted = prefactor * g_c;
 
                 let denom = predicted.abs().max(g_raw.abs()).max(1e-300);
@@ -27209,18 +27171,10 @@ mod tests {
                         centers[[i, c]] = det_rand(&mut seed);
                     }
                 }
-                let eta: Vec<f64> = (0..d)
-                    .map(|_| (det_rand(&mut seed) - 0.5) * 0.4)
-                    .collect();
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
 
-                let g = closed_form_anisotropic_pair_block(
-                    centers.view(),
-                    q,
-                    m,
-                    s,
-                    kappa,
-                    Some(&eta),
-                );
+                let g =
+                    closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta));
 
                 let order = DuchonNullspaceOrder::Linear;
                 let p_block = polynomial_block_from_order(centers.view(), order);
@@ -27283,12 +27237,9 @@ mod tests {
                                 let mut r_vec = vec![0.0_f64; d];
                                 r_vec[0] = big_r;
 
-                                let radial = anisotropic_duchon_penalty_radial(
-                                    q, m, s, kappa, &eta, &r_vec,
-                                );
-                                let iso = isotropic_duchon_penalty(
-                                    q, d, m, s, kappa, big_r,
-                                );
+                                let radial =
+                                    anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r_vec);
+                                let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
                                 if !radial.is_finite() || !iso.is_finite() {
                                     skipped += 1;
                                     continue;
@@ -27354,23 +27305,15 @@ mod tests {
 
         let mut seed = 0xFEED_FACE_u64;
 
-        let cases: &[(usize, usize, usize, f64)] = &[
-            (5, 2, 2, 0.7),
-            (5, 2, 3, 1.1),
-            (7, 2, 3, 0.5),
-        ];
+        let cases: &[(usize, usize, usize, f64)] =
+            &[(5, 2, 2, 0.7), (5, 2, 3, 1.1), (7, 2, 3, 0.5)];
 
         for &(d, m, s, kappa) in cases {
             for _ in 0..4 {
-                let eta: Vec<f64> = (0..d)
-                    .map(|_| (det_rand(&mut seed) - 0.5) * 0.6)
-                    .collect();
-                let r: Vec<f64> = (0..d)
-                    .map(|_| 0.4 + 1.0 * det_rand(&mut seed))
-                    .collect();
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.6).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.4 + 1.0 * det_rand(&mut seed)).collect();
 
-                let h2_direct =
-                    anisotropic_duchon_penalty_radial(2, m, s, kappa, &eta, &r);
+                let h2_direct = anisotropic_duchon_penalty_radial(2, m, s, kappa, &eta, &r);
 
                 let mut s1 = 0.0_f64;
                 let mut s2 = 0.0_f64;
@@ -27387,8 +27330,7 @@ mod tests {
                     u2 += b * b * b * rk2;
                 }
                 let big_r = r2.sqrt();
-                let fr =
-                    radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 4);
+                let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 4);
 
                 let r1 = big_r;
                 let r2p = r1 * r1;
@@ -27398,14 +27340,12 @@ mod tests {
                 let r6 = r4 * r2p;
                 let r7 = r6 * r1;
 
-                let big_a = fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6
-                    - 15.0 * fr[1] / r7;
+                let big_a = fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7;
                 let big_b = 2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5;
                 let big_c = fr[2] / r2p - fr[1] / r3;
 
-                let h2_grouped = big_a * u1 * u1
-                    + big_b * (s1 * u1 + 2.0 * u2)
-                    + big_c * (s1 * s1 + 2.0 * s2);
+                let h2_grouped =
+                    big_a * u1 * u1 + big_b * (s1 * u1 + 2.0 * u2) + big_c * (s1 * s1 + 2.0 * s2);
 
                 let denom = h2_direct.abs().max(h2_grouped.abs()).max(1e-300);
                 let rel = (h2_direct - h2_grouped).abs() / denom;
@@ -27424,11 +27364,8 @@ mod tests {
             anisotropic_duchon_penalty_radial, radial_derivatives_of_isotropic_duchon,
         };
 
-        let cases: &[(usize, usize, usize, f64)] = &[
-            (3, 2, 1, 0.7),
-            (5, 2, 2, 1.0),
-            (7, 2, 3, 0.5),
-        ];
+        let cases: &[(usize, usize, usize, f64)] =
+            &[(3, 2, 1, 0.7), (5, 2, 2, 1.0), (7, 2, 3, 0.5)];
 
         for &(d, m, s, kappa) in cases {
             for &big_r in &[0.6_f64, 1.2, 2.4] {
@@ -27438,16 +27375,13 @@ mod tests {
 
                 let g2 = anisotropic_duchon_penalty_radial(2, m, s, kappa, &eta, &r);
 
-                let fr =
-                    radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 4);
+                let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 4);
                 let r1 = big_r;
                 let r2 = r1 * r1;
                 let r3 = r2 * r1;
                 let dm1 = (d as f64) - 1.0;
                 let dm3 = (d as f64) - 3.0;
-                let bilap = fr[4]
-                    + 2.0 * dm1 / r1 * fr[3]
-                    + dm1 * dm3 / r2 * fr[2]
+                let bilap = fr[4] + 2.0 * dm1 / r1 * fr[3] + dm1 * dm3 / r2 * fr[2]
                     - dm1 * dm3 / r3 * fr[1];
 
                 let denom = g2.abs().max(bilap.abs()).max(1e-300);
@@ -27475,18 +27409,12 @@ mod tests {
 
         for &(q, d, m, s, kappa) in cases {
             for _ in 0..5 {
-                let eta: Vec<f64> = (0..d)
-                    .map(|_| (det_rand(&mut seed) - 0.5) * 0.5)
-                    .collect();
-                let r: Vec<f64> = (0..d)
-                    .map(|_| 0.3 + 1.5 * det_rand(&mut seed))
-                    .collect();
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.5).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.3 + 1.5 * det_rand(&mut seed)).collect();
                 let r_neg: Vec<f64> = r.iter().map(|&x| -x).collect();
 
-                let v_pos =
-                    anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
-                let v_neg =
-                    anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r_neg);
+                let v_pos = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+                let v_neg = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r_neg);
                 let denom = v_pos.abs().max(1e-300);
                 let rel = (v_pos - v_neg).abs() / denom;
                 assert!(
@@ -27505,8 +27433,8 @@ mod tests {
         // Pure-Duchon (κ=0), q ∈ {1, 2}, with p = 4(m+s)−d > 2q so
         // the finite-part radial limit is bounded.
         let cases: &[(usize, usize, usize, usize, f64)] = &[
-            (2, 3, 2, 1, 0.0),  // p = 8 - 3 = 5 > 4
-            (2, 5, 2, 2, 0.0),  // p = 11 > 4
+            (2, 3, 2, 1, 0.0), // p = 8 - 3 = 5 > 4
+            (2, 5, 2, 2, 0.0), // p = 11 > 4
         ];
 
         for &(q, d, m, s, kappa) in cases {
@@ -27537,12 +27465,8 @@ mod tests {
         let kappa = 1.0_f64;
 
         for &d in &dims {
-            let (_ns_order, s) = resolve_duchon_orders(
-                d,
-                DuchonNullspaceOrder::Linear,
-                2,
-                Some(1.0),
-            );
+            let (_ns_order, s) =
+                resolve_duchon_orders(d, DuchonNullspaceOrder::Linear, 2, Some(1.0));
             let q = 2_usize;
             let m = 2_usize;
 
@@ -27555,14 +27479,7 @@ mod tests {
             }
             let eta: Vec<f64> = vec![0.0_f64; d];
 
-            let g = closed_form_anisotropic_pair_block(
-                centers.view(),
-                q,
-                m,
-                s,
-                kappa,
-                Some(&eta),
-            );
+            let g = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta));
 
             assert_eq!(g.dim(), (k, k), "wrong dim for d={d}");
             for i in 0..k {
@@ -27592,28 +27509,19 @@ mod tests {
     #[test]
     fn test_kappa_derivative_matches_finite_difference() {
         use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial,
-            pair_block_radial_with_j_second_derivatives,
+            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
         };
 
         let mut seed = 0xCAFE_BABE_u64;
-        let cases: &[(usize, usize, usize, usize, f64)] = &[
-            (1, 3, 1, 1, 1.0),
-            (1, 5, 1, 2, 0.7),
-            (2, 5, 2, 2, 0.9),
-        ];
+        let cases: &[(usize, usize, usize, usize, f64)] =
+            &[(1, 3, 1, 1, 1.0), (1, 5, 1, 2, 0.7), (2, 5, 2, 2, 0.9)];
 
         for &(q, d, m, s, kappa) in cases {
             for _ in 0..3 {
-                let eta: Vec<f64> = (0..d)
-                    .map(|_| (det_rand(&mut seed) - 0.5) * 0.4)
-                    .collect();
-                let r: Vec<f64> = (0..d)
-                    .map(|_| 0.5 + 1.0 * det_rand(&mut seed))
-                    .collect();
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.5 + 1.0 * det_rand(&mut seed)).collect();
 
-                let bundle =
-                    pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+                let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
 
                 let big_j = eta.iter().sum::<f64>().exp();
                 let v_at = |kk: f64| -> f64 {
@@ -27641,34 +27549,23 @@ mod tests {
     #[test]
     fn test_eta_derivative_matches_finite_difference() {
         use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial,
-            pair_block_radial_with_j_second_derivatives,
+            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
         };
 
         let mut seed = 0xABCD_1234_u64;
-        let cases: &[(usize, usize, usize, usize, f64)] = &[
-            (1, 3, 1, 1, 0.8),
-            (2, 5, 2, 2, 1.0),
-        ];
+        let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 1, 0.8), (2, 5, 2, 2, 1.0)];
 
         for &(q, d, m, s, kappa) in cases {
             for _trial in 0..3 {
-                let eta: Vec<f64> = (0..d)
-                    .map(|_| (det_rand(&mut seed) - 0.5) * 0.4)
-                    .collect();
-                let r: Vec<f64> = (0..d)
-                    .map(|_| 0.4 + 1.2 * det_rand(&mut seed))
-                    .collect();
+                let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
+                let r: Vec<f64> = (0..d).map(|_| 0.4 + 1.2 * det_rand(&mut seed)).collect();
 
-                let bundle =
-                    pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+                let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
 
                 for l in 0..d {
                     let v_at = |eta_use: &[f64]| -> f64 {
                         eta_use.iter().sum::<f64>().exp()
-                            * anisotropic_duchon_penalty_radial(
-                                q, m, s, kappa, eta_use, &r,
-                            )
+                            * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta_use, &r)
                     };
                     let h1 = 1e-3_f64;
                     let h2 = 0.5 * h1;
@@ -27684,8 +27581,7 @@ mod tests {
                     let d2 = (v_at(&e_p2) - v_at(&e_m2)) / (2.0 * h2);
                     let de_richardson = (4.0 * d2 - d1) / 3.0;
 
-                    let denom =
-                        de_richardson.abs().max(bundle.d_eta[l].abs()).max(1e-12);
+                    let denom = de_richardson.abs().max(bundle.d_eta[l].abs()).max(1e-12);
                     let rel = (bundle.d_eta[l] - de_richardson).abs() / denom;
                     assert!(
                         rel < 1e-6,
