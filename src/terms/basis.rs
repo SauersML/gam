@@ -19582,6 +19582,158 @@ pub mod closed_form_penalty {
         }
     }
 
+    /// Hessian of `g_q` w.r.t. the invariants `(R, s_1, s_2, u_1, u_2)` at
+    /// fixed radial-derivative table `fr`. Required for the second-order
+    /// chain rule into `∂²_{η_k η_l} g_q`.
+    ///
+    /// `fr[k]` must equal `f^{(k)}(R; κ)` for `k = 0, …, 2q + 2`, since
+    /// `g_{RR}` differentiates `g_R` once more in R (which already had
+    /// `f^{(2q+1)}`).
+    ///
+    /// Returned tuple is the upper-triangle of the symmetric 5×5 Hessian:
+    ///   `(g_RR,
+    ///     g_R_s1, g_R_s2, g_R_u1, g_R_u2,
+    ///     g_s1s1, g_s1s2, g_s1u1, g_s1u2,
+    ///     g_s2s2, g_s2u1, g_s2u2,
+    ///     g_u1u1, g_u1u2,
+    ///     g_u2u2)`
+    /// All cross terms not involving `R` vanish for q ≤ 2 except
+    /// `g_s1s1 = 2 F3`, `g_s1u1 = F2`, `g_u1u1 = 2 F1` at q = 2.
+    #[allow(clippy::too_many_arguments)]
+    fn radial_g_q_hessian(
+        q: usize,
+        big_r: f64,
+        s1: f64,
+        s2: f64,
+        u1: f64,
+        u2: f64,
+        fr: &[f64],
+    ) -> (
+        f64, // g_RR
+        f64, // g_R_s1
+        f64, // g_R_s2
+        f64, // g_R_u1
+        f64, // g_R_u2
+        f64, // g_s1s1
+        f64, // g_s1s2
+        f64, // g_s1u1
+        f64, // g_s1u2
+        f64, // g_s2s2
+        f64, // g_s2u1
+        f64, // g_s2u2
+        f64, // g_u1u1
+        f64, // g_u1u2
+        f64, // g_u2u2
+    ) {
+        let r = big_r;
+        let r2 = r * r;
+        let r3 = r2 * r;
+        let r4 = r2 * r2;
+        let r5 = r4 * r;
+        let r6 = r4 * r2;
+        let r7 = r6 * r;
+        let r8 = r4 * r4;
+        let r9 = r8 * r;
+
+        match q {
+            0 => {
+                // g = f(R). Only non-zero second partial is g_RR = f''.
+                let g_rr = fr[2];
+                (g_rr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            }
+            1 => {
+                // g_R   = -f''' u_1/R² + 3 f'' u_1/R³ - f'' s_1/R + f' s_1/R² - 3 f' u_1/R⁴
+                // g_RR  = ∂g_R/∂R, expanded with chain through f^{(k)}(R) and 1/R^e:
+                //   = -f'''' u1/R² + 5 f''' u1/R³ - 12 f'' u1/R⁴
+                //     - f''' s1/R + 2 f'' s1/R² - 2 f' s1/R³
+                //     + 12 f' u1/R⁵
+                let g_rr = -fr[4] * u1 / r2 + 5.0 * fr[3] * u1 / r3 - 12.0 * fr[2] * u1 / r4
+                    - fr[3] * s1 / r
+                    + 2.0 * fr[2] * s1 / r2
+                    - 2.0 * fr[1] * s1 / r3
+                    + 12.0 * fr[1] * u1 / r5;
+                // g_R_s1 = ∂g_R/∂s1 = -f''/R + f'/R²
+                let g_r_s1 = -fr[2] / r + fr[1] / r2;
+                // g_R_u1 = ∂g_R/∂u1 = -f'''/R² + 3 f''/R³ - 3 f'/R⁴
+                let g_r_u1 = -fr[3] / r2 + 3.0 * fr[2] / r3 - 3.0 * fr[1] / r4;
+                // q=1 is linear in s_1, u_1; cross/diagonal partials vanish.
+                (
+                    g_rr, g_r_s1, 0.0, g_r_u1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                )
+            }
+            2 => {
+                // F_i, dF_i/dR, d²F_i/dR² blocks (manually expanded; see
+                // `radial_g_q_partials` for F_i and dF_i/dR derivations).
+                let f1 = fr[4] / r4 - 6.0 * fr[3] / r5 + 15.0 * fr[2] / r6 - 15.0 * fr[1] / r7;
+                let f2 = 2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5;
+                let f3 = fr[2] / r2 - fr[1] / r3;
+                let f4 = 4.0 * fr[3] / r3 - 12.0 * fr[2] / r4 + 12.0 * fr[1] / r5;
+                let f5 = 2.0 * fr[2] / r2 - 2.0 * fr[1] / r3;
+
+                let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6
+                    - 105.0 * fr[2] / r7
+                    + 105.0 * fr[1] / r8;
+                let df2 = 2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5
+                    - 30.0 * fr[1] / r6;
+                let df3 = fr[3] / r2 - 3.0 * fr[2] / r3 + 3.0 * fr[1] / r4;
+                let df4 = 4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5
+                    - 60.0 * fr[1] / r6;
+                let df5 = 2.0 * fr[3] / r2 - 6.0 * fr[2] / r3 + 6.0 * fr[1] / r4;
+
+                // d²F_i/dR² (derived in task #24 phase 3 notes):
+                //   d²F1/dR² = f⁽⁶⁾/R⁴ - 14 f⁽⁵⁾/R⁵ + 95 f⁽⁴⁾/R⁶ - 375 f'''/R⁷ + 840 f''/R⁸ - 840 f'/R⁹
+                //   d²F2/dR² = 2 f⁽⁵⁾/R³ - 18 f⁽⁴⁾/R⁴ + 78 f'''/R⁵ - 180 f''/R⁶ + 180 f'/R⁷
+                //   d²F3/dR² = f⁽⁴⁾/R² - 5 f'''/R³ + 12 f''/R⁴ - 12 f'/R⁵
+                //   d²F4/dR² = 4 f⁽⁵⁾/R³ - 36 f⁽⁴⁾/R⁴ + 156 f'''/R⁵ - 360 f''/R⁶ + 360 f'/R⁷
+                //   d²F5/dR² = 2 f⁽⁴⁾/R² - 10 f'''/R³ + 24 f''/R⁴ - 24 f'/R⁵
+                let d2f1 = fr[6] / r4 - 14.0 * fr[5] / r5 + 95.0 * fr[4] / r6
+                    - 375.0 * fr[3] / r7
+                    + 840.0 * fr[2] / r8
+                    - 840.0 * fr[1] / r9;
+                let d2f2 = 2.0 * fr[5] / r3 - 18.0 * fr[4] / r4 + 78.0 * fr[3] / r5
+                    - 180.0 * fr[2] / r6
+                    + 180.0 * fr[1] / r7;
+                let d2f3 = fr[4] / r2 - 5.0 * fr[3] / r3 + 12.0 * fr[2] / r4 - 12.0 * fr[1] / r5;
+                let d2f4 = 4.0 * fr[5] / r3 - 36.0 * fr[4] / r4 + 156.0 * fr[3] / r5
+                    - 360.0 * fr[2] / r6
+                    + 360.0 * fr[1] / r7;
+                let d2f5 = 2.0 * fr[4] / r2 - 10.0 * fr[3] / r3 + 24.0 * fr[2] / r4
+                    - 24.0 * fr[1] / r5;
+
+                // g_RR = u_1²·d²F1 + s_1·u_1·d²F2 + s_1²·d²F3 + u_2·d²F4 + s_2·d²F5
+                let g_rr = u1 * u1 * d2f1 + s1 * u1 * d2f2 + s1 * s1 * d2f3 + u2 * d2f4 + s2 * d2f5;
+
+                // Mixed R-X partials: ∂(∂g/∂X)/∂R = derivative of the X-coefficient
+                // of g_R, i.e., differentiate the corresponding F (or its dF) entries.
+                //   g_R_s1 = ∂g_R/∂s1 = u_1·dF2 + 2 s_1·dF3
+                //   g_R_s2 = ∂g_R/∂s2 = dF5
+                //   g_R_u1 = ∂g_R/∂u1 = 2 u_1·dF1 + s_1·dF2
+                //   g_R_u2 = ∂g_R/∂u2 = dF4
+                let g_r_s1 = u1 * df2 + 2.0 * s1 * df3;
+                let g_r_s2 = df5;
+                let g_r_u1 = 2.0 * u1 * df1 + s1 * df2;
+                let g_r_u2 = df4;
+
+                // Pure-invariant Hessian (q=2 quadratic form):
+                //   g = u_1²·F1 + s_1 u_1·F2 + s_1²·F3 + u_2·F4 + s_2·F5
+                // ⇒ g_{s1, s1} = 2 F3
+                //   g_{s1, u1} = F2
+                //   g_{u1, u1} = 2 F1
+                // All other invariant-pair Hessian entries vanish.
+                let g_s1s1 = 2.0 * f3;
+                let g_s1u1 = f2;
+                let g_u1u1 = 2.0 * f1;
+
+                (
+                    g_rr, g_r_s1, g_r_s2, g_r_u1, g_r_u2, g_s1s1, 0.0, g_s1u1, 0.0, 0.0, 0.0, 0.0,
+                    g_u1u1, 0.0, 0.0,
+                )
+            }
+            _ => panic!("radial_g_q_hessian: q must be in {{0, 1, 2}}"),
+        }
+    }
+
     /// Anisotropic invariants and their first derivatives w.r.t. each `η_l`.
     ///
     /// Returns `(R, s_1, s_2, u_1, u_2, [∂R/∂η_l], [∂s_1/∂η_l], …)`.
@@ -19766,47 +19918,183 @@ pub mod closed_form_penalty {
                 / (h_kappa * h_kappa)
         };
 
-        // Second derivatives in η: diagonal via 3-pt stencil.
-        // (FD scratch buffers; phase-3 will replace this with analytic chain rule.)
-        let mut eta_p: EtaBuf = eta_buf_from(eta);
-        let mut eta_m: EtaBuf = eta_buf_from(eta);
-        for l in 0..d {
-            eta_p.copy_from_slice(eta);
-            eta_m.copy_from_slice(eta);
-            eta_p[l] += h_eta;
-            eta_m[l] -= h_eta;
-            d2_eta[l][l] =
-                (val(&eta_p, kappa) - 2.0 * value + val(&eta_m, kappa)) / (h_eta * h_eta);
-        }
-        // Off-diagonal: 4-pt stencil.
-        let mut e_pp: EtaBuf = eta_buf_from(eta);
-        let mut e_pm: EtaBuf = eta_buf_from(eta);
-        let mut e_mp: EtaBuf = eta_buf_from(eta);
-        let mut e_mm: EtaBuf = eta_buf_from(eta);
-        for k in 0..d {
-            for l in (k + 1)..d {
-                e_pp.copy_from_slice(eta);
-                e_pm.copy_from_slice(eta);
-                e_mp.copy_from_slice(eta);
-                e_mm.copy_from_slice(eta);
-                e_pp[k] += h_eta;
-                e_pp[l] += h_eta;
-                e_pm[k] += h_eta;
-                e_pm[l] -= h_eta;
-                e_mp[k] -= h_eta;
-                e_mp[l] += h_eta;
-                e_mm[k] -= h_eta;
-                e_mm[l] -= h_eta;
-                let off = (val(&e_pp, kappa) - val(&e_pm, kappa) - val(&e_mp, kappa)
-                    + val(&e_mm, kappa))
-                    / (4.0 * h_eta * h_eta);
-                d2_eta[k][l] = off;
-                d2_eta[l][k] = off;
+        // Second η-η Hessian. Analytic chain rule:
+        //   ∂²_{η_k η_l} (J · g)
+        //     = J · (g + ∂_{η_k} g + ∂_{η_l} g + ∂²_{η_k η_l} g)
+        // where
+        //   ∂²_{η_k η_l} g = Σ_{X, Y} g_{X,Y} · (∂_{η_k} Y) · (∂_{η_l} X)
+        //                   + Σ_X g_X · (∂²_{η_k η_l} X).
+        //
+        // The second-derivative tensor of the invariants is diagonal in
+        // (k, l) for s_1, s_2, u_1, u_2 (each invariant is a single sum
+        // over k whose summand depends only on b_k, r_k):
+        //   ∂²s_1/∂η_k ∂η_l = 4 b_l δ_{kl}
+        //   ∂²s_2/∂η_k ∂η_l = 16 b_l² δ_{kl}
+        //   ∂²u_1/∂η_k ∂η_l = 16 b_l² r_l² δ_{kl}
+        //   ∂²u_2/∂η_k ∂η_l = 36 b_l³ r_l² δ_{kl}
+        // R is built from R² = Σ b_k r_k² so
+        //   ∂²R/∂η_k ∂η_l = 2 b_l r_l² δ_{kl} / R − b_k b_l r_k² r_l² / R³.
+        if analytic_first_ok {
+            let max_order_h = 2 * q + 2; // need f^{(2q+2)} for g_RR (q=2 → f^{(6)}).
+            let max_order_h = max_order_h.min(6);
+            let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
+                aniso_invariants_eta_jacobian(eta, r);
+            let fr =
+                radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
+            let (g, g_r, g_s1, g_s2, g_u1, g_u2) =
+                radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
+            let (
+                g_rr,
+                g_r_s1,
+                g_r_s2,
+                g_r_u1,
+                g_r_u2,
+                g_s1s1,
+                _g_s1s2,
+                g_s1u1,
+                _g_s1u2,
+                _g_s2s2,
+                _g_s2u1,
+                _g_s2u2,
+                g_u1u1,
+                _g_u1u2,
+                _g_u2u2,
+            ) = radial_g_q_hessian(q, big_r, s1, s2, u1, u2, &fr);
+            let big_j = big_j_of(eta);
+            // Per-axis ∂_{η_l} g (recompute; cheap).
+            let bare_d_eta_g: Vec<f64> = (0..d)
+                .map(|l| {
+                    g_r * dr_de[l]
+                        + g_s1 * ds1_de[l]
+                        + g_s2 * ds2_de[l]
+                        + g_u1 * du1_de[l]
+                        + g_u2 * du2_de[l]
+                })
+                .collect();
+            for k in 0..d {
+                for l in 0..d {
+                    // Mixed-partial term: Σ_{X,Y} g_{X,Y} (∂η_k Y) (∂η_l X).
+                    // Symmetric form using only nonzero Hessian entries.
+                    // R-X cross terms (X ∈ {R, s1, s2, u1, u2}, summed both ways):
+                    let dr_k = dr_de[k];
+                    let dr_l = dr_de[l];
+                    let ds1_k = ds1_de[k];
+                    let ds1_l = ds1_de[l];
+                    let ds2_k = ds2_de[k];
+                    let ds2_l = ds2_de[l];
+                    let du1_k = du1_de[k];
+                    let du1_l = du1_de[l];
+                    let du2_k = du2_de[k];
+                    let du2_l = du2_de[l];
+                    let mut hess_term = g_rr * dr_k * dr_l
+                        + g_r_s1 * (dr_k * ds1_l + ds1_k * dr_l)
+                        + g_r_s2 * (dr_k * ds2_l + ds2_k * dr_l)
+                        + g_r_u1 * (dr_k * du1_l + du1_k * dr_l)
+                        + g_r_u2 * (dr_k * du2_l + du2_k * dr_l);
+                    // Pure-invariant Hessian (only s1s1, s1u1, u1u1 nonzero for q ≤ 2):
+                    hess_term += g_s1s1 * ds1_k * ds1_l
+                        + g_s1u1 * (ds1_k * du1_l + du1_k * ds1_l)
+                        + g_u1u1 * du1_k * du1_l;
+
+                    // Second-derivative-of-invariant term: Σ_X g_X · ∂²_{η_k η_l} X.
+                    // Only diagonal pieces (k == l) for s1, s2, u1, u2; R has both
+                    // a diagonal δ_{kl} piece and an off-diagonal -b_k b_l r_k² r_l² / R³ piece.
+                    let kron = if k == l { 1.0 } else { 0.0 };
+                    let b_l_v = (-2.0 * eta[l]).exp();
+                    let b_l_sq_v = b_l_v * b_l_v;
+                    let b_l_cu_v = b_l_sq_v * b_l_v;
+                    let r_l_sq_v = r[l] * r[l];
+                    let b_k_v = (-2.0 * eta[k]).exp();
+                    let r_k_sq_v = r[k] * r[k];
+                    let d2s1 = if k == l { 4.0 * b_l_v } else { 0.0 };
+                    let d2s2 = if k == l { 16.0 * b_l_sq_v } else { 0.0 };
+                    let d2u1 = if k == l { 16.0 * b_l_sq_v * r_l_sq_v } else { 0.0 };
+                    let d2u2 = if k == l { 36.0 * b_l_cu_v * r_l_sq_v } else { 0.0 };
+                    let d2r = {
+                        let r_inv = if big_r > 0.0 { 1.0 / big_r } else { 0.0 };
+                        let r_inv_cu = r_inv * r_inv * r_inv;
+                        kron * 2.0 * b_l_v * r_l_sq_v * r_inv
+                            - b_k_v * b_l_v * r_k_sq_v * r_l_sq_v * r_inv_cu
+                    };
+                    let inv_term = g_r * d2r
+                        + g_s1 * d2s1
+                        + g_s2 * d2s2
+                        + g_u1 * d2u1
+                        + g_u2 * d2u2;
+
+                    let bare_d2 = hess_term + inv_term;
+                    d2_eta[k][l] = big_j
+                        * (g + bare_d_eta_g[k] + bare_d_eta_g[l] + bare_d2);
+                }
+            }
+        } else {
+            // Special-case fallback: existing FD diagonal+off-diagonal stencils.
+            let mut eta_p: EtaBuf = eta_buf_from(eta);
+            let mut eta_m: EtaBuf = eta_buf_from(eta);
+            for l in 0..d {
+                eta_p.copy_from_slice(eta);
+                eta_m.copy_from_slice(eta);
+                eta_p[l] += h_eta;
+                eta_m[l] -= h_eta;
+                d2_eta[l][l] =
+                    (val(&eta_p, kappa) - 2.0 * value + val(&eta_m, kappa)) / (h_eta * h_eta);
+            }
+            let mut e_pp: EtaBuf = eta_buf_from(eta);
+            let mut e_pm: EtaBuf = eta_buf_from(eta);
+            let mut e_mp: EtaBuf = eta_buf_from(eta);
+            let mut e_mm: EtaBuf = eta_buf_from(eta);
+            for k in 0..d {
+                for l in (k + 1)..d {
+                    e_pp.copy_from_slice(eta);
+                    e_pm.copy_from_slice(eta);
+                    e_mp.copy_from_slice(eta);
+                    e_mm.copy_from_slice(eta);
+                    e_pp[k] += h_eta;
+                    e_pp[l] += h_eta;
+                    e_pm[k] += h_eta;
+                    e_pm[l] -= h_eta;
+                    e_mp[k] -= h_eta;
+                    e_mp[l] += h_eta;
+                    e_mm[k] -= h_eta;
+                    e_mm[l] -= h_eta;
+                    let off = (val(&e_pp, kappa) - val(&e_pm, kappa) - val(&e_mp, kappa)
+                        + val(&e_mm, kappa))
+                        / (4.0 * h_eta * h_eta);
+                    d2_eta[k][l] = off;
+                    d2_eta[l][k] = off;
+                }
             }
         }
 
-        // Mixed ∂²_{η_l, κ} via 4-pt stencil.
-        if s != 0 {
+        // Mixed ∂²_{η_l, κ}. Analytic via chain rule: differentiate ∂_κ g (which
+        // is the same g_q expansion with fr → ∂_κ fr) w.r.t. η_l. Since the
+        // invariants (R, s_1, ..., u_2) are κ-independent and g_q is linear
+        // in F^{(k)}, we apply `radial_g_q_partials` to ∂_κ fr to obtain
+        // (∂_κ g, ∂_κ g_R, ∂_κ g_s1, ..., ∂_κ g_u2), then chain through η_l:
+        //   ∂²_{η_l κ} (J · g) = J · (∂_κ g + ∂_{η_l} ∂_κ g)
+        //   ∂_{η_l} ∂_κ g = (∂_κ g_R) · ∂R/∂η_l
+        //                  + (∂_κ g_s1) · ∂s1/∂η_l + (∂_κ g_s2) · ∂s2/∂η_l
+        //                  + (∂_κ g_u1) · ∂u1/∂η_l + (∂_κ g_u2) · ∂u2/∂η_l.
+        if s != 0 && kappa != 0.0 && analytic_first_ok {
+            let max_order = 2 * q + 1;
+            let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
+                aniso_invariants_eta_jacobian(eta, r);
+            let dfr = radial_derivatives_of_isotropic_duchon_kappa_partial(
+                d, m, s, kappa, big_r, max_order,
+            );
+            let (dg, dg_r, dg_s1, dg_s2, dg_u1, dg_u2) =
+                radial_g_q_partials(q, big_r, s1, s2, u1, u2, &dfr);
+            let big_j = big_j_of(eta);
+            for l in 0..d {
+                let bare_cross = dg_r * dr_de[l]
+                    + dg_s1 * ds1_de[l]
+                    + dg_s2 * ds2_de[l]
+                    + dg_u1 * du1_de[l]
+                    + dg_u2 * du2_de[l];
+                d2_eta_kappa[l] = big_j * (dg + bare_cross);
+            }
+        } else if s != 0 {
+            // Special-case FD fallback.
             let mut e_p: EtaBuf = eta_buf_from(eta);
             let mut e_m: EtaBuf = eta_buf_from(eta);
             for l in 0..d {

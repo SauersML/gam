@@ -159,6 +159,69 @@ impl PenaltyOp for ClosedFormPenaltyOperator {
     }
 }
 
+/// Wrap any `PenaltyOp` with a scalar multiplier. Useful when the dense
+/// `PenaltyCandidate.matrix` has been normalized by a Frobenius factor `norm`
+/// and we need an operator whose `as_dense()` matches it bit-for-bit. The
+/// adapter divides every matvec / diag / trace result by `norm` (equivalently:
+/// scales by `1/norm`).
+pub struct ScaledPenaltyOp {
+    inner: Arc<dyn PenaltyOp>,
+    scale: f64,
+}
+
+impl ScaledPenaltyOp {
+    pub fn new(inner: Arc<dyn PenaltyOp>, scale: f64) -> Self {
+        Self { inner, scale }
+    }
+}
+
+impl PenaltyOp for ScaledPenaltyOp {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn matvec(&self, w: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        self.inner.matvec(w, out.view_mut());
+        out.mapv_inplace(|v| v * self.scale);
+    }
+
+    fn diag(&self) -> Array1<f64> {
+        let mut d = self.inner.diag();
+        d.mapv_inplace(|v| v * self.scale);
+        d
+    }
+
+    fn trace(&self) -> f64 {
+        self.inner.trace() * self.scale
+    }
+
+    fn log_det_plus_lambda_i(
+        &self,
+        lambda: f64,
+        num_probes: usize,
+        lanczos_steps: usize,
+        seed: u64,
+    ) -> Result<f64, String> {
+        // log det(scale * S + λ I) cannot be derived from log det(S + (λ/scale) I)
+        // by a uniform shift unless we materialize. Materialize via as_dense and
+        // call the Array2 impl, which goes through SLQ on the scaled dense.
+        let dense = self.as_dense();
+        <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(
+            &dense,
+            lambda,
+            num_probes,
+            lanczos_steps,
+            seed,
+        )
+    }
+
+    fn as_dense(&self) -> Array2<f64> {
+        let mut m = self.inner.as_dense();
+        m.mapv_inplace(|v| v * self.scale);
+        m
+    }
+}
+
 /// Concrete carrier of a penalty within the candidate / canonical-block
 /// pipeline. The `Dense` variant carries an owned `Array2<f64>` and is the
 /// default; the `Operator` variant carries an `Arc<dyn PenaltyOp>` so the
