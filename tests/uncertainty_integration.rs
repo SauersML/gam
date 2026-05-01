@@ -227,6 +227,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
             apply_bias_correction: false,
+            ..PredictUncertaintyOptions::default()
         },
     )
     .expect("prediction uncertainty should succeed");
@@ -493,6 +494,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
             apply_bias_correction: false,
+            ..PredictUncertaintyOptions::default()
         },
     )
     .expect("mixture uncertainty prediction should succeed");

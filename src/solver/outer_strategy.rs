@@ -4912,7 +4912,15 @@ mod tests {
     }
 
     #[test]
-    fn run_seed_materialization_failure_falls_back_from_arc() {
+    fn run_seed_materialization_failure_surfaces_arc_error_verbatim() {
+        // Under the budget-bump retry ladder (commit c96c4233), an ARC
+        // primary with `(Analytic, Analytic)` capability has zero degraded
+        // fallbacks. A seed-materialization failure surfaces as `Err`
+        // verbatim — there is no lateral demote to BFGS+BfgsApprox that
+        // would silently discard the analytic outer Hessian. Materialization
+        // failures are deterministic w.r.t. rho, so the budget-bump retry
+        // ladder cannot rescue them; the operator returns the same Err on
+        // every retry. Hence the runner returns the original Err.
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
@@ -4936,15 +4944,35 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let result = problem
+        let err = problem
             .run(&mut obj, "seed materialization failure")
-            .expect("materialization failure should trigger the degraded fallback plan");
-        assert_eq!(result.plan_used.solver, Solver::Bfgs);
-        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
+            .expect_err(
+                "ARC primary must surface the materialization failure verbatim — \
+                 no lateral demote to BFGS+BfgsApprox",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("seed materialization failed"),
+            "error must propagate the underlying materialization message; got: {msg}"
+        );
     }
 
     #[test]
-    fn run_nonconverged_arc_falls_back_to_first_order_plan() {
+    fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
+        // Under the budget-bump retry ladder (commit c96c4233), an ARC
+        // primary that exhausts its iteration budget is retried up to two
+        // additional times with `max_iter *= 2` per retry, warm-started
+        // from the previous attempt's last rho — preserving the analytic
+        // outer Hessian instead of demoting to a strictly weaker
+        // BFGS+BfgsApprox surface. After the ladder is exhausted, the
+        // runner returns the final `Ok(OuterResult{converged:false})` from
+        // the last ARC attempt; the plan stays ARC + Analytic Hessian.
+        //
+        // We use `cost = x^4`, `grad = 4 x^3`, `hess = 12 x^2` from
+        // `initial_rho = [5.0]` with `max_iter = 1`. ARC cannot reach the
+        // optimum from x=5 within the available budget (1 → 2 → 4 outer
+        // iterations on a quartic); thus the ladder surfaces a
+        // non-converged result without lateral demotion.
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
@@ -4968,10 +4996,26 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let result = problem
-            .run(&mut obj, "nonconverged arc should fall back")
-            .expect("automatic fallback should continue after a nonconverged Arc attempt");
-        assert_eq!(result.plan_used.solver, Solver::Bfgs);
-        assert_eq!(result.plan_used.hessian_source, HessianSource::BfgsApprox);
+            .run(&mut obj, "nonconverged arc should stay on arc")
+            .expect(
+                "ARC ladder must surface the last non-converged ARC result rather than \
+                 demoting to BFGS+BfgsApprox",
+            );
+        assert_eq!(
+            result.plan_used.solver,
+            Solver::Arc,
+            "ARC primary must not lateral-demote after budget exhaustion"
+        );
+        assert_eq!(
+            result.plan_used.hessian_source,
+            HessianSource::Analytic,
+            "analytic outer Hessian must be preserved across the budget-bump retry ladder"
+        );
+        assert!(
+            !result.converged,
+            "test fixture is engineered so the ladder cannot converge; \
+             converged=true would mean the fixture stopped exercising the ladder"
+        );
     }
 
     #[test]

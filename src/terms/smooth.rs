@@ -2957,7 +2957,8 @@ fn build_tensor_bspline_basis(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
-    let (penalties, nullspace_dims, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        crate::terms::basis::filter_active_penalty_candidates_with_ops(candidates)?;
     let design = if let Some(dense_design) = dense_design {
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense_design))
     } else {
@@ -2976,6 +2977,7 @@ fn build_tensor_bspline_basis(
         penalties,
         nullspace_dims,
         penaltyinfo,
+        ops,
         metadata: BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
@@ -3247,9 +3249,18 @@ pub fn build_smooth_design_withworkspace(
                 let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
                     rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
                 })?;
-                // Inject input scales into metadata for downstream storage.
-                if let BasisMetadata::ThinPlate { input_scales, .. } = &mut result.metadata {
+                // Inject input scales into metadata; also restore the user's
+                // original length_scale (not the σ_geom-compensated one) so a
+                // metadata-driven rebuild that re-applies compensation does not
+                // double-divide.
+                if let BasisMetadata::ThinPlate {
+                    input_scales,
+                    length_scale,
+                    ..
+                } = &mut result.metadata
+                {
                     *input_scales = scales;
+                    *length_scale = spec.length_scale;
                 }
                 result
             }
@@ -3302,8 +3313,14 @@ pub fn build_smooth_design_withworkspace(
                 let mut spec_local = spec.clone();
                 spec_local.length_scale = length_scale_eff;
                 let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
-                if let BasisMetadata::Matern { input_scales, .. } = &mut result.metadata {
+                if let BasisMetadata::Matern {
+                    input_scales,
+                    length_scale,
+                    ..
+                } = &mut result.metadata
+                {
                     *input_scales = scales;
+                    *length_scale = spec.length_scale;
                 }
                 result
             }
@@ -3363,8 +3380,14 @@ pub fn build_smooth_design_withworkspace(
                     spec_local.identifiability = SpatialIdentifiability::None;
                 }
                 let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, workspace)?;
-                if let BasisMetadata::Duchon { input_scales, .. } = &mut result.metadata {
+                if let BasisMetadata::Duchon {
+                    input_scales,
+                    length_scale,
+                    ..
+                } = &mut result.metadata
+                {
                     *input_scales = scales;
+                    *length_scale = spec.length_scale;
                 }
                 result
             }

@@ -2114,6 +2114,7 @@ fn run_predict_unified(
             mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             apply_bias_correction: !args.no_bias_correction,
+            ..gam::estimate::PredictUncertaintyOptions::default()
         };
         let pred = predictor
             .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
@@ -3162,6 +3163,7 @@ fn run_predict_survival(
                         mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
                         includeobservation_interval: false,
                         apply_bias_correction: !args.no_bias_correction,
+                        ..gam::estimate::PredictUncertaintyOptions::default()
                     },
                 )
                 .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;

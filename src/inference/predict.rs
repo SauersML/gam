@@ -3392,6 +3392,51 @@ pub enum InferenceCovarianceMode {
     ConditionalPlusSmoothingRequired,
 }
 
+/// Per-axis training support range used by boundary and OOD corrections.
+/// For each predictor axis we record the empirical [min, max] from training.
+/// Boundary correction inflates variance for x_i within a small fraction of
+/// the range from either edge; OOD inflation inflates variance for x_i
+/// outside [min, max] proportional to (excess / range).
+#[derive(Clone, Debug)]
+pub struct TrainingSupport {
+    /// Axis-wise minimum across the training rows; length = number of input
+    /// columns the design treats as continuous predictors. The order must
+    /// match `predictor_x` rows passed in `PredictUncertaintyOptions::
+    /// predictor_x_for_corrections` (see helper below); a length of zero
+    /// disables both boundary and OOD corrections.
+    pub axis_min: Array1<f64>,
+    /// Axis-wise maximum, paired with `axis_min`.
+    pub axis_max: Array1<f64>,
+}
+
+impl TrainingSupport {
+    /// Convenience constructor from raw training rows. Computes per-axis
+    /// min/max in a single pass.
+    pub fn from_training_rows(rows: ArrayView2<'_, f64>) -> Self {
+        let d = rows.ncols();
+        if rows.nrows() == 0 || d == 0 {
+            return Self {
+                axis_min: Array1::zeros(0),
+                axis_max: Array1::zeros(0),
+            };
+        }
+        let mut axis_min = Array1::from_elem(d, f64::INFINITY);
+        let mut axis_max = Array1::from_elem(d, f64::NEG_INFINITY);
+        for row in rows.outer_iter() {
+            for k in 0..d {
+                let v = row[k];
+                if v < axis_min[k] {
+                    axis_min[k] = v;
+                }
+                if v > axis_max[k] {
+                    axis_max[k] = v;
+                }
+            }
+        }
+        Self { axis_min, axis_max }
+    }
+}
+
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
     pub confidence_level: f64,
@@ -3409,6 +3454,59 @@ pub struct PredictUncertaintyOptions {
     /// are unaffected at first order. Requires `fit.bias_correction_beta()`
     /// to be available; silently falls back to the raw predictor otherwise.
     pub apply_bias_correction: bool,
+    /// Edgeworth expansion correction for one-sided tail coverage. When ON
+    /// (default), the per-row z-multiplier is replaced by the Cornish–Fisher
+    /// expansion z + (z² − 1)·κ₃ / 6 + … using a per-row skewness estimate
+    /// derived from `eta` and `eta_standard_error`. The result is an
+    /// asymmetric (lower, upper) multiplier pair that preserves the central
+    /// confidence level while adjusting tail rates separately. Requires
+    /// `eta_skewness_for_corrections` if a non-zero skew estimate is to be
+    /// used; otherwise this reduces to the standard symmetric interval.
+    pub edgeworth_one_sided: bool,
+    /// Inflate variance near the support boundary. When ON (default),
+    /// requires both `predictor_x_for_corrections` and `training_support`;
+    /// otherwise behaves as a no-op. The inflation factor is
+    /// `1 + α · max(0, 1 − d_edge / (β · range))²` per axis, with
+    /// α = `boundary_alpha` and β = `boundary_band_fraction`. d_edge is the
+    /// minimum of (x − min, max − x) per axis.
+    pub boundary_correction: bool,
+    /// Inflate variance for predictions outside the per-axis training
+    /// range. When ON (default OFF), requires both
+    /// `predictor_x_for_corrections` and `training_support`. Factor is
+    /// `1 + γ · Σ_k (excess_k / range_k)²`, with γ = `ood_gamma`.
+    pub ood_inflation: bool,
+    /// Joint coverage adjustment over a query batch. When ON (default
+    /// OFF) the per-row z multiplier is increased so the family-wise
+    /// coverage of the returned intervals matches `confidence_level`.
+    /// Uses Bonferroni: `z_joint = standard_normal_quantile(
+    /// 0.5 + 0.5·(1 − (1 − level) / m))` where m is the joint query count
+    /// (defaults to the prediction batch size when `joint_query_count` is
+    /// None).
+    pub multi_point_joint: bool,
+    /// Predictor rows aligned with the prediction batch, used by boundary
+    /// and OOD corrections. Number of columns must match
+    /// `training_support.axis_min.len()`. When None, both corrections
+    /// silently no-op even if their flags are set.
+    pub predictor_x_for_corrections: Option<Array2<f64>>,
+    /// Per-axis training support, paired with `predictor_x_for_corrections`.
+    pub training_support: Option<TrainingSupport>,
+    /// Per-row Edgeworth skewness κ₃ estimate (length = batch size). When
+    /// None, Edgeworth correction reduces to the standard symmetric
+    /// quantile (no-op).
+    pub eta_skewness_for_corrections: Option<Array1<f64>>,
+    /// Joint query count m for the multi-point adjustment. When None the
+    /// prediction batch size is used.
+    pub joint_query_count: Option<usize>,
+    /// Boundary correction strength α (multiplier on the squared shortfall).
+    /// Default 0.25. Larger ⇒ more inflation near the edge.
+    pub boundary_alpha: f64,
+    /// Boundary correction band β (fraction of range that counts as "near"
+    /// the edge). Default 0.05. Inside this band the inflation factor
+    /// grows quadratically as x → edge.
+    pub boundary_band_fraction: f64,
+    /// OOD inflation strength γ (multiplier on the squared per-axis
+    /// overshoot fraction). Default 1.0.
+    pub ood_gamma: f64,
 }
 
 impl Default for PredictUncertaintyOptions {
@@ -3419,8 +3517,146 @@ impl Default for PredictUncertaintyOptions {
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
             apply_bias_correction: true,
+            edgeworth_one_sided: true,
+            boundary_correction: true,
+            ood_inflation: false,
+            multi_point_joint: false,
+            predictor_x_for_corrections: None,
+            training_support: None,
+            eta_skewness_for_corrections: None,
+            joint_query_count: None,
+            boundary_alpha: 0.25,
+            boundary_band_fraction: 0.05,
+            ood_gamma: 1.0,
         }
     }
+}
+
+/// Asymmetric (lower, upper) z-multiplier produced by the Edgeworth
+/// one-sided correction. With κ₃ = 0 both entries equal the standard
+/// symmetric `z_{(1+level)/2}` quantile.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EdgeworthZ {
+    pub z_lower: f64,
+    pub z_upper: f64,
+}
+
+/// One-sided Edgeworth expansion (Cornish–Fisher to first non-Gaussian
+/// order) for a coverage level on each tail. Given a per-row skewness
+/// estimate κ₃, returns (z_lower, z_upper) such that
+///
+///   eta_lower = eta − z_lower · se,   eta_upper = eta + z_upper · se,
+///
+/// with the lower-tail probability Φ(−z_lower) ≈ α/2 and the upper-tail
+/// probability 1 − Φ(z_upper) ≈ α/2 to O(κ₃). The expansion is
+///   z_p ≈ z + (z² − 1) · κ₃ / 6
+/// applied with sign-symmetric z at the two tails. With κ₃ = 0 this
+/// reduces to the symmetric interval z_lower = z_upper = z.
+pub(crate) fn edgeworth_one_sided_quantile(z: f64, skew_kappa3: f64) -> EdgeworthZ {
+    // Cornish–Fisher: q_α = z_α + (z_α² − 1) κ₃ / 6.
+    // For the upper tail use +z, for the lower tail use −z (in the
+    // standardized scale), then negate. Net effect:
+    //   z_upper_eta = z + (z² − 1) κ₃ / 6
+    //   z_lower_eta = z − (z² − 1) κ₃ / 6
+    let bump = (z * z - 1.0) * skew_kappa3 / 6.0;
+    EdgeworthZ {
+        z_lower: (z - bump).max(0.0),
+        z_upper: (z + bump).max(0.0),
+    }
+}
+
+/// Per-row variance-inflation factor for the boundary correction. Returns
+/// 1 if no axis is inside the boundary band, otherwise
+/// `1 + α · Σ_k max(0, 1 − d_k / (β · range_k))²` summed over axes.
+/// When `range_k = 0` (degenerate axis) the contribution is skipped.
+pub(crate) fn boundary_variance_inflation_factor(
+    x_row: ArrayView1<'_, f64>,
+    axis_min: ArrayView1<'_, f64>,
+    axis_max: ArrayView1<'_, f64>,
+    alpha: f64,
+    band_fraction: f64,
+) -> f64 {
+    let d = x_row.len();
+    if d == 0 || axis_min.len() != d || axis_max.len() != d || band_fraction <= 0.0 {
+        return 1.0;
+    }
+    let mut excess = 0.0_f64;
+    for k in 0..d {
+        let lo = axis_min[k];
+        let hi = axis_max[k];
+        let range = hi - lo;
+        if !(range > 0.0) {
+            continue;
+        }
+        let x = x_row[k];
+        // Closest-edge distance, clamped to interior.
+        let d_edge = (x - lo).min(hi - x);
+        if !d_edge.is_finite() || d_edge >= band_fraction * range {
+            continue;
+        }
+        // Inside the band (or beyond on the wrong side; we only inflate
+        // for interior-near-edge here, OOD case is the other helper).
+        if d_edge <= 0.0 {
+            // Exactly on or just past the boundary: full band shortfall.
+            excess += 1.0;
+        } else {
+            let shortfall = 1.0 - d_edge / (band_fraction * range);
+            excess += shortfall * shortfall;
+        }
+    }
+    (1.0 + alpha * excess).max(1.0)
+}
+
+/// Per-row variance-inflation factor for an out-of-distribution prediction.
+/// Returns `1 + γ · Σ_k (excess_k / range_k)²` where excess_k = max(0,
+/// max(lo − x, x − hi)) per axis, range_k = hi − lo. Always ≥ 1; equal to
+/// 1 when x is inside the bounding box on every axis.
+pub(crate) fn ood_variance_inflation_factor(
+    x_row: ArrayView1<'_, f64>,
+    axis_min: ArrayView1<'_, f64>,
+    axis_max: ArrayView1<'_, f64>,
+    gamma: f64,
+) -> f64 {
+    let d = x_row.len();
+    if d == 0 || axis_min.len() != d || axis_max.len() != d {
+        return 1.0;
+    }
+    let mut sq_excess = 0.0_f64;
+    for k in 0..d {
+        let lo = axis_min[k];
+        let hi = axis_max[k];
+        let range = hi - lo;
+        if !(range > 0.0) {
+            continue;
+        }
+        let x = x_row[k];
+        let excess = if x < lo {
+            lo - x
+        } else if x > hi {
+            x - hi
+        } else {
+            0.0
+        };
+        let frac = excess / range;
+        sq_excess += frac * frac;
+    }
+    (1.0 + gamma * sq_excess).max(1.0)
+}
+
+/// Bonferroni-adjusted z multiplier for joint coverage of `m` query
+/// rows at central level `level`. The per-row tail probability is
+/// `(1 − level) / m` (split equally across both tails), giving a
+/// per-row central level of `1 − (1 − level) / m`. Returns the
+/// corresponding standard-normal quantile, or the un-adjusted z if
+/// m ≤ 1 or inputs are degenerate.
+pub(crate) fn multi_point_joint_z(level: f64, m: usize) -> Result<f64, String> {
+    if m <= 1 || !(level.is_finite() && level > 0.0 && level < 1.0) {
+        return standard_normal_quantile(0.5 + 0.5 * level);
+    }
+    let alpha = 1.0 - level;
+    let per_row_alpha = alpha / (m as f64);
+    let per_row_level = 1.0 - per_row_alpha;
+    standard_normal_quantile(0.5 + 0.5 * per_row_level)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3766,13 +4002,91 @@ where
     let strategy = strategy_for_family(family, link_kind.as_ref());
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
-    let etavar = linear_predictorvariance_from_backend(&x, &backend)?;
+    let etavar_raw = linear_predictorvariance_from_backend(&x, &backend)?;
+    let n_rows = etavar_raw.len();
+
+    // ── Coverage corrections ────────────────────────────────────────────
+    // Variance inflation (boundary + OOD). Both are per-row multipliers
+    // ≥ 1 applied to Var(η_i); they propagate through to eta_se and
+    // observation intervals consistently.
+    let mut variance_inflation = Array1::<f64>::ones(n_rows);
+    if (options.boundary_correction || options.ood_inflation)
+        && let (Some(predictor_x), Some(support)) = (
+            options.predictor_x_for_corrections.as_ref(),
+            options.training_support.as_ref(),
+        )
+        && predictor_x.nrows() == n_rows
+        && predictor_x.ncols() == support.axis_min.len()
+        && support.axis_min.len() == support.axis_max.len()
+    {
+        for i in 0..n_rows {
+            let row = predictor_x.row(i);
+            let mut factor = 1.0_f64;
+            if options.boundary_correction {
+                factor *= boundary_variance_inflation_factor(
+                    row,
+                    support.axis_min.view(),
+                    support.axis_max.view(),
+                    options.boundary_alpha,
+                    options.boundary_band_fraction,
+                );
+            }
+            if options.ood_inflation {
+                factor *= ood_variance_inflation_factor(
+                    row,
+                    support.axis_min.view(),
+                    support.axis_max.view(),
+                    options.ood_gamma,
+                );
+            }
+            variance_inflation[i] = factor;
+        }
+    }
+    let etavar = if variance_inflation.iter().all(|&f| f == 1.0) {
+        etavar_raw.clone()
+    } else {
+        Array1::from_iter(
+            etavar_raw
+                .iter()
+                .zip(variance_inflation.iter())
+                .map(|(&v, &f)| v * f),
+        )
+    };
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
-    let z = standard_normal_quantile(0.5 + 0.5 * options.confidence_level)
-        .map_err(EstimationError::InvalidInput)?;
-    let eta_lower = &eta - &eta_standard_error.mapv(|s| z * s);
-    let eta_upper = &eta + &eta_standard_error.mapv(|s| z * s);
+    // Per-row z multipliers. Joint adjustment widens the central level
+    // first; Edgeworth then optionally splits the lower/upper tails.
+    let level = options.confidence_level;
+    let z_central = if options.multi_point_joint {
+        let m = options.joint_query_count.unwrap_or(n_rows).max(1);
+        multi_point_joint_z(level, m).map_err(EstimationError::InvalidInput)?
+    } else {
+        standard_normal_quantile(0.5 + 0.5 * level).map_err(EstimationError::InvalidInput)?
+    };
+    let mut z_lower_per_row = Array1::<f64>::from_elem(n_rows, z_central);
+    let mut z_upper_per_row = Array1::<f64>::from_elem(n_rows, z_central);
+    if options.edgeworth_one_sided
+        && let Some(skew) = options.eta_skewness_for_corrections.as_ref()
+        && skew.len() == n_rows
+    {
+        for i in 0..n_rows {
+            let adj = edgeworth_one_sided_quantile(z_central, skew[i]);
+            z_lower_per_row[i] = adj.z_lower;
+            z_upper_per_row[i] = adj.z_upper;
+        }
+    }
+    let eta_lower = Array1::from_iter(
+        eta.iter()
+            .zip(eta_standard_error.iter())
+            .zip(z_lower_per_row.iter())
+            .map(|((&e, &s), &zl)| e - zl * s),
+    );
+    let eta_upper = Array1::from_iter(
+        eta.iter()
+            .zip(eta_standard_error.iter())
+            .zip(z_upper_per_row.iter())
+            .map(|((&e, &s), &zu)| e + zu * s),
+    );
     let quadctx = crate::quadrature::QuadratureContext::new();
 
     // Derivative of inverse link g^{-1}(η) used for delta-method:
@@ -3869,8 +4183,18 @@ where
 
     let (mut mean_lower, mut mean_upper) = match options.mean_interval_method {
         MeanIntervalMethod::Delta => (
-            &mean - &mean_standard_error.mapv(|s| z * s),
-            &mean + &mean_standard_error.mapv(|s| z * s),
+            Array1::from_iter(
+                mean.iter()
+                    .zip(mean_standard_error.iter())
+                    .zip(z_lower_per_row.iter())
+                    .map(|((&m, &s), &zl)| m - zl * s),
+            ),
+            Array1::from_iter(
+                mean.iter()
+                    .zip(mean_standard_error.iter())
+                    .zip(z_upper_per_row.iter())
+                    .map(|((&m, &s), &zu)| m + zu * s),
+            ),
         ),
         MeanIntervalMethod::TransformEta => {
             let transformed_lower =
@@ -3913,8 +4237,18 @@ where
     {
         let obsvar = fit.standard_deviation.max(0.0).powi(2);
         let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
-        let lower = &eta - &obs_se.mapv(|s| z * s);
-        let upper = &eta + &obs_se.mapv(|s| z * s);
+        let lower = Array1::from_iter(
+            eta.iter()
+                .zip(obs_se.iter())
+                .zip(z_lower_per_row.iter())
+                .map(|((&e, &s), &zl)| e - zl * s),
+        );
+        let upper = Array1::from_iter(
+            eta.iter()
+                .zip(obs_se.iter())
+                .zip(z_upper_per_row.iter())
+                .map(|((&e, &s), &zu)| e + zu * s),
+        );
         (Some(lower), Some(upper))
     } else {
         (None, None)
@@ -4549,6 +4883,13 @@ mod tests {
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             apply_bias_correction: false,
+            // Coverage corrections off so the test asserts the legacy
+            // unadjusted interval semantics.
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
         };
 
         let out = predict_gamwith_uncertainty(
@@ -4759,7 +5100,7 @@ mod tests {
             beta_standard_errors_corrected: None,
             bias_correction_beta,
         };
-        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: beta.clone(),
                 role: BlockRole::Mean,
@@ -4795,7 +5136,6 @@ mod tests {
             },
             inner_cycles: 0,
         })
-        .expect("test fit with bias correction")
     }
 
     fn bc_options(apply: bool) -> PredictUncertaintyOptions {
@@ -4805,6 +5145,11 @@ mod tests {
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             apply_bias_correction: apply,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
         }
     }
 
@@ -5276,16 +5621,36 @@ mod tests {
     }
 
     /// Test 5: bias is O(n⁻¹) — it should shrink as n grows when λ is held
-    /// at a fixed (n-independent) value. We simulate at n ∈ {200, 1000, 5000}
-    /// over multiple seeds, hand-build (β̂, H, S) per simulation, and require
-    /// |E[η̂_BC − η*]| / |E[η̂_raw − η*]| < 0.5 at n=5000 with the ratio
-    /// monotonically decreasing.
+    /// at a fixed (n-independent) value. The previous formulation drew a
+    /// fresh (X, y) at each seed and averaged across 12 seeds; with σ²=0.25
+    /// and p=4, the per-seed coefficient SE Var(β̂)≈σ²/n is comparable to
+    /// or larger than the true bias H⁻¹λβ ≈ (λ/n)·β at n=5000, so the
+    /// MC-averaged "bias" estimator is dominated by sampling noise of η̂
+    /// rather than by the bias signal — the headline ratio cannot be
+    /// resolved at this scale with 12 seeds.
+    ///
+    /// The principled comparison is deterministic. For Gaussian-identity
+    /// ridge with penalty S = λ I and design X (fixed), the conditional
+    /// mean of the penalized estimator is
+    ///     E[β̂ | X] = (XᵀX + λI)⁻¹ XᵀX β = β - H⁻¹ S β.
+    /// The bias-correction vector is b̂(β̂) = H⁻¹ S β̂, so the conditional
+    /// mean of the corrected estimator is
+    ///     E[β̂_BC | X] = E[β̂|X] + H⁻¹ S E[β̂|X] = β - (H⁻¹ S)² β.
+    /// Thus the conditional bias of η̂_raw is -xᵀH⁻¹Sβ (order λ/n), and
+    /// the conditional bias of η̂_BC is -xᵀ(H⁻¹S)²β (order (λ/n)²). The
+    /// ratio scales like λ/(n+λ), which at n=5000 and λ=5 is ≈ 10⁻³.
+    ///
+    /// We run the production prediction pipeline with `β̂ := E[β̂|X]` and
+    /// `b̂ := H⁻¹ S β̂` (both deterministic). The eta we read back is
+    /// exactly E[η̂_*|X], so |Δη| against η_true measures conditional bias
+    /// without any Monte-Carlo overlay. This both (a) eliminates the
+    /// signal-vs-noise floor and (b) still exercises the BC wiring inside
+    /// `predict_gamwith_uncertainty`.
     #[test]
     fn test_bias_correction_bias_drops_with_n_simulation() {
         let p = 4usize;
         let beta_true = array![0.4_f64, 0.9, -0.5, 0.6];
-        let lambda = 5.0_f64; // fixed λ across n; bias scales as λ/(n+λ)
-        let seeds: [u64; 12] = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31];
+        let lambda = 5.0_f64;
         let ns = [200usize, 1000, 5000];
 
         // Held-out test points are reused across n (they are just probes).
@@ -5305,71 +5670,60 @@ mod tests {
         let mut mean_abs_raw_bias = [0.0_f64; 3];
         let mut mean_abs_bc_bias = [0.0_f64; 3];
 
+        // Use a single deterministic LCG stream across all n for the design
+        // rows — different n share the same seed prefix so the X-RNG state
+        // for the first min(n_a, n_b) rows is identical, isolating the
+        // ratio drop to scale alone rather than to a confounding draw.
         for (kn, &n) in ns.iter().enumerate() {
-            // Average the per-test-point bias estimate across seeds.
-            let mut sum_eta_raw = Array1::<f64>::zeros(m);
-            let mut sum_eta_bc = Array1::<f64>::zeros(m);
-            for &seed in &seeds {
-                let mut rng = Lcg::new(seed.wrapping_add(7919 * n as u64));
-                let mut x_data = vec![0.0_f64; n * p];
-                for i in 0..n {
-                    x_data[i * p] = 1.0;
-                    for j in 1..p {
-                        x_data[i * p + j] = rng.normal();
-                    }
+            let mut rng = Lcg::new(0xBEEFu64);
+            let mut x_data = vec![0.0_f64; n * p];
+            for i in 0..n {
+                x_data[i * p] = 1.0;
+                for j in 1..p {
+                    x_data[i * p + j] = rng.normal();
                 }
-                let x = Array2::from_shape_vec((n, p), x_data).expect("X shape");
-                let mut y = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    let mut e = 0.0;
-                    for j in 0..p {
-                        e += x[[i, j]] * beta_true[j];
-                    }
-                    y[i] = e + 0.5 * rng.normal();
-                }
-                let xtx = x.t().dot(&x);
-                let xty = x.t().dot(&y);
-                let mut h = xtx.clone();
-                for k in 0..p {
-                    h[[k, k]] += lambda;
-                }
-                // Penalized estimator β̂ = H⁻¹ Xᵀy.
-                let beta_hat = solve_dense_spd(&h, &xty);
-                let s_beta = beta_hat.mapv(|v| lambda * v);
-                let b_hat = solve_dense_spd(&h, &s_beta);
-
-                let cov = Array2::<f64>::eye(p);
-                let fit = test_fit_with_bias_correction(beta_hat.clone(), cov, Some(b_hat));
-
-                let pred_raw = predict_gamwith_uncertainty(
-                    xt.clone(),
-                    beta_hat.view(),
-                    offset.view(),
-                    crate::types::LikelihoodFamily::GaussianIdentity,
-                    &fit,
-                    &bc_options(false),
-                )
-                .expect("raw predict");
-                let pred_bc = predict_gamwith_uncertainty(
-                    xt.clone(),
-                    beta_hat.view(),
-                    offset.view(),
-                    crate::types::LikelihoodFamily::GaussianIdentity,
-                    &fit,
-                    &bc_options(true),
-                )
-                .expect("bc predict");
-                sum_eta_raw += &pred_raw.eta;
-                sum_eta_bc += &pred_bc.eta;
             }
-            let nseeds = seeds.len() as f64;
-            let mean_raw = &sum_eta_raw / nseeds;
-            let mean_bc = &sum_eta_bc / nseeds;
+            let x = Array2::from_shape_vec((n, p), x_data).expect("X shape");
+            let xtx = x.t().dot(&x);
+            let mut h = xtx.clone();
+            for k in 0..p {
+                h[[k, k]] += lambda;
+            }
+
+            // E[β̂ | X] = β - H⁻¹ S β = (XᵀX + λI)⁻¹ XᵀX β.
+            let xtx_beta = xtx.dot(&beta_true);
+            let beta_mean = solve_dense_spd(&h, &xtx_beta);
+            // b̂(β̂) at β̂ = E[β̂|X]: b̂ = H⁻¹ λ β̂.
+            let s_beta_mean = beta_mean.mapv(|v| lambda * v);
+            let b_hat = solve_dense_spd(&h, &s_beta_mean);
+
+            let cov = Array2::<f64>::eye(p);
+            let fit = test_fit_with_bias_correction(beta_mean.clone(), cov, Some(b_hat));
+
+            let pred_raw = predict_gamwith_uncertainty(
+                xt.clone(),
+                beta_mean.view(),
+                offset.view(),
+                crate::types::LikelihoodFamily::GaussianIdentity,
+                &fit,
+                &bc_options(false),
+            )
+            .expect("raw predict");
+            let pred_bc = predict_gamwith_uncertainty(
+                xt.clone(),
+                beta_mean.view(),
+                offset.view(),
+                crate::types::LikelihoodFamily::GaussianIdentity,
+                &fit,
+                &bc_options(true),
+            )
+            .expect("bc predict");
+
             let mut acc_raw = 0.0;
             let mut acc_bc = 0.0;
             for i in 0..m {
-                acc_raw += (mean_raw[i] - eta_true[i]).abs();
-                acc_bc += (mean_bc[i] - eta_true[i]).abs();
+                acc_raw += (pred_raw.eta[i] - eta_true[i]).abs();
+                acc_bc += (pred_bc.eta[i] - eta_true[i]).abs();
             }
             mean_abs_raw_bias[kn] = acc_raw / m as f64;
             mean_abs_bc_bias[kn] = acc_bc / m as f64;
@@ -5379,14 +5733,18 @@ mod tests {
         // the test conditions are wrong, not the BC).
         assert!(
             mean_abs_raw_bias[2] < mean_abs_raw_bias[0],
-            "raw penalized bias should shrink with n: got {:?}",
+            "raw penalized conditional bias should shrink with n: got {:?}",
             mean_abs_raw_bias
         );
-        // The headline claim: BC is much smaller than raw at large n.
+        // The headline claim: BC is much smaller than raw at large n. The
+        // analytic ratio is λ/(n+λ); at n=5000, λ=5 this is ≈10⁻³, so the
+        // 0.5 threshold is conservative and the test fails decisively if
+        // the BC sign or scale is wrong (e.g. dropping the H⁻¹, swapping
+        // sign, or using cov instead of H).
         let ratio_large = mean_abs_bc_bias[2] / mean_abs_raw_bias[2].max(1e-300);
         assert!(
             ratio_large < 0.5,
-            "BC must reduce bias by >2× at n={}; raw={}, bc={}, ratio={}",
+            "BC must reduce conditional bias by >2× at n={}; raw={}, bc={}, ratio={}",
             ns[2],
             mean_abs_raw_bias[2],
             mean_abs_bc_bias[2],

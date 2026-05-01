@@ -28,6 +28,11 @@ const M_FIXED: usize = 2;
 const S_FIXED: usize = 8;
 const KAPPA: f64 = 1.0;
 
+/// Deterministic synthetic (eta, r) pairs in the bench.
+///
+/// `eta` lives near zero (production typical: log b_k ~ O(1)); `r` is a
+/// non-trivial lag of unit-ish magnitude. We mix sin/cos so individual
+/// pairs are not co-located (which would funnel into the R = 0 branch).
 fn synthetic_pairs(m: usize, d: usize) -> Vec<(Vec<f64>, Vec<f64>)> {
     let mut out = Vec::with_capacity(m);
     for i in 0..m {
@@ -111,6 +116,11 @@ fn bench_pair_block_end_to_end(c: &mut Criterion) {
     group.finish();
 }
 
+/// Sanity check: the SIMD and scalar invariants must agree to within a
+/// few ulps on representative inputs (lane vs sequential summation aside).
+/// This runs once per bench invocation as a fast smoke check; failure here
+/// indicates the two paths have diverged and the speedup numbers below
+/// are meaningless.
 fn bench_simd_scalar_parity(c: &mut Criterion) {
     let mut group = c.benchmark_group("aniso_invariants_parity");
     group.sample_size(10);
