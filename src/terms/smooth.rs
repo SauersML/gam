@@ -3196,6 +3196,9 @@ pub fn build_smooth_design_withworkspace(
     })?;
     let mut local_designs = Vec::<DesignMatrix>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
+    let mut local_ops = Vec::<
+        Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+    >::with_capacity(terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
     let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
     let mut local_pre_dropped_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
@@ -3450,6 +3453,12 @@ pub fn build_smooth_design_withworkspace(
         };
         let mut design_t = built.design;
         let mut penalties_t: Vec<Array2<f64>> = built.penalties;
+        // Ops vector parallel to `penalties_t`. Survives unchanged through the
+        // identity path; nulled element-wise when `T^T S T` reparametrization
+        // is applied (operator no longer bit-equivalent to the transformed
+        // matrix); wrapped in `ScaledPenaltyOp` after Frobenius normalization.
+        let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>> =
+            built.ops;
         if matches!(
             spatial_identifiability_policy(term),
             Some(SpatialIdentifiability::OrthogonalToParametric)
@@ -3500,6 +3509,8 @@ pub fn build_smooth_design_withworkspace(
                     tt_s.dot(&t)
                 })
                 .collect();
+            // T^T S T invalidates op-form bit-equivalence; drop ops here.
+            ops_t = vec![None; penalties_t.len()];
         }
         if penalties_t.len() != active_penaltyinfo_t.len() {
             return Err(BasisError::InvalidInput(format!(
@@ -3509,23 +3520,39 @@ pub fn build_smooth_design_withworkspace(
                 active_penaltyinfo_t.len()
             )));
         }
+        if ops_t.len() != penalties_t.len() {
+            ops_t = vec![None; penalties_t.len()];
+        }
         let penalty_candidates = penalties_t
             .into_iter()
             .zip(active_penaltyinfo_t.into_iter())
-            .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
+            .zip(ops_t.into_iter())
+            .map(|((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+                // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
+                // so `op.as_dense() == matrix` post-normalization.
+                let scaled_op = if c_new > 0.0 && c_new.is_finite() {
+                    op_in.map(|op| {
+                        std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
+                            op,
+                            1.0 / c_new,
+                        )) as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
+                    })
+                } else {
+                    None
+                };
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
                     kronecker_factors: None,
-                    op: None,
+                    op: scaled_op,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (penalties_t, nullspaces_t, penaltyinfo_t) =
-            filter_active_penalty_candidates(penalty_candidates)?;
+        let (penalties_t, nullspaces_t, penaltyinfo_t, ops_t) =
+            crate::terms::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;
         let linear_constraints_local = if term.shape != ShapeConstraint::None && !use_box_reparam {
             let axis = shape_axis_col.ok_or_else(|| {
                 BasisError::InvalidInput(format!(
@@ -3547,6 +3574,7 @@ pub fn build_smooth_design_withworkspace(
         local_dims.push(p_local);
         local_designs.push(design_t);
         local_penalties.push(penalties_t);
+        local_ops.push(ops_t);
         local_nullspaces.push(nullspaces_t);
         local_penaltyinfo.push(penaltyinfo_t);
         local_pre_dropped_penaltyinfo.push(pre_dropped_penaltyinfo_t);
@@ -3589,13 +3617,17 @@ pub fn build_smooth_design_withworkspace(
                 local_penalties[idx].len()
             )));
         }
-        for ((s_local, &ns), info) in local_penalties[idx]
+        for (((s_local, &ns), info), op_local) in local_penalties[idx]
             .iter()
             .zip(local_nullspaces[idx].iter())
             .zip(activeinfos.into_iter())
+            .zip(local_ops[idx].iter())
         {
             let global_index = penalties_global.len();
-            penalties_global.push(BlockwisePenalty::new(col_start..col_end, s_local.clone()));
+            penalties_global.push(
+                BlockwisePenalty::new(col_start..col_end, s_local.clone())
+                    .with_op(op_local.clone()),
+            );
             nullspace_dims_global.push(ns);
             let mut penalty = info.clone();
             penalty.nullspace_dim_hint = ns;
@@ -3904,6 +3936,7 @@ fn build_term_collection_design_inner(
             (bp_smooth.col_range.start + smooth_start)..(bp_smooth.col_range.end + smooth_start);
         let bp = if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
             BlockwisePenalty::kronecker(offset_range, bp_smooth.local.clone(), factors.clone())
+                .with_op(bp_smooth.op.clone())
         } else if matches!(localinfo.penalty.source, PenaltySource::TensorGlobalRidge)
             || matches!(
                 localinfo.penalty.source,
@@ -3913,6 +3946,7 @@ fn build_term_collection_design_inner(
             BlockwisePenalty::ridge(offset_range, 1.0)
         } else {
             BlockwisePenalty::new(offset_range, bp_smooth.local.clone())
+                .with_op(bp_smooth.op.clone())
         };
         penalties.push(bp);
         nullspace_dims.push(ns);
