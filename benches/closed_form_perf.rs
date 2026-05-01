@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use gam::terms::basis::{closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_block_pure};
+use gam::terms::basis::{
+    closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_block_pure,
+};
 use ndarray::Array2;
 
 fn main() {

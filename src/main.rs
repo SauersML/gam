@@ -3306,6 +3306,7 @@ fn run_predict_survival(
                 mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
                 includeobservation_interval: false,
                 apply_bias_correction: !args.no_bias_correction,
+                ..gam::estimate::PredictUncertaintyOptions::default()
             },
         )
         .map_err(|e| format!("survival uncertainty prediction failed: {e}"))?;

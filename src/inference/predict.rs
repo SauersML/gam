@@ -6340,7 +6340,7 @@ mod tests {
         let fit = test_fit_with_bias_correction(beta.clone(), cov, None);
         // Five identical query rows; joint over m=5 must widen each
         // interval relative to the per-row baseline, by the Bonferroni z.
-        let x = array![[1.0_f64]; 5];
+        let x = Array2::<f64>::from_elem((5, 1), 1.0_f64);
         let offset = Array1::zeros(5);
         let mut opts = corrections_baseline_options();
         opts.multi_point_joint = true;
@@ -6357,8 +6357,7 @@ mod tests {
         .expect("joint-adjusted prediction");
 
         let z_per_row = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
-        let z_joint =
-            standard_normal_quantile(0.5 + 0.5 * (1.0 - 0.05_f64 / 5.0)).unwrap();
+        let z_joint = standard_normal_quantile(0.5 + 0.5 * (1.0 - 0.05_f64 / 5.0)).unwrap();
         assert!(
             z_joint > z_per_row + 1e-6,
             "Bonferroni z must exceed per-row z: joint={z_joint}, per-row={z_per_row}"

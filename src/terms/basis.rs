@@ -1907,6 +1907,15 @@ fn duchon_next_nullspace_order(order: DuchonNullspaceOrder) -> DuchonNullspaceOr
     }
 }
 
+fn duchon_previous_nullspace_order(order: DuchonNullspaceOrder) -> DuchonNullspaceOrder {
+    match order {
+        DuchonNullspaceOrder::Zero => DuchonNullspaceOrder::Zero,
+        DuchonNullspaceOrder::Linear => DuchonNullspaceOrder::Zero,
+        DuchonNullspaceOrder::Degree(2) => DuchonNullspaceOrder::Linear,
+        DuchonNullspaceOrder::Degree(k) => DuchonNullspaceOrder::Degree(k - 1),
+    }
+}
+
 /// Returns the maximum derivative order required by the *active* operator
 /// penalties: 2 if stiffness is Active, else 1 if tension is Active, else 0.
 /// Mass-only (or no active operator) penalties only require kernel validity
@@ -2002,7 +2011,10 @@ impl std::fmt::Debug for BasisBuildResult {
             .field("penaltyinfo", &self.penaltyinfo)
             .field("metadata", &self.metadata)
             .field("kronecker_factored", &self.kronecker_factored)
-            .field("ops_present", &self.ops.iter().map(|o| o.is_some()).collect::<Vec<_>>())
+            .field(
+                "ops_present",
+                &self.ops.iter().map(|o| o.is_some()).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -8441,8 +8453,8 @@ pub fn closed_form_matern_pair_block(
             let mut acc = 0.0_f64;
             for jj in 0..=q {
                 let order = two_ell - jj; // ≥ 1 by the gate
-                acc += binom_coeffs[jj]
-                    * closed_form_penalty::matern_kernel_value(d, order, kappa, r);
+                acc +=
+                    binom_coeffs[jj] * closed_form_penalty::matern_kernel_value(d, order, kappa, r);
             }
             g[[i, j]] = acc;
             if i != j {
@@ -8850,24 +8862,28 @@ pub fn operator_penalty_candidates_closed_form(
     };
     let (s2, c2) = normalize_penalty(&s2_raw);
 
-    let make_op = |q: usize, c: f64| -> Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
+    let make_op = |q: usize,
+                   c: f64|
+     -> Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
         if !emit_operator {
             return None;
         }
         if !closed_form_converges(q) {
             return None;
         }
-        let raw_op = std::sync::Arc::new(crate::terms::closed_form_operator::ClosedFormPenaltyOperator::new(
-            centers,
-            q,
-            p_order,
-            s_order,
-            kappa,
-            aniso_log_scales,
-            kernel_nullspace,
-            polynomial_block_cols,
-            outer_identifiability,
-        ));
+        let raw_op = std::sync::Arc::new(
+            crate::terms::closed_form_operator::ClosedFormPenaltyOperator::new(
+                centers,
+                q,
+                p_order,
+                s_order,
+                kappa,
+                aniso_log_scales,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            ),
+        );
         // The candidate's `matrix` is the closed-form Gram divided by its
         // Frobenius norm `c`. Wrap in `ScaledPenaltyOp` with factor `1/c`
         // so `op.as_dense()` matches the candidate's dense matrix.
@@ -9801,13 +9817,15 @@ fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
     }
 }
 
-/// Returns the effective Duchon null-space order, auto-degrading to `Zero`
-/// when the requested order cannot be spanned by the supplied centers.
+/// Returns the effective Duchon null-space order, auto-degrading when the
+/// requested order leaves no radial kernel degrees of freedom.
 ///
-/// When `order=Linear` and `centers.nrows() < d + 1`, the polynomial block
-/// `[1, x_1, ..., x_d]` cannot be affinely spanned; rather than hard-erroring
-/// the caller falls back to `order=Zero` (constant null space) and logs a
-/// single warning so the user sees the degradation.
+/// The constrained kernel block has `centers.nrows() - rank(P)` columns, where
+/// `P` is the polynomial null-space block. A valid polynomial block with
+/// exactly as many centers as columns is still useless for smoothing: every
+/// center is consumed by the side constraints and the design collapses to the
+/// polynomial tail. Degrade to the highest lower null-space order with at
+/// least one constrained kernel column.
 fn duchon_effective_nullspace_order(
     centers: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
@@ -9815,8 +9833,13 @@ fn duchon_effective_nullspace_order(
     if order == DuchonNullspaceOrder::Zero {
         return order;
     }
-    let required = polynomial_block_from_order(centers, order).ncols();
-    if centers.nrows() < required {
+    let mut effective = order;
+    while effective != DuchonNullspaceOrder::Zero
+        && centers.nrows() <= polynomial_block_from_order(centers, effective).ncols()
+    {
+        effective = duchon_previous_nullspace_order(effective);
+    }
+    if effective != order {
         // Dedup: warn only once per (rows, cols, requested_order) per process.
         // BFGS × P-IRLS × derivative callsites hit this path many times.
         static SEEN: std::sync::OnceLock<
@@ -9826,17 +9849,20 @@ fn duchon_effective_nullspace_order(
         let key = (centers.nrows(), centers.ncols(), order);
         let fresh = seen.lock().map(|mut s| s.insert(key)).unwrap_or(true);
         if fresh {
+            let requested_cols = polynomial_block_from_order(centers, order).ncols();
+            let effective_cols = polynomial_block_from_order(centers, effective).ncols();
             log::warn!(
-                "Duchon nullspace order={:?} needs >={} centers in dim={}; got {} — degrading to Zero",
+                "Duchon nullspace order={:?} in dim={} with {} centers leaves no radial kernel columns (polynomial_cols={}); degrading to {:?} (polynomial_cols={})",
                 order,
-                required,
                 centers.ncols(),
-                centers.nrows()
+                centers.nrows(),
+                requested_cols,
+                effective,
+                effective_cols
             );
         }
-        return DuchonNullspaceOrder::Zero;
     }
-    order
+    effective
 }
 
 #[inline(always)]
@@ -15171,14 +15197,16 @@ pub fn build_duchon_basiswithworkspace(
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
         workspace,
     )?;
-    // Closed-form Lebesgue penalty: only available when the nullspace contains
-    // constants alone. With non-constant polynomials in the nullspace (Linear
-    // or higher), the polynomial-block contribution to the L²-Lebesgue
-    // operator penalty diverges (e.g. ∫|∇x_k|² dx = ∞ over R^d), so the
-    // closed-form pad-with-zeros is mathematically a different object than
-    // the collocation D^T D Gram matrix. Restricting to Zero ensures the
-    // closed-form and collocation paths agree on the same penalty matrix.
-    let use_closed_form = matches!(effective_nullspace_order, DuchonNullspaceOrder::Zero);
+    // Closed-form Lebesgue penalty: admitted at any nullspace order. The
+    // polynomial-block contribution to the L²-Lebesgue operator penalty is
+    // genuinely zero on R^d (polynomials live in the unpenalized null space),
+    // so zero-padding the polynomial block is the mathematically faithful
+    // object — not a substitute for the collocation D^T D poly block, which
+    // is a different finite-K object. The kernel sub-block of the closed-form
+    // Q^T G_raw Q matches the collocation kernel sub-block in the limit
+    // (pointwise basis evaluations of the Lebesgue Gram). Linear+ no longer
+    // forces the collocation D^T D fallback.
+    let use_closed_form = true;
     let candidates = if use_closed_form {
         if let Some(length_scale) = spec.length_scale {
             operator_penalty_candidates_closed_form(
@@ -20112,7 +20140,9 @@ pub mod closed_form_penalty {
             0 => {
                 // g = f(R). Only non-zero second partial is g_RR = f''.
                 let g_rr = fr[2];
-                (g_rr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                (
+                    g_rr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                )
             }
             1 => {
                 // g_R   = -f''' u_1/R² + 3 f'' u_1/R³ - f'' s_1/R + f' s_1/R² - 3 f' u_1/R⁴
@@ -20120,7 +20150,8 @@ pub mod closed_form_penalty {
                 //   = -f'''' u1/R² + 5 f''' u1/R³ - 12 f'' u1/R⁴
                 //     - f''' s1/R + 2 f'' s1/R² - 2 f' s1/R³
                 //     + 12 f' u1/R⁵
-                let g_rr = -fr[4] * u1 / r2 + 5.0 * fr[3] * u1 / r3 - 12.0 * fr[2] * u1 / r4
+                let g_rr = -fr[4] * u1 / r2 + 5.0 * fr[3] * u1 / r3
+                    - 12.0 * fr[2] * u1 / r4
                     - fr[3] * s1 / r
                     + 2.0 * fr[2] * s1 / r2
                     - 2.0 * fr[1] * s1 / r3
@@ -20146,14 +20177,13 @@ pub mod closed_form_penalty {
                 let f2 = 2.0 * fr[3] / r3 - 6.0 * fr[2] / r4 + 6.0 * fr[1] / r5;
                 let f3 = fr[2] / r2 - fr[1] / r3;
 
-                let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6
-                    - 105.0 * fr[2] / r7
+                let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6 - 105.0 * fr[2] / r7
                     + 105.0 * fr[1] / r8;
-                let df2 = 2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5
-                    - 30.0 * fr[1] / r6;
+                let df2 =
+                    2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5 - 30.0 * fr[1] / r6;
                 let df3 = fr[3] / r2 - 3.0 * fr[2] / r3 + 3.0 * fr[1] / r4;
-                let df4 = 4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5
-                    - 60.0 * fr[1] / r6;
+                let df4 =
+                    4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5 - 60.0 * fr[1] / r6;
                 let df5 = 2.0 * fr[3] / r2 - 6.0 * fr[2] / r3 + 6.0 * fr[1] / r4;
 
                 // d²F_i/dR² (derived in task #24 phase 3 notes):
@@ -20162,8 +20192,7 @@ pub mod closed_form_penalty {
                 //   d²F3/dR² = f⁽⁴⁾/R² - 5 f'''/R³ + 12 f''/R⁴ - 12 f'/R⁵
                 //   d²F4/dR² = 4 f⁽⁵⁾/R³ - 36 f⁽⁴⁾/R⁴ + 156 f'''/R⁵ - 360 f''/R⁶ + 360 f'/R⁷
                 //   d²F5/dR² = 2 f⁽⁴⁾/R² - 10 f'''/R³ + 24 f''/R⁴ - 24 f'/R⁵
-                let d2f1 = fr[6] / r4 - 14.0 * fr[5] / r5 + 95.0 * fr[4] / r6
-                    - 375.0 * fr[3] / r7
+                let d2f1 = fr[6] / r4 - 14.0 * fr[5] / r5 + 95.0 * fr[4] / r6 - 375.0 * fr[3] / r7
                     + 840.0 * fr[2] / r8
                     - 840.0 * fr[1] / r9;
                 let d2f2 = 2.0 * fr[5] / r3 - 18.0 * fr[4] / r4 + 78.0 * fr[3] / r5
@@ -20173,8 +20202,8 @@ pub mod closed_form_penalty {
                 let d2f4 = 4.0 * fr[5] / r3 - 36.0 * fr[4] / r4 + 156.0 * fr[3] / r5
                     - 360.0 * fr[2] / r6
                     + 360.0 * fr[1] / r7;
-                let d2f5 = 2.0 * fr[4] / r2 - 10.0 * fr[3] / r3 + 24.0 * fr[2] / r4
-                    - 24.0 * fr[1] / r5;
+                let d2f5 =
+                    2.0 * fr[4] / r2 - 10.0 * fr[3] / r3 + 24.0 * fr[2] / r4 - 24.0 * fr[1] / r5;
 
                 // g_RR = u_1²·d²F1 + s_1·u_1·d²F2 + s_1²·d²F3 + u_2·d²F4 + s_2·d²F5
                 let g_rr = u1 * u1 * d2f1 + s1 * u1 * d2f2 + s1 * s1 * d2f3 + u2 * d2f4 + s2 * d2f5;
@@ -20414,8 +20443,7 @@ pub mod closed_form_penalty {
             let max_order_h = max_order_h.min(6);
             let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
                 aniso_invariants_eta_jacobian(eta, r);
-            let fr =
-                radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
+            let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
             let (g, g_r, g_s1, g_s2, g_u1, g_u2) =
                 radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
             let (
@@ -20483,23 +20511,27 @@ pub mod closed_form_penalty {
                     let r_k_sq_v = r[k] * r[k];
                     let d2s1 = if k == l { 4.0 * b_l_v } else { 0.0 };
                     let d2s2 = if k == l { 16.0 * b_l_sq_v } else { 0.0 };
-                    let d2u1 = if k == l { 16.0 * b_l_sq_v * r_l_sq_v } else { 0.0 };
-                    let d2u2 = if k == l { 36.0 * b_l_cu_v * r_l_sq_v } else { 0.0 };
+                    let d2u1 = if k == l {
+                        16.0 * b_l_sq_v * r_l_sq_v
+                    } else {
+                        0.0
+                    };
+                    let d2u2 = if k == l {
+                        36.0 * b_l_cu_v * r_l_sq_v
+                    } else {
+                        0.0
+                    };
                     let d2r = {
                         let r_inv = if big_r > 0.0 { 1.0 / big_r } else { 0.0 };
                         let r_inv_cu = r_inv * r_inv * r_inv;
                         kron * 2.0 * b_l_v * r_l_sq_v * r_inv
                             - b_k_v * b_l_v * r_k_sq_v * r_l_sq_v * r_inv_cu
                     };
-                    let inv_term = g_r * d2r
-                        + g_s1 * d2s1
-                        + g_s2 * d2s2
-                        + g_u1 * d2u1
-                        + g_u2 * d2u2;
+                    let inv_term =
+                        g_r * d2r + g_s1 * d2s1 + g_s2 * d2s2 + g_u1 * d2u1 + g_u2 * d2u2;
 
                     let bare_d2 = hess_term + inv_term;
-                    d2_eta[k][l] = big_j
-                        * (g + bare_d_eta_g[k] + bare_d_eta_g[l] + bare_d2);
+                    d2_eta[k][l] = big_j * (g + bare_d_eta_g[k] + bare_d_eta_g[l] + bare_d2);
                 }
             }
         } else {
@@ -23468,12 +23500,12 @@ mod tests {
         // symmetric, and non-zero for (m, s, d, q) inside the Duchon
         // convergence regime: 4(m+s) > d + 2q AND d + 2q > 4m.
         //
-        // Closed-form-Zero (m=1) restricts q ≤ 2m-1 = 1 by the
+        // Closed-form (m=1) restricts q ≤ 2m-1 = 1 by the
         // partial-fraction precondition `2m - q ≥ 1`. Stiffness (q=2)
-        // would require m≥2 but option-3 gates closed-form OFF for
-        // Linear+ nullspaces, so q=2 is outside the closed-form-Zero
-        // domain and is exercised only via the collocation fallback in
-        // `operator_penalty_candidates_closed_form_pure` (covered by
+        // would require m≥2; for Linear+ nullspaces the closed-form path
+        // is now active (kernel-sub-block via Q^T G_raw Q), but q=2 still
+        // falls through to collocation when the per-q convergence
+        // predicate fails (covered by
         // `test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime`).
         //
         // This test exercises q=1 (tension), the maximal closed-form q
@@ -23524,6 +23556,387 @@ mod tests {
         assert!(
             frob_sq > 0.0,
             "closed-form pair block is identically zero in converging regime"
+        );
+    }
+
+    #[test]
+    fn test_closed_form_linear_nullspace_kernel_subblock_finite_psd() {
+        // Task #8: with the outer gate flipped, closed-form is admitted at
+        // Linear nullspace order. The kernel sub-block of the resulting
+        // penalty (Q^T G_raw Q where Q spans null(P^T) for the polynomial
+        // block P = [1, x_1, ..., x_d] evaluated at centers) must be
+        // finite, symmetric, and positive semidefinite. The polynomial
+        // block remains zero-padded (Option A: faithful to L²-Lebesgue),
+        // so we verify finiteness/symmetry/PSD on the kernel sub-block
+        // only — that is the contract the team-lead specified for
+        // Linear+ closed-form.
+        use ndarray::Array2 as A2;
+        let k = 24usize;
+        let d = 3usize;
+        let mut state: u64 = 0xBADC0FFE;
+        let mut next_unit = || -> f64 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract()
+        };
+        let mut centers = A2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = next_unit();
+            }
+        }
+
+        let p_order = 2usize; // m = 2
+        let s_order = 1usize; // s = 1
+
+        // Linear polynomial block: [1, x_1, ..., x_d], (k, d+1).
+        let mut poly = A2::<f64>::zeros((k, d + 1));
+        poly.column_mut(0).fill(1.0);
+        for c in 0..d {
+            poly.column_mut(c + 1).assign(&centers.column(c));
+        }
+        let z = kernel_constraint_nullspace_from_matrix(poly.view()).expect("Q construction");
+        // Z is (k, kernel_cols) with kernel_cols = k − rank(P) = k − (d+1).
+        let kernel_cols = z.ncols();
+        assert_eq!(kernel_cols, k - (d + 1));
+
+        // Closed-form pair block in raw kernel basis (κ=0, pure Duchon).
+        let g_raw = closed_form_anisotropic_pair_block_pure(
+            centers.view(),
+            1, // q = 1 (tension), maximal closed-form q for these orders
+            p_order,
+            s_order,
+            None,
+        );
+        // Q^T G_raw Q — the kernel sub-block.
+        let zt_g = fast_atb(&z, &g_raw);
+        let g_kernel = fast_ab(&zt_g, &z);
+
+        // Finite, symmetric.
+        assert_eq!(g_kernel.nrows(), kernel_cols);
+        assert_eq!(g_kernel.ncols(), kernel_cols);
+        assert!(g_kernel.iter().all(|v| v.is_finite()));
+        for i in 0..kernel_cols {
+            for j in 0..i {
+                let diff = (g_kernel[[i, j]] - g_kernel[[j, i]]).abs();
+                let scale = g_kernel[[i, j]].abs().max(1.0);
+                assert!(
+                    diff < 1e-9 * scale,
+                    "kernel sub-block asymmetry at ({i},{j}): {diff:.3e}"
+                );
+            }
+        }
+        // PSD (smallest eigenvalue ≥ -ε·trace via Rayleigh quotient on a
+        // few random unit vectors as a cheap sanity check).
+        let trace: f64 = (0..kernel_cols).map(|i| g_kernel[[i, i]]).sum();
+        for trial in 0..8 {
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            let mut v = vec![0.0_f64; kernel_cols];
+            let mut s2 = 0.0_f64;
+            for vi in v.iter_mut() {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u = ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract() - 0.5;
+                *vi = u;
+                s2 += u * u;
+            }
+            let nrm = s2.sqrt().max(1e-300);
+            for vi in v.iter_mut() {
+                *vi /= nrm;
+            }
+            let mut q = 0.0_f64;
+            for i in 0..kernel_cols {
+                let mut row_dot = 0.0;
+                for j in 0..kernel_cols {
+                    row_dot += g_kernel[[i, j]] * v[j];
+                }
+                q += v[i] * row_dot;
+            }
+            assert!(
+                q > -1e-9 * trace.abs().max(1.0),
+                "kernel sub-block not PSD (trial {trial}): v^T G_kernel v = {q:.3e}, trace = {trace:.3e}"
+            );
+        }
+        // Non-zero (we're in the converging regime).
+        let frob_sq: f64 = g_kernel.iter().map(|v| v * v).sum();
+        assert!(
+            frob_sq > 0.0,
+            "kernel sub-block is identically zero in converging regime"
+        );
+    }
+
+    #[test]
+    fn test_tps_closed_form_matches_collocation() {
+        // q=0 closed-form TPS pair-block must match the K_CC kernel Gram
+        // built by the existing collocation path
+        // (`build_thin_plate_penalty_matrices` pre-transform). We compare
+        // the unconstrained K-by-K block to entry-wise tolerance 1e-12 since
+        // both routes call `thin_plate_kernel_from_dist2` with the same
+        // scaled distance.
+        use ndarray::Array2 as A2;
+        let k = 24usize;
+        let d = 3usize;
+        let length_scale = 0.7_f64;
+        let mut state: u64 = 0xDEADC0DE;
+        let mut next_unit = || -> f64 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract()
+        };
+        let mut centers = A2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = next_unit();
+            }
+        }
+
+        let g_cf = closed_form_thin_plate_pair_block(centers.view(), 0, length_scale, None)
+            .expect("q=0 TPS closed-form should always return Some");
+
+        // Reference: hand-build K_CC the same way `build_thin_plate_penalty_matrices`
+        // does, before any kernel-nullspace transform.
+        let mut omega = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in i..k {
+                let mut dist2 = 0.0;
+                for axis in 0..d {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                let kij =
+                    thin_plate_kernel_from_dist2(dist2 / (length_scale * length_scale), d).unwrap();
+                omega[[i, j]] = kij;
+                omega[[j, i]] = kij;
+            }
+        }
+
+        for i in 0..k {
+            for j in 0..k {
+                let diff = (g_cf[[i, j]] - omega[[i, j]]).abs();
+                assert!(
+                    diff < 1e-12,
+                    "TPS closed-form q=0 mismatch at ({i},{j}): cf={}, ref={}, diff={}",
+                    g_cf[[i, j]],
+                    omega[[i, j]],
+                    diff
+                );
+            }
+        }
+
+        // Symmetric and finite.
+        assert!(g_cf.iter().all(|v| v.is_finite()));
+        for i in 0..k {
+            for j in 0..i {
+                assert_eq!(g_cf[[i, j]], g_cf[[j, i]]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tps_pair_block_gates_to_collocation_for_q1_q2_at_s0() {
+        // The Lebesgue convergence gate `4(m+s) > d+2q && d+2q > 4m`
+        // collapses at s=0 to a contradiction, so the closed-form TPS
+        // pair-block must return None for q ∈ {1, 2} (caller must use
+        // `D_q^T D_q` collocation). We verify this for the standard
+        // d=2,3,4 TPS configurations.
+        use ndarray::Array2 as A2;
+        for d in 2..=4 {
+            let k = 8usize;
+            let mut centers = A2::<f64>::zeros((k, d));
+            for i in 0..k {
+                for j in 0..d {
+                    centers[[i, j]] = (i as f64 + 1.0) * 0.13 + (j as f64) * 0.21;
+                }
+            }
+            for q in 1..=2 {
+                let g = closed_form_thin_plate_pair_block(centers.view(), q, 1.0, None);
+                assert!(
+                    g.is_none(),
+                    "TPS closed-form q={q} d={d} must return None (s=0 \
+                     Lebesgue gate is unsatisfiable); caller must fall back \
+                     to collocation D_q^T D_q",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matern_closed_form_matches_collocation() {
+        // q=0 Matérn closed-form pair-block must match the K_CC RKHS Gram
+        // built by `build_matern_kernel_penalty` (and embedded in the
+        // `MaternSplineBasis::penalty_kernel`) to entry-wise 1e-12 — both
+        // call the same closed-form half-integer formula via
+        // `matern_kernel_from_distance`, modulo the Matérn parameterization
+        // mapping κ = √(2ν)/length_scale used by the closed-form path.
+        //
+        // The default `matern_kernel_from_distance` (basis.rs:5949) scales
+        // distance by `r/length_scale` and applies the polynomial × exp
+        // form directly. Our closed-form path uses the spectral form
+        // M_ℓ^d(R; κ) which differs by a κ-dependent normalization
+        // constant. The two MUST agree up to the global RKHS scaling
+        // (which is exactly the constant `c` in K̂(ρ) = c (κ²+ρ²)^{-ℓ}).
+        // We therefore compare ratios entry-wise.
+        use ndarray::Array2 as A2;
+        let k = 16usize;
+        let d = 3usize;
+        let length_scale = 0.5_f64;
+        let nu = MaternNu::FiveHalves;
+        let mut state: u64 = 0xFEEDFACE;
+        let mut next_unit = || -> f64 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract()
+        };
+        let mut centers = A2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = next_unit();
+            }
+        }
+
+        let g_cf = closed_form_matern_pair_block(centers.view(), 0, length_scale, nu, None)
+            .expect("q=0 Matérn closed-form should always return Some when 4ℓ > d");
+        assert_eq!(g_cf.shape(), &[k, k]);
+        assert!(g_cf.iter().all(|v| v.is_finite()));
+
+        // Symmetric.
+        for i in 0..k {
+            for j in 0..i {
+                let diff = (g_cf[[i, j]] - g_cf[[j, i]]).abs();
+                assert!(
+                    diff < 1e-12 * g_cf[[i, j]].abs().max(1.0),
+                    "asymmetry at ({i},{j}): {} vs {}",
+                    g_cf[[i, j]],
+                    g_cf[[j, i]]
+                );
+            }
+        }
+
+        // PSD via eigh (Frobenius-positive eigenvalues).
+        let (eigs, _) = FaerEigh::eigh(&g_cf, Side::Lower).expect("eigh");
+        let min_eig = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_eig = eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        // PSD with mild numerical tolerance scaled by the matrix size.
+        assert!(
+            min_eig > -1e-10 * max_eig.abs().max(1.0),
+            "q=0 Matérn closed-form must be PSD; got eigenvalue range [{min_eig}, {max_eig}]"
+        );
+        assert!(
+            max_eig > 0.0,
+            "non-trivial Gram must have a positive eigenvalue"
+        );
+
+        // Constancy of the closed-form-vs-collocation ratio. The reference
+        // K_CC entry uses the polynomial-times-exp formula with distance
+        // `r/length_scale`; the closed-form uses M_ℓ^d(R;κ) with the same
+        // physical R but with explicit κ. The ratio must be a constant
+        // depending only on (d, ν, length_scale).
+        let mut ref_kcc = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in i..k {
+                let mut dist2 = 0.0;
+                for axis in 0..d {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    dist2 += delta * delta;
+                }
+                let r = dist2.sqrt();
+                let kij = matern_kernel_from_distance(r, length_scale, nu).unwrap();
+                ref_kcc[[i, j]] = kij;
+                ref_kcc[[j, i]] = kij;
+            }
+        }
+        // Determine the ratio from the diagonal (R=0): ratio = g_cf(0)/K(0).
+        // Both diagonals are positive constants; the ratio fixes the
+        // proportionality constant between the spectral and polynomial
+        // parameterizations.
+        let ratio = g_cf[[0, 0]] / ref_kcc[[0, 0]];
+        assert!(
+            ratio.is_finite() && ratio > 0.0,
+            "closed-form / collocation ratio must be finite and positive, got {ratio}"
+        );
+        for i in 0..k {
+            for j in 0..k {
+                let cf = g_cf[[i, j]];
+                let rf = ref_kcc[[i, j]];
+                let predicted = ratio * rf;
+                let diff = (cf - predicted).abs();
+                let scale = predicted.abs().max(1.0);
+                assert!(
+                    diff < 1e-10 * scale,
+                    "closed-form / collocation ratio non-constant at ({i},{j}): \
+                     cf={cf}, rf={rf}, ratio*rf={predicted}, diff={diff}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matern_closed_form_q1_q2_psd_and_finite() {
+        // q=1, q=2 Matérn Lebesgue pair-blocks via partial-fraction
+        // expansion of |ρ|^{2q} / (κ²+ρ²)^{2ℓ}. With ν=9/2, d=3 we have
+        // 2ℓ = 12 so 4ℓ - 2q = 24 - 2q > 3 holds for q ∈ {0,1,2}: all
+        // three matrices are well-defined. We assert finiteness, symmetry,
+        // and PSD via eigh.
+        use ndarray::Array2 as A2;
+        let k = 12usize;
+        let d = 3usize;
+        let length_scale = 0.4_f64;
+        let nu = MaternNu::NineHalves;
+        let mut state: u64 = 0x1337BEEF;
+        let mut next_unit = || -> f64 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract()
+        };
+        let mut centers = A2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = next_unit();
+            }
+        }
+
+        for q in [0usize, 1, 2] {
+            let g = closed_form_matern_pair_block(centers.view(), q, length_scale, nu, None)
+                .unwrap_or_else(|| panic!("q={q} Matérn closed-form must accept ν=9/2 d=3"));
+            assert_eq!(g.shape(), &[k, k]);
+            assert!(g.iter().all(|v| v.is_finite()), "q={q}: non-finite");
+            for i in 0..k {
+                for j in 0..i {
+                    assert!(
+                        (g[[i, j]] - g[[j, i]]).abs() < 1e-10 * g[[i, j]].abs().max(1.0),
+                        "q={q}: asymmetry at ({i},{j})"
+                    );
+                }
+            }
+            let (eigs, _) = FaerEigh::eigh(&g, Side::Lower).expect("eigh");
+            let min_eig = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_eig = eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                max_eig > 0.0,
+                "q={q}: Gram must have a positive eigenvalue (got max={max_eig})"
+            );
+            assert!(
+                min_eig > -1e-9 * max_eig.abs().max(1.0),
+                "q={q}: Gram must be PSD; eigenvalue range [{min_eig}, {max_eig}]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matern_closed_form_gates_when_divergent() {
+        // ν=1/2, d=3 → 2ℓ = 4 so 4ℓ = 8. Convergence of q-th block needs
+        // 8 > 2q + 3, i.e. q ≤ 2. So even at the smoothest-supported edge
+        // q=2: 8 > 7 holds, and we still get a valid block. To trigger
+        // divergence we need 4ℓ ≤ 2q + d. With d=3, ν=1/2 (2ℓ=4), q=3
+        // fails 8 > 9 → false → return None. q > 2 returns None
+        // unconditionally per the spec contract (we only support q ∈
+        // {0,1,2}).
+        use ndarray::Array2 as A2;
+        let centers = A2::<f64>::from_shape_vec(
+            (4, 3),
+            vec![0.1, 0.2, 0.3, 0.5, 0.4, 0.6, 0.8, 0.7, 0.9, 0.2, 0.5, 0.4],
+        )
+        .unwrap();
+        // q=3 (> 2): always None.
+        assert!(
+            closed_form_matern_pair_block(centers.view(), 3, 1.0, MaternNu::Half, None).is_none()
         );
     }
 
@@ -28595,8 +29008,12 @@ mod tests {
         };
 
         let mut seed = 0x1234_5678_u64;
-        let cases: &[(usize, usize, usize, usize, f64)] =
-            &[(0, 3, 1, 1, 1.0), (1, 3, 1, 1, 0.9), (1, 5, 1, 2, 0.7), (2, 5, 2, 2, 0.85)];
+        let cases: &[(usize, usize, usize, usize, f64)] = &[
+            (0, 3, 1, 1, 1.0),
+            (1, 3, 1, 1, 0.9),
+            (1, 5, 1, 2, 0.7),
+            (2, 5, 2, 2, 0.85),
+        ];
 
         for &(q, d, m, s, kappa) in cases {
             for _ in 0..3 {
@@ -28636,11 +29053,8 @@ mod tests {
         };
 
         let mut seed = 0xFEED_FACE_u64;
-        let cases: &[(usize, usize, usize, usize, f64)] = &[
-            (0, 2, 1, 1, 1.0),
-            (1, 3, 1, 1, 0.8),
-            (2, 3, 2, 2, 1.0),
-        ];
+        let cases: &[(usize, usize, usize, usize, f64)] =
+            &[(0, 2, 1, 1, 1.0), (1, 3, 1, 1, 0.8), (2, 3, 2, 2, 1.0)];
 
         for &(q, d, m, s, kappa) in cases {
             for _trial in 0..2 {
@@ -28679,12 +29093,16 @@ mod tests {
                         let mut epm = eta.clone();
                         let mut emp = eta.clone();
                         let mut emm = eta.clone();
-                        epp[k] += h; epp[l] += h;
-                        epm[k] += h; epm[l] -= h;
-                        emp[k] -= h; emp[l] += h;
-                        emm[k] -= h; emm[l] -= h;
-                        let off_fd = (v_at(&epp) - v_at(&epm) - v_at(&emp) + v_at(&emm))
-                            / (4.0 * h * h);
+                        epp[k] += h;
+                        epp[l] += h;
+                        epm[k] += h;
+                        epm[l] -= h;
+                        emp[k] -= h;
+                        emp[l] += h;
+                        emm[k] -= h;
+                        emm[l] -= h;
+                        let off_fd =
+                            (v_at(&epp) - v_at(&epm) - v_at(&emp) + v_at(&emm)) / (4.0 * h * h);
                         let denom = off_fd.abs().max(bundle.d2_eta[k][l].abs()).max(1e-8);
                         let rel = (bundle.d2_eta[k][l] - off_fd).abs() / denom;
                         assert!(
@@ -28696,7 +29114,10 @@ mod tests {
                         );
                         // Symmetry sanity.
                         let sym = (bundle.d2_eta[k][l] - bundle.d2_eta[l][k]).abs();
-                        assert!(sym < 1e-10, "Hessian symmetry violated: ({k},{l}) Δ={sym:.3e}");
+                        assert!(
+                            sym < 1e-10,
+                            "Hessian symmetry violated: ({k},{l}) Δ={sym:.3e}"
+                        );
                     }
                 }
             }
@@ -28710,8 +29131,7 @@ mod tests {
         };
 
         let mut seed = 0xDEAD_BEEF_u64;
-        let cases: &[(usize, usize, usize, usize, f64)] =
-            &[(1, 3, 1, 1, 0.8), (2, 3, 2, 2, 0.9)];
+        let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 1, 0.8), (2, 3, 2, 2, 0.9)];
 
         for &(q, d, m, s, kappa) in cases {
             for _ in 0..2 {
