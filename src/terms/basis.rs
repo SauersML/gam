@@ -21289,6 +21289,87 @@ mod tests {
     }
 
     #[test]
+    fn test_pure_duchon_closed_form_agrees_with_collocation_high_k() {
+        // High-K (K=200) test: at fine knot resolution the collocation
+        // Gram (D^T D) and the Lebesgue closed-form penalty matrices
+        // should agree on Frobenius-normalized matrices for the
+        // pure-Duchon (κ=0) path. Uses radial-derivative form which
+        // handles κ=0 cleanly.
+        use ndarray::Array2 as A2;
+        // Deterministic LCG (Numerical Recipes) for reproducibility without
+        // pulling in ndarray-rand.
+        let k = 200usize;
+        let d = 3usize;
+        let mut state: u64 = 0xCAFEBABE;
+        let mut next_unit = || -> f64 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f64 / ((1u64 << 56) as f64)).fract()
+        };
+        let mut centers = A2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = next_unit();
+            }
+        }
+        let p_order = 2usize;
+        let s_order = 1usize;
+
+        // Closed-form (radial, κ=0) Lebesgue penalty matrix at q=2 (stiffness).
+        let g_closed = closed_form_anisotropic_pair_block_pure(
+            centers.view(),
+            2,
+            p_order,
+            s_order,
+            None,
+        );
+        // Collocation Gram via D2.
+        let nullspace_order = DuchonNullspaceOrder::Linear;
+        let mut workspace = BasisWorkspace::default();
+        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
+            None,
+            None,
+            s_order,
+            nullspace_order,
+            None,
+            None,
+            2,
+            &mut workspace,
+        )
+        .expect("collocation ops");
+        let g_collo = symmetrize(&fast_ata(&ops.d2));
+
+        // Compare top-left K×K kernel block of g_collo (collocation
+        // operates in kernel-Z space) against the closed-form raw block
+        // projected through the kernel transform.
+        let z =
+            kernel_constraint_nullspace(centers.view(), nullspace_order, &mut workspace.cache)
+                .expect("kernel transform");
+        let zt_g = fast_atb(&z, &g_closed);
+        let g_closed_kernel = fast_ab(&zt_g, &z);
+
+        let frob =
+            |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+        let f_closed = frob(&g_closed_kernel);
+        let f_collo = frob(&g_collo);
+        let g_closed_n = g_closed_kernel.mapv(|v| v / f_closed);
+        let g_collo_n = g_collo.mapv(|v| v / f_collo);
+
+        // At high K, both penalties approximate the same continuum
+        // bilinear form up to discretization, so Frobenius-normalized
+        // matrices should agree to within a few percent.
+        let diff_frob = (&g_closed_n - &g_collo_n)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            diff_frob < 0.10,
+            "pure-Duchon closed-form vs collocation Frobenius diff = {diff_frob}"
+        );
+    }
+
+    #[test]
     fn test_build_duchon_basis_linear_nullspace_uses_operator_penalty_triplet() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
