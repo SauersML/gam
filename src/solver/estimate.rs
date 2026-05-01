@@ -75,7 +75,7 @@ use std::ops::Range;
 /// the O(p^2) cost of embedding into a full penalty matrix.
 /// `Dense` stores a full `p x p` penalty matrix for callers that already
 /// have one.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PenaltySpec {
     /// Block-local penalty: `local` is `block_dim x block_dim`,
     /// applied to columns `col_range` of the coefficient vector.
@@ -84,9 +84,34 @@ pub enum PenaltySpec {
         col_range: Range<usize>,
         /// Optional structural hint for fast-path spectral decomposition.
         structure_hint: Option<crate::terms::smooth::PenaltyStructureHint>,
+        /// Optional operator-form handle bit-equivalent to `local`.
+        op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
     },
     /// Full dense penalty matrix (`p x p`).
     Dense(Array2<f64>),
+}
+
+impl std::fmt::Debug for PenaltySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PenaltySpec::Block {
+                local,
+                col_range,
+                structure_hint,
+                op,
+            } => f
+                .debug_struct("Block")
+                .field("local", &format_args!("{}×{}", local.nrows(), local.ncols()))
+                .field("col_range", col_range)
+                .field("structure_hint", structure_hint)
+                .field("op", &op.as_ref().map(|o| o.dim()))
+                .finish(),
+            PenaltySpec::Dense(m) => f
+                .debug_tuple("Dense")
+                .field(&format_args!("{}×{}", m.nrows(), m.ncols()))
+                .finish(),
+        }
+    }
 }
 
 impl PenaltySpec {
@@ -102,12 +127,21 @@ impl PenaltySpec {
         }
     }
 
-    /// Convert from a `BlockwisePenalty`, preserving the structure hint.
+    /// Op-form handle when present (only for `Block`; `Dense` always returns `None`).
+    pub fn op(&self) -> Option<&std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
+        match self {
+            PenaltySpec::Block { op, .. } => op.as_ref(),
+            PenaltySpec::Dense(_) => None,
+        }
+    }
+
+    /// Convert from a `BlockwisePenalty`, preserving the structure hint and op.
     pub fn from_blockwise(bp: crate::terms::smooth::BlockwisePenalty) -> Self {
         PenaltySpec::Block {
             local: bp.local,
             col_range: bp.col_range,
             structure_hint: bp.structure_hint,
+            op: bp.op,
         }
     }
 
@@ -116,6 +150,7 @@ impl PenaltySpec {
             local: bp.local.clone(),
             col_range: bp.col_range.clone(),
             structure_hint: bp.structure_hint.clone(),
+            op: bp.op.clone(),
         }
     }
 
