@@ -4,6 +4,7 @@ A test script to simulate data, train a GAM model using the 'gnomon' Rust
 executable, evaluate its performance against a baseline, and generate
 a comprehensive set of analysis plots.
 """
+import typing
 
 import subprocess
 import pandas as pd
@@ -58,7 +59,7 @@ SIMULATION_SIGNAL_STRENGTH = 0.6 # The coefficient for the true logit function
 
 # --- Helper Functions ---
 
-def build_rust_project():
+def build_rust_project() -> None:
     """Checks for an executable and compiles the Rust project if not found."""
     global EXECUTABLE_NAME, EXECUTABLE_PATH
     for candidate in _preferred_bins:
@@ -95,7 +96,7 @@ def build_rust_project():
     sys.exit(1)
 
 
-def simulate_data(n_samples: int, seed: int):
+def simulate_data(n_samples: int, seed: int) -> typing.Any:
     """
     Simulates a dataset with heteroscedastic noise.
 
@@ -146,7 +147,7 @@ def simulate_data(n_samples: int, seed: int):
     return df
 
 
-def run_subprocess(command, cwd):
+def run_subprocess(command: typing.Any, cwd: typing.Any) -> None:
     """Runs a subprocess and handles common errors cleanly."""
     try:
         print(f"Executing: {' '.join(map(str, command))}\n")
@@ -160,7 +161,7 @@ def run_subprocess(command, cwd):
         sys.exit(1)
 
 
-def tjurs_r2(y_true, y_prob):
+def tjurs_r2(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Calculates Tjur's Coefficient of Discrimination (R-squared)."""
     y_true = pd.Series(y_true)
     mean_prob_cases = y_prob[y_true == 1].mean()
@@ -168,7 +169,7 @@ def tjurs_r2(y_true, y_prob):
     return mean_prob_cases - mean_prob_controls
 
 
-def nagelkerkes_r2(y_true, y_prob):
+def nagelkerkes_r2(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Calculates Nagelkerke's Pseudo R-squared."""
     y_true = np.asarray(y_true, float)
     y_prob = np.clip(np.asarray(y_prob, float), 1e-15, 1 - 1e-15)
@@ -195,28 +196,28 @@ def nagelkerkes_r2(y_true, y_prob):
 # Small constant to prevent numerical issues
 _EPS = 1e-15
 
-def _prep_vec(y, p):
+def _prep_vec(y: typing.Any, p: typing.Any) -> typing.Any:
     """Prepare data vectors by converting to proper types and handling NaNs."""
     y = pd.Series(y).astype(float)
     p = pd.Series(p).astype(float).clip(_EPS, 1-_EPS)
     m = (~y.isna()) & (~p.isna())
     return y[m].values, p[m].values
 
-def safe_auc(y_true, y_prob):
+def safe_auc(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Safely calculate AUC with proper edge case handling."""
     y, p = _prep_vec(y_true, y_prob)
     if len(np.unique(y)) < 2:  # Need both classes for ROC
         return np.nan
     return roc_auc_score(y, p)
 
-def safe_pr_auc(y_true, y_prob):
+def safe_pr_auc(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Safely calculate PR-AUC with proper edge case handling."""
     y, p = _prep_vec(y_true, y_prob)
     if (y==1).sum() == 0 or (y==0).sum() == 0:  # Need both classes
         return np.nan
     return average_precision_score(y, p)
 
-def safe_logloss(y_true, y_prob):
+def safe_logloss(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Safely calculate log loss with proper edge case handling."""
     y, p = _prep_vec(y_true, y_prob)
     if len(y) == 0:
@@ -224,7 +225,7 @@ def safe_logloss(y_true, y_prob):
     from sklearn.metrics import log_loss
     return log_loss(y, p)
 
-def best_threshold_youden(y_true, y_prob):
+def best_threshold_youden(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Find the optimal threshold that maximizes Youden's J statistic (sensitivity + specificity - 1).
     
     Args:
@@ -242,7 +243,7 @@ def best_threshold_youden(y_true, y_prob):
     best_idx = np.argmax(tpr - fpr)
     return float(thresholds[best_idx])
 
-def _ece_from_edges(y, p, edges):
+def _ece_from_edges(y: typing.Any, p: typing.Any, edges: typing.Any) -> typing.Any:
     """Calculate ECE given bin edges, using bin-mass weighting."""
     # Assign points to bins formed by 'edges' in probability space
     ids = np.digitize(p, edges, right=True) - 1
@@ -259,7 +260,7 @@ def _ece_from_edges(y, p, edges):
         ece += (n_b / N) * abs(acc - conf)
     return ece
 
-def ece_quantile(y_true, y_prob, n_bins=20):
+def ece_quantile(y_true: typing.Any, y_prob: typing.Any, n_bins: typing.Any=20) -> typing.Any:
     """Mass-weighted ECE using equal-frequency (quantile) bins.
     
     Args:
@@ -281,7 +282,7 @@ def ece_quantile(y_true, y_prob, n_bins=20):
         return abs(y.mean() - p.mean())  # degenerate case
     return _ece_from_edges(y, p, edges)
 
-def ece_randomized_quantile(y_true, y_prob, bin_counts=(10,20,40), repeats=50, min_per_bin=20, rng=None):
+def ece_randomized_quantile(y_true: typing.Any, y_prob: typing.Any, bin_counts: typing.Any=(10,20,40), repeats: typing.Any=50, min_per_bin: typing.Any=20, rng: typing.Any=None) -> typing.Any:
     """Averaged, bin-insensitive ECE: quantile bins with random offsets, multi-resolution.
     
     This method creates multiple random binnings in rank space and
@@ -327,7 +328,7 @@ def ece_randomized_quantile(y_true, y_prob, bin_counts=(10,20,40), repeats=50, m
         'details':  {'bin_counts': list(bin_counts), 'repeats': repeats}
     }
 
-def wilson_ci(k, n, z=1.959963984540054):  # 95% CI
+def wilson_ci(k: typing.Any, n: typing.Any, z: typing.Any=1.959963984540054) -> typing.Any:  # 95% CI
     if n == 0: 
         return (np.nan, np.nan)
     p = k/n
@@ -336,7 +337,7 @@ def wilson_ci(k, n, z=1.959963984540054):  # 95% CI
     half = z*np.sqrt((p*(1-p) + z**2/(4*n))/n) / denom
     return center - half, center + half
 
-def ici_isotonic(y_true, y_prob):
+def ici_isotonic(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Compute Integrated Calibration Index with isotonic regression.
 
     This is a bin-free calibration metric measuring the mean absolute
@@ -351,7 +352,7 @@ def ici_isotonic(y_true, y_prob):
     return float(np.mean(np.abs(m - p)))
 
 
-def ece_rq_shared_edges(preds_dict, y_true, bin_counts=(10,20,40), repeats=50, min_per_bin=20, rng=None):
+def ece_rq_shared_edges(preds_dict: typing.Any, y_true: typing.Any, bin_counts: typing.Any=(10,20,40), repeats: typing.Any=50, min_per_bin: typing.Any=20, rng: typing.Any=None) -> typing.Any:
     """Calculate randomized quantile ECE using shared bin edges across all models.
     
     This ensures that all models are evaluated on the exact same bin edges,
@@ -413,7 +414,7 @@ def ece_rq_shared_edges(preds_dict, y_true, bin_counts=(10,20,40), repeats=50, m
     return results
 
 
-def ece_rq_shared_edges_bootstrap_ci(models, y_true, n_boot=500, alpha=0.05, rng=None):
+def ece_rq_shared_edges_bootstrap_ci(models: typing.Any, y_true: typing.Any, n_boot: typing.Any=500, alpha: typing.Any=0.05, rng: typing.Any=None) -> typing.Any:
     """Calculate bootstrap confidence intervals for shared-edges randomized quantile ECE.
     
     This measures sampling uncertainty in the shared-edges ECE estimate by bootstrapping
@@ -461,7 +462,7 @@ def ece_rq_shared_edges_bootstrap_ci(models, y_true, n_boot=500, alpha=0.05, rng
     return out
 
 
-def brier_decomposition(y_true, y_prob, n_bins=20):
+def brier_decomposition(y_true: typing.Any, y_prob: typing.Any, n_bins: typing.Any=20) -> typing.Any:
     """Decompose Brier score into reliability, resolution, uncertainty.
 
     Args:
@@ -511,7 +512,7 @@ def brier_decomposition(y_true, y_prob, n_bins=20):
     return reliability, resolution, uncertainty
 
 
-def generate_performance_report(df_results):
+def generate_performance_report(df_results: typing.Any) -> None:
     """Calculates and prints a side-by-side comparison of model metrics."""
     y_true = df_results['phenotype']
 
@@ -616,7 +617,7 @@ def generate_performance_report(df_results):
     print("\n" + "="*60)
     return
 
-def main():
+def main() -> None:
     """Main function to run the end-to-end simulation and plotting."""
     # Set default figure format and output path for saved plots
     output_dir = Path(os.environ.get('PLOT_OUTPUT_DIR', './'))

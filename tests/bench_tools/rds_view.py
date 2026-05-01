@@ -11,7 +11,7 @@ DECIMAL_PLACES = 3
 TRUNCATE_THRESHOLD = 300  # Truncate lists longer than this
 TRUNCATE_KEEP = 100       # Keep this many items at the start and end
 
-def main():
+def main() -> None:
     """Converts an RDS file to a rounded and truncated R script."""
     # Stage: Pre-flight checks for the input file and Rscript
     if not INPUT.exists():
@@ -53,7 +53,7 @@ def main():
     print("You can open it in a text editor or run `source('gam_model_fit.R')` in R.")
 
 
-def generate_r_file():
+def generate_r_file() -> None:
     """Calls Rscript to convert the RDS file to a .R file."""
     r_code = f"""
 options(digits = 17, width = 10000)

@@ -5,6 +5,7 @@ Duchon smooths throughout, main-formula linkwiggle, logslope score-warp via
 logslope-formula linkwiggle, and timewiggle — no linear terms. PIT is done
 entirely by the gam binary via --transformation-normal.
 """
+import typing
 
 import csv
 import math
@@ -18,7 +19,7 @@ import time
 GAM_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "gam")
 
 
-def generate_reference(n=40, seed=1):
+def generate_reference(n: typing.Any=40, seed: typing.Any=1) -> typing.Any:
     """Reference panel with Gaussian location-scale structure."""
     rng = random.Random(seed)
     rows = []
@@ -37,7 +38,7 @@ def generate_reference(n=40, seed=1):
     return rows
 
 
-def generate_study(n=40, seed=2):
+def generate_study(n: typing.Any=40, seed: typing.Any=2) -> typing.Any:
     """Study cohort with binary + survival outcomes."""
     rng = random.Random(seed)
     rows = []
@@ -79,19 +80,19 @@ def generate_study(n=40, seed=2):
     return rows
 
 
-def write_csv(rows, path):
+def write_csv(rows: typing.Any, path: typing.Any) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def read_csv(path):
+def read_csv(path: typing.Any) -> typing.Any:
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
 
 
-def merge_z_into_study(study_csv, pred_csv, out_csv):
+def merge_z_into_study(study_csv: typing.Any, pred_csv: typing.Any, out_csv: typing.Any) -> None:
     """Read predict output (eta column = PIT z), merge as 'z' into study data.
 
     The merged z scores should be approximately N(0, 1) under conditional
@@ -146,7 +147,7 @@ def merge_z_into_study(study_csv, pred_csv, out_csv):
         )
 
 
-def _finite(v):
+def _finite(v: typing.Any) -> typing.Any:
     try:
         f = float(v)
     except (TypeError, ValueError):
@@ -154,7 +155,7 @@ def _finite(v):
     return f == f and f not in (float("inf"), float("-inf"))
 
 
-def run(args, label, timeout=300):
+def run(args: typing.Any, label: typing.Any, timeout: typing.Any=300) -> typing.Any:
     cmd = [GAM_BIN] + args
     print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
     print(f"  cmd: gam {' '.join(args)}")
@@ -181,13 +182,13 @@ def run(args, label, timeout=300):
     return True, elapsed
 
 
-def skip(label, reason):
+def skip(label: typing.Any, reason: typing.Any) -> typing.Any:
     print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
     print(f"  SKIP ({reason})")
     return False, 0.0
 
 
-def main():
+def main() -> None:
     if not os.path.exists(GAM_BIN):
         print(f"Binary not found: {GAM_BIN}")
         sys.exit(1)

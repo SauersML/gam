@@ -19,6 +19,7 @@ must keep their headline accuracy on out-of-sample rows.
 """
 
 from __future__ import annotations
+import typing
 
 import math
 
@@ -88,8 +89,8 @@ def _c_index(times: np.ndarray, events: np.ndarray, risk: np.ndarray) -> float:
 
 
 def test_e2e_stage1_calibration_transfers_to_heldout_test(
-    synthetic_biobank_factory,
-):
+    synthetic_biobank_factory: typing.Any,
+) -> None:
     """Calibrate on train, transform test, check held-out z is ~ N(0, 1).
 
     Stage 1's contract is that ``h(PGS | PCs) ~ N(0, 1)`` after the map is
@@ -130,8 +131,8 @@ def test_e2e_stage1_calibration_transfers_to_heldout_test(
 
 
 def test_e2e_stage1_then_stage2a_binary_holdout_auc(
-    synthetic_biobank_factory,
-):
+    synthetic_biobank_factory: typing.Any,
+) -> None:
     """Stage 1 → Stage 2a end-to-end: train, predict on held-out, AUC > 0.6.
 
     The synthetic biobank generates ``disease`` from a probit of
@@ -183,8 +184,8 @@ def test_e2e_stage1_then_stage2a_binary_holdout_auc(
 
 
 def test_e2e_stage1_then_stage2b_survival_holdout_cindex(
-    synthetic_biobank_factory,
-):
+    synthetic_biobank_factory: typing.Any,
+) -> None:
     """Stage 1 → Stage 2b end-to-end: train, predict on held-out, C-idx > 0.55.
 
     The synthetic biobank's hazard is ``lam = exp(-1.2 - 0.3 * PGS)``, so
@@ -246,8 +247,8 @@ def test_e2e_stage1_then_stage2b_survival_holdout_cindex(
 
 
 def test_e2e_pipeline_save_and_reload_predicts_identically(
-    synthetic_biobank_factory, tmp_path
-):
+    synthetic_biobank_factory: typing.Any, tmp_path: typing.Any
+) -> None:
     """Roundtrip the full pipeline (calibration + binary model) through disk.
 
     A deployment-time concern: after Stage 1 calibration is fit on train,

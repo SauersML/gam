@@ -1,3 +1,4 @@
+import typing
 import builtins
 import importlib.util
 import sys
@@ -20,7 +21,7 @@ class RunSuiteOptionalImportTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         orig_import = builtins.__import__
 
-        def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        def _guarded_import(name: typing.Any, globals: typing.Any=None, locals: typing.Any=None, fromlist: typing.Any=(), level: typing.Any=0) -> typing.Any:
             root = name.split(".", 1)[0]
             if root in {"lifelines", "sklearn"}:
                 raise ModuleNotFoundError(f"No module named '{root}'")

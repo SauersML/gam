@@ -1,3 +1,4 @@
+import typing
 import subprocess
 import sys
 from pathlib import Path
@@ -34,7 +35,7 @@ PLOT_RANGE_EXPANSION_FACTOR = 1.1 # Expand plot boundaries by 10%
 # Constant for small values to prevent numerical issues
 EPS = 1e-15
 
-def _prep(y_true, y_prob):
+def _prep(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Prepare data by converting to float, clipping probabilities, and handling NaNs."""
     y = pd.Series(y_true).astype(float)
     p = pd.Series(y_prob).astype(float).clip(EPS, 1-EPS)
@@ -42,34 +43,34 @@ def _prep(y_true, y_prob):
     y, p = y[mask], p[mask]
     return y.values, p.values
 
-def safe_auc(y_true, y_prob):
+def safe_auc(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Safely calculates ROC AUC with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
     if len(np.unique(y)) < 2:  # Check if we have both classes
         return np.nan
     return roc_auc_score(y, p)
 
-def safe_brier(y_true, y_prob):
+def safe_brier(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     y, p = _prep(y_true, y_prob)
     if len(y) == 0:
         return np.nan
     return brier_score_loss(y, p)
 
-def safe_logloss(y_true, y_prob):
+def safe_logloss(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Safely calculates log loss (cross-entropy) with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
     if len(y) == 0:
         return np.nan
     return log_loss(y, p)
 
-def tjurs_r2(y_true, y_prob):
+def tjurs_r2(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Calculates Tjur's R-squared for model performance with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
     if (y==1).sum()==0 or (y==0).sum()==0:  # Check if we have both classes
         return np.nan
     return p[y==1].mean() - p[y==0].mean()
 
-def nagelkerkes_r2(y_true, y_prob):
+def nagelkerkes_r2(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Calculates Nagelkerke's R-squared for model performance with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
     p_mean = y.mean()
@@ -82,14 +83,14 @@ def nagelkerkes_r2(y_true, y_prob):
     max_r2_cs = 1 - np.exp((2/n)*ll_null)
     return r2_cs / max_r2_cs if max_r2_cs > 0 else np.nan
 
-def pr_auc(y_true, y_prob):
+def pr_auc(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Calculates PR-AUC (Average Precision) with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
     if (y==1).sum()==0:  # Need positive examples for PR-AUC
         return np.nan
     return average_precision_score(y, p)
 
-def calibration_intercept_slope(y_true, y_prob):
+def calibration_intercept_slope(y_true: typing.Any, y_prob: typing.Any) -> typing.Any:
     """Calculate calibration intercept and slope via logistic regression."""
     y, p = _prep(y_true, y_prob)
     logit_p = np.log(p/(1-p)).reshape(-1,1)  # logit transform
@@ -101,7 +102,7 @@ def calibration_intercept_slope(y_true, y_prob):
     except Exception:
         return np.nan, np.nan
 
-def expected_calibration_error(y_true, y_prob, n_bins=20, strategy='uniform'):
+def expected_calibration_error(y_true: typing.Any, y_prob: typing.Any, n_bins: typing.Any=20, strategy: typing.Any='uniform') -> typing.Any:
     """Calculate Expected Calibration Error using binning.
     
     Parameters:
@@ -155,11 +156,11 @@ def expected_calibration_error(y_true, y_prob, n_bins=20, strategy='uniform'):
         
     return ece
 
-def ece_randomized_quantile(y_true, y_prob, 
-                          bin_counts=(10, 20, 40),  # multi-resolution
-                          repeats=50,              # random offsets per resolution
-                          min_per_bin=20,          # auto-downshift if sample is small
-                          rng=None):
+def ece_randomized_quantile(y_true: typing.Any, y_prob: typing.Any, 
+                          bin_counts: typing.Any=(10, 20, 40),  # multi-resolution
+                          repeats: typing.Any=50,              # random offsets per resolution
+                          min_per_bin: typing.Any=20,          # auto-downshift if sample is small
+                          rng: typing.Any=None) -> typing.Any:
     """Calculate ECE using randomized quantile bins for stability.
     
     This method creates multiple random binnings in rank space and
@@ -234,7 +235,7 @@ def ece_randomized_quantile(y_true, y_prob,
         "details": {"bin_counts": list(bin_counts), "repeats": repeats}
     }
 
-def brier_decomposition(y_true, y_prob, n_bins=20):
+def brier_decomposition(y_true: typing.Any, y_prob: typing.Any, n_bins: typing.Any=20) -> typing.Any:
     y, p = _prep(y_true, y_prob)
     # Reliability diagram bins
     bins = np.linspace(0,1,n_bins+1)
@@ -254,7 +255,7 @@ def brier_decomposition(y_true, y_prob, n_bins=20):
     uncertainty = p_bar*(1-p_bar)  # inherent uncertainty in the data
     return reliability, resolution, uncertainty
 
-def bootstrap_metric_ci(y_true, y_prob, metric_fn, n_boot=1000, alpha=0.05, rng=None):
+def bootstrap_metric_ci(y_true: typing.Any, y_prob: typing.Any, metric_fn: typing.Any, n_boot: typing.Any=1000, alpha: typing.Any=0.05, rng: typing.Any=None) -> typing.Any:
     """Calculate bootstrap confidence intervals for any metric.
     
     Parameters:
@@ -298,7 +299,7 @@ def bootstrap_metric_ci(y_true, y_prob, metric_fn, n_boot=1000, alpha=0.05, rng=
     return (metric_fn(y, p), lo, hi)
 
 
-def wilson_ci(k, n, alpha=0.05):
+def wilson_ci(k: typing.Any, n: typing.Any, alpha: typing.Any=0.05) -> typing.Any:
     """Calculate Wilson score interval for a binomial proportion."""
     if n == 0:
         return (np.nan, np.nan)
@@ -314,7 +315,7 @@ def wilson_ci(k, n, alpha=0.05):
     return (center - half_width, center + half_width)
 
 
-def compute_calibration_bins(y_true, y_prob, n_bins=20, strategy='quantile'):
+def compute_calibration_bins(y_true: typing.Any, y_prob: typing.Any, n_bins: typing.Any=20, strategy: typing.Any='quantile') -> typing.Any:
     """Compute calibration bins for reliability diagram.
     
     Parameters:
@@ -382,7 +383,7 @@ def compute_calibration_bins(y_true, y_prob, n_bins=20, strategy='quantile'):
 
 # --- 3. Analysis and Plotting Functions ---
 
-def run_r_inference(input_csv, output_csv):
+def run_r_inference(input_csv: typing.Any, output_csv: typing.Any) -> None:
     """Generic function to get predictions from the R/mgcv model."""
     print(f"--- Running R/mgcv inference on '{input_csv.name}'")
     r_script = f"suppressPackageStartupMessages(library(mgcv)); model<-readRDS('{R_MODEL_PATH.name}');" \
@@ -394,7 +395,7 @@ def run_r_inference(input_csv, output_csv):
         print(f"\nERROR: R script failed. Is R installed? Error:\n{getattr(e, 'stderr', e)}")
         sys.exit(1)
 
-def run_rust_inference(input_csv, temp_tsv, output_csv):
+def run_rust_inference(input_csv: typing.Any, temp_tsv: typing.Any, output_csv: typing.Any) -> None:
     """Generic function to get predictions from the Rust/gnomon model."""
     print(f"--- Running Rust/gnomon inference on '{input_csv.name}'")
     cmd = [str(GNOMON_EXECUTABLE), "infer", "--model", RUST_MODEL_CONFIG_PATH.name, str(temp_tsv.relative_to(PROJECT_ROOT))]
@@ -406,7 +407,7 @@ def run_rust_inference(input_csv, temp_tsv, output_csv):
         print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}")
         sys.exit(1)
         
-def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
+def print_performance_report(df: typing.Any, bootstrap_ci: typing.Any=True, n_boot: typing.Any=1000, seed: typing.Any=42) -> None:
     """Calculates and prints all performance metrics based on test data.
     
     Parameters:
@@ -498,7 +499,7 @@ def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
 
     print("\n" + "="*60)
 
-def plot_prediction_comparisons(df):
+def plot_prediction_comparisons(df: typing.Any) -> typing.Any:
     """
     Generates plots comparing models to ground truth (not model vs model).
     """
@@ -565,7 +566,7 @@ def plot_prediction_comparisons(df):
                  for name, model in models.items()}
     
     # Function to plot model vs ground truth scatter with density coloring
-    def plot_model_vs_truth(ax, model_name, model_data):
+    def plot_model_vs_truth(ax: typing.Any, model_name: typing.Any, model_data: typing.Any) -> typing.Any:
         x = df['final_probability'].values
         y = df[model_data['predictions']].values
         mae = mae_values[model_name]
@@ -660,7 +661,7 @@ def plot_prediction_comparisons(df):
     fig.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.4, wspace=0.3)
     plt.show()
 
-def plot_calibrated_vs_uncalibrated(df):
+def plot_calibrated_vs_uncalibrated(df: typing.Any) -> None:
     """
     Create a plot comparing calibrated vs uncalibrated predictions for the Rust/gnomon model.
     Only runs if uncalibrated_prediction column exists in the dataframe.
@@ -764,7 +765,7 @@ def plot_calibrated_vs_uncalibrated(df):
     fig.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust for the suptitle
     plt.show()
 
-def plot_model_surfaces(test_df):
+def plot_model_surfaces(test_df: typing.Any) -> typing.Any:
     """Generates model surface plots for all available models and empirical data."""
     print("\n" + "#" * 70)
     print("### PLOTTING MODEL SURFACES COMPARISON ###")
@@ -790,7 +791,7 @@ def plot_model_surfaces(test_df):
 
     # A. Dynamically calculate plot boundaries based on the test data range
     print(f"\n--- Dynamically calculating plot ranges from '{TEST_DATA_CSV.name}' ---")
-    def get_expanded_range(data_series, factor):
+    def get_expanded_range(data_series: typing.Any, factor: typing.Any) -> typing.Any:
         min_val, max_val = data_series.min(), data_series.max()
         center, half_width = (min_val + max_val) / 2, (max_val - min_val) / 2
         expanded_half_width = half_width * factor
@@ -902,7 +903,7 @@ def plot_model_surfaces(test_df):
     
 # --- 4. Main Execution Block ---
 
-def plot_model_calibration_comparison(df):
+def plot_model_calibration_comparison(df: typing.Any) -> None:
     """Plot reliability diagrams for all models."""
     print("\n--- Generating Calibration Comparison Plots ---")
     
@@ -1027,7 +1028,7 @@ def plot_model_calibration_comparison(df):
     plt.show()
     
 
-def main():
+def main() -> None:
     # --- 1. Check for required files ---
     required_files = [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH, TEST_DATA_CSV]
     for f in required_files:

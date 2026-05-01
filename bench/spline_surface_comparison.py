@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import typing
 import csv
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,7 +10,7 @@ from sklearn.preprocessing import SplineTransformer
 from scipy.optimize import minimize
 
 
-def true_surface(x, y):
+def true_surface(x: typing.Any, y: typing.Any) -> typing.Any:
     return (
         0.80 * np.sin(1.5 * x)
         + 0.60 * np.cos(1.2 * y)
@@ -19,7 +20,7 @@ def true_surface(x, y):
     )
 
 
-def tps_kernel(r):
+def tps_kernel(r: typing.Any) -> typing.Any:
     out = np.zeros_like(r)
     mask = r > 0
     rr = r[mask]
@@ -27,12 +28,12 @@ def tps_kernel(r):
     return out
 
 
-def pairwise_dist(a, b):
+def pairwise_dist(a: typing.Any, b: typing.Any) -> typing.Any:
     d = a[:, None, :] - b[None, :, :]
     return np.sqrt(np.sum(d * d, axis=2))
 
 
-def farthest_point_centers(xy, m):
+def farthest_point_centers(xy: typing.Any, m: typing.Any) -> typing.Any:
     n = xy.shape[0]
     m = min(max(2, m), n)
     first = np.argmin(np.sum((xy - np.mean(xy, axis=0)) ** 2, axis=1))
@@ -46,14 +47,14 @@ def farthest_point_centers(xy, m):
     return xy[np.array(selected)]
 
 
-def diff_penalty(n, order=2):
+def diff_penalty(n: typing.Any, order: typing.Any=2) -> typing.Any:
     d = np.eye(n)
     for _ in range(order):
         d = d[1:, :] - d[:-1, :]
     return d.T @ d
 
 
-def nullspace_of_pt(p):
+def nullspace_of_pt(p: typing.Any) -> typing.Any:
     # returns Z such that P^T Z = 0
     u, s, vt = np.linalg.svd(p.T, full_matrices=True)
     tol = max(p.shape) * np.finfo(float).eps * (s[0] if s.size else 1.0)
@@ -62,12 +63,12 @@ def nullspace_of_pt(p):
     return v[:, rank:]
 
 
-def fit_gaussian_reml(X, y, S_list, maxiter=120):
+def fit_gaussian_reml(X: typing.Any, y: typing.Any, S_list: typing.Any, maxiter: typing.Any=120) -> typing.Any:
     n, p = X.shape
     XtX = X.T @ X
     Xty = X.T @ y
 
-    def objective(rho):
+    def objective(rho: typing.Any) -> typing.Any:
         lambdas = np.exp(rho)
         S = np.zeros((p, p))
         for lam, sk in zip(lambdas, S_list):
@@ -122,7 +123,7 @@ def fit_gaussian_reml(X, y, S_list, maxiter=120):
     return beta, lam, opt
 
 
-def build_tensor_bspline_train_eval(train_xy, eval_xy):
+def build_tensor_bspline_train_eval(train_xy: typing.Any, eval_xy: typing.Any) -> typing.Any:
     sx = SplineTransformer(degree=3, n_knots=8, include_bias=True)
     sy = SplineTransformer(degree=3, n_knots=8, include_bias=True)
 
@@ -142,7 +143,7 @@ def build_tensor_bspline_train_eval(train_xy, eval_xy):
     return X_train, X_eval, [S1, S2]
 
 
-def build_tps_train_eval(train_xy, eval_xy, centers):
+def build_tps_train_eval(train_xy: typing.Any, eval_xy: typing.Any, centers: typing.Any) -> typing.Any:
     r_train = pairwise_dist(train_xy, centers)
     K_train = tps_kernel(r_train)
     P_train = np.c_[np.ones(len(train_xy)), train_xy]
@@ -170,7 +171,7 @@ def build_tps_train_eval(train_xy, eval_xy, centers):
     return X_train, X_eval, [S1, S2]
 
 
-def ensure_rust_bin():
+def ensure_rust_bin() -> typing.Any:
     root = Path(__file__).resolve().parents[1]
     candidate = root / "target" / "release" / "gam"
     if candidate.exists():
@@ -187,7 +188,7 @@ def ensure_rust_bin():
     return candidate
 
 
-def write_xy_csv(path, xy, y=None):
+def write_xy_csv(path: typing.Any, xy: typing.Any, y: typing.Any=None) -> None:
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         if y is None:
@@ -200,7 +201,7 @@ def write_xy_csv(path, xy, y=None):
                 w.writerow([float(xv), float(yv), float(zv)])
 
 
-def read_mean_predictions(path):
+def read_mean_predictions(path: typing.Any) -> typing.Any:
     out = []
     with path.open("r", newline="") as f:
         rdr = csv.DictReader(f)
@@ -211,7 +212,7 @@ def read_mean_predictions(path):
     return np.asarray(out, dtype=float)
 
 
-def native_surface_predict(train_xy, z_obs, eval_xy, basis_type, centers=30, ell=0.55):
+def native_surface_predict(train_xy: typing.Any, z_obs: typing.Any, eval_xy: typing.Any, basis_type: typing.Any, centers: typing.Any=30, ell: typing.Any=0.55) -> typing.Any:
     rust_bin = ensure_rust_bin()
     root = Path(__file__).resolve().parents[1]
 
@@ -263,7 +264,7 @@ def native_surface_predict(train_xy, z_obs, eval_xy, basis_type, centers=30, ell
         return read_mean_predictions(pred_csv)
 
 
-def main():
+def main() -> None:
     rng = np.random.default_rng(42)
 
     n = 80

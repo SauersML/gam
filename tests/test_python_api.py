@@ -1,4 +1,5 @@
 from __future__ import annotations
+import typing
 
 import pathlib
 
@@ -45,7 +46,7 @@ def prediction_frame() -> pd.DataFrame:
     return pd.DataFrame(prediction_rows())
 
 
-def test_build_info_reports_real_extension():
+def test_build_info_reports_real_extension() -> None:
     info = gam.build_info()
     assert info["available"] is True
     assert info["module"] == "gam._rust"
@@ -64,7 +65,7 @@ def test_build_info_reports_real_extension():
     ]
 
 
-def test_validate_formula_reports_model_metadata():
+def test_validate_formula_reports_model_metadata() -> None:
     validation = gam.validate_formula(training_rows(), "y ~ x")
 
     assert validation["formula"] == "y ~ x"
@@ -74,7 +75,7 @@ def test_validate_formula_reports_model_metadata():
     assert validation.supported_by_python is True
 
 
-def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path):
+def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) -> None:
     model = gam.fit(training_rows(), "y ~ x")
     summary = model.summary()
 
@@ -145,7 +146,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path):
     assert reloaded_prediction["mean"] == predicted["mean"]
 
 
-def test_pandas_diagnostics_and_plotting():
+def test_pandas_diagnostics_and_plotting() -> None:
     model = gam.fit(training_frame(), "y ~ x")
 
     predicted = model.predict(prediction_frame())
@@ -164,7 +165,7 @@ def test_pandas_diagnostics_and_plotting():
     assert ovp_ax.get_xlabel() == "predicted mean"
 
 
-def test_sklearn_regressor_roundtrip():
+def test_sklearn_regressor_roundtrip() -> None:
     train = training_frame()
     predict = prediction_frame()
 
@@ -178,7 +179,7 @@ def test_sklearn_regressor_roundtrip():
     assert est.score(train[["x"]], train["y"]) > 0.999
 
 
-def test_numpy_inputs_and_outputs():
+def test_numpy_inputs_and_outputs() -> None:
     x_train = np.array([[0.0], [1.0], [2.0], [3.0]])
     y_train = np.array([1.0, 2.0, 3.0, 4.0])
     x_test = np.array([[1.5], [2.5]])
@@ -203,7 +204,7 @@ def test_numpy_inputs_and_outputs():
     np.testing.assert_allclose(raw[:, 1], [2.5, 3.5], atol=1e-3)
 
 
-def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target():
+def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> None:
     x_train = pd.DataFrame([{"x0": 0.0}, {"x0": 1.0}, {"x0": 2.0}, {"x0": 3.0}])
     y_train = np.array([1.0, 2.0, 3.0, 4.0])
 
@@ -214,7 +215,7 @@ def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target():
     assert est.feature_names_in_.tolist() == ["x0"]
 
 
-def test_sklearn_classifier_roundtrip():
+def test_sklearn_classifier_roundtrip() -> None:
     train = pd.DataFrame(
         [
             {"y": 0.0, "x": 0.0},
@@ -253,7 +254,7 @@ def test_sklearn_classifier_roundtrip():
     np.testing.assert_array_equal(np.asarray(pred).reshape(-1), expected_hard)
 
 
-def test_predict_rejects_schema_mismatch():
+def test_predict_rejects_schema_mismatch() -> None:
     model = gam.fit(training_rows(), "y ~ x")
 
     # 1) Wrong column name (no required feature present).
@@ -288,7 +289,7 @@ def test_predict_rejects_schema_mismatch():
         )
 
 
-def test_predict_can_passthrough_id_column():
+def test_predict_can_passthrough_id_column() -> None:
     model = gam.fit(training_rows(), "y ~ x")
 
     pred = model.predict(
@@ -318,7 +319,7 @@ def test_predict_can_passthrough_id_column():
 # ---------------------------------------------------------------------------
 
 
-def _require_extension():
+def _require_extension() -> None:
     if not gam.build_info().get("available"):
         pytest.skip("rust extension not built")
 
@@ -330,7 +331,7 @@ def _pc_duchon(centers: int = 6) -> str:
     )
 
 
-def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_factory):
+def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_factory: typing.Any) -> None:
     """Stage 1: fit h(PGS | PCs) ~ N(0, 1) and verify PIT properties.
 
     After conditional Gaussianization on the PC manifold the predicted
@@ -361,8 +362,8 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
 
 
 def test_pgs_calibration_predicts_minimal_new_samples_after_fit_on_full_df(
-    synthetic_biobank_factory,
-):
+    synthetic_biobank_factory: typing.Any,
+) -> None:
     _require_extension()
     df = synthetic_biobank_factory(seed=10, n=64)
     df["person_id"] = [f"p{i}" for i in range(len(df))]
@@ -380,7 +381,7 @@ def test_pgs_calibration_predicts_minimal_new_samples_after_fit_on_full_df(
     assert np.all(np.isfinite(z))
 
 
-def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory):
+def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory: typing.Any) -> None:
     _require_extension()
     df = synthetic_biobank_factory(seed=11, n=64)
 
@@ -400,7 +401,7 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory)
         model.predict(missing_pgs)
 
 
-def test_pgs_calibration_formula_uses_duchon_operator_penalties_without_double_penalty():
+def test_pgs_calibration_formula_uses_duchon_operator_penalties_without_double_penalty() -> None:
     calibration = PgsCalibration(pc_columns=["pc1", "pc2"], pgs_column="PGS")
 
     assert "double_penalty" not in calibration.formula
@@ -408,9 +409,9 @@ def test_pgs_calibration_formula_uses_duchon_operator_penalties_without_double_p
 
 
 def test_pgs_calibration_save_load_restores_wrapper_metadata(
-    synthetic_biobank_factory,
-    tmp_path,
-):
+    synthetic_biobank_factory: typing.Any,
+    tmp_path: typing.Any,
+) -> None:
     _require_extension()
     df = synthetic_biobank_factory(seed=12, n=64)
     calibration = PgsCalibration(
@@ -434,8 +435,8 @@ def test_pgs_calibration_save_load_restores_wrapper_metadata(
 
 
 def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
-    synthetic_biobank_factory, tmp_path
-):
+    synthetic_biobank_factory: typing.Any, tmp_path: typing.Any
+) -> None:
     """Stage 2a: Bernoulli marginal-slope + linkwiggle + logslope score-warp.
 
     Fit Stage 1 to produce ``pgs_ctn_z`` (the anchored deviation), then fit
@@ -493,8 +494,8 @@ def test_bernoulli_marginal_slope_with_linkwiggle_and_score_warp(
 
 
 def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
-    synthetic_biobank_factory,
-):
+    synthetic_biobank_factory: typing.Any,
+) -> None:
     """Stage 2b: survival marginal-slope with GM baseline + timewiggle.
 
     Fit left-truncated survival with a Gompertz-Makeham baseline, a
@@ -615,7 +616,7 @@ def test_survival_marginal_slope_gompertz_makeham_timewiggle_smoke(
     )
 
 
-def test_survival_predict_new_samples_do_not_need_event(synthetic_biobank_factory):
+def test_survival_predict_new_samples_do_not_need_event(synthetic_biobank_factory: typing.Any) -> None:
     _require_extension()
     df = synthetic_biobank_factory(seed=13, n=64)
 
@@ -656,7 +657,7 @@ def test_survival_predict_new_samples_do_not_need_event(synthetic_biobank_factor
     assert np.all(np.isfinite(survival))
 
 
-def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path):
+def test_survival_prediction_large_curves_require_chunks(tmp_path: pathlib.Path) -> None:
     pred = gam.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((1_001, 1), dtype=float),

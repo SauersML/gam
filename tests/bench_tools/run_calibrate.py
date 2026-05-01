@@ -1,3 +1,4 @@
+import typing
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,7 @@ RUST_TRAIN_DATA_PATH = SCRIPT_DIR / "rust_formatted_training_data.tsv"
 # The model requires one penalized variable, so we set num_pcs to 1.
 NUM_PCS = 1
 
-def prepare_data_for_rust():
+def prepare_data_for_rust() -> None:
     """
     Reads the user-provided CSV, renames columns to match the Rust tool's
     required schema, and saves it as a tab-separated file (TSV).
@@ -54,7 +55,7 @@ def prepare_data_for_rust():
     # Save to the TSV format that the Rust tool expects
     print(f"Successfully created formatted data at '{RUST_TRAIN_DATA_PATH}'\n")
 
-def build_rust_project():
+def build_rust_project() -> None:
     """Checks for the executable and compiles the Rust project if it's not found."""
     if not EXECUTABLE_PATH.is_file():
         print("--- Executable not found. Compiling Rust Project... ---")
@@ -75,7 +76,7 @@ def build_rust_project():
         print("--- Found existing release executable. Skipping build. ---")
 
 
-def run_subprocess(command):
+def run_subprocess(command: typing.Any) -> None:
     """Runs a subprocess and streams its output in real-time."""
     print(f"Executing: {' '.join(map(str, command))}\n")
     try:
@@ -92,7 +93,7 @@ def run_subprocess(command):
         print(f"Failed command: {' '.join(map(str, e.cmd))}")
         sys.exit(1)
 
-def main():
+def main() -> None:
     """Main script execution: Prepare data, build if needed, train model."""
     build_rust_project()
     prepare_data_for_rust()
