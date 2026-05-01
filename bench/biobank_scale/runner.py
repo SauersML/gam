@@ -148,6 +148,8 @@ BIOBANK_DUCHON16D_POWER = 8
 BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
+PGS_CTN_FIT_SUBSAMPLE_N = 5000
+PGS_CTN_FIT_SUBSAMPLE_SEED = 20260430
 PGS_CTN_DIAGNOSTIC_MIN_N = 40
 PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN = 0.30
 PGS_CTN_DIAGNOSTIC_MIN_VAR = 0.50
@@ -635,12 +637,24 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         )
 
     ctn_model_path = out_dir / f"{spec.name}.pgs_ctn.model.json"
+    ctn_fit_input_path = out_dir / f"{spec.name}.pgs_ctn.fit_input.csv"
     ctn_train_input_path = out_dir / f"{spec.name}.pgs_ctn.train_input.csv"
     ctn_test_input_path = out_dir / f"{spec.name}.pgs_ctn.test_input.csv"
     ctn_train_pred_path = out_dir / f"{spec.name}.pgs_ctn.train_pred.csv"
     ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
     formula = _ctn_formula(spec.pc_count, centers)
     ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
+    if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_N:
+        rng = np.random.default_rng(PGS_CTN_FIT_SUBSAMPLE_SEED)
+        idx = rng.choice(len(train_rows), size=PGS_CTN_FIT_SUBSAMPLE_N, replace=False)
+        ctn_fit_rows = [train_rows[int(i)] for i in idx]
+    else:
+        ctn_fit_rows = train_rows
+    write_csv_rows(
+        ctn_fit_input_path,
+        [{key: row[key] for key in ctn_columns} for row in ctn_fit_rows],
+        ctn_columns,
+    )
     write_csv_rows(
         ctn_train_input_path,
         [{key: row[key] for key in ctn_columns} for row in train_rows],
@@ -658,7 +672,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         "--scale-dimensions",
         "--out",
         str(ctn_model_path),
-        str(ctn_train_input_path),
+        str(ctn_fit_input_path),
         formula,
     ]
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
@@ -683,6 +697,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     diagnostics = [
         f"conditional PGS CTN formula: {formula}",
         f"conditional PGS CTN fit is phenotype-blind and train-only; downstream z column: {PGS_CTN_Z_COLUMN}",
+        f"conditional PGS CTN fit subsample: {len(ctn_fit_rows)} of {len(train_rows)} train rows (cap {PGS_CTN_FIT_SUBSAMPLE_N})",
     ]
     diagnostics.extend(
         _z_moment_report(train_aug, z_column=PGS_CTN_Z_COLUMN, pc_columns=pc_cols, split_label="train")

@@ -226,6 +226,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
+            apply_bias_correction: false,
         },
     )
     .expect("prediction uncertainty should succeed");
@@ -491,6 +492,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
+            apply_bias_correction: false,
         },
     )
     .expect("mixture uncertainty prediction should succeed");

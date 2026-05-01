@@ -762,13 +762,14 @@ impl PredictableModel for StandardPredictor {
                 )
             })?;
             let strategy = strategy_from_fit(self.family, fit)?;
-            predict_gam_posterior_mean_from_backend(
+            predict_gam_posterior_mean_from_backendwith_bc(
                 input.design.clone(),
                 self.beta.view(),
                 input.offset.view(),
                 &backend,
                 &strategy,
                 "standard posterior mean",
+                fit.bias_correction_beta().map(|b| b.view()),
             )?
         } else {
             let runtime = self.link_wiggle.as_ref().expect("checked above");
@@ -3401,6 +3402,13 @@ pub struct PredictUncertaintyOptions {
     /// For Gaussian identity, also return observation intervals using
     /// Var(y_new | x) = Var(eta_hat) + sigma^2.
     pub includeobservation_interval: bool,
+    /// Apply the O(n⁻¹) frequentist bias correction at prediction time.
+    /// When enabled (default), η̂_BC(x) = η̂(x) + s_*(x)^T H⁻¹ S(λ̂) β̂
+    /// is reported instead of the raw plug-in η̂(x), restoring the OLS-style
+    /// predictor at the cost of slightly higher variance. Standard errors
+    /// are unaffected at first order. Requires `fit.bias_correction_beta()`
+    /// to be available; silently falls back to the raw predictor otherwise.
+    pub apply_bias_correction: bool,
 }
 
 impl Default for PredictUncertaintyOptions {
@@ -3410,6 +3418,7 @@ impl Default for PredictUncertaintyOptions {
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
+            apply_bias_correction: true,
         }
     }
 }
@@ -3449,6 +3458,18 @@ fn predict_gam_posterior_mean_from_backend(
     strategy: &dyn FamilyStrategy,
     label: &str,
 ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+    predict_gam_posterior_mean_from_backendwith_bc(x, beta, offset, backend, strategy, label, None)
+}
+
+fn predict_gam_posterior_mean_from_backendwith_bc(
+    x: DesignMatrix,
+    beta: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    backend: &PredictionCovarianceBackend<'_>,
+    strategy: &dyn FamilyStrategy,
+    label: &str,
+    bias_correction_beta: Option<ArrayView1<'_, f64>>,
+) -> Result<PredictPosteriorMeanResult, EstimationError> {
     if x.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
             "{label} dimension mismatch: X has {} columns but beta has length {}",
@@ -3473,6 +3494,18 @@ fn predict_gam_posterior_mean_from_backend(
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
+    if let Some(bc) = bias_correction_beta {
+        if bc.len() != beta.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label} bias-correction dimension mismatch: beta has length {} but bias_correction_beta has length {}",
+                beta.len(),
+                bc.len()
+            )));
+        }
+        let bc_owned = bc.to_owned();
+        let delta = x.matrixvectormultiply(&bc_owned);
+        eta += &delta;
+    }
     let etavar = linear_predictorvariance_from_backend(&x, backend)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
     let quadctx = crate::quadrature::QuadratureContext::new();
@@ -3695,6 +3728,21 @@ where
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
+    if options.apply_bias_correction
+        && let Some(bc) = fit.bias_correction_beta()
+    {
+        if bc.len() == beta.len() {
+            let delta = x.matrixvectormultiply(&bc.clone());
+            eta += &delta;
+        } else {
+            log::warn!(
+                "predict_gamwith_uncertainty: bias-correction dimension mismatch \
+                (beta {}, bc {}); skipping bias correction",
+                beta.len(),
+                bc.len()
+            );
+        }
+    }
     let fitted_link_state = fit.fitted_link_state(family).ok();
     let mixture_state = match fitted_link_state.as_ref() {
         Some(FittedLinkState::Mixture { state, .. }) => Some(state.clone()),
@@ -4500,6 +4548,7 @@ mod tests {
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
+            apply_bias_correction: false,
         };
 
         let out = predict_gamwith_uncertainty(
@@ -4683,5 +4732,195 @@ mod tests {
 
         assert!(point.mean[0].is_finite());
         assert!((point.mean[0] - expected).abs() <= 1e-12);
+    }
+
+    // ─── O(n⁻¹) frequentist bias correction tests ─────────────────────────
+
+    fn test_fit_with_bias_correction(
+        beta: Array1<f64>,
+        covariance: Array2<f64>,
+        bias_correction_beta: Option<Array1<f64>>,
+    ) -> UnifiedFitResult {
+        use crate::estimate::FitInference;
+        let p = beta.len();
+        let inf = FitInference {
+            // No penalty in this fixture (lambdas empty), so leave edf_by_block
+            // empty to satisfy the EDF/lambdas count invariant.
+            edf_by_block: vec![],
+            edf_total: p as f64,
+            smoothing_correction: None,
+            penalized_hessian: Array2::<f64>::eye(p),
+            working_weights: Array1::zeros(0),
+            working_response: Array1::zeros(0),
+            reparam_qs: None,
+            beta_covariance: Some(covariance.clone()),
+            beta_standard_errors: None,
+            beta_covariance_corrected: None,
+            beta_standard_errors_corrected: None,
+            bias_correction_beta,
+        };
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: beta.clone(),
+                role: BlockRole::Mean,
+                edf: p as f64,
+                lambdas: Array1::zeros(0),
+            }],
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            likelihood_family: Some(crate::types::LikelihoodFamily::GaussianIdentity),
+            likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: 0.0,
+            standard_deviation: 1.0,
+            covariance_conditional: Some(covariance),
+            covariance_corrected: None,
+            inference: Some(inf),
+            fitted_link: FittedLinkState::Standard(Some(LinkFunction::Identity)),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts {
+                pirls: None,
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        })
+        .expect("test fit with bias correction")
+    }
+
+    fn bc_options(apply: bool) -> PredictUncertaintyOptions {
+        PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            apply_bias_correction: apply,
+        }
+    }
+
+    #[test]
+    fn test_bias_correction_idempotent_with_flag() {
+        // With bc=[0.1, -0.05] and x=[[1, 2]], delta_eta = [1*0.1 + 2*(-0.05)] = [0].
+        // Use a non-degenerate row to see a real shift.
+        let x = array![[1.0, 0.5]];
+        let beta = array![1.0, 2.0];
+        let bc = array![0.1, -0.05];
+        let cov = Array2::<f64>::eye(2);
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(bc.clone()));
+        let offset = array![0.0];
+
+        // Raw eta = [1.0 + 1.0] = 2.0; corrected eta = 2.0 + (0.1 + 0.5*(-0.05)) = 2.075.
+        let pred_off = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(false),
+        )
+        .expect("predict no-bc");
+        let pred_on = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("predict bc");
+        assert!((pred_off.eta[0] - 2.0).abs() < 1e-12);
+        let expected_delta = 1.0 * 0.1 + 0.5 * (-0.05);
+        assert!((pred_on.eta[0] - (2.0 + expected_delta)).abs() < 1e-12);
+        // SE unchanged at first order: identical covariance and design.
+        assert!(
+            (pred_off.eta_standard_error[0] - pred_on.eta_standard_error[0]).abs() < 1e-14,
+            "bias correction must not affect eta standard error"
+        );
+    }
+
+    #[test]
+    fn test_bias_correction_zero_when_unset() {
+        // Without bias_correction_beta, prediction must equal raw plug-in regardless
+        // of the apply_bias_correction flag.
+        let x = array![[1.0, 0.5]];
+        let beta = array![1.0, 2.0];
+        let cov = Array2::<f64>::eye(2);
+        let fit = test_fit_with_bias_correction(beta.clone(), cov, None);
+        let offset = array![0.0];
+
+        let pred = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit,
+            &bc_options(true),
+        )
+        .expect("predict");
+        assert!((pred.eta[0] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_bias_correction_does_not_affect_posterior_se() {
+        // SE depends only on cov and design rows, not on β or the BC vector.
+        let x = array![[1.0, 0.5], [0.7, -0.3]];
+        let beta = array![0.4, 0.9];
+        let bc = array![0.2, -0.1];
+        let cov = array![[1.0, 0.1], [0.1, 0.5]];
+        let fit_with = test_fit_with_bias_correction(beta.clone(), cov.clone(), Some(bc));
+        let fit_without = test_fit_with_bias_correction(beta.clone(), cov, None);
+        let offset = array![0.0, 0.0];
+
+        let pred_with = predict_gamwith_uncertainty(
+            x.clone(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit_with,
+            &bc_options(true),
+        )
+        .expect("predict with bc");
+        let pred_without = predict_gamwith_uncertainty(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::GaussianIdentity,
+            &fit_without,
+            &bc_options(true),
+        )
+        .expect("predict without bc");
+        for i in 0..2 {
+            assert!(
+                (pred_with.eta_standard_error[i] - pred_without.eta_standard_error[i]).abs()
+                    < 1e-14,
+                "BC must not perturb eta SE at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bias_correction_accessor_propagates() {
+        // bias_correction_beta() accessor returns the value stored on FitInference.
+        let beta = array![1.0, 2.0];
+        let bc = array![0.3, -0.2];
+        let cov = Array2::<f64>::eye(2);
+        let fit = test_fit_with_bias_correction(beta, cov, Some(bc.clone()));
+        let recovered = fit
+            .bias_correction_beta()
+            .expect("bias correction should be present");
+        assert_eq!(recovered.len(), bc.len());
+        for i in 0..bc.len() {
+            assert!((recovered[i] - bc[i]).abs() < 1e-15);
+        }
     }
 }

@@ -6675,6 +6675,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
+                bias_correction_beta: None,
             };
             let geometry = Some(crate::estimate::FitGeometry {
                 penalized_hessian,
@@ -9067,6 +9068,7 @@ fn fit_bounded_term_collection_with_design(
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
+                bias_correction_beta: None,
             };
             let covariance_conditional = inf.beta_covariance.clone();
             let pirls_status_val = if fit.outer_converged {
@@ -14680,8 +14682,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 4);
-        assert_eq!(sd.nullspace_dims.len(), 4);
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
     }
 
     #[test]
@@ -19106,7 +19108,7 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
-        assert_eq!(design.penalties.len(), 4);
+        assert_eq!(design.penalties.len(), 3);
         let caches =
             extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
         assert_eq!(caches.len(), 1);
