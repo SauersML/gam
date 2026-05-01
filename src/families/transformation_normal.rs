@@ -1912,7 +1912,6 @@ impl TransformationNormalFamily {
         }
 
         let weights = self.weights.as_ref();
-        let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, p_total));
 
@@ -1922,13 +1921,11 @@ impl TransformationNormalFamily {
             let rv = self.response_val_basis.row(i);
             let rd = self.response_deriv_basis.row(i);
             let wi = weights[i];
-            let hi = h[i];
             let hp = h_prime[i];
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
             let inv_hp_cu = inv_hp_sq * inv_hp;
             let inv_hp_qu = inv_hp_sq * inv_hp_sq;
-            let d_inv_hp = -inv_hp_sq;
 
             let mut gamma = vec![0.0; p_resp];
             let mut gamma_dir = vec![0.0; p_resp];
@@ -1943,20 +1940,19 @@ impl TransformationNormalFamily {
 
             let mut h_dir = rv[0] * gamma_dir[0];
             let mut hp_dir = rd[0] * gamma_dir[0];
-            let mut h_psi = rv[0] * gamma_psi[0];
             let mut hp_psi = rd[0] * gamma_psi[0];
             let mut h_psi_dir = rv[0] * gamma_psi_dir[0];
             let mut hp_psi_dir = rd[0] * gamma_psi_dir[0];
             for k in 1..p_resp {
                 h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
                 hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
-                h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
                 hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
                 h_psi_dir +=
                     2.0 * rv[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
                 hp_psi_dir +=
                     2.0 * rd[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
             }
+            let d_inv_hp = -hp_dir * inv_hp_sq;
             let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
             let d_inv_hp_cu = -3.0 * hp_dir * inv_hp_qu;
 
@@ -5646,17 +5642,6 @@ impl TensorKroneckerPsiOperator {
 
     fn materialize_lifted(&self, resp_basis: &Array2<f64>, cov: &Array2<f64>) -> Array2<f64> {
         rowwise_kronecker(resp_basis, cov)
-    }
-
-    fn forward_mul_deriv(
-        &self,
-        axis: usize,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        // Route through directional kernel with unit basis vector e_axis.
-        let mut unit = Array1::<f64>::zeros(self.covariate_derivs.len());
-        unit[axis] = 1.0;
-        self.forward_directional_deriv(&unit.view(), &u.view())
     }
 
     fn transpose_mul_deriv(
