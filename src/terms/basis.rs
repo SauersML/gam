@@ -8242,11 +8242,14 @@ pub fn operator_penalty_candidates_closed_form_pure(
     let d = centers.ncols();
     let m = p_order;
     let s = s_order;
+    // Convergence predicate also requires `isotropic_duchon_penalty`'s
+    // partial-fraction precondition `2m ≥ q + 1` (basis.rs:16953); without
+    // it, closed-form panics on configs like m=1, q=2.
     let closed_form_converges = |q: usize| -> bool {
         let four_ms = 4 * (m + s);
         let dp2q = d + 2 * q;
         let four_m = 4 * m;
-        four_ms > dp2q && dp2q > four_m
+        four_ms > dp2q && dp2q > four_m && 2 * m >= q + 1
     };
 
     let s1_raw = if closed_form_converges(1) {
@@ -18598,6 +18601,27 @@ pub mod closed_form_penalty {
     ///
     /// Only Matérn blocks (and their κ-dependent partial-fraction
     /// coefficients) contribute: pure Riesz blocks are κ-independent.
+    ///
+    /// Analytic chain-rule derivation. With `a = 2m`, `b = 2s`,
+    /// `n_j = a + b − j`, the partial-fraction expansion of f at fixed
+    /// (d, m, s) is
+    ///
+    ///   f^{(k)}(R; κ) = Σ_{j=1}^{a} A_j(κ) · [R_j^d]^{(k)}(R)
+    ///                 + Σ_{ℓ=1}^{b} B_ℓ(κ) · [M_ℓ^d(·; κ)]^{(k)}(R),
+    ///
+    /// with A_j(κ) = (−1)^{a−j} · C(n_j+j−1, a−j) · κ^{−2 n_j} and
+    /// B_ℓ(κ) = (−1)^a · C(n_ℓ+ℓ−1, b−ℓ) · κ^{−2 n_ℓ}. Differentiating in κ
+    /// gives A_j'(κ) = −(2 n_j / κ) · A_j(κ) and B_ℓ'(κ) = −(2 n_ℓ / κ) ·
+    /// B_ℓ(κ), and the Matérn-block κ-derivative satisfies
+    /// `∂_κ M_ℓ^d(R; κ) = −2 ℓ κ · M_{ℓ+1}^d(R; κ)` (and the same identity
+    /// commutes with the radial derivative ∂^k_R since M depends on R only
+    /// through κR alongside κ). The result is
+    ///
+    ///   ∂_κ f^{(k)} = Σ_j A_j'(κ) · [R_j^d]^{(k)}
+    ///               + Σ_ℓ ( B_ℓ'(κ) · [M_ℓ^d]^{(k)}
+    ///                       − 2 ℓ κ · B_ℓ(κ) · [M_{ℓ+1}^d]^{(k)} ).
+    ///
+    /// Replaces the previous central-FD-in-κ implementation.
     pub fn radial_derivatives_of_isotropic_duchon_kappa_partial(
         d: usize,
         m: usize,
@@ -18608,22 +18632,46 @@ pub mod closed_form_penalty {
     ) -> Vec<f64> {
         assert!(r > 0.0);
         assert!(max_order <= 4);
-        let total = vec![0.0_f64; max_order + 1];
+        let mut total = vec![0.0_f64; max_order + 1];
         if s == 0 || kappa == 0.0 {
             // No Matérn or κ → 0 limit (Riesz pure) — both κ-independent.
             return total;
         }
-        // Use central FD in κ on the value-side radial derivative table.
-        // Step size scaled by κ to stay roughly relative.
-        let eps = (kappa.abs().max(1.0)) * 1e-5;
-        let kp = kappa + eps;
-        let km = kappa - eps;
-        let a = radial_derivatives_of_isotropic_duchon(d, m, s, kp, r, max_order);
-        let b = radial_derivatives_of_isotropic_duchon(d, m, s, km, r, max_order);
-        a.iter()
-            .zip(b.iter())
-            .map(|(p, n)| (p - n) / (2.0 * eps))
-            .collect()
+
+        let a = 2 * m;
+        let b = 2 * s;
+        let kappa_sq = kappa * kappa;
+
+        // Riesz piece: A_j'(κ) = -(2 n_j / κ) · A_j(κ).
+        for j in 1..=a {
+            let n_j = a + b - j;
+            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let binom = binomial_f64(a + b - j - 1, a - j);
+            let a_j = sign * binom * kappa_sq.powi(-(n_j as i32));
+            let a_j_prime = -(2.0 * n_j as f64 / kappa) * a_j;
+            let block = riesz_block_radial_derivatives(d, j, r, max_order);
+            for (k, v) in block.into_iter().enumerate() {
+                total[k] += a_j_prime * v;
+            }
+        }
+
+        // Matérn pieces: B_ℓ'·M_ℓ + B_ℓ·∂_κ M_ℓ, with ∂_κ M_ℓ = -2ℓκ·M_{ℓ+1}.
+        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        for ell in 1..=b {
+            let n_ell = a + b - ell;
+            let binom = binomial_f64(a + b - ell - 1, b - ell);
+            let b_ell = sign_a * binom * kappa_sq.powi(-(n_ell as i32));
+            let b_ell_prime = -(2.0 * n_ell as f64 / kappa) * b_ell;
+
+            let m_ell = matern_block_radial_derivatives(d, ell, kappa, r, max_order);
+            let m_ell_p1 = matern_block_radial_derivatives(d, ell + 1, kappa, r, max_order);
+            let kappa_factor = -2.0 * ell as f64 * kappa;
+            for k in 0..=max_order {
+                total[k] += b_ell_prime * m_ell[k] + b_ell * kappa_factor * m_ell_p1[k];
+            }
+        }
+
+        total
     }
 
     /// Bundled value + first/second derivatives of the radial-form
