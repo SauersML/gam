@@ -5,12 +5,12 @@ import pytest
 from gam._tables import normalize_table, restore_output_table
 
 
-def test_normalize_table_rejects_zero_row_mapping():
+def test_normalize_table_rejects_zero_row_mapping() -> None:
     with pytest.raises(ValueError, match="table data cannot be empty"):
         normalize_table({"x": [], "y": []})
 
 
-def test_restore_output_table_rejects_unknown_return_type():
+def test_restore_output_table_rejects_unknown_return_type() -> None:
     with pytest.raises(ValueError, match="unsupported return_type 'arrowish'"):
         restore_output_table(
             {"mean": [1.0], "eta": [0.0]},
@@ -20,7 +20,7 @@ def test_restore_output_table_rejects_unknown_return_type():
         )
 
 
-def test_restore_output_table_supports_pyarrow_output():
+def test_restore_output_table_supports_pyarrow_output() -> None:
     pyarrow = pytest.importorskip("pyarrow")
 
     restored = restore_output_table(
@@ -35,7 +35,7 @@ def test_restore_output_table_supports_pyarrow_output():
     assert restored.to_pydict() == {"mean": [1.0, 2.0], "eta": [0.0, 0.5]}
 
 
-def test_restore_output_table_prefers_pyarrow_training_kind():
+def test_restore_output_table_prefers_pyarrow_training_kind() -> None:
     pyarrow = pytest.importorskip("pyarrow")
 
     restored = restore_output_table(

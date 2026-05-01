@@ -1,3 +1,4 @@
+import typing
 import sys
 import subprocess
 from pathlib import Path
@@ -13,7 +14,7 @@ R_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.rds'
 RUST_MODEL_CONFIG_PATH = PROJECT_ROOT / 'model.toml'
 N_POINTS_PLOT = 400
 
-def print_array_summary(name, arr):
+def print_array_summary(name: typing.Any, arr: typing.Any) -> None:
     """Helper to print detailed diagnostics for a numpy array."""
     if arr.ndim == 1:
         print(f"  [DIAGNOSTIC] {name} | Shape: {arr.shape} | Min: {np.min(arr):.4f} | Max: {np.max(arr):.4f} | Mean: {np.mean(arr):.4f} | Std: {np.std(arr):.4f}")
@@ -24,7 +25,7 @@ def print_array_summary(name, arr):
         print(f"    -> Stds of first 5 columns: {col_stds[:5]}")
         print(f"    -> First 2x5 slice:\n{arr[:2, :5]}")
 
-def evaluate_bspline_basis(x, knots, degree):
+def evaluate_bspline_basis(x: typing.Any, knots: typing.Any, degree: typing.Any) -> typing.Any:
     """
     A Python implementation of the Cox-de Boor algorithm that mirrors the Rust code's
     logic, including state persistence for intermediate calculations and boundary handling.
@@ -75,7 +76,7 @@ def evaluate_bspline_basis(x, knots, degree):
 
     return basis_matrix
 
-def get_mgcv_basis_data():
+def get_mgcv_basis_data() -> typing.Any:
     """
     Runs an R script to extract the mgcv model's basis matrix and coefficients.
     """
@@ -125,7 +126,7 @@ def get_mgcv_basis_data():
             if f.exists():
                 f.unlink()
 
-def get_gnomon_basis_data():
+def get_gnomon_basis_data() -> typing.Any:
     """
     Reconstructs the gnomon constrained basis from the model.toml file.
     """
@@ -136,7 +137,7 @@ def get_gnomon_basis_data():
     with open(RUST_MODEL_CONFIG_PATH, "rb") as f:
         toml_data = tomli.load(f)
 
-    def _find_key(obj, key):
+    def _find_key(obj: typing.Any, key: typing.Any) -> typing.Any:
         if isinstance(obj, dict):
             if key in obj:
                 return obj[key]
@@ -213,7 +214,7 @@ def get_gnomon_basis_data():
     print("  [INFO] All dimension checks passed successfully.")
     return {"x_axis": x_axis, "basis_matrix": constrained_basis_matrix, "coeffs": coeffs}
 
-def create_comparison_plot(mgcv_data, gnomon_data):
+def create_comparison_plot(mgcv_data: typing.Any, gnomon_data: typing.Any) -> None:
     """
     Creates a 3x2 plot comparing all components of the main smooth term.
     The mgcv components are centered for visual comparability.
@@ -287,7 +288,7 @@ def create_comparison_plot(mgcv_data, gnomon_data):
 
     plt.show()
 
-def main():
+def main() -> None:
     """Main script to generate and display the basis function plots."""
     for f in [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH]:
         if not f.is_file():
