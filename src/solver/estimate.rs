@@ -3093,10 +3093,7 @@ impl FitInference {
             validate_all_finite_estimation("fit_result.beta_standard_errors", v.iter().copied())?;
         }
         if let Some(v) = self.bias_correction_beta.as_ref() {
-            validate_all_finite_estimation(
-                "fit_result.bias_correction_beta",
-                v.iter().copied(),
-            )?;
+            validate_all_finite_estimation("fit_result.bias_correction_beta", v.iter().copied())?;
         }
         if let Some(v) = self.beta_standard_errors_corrected.as_ref() {
             validate_all_finite_estimation(

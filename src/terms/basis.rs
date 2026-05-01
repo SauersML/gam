@@ -16887,9 +16887,7 @@ pub mod closed_form_penalty {
         // Non-log case
         let half_d = d as f64 / 2.0;
         let num = gamma_fn(half_d - j as f64);
-        let denom = 4.0_f64.powi(j as i32)
-            * std::f64::consts::PI.powf(half_d)
-            * gamma_fn(j as f64);
+        let denom = 4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64);
         num / denom * r.powf(2.0 * j as f64 - d as f64)
     }
 
@@ -17528,8 +17526,8 @@ pub mod closed_form_penalty {
         let mut d2_eta: Vec<Vec<f64>> = vec![vec![0.0_f64; d]; d];
         for k in 0..d {
             for l in 0..d {
-                d2_eta[k][l] = big_j
-                    * (bare_value + bare_d_eta[k] + bare_d_eta[l] + bare_d2_eta[k * d + l]);
+                d2_eta[k][l] =
+                    big_j * (bare_value + bare_d_eta[k] + bare_d_eta[l] + bare_d2_eta[k * d + l]);
             }
         }
         let d2_eta_kappa: Vec<f64> = (0..d)
@@ -24186,7 +24184,12 @@ mod tests {
 
     fn frobenius_relative_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         assert_eq!(a.dim(), b.dim());
-        let diff_norm = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt();
+        let diff_norm = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let scale = a.iter().map(|v| v * v).sum::<f64>().sqrt();
         diff_norm / scale.max(1e-300)
     }
@@ -24209,7 +24212,9 @@ mod tests {
         // Deterministic LCG for reproducibility (no rng dep needed).
         let mut state: u64 = 0xC0FFEE_BEEFu64;
         let mut next = || {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             ((state >> 32) as f64) / (u32::MAX as f64) - 0.5
         };
         let mut centers = Array2::<f64>::zeros((k, d));
@@ -24251,8 +24256,14 @@ mod tests {
             );
 
             // Both should be finite.
-            assert!(analytic.iter().all(|v| v.is_finite()), "non-finite analytic q={q}");
-            assert!(colloc.iter().all(|v| v.is_finite()), "non-finite collocation q={q}");
+            assert!(
+                analytic.iter().all(|v| v.is_finite()),
+                "non-finite analytic q={q}"
+            );
+            assert!(
+                colloc.iter().all(|v| v.is_finite()),
+                "non-finite collocation q={q}"
+            );
 
             // Both should be nontrivial (non-zero Frobenius norm).
             let an_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -24269,10 +24280,7 @@ mod tests {
             let an_normalized = analytic.mapv(|v| v / an_norm);
             let cl_normalized = colloc.mapv(|v| v / cl_norm);
             let rel = frobenius_relative_diff(&an_normalized, &cl_normalized);
-            assert!(
-                rel.is_finite(),
-                "non-finite relative diff for q={q}: {rel}"
-            );
+            assert!(rel.is_finite(), "non-finite relative diff for q={q}: {rel}");
             assert!(
                 rel < 1.5,
                 "closed-form vs collocation drift too far at K={k}, q={q}: rel_frob={rel}"

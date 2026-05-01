@@ -403,12 +403,11 @@ pub fn build_smooth_basis(
                         2,
                         length_scale,
                     );
-                    let final_power =
-                        if resolved_nullspace == requested_nullspace_order {
-                            req_power.max(min_admissible_power)
-                        } else {
-                            req_power
-                        };
+                    let final_power = if resolved_nullspace == requested_nullspace_order {
+                        req_power.max(min_admissible_power)
+                    } else {
+                        req_power
+                    };
                     if final_power != req_power {
                         inference_notes.push(format!(
                             "Note: explicit Duchon power={} is below the minimum admissible \
