@@ -83,7 +83,7 @@ def build_demo_data(
     seed: int,
     n_train: int,
     n_grid: int,
-) -> tuple[Path, Path, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[Path, Path, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     x_train = np.sort(rng.uniform(0.0, 1.0, size=n_train))
     y_train = true_curve(x_train) + rng.normal(0.0, 0.09, size=n_train)
