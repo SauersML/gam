@@ -7854,42 +7854,51 @@ pub fn closed_form_anisotropic_pair_block(
     // regimes. Use the same median-lag·1e-6 ε-displacement strategy as the
     // pure-Duchon variant (`closed_form_anisotropic_pair_block_pure`).
     let r_eps = pure_duchon_diagonal_epsilon(centers, eta_raw);
-    let mut g = Array2::<f64>::zeros((k, k));
-    let mut r_buf = vec![0.0_f64; d];
-    for i in 0..k {
-        for j in 0..=i {
+
+    // Parallelize the K(K+1)/2 lower-triangular pair-block evaluations.
+    // Each pair eval is independent; outputs are scattered into a symmetric
+    // dense Array2 after the parallel reduction.
+    let n_pairs = k * (k + 1) / 2;
+    let values: Vec<f64> = (0..n_pairs)
+        .into_par_iter()
+        .map(|idx| {
+            // Map flat lower-triangular index to (i, j) with j ≤ i.
+            // i is the largest integer with i*(i+1)/2 ≤ idx.
+            let i = ((-1.0 + (1.0 + 8.0 * idx as f64).sqrt()) * 0.5).floor() as usize;
+            let i = if i * (i + 1) / 2 > idx { i - 1 } else { i };
+            let j = idx - i * (i + 1) / 2;
+            let mut r_buf = vec![0.0_f64; d];
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
-            let val = if i == j {
+            if i == j {
                 let mut r_eps_buf = vec![0.0_f64; d];
                 if d > 0 {
                     r_eps_buf[0] = r_eps * eta_raw[0].exp();
                 }
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial(
-                        q,
-                        m,
-                        s,
-                        kappa,
-                        eta_raw,
-                        &r_eps_buf,
+                        q, m, s, kappa, eta_raw, &r_eps_buf,
                     )
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial(
-                        q,
-                        m,
-                        s,
-                        kappa,
-                        eta_raw,
-                        &r_buf,
+                        q, m, s, kappa, eta_raw, &r_buf,
                     )
-            };
-            g[[i, j]] = val;
-            if i != j {
-                g[[j, i]] = val;
             }
+        })
+        .collect();
+
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut idx = 0usize;
+    for i in 0..k {
+        for j in 0..=i {
+            let v = values[idx];
+            g[[i, j]] = v;
+            if i != j {
+                g[[j, i]] = v;
+            }
+            idx += 1;
         }
     }
     g
@@ -7929,45 +7938,50 @@ pub fn closed_form_anisotropic_pair_block_pure(
     // Median off-diagonal anisotropic distance for diagonal regularization.
     let r_eps = pure_duchon_diagonal_epsilon(centers, &eta_centered);
 
-    let mut g = Array2::<f64>::zeros((k, k));
-    let mut r_buf = vec![0.0_f64; d];
-    for i in 0..k {
-        for j in 0..=i {
+    // Parallelize the K(K+1)/2 lower-triangular pair-block evaluations.
+    let n_pairs = k * (k + 1) / 2;
+    let eta_slice: &[f64] = eta_centered.as_slice();
+    let values: Vec<f64> = (0..n_pairs)
+        .into_par_iter()
+        .map(|idx| {
+            let i = ((-1.0 + (1.0 + 8.0 * idx as f64).sqrt()) * 0.5).floor() as usize;
+            let i = if i * (i + 1) / 2 > idx { i - 1 } else { i };
+            let j = idx - i * (i + 1) / 2;
+            let mut r_buf = vec![0.0_f64; d];
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
-            let val = if i == j {
+            if i == j {
                 // Self-pair: ε-regularize by using a small displacement
                 // along axis 0 with magnitude r_eps · exp(η_0). This keeps
                 // R > 0 in the pure-Riesz radial form.
                 let mut r_eps_buf = vec![0.0_f64; d];
                 if d > 0 {
-                    r_eps_buf[0] = r_eps * eta_centered[0].exp();
+                    r_eps_buf[0] = r_eps * eta_slice[0].exp();
                 }
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial(
-                        q,
-                        m,
-                        s,
-                        0.0,
-                        &eta_centered,
-                        &r_eps_buf,
+                        q, m, s, 0.0, eta_slice, &r_eps_buf,
                     )
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial(
-                        q,
-                        m,
-                        s,
-                        0.0,
-                        &eta_centered,
-                        &r_buf,
+                        q, m, s, 0.0, eta_slice, &r_buf,
                     )
-            };
-            g[[i, j]] = val;
-            if i != j {
-                g[[j, i]] = val;
             }
+        })
+        .collect();
+
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut idx = 0usize;
+    for i in 0..k {
+        for j in 0..=i {
+            let v = values[idx];
+            g[[i, j]] = v;
+            if i != j {
+                g[[j, i]] = v;
+            }
+            idx += 1;
         }
     }
     g
