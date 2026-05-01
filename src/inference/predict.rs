@@ -4971,10 +4971,16 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+            Self(
+                seed.wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407),
+            )
         }
         fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0
         }
         fn unif(&mut self) -> f64 {
@@ -4994,16 +5000,8 @@ mod tests {
     #[test]
     fn test_bias_correction_matches_explicit_formula() {
         // p = 3. Pick H SPD (= XᵀWX + S in spirit), S, β̂, then solve H b = S β̂.
-        let h = array![
-            [4.0_f64, 0.5, 0.2],
-            [0.5, 3.0, 0.1],
-            [0.2, 0.1, 2.0]
-        ];
-        let s_pen = array![
-            [1.0_f64, 0.0, 0.0],
-            [0.0, 0.5, 0.0],
-            [0.0, 0.0, 2.0]
-        ];
+        let h = array![[4.0_f64, 0.5, 0.2], [0.5, 3.0, 0.1], [0.2, 0.1, 2.0]];
+        let s_pen = array![[1.0_f64, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 2.0]];
         let beta = array![0.7_f64, -1.3, 0.4];
         let s_beta = s_pen.dot(&beta);
         let b_hat = solve_3x3_spd(&h, &s_beta);
@@ -5100,11 +5098,7 @@ mod tests {
     #[test]
     fn test_bias_correction_increases_with_penalty_strength() {
         // Use p = 3 and the same H_base / β̂ across runs.
-        let h_base = array![
-            [3.0_f64, 0.4, 0.1],
-            [0.4, 2.5, 0.2],
-            [0.1, 0.2, 4.0]
-        ];
+        let h_base = array![[3.0_f64, 0.4, 0.1], [0.4, 2.5, 0.2], [0.1, 0.2, 4.0]];
         let beta = array![1.2_f64, -0.8, 0.5];
         let x = array![[1.0, 0.5, -0.2], [0.3, -0.4, 0.9], [0.7, 0.7, 0.7]];
         let offset = array![0.0, 0.0, 0.0];
@@ -5153,12 +5147,18 @@ mod tests {
         assert!(
             deltas[0] < deltas[1],
             "‖η_BC − η_raw‖ must grow with λ: λ={} gave {}, λ={} gave {}",
-            lambdas[0], deltas[0], lambdas[1], deltas[1]
+            lambdas[0],
+            deltas[0],
+            lambdas[1],
+            deltas[1]
         );
         assert!(
             deltas[1] < deltas[2],
             "‖η_BC − η_raw‖ must grow with λ: λ={} gave {}, λ={} gave {}",
-            lambdas[1], deltas[1], lambdas[2], deltas[2]
+            lambdas[1],
+            deltas[1],
+            lambdas[2],
+            deltas[2]
         );
         // And there should be a meaningful gap, not numerical noise.
         assert!(
@@ -5269,7 +5269,9 @@ mod tests {
         assert!(
             frac >= 0.9,
             "BC must close the OLS gap at ≥90% of test points; got {}/{} = {:.2}",
-            closer, m, frac
+            closer,
+            m,
+            frac
         );
     }
 
@@ -5283,9 +5285,7 @@ mod tests {
         let p = 4usize;
         let beta_true = array![0.4_f64, 0.9, -0.5, 0.6];
         let lambda = 5.0_f64; // fixed λ across n; bias scales as λ/(n+λ)
-        let seeds: [u64; 12] = [
-            1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
-        ];
+        let seeds: [u64; 12] = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31];
         let ns = [200usize, 1000, 5000];
 
         // Held-out test points are reused across n (they are just probes).
@@ -5339,8 +5339,7 @@ mod tests {
                 let b_hat = solve_dense_spd(&h, &s_beta);
 
                 let cov = Array2::<f64>::eye(p);
-                let fit =
-                    test_fit_with_bias_correction(beta_hat.clone(), cov, Some(b_hat));
+                let fit = test_fit_with_bias_correction(beta_hat.clone(), cov, Some(b_hat));
 
                 let pred_raw = predict_gamwith_uncertainty(
                     xt.clone(),
@@ -5388,14 +5387,18 @@ mod tests {
         assert!(
             ratio_large < 0.5,
             "BC must reduce bias by >2× at n={}; raw={}, bc={}, ratio={}",
-            ns[2], mean_abs_raw_bias[2], mean_abs_bc_bias[2], ratio_large
+            ns[2],
+            mean_abs_raw_bias[2],
+            mean_abs_bc_bias[2],
+            ratio_large
         );
         // And the BC/raw ratio should decrease (or at least not grow) with n.
         let ratio_small = mean_abs_bc_bias[0] / mean_abs_raw_bias[0].max(1e-300);
         assert!(
             ratio_large <= ratio_small + 1e-6,
             "BC/raw ratio should not grow with n: small-n ratio={}, large-n ratio={}",
-            ratio_small, ratio_large
+            ratio_small,
+            ratio_large
         );
     }
 
@@ -5407,26 +5410,14 @@ mod tests {
     #[test]
     fn test_bias_correction_identity_in_basis_change() {
         // Original parameterization (p = 3).
-        let h = array![
-            [4.0_f64, 0.5, 0.2],
-            [0.5, 3.0, 0.1],
-            [0.2, 0.1, 2.5]
-        ];
-        let s_pen = array![
-            [0.7_f64, 0.1, 0.0],
-            [0.1, 0.5, 0.05],
-            [0.0, 0.05, 1.2]
-        ];
+        let h = array![[4.0_f64, 0.5, 0.2], [0.5, 3.0, 0.1], [0.2, 0.1, 2.5]];
+        let s_pen = array![[0.7_f64, 0.1, 0.0], [0.1, 0.5, 0.05], [0.0, 0.05, 1.2]];
         let beta = array![0.6_f64, -0.4, 1.1];
         let s_beta = s_pen.dot(&beta);
         let b_hat = solve_3x3_spd(&h, &s_beta);
 
         // Pick an invertible Q (upper-triangular with unit diagonal).
-        let q = array![
-            [1.0_f64, 0.3, -0.2],
-            [0.0, 1.0, 0.5],
-            [0.0, 0.0, 1.0]
-        ];
+        let q = array![[1.0_f64, 0.3, -0.2], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]];
         // θ = Q⁻¹ β; with this triangular Q we can solve directly.
         let qinv = invert_upper_triangular_3(&q);
         let theta = qinv.dot(&beta);
@@ -5447,10 +5438,8 @@ mod tests {
         let offset = array![0.0_f64];
 
         let cov = Array2::<f64>::eye(3);
-        let fit_orig =
-            test_fit_with_bias_correction(beta.clone(), cov.clone(), Some(b_hat));
-        let fit_repar =
-            test_fit_with_bias_correction(theta.clone(), cov, Some(b_tilde));
+        let fit_orig = test_fit_with_bias_correction(beta.clone(), cov.clone(), Some(b_hat));
+        let fit_repar = test_fit_with_bias_correction(theta.clone(), cov, Some(b_tilde));
 
         let pred_orig = predict_gamwith_uncertainty(
             x_row,
@@ -5535,7 +5524,10 @@ mod tests {
             assert!(
                 rel < 1e-14,
                 "SE leakage detected at i={}: off={}, on={}, relΔ={}",
-                i, a, b, rel
+                i,
+                a,
+                b,
+                rel
             );
         }
     }
@@ -5595,7 +5587,9 @@ mod tests {
             assert!(
                 d < 1e-15,
                 "apply_bias_correction=false must return raw plug-in: η[{i}]={} expected={} Δ={}",
-                pred.eta[i], expected[i], d
+                pred.eta[i],
+                expected[i],
+                d
             );
         }
     }
@@ -5609,16 +5603,8 @@ mod tests {
     #[test]
     fn test_bias_correction_with_nonidentity_covariance_uses_correct_h() {
         // True (XᵀWX + S) implied by the fit:
-        let h_true = array![
-            [5.0_f64, 0.7, 0.2],
-            [0.7, 4.0, 0.3],
-            [0.2, 0.3, 3.5]
-        ];
-        let s_pen = array![
-            [0.8_f64, 0.0, 0.0],
-            [0.0, 1.2, 0.0],
-            [0.0, 0.0, 0.6]
-        ];
+        let h_true = array![[5.0_f64, 0.7, 0.2], [0.7, 4.0, 0.3], [0.2, 0.3, 3.5]];
+        let s_pen = array![[0.8_f64, 0.0, 0.0], [0.0, 1.2, 0.0], [0.0, 0.0, 0.6]];
         let beta = array![0.9_f64, -1.1, 0.4];
         let s_beta = s_pen.dot(&beta);
         let b_hat_correct = solve_3x3_spd(&h_true, &s_beta);
@@ -5626,11 +5612,7 @@ mod tests {
         // Also compute the WRONG b̂ that one would get if the code used
         // covariance⁻¹ instead of H. We pick a covariance that is clearly
         // not H⁻¹: a tridiagonal SPD matrix.
-        let cov_wrong = array![
-            [2.0_f64, 0.4, 0.0],
-            [0.4, 1.5, 0.3],
-            [0.0, 0.3, 1.8]
-        ];
+        let cov_wrong = array![[2.0_f64, 0.4, 0.0], [0.4, 1.5, 0.3], [0.0, 0.3, 1.8]];
         // cov_wrong is not equal to H_true^{-1}.
         let h_inv = invert_3x3_spd(&h_true);
         let mut diff = 0.0;
@@ -5648,11 +5630,8 @@ mod tests {
         // Build the fit with the WRONG covariance but the CORRECT bias vector.
         // Predictions must reflect b_hat_correct (not whatever the code might
         // compute from cov_wrong).
-        let fit = test_fit_with_bias_correction(
-            beta.clone(),
-            cov_wrong,
-            Some(b_hat_correct.clone()),
-        );
+        let fit =
+            test_fit_with_bias_correction(beta.clone(), cov_wrong, Some(b_hat_correct.clone()));
 
         let x = array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let offset = array![0.0_f64, 0.0, 0.0];
@@ -5672,7 +5651,9 @@ mod tests {
                 (pred.eta[i] - expected).abs() < 1e-12,
                 "prediction must use the supplied bias_correction_beta verbatim: \
                  η[{i}]={} expected={} (β+b̂_correct[{i}]={})",
-                pred.eta[i], expected, b_hat_correct[i]
+                pred.eta[i],
+                expected,
+                b_hat_correct[i]
             );
         }
     }
@@ -5692,12 +5673,17 @@ mod tests {
         let recovered = decoded
             .bias_correction_beta()
             .expect("bias_correction_beta must survive JSON round-trip");
-        assert_eq!(recovered.len(), bc.len(), "bc length changed across round-trip");
+        assert_eq!(
+            recovered.len(),
+            bc.len(),
+            "bc length changed across round-trip"
+        );
         for i in 0..bc.len() {
             assert!(
                 (recovered[i] - bc[i]).abs() < 1e-15,
                 "bc[{i}] drifted across JSON round-trip: in={}, out={}",
-                bc[i], recovered[i]
+                bc[i],
+                recovered[i]
             );
         }
     }
@@ -5778,10 +5764,6 @@ mod tests {
         let a = q[[0, 1]];
         let b = q[[0, 2]];
         let c = q[[1, 2]];
-        array![
-            [1.0, -a, a * c - b],
-            [0.0, 1.0, -c],
-            [0.0, 0.0, 1.0]
-        ]
+        array![[1.0, -a, a * c - b], [0.0, 1.0, -c], [0.0, 0.0, 1.0]]
     }
 }
