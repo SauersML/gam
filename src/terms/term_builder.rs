@@ -381,7 +381,50 @@ pub fn build_smooth_basis(
             // the policy path may auto-escalate the nullspace order in pure mode
             // when CPD requires a richer polynomial absorption space.
             let (nullspace_order, power) = match parse_duchon_power_policy(options)? {
-                DuchonPowerPolicy::Explicit(power) => (requested_nullspace_order, power),
+                DuchonPowerPolicy::Explicit(req_power) => {
+                    // Honor the user's nullspace_order, but auto-escalate
+                    // explicit power when it sits below the minimum needed
+                    // for the active operator-penalty triple
+                    // (mass + tension + stiffness ⇒ D2 collocation requires
+                    // 2(p+s) > d+2). Without this escalation the basis
+                    // builder later rejects the user's combination with an
+                    // opaque "Duchon D2 collocation requires …" diagnostic
+                    // even though the requested kernel exists — the user's
+                    // power was simply too low for the *operator* derivative
+                    // order, not for the kernel itself. Only escalate when
+                    // CPD does not also force a different nullspace order;
+                    // when CPD bumps the nullspace, the explicit power is
+                    // bound to the user-requested order, so leave it alone
+                    // and let the kernel validator emit a precise
+                    // diagnostic for that combination.
+                    let (resolved_nullspace, min_admissible_power) = resolve_duchon_orders(
+                        cols.len(),
+                        requested_nullspace_order,
+                        2,
+                        length_scale,
+                    );
+                    let final_power =
+                        if resolved_nullspace == requested_nullspace_order {
+                            req_power.max(min_admissible_power)
+                        } else {
+                            req_power
+                        };
+                    if final_power != req_power {
+                        inference_notes.push(format!(
+                            "Note: explicit Duchon power={} is below the minimum admissible \
+                             power={} for D2 (stiffness) collocation at dimension={}, \
+                             nullspace_order={:?} (requires 2(p+s) > d+2). Auto-escalated \
+                             to power={} so all three Duchon operator penalties (mass, \
+                             tension, stiffness) remain active.",
+                            req_power,
+                            min_admissible_power,
+                            cols.len(),
+                            requested_nullspace_order,
+                            final_power,
+                        ));
+                    }
+                    (requested_nullspace_order, final_power)
+                }
                 DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
                     let resolved = resolve_duchon_orders(
                         cols.len(),

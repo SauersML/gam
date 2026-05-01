@@ -12079,6 +12079,110 @@ mod tests {
     }
 
     #[test]
+    fn build_termspec_escalates_explicit_duchon_power_below_d2_collocation_minimum() {
+        // PgsCalibration's defaults expand into
+        // `duchon(pc1, pc2, pc3, pc4, centers=N, order=1, power=1, length_scale=1)`.
+        // With the active operator-penalty triple (mass + tension + stiffness),
+        // D2 collocation requires `2(p+s) > d+2`, i.e. `2(2+s) > 6 ⇔ s ≥ 2`,
+        // so explicit `power=1` previously produced the opaque
+        // "Duchon D2 collocation requires …" error from the basis builder
+        // and broke every PgsCalibration fit. The term builder now escalates
+        // the explicit power to the minimum admissible value while honoring
+        // the user-requested nullspace order, and emits an inference note.
+        let formula = "y ~ s(pc1, pc2, pc3, pc4, type=duchon, centers=8, order=1, \
+                       power=1, length_scale=1)";
+        let parsed = parse_formula(formula).expect("formula should parse");
+        let ds = Dataset {
+            headers: vec![
+                "pc1".to_string(),
+                "pc2".to_string(),
+                "pc3".to_string(),
+                "pc4".to_string(),
+            ],
+            values: array![
+                [0.10, 0.20, 0.30, 0.40],
+                [0.15, 0.25, 0.35, 0.45],
+                [0.20, 0.30, 0.40, 0.50],
+                [0.25, 0.35, 0.45, 0.55],
+                [0.30, 0.40, 0.50, 0.60],
+                [0.35, 0.45, 0.55, 0.65],
+                [0.40, 0.50, 0.60, 0.70],
+                [0.45, 0.55, 0.65, 0.75],
+                [0.50, 0.60, 0.70, 0.80],
+                [0.55, 0.65, 0.75, 0.85],
+            ],
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "pc1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc3".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc4".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let col_map = HashMap::from([
+            ("pc1".to_string(), 0usize),
+            ("pc2".to_string(), 1usize),
+            ("pc3".to_string(), 2usize),
+            ("pc4".to_string(), 3usize),
+        ]);
+        let mut inference_notes = Vec::<String>::new();
+        let spec = super::build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )
+        .expect("explicit power=1 should auto-escalate, not reject");
+        assert_eq!(spec.smooth_terms.len(), 1);
+        match &spec.smooth_terms[0].basis {
+            gam::smooth::SmoothBasisSpec::Duchon { spec: duchon, .. } => {
+                assert_eq!(
+                    duchon.power, 2,
+                    "explicit power=1 should escalate to power=2 (the minimum \
+                     admissible for D2 collocation at d=4, p=2): got power={}",
+                    duchon.power
+                );
+                assert_eq!(
+                    duchon.nullspace_order,
+                    gam::basis::DuchonNullspaceOrder::Linear,
+                    "user-requested nullspace order=Linear must be preserved",
+                );
+            }
+            other => panic!("expected Duchon basis, got {other:?}"),
+        }
+        assert!(
+            inference_notes
+                .iter()
+                .any(|note| note.contains("Auto-escalated to power=2")),
+            "expected inference note describing the power escalation; got: {inference_notes:?}"
+        );
+    }
+
+    #[test]
     fn survival_prediction_csv_includes_explicit_semantics_columns() {
         let mut path = std::env::temp_dir();
         let ts = SystemTime::now()
