@@ -417,7 +417,9 @@ mod tests {
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut v = Array1::<f64>::zeros(n);
         for vi in v.iter_mut() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *vi = ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5;
         }
         let mut got = Array1::<f64>::zeros(n);
@@ -480,17 +482,7 @@ mod tests {
     #[test]
     fn test_log_det_plus_lambda_matches_dense() {
         let centers = small_centers();
-        let op = ClosedFormPenaltyOperator::new(
-            centers.view(),
-            1,
-            2,
-            1,
-            1.0,
-            None,
-            None,
-            0,
-            None,
-        );
+        let op = ClosedFormPenaltyOperator::new(centers.view(), 1, 2, 1, 1.0, None, None, 0, None);
         let dense = op.dense_form();
         let n = op.dim();
         let lambda = 0.25_f64;
@@ -518,8 +510,8 @@ mod tests {
         let est = op
             .log_det_plus_lambda_i(lambda, 8, 12, 7)
             .expect("slq logdet");
-        use faer::Side;
         use crate::faer_ndarray::FaerEigh;
+        use faer::Side;
         let (evals, _) = FaerEigh::eigh(&reg, Side::Lower).expect("eigh");
         let max_abs = evals
             .iter()

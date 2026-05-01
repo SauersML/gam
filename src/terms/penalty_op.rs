@@ -78,7 +78,11 @@ pub trait PenaltyOp: Send + Sync {
 
 impl PenaltyOp for Array2<f64> {
     fn dim(&self) -> usize {
-        debug_assert_eq!(self.nrows(), self.ncols(), "PenaltyOp matrix must be square");
+        debug_assert_eq!(
+            self.nrows(),
+            self.ncols(),
+            "PenaltyOp matrix must be square"
+        );
         self.nrows()
     }
 
@@ -227,7 +231,9 @@ mod tests {
         // Symmetric PSD: A = B^T B with random-ish B.
         let b = Array::from_shape_vec(
             (3, 4),
-            vec![1.0, -0.3, 0.7, 0.1, 0.2, 1.1, -0.5, 0.4, -0.1, 0.6, 0.9, -0.2],
+            vec![
+                1.0, -0.3, 0.7, 0.1, 0.2, 1.1, -0.5, 0.4, -0.1, 0.6, 0.9, -0.2,
+            ],
         )
         .unwrap();
         b.t().dot(&b)
@@ -259,8 +265,7 @@ mod tests {
     #[test]
     fn array2_impl_eigendecompose_matches_eigh() {
         let s = psd_fixture();
-        let (evals_op, evecs_op) =
-            <Array2<f64> as PenaltyOp>::eigendecompose(&s).expect("eigh");
+        let (evals_op, evecs_op) = <Array2<f64> as PenaltyOp>::eigendecompose(&s).expect("eigh");
         let (evals_ref, evecs_ref) = s.eigh(Side::Lower).expect("eigh ref");
         for i in 0..evals_op.len() {
             assert_abs_diff_eq!(evals_op[i], evals_ref[i], epsilon = 1e-12);
