@@ -7952,17 +7952,34 @@ pub fn closed_form_anisotropic_pair_block_pure(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             if i == j {
-                // Self-pair: ε-regularize by using a small displacement
-                // along axis 0 with magnitude r_eps · exp(η_0). This keeps
-                // R > 0 in the pure-Riesz radial form.
-                let mut r_eps_buf = vec![0.0_f64; d];
-                if d > 0 {
-                    r_eps_buf[0] = r_eps * eta_slice[0].exp();
+                // Self-pair (R = 0). When the analytic finite-part limit
+                // is known (math team Letter A §3) prefer it over the
+                // ε-regularization fallback. For pure Duchon (κ = 0) the
+                // q = 0 kernel is f(R) = R_{2(m+s)}^d(R) = c · R^p with
+                // p = 4(m+s) - d (non-log case). Then h_q(0) takes the
+                // explicit closed form
+                //
+                //   h_1(0) = -s_1 · F_{2,0},   F_{2,0} = f''(0)
+                //   h_2(0) = (F_{4,0}/3) · (s_1² + 2 s_2),   F_{4,0} = f^{(4)}(0)
+                //
+                // with F_{2q,0} = 0 when p > 2q, c · p!/(p − 2q)! when
+                // p = 2q, and divergent (Hadamard) otherwise. We handle
+                // the finite cases analytically and fall back to
+                // ε-regularization for the divergent / log-typed cases.
+                if let Some(closed) =
+                    closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, eta_slice)
+                {
+                    j_prefactor * closed
+                } else {
+                    let mut r_eps_buf = vec![0.0_f64; d];
+                    if d > 0 {
+                        r_eps_buf[0] = r_eps * eta_slice[0].exp();
+                    }
+                    j_prefactor
+                        * closed_form_penalty::anisotropic_duchon_penalty_radial(
+                            q, m, s, 0.0, eta_slice, &r_eps_buf,
+                        )
                 }
-                j_prefactor
-                    * closed_form_penalty::anisotropic_duchon_penalty_radial(
-                        q, m, s, 0.0, eta_slice, &r_eps_buf,
-                    )
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial(
@@ -8061,6 +8078,115 @@ pub fn closed_form_operator_penalty_in_total_basis(
         g_padded
     };
     symmetrize(&g_total)
+}
+
+/// Closed-form penalty value `S_q` and its log-κ derivatives `S_q_psi`,
+/// `S_q_psi_psi` in the final (post-transform) basis space, computed via
+/// `pair_block_radial_with_j_second_derivatives` from the closed_form_penalty
+/// module. Bundle's `d_kappa` and `d2_kappa` are FD-approximated κ-derivatives;
+/// chain rule converts to log-κ: `∂/∂ψ = κ·∂/∂κ`,
+/// `∂²/∂ψ² = κ²·∂²/∂κ² + κ·∂/∂κ`.
+///
+/// All three matrices share the same Z + poly-pad + outer-T transform pipeline
+/// as `closed_form_operator_penalty_in_total_basis` (the transforms are
+/// linear and commute with parameter differentiation).
+pub fn closed_form_psi_derivatives_in_total_basis(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    p_order: usize,
+    s_order: usize,
+    kappa: f64,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let zeros: Vec<f64>;
+    let eta_raw: &[f64] = match aniso_log_scales {
+        Some(eta) => eta,
+        None => {
+            zeros = vec![0.0_f64; d];
+            &zeros
+        }
+    };
+    let j_prefactor = eta_raw.iter().sum::<f64>().exp();
+    let r_eps = pure_duchon_diagonal_epsilon(centers, eta_raw);
+
+    let mut g = Array2::<f64>::zeros((k, k));
+    let mut g_psi = Array2::<f64>::zeros((k, k));
+    let mut g_psi_psi = Array2::<f64>::zeros((k, k));
+    let mut r_buf = vec![0.0_f64; d];
+    for i in 0..k {
+        for j in 0..=i {
+            for axis in 0..d {
+                r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
+            }
+            let bundle = if i == j {
+                let mut r_eps_buf = vec![0.0_f64; d];
+                if d > 0 {
+                    r_eps_buf[0] = r_eps * eta_raw[0].exp();
+                }
+                closed_form_penalty::pair_block_radial_with_j_second_derivatives(
+                    q, p_order, s_order, kappa, eta_raw, &r_eps_buf,
+                )
+            } else {
+                closed_form_penalty::pair_block_radial_with_j_second_derivatives(
+                    q, p_order, s_order, kappa, eta_raw, &r_buf,
+                )
+            };
+            // Bundle's value already includes J prefactor; multiply by the
+            // pair-block J only when consistent with the value-side helper,
+            // which prefactors externally. Pair-block bundle returns
+            // J·g and J·∂g/∂κ etc., so we use it directly.
+            // Actually: `pair_block_radial_with_j_second_derivatives` returns
+            // J · g_q and its κ derivatives directly per its own contract,
+            // so no extra j_prefactor multiplication is needed here.
+            let _ = j_prefactor;
+            let val = bundle.value;
+            let val_psi = kappa * bundle.d_kappa;
+            let val_psi_psi = kappa * kappa * bundle.d2_kappa + kappa * bundle.d_kappa;
+            g[[i, j]] = val;
+            g_psi[[i, j]] = val_psi;
+            g_psi_psi[[i, j]] = val_psi_psi;
+            if i != j {
+                g[[j, i]] = val;
+                g_psi[[j, i]] = val_psi;
+                g_psi_psi[[j, i]] = val_psi_psi;
+            }
+        }
+    }
+
+    // Apply Z + poly-pad + T to each of g, g_psi, g_psi_psi identically.
+    let transform = |raw: Array2<f64>| -> Array2<f64> {
+        let kernel_block = if let Some(z) = kernel_nullspace {
+            let zt = fast_atb(z, &raw);
+            fast_ab(&zt, z)
+        } else {
+            raw
+        };
+        let kernel_cols = kernel_block.nrows();
+        let total_pre = kernel_cols + polynomial_block_cols;
+        let padded = if polynomial_block_cols == 0 {
+            kernel_block
+        } else {
+            let mut padded = Array2::<f64>::zeros((total_pre, total_pre));
+            padded
+                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(&kernel_block);
+            padded
+        };
+        let total = if let Some(t) = outer_identifiability {
+            let tt = fast_atb(t, &padded);
+            fast_ab(&tt, t)
+        } else {
+            padded
+        };
+        symmetrize(&total)
+    };
+
+    (transform(g), transform(g_psi), transform(g_psi_psi))
 }
 
 pub fn operator_penalty_candidates_closed_form(
@@ -18467,6 +18593,88 @@ pub mod closed_form_penalty {
     ///   g_q(z; η, m, s, κ) = J · (-Δ_B)^q f(R)
     /// implemented via analytic radial derivatives of f.
     ///
+    /// Closed-form pure-Duchon self-pair value `g_q(0; η, m, s, κ=0)`,
+    /// implementing the math team's Letter A §3 finite-part formulas:
+    ///
+    ///   h_1(0) = −s_1 · F_{2,0},
+    ///   h_2(0) =  (F_{4,0}/3) · (s_1² + 2 s_2),
+    ///
+    /// where `F_{2q,0} = f^{(2q)}(0)` is the (2q)-th radial derivative of
+    /// the q = 0 kernel `f(R) = R_{2(m+s)}^d(R) = c · R^p` with
+    /// `p = 4(m+s) − d`. For non-log cases (`p` not a non-negative even
+    /// integer):
+    ///   * `p > 2q`:  F_{2q,0} = 0, so `h_q(0) = 0`.
+    ///   * `p = 2q`:  F_{2q,0} = c · p!/(p − 2q)! = c · (2q)!.
+    ///   * `p < 2q`:  divergent — Hadamard finite-part needed; not
+    ///                 handled here (caller falls back to ε-reg).
+    /// Log cases (`p` non-negative even integer) are also returned as
+    /// `None`.
+    ///
+    /// Returns `None` if the analytic limit is unavailable for the given
+    /// (q, d, m, s); caller should keep its ε-regularization path.
+    pub fn pure_duchon_self_pair_value(
+        q: usize,
+        d: usize,
+        m: usize,
+        s: usize,
+        eta: &[f64],
+    ) -> Option<f64> {
+        if q != 1 && q != 2 {
+            return None;
+        }
+        if eta.len() != d {
+            return None;
+        }
+        let mm = 2 * (m + s); // Riesz block index for q=0 pure-Duchon kernel
+        // Detect log case: 2·mm == d + 2n for some n ≥ 0 ⇔ p = 2 mm − d
+        // is a non-negative even integer.
+        let two_mm = 2 * mm;
+        if two_mm >= d && (two_mm - d) % 2 == 0 {
+            return None; // log regime — Hadamard not implemented here
+        }
+        let p_int = two_mm as isize - d as isize; // exponent of R in f(R) = c·R^p
+
+        let two_q = 2 * q as isize;
+        if p_int < two_q {
+            return None; // divergent — Hadamard not implemented here
+        }
+
+        // s_1, s_2 (R=0 reduces u_1 = u_2 = 0).
+        let mut s_1 = 0.0_f64;
+        let mut s_2 = 0.0_f64;
+        for &e in eta {
+            let bb = (-2.0 * e).exp();
+            s_1 += bb;
+            s_2 += bb * bb;
+        }
+
+        // F_{2q,0}: 0 if p > 2q, else c · (2q)! at p = 2q (per math team §3).
+        let f_2q_0 = if p_int > two_q {
+            0.0
+        } else {
+            // p == two_q
+            let c = riesz_kernel_coefficient_nonlog(d, mm);
+            c * factorial_f64(two_q as usize)
+        };
+
+        let value = match q {
+            1 => -s_1 * f_2q_0,
+            2 => (f_2q_0 / 3.0) * (s_1 * s_1 + 2.0 * s_2),
+            _ => unreachable!(),
+        };
+        Some(value)
+    }
+
+    /// Riesz kernel coefficient `c_j^d` for the non-log case
+    /// (`R_j^d(R) = c_j^d · R^{2j − d}`):
+    ///   c_j^d = Γ(d/2 − j) / (4^j · π^{d/2} · Γ(j)).
+    fn riesz_kernel_coefficient_nonlog(d: usize, j: usize) -> f64 {
+        let half_d = d as f64 / 2.0;
+        let num = gamma_fn(half_d - j as f64);
+        let denom = 4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64);
+        num / denom
+    }
+
     /// Returns the same quantity as `anisotropic_duchon_penalty` (without
     /// the J prefactor on `g_q` — caller multiplies by J), but is finite
     /// pointwise in any (m, s, d) regime and avoids the Schoenberg
