@@ -5530,6 +5530,20 @@ pub fn filter_active_penalty_candidates(
             None
         };
         let active = dropped_reason.is_none();
+        eprintln!(
+            "DEBUG_FILTER: idx={} source={:?} rank={} iszero={} nrows={} fro2={:.3e} active={}",
+            original_index,
+            candidate.source,
+            analysis.rank,
+            analysis.iszero,
+            analysis.sym_penalty.nrows(),
+            analysis
+                .sym_penalty
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>(),
+            active,
+        );
         let kronecker_factors =
             validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         if active {
