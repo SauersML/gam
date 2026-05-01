@@ -193,7 +193,7 @@ def _coerce_positive_survival_times(df: pd.DataFrame, time_col: str, dataset_nam
     replacement = max(float(positive.min()) * 0.5, 1e-12)
     adjusted = df.copy()
     adjusted.loc[non_positive, time_col] = replacement
-    return adjusted
+    return typing.cast(pd.DataFrame, adjusted)
 
 
 def _coerce_positive_survival_dataset_inplace(ds: dict[str, typing.Any], dataset_name: str) -> dict[str, typing.Any]:
@@ -571,7 +571,7 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: boo
     if stratified:
         classes = np.unique(y)
         if len(classes) >= 2:
-            fold_bins = [[] for _ in range(n_splits)]
+            fold_bins: list[list[int]] = [[] for _ in range(n_splits)]
             for c in classes:
                 idx = np.where(y == c)[0]
                 rng.shuffle(idx)
@@ -1668,7 +1668,7 @@ def _synthetic_continuous_order_dataset(
         raise RuntimeError(f"unsupported continuous-order synthetic mode '{mode}'")
 
     rows = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x, y)]
-    out = {
+    out: dict[str, typing.Any] = {
         "family": "gaussian",
         "rows": rows,
         "features": ["x"],
@@ -2078,8 +2078,8 @@ def _synthetic_hgdp_1kg_pc_panel() -> typing.Any:
         superpop_shift = rng.normal(loc=0.0, scale=0.85, size=16)
         for sub_idx in range(4):
             sub_name = f"{spec['name']}_SUB{sub_idx + 1:02d}"
-            sub_lat = float(spec["lat"] + rng.normal(0.0, 5.0))
-            sub_lon = float(spec["lon"] + rng.normal(0.0, 7.5))
+            sub_lat = float(float(spec["lat"]) + rng.normal(0.0, 5.0))
+            sub_lon = float(float(spec["lon"]) + rng.normal(0.0, 7.5))
             sub_shift = rng.normal(loc=0.0, scale=0.30, size=16)
             for _ in range(_SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP):
                 sample_lat = float(np.clip(sub_lat + rng.normal(0.0, 1.2), -58.0, 72.0))
@@ -2865,6 +2865,8 @@ def _normalize_result_metadata(results: list[dict[str, typing.Any]]) -> None:
             continue
         if result.get("evaluation") in (None, ""):
             n_folds = result.get("n_folds")
+            if n_folds is None:
+                continue
             try:
                 result["evaluation"] = _evaluation_label_for_n_folds(int(n_folds))
             except Exception:
@@ -3507,7 +3509,7 @@ def _is_matern_rust_scenario(s_cfg: typing.Any) -> bool:
     cfg = _scenario_fit_mapping(s_cfg["name"])
     if cfg is None:
         return False
-    return _canonical_smooth_basis(cfg.get("smooth_basis", "ps")) == "matern"
+    return bool(_canonical_smooth_basis(cfg.get("smooth_basis", "ps")) == "matern")
 
 
 def _make_far_ood_frame(
@@ -3646,7 +3648,7 @@ def _thread3_cliff_gradient_magnitude(
     az = np.clip(np.abs(sharpness * z), 0.0, 50.0)
     sech2 = 1.0 / (np.cosh(az) ** 2)
     deta_dz_abs = abs(jump * sharpness) * sech2
-    return deta_dz_abs * coeff_norm
+    return np.asarray(deta_dz_abs * coeff_norm, dtype=float)
 
 
 def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] | None, ds: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -3711,9 +3713,17 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] 
         )
 
     if corr_rows:
-        denom = max(sum(int(r["n"]) for r in corr_rows), 1)
-        valid_g = [(float(r["corr_g"]), int(r["n"])) for r in corr_rows if r["corr_g"] is not None]
-        valid_c = [(float(r["corr_c"]), int(r["n"])) for r in corr_rows if r["corr_c"] is not None]
+        denom = max(sum(int(r["n"]) for r in corr_rows if r.get("n") is not None), 1)
+        valid_g = [
+            (float(r["corr_g"]), int(r["n"]))
+            for r in corr_rows
+            if r.get("corr_g") is not None and r.get("n") is not None
+        ]
+        valid_c = [
+            (float(r["corr_c"]), int(r["n"]))
+            for r in corr_rows
+            if r.get("corr_c") is not None and r.get("n") is not None
+        ]
         if valid_g:
             out["thread3_weight_grad_corr"] = float(
                 sum(v * w for v, w in valid_g) / max(sum(w for _, w in valid_g), 1)
@@ -3803,7 +3813,7 @@ def _rust_native_survival_matrix_from_model(
         raise RuntimeError(
             f"rust native survival predict length mismatch: got {surv.shape[0]}, expected {expected}"
         )
-    return surv.reshape(grid.size, n).T
+    return np.asarray(surv.reshape(grid.size, n).T, dtype=float)
 
 
 def _ensure_rust_binary() -> typing.Any:
@@ -4108,6 +4118,7 @@ def run_rust_scenario_cv(
                         "status": "failed",
                         "error": str(e),
                     }
+                test_eval_df = test_df
                 surv_metrics = score_survival_fold(
                     train_df,
                     test_eval_df,
@@ -4170,7 +4181,7 @@ def run_rust_scenario_cv(
         valid_nu = [(float(r["nu"]), int(r["n_test"])) for r in continuous_rows if r.get("nu") is not None]
         valid_k2 = [(float(r["kappa2"]), int(r["n_test"])) for r in continuous_rows if r.get("kappa2") is not None]
         metrics["continuous_order_status_counts"] = status_counts
-        metrics["continuous_order_status_mode"] = max(status_counts, key=status_counts.get)
+        metrics["continuous_order_status_mode"] = max(status_counts, key=lambda status: status_counts[status])
         metrics["continuous_order_nu"] = (
             float(sum(v * w for v, w in valid_nu) / max(sum(w for _, w in valid_nu), 1))
             if valid_nu
@@ -4239,7 +4250,7 @@ def run_rust_scenario_cv(
         family=ds["family"],
         cv_rows=cv_rows,
         plot_payload=plot_payload,
-        model_spec=cv_rows[0]["model_spec"],
+        model_spec=str(cv_rows[0]["model_spec"]),
         extra_metrics=metrics,
     )
 
@@ -4465,7 +4476,7 @@ def _run_rust_gamlss_scenario_cv_variant(
         family=family,
         cv_rows=cv_rows,
         plot_payload=plot_payload,
-        model_spec=cv_rows[0]["model_spec"],
+        model_spec=str(cv_rows[0]["model_spec"]),
     )
 
 
@@ -4646,7 +4657,7 @@ def run_rust_gamlss_marginal_slope_cv(
         family=ds["family"],
         cv_rows=cv_rows,
         plot_payload=plot_payload,
-        model_spec=cv_rows[0]["model_spec"],
+        model_spec=str(cv_rows[0]["model_spec"]),
     )
 
 
@@ -4830,7 +4841,7 @@ def run_rust_gamlss_survival_cv(
         family=ds["family"],
         cv_rows=cv_rows,
         plot_payload=plot_payload,
-        model_spec=cv_rows[0]["model_spec"],
+        model_spec=str(cv_rows[0]["model_spec"]),
     )
 
 
@@ -5025,7 +5036,7 @@ def run_rust_gamlss_survival_marginal_slope_cv(
         family=ds["family"],
         cv_rows=cv_rows,
         plot_payload=plot_payload,
-        model_spec=cv_rows[0]["model_spec"],
+        model_spec=str(cv_rows[0]["model_spec"]),
     )
 
 
@@ -7459,11 +7470,13 @@ def run_external_sksurv_gb_cv(scenario: typing.Any, *, ds: dict[str, typing.Any]
     if ds["family"] != "survival":
         return None
     try:
-        from sksurv.ensemble import (
-            ComponentwiseGradientBoostingSurvivalAnalysis,
-            GradientBoostingSurvivalAnalysis,
+        sksurv_ensemble: typing.Any = importlib.import_module("sksurv.ensemble")
+        sksurv_util: typing.Any = importlib.import_module("sksurv.util")
+        ComponentwiseGradientBoostingSurvivalAnalysis = (
+            sksurv_ensemble.ComponentwiseGradientBoostingSurvivalAnalysis
         )
-        from sksurv.util import Surv
+        GradientBoostingSurvivalAnalysis = sksurv_ensemble.GradientBoostingSurvivalAnalysis
+        Surv = sksurv_util.Surv
     except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_sksurv_gb_coxph",
@@ -7974,7 +7987,7 @@ def main() -> None:
         if not scenarios:
             raise SystemExit("Scenario filter matched zero scenarios.")
 
-    results = []
+    results: list[dict[str, typing.Any]] = []
     for s_cfg in scenarios:
         ds = dataset_for_scenario(s_cfg)
         folds = folds_for_dataset(ds)
@@ -8442,7 +8455,7 @@ def _subsample_plot_df(df: pd.DataFrame, max_points: int, seed: int = 42) -> pd.
         return df
     rng = np.random.default_rng(seed)
     keep = np.sort(rng.choice(len(df), size=max_points, replace=False))
-    return df.iloc[keep].copy()
+    return typing.cast(pd.DataFrame, df.iloc[keep].copy())
 
 
 def _plot_single_predictor_gaussian(ax: typing.Any, payload: dict[str, typing.Any], *, accent: str, text_color: str) -> None:
@@ -8727,7 +8740,7 @@ def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Pat
 
         for idx, (key, label, higher_is_better) in enumerate(active_metrics):
             ax = axes[idx]
-            vals = []
+            vals: list[float] = []
             for r in rows:
                 v = r.get(key)
                 vals.append(float(v) if v is not None else float("nan"))
