@@ -6022,10 +6022,12 @@ mod tests {
     ) {
         let response_val_basis = array![[1.0, -1.0], [1.0, -0.2], [1.0, 0.6], [1.0, 1.3],];
         let response_deriv_basis = array![[0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0],];
+        let response = Array1::zeros(response_val_basis.nrows());
         let weights = Array1::from_elem(response_val_basis.nrows(), 1.0);
         let offset = Array1::zeros(response_val_basis.nrows());
         let (cov_design, cov_derivs) = toy_covariate_design_and_derivs(psi);
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
             response_val_basis,
             response_deriv_basis,
             vec![],
@@ -6239,6 +6241,7 @@ mod tests {
             scale: array![2.0, 2.0],
         };
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
             response_val_basis,
             response_deriv_basis,
             vec![],
@@ -6573,7 +6576,9 @@ mod tests {
         let weights = Array1::from_elem(n, 1.0);
         let offset = Array1::zeros(n);
         let cov_design = Array2::<f64>::zeros((n, p_cov));
+        let response = Array1::zeros(n);
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
             response_val_basis,
             response_deriv_basis,
             vec![],
