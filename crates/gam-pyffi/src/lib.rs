@@ -532,6 +532,7 @@ fn predict_table_impl(
                 gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
+            apply_bias_correction: true,
         };
         let prediction = predictor
             .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
