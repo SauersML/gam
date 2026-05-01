@@ -1821,32 +1821,29 @@ impl CustomFamily for TransformationNormalFamily {
             term1 + &term2 + &term3 + &term4
         };
 
-        let hessian_psi = {
-            let xvt_xvp = op
-                .weighted_cross_with_cov_first(
-                    &self.response_val_basis,
-                    &self.response_val_basis,
-                    axis,
-                    self.weights.as_ref(),
-                )
-                .map_err(|e| format!("tensor psi weighted_cross(value) failed: {e}"))?;
-            let sym_val = &xvt_xvp + &xvt_xvp.t();
-
-            let xdt_xdp = op
-                .weighted_cross_with_cov_first(
-                    &self.response_deriv_basis,
-                    &self.response_deriv_basis,
-                    axis,
-                    weighted_inv_h_prime_sq,
-                )
-                .map_err(|e| format!("tensor psi weighted_cross(derivative) failed: {e}"))?;
-            let sym_deriv = &xdt_xdp + &xdt_xdp.t();
-
-            let w_cubic = ((v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
-            let cubic_term = self.x_deriv_kron.weighted_gram(&w_cubic, &self.policy);
-
-            sym_val + &sym_deriv + &cubic_term
-        };
+        // Build a matrix-free operator that composes the three Hessian pieces
+        //   (sym_val)   = X_valᵀ diag(w) (B_val ⊗_KR C_psi) + transpose
+        //   (sym_deriv) = X_derivᵀ diag(w/h'²) (B_deriv ⊗_KR C_psi) + transpose
+        //   (cubic)     = X_derivᵀ diag(-2 w v_deriv / h'³) X_deriv
+        // without materializing the (p_resp · p_cov)² dense block. The
+        // consumer at custom_family.rs:9897 prefers `hessian_psi_operator`
+        // when present and ignores the dense `hessian_psi` field, so we
+        // emit a zero placeholder there to skip the costly p×p assembly.
+        let w_cubic = ((v_deriv * inv_h_prime_cu) * self.weights.as_ref()).mapv(|v| -2.0 * v);
+        let psi_op_arc = deriv
+            .implicit_operator
+            .as_ref()
+            .expect("psi op presence checked above")
+            .clone();
+        let hessian_psi_operator: Arc<dyn HyperOperator> = Arc::new(
+            TransformationNormalPsiHessianOperator {
+                family: Arc::new(self.clone()),
+                psi_op: psi_op_arc,
+                axis,
+                weighted_inv_h_prime_sq: row.weighted_inv_h_prime_sq.clone(),
+                w_cubic,
+            },
+        );
 
         log::info!(
             "[STAGE] CTN psi first-order terms axis={} psi_index={} elapsed={:.3}s",
@@ -1858,8 +1855,8 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi: obj_psi,
             score_psi,
-            hessian_psi,
-            hessian_psi_operator: None,
+            hessian_psi: Array2::zeros((0, 0)),
+            hessian_psi_operator: Some(hessian_psi_operator),
         }))
     }
 
@@ -2753,6 +2750,166 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
         self.family
             .x_deriv_kron
             .weighted_gram(&self.weight_kernel, &self.family.policy)
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Matrix-free ψ-Hessian operator (CTN exact-Newton joint ψ Hessian)
+// ---------------------------------------------------------------------------
+
+/// Operator-form of the CTN ψ-Hessian
+///
+///   `H_ψ = (sym_val) + (sym_deriv) + (cubic)`,
+///
+/// where
+///   `sym_val   = (X_valᵀ diag(w) (B_val ⊗_KR C_psi)) + transpose`,
+///   `sym_deriv = (X_derivᵀ diag(w/h'²) (B_deriv ⊗_KR C_psi)) + transpose`,
+///   `cubic     = X_derivᵀ diag(w_cubic) X_deriv`
+/// with `w_cubic = -2 · w · v_deriv / h'³`.
+///
+/// `mul_vec` composes the three pieces through the existing Khatri-Rao
+/// `forward_mul`/`transpose_mul` primitives on `KroneckerDesign` and the
+/// per-axis `forward_mul`/`transpose_mul`(`_deriv`) on the
+/// `TensorKroneckerPsiOperator`, never building the
+/// `(p_resp · p_cov) × (p_resp · p_cov)` dense block.
+struct TransformationNormalPsiHessianOperator {
+    family: Arc<TransformationNormalFamily>,
+    psi_op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    axis: usize,
+    weighted_inv_h_prime_sq: Arc<Array1<f64>>,
+    w_cubic: Array1<f64>,
+}
+
+impl TransformationNormalPsiHessianOperator {
+    fn p_total(&self) -> usize {
+        self.family.x_val_kron.ncols()
+    }
+
+    fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
+        self.psi_op
+            .as_any()
+            .downcast_ref::<TensorKroneckerPsiOperator>()
+            .expect("CTN ψ-Hessian operator constructed only on tensor-Kronecker ψ ops")
+    }
+
+    fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        let n = self.family.weights.len();
+        let weights = self.family.weights.as_ref();
+        let weighted_inv_hp_sq = self.weighted_inv_h_prime_sq.as_ref();
+        let tensor = self.tensor_op();
+
+        // sym_val · v: A_val·v + A_valᵀ·v
+        //   A_val   = (B_val ⊗_KR C_design)ᵀ · diag(w) · (B_val ⊗_KR C_psi)
+        //   so A_val·v   = x_val_kronᵀ · (w * lifted_forward_val)
+        //      A_valᵀ·v  = lifted_transpose_val(w * x_val_kron · v)
+        let lifted_val = tensor
+            .forward_mul(self.axis, &v.view())
+            .expect("tensor ψ forward_mul (val basis)");
+        debug_assert_eq!(lifted_val.len(), n);
+        let mut weighted_lifted_val = Array1::<f64>::zeros(n);
+        ndarray::Zip::from(&mut weighted_lifted_val)
+            .and(&lifted_val)
+            .and(weights)
+            .par_for_each(|o, &lv, &w| *o = w * lv);
+        let mut out = self.family.x_val_kron.transpose_mul(&weighted_lifted_val);
+
+        let xval_image = self.family.x_val_kron.forward_mul(v);
+        debug_assert_eq!(xval_image.len(), n);
+        let mut weighted_xval_image = Array1::<f64>::zeros(n);
+        ndarray::Zip::from(&mut weighted_xval_image)
+            .and(&xval_image)
+            .and(weights)
+            .par_for_each(|o, &xv, &w| *o = w * xv);
+        let a_val_t = tensor
+            .transpose_mul(self.axis, &weighted_xval_image.view())
+            .expect("tensor ψ transpose_mul (val basis)");
+        out += &a_val_t;
+
+        // sym_deriv · v: A_deriv·v + A_derivᵀ·v with weights = w/h'²
+        //   A_deriv   = (B_deriv ⊗_KR C_design)ᵀ · diag(w/h'²) · (B_deriv ⊗_KR C_psi)
+        let lifted_deriv = tensor
+            .forward_mul_deriv(self.axis, v)
+            .expect("tensor ψ forward_mul_deriv");
+        debug_assert_eq!(lifted_deriv.len(), n);
+        let mut weighted_lifted_deriv = Array1::<f64>::zeros(n);
+        ndarray::Zip::from(&mut weighted_lifted_deriv)
+            .and(&lifted_deriv)
+            .and(weighted_inv_hp_sq)
+            .par_for_each(|o, &lv, &w| *o = w * lv);
+        out += &self.family.x_deriv_kron.transpose_mul(&weighted_lifted_deriv);
+
+        let xderiv_image = self.family.x_deriv_kron.forward_mul(v);
+        debug_assert_eq!(xderiv_image.len(), n);
+        let mut weighted_xderiv_image = Array1::<f64>::zeros(n);
+        ndarray::Zip::from(&mut weighted_xderiv_image)
+            .and(&xderiv_image)
+            .and(weighted_inv_hp_sq)
+            .par_for_each(|o, &xv, &w| *o = w * xv);
+        let a_deriv_t = tensor
+            .transpose_mul_deriv(self.axis, &weighted_xderiv_image)
+            .expect("tensor ψ transpose_mul_deriv");
+        out += &a_deriv_t;
+
+        // cubic · v = X_derivᵀ diag(w_cubic) X_deriv v
+        let mut cubic_image = self.family.x_deriv_kron.forward_mul(v);
+        debug_assert_eq!(cubic_image.len(), n);
+        cubic_image *= &self.w_cubic;
+        out += &self.family.x_deriv_kron.transpose_mul(&cubic_image);
+
+        out
+    }
+}
+
+impl HyperOperator for TransformationNormalPsiHessianOperator {
+    fn dim(&self) -> usize {
+        self.p_total()
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p_total());
+        self.apply(v)
+    }
+
+    /// Materialize the dense ψ-Hessian via the existing
+    /// `weighted_cross_with_cov_first` + `weighted_gram` paths. Reached only
+    /// when a legacy consumer forces dense materialization (`materialize` /
+    /// `to_dense`) on the drift; production consumers stay on the operator
+    /// matvec path.
+    fn to_dense(&self) -> Array2<f64> {
+        let tensor = self.tensor_op();
+        let weights = self.family.weights.as_ref();
+        let weighted_inv_hp_sq = self.weighted_inv_h_prime_sq.as_ref();
+
+        let xvt_xvp = tensor
+            .weighted_cross_with_cov_first(
+                &self.family.response_val_basis,
+                &self.family.response_val_basis,
+                self.axis,
+                weights,
+            )
+            .expect("tensor ψ weighted_cross(val) for to_dense");
+        let sym_val = &xvt_xvp + &xvt_xvp.t();
+
+        let xdt_xdp = tensor
+            .weighted_cross_with_cov_first(
+                &self.family.response_deriv_basis,
+                &self.family.response_deriv_basis,
+                self.axis,
+                weighted_inv_hp_sq,
+            )
+            .expect("tensor ψ weighted_cross(deriv) for to_dense");
+        let sym_deriv = &xdt_xdp + &xdt_xdp.t();
+
+        let cubic_term = self
+            .family
+            .x_deriv_kron
+            .weighted_gram(&self.w_cubic, &self.family.policy);
+
+        sym_val + &sym_deriv + &cubic_term
     }
 
     fn is_implicit(&self) -> bool {

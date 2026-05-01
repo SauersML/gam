@@ -5250,6 +5250,7 @@ pub fn build_bspline_basis_1d(
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
         kronecker_factors: None,
+        op: None,
     }];
     if spec.double_penalty {
         penalties_raw.push(PenaltyCandidate {
@@ -5260,6 +5261,7 @@ pub fn build_bspline_basis_1d(
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: 1.0,
             kronecker_factors: None,
+            op: None,
         });
     }
 
@@ -5818,6 +5820,7 @@ pub fn build_thin_plate_basiswithworkspace(
             source: PenaltySource::Primary,
             normalization_scale: 1.0,
             kronecker_factors: None,
+            op: None,
         }];
         if let Some(penalty_ridge) = penalty_ridge {
             candidates.push(PenaltyCandidate {
@@ -5855,6 +5858,7 @@ pub fn build_thin_plate_basiswithworkspace(
             source: PenaltySource::Primary,
             normalization_scale: 1.0,
             kronecker_factors: None,
+            op: None,
         }];
         if spec.double_penalty {
             candidates.push(PenaltyCandidate {
@@ -8588,6 +8592,7 @@ pub fn operator_penalty_candidates_closed_form(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
@@ -8597,6 +8602,7 @@ pub fn operator_penalty_candidates_closed_form(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
@@ -8606,6 +8612,7 @@ pub fn operator_penalty_candidates_closed_form(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         });
     }
     out
@@ -8750,6 +8757,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
@@ -8759,6 +8767,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
@@ -8768,6 +8777,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         });
     }
     out
@@ -8791,6 +8801,7 @@ fn operator_penalty_candidates_from_collocation(
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
+            op: None,
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
@@ -8800,6 +8811,7 @@ fn operator_penalty_candidates_from_collocation(
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
+            op: None,
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
@@ -8809,6 +8821,7 @@ fn operator_penalty_candidates_from_collocation(
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
+            op: None,
         });
     }
     out

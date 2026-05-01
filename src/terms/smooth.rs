@@ -2441,6 +2441,7 @@ fn matern_operator_penalty_triplet_from_metadata(
             source,
             normalization_scale,
             kronecker_factors: None,
+            op: None,
         });
     }
     filter_active_penalty_candidates(candidates)
@@ -2888,6 +2889,7 @@ fn build_tensor_bspline_basis(
             source: PenaltySource::TensorMarginal { dim },
             normalization_scale: 1.0,
             kronecker_factors: Some(factors),
+            op: None,
         });
     }
 
@@ -2898,6 +2900,7 @@ fn build_tensor_bspline_basis(
             source: PenaltySource::TensorGlobalRidge,
             normalization_scale: 1.0,
             kronecker_factors: None,
+            op: None,
         });
     }
 
@@ -3461,6 +3464,7 @@ pub fn build_smooth_design_withworkspace(
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
                     kronecker_factors: None,
+                    op: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -4305,6 +4309,7 @@ fn apply_global_smooth_identifiability(
                     source: info.source,
                     normalization_scale: info.normalization_scale * c_new,
                     kronecker_factors: None,
+                    op: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
