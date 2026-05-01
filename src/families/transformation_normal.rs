@@ -3224,10 +3224,92 @@ fn build_monotonicity_derivative_grid_kron(
             response_deriv_grid = combined;
         }
     }
+    // Augment the covariate side with `2 · p_cov` axis-extreme rows so the
+    // loose-bound certificate `β₁(x) + δ_k(x) ≥ ε` holds at every corner of
+    // the axis-aligned box `[col_min_j, col_max_j]^{p_cov}` reached after
+    // `axis_clip_to_training_ranges` on the predict path. Each axis-extreme
+    // row is the training-mean covariate vector with column j replaced by
+    // the training column min (then max) of that column. Rows of the
+    // training design are unchanged; the augmented matrix simply has
+    // `2 · p_cov` extra rows appended after the original n. The resulting
+    // covariate side lives in the same (already-standardized) space the
+    // training design was built in — we read training stats directly out
+    // of `covariate_design` and emit values in that same coordinate
+    // system, so no extra transform is applied.
+    let augmented_covariate_design =
+        augment_covariate_design_with_axis_extremes(covariate_design)?;
     // Build the operator factored: the small (n_grid × p_resp) response-side
-    // factor and the unmodified covariate design. The implied virtual row
-    // space is n_cov × n_grid — never materialized.
-    KroneckerDesign::new_kronecker(response_deriv_grid, covariate_design.clone())
+    // factor and the augmented covariate design. The implied virtual row
+    // space is (n_cov + 2·p_cov) × n_grid — never materialized.
+    KroneckerDesign::new_kronecker(response_deriv_grid, augmented_covariate_design)
+}
+
+/// Append `2 · p_cov` axis-extreme rows to a covariate design.
+///
+/// Each axis-extreme row is the training-mean covariate vector with column
+/// `j` replaced by the training column min (rows 0..p_cov) or training
+/// column max (rows p_cov..2·p_cov). These rows act as additional
+/// monotonicity feasibility constraints in the loose-bound row set so the
+/// certificate `β₁(x) + δ_k(x) ≥ ε` holds at the corners of the
+/// axis-aligned predict-time box, not only at training rows.
+///
+/// Sparse designs are materialized through `try_to_dense_by_chunks` so the
+/// per-column min / mean / max can be read; for biobank-scale dense CTN
+/// (the common case) this is a single dense pass.
+fn augment_covariate_design_with_axis_extremes(
+    covariate_design: &DesignMatrix,
+) -> Result<DesignMatrix, String> {
+    let n_train = covariate_design.nrows();
+    let p_cov = covariate_design.ncols();
+    if n_train == 0 || p_cov == 0 {
+        return Ok(covariate_design.clone());
+    }
+    let dense = covariate_design
+        .try_to_dense_by_chunks(
+            "build_monotonicity_derivative_grid_kron axis-extreme augmentation",
+        )
+        .map_err(|e| {
+            format!(
+                "monotonicity grid axis-extreme augmentation: failed to materialize covariate design: {e}"
+            )
+        })?;
+
+    // Per-column training mean / min / max.
+    let mut col_mean = Array1::<f64>::zeros(p_cov);
+    let mut col_min = Array1::<f64>::from_elem(p_cov, f64::INFINITY);
+    let mut col_max = Array1::<f64>::from_elem(p_cov, f64::NEG_INFINITY);
+    let inv_n = 1.0 / n_train as f64;
+    for j in 0..p_cov {
+        let mut sum = 0.0;
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for i in 0..n_train {
+            let v = dense[[i, j]];
+            sum += v;
+            if v < lo {
+                lo = v;
+            }
+            if v > hi {
+                hi = v;
+            }
+        }
+        col_mean[j] = sum * inv_n;
+        col_min[j] = lo;
+        col_max[j] = hi;
+    }
+
+    let extra_rows = 2 * p_cov;
+    let mut augmented = Array2::<f64>::zeros((n_train + extra_rows, p_cov));
+    augmented.slice_mut(s![..n_train, ..]).assign(&dense);
+    for j in 0..p_cov {
+        let mut row_min = augmented.row_mut(n_train + j);
+        row_min.assign(&col_mean);
+        row_min[j] = col_min[j];
+        let mut row_max = augmented.row_mut(n_train + p_cov + j);
+        row_max.assign(&col_mean);
+        row_max[j] = col_max[j];
+    }
+    Ok(DesignMatrix::from(augmented))
 }
 
 fn effective_response_num_internal_knots(
