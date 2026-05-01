@@ -17346,37 +17346,119 @@ pub mod closed_form_penalty {
             max_term = max_term.max(term.abs());
         }
 
-        // Cancellation detector. The partial-fraction expansion sums Riesz
-        // and Matérn terms whose individual magnitudes scale as
-        // κ^{-2(a+b-j)} but the analytical sum tends to the finite κ → 0
-        // limit R_{a+b}^d(r). For small κ this is a sum of huge values
-        // cancelling to a small one and roundoff in the κ^{-2k} coefficients
-        // (combined with the small-argument Bessel-K series inside the
-        // Matérn factor) leaks through with absolute error far in excess of
-        // ε · max|term|. When the |sum| inflates beyond the κ → 0 limit by
-        // many decades — clear evidence that double precision has lost the
-        // cancellation — fall back to that limit, whose own truncation
-        // error in the omitted Matérn correction is O((κr)²) and tends to
-        // zero as κ → 0.
+        // Cancellation gate. The partial-fraction expansion sums Riesz and
+        // Matérn terms whose individual magnitudes scale as κ^{-2(N-j)}
+        // (with N = a + b) but the analytical sum tends to the finite-part
+        // Duchon kernel, whose leading term is R_N^d(R) and whose higher
+        // small-κ corrections are captured exactly by the Taylor / ₁F₂
+        // expansion
         //
-        // The detector must only fire in the small-κr regime where the
-        // κ → 0 Riesz limit is genuinely a faithful approximation of the
-        // partial-fraction sum. For κr ≳ O(1) the sum is the correct
-        // answer (it has departed from the κ → 0 limit by an O(1) factor),
-        // and the ratio |sum|/|limit| can legitimately be large without
-        // any roundoff problem. Triggering there overrides good results
-        // with the wrong limit.
+        //   g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · R_{N+n}^d(R).
+        //
+        // For small κr the literal partial-fraction sum suffers
+        // catastrophic cancellation across O(κ^{-2N}) terms and double
+        // precision leaks far in excess of ε · max|term|. The condition
+        // number χ = max|term| / |sum| measures the lost-precision span:
+        // when χ exceeds ~10⁸ the sum has fewer than ~8 reliable digits
+        // and the Taylor series, which is numerically benign in that
+        // regime, is the better replacement (and the Taylor's leading
+        // term alone — R_N^d(R) — is what the previous band-aid returned).
+        //
+        // For ODD d the Riesz blocks R_{N+n}^d are pure powers and the
+        // Taylor recurrence below is exact. For EVEN d log-Riesz blocks
+        // appear and we keep the legacy leading-term fallback (the full
+        // log finite-part series is left for a follow-up).
         let limit = riesz_kernel_value(d, a + b, r);
+        let chi = if sum.abs() > 0.0 {
+            max_term / sum.abs()
+        } else {
+            f64::INFINITY
+        };
         let kappa_r = kappa * r;
-        if kappa_r < 0.01
-            && limit.is_finite()
-            && limit.abs() > 0.0
-            && sum.abs() > 1e6 * limit.abs()
-            && max_term > 1e9 * limit.abs()
-        {
-            return limit;
+        let cancellation_lost = chi > 1.0e8;
+        if cancellation_lost {
+            if d % 2 == 1 {
+                if let Some(tay) = finite_part_duchon_taylor_odd_d(d, a, b, kappa, r) {
+                    return tay;
+                }
+            }
+            if kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
+                return limit;
+            }
         }
         sum
+    }
+
+    /// Adaptive Taylor expansion of the finite-part Duchon kernel for odd d:
+    ///
+    ///   g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · R_{N+n}^d(R)
+    ///              = R_N^d(R) · ₁F₂(b; N, N+1-d/2; (κR)²/4)
+    ///
+    /// where `a = 2m - q`, `b = 2s`, `N = a + b`, and `(b)_n` is the
+    /// rising Pochhammer symbol. Restricted to ODD `d`, in which case
+    /// `R_{N+n}^d(R) = c_{N+n} · R^{2(N+n)-d}` is a pure power and the
+    /// term-ratio recurrence
+    ///
+    ///   T_{n+1} / T_n = (b + n) · x / [4 · (n + 1) · (N + n) · (N + 1 − d/2 + n)],
+    ///   x = (κR)²,
+    ///
+    /// (derived from `R_{j+1}^d / R_j^d = R² / [4 · j · (d/2 − j − 1)]`
+    /// times the Pochhammer / factorial / κ²-step) is exact and stable.
+    ///
+    /// Returns `None` if the recurrence stalls (NaN / non-finite) or the
+    /// configuration is not in the expected regime.
+    fn finite_part_duchon_taylor_odd_d(
+        d: usize,
+        a: usize,
+        b: usize,
+        kappa: f64,
+        r: f64,
+    ) -> Option<f64> {
+        debug_assert!(d % 2 == 1);
+        debug_assert!(r > 0.0);
+        debug_assert!(kappa > 0.0);
+        if a == 0 || b == 0 {
+            return None;
+        }
+        let big_n = (a + b) as f64;
+        let half_d = d as f64 / 2.0;
+        // UV/IR integrability requires N + 1 − d/2 > 0 for any term to be
+        // nonsingular; should always hold for valid Duchon configs.
+        let denom_d = big_n + 1.0 - half_d;
+        if !(denom_d > 0.0) {
+            return None;
+        }
+
+        let x = (kappa * r) * (kappa * r);
+        // T_0 = R_N^d(R)
+        let t0 = riesz_kernel_value(d, a + b, r);
+        if !t0.is_finite() {
+            return None;
+        }
+        let mut term = t0;
+        let mut sum = t0;
+        let max_iters = 256usize;
+        for n in 0..max_iters {
+            let nf = n as f64;
+            let num = (b as f64 + nf) * x;
+            let den = 4.0 * (nf + 1.0) * (big_n + nf) * (denom_d + nf);
+            if !(den.is_finite()) || den == 0.0 {
+                return None;
+            }
+            term *= num / den;
+            sum += term;
+            if !term.is_finite() || !sum.is_finite() {
+                return None;
+            }
+            // Convergence: next term is smaller than 1e-16 of the
+            // accumulated sum and a few iterations of warmup are done.
+            if n >= 4 && term.abs() <= 1.0e-16 * sum.abs().max(t0.abs()) {
+                return Some(sum);
+            }
+        }
+        // Did not converge within budget; refuse rather than return a
+        // truncated sum (caller will keep its own fallback).
+        None
     }
 
     /// Confluent hypergeometric function ₁F₁(a; b; x) for nonnegative-integer
