@@ -154,7 +154,7 @@ def mapping_table_columns(data: Mapping[Any, Any]) -> dict[str, list[Any]]:
 
 def record_table_columns(rows: list[Mapping[str, Any]]) -> dict[str, list[Any]]:
     headers = collect_record_headers(rows)
-    columns = {header: [] for header in headers}
+    columns: dict[str, list[Any]] = {header: [] for header in headers}
     for row in rows:
         for header in headers:
             if header not in row:
@@ -173,7 +173,7 @@ def sequence_table_columns(rows: Sequence[Sequence[Any]]) -> dict[str, list[Any]
                 f"row {index + 1} has width {len(row)} but expected {width}"
             )
     headers = [f"x{index}" for index in range(width)]
-    columns = {header: [] for header in headers}
+    columns: dict[str, list[Any]] = {header: [] for header in headers}
     for row in rows:
         for index, value in enumerate(row):
             columns[headers[index]].append(value)
@@ -272,7 +272,8 @@ def vector_values(values: Any) -> list[Any]:
         array = np.asarray(values)
         if array.ndim != 1:
             raise ValueError("target arrays must be 1D")
-        return array.tolist()
+        result: list[Any] = array.tolist()
+        return result
     if isinstance(values, Mapping):
         raise TypeError("target values must be a vector, not a mapping")
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
