@@ -56,7 +56,7 @@ def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str
 
 
 @dataclass
-class _BaseGAMEstimator(BaseEstimator):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat BaseEstimator as Any
+class _BaseGAMEstimator(BaseEstimator):
     formula: str
     family: str = "auto"
     offset: str | None = None
@@ -91,7 +91,7 @@ class _BaseGAMEstimator(BaseEstimator):  # type: ignore[misc]  # sklearn stubs m
         return self.model_.check(X)
 
 
-class GAMRegressor(_BaseGAMEstimator, RegressorMixin):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat RegressorMixin as Any
+class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
     def fit(self, X: Any, y: Any = None) -> "GAMRegressor":
         return self._fit_model(X, y)
 
@@ -100,11 +100,11 @@ class GAMRegressor(_BaseGAMEstimator, RegressorMixin):  # type: ignore[misc]  # 
         predicted = self.model_.predict(X, return_type="dict")
         return np.asarray(predicted["mean"], dtype=float)
 
-    def score(self, X: Any, y: Any) -> float:
+    def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
         return float(r2_score(np.asarray(y, dtype=float), self.predict(X)))
 
 
-class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):  # type: ignore[misc]  # sklearn stubs missing under --ignore-missing-imports treat ClassifierMixin as Any
+class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
     def fit(self, X: Any, y: Any = None) -> "GAMClassifier":
         fitted = self._fit_model(X, y)
         self.classes_ = np.asarray([0, 1])
@@ -120,5 +120,5 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):  # type: ignore[misc]  
     def predict(self, X: Any) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
-    def score(self, X: Any, y: Any) -> float:
+    def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
         return float(accuracy_score(np.asarray(y, dtype=int), self.predict(X)))

@@ -104,6 +104,7 @@ def preferred_output_kind(input_kind: str, training_kind: str | None) -> str:
 def detect_table_kind(data: Any) -> str:
     if data is None:
         return "unknown"
+    pd: Any | None
     try:
         import pandas as pd
     except ImportError:
@@ -111,6 +112,7 @@ def detect_table_kind(data: Any) -> str:
     if pd is not None and isinstance(data, pd.DataFrame):
         return "pandas"
 
+    pl: Any | None
     try:
         import polars as pl
     except ImportError:
@@ -118,6 +120,7 @@ def detect_table_kind(data: Any) -> str:
     if pl is not None and isinstance(data, pl.DataFrame):
         return "polars"
 
+    pa: Any | None
     try:
         import pyarrow as pa
     except ImportError:
@@ -125,6 +128,7 @@ def detect_table_kind(data: Any) -> str:
     if pa is not None and isinstance(data, pa.Table):
         return "pyarrow"
 
+    np: Any | None
     try:
         import numpy as np
     except ImportError:
