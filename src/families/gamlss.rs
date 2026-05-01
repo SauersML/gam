@@ -14515,6 +14515,21 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let total = pt + pls;
         let n = self.y.len();
 
+        // Operator-aware downgrade: in the matrix-free regime the unified
+        // per-θ_j path uses the family's `ExactNewtonJointHessianWorkspace`
+        // (matvec + dH/d²H operators) and never materializes the dense
+        // total×total joint Hessian, the dense Cholesky factor, or the
+        // total×n leverage panels (`Q_t`, `Q_l`) that this batched fast-path
+        // builds below. At biobank scale (e.g. n≈4·10⁵, total≈120) those
+        // dense allocations and the n·total² leverage solve dominate
+        // wall-clock time and inflate resident memory by ~6 GiB. Decline
+        // the batched path when the joint dimensions cross the same gate
+        // used for matrix-free outer routing — the unified evaluator will
+        // produce identical gradient values via the operator workspace.
+        if crate::custom_family::use_joint_matrix_free_path(total, n) {
+            return Ok(None);
+        }
+
         // ── Step 1: build dense joint Hessian H_L (unpenalized).
         let h_l = self
             .exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)?
