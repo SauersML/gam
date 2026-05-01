@@ -2078,8 +2078,8 @@ def _synthetic_hgdp_1kg_pc_panel() -> typing.Any:
         superpop_shift = rng.normal(loc=0.0, scale=0.85, size=16)
         for sub_idx in range(4):
             sub_name = f"{spec['name']}_SUB{sub_idx + 1:02d}"
-            sub_lat = float(float(spec["lat"]) + rng.normal(0.0, 5.0))
-            sub_lon = float(float(spec["lon"]) + rng.normal(0.0, 7.5))
+            sub_lat = float(float(typing.cast(typing.Any, spec["lat"])) + rng.normal(0.0, 5.0))
+            sub_lon = float(float(typing.cast(typing.Any, spec["lon"])) + rng.normal(0.0, 7.5))
             sub_shift = rng.normal(loc=0.0, scale=0.30, size=16)
             for _ in range(_SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP):
                 sample_lat = float(np.clip(sub_lat + rng.normal(0.0, 1.2), -58.0, 72.0))
@@ -3713,17 +3713,22 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] 
         )
 
     if corr_rows:
-        denom = max(sum(int(r["n"]) for r in corr_rows if r.get("n") is not None), 1)
-        valid_g = [
-            (float(r["corr_g"]), int(r["n"]))
-            for r in corr_rows
-            if r.get("corr_g") is not None and r.get("n") is not None
-        ]
-        valid_c = [
-            (float(r["corr_c"]), int(r["n"]))
-            for r in corr_rows
-            if r.get("corr_c") is not None and r.get("n") is not None
-        ]
+        denom_parts: list[int] = []
+        valid_g: list[tuple[float, int]] = []
+        valid_c: list[tuple[float, int]] = []
+        for row in corr_rows:
+            n_raw = row.get("n")
+            if n_raw is None:
+                continue
+            n_int = int(n_raw)
+            denom_parts.append(n_int)
+            corr_g = row.get("corr_g")
+            if corr_g is not None:
+                valid_g.append((float(corr_g), n_int))
+            corr_c = row.get("corr_c")
+            if corr_c is not None:
+                valid_c.append((float(corr_c), n_int))
+        denom = max(sum(denom_parts), 1)
         if valid_g:
             out["thread3_weight_grad_corr"] = float(
                 sum(v * w for v, w in valid_g) / max(sum(w for _, w in valid_g), 1)
@@ -8703,8 +8708,8 @@ def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Pat
         # Filter to metrics that have at least one non-None value.
         active_metrics = []
         for key, label, hib in metrics_cfg:
-            vals = [r.get(key) for r in rows if r.get(key) is not None]
-            if vals:
+            metric_values = [r.get(key) for r in rows if r.get(key) is not None]
+            if metric_values:
                 active_metrics.append((key, label, hib))
         if not active_metrics:
             continue
@@ -8740,24 +8745,24 @@ def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Pat
 
         for idx, (key, label, higher_is_better) in enumerate(active_metrics):
             ax = axes[idx]
-            vals: list[float] = []
+            metric_vals: list[float] = []
             for r in rows:
                 v = r.get(key)
-                vals.append(float(v) if v is not None else float("nan"))
+                metric_vals.append(float(v) if v is not None else float("nan"))
 
             bars = ax.barh(
-                y_pos, vals, height=0.62,
+                y_pos, metric_vals, height=0.62,
                 color=colors, edgecolor="none", alpha=0.88,
                 zorder=3,
             )
             # Highlight the best value.
-            valid_vals = [v for v in vals if np.isfinite(v)]
+            valid_vals = [v for v in metric_vals if np.isfinite(v)]
             if valid_vals:
                 if higher_is_better:
                     best_val = max(valid_vals)
                 else:
                     best_val = min(valid_vals)
-                for i, (bar, v) in enumerate(zip(bars, vals)):
+                for i, (bar, v) in enumerate(zip(bars, metric_vals)):
                     if np.isfinite(v) and abs(v - best_val) < 1e-12:
                         bar.set_edgecolor("#f0f6fc")
                         bar.set_linewidth(1.8)
@@ -8772,7 +8777,7 @@ def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Pat
             ax.grid(axis="x", color=grid_color, linewidth=0.5, zorder=0)
 
             # Value labels on bars.
-            for bar, v in zip(bars, vals):
+            for bar, v in zip(bars, metric_vals):
                 if not np.isfinite(v):
                     continue
                 if abs(v) < 0.01:
