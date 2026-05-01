@@ -17361,28 +17361,34 @@ pub mod closed_form_penalty {
             max_term = max_term.max(term.abs());
         }
 
-        // Cancellation gate. The partial-fraction expansion sums Riesz and
-        // Matérn terms whose individual magnitudes scale as κ^{-2(N-j)}
-        // (with N = a + b) but the analytical sum tends to the finite-part
-        // Duchon kernel, whose leading term is R_N^d(R) and whose higher
-        // small-κ corrections are captured exactly by the Taylor / ₁F₂
-        // expansion
+        // Cancellation gate. The partial-fraction expansion sums Riesz
+        // and Matérn terms whose individual magnitudes scale as
+        // κ^{-2(N-j)} (with N = a + b) but the analytical sum tends to
+        // the finite-part Duchon kernel, whose leading term is R_N^d(R)
+        // and whose higher small-κ corrections are captured exactly by
+        // the Taylor / ₁F₂ expansion
         //
         //   g_fp(R; κ) = Σ_{n≥0} (-1)^n · (b)_n / n! · κ^{2n} · R_{N+n}^d(R).
         //
-        // For small κr the literal partial-fraction sum suffers
+        // For small κR the literal partial-fraction sum suffers
         // catastrophic cancellation across O(κ^{-2N}) terms and double
-        // precision leaks far in excess of ε · max|term|. The condition
-        // number χ = max|term| / |sum| measures the lost-precision span:
-        // when χ exceeds ~10⁸ the sum has fewer than ~8 reliable digits
-        // and the Taylor series, which is numerically benign in that
-        // regime, is the better replacement (and the Taylor's leading
-        // term alone — R_N^d(R) — is what the previous band-aid returned).
+        // precision leaks far in excess of ε · max|term|. The math team's
+        // Letter B caveat is important: the Taylor finite-part series
+        // does NOT in general equal the literal Matérn partial-fraction
+        // kernel — they share a leading R_N^d(R) term as κR → 0, but
+        // differ at moderate κR by non-Taylor branches (e.g. κ^{d-2N+2r})
+        // that the partial-fraction sum captures and the Taylor does not.
+        // We must therefore only substitute Taylor when the literal
+        // partial-fraction value is no longer trustworthy in floating
+        // point — i.e. when the cancellation condition number
+        // χ = max|term| / |sum| signals catastrophic precision loss
+        // (χ > 1e8 ⇒ < 8 reliable digits in the sum). At larger κR the
+        // partial-fraction sum stands.
         //
         // For ODD d the Riesz blocks R_{N+n}^d are pure powers and the
-        // Taylor recurrence below is exact. For EVEN d log-Riesz blocks
-        // appear and we keep the legacy leading-term fallback (the full
-        // log finite-part series is left for a follow-up).
+        // Taylor recurrence is exact. For EVEN d log-Riesz blocks appear
+        // and we keep the legacy leading-term fallback (the full log
+        // finite-part series is left for a follow-up).
         let limit = riesz_kernel_value(d, a + b, r);
         let chi = if sum.abs() > 0.0 {
             max_term / sum.abs()
