@@ -488,7 +488,7 @@ pub enum PenaltyStructureHint {
 /// Instead of embedding every penalty into a full `p_total × p_total` dense
 /// matrix filled with zeros, we keep the compact local matrix and reconstruct
 /// the global view only when a downstream consumer explicitly requires it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BlockwisePenalty {
     /// Column range in the global coefficient vector that this penalty covers.
     pub col_range: Range<usize>,
@@ -498,6 +498,25 @@ pub struct BlockwisePenalty {
     /// Optional structural hint so downstream spectral/logdet code can stay
     /// block-local or factorized without reverse-engineering the matrix.
     pub structure_hint: Option<PenaltyStructureHint>,
+    /// Optional operator-form handle bit-equivalent to `local`. Populated when
+    /// the originating closed-form factory emitted an op-form penalty so PIRLS
+    /// PCG and REML SLQ log-det can use matvec instead of materializing the
+    /// dense `block_p × block_p` Gram. `None` for ordinary dense penalties.
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+}
+
+impl std::fmt::Debug for BlockwisePenalty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockwisePenalty")
+            .field("col_range", &self.col_range)
+            .field(
+                "local",
+                &format_args!("{}×{}", self.local.nrows(), self.local.ncols()),
+            )
+            .field("structure_hint", &self.structure_hint)
+            .field("op", &self.op.as_ref().map(|o| o.dim()))
+            .finish()
+    }
 }
 
 impl BlockwisePenalty {
@@ -509,7 +528,17 @@ impl BlockwisePenalty {
             col_range,
             local,
             structure_hint: None,
+            op: None,
         }
+    }
+
+    /// Attach an op-form penalty handle bit-equivalent to `local`.
+    pub fn with_op(
+        mut self,
+        op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+    ) -> Self {
+        self.op = op;
+        self
     }
 
     pub fn ridge(col_range: Range<usize>, scale: f64) -> Self {
@@ -522,6 +551,7 @@ impl BlockwisePenalty {
             col_range,
             local,
             structure_hint: Some(PenaltyStructureHint::Ridge(scale)),
+            op: None,
         }
     }
 
@@ -536,6 +566,7 @@ impl BlockwisePenalty {
             col_range,
             local,
             structure_hint: Some(PenaltyStructureHint::Kronecker(factors)),
+            op: None,
         }
     }
 

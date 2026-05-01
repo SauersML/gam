@@ -8430,6 +8430,7 @@ mod tests {
                     nullity: 0,
                     local,
                     positive_eigenvalues: Vec::new(),
+                    op: None,
                 }
             })
             .collect();
@@ -8643,6 +8644,7 @@ mod tests {
                     nullity: 0,
                     local,
                     positive_eigenvalues: Vec::new(),
+                    op: None,
                 }
             })
             .collect();
@@ -8713,6 +8715,7 @@ mod tests {
                     nullity: 0,
                     local,
                     positive_eigenvalues: Vec::new(),
+                    op: None,
                 }
             })
             .collect();
@@ -9749,6 +9752,7 @@ mod root_cause_tests {
                     nullity: 0,
                     local,
                     positive_eigenvalues: Vec::new(),
+                    op: None,
                 }
             })
             .collect();
@@ -9825,6 +9829,7 @@ mod root_cause_tests {
                     nullity: 0,
                     local,
                     positive_eigenvalues: Vec::new(),
+                    op: None,
                 }
             })
             .collect();
@@ -9921,6 +9926,7 @@ mod root_cause_tests {
                         nullity: 0,
                         local,
                         positive_eigenvalues: Vec::new(),
+                        op: None,
                     }
                 })
                 .collect();

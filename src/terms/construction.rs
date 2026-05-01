@@ -795,7 +795,7 @@ fn kronecker_eigenvalues(decomps: &[KroneckerFactorDecomp], block_dim: usize) ->
 /// Instead of storing a full `p x p` penalty matrix, this stores only the
 /// `rank x block_dim` root and the column range, enabling O(p_k^2) operations
 /// instead of O(p^2).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CanonicalPenalty {
     /// Square root matrix: S_k = root^T * root.
     /// Shape: `rank x block_dim` for block-local, `rank x p` for dense.
@@ -814,6 +814,30 @@ pub struct CanonicalPenalty {
     /// Positive eigenvalues of the local penalty matrix (length = rank).
     /// Cached at construction time for REML logdet block-factored paths.
     pub positive_eigenvalues: Vec<f64>,
+    /// Optional operator-form handle bit-equivalent to `local`. Propagated
+    /// from `PenaltySpec::Block.op`. Downstream PIRLS PCG and REML SLQ log-det
+    /// route through this for dense-Gram-free matvec when present.
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+}
+
+impl std::fmt::Debug for CanonicalPenalty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalPenalty")
+            .field(
+                "root",
+                &format_args!("{}×{}", self.root.nrows(), self.root.ncols()),
+            )
+            .field("col_range", &self.col_range)
+            .field("total_dim", &self.total_dim)
+            .field("nullity", &self.nullity)
+            .field(
+                "local",
+                &format_args!("{}×{}", self.local.nrows(), self.local.ncols()),
+            )
+            .field("positive_eigenvalues", &self.positive_eigenvalues)
+            .field("op", &self.op.as_ref().map(|o| o.dim()))
+            .finish()
+    }
 }
 
 impl CanonicalPenalty {
@@ -830,6 +854,7 @@ impl CanonicalPenalty {
             nullity: 0,
             local,
             positive_eigenvalues,
+            op: None,
         }
     }
 
@@ -943,11 +968,12 @@ pub fn canonicalize_penalty_spec(
 ) -> Result<Option<CanonicalPenalty>, EstimationError> {
     use crate::estimate::PenaltySpec;
 
-    let (local_matrix, col_range, hint) = match spec {
+    let (local_matrix, col_range, hint, op) = match spec {
         PenaltySpec::Block {
             local,
             col_range,
             structure_hint,
+            op,
         } => {
             let bd = col_range.len();
             if local.nrows() != bd || local.ncols() != bd {
@@ -963,7 +989,7 @@ pub fn canonicalize_penalty_spec(
                     col_range.start, col_range.end
                 )));
             }
-            (local.view(), col_range.clone(), structure_hint.as_ref())
+            (local.view(), col_range.clone(), structure_hint.as_ref(), op.clone())
         }
         PenaltySpec::Dense(m) => {
             if m.nrows() != p || m.ncols() != p {
@@ -973,7 +999,7 @@ pub fn canonicalize_penalty_spec(
                     m.ncols()
                 )));
             }
-            (m.view(), 0..p, None)
+            (m.view(), 0..p, None, None)
         }
     };
 
@@ -1000,6 +1026,7 @@ pub fn canonicalize_penalty_spec(
             nullity: 0,
             local: local_sym,
             positive_eigenvalues: vec![*scale; block_dim],
+            op,
         }));
     }
 
@@ -1024,6 +1051,7 @@ pub fn canonicalize_penalty_spec(
             nullity,
             local: local_sym,
             positive_eigenvalues,
+            op,
         }));
     }
 
@@ -1071,6 +1099,7 @@ pub fn canonicalize_penalty_spec(
         nullity: analysis.nullity,
         local: analysis.sym_penalty,
         positive_eigenvalues,
+        op,
     }))
 }
 
@@ -2506,6 +2535,7 @@ mod tests {
                     nullity: 0,
                     local,
                     positive_eigenvalues: Vec::new(),
+                    op: None,
                 }
             })
             .collect()
