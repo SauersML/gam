@@ -1560,10 +1560,10 @@ def print_leaderboard(results: typing.Any, top_n: typing.Any=25) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _DEPTH_DEFAULTS = {
-    "lean": 150,
-    "default": 300,
-    "deep": 750,
-    "heavy": 1500,
+    "lean": 100,
+    "default": 200,
+    "deep": 500,
+    "heavy": 1000,
 }
 
 
