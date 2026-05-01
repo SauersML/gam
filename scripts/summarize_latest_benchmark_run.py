@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+ZoneInfo: Any
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+    ZoneInfo = None
 
 DEFAULT_WORKFLOW = "benchmark.yml"
 DEFAULT_OUT = Path("scripts/latest_benchmark_summary.md")
