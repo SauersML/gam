@@ -15,6 +15,7 @@ use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19131,20 +19132,71 @@ pub mod closed_form_penalty {
     ///   u_p = Σ b_k^{p+1} r_k², p ∈ {1, 2}
     /// where b_k = exp(-2 η_k).
     fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-        let mut s1 = 0.0_f64;
-        let mut s2 = 0.0_f64;
-        let mut r2 = 0.0_f64; // Σ b_k r_k²
-        let mut u1 = 0.0_f64;
-        let mut u2 = 0.0_f64;
-        for k in 0..eta.len() {
-            let b = (-2.0 * eta[k]).exp();
-            let rk2 = r[k] * r[k];
-            s1 += b;
-            s2 += b * b;
-            r2 += b * rk2;
-            u1 += b * b * rk2;
-            u2 += b * b * b * rk2;
+        // SIMD-vectorized over the d-axis using `wide::f64x4` (stable, AVX2 on
+        // x86_64; portable scalar fallback elsewhere). Five accumulators share
+        // the same iteration pattern, so we widen each into a 4-lane vector
+        // accumulator and horizontally reduce at the end. `f64::exp` is not
+        // available in `wide`, so we apply it scalar-wise into a lane buffer
+        // before lifting; the dominant arithmetic (multiplies, adds, mul-add
+        // for the b², b³ chain) is fully vectorized.
+        use wide::f64x4;
+
+        let d = eta.len();
+        let mut s1_v = f64x4::ZERO;
+        let mut s2_v = f64x4::ZERO;
+        let mut r2_v = f64x4::ZERO;
+        let mut u1_v = f64x4::ZERO;
+        let mut u2_v = f64x4::ZERO;
+
+        let chunks = d / 4;
+        let tail = d % 4;
+        for c in 0..chunks {
+            let base = c * 4;
+            let b_arr = [
+                (-2.0 * eta[base]).exp(),
+                (-2.0 * eta[base + 1]).exp(),
+                (-2.0 * eta[base + 2]).exp(),
+                (-2.0 * eta[base + 3]).exp(),
+            ];
+            let rk_arr = [r[base], r[base + 1], r[base + 2], r[base + 3]];
+            let b = f64x4::from(b_arr);
+            let rk = f64x4::from(rk_arr);
+            let rk2 = rk * rk;
+            let b2 = b * b;
+            let b3 = b2 * b;
+            s1_v += b;
+            s2_v += b2;
+            r2_v += b * rk2;
+            u1_v += b2 * rk2;
+            u2_v += b3 * rk2;
         }
+
+        // Horizontal reduction of the 4-lane accumulators.
+        let s1_a = s1_v.to_array();
+        let s2_a = s2_v.to_array();
+        let r2_a = r2_v.to_array();
+        let u1_a = u1_v.to_array();
+        let u2_a = u2_v.to_array();
+        let mut s1 = s1_a[0] + s1_a[1] + s1_a[2] + s1_a[3];
+        let mut s2 = s2_a[0] + s2_a[1] + s2_a[2] + s2_a[3];
+        let mut r2 = r2_a[0] + r2_a[1] + r2_a[2] + r2_a[3];
+        let mut u1 = u1_a[0] + u1_a[1] + u1_a[2] + u1_a[3];
+        let mut u2 = u2_a[0] + u2_a[1] + u2_a[2] + u2_a[3];
+
+        // Scalar tail (0..3 elements).
+        let tail_start = chunks * 4;
+        for k in 0..tail {
+            let idx = tail_start + k;
+            let b = (-2.0 * eta[idx]).exp();
+            let rk2 = r[idx] * r[idx];
+            let b2 = b * b;
+            s1 += b;
+            s2 += b2;
+            r2 += b * rk2;
+            u1 += b2 * rk2;
+            u2 += b2 * b * rk2;
+        }
+
         (r2.sqrt(), s1, s2, u1, u2)
     }
 
