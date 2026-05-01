@@ -172,7 +172,6 @@ class MethodSpec:
     family: str
     spatial_basis: str
     centers: int | None = None
-    smooth_kind: str = "joint"
     include_sigma: bool = False
     survival_likelihood: str | None = None
     survival_distribution: str | None = None
@@ -538,6 +537,47 @@ def _biobank_duchon_pc_term(pc_count: int, centers: int) -> str:
         f"duchon({pc_cols}, centers={centers}, "
         f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
         f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
+    )
+
+
+def _biobank_pc_smooth_term(spatial_basis: str, pc_count: int, centers: int) -> str:
+    """Joint multi-D smooth over the PC ancestry axes.
+
+    All biobank lanes treat ancestry as a single object on the joint PC space
+    (the production-pipeline strategic goal: PGS calibration via Duchon/TPS on
+    joint PC). Lat/lon geographic coordinates are deliberately excluded — the
+    relevant continuous structure is genetic ancestry, not geography.
+    """
+    pc_cols = ", ".join(_pc_std_columns(pc_count))
+    if spatial_basis == "duchon":
+        return _biobank_duchon_pc_term(pc_count, centers)
+    if spatial_basis == "thinplate":
+        return f"thinplate({pc_cols}, knots={centers})"
+    if spatial_basis == "matern":
+        return f"matern({pc_cols}, centers={centers})"
+    raise RuntimeError(
+        f"unsupported Rust joint-PC spatial basis '{spatial_basis}' "
+        "(use duchon, thinplate, or matern)"
+    )
+
+
+def _mgcv_pc_smooth_term(spatial_basis: str, pc_count: int, k: int) -> str:
+    """Joint multi-D mgcv smooth over the PC ancestry axes.
+
+    Each biobank lane uses the same joint-PC contract on the mgcv side. The
+    PCs enter as one mgcv smooth `s(pc1_std, ..., pcN_std, bs=..., k=...)` —
+    never as independent linear terms, never combined with lat/lon.
+    """
+    pc_cols = ", ".join(_pc_std_columns(pc_count))
+    if spatial_basis == "duchon":
+        return f"s({pc_cols}, bs='ds', k=min({k}, nrow(train_df)-1))"
+    if spatial_basis == "thinplate":
+        return f"s({pc_cols}, bs='tp', k=min({k}, nrow(train_df)-1))"
+    if spatial_basis == "matern":
+        return f"s({pc_cols}, bs='gp', m=c(-4,1.0), k=min({k}, nrow(train_df)-1))"
+    raise RuntimeError(
+        f"unsupported mgcv joint-PC spatial basis '{spatial_basis}' "
+        "(use duchon, thinplate, or matern)"
     )
 
 
@@ -1644,7 +1684,6 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
             family=str(item["family"]),
             spatial_basis=str(item["spatial_basis"]),
             centers=int(item["centers"]) if item.get("centers") is not None else None,
-            smooth_kind=str(item.get("smooth_kind", "joint")),
             include_sigma=bool(item.get("include_sigma", False)),
             survival_likelihood=(
                 str(item["survival_likelihood"])
@@ -1716,55 +1755,37 @@ def effective_marginal_slope_centers(
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
-    if spec.smooth_kind == "joint":
-        if spec.spatial_basis == "thinplate":
-            spatial = f"thinplate(lat_final_std, lon_final_std, knots={int(spec.centers or 60)})"
-        elif spec.spatial_basis == "duchon":
-            spatial = f"duchon(lat_final_std, lon_final_std, centers={int(spec.centers or 60)})"
-        elif spec.spatial_basis == "matern":
-            spatial = f"matern(lat_final_std, lon_final_std, centers={int(spec.centers or 60)})"
-        else:
-            raise RuntimeError(f"unsupported Rust spatial basis '{spec.spatial_basis}'")
-        base_terms = [
-            "pgs_std",
-            "sex",
-            "smooth(age_entry_std)",
-            spatial,
-            *[f"pc{i}_std" for i in range(1, 17)],
-        ]
-        mean_formula = "phenotype ~ " + " + ".join(base_terms)
-        sigma_formula = " + ".join(
-            ["smooth(age_entry_std)", spatial, *[f"pc{i}_std" for i in range(1, 5)]]
-        )
-        return mean_formula, sigma_formula
+    """Build mean + sigma formulas for biobank classification lanes.
+
+    PCs enter as a SINGLE JOINT smooth over the ancestry manifold using the
+    lane's `spatial_basis`; no per-PC linear terms, no separate per-axis
+    smooths. Lat/lon coordinates are NOT used as predictors. The mean and
+    sigma blocks share the joint-PC term so any heteroscedastic structure
+    is over the same ancestry surface as the location surface.
+    """
+    centers = int(spec.centers or 60)
+    pc_count = int(spec.pc_count)
+    spatial = _biobank_pc_smooth_term(spec.spatial_basis, pc_count, centers)
     mean_terms = [
         "pgs_std",
         "sex",
         "smooth(age_entry_std)",
-        "smooth(lat_final_std)",
-        "smooth(lon_final_std)",
-        *[f"pc{i}_std" for i in range(1, 17)],
+        spatial,
     ]
     sigma_terms = [
         "smooth(age_entry_std)",
-        "smooth(lat_final_std)",
-        "smooth(lon_final_std)",
-        *[f"pc{i}_std" for i in range(1, 5)],
+        spatial,
     ]
     return "phenotype ~ " + " + ".join(mean_terms), " + ".join(sigma_terms)
 
 
 def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -> tuple[str, str]:
-    """Build mean and logslope formulas for biobank marginal-slope classification."""
-    if spec.spatial_basis == "duchon":
-        spatial = _biobank_duchon_pc_term(int(spec.pc_count), centers)
-    elif spec.spatial_basis == "matern":
-        pc_cols = ", ".join(f"pc{i}_std" for i in range(1, int(spec.pc_count) + 1))
-        spatial = f"matern({pc_cols}, centers={centers})"
-    else:
-        raise RuntimeError(
-            f"unsupported marginal-slope spatial basis '{spec.spatial_basis}' (use duchon or matern)"
-        )
+    """Build mean and logslope formulas for biobank marginal-slope classification.
+
+    Uses the shared joint-PC helper so duchon / thinplate / matern lanes all
+    route through the same ancestry-manifold contract.
+    """
+    spatial = _biobank_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
     mean_terms = [
         "link(type=probit)",
         "sex",
@@ -1867,11 +1888,7 @@ def run_rust_marginal_slope_classification(
 
 
 def rust_survival_marginal_slope_formula_parts(spec: MethodSpec, centers: int) -> tuple[str, str]:
-    if spec.spatial_basis != "duchon":
-        raise RuntimeError(
-            f"survival marginal-slope method '{spec.name}' requires spatial_basis='duchon'"
-        )
-    spatial = _biobank_duchon_pc_term(int(spec.pc_count), centers)
+    spatial = _biobank_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
     mean_terms = ["sex", "smooth(age_entry_std)", spatial]
     if spec.timewiggle_knots is not None:
         mean_terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
@@ -1900,16 +1917,14 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
         raise RuntimeError(
             f"survival method '{spec.name}' is missing survival_distribution"
         )
+    pc_count = int(spec.pc_count)
+    centers = int(spec.centers or 60)
+    pc_term = _biobank_pc_smooth_term(spec.spatial_basis, pc_count, centers)
     terms = [
         "pgs_std",
         "sex",
         "smooth(age_entry_std)",
-        "smooth(lat_final_std)",
-        "smooth(lon_final_std)",
-        "pc1_std",
-        "pc2_std",
-        "pc3_std",
-        "pc4_std",
+        pc_term,
         f"survmodel(spec=net, distribution={distribution})",
     ]
     if spec.mean_linkwiggle_knots is not None:
@@ -1969,35 +1984,40 @@ def write_survival_benchmark_csv(
 
 
 def mgcv_formula_classification(spec: MethodSpec) -> str:
-    terms = ["pgs_std", "sex", "s(age_entry_std, bs='ps', k=min(10, nrow(train_df)-1))"]
-    if spec.smooth_kind == "joint":
-        if spec.spatial_basis == "thinplate":
-            terms.append(f"s(lat_final_std, lon_final_std, bs='tp', k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
-        elif spec.spatial_basis == "duchon":
-            terms.append(f"s(lat_final_std, lon_final_std, bs='ds', k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
-        elif spec.spatial_basis == "matern":
-            terms.append(f"s(lat_final_std, lon_final_std, bs='gp', m=c(-4,1.0), k=min({int(spec.centers or 60)}, nrow(train_df)-1))")
-        else:
-            raise RuntimeError(f"unsupported mgcv joint basis '{spec.spatial_basis}'")
-    else:
-        terms.extend(
-            [
-                "s(lat_final_std, bs='ps', k=min(12, nrow(train_df)-1))",
-                "s(lon_final_std, bs='ps', k=min(12, nrow(train_df)-1))",
-            ]
-        )
-    terms.extend(f"pc{i}_std" for i in range(1, 17))
+    """mgcv classification formula: joint PC ancestry smooth, no lat/lon.
+
+    Mirrors the rust contract — the PCs enter as a single multi-D mgcv smooth
+    using the lane's `spatial_basis`, never as 16 independent linear terms.
+    Geographic coordinates are not predictors.
+    """
+    pc_count = int(spec.pc_count)
+    centers = int(spec.centers or 60)
+    pc_term = _mgcv_pc_smooth_term(spec.spatial_basis, pc_count, centers)
+    terms = [
+        "pgs_std",
+        "sex",
+        "s(age_entry_std, bs='ps', k=min(10, nrow(train_df)-1))",
+        pc_term,
+    ]
     return "phenotype ~ " + " + ".join(terms)
 
 
-def mgcv_survival_formula() -> str:
-    return (
-        "time ~ pgs_std + sex + "
-        "s(age_entry_std, bs='ps', k=min(10, nrow(train_df)-1)) + "
-        "s(lat_final_std, bs='ps', k=min(12, nrow(train_df)-1)) + "
-        "s(lon_final_std, bs='ps', k=min(12, nrow(train_df)-1)) + "
-        "pc1_std + pc2_std + pc3_std + pc4_std"
-    )
+def mgcv_survival_formula(spec: MethodSpec) -> str:
+    """mgcv survival formula: joint PC ancestry smooth, no lat/lon.
+
+    Built from `spec.spatial_basis`, `spec.centers`, and `spec.pc_count` —
+    not hardcoded — so YAML config flips actually take effect.
+    """
+    pc_count = int(spec.pc_count)
+    centers = int(spec.centers or 60)
+    pc_term = _mgcv_pc_smooth_term(spec.spatial_basis, pc_count, centers)
+    terms = [
+        "pgs_std",
+        "sex",
+        "s(age_entry_std, bs='ps', k=min(10, nrow(train_df)-1))",
+        pc_term,
+    ]
+    return "time ~ " + " + ".join(terms)
 
 
 def csv_numeric_column(path: Path, col: str) -> np.ndarray:
@@ -2243,7 +2263,7 @@ cat(jsonlite::toJSON(list(fit_sec=fit_sec, predict_sec=pred_sec), auto_unbox=TRU
 def run_r_mgcv_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir: Path) -> dict[str, Any]:
     if not tool_exists("Rscript"):
         raise RuntimeError("Rscript is required for mgcv survival methods")
-    formula = mgcv_survival_formula()
+    formula = mgcv_survival_formula(spec)
     script = f"""
 args <- commandArgs(trailingOnly = TRUE)
 train_path <- args[1]

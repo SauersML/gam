@@ -13,63 +13,57 @@
   "upsample_batch_size": 5000,
   "methods": [
     {
-      "name": "rust_gam_additive_tps60",
+      "name": "rust_gam_jointpc_tps60",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
       "spatial_basis": "thinplate",
       "centers": 60,
-      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
-      "name": "rust_gam_additive_duchon60",
+      "name": "rust_gam_jointpc_duchon60",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 60,
-      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
-      "name": "rust_gam_additive_matern60",
+      "name": "rust_gam_jointpc_matern60",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
       "spatial_basis": "matern",
       "centers": 60,
-      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
-      "name": "rust_gamlss_additive_duchon60",
+      "name": "rust_gamlss_jointpc_duchon60",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 60,
-      "smooth_kind": "separate",
       "include_sigma": true
     },
     {
-      "name": "r_mgcv_thinplate60",
+      "name": "r_mgcv_jointpc_thinplate60",
       "dataset": "disease",
       "backend": "r_mgcv",
       "family": "binomial",
       "spatial_basis": "thinplate",
       "centers": 60,
-      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
-      "name": "r_mgcv_duchon60",
+      "name": "r_mgcv_jointpc_duchon60",
       "dataset": "disease",
       "backend": "r_mgcv",
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 60,
-      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
@@ -79,7 +73,6 @@
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 24,
-      "smooth_kind": "joint",
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
@@ -89,13 +82,12 @@
       "max_centers": 32
     },
     {
-      "name": "r_mgcv_matern60",
+      "name": "r_mgcv_jointpc_matern60",
       "dataset": "disease",
       "backend": "r_mgcv",
       "family": "binomial",
       "spatial_basis": "matern",
       "centers": 60,
-      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
@@ -105,7 +97,6 @@
       "family": "survival",
       "spatial_basis": "duchon",
       "centers": 24,
-      "smooth_kind": "joint",
       "include_sigma": false,
       "survival_likelihood": "marginal-slope",
       "marginal_slope": true,
@@ -117,12 +108,12 @@
       "max_centers": 32
     },
     {
-      "name": "r_mgcv_survival_ps",
+      "name": "r_mgcv_survival_jointpc_duchon60",
       "dataset": "survival",
       "backend": "r_mgcv_survival",
       "family": "survival",
-      "spatial_basis": "ps",
-      "smooth_kind": "separate",
+      "spatial_basis": "duchon",
+      "centers": 60,
       "include_sigma": false
     }
   ]
