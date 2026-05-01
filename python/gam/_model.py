@@ -443,10 +443,11 @@ class Model:
                 row_ids=row_ids,
             )
 
+        out_columns_any: dict[str, list[Any]] = dict(columns)
         if id_column is not None:
-            columns = {id_column: row_ids or [], **columns}
+            out_columns_any = {id_column: list(row_ids or []), **out_columns_any}
         return restore_output_table(
-            columns,
+            out_columns_any,
             requested=return_type,
             input_kind=table_kind,
             training_kind=self._training_table_kind,
@@ -475,7 +476,7 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         if path is None:
-            return html
+            return str(html)
         Path(path).write_text(html, encoding="utf-8")
         return str(path)
 
@@ -815,7 +816,13 @@ def _coerce_matrix(value: Any) -> Any:
     return arr
 
 
-def _interpolate_rows(grid: Any, surface: Any, query: Any, *, clip: tuple) -> Any:
+def _interpolate_rows(
+    grid: Any,
+    surface: Any,
+    query: Any,
+    *,
+    clip: tuple[float | None, float | None],
+) -> Any:
     """Linear interpolation of each row of ``surface`` against ``grid``.
 
     ``grid`` — 1-D time grid (must be sorted for ``numpy.interp``; we
