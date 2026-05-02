@@ -12986,19 +12986,22 @@ where
 
     struct NBlockExactJointState<'d> {
         best_cost: f64,
+        best_theta: Option<Array1<f64>>,
         cache: ExactJointDesignCache<'d>,
     }
 
     impl<'d> NBlockExactJointState<'d> {
-        fn track_best(&mut self, _: &Array1<f64>, cost: f64) {
-            if cost < self.best_cost {
+        fn track_best(&mut self, theta: &Array1<f64>, cost: f64) {
+            if cost.is_finite() && cost < self.best_cost {
                 self.best_cost = cost;
+                self.best_theta = Some(theta.clone());
             }
         }
     }
 
     let mut state = NBlockExactJointState {
         best_cost: f64::INFINITY,
+        best_theta: None,
         cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
     };
 
@@ -13192,7 +13195,17 @@ where
             .map_err(|e| e.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
 
-    let theta_star = result.rho;
+    let theta_star = match state.best_theta.as_ref() {
+        Some(best_theta) if state.best_cost.is_finite() && state.best_cost < result.final_value => {
+            log::info!(
+                "[OUTER] n-block exact-joint spatial: using best evaluated theta cost={:.6e} over solver final cost={:.6e}",
+                state.best_cost,
+                result.final_value
+            );
+            best_theta.clone()
+        }
+        _ => result.rho,
+    };
 
     state.cache.ensure_theta(&theta_star)?;
 

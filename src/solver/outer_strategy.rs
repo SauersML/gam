@@ -2438,7 +2438,7 @@ pub struct OuterResult {
 const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
 const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
 const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
-const OPERATOR_DESCENT_ACCEPT_RADIUS: f64 = 1.0e-3;
+const OPERATOR_TRUST_RADIUS_REJECT_FLOOR: f64 = 1.0e-9;
 
 fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
     match bounds {
@@ -2821,13 +2821,9 @@ fn run_operator_trust_region(
         let act_dec = eval_k.cost - eval_trial.cost;
         let rho = act_dec / pred_dec;
         let accepted_by_ratio = rho > OPERATOR_ETA_ACCEPT;
-        let accepted_by_descent =
-            act_dec > 0.0 && act_dec.is_finite() && trust_radius <= OPERATOR_DESCENT_ACCEPT_RADIUS;
-        let accepted = accepted_by_ratio || accepted_by_descent;
+        let accepted = accepted_by_ratio;
         let new_trust_radius = if rho > 0.75 && s_norm > 0.99 * trust_radius {
             (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX)
-        } else if accepted_by_descent && !accepted_by_ratio {
-            (trust_radius * 0.5).max(1e-12)
         } else if rho < 0.25 {
             (trust_radius * 0.5).max(1e-12)
         } else {
@@ -2846,8 +2842,6 @@ fn run_operator_trust_region(
              hv_applies={} elapsed={:.3}s",
             if accepted_by_ratio {
                 "accepted"
-            } else if accepted_by_descent {
-                "accepted_descent"
             } else {
                 "rejected"
             },
@@ -2867,6 +2861,19 @@ fn run_operator_trust_region(
         if accepted {
             x_k = x_trial;
             eval_k = eval_trial;
+        } else if trust_radius <= OPERATOR_TRUST_RADIUS_REJECT_FLOOR {
+            let final_grad = projected_gradient(&x_k, &eval_k.gradient, bounds);
+            let final_grad_norm = final_grad.dot(&final_grad).sqrt();
+            return Ok(OuterResult {
+                rho: x_k,
+                final_value: eval_k.cost,
+                iterations: iter + 1,
+                final_grad_norm,
+                final_gradient: Some(eval_k.gradient),
+                final_hessian: None,
+                converged: false,
+                plan_used: plan,
+            });
         }
     }
 

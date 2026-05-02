@@ -1613,6 +1613,7 @@ fn run_fit_transformation_normal(
             frozen_covariate,
             solved.fit,
             &solved.family,
+            solved.score_calibration,
         );
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
@@ -7118,6 +7119,7 @@ fn build_transformation_normal_saved_model(
     resolved_covariate_spec: TermCollectionSpec,
     fit_result: UnifiedFitResult,
     family: &gam::families::transformation_normal::TransformationNormalFamily,
+    score_calibration: gam::inference::model::TransformationScoreCalibration,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -7144,6 +7146,7 @@ fn build_transformation_normal_saved_model(
     );
     payload.transformation_response_degree = Some(family.response_degree());
     payload.transformation_response_median = Some(family.response_median());
+    payload.transformation_score_calibration = Some(score_calibration);
     SavedModel::from_payload(payload)
 }
 
