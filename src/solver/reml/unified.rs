@@ -9399,6 +9399,20 @@ impl HessianOperator for MatrixFreeSpdOperator {
         -cross[[0, 1]]
     }
 
+    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
+        let n = matrices.len();
+        if n == 0 {
+            return Array2::zeros((0, 0));
+        }
+
+        let estimator = StochasticTraceEstimator::for_outer_hessian(self.n_dim, n);
+        let no_ops: [&dyn HyperOperator; 0] = [];
+        let mut cross =
+            estimator.estimate_second_order_traces_with_operators(self, matrices, &no_ops);
+        cross.mapv_inplace(|value| -value);
+        cross
+    }
+
     fn active_rank(&self) -> usize {
         self.n_dim
     }
