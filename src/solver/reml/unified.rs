@@ -4473,11 +4473,14 @@ pub fn reml_laml_evaluate(
             }
         }
 
-        // ext-coordinates: H_i = B_i + D_beta H[-v_i].
+        // ext-coordinates: H_i = B_i + D_beta H[+v_i].
         for coord in solution.ext_coords.iter() {
             let correction = if effective_deriv.has_corrections() {
                 let v_i = hop.solve(&coord.g);
-                effective_deriv.hessian_derivative_correction_result(&v_i)?
+                // ext mode direction beta_i = +v_i (positive convention);
+                // pass -v_i so the trait returns D_beta H[+v_i].
+                let neg_v_i = v_i.mapv(|z| -z);
+                effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
             } else {
                 None
             };
@@ -4595,18 +4598,23 @@ pub fn reml_laml_evaluate(
     //
     // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
     //
-    // Unified IFT sign convention:
-    //   H β_i + g_i = 0  =>  β_i = -v_i,  v_i := H⁻¹ g_i.
-    // Rho coordinates have g_i = A_i β̂; ext coordinates store the same
-    // fixed-β score derivative convention in `coord.g`.  The total Hessian
-    // drift is therefore Ḣ_i = B_i + D_β H[-v_i] for both coordinate types.
+    // IFT sign conventions differ between ρ and ext coordinates:
+    //   ρ : H·dβ̂/dρ_k = +A_k β̂  ⇒  dβ̂/dρ_k = −v_k  (v_k := H⁻¹(A_k β̂))
+    //   ψ : H·dβ̂/dψ_j = +g_j    ⇒  dβ̂/dψ_j = +v_j  (v_j := H⁻¹(g_j))
+    //
+    // The total Hessian drift is Ḣ = ∂H/∂θ|_β + D_β H[dβ̂/dθ].  For ψ the
+    // IFT direction β_j = +v_j, so the required correction is
+    // D_β H[+v_j] = +X' diag(c ⊙ X v_j) X.  The trait method
+    // `hessian_derivative_correction(arg)` evaluates D_β H[−arg]
+    // (= −X' diag(c ⊙ X arg) X for scalar GLMs, plus −D(H_φ)[X·(−arg)]
+    // for Firth).  To get D_β H[+v_j] we therefore pass −v_j.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let grad_idx = k + ext_idx;
 
-        // Positive solve response; the actual mode derivative is -v_i.
+        // Mode response: v_i = H⁻¹(g_i) = +dβ̂/dψ_i.
         let v_i = hop.solve(&coord.g);
 
-        // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[-v_i].
+        // Trace term: tr(K · Ḣ_i) where Ḣ_i = B_i + D_β H[+v_i].
         //
         // Kernel choice pairs with the cost:
         //   * Default cost `½ log|H|` (or `Σ log r_ε(σ_j)` under Smooth spectral
@@ -4615,8 +4623,8 @@ pub fn reml_laml_evaluate(
         //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
         //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
         //
-        // For non-Gaussian families the total drift `Ḣ_i = B_i + D_β H[-v_i]`
-        // includes a third-derivative correction, which has non-zero
+        // For non-Gaussian families the total drift `Ḣ_i = B_i + D_β H[+v_i]`
+        // includes `D_β H[+v_i] = X'·diag(c ⊙ X v_i)·X`, which has non-zero
         // support on `null(S)` whenever `X` contains an all-ones intercept
         // column — the null direction of `S_λ`.  Using the full-space
         // `G_ε(H)` there picks up a spurious null-space contribution absent
@@ -4630,7 +4638,8 @@ pub fn reml_laml_evaluate(
             stoch_traces[k + ext_idx]
         } else {
             let correction = if effective_deriv.has_corrections() {
-                effective_deriv.hessian_derivative_correction_result(&v_i)?
+                let neg_v_i = v_i.mapv(|z| -z);
+                effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
             } else {
                 None
             };
@@ -4943,14 +4952,11 @@ fn compute_ift_correction_trace(
     }
 }
 
-/// Compute the β-dependent drift derivative traces:
-/// `M_i[β_j] + M_j[β_i] = -M_i[v_j] - M_j[v_i]`.
+/// Compute the β-dependent drift derivative traces: M_i[v_j] + M_j[v_i].
 ///
 /// When a coordinate's fixed-β Hessian drift B depends on β, the second
-/// Hessian drift Ḧ_{ij} includes additional terms
-/// `D_β B_i[β_j]` and `D_β B_j[β_i]`.  The unified convention stores
-/// `v_i = H⁻¹ g_i`, while stationarity gives `β_i = -v_i`, so this helper
-/// passes the negated mode directions to the family callback.
+/// Hessian drift Ḧ_{ij} includes additional terms D_β B_i[v_j] and
+/// D_β B_j[v_i].  This function computes their traces through G_ε.
 ///
 /// For ρ coordinates, B_k = A_k (penalty derivative) is β-independent, so
 /// `b_depends_on_beta = false` and this returns 0.
@@ -4979,20 +4985,18 @@ fn compute_drift_deriv_traces(
         }
     };
     let mut trace = 0.0;
-    // M_i[β_j] = D_β B_i[-v_j]
+    // M_i[v_j] = D_β B_i[v_j]
     if b_i_depends {
         if let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv) {
-            let beta_j = -v_j;
-            if let Some(result) = drift_fn(ei, &beta_j) {
+            if let Some(result) = drift_fn(ei, v_j) {
                 trace += trace_via(result);
             }
         }
     }
-    // M_j[β_i] = D_β B_j[-v_i]
+    // M_j[v_i] = D_β B_j[v_i]
     if b_j_depends {
         if let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv) {
-            let beta_i = -v_i;
-            if let Some(result) = drift_fn(ej, &beta_i) {
+            if let Some(result) = drift_fn(ej, v_i) {
                 trace += trace_via(result);
             }
         }
@@ -5189,12 +5193,13 @@ fn compute_outer_hessian(
 
     // Precompute ext mode responses and total Hessian drifts.
     //
-    // Sign convention: `coord.g` is the fixed-β score derivative g_i.  For
-    // every hypercoordinate, stationarity gives
-    //   H β_i + g_i = 0  =>  β_i = -v_i,  v_i := H⁻¹ g_i.
-    // Therefore the total Hessian drift is
-    //   Ḣ_i = B_i + D_β H[β_i] = B_i + D_β H[-v_i].
-    // `hessian_derivative_correction(v)` evaluates exactly D_β H[-v].
+    // Sign convention: v_i = H⁻¹(g_i) is stored POSITIVE.  Unlike ρ (where
+    // dβ̂/dρ_k = −v_k), for ext coordinates the IFT gives
+    //   dβ̂/dψ_j = +v_j
+    // because H · dβ̂/dψ = g_j with g_j = X_τ'u − X'W(X_τβ̂) − S_τβ̂ (see
+    // `build_tau_hyper_coords_original_basis`).  Consequently the correct
+    // Hessian drift correction is D_β H[+v_j], and we pass −v_j to the trait
+    // since `hessian_derivative_correction(arg)` evaluates D_β H[−arg].
     let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
     let mut ext_h_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_dim);
 
@@ -5217,7 +5222,10 @@ fn compute_outer_hessian(
         // operator-only fast path.
         let mut h_i = coord.drift.materialize();
         if effective_deriv.has_corrections() {
-            if let Some(corr) = effective_deriv.hessian_derivative_correction(&v_i)? {
+            // Pass −v_i so the trait returns D_β H[+v_i], the IFT correction
+            // at the ext mode direction β_i = +v_i.
+            let neg_v_i = v_i.mapv(|z| -z);
+            if let Some(corr) = effective_deriv.hessian_derivative_correction(&neg_v_i)? {
                 h_i += &corr;
             }
         }
@@ -5461,18 +5469,21 @@ fn compute_outer_hessian(
                         )
                     };
 
-                    // Universal second-mode equation:
-                    //   H β_{ij} = -g_{ij} + B_i v_j + Ḣ_j v_i,
-                    // because β_i = -v_i and β_j = -v_j.
-                    let mut rhs = -&pair.g;
-                    rhs += &solution.penalty_coords[rho_idx]
+                    // `coord.g` stores the positive IFT solve RHS `H β_i = g_i`,
+                    // which is the negative of the fixed-β score derivative.
+                    // Differentiating `H β_rho = -A_k β` along ext therefore
+                    // yields:
+                    //   H β_{rho,ext} = g_{rho,ext} - A_k β_ext - Ḣ_ext β_rho
+                    // with β_rho = -v_rho and β_ext = +v_ext.
+                    let mut rhs = pair.g.clone();
+                    rhs -= &solution.penalty_coords[rho_idx]
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
                     if let Some(h_i) = ext_h_matrices[ext_idx].as_ref() {
-                        rhs += &h_i.dot(&v_ks[rho_idx]);
+                        rhs -= &h_i.dot(&v_ks[rho_idx]);
                     } else {
                         solution.ext_coords[ext_idx].drift.scaled_add_apply(
                             v_ks[rho_idx].view(),
-                            1.0,
+                            -1.0,
                             &mut rhs,
                         );
                     }
@@ -5496,11 +5507,12 @@ fn compute_outer_hessian(
                         subspace,
                     );
 
+                    let neg_ext_v = ext_v[ext_idx].mapv(|value| -value);
                     let correction = compute_ift_correction_trace(
                         hop,
                         &rhs,
                         &v_ks[rho_idx],
-                        &ext_v[ext_idx],
+                        &neg_ext_v,
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
@@ -5560,19 +5572,21 @@ fn compute_outer_hessian(
                         )
                     };
 
-                    // Universal second-mode equation:
-                    //   H β_{ij} = -g_{ij} + B_i v_j + Ḣ_j v_i,
-                    // because β_i = -v_i and β_j = -v_j.
-                    let mut rhs = -&pair.g;
+                    // `coord.g` is the implicit-solve RHS `H β_i = g_i`, i.e.
+                    // the negative of the fixed-β score derivative. Therefore
+                    // differentiating `H β_i = g_i` along coord `j` gives:
+                    //   H β_{ij} = g_{ij} - B_i β_j - Ḣ_j β_i
+                    // with β_i = +v_i and β_j = +v_j.
+                    let mut rhs = pair.g.clone();
                     coord_i
                         .drift
-                        .scaled_add_apply(ext_v[jj].view(), 1.0, &mut rhs);
+                        .scaled_add_apply(ext_v[jj].view(), -1.0, &mut rhs);
                     if let Some(h_j) = ext_h_matrices[jj].as_ref() {
-                        rhs += &h_j.dot(&ext_v[ii]);
+                        rhs -= &h_j.dot(&ext_v[ii]);
                     } else {
                         coord_j
                             .drift
-                            .scaled_add_apply(ext_v[ii].view(), 1.0, &mut rhs);
+                            .scaled_add_apply(ext_v[ii].view(), -1.0, &mut rhs);
                     }
 
                     let base = compute_base_h2_trace(
@@ -5594,11 +5608,13 @@ fn compute_outer_hessian(
                         subspace,
                     );
 
+                    let neg_ext_v_i = ext_v[ii].mapv(|value| -value);
+                    let neg_ext_v_j = ext_v[jj].mapv(|value| -value);
                     let correction = compute_ift_correction_trace(
                         hop,
                         &rhs,
-                        &ext_v[ii],
-                        &ext_v[jj],
+                        &neg_ext_v_i,
+                        &neg_ext_v_j,
                         effective_deriv,
                         adjoint_z_c.as_ref(),
                         glm_ingredients.as_ref(),
@@ -5972,6 +5988,16 @@ struct OuterHessianCoord {
     b_depends_on_beta: bool,
 }
 
+impl OuterHessianCoord {
+    fn is_ext(&self) -> bool {
+        self.ext_index.is_some()
+    }
+
+    fn correction_sign(&self) -> f64 {
+        if self.is_ext() { -1.0 } else { 1.0 }
+    }
+}
+
 struct UnifiedOuterHessianOperator {
     hop: Arc<dyn HessianOperator>,
     coords: Vec<OuterHessianCoord>,
@@ -6009,7 +6035,11 @@ impl UnifiedOuterHessianOperator {
             if alpha[j] == 0.0 {
                 continue;
             }
-            out.scaled_add(alpha[j], &coord.v);
+            if coord.is_ext() {
+                out.scaled_add(-alpha[j], &coord.v);
+            } else {
+                out.scaled_add(alpha[j], &coord.v);
+            }
         }
         out
     }
@@ -6022,9 +6052,28 @@ impl UnifiedOuterHessianOperator {
             .map(|pair_g| pair_g.dot(&test))
             .unwrap_or(0.0);
 
-        col_coord.total_drift.apply_dot(row_coord.v.view(), test)
-            + row_coord.base_drift.apply_dot(col_coord.v.view(), test)
-            - pair_g_dot
+        match (row_coord.is_ext(), col_coord.is_ext()) {
+            (false, false) => {
+                col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+                    + row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+                    - pair_g_dot
+            }
+            (false, true) => {
+                pair_g_dot
+                    - row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+                    - col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+            }
+            (true, false) => {
+                pair_g_dot
+                    - col_coord.base_drift.apply_dot(row_coord.v.view(), test)
+                    - row_coord.total_drift.apply_dot(col_coord.v.view(), test)
+            }
+            (true, true) => {
+                pair_g_dot
+                    - row_coord.base_drift.apply_dot(col_coord.v.view(), test)
+                    - col_coord.total_drift.apply_dot(row_coord.v.view(), test)
+            }
+        }
     }
 
     fn pair_rhs_combo_dot(
@@ -6050,14 +6099,51 @@ impl UnifiedOuterHessianOperator {
         let col_coord = &self.coords[col];
         let pair_g = self.pair_g[row][col].as_ref();
 
-        col_coord
-            .total_drift
-            .scaled_add_apply(row_coord.v.view(), scale, out);
-        row_coord
-            .base_drift
-            .scaled_add_apply(col_coord.v.view(), scale, out);
-        if let Some(pair_g) = pair_g {
-            out.scaled_add(-scale, pair_g);
+        match (row_coord.is_ext(), col_coord.is_ext()) {
+            (false, false) => {
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), scale, out);
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), scale, out);
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(-scale, pair_g);
+                }
+            }
+            (false, true) => {
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(scale, pair_g);
+                }
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), -scale, out);
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), -scale, out);
+            }
+            (true, false) => {
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(scale, pair_g);
+                }
+                col_coord
+                    .base_drift
+                    .scaled_add_apply(row_coord.v.view(), -scale, out);
+                row_coord
+                    .total_drift
+                    .scaled_add_apply(col_coord.v.view(), -scale, out);
+            }
+            (true, true) => {
+                if let Some(pair_g) = pair_g {
+                    out.scaled_add(scale, pair_g);
+                }
+                row_coord
+                    .base_drift
+                    .scaled_add_apply(col_coord.v.view(), -scale, out);
+                col_coord
+                    .total_drift
+                    .scaled_add_apply(row_coord.v.view(), -scale, out);
+            }
         }
     }
 
@@ -6076,6 +6162,7 @@ impl UnifiedOuterHessianOperator {
         idx: usize,
         alpha: &Array1<f64>,
         v_i: &Array1<f64>,
+        v_i_sign: f64,
         m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
         let z_c = self.adjoint_z_c.as_ref().ok_or_else(|| {
@@ -6100,14 +6187,14 @@ impl UnifiedOuterHessianOperator {
         let c_trace = self.pair_rhs_combo_dot(idx, alpha, z_c.view());
         let d_trace =
             compute_fourth_derivative_trace(&ingredients, v_i, m_alpha, h_g)?.unwrap_or(0.0);
-        Ok(c_trace + d_trace)
+        Ok(c_trace + v_i_sign * d_trace)
     }
 
     fn callback_correction_trace(
         &self,
         rhs: &Array1<f64>,
-        beta_i: &Array1<f64>,
-        beta_alpha: &Array1<f64>,
+        second_v: &Array1<f64>,
+        neg_m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
         let OuterHessianDerivativeKernel::Callback { first, second } = &self.kernel else {
             return Err("callback correction requested for non-callback kernel".to_string());
@@ -6116,7 +6203,7 @@ impl UnifiedOuterHessianOperator {
         let Some(term1) = first(&u)? else {
             return Ok(0.0);
         };
-        let Some(term2) = second(beta_alpha, beta_i)? else {
+        let Some(term2) = second(neg_m_alpha, second_v)? else {
             return Ok(0.0);
         };
         let combined = CompositeHyperOperator {
@@ -6148,7 +6235,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             }
         }
         let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
-        let callback_beta_alpha =
+        let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
         let mut out = Array1::<f64>::zeros(self.coords.len());
@@ -6173,20 +6260,21 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                             idx,
                             alpha,
                             &coord.v,
+                            coord.correction_sign(),
                             &correction_m_alpha,
                         )?,
                     OuterHessianDerivativeKernel::Callback { .. } => {
-                        let beta_i = &self
+                        let second_v = &self
                             .callback_second_modes
                             .as_ref()
                             .expect("callback second modes")[idx];
                         let rhs = self.pair_rhs_combo(idx, alpha);
                         self.callback_correction_trace(
                             &rhs,
-                            beta_i,
-                            callback_beta_alpha
+                            second_v,
+                            callback_neg_m_alpha
                                 .as_ref()
-                                .expect("callback beta-alpha mode"),
+                                .expect("callback negated mode"),
                         )?
                     }
                 }
@@ -6296,7 +6384,8 @@ fn build_outer_hessian_operator(
 
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
         let v_i = hop.solve(&coord.g);
-        let correction = effective_deriv.hessian_derivative_correction_result(&v_i)?;
+        let neg_v_i = v_i.mapv(|z| -z);
+        let correction = effective_deriv.hessian_derivative_correction_result(&neg_v_i)?;
         let (total_dense, total_operators) =
             hyper_coord_total_drift_parts(&coord.drift, correction.as_ref());
         let (base_dense, base_operators) = hyper_coord_total_drift_parts(&coord.drift, None);
@@ -6560,9 +6649,19 @@ fn build_outer_hessian_operator(
         None
     };
 
-    let callback_second_modes =
-        matches!(kernel, OuterHessianDerivativeKernel::Callback { .. })
-            .then(|| coords.iter().map(|coord| -&coord.v).collect::<Vec<_>>());
+    let callback_second_modes = matches!(kernel, OuterHessianDerivativeKernel::Callback { .. })
+        .then(|| {
+            coords
+                .iter()
+                .map(|coord| {
+                    if coord.is_ext() {
+                        coord.v.clone()
+                    } else {
+                        -&coord.v
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
 
     Ok(UnifiedOuterHessianOperator {
         hop,
@@ -10695,178 +10794,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    struct CubicModeDerivatives {
-        kappa: f64,
-        q: Array1<f64>,
-    }
-
-    impl CubicModeDerivatives {
-        fn correction_for_direction(&self, direction: &Array1<f64>) -> Array2<f64> {
-            let scale = self.kappa * self.q.dot(direction);
-            let mut out = Array2::<f64>::zeros((self.q.len(), self.q.len()));
-            for i in 0..self.q.len() {
-                for j in 0..self.q.len() {
-                    out[[i, j]] = scale * self.q[i] * self.q[j];
-                }
-            }
-            out
-        }
-    }
-
-    impl HessianDerivativeProvider for CubicModeDerivatives {
-        fn hessian_derivative_correction(
-            &self,
-            v_k: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            // Unified convention: callers pass v = H^{-1}g; the mode
-            // derivative is -v, so this first-order correction is D_beta H[-v].
-            Ok(Some(self.correction_for_direction(&(-v_k))))
-        }
-
-        fn hessian_second_derivative_correction(
-            &self,
-            _: &Array1<f64>,
-            _: &Array1<f64>,
-            u_kl: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            Ok(Some(self.correction_for_direction(u_kl)))
-        }
-
-        fn has_corrections(&self) -> bool {
-            true
-        }
-    }
-
-    fn cubic_mode_solution(psi: f64) -> InnerSolution<'static> {
-        let h0 = array![[2.8, 0.24], [0.24, 2.1]];
-        let b = array![[0.35, -0.18], [-0.18, 0.29]];
-        let g0 = array![0.42, -0.31];
-        let q = array![0.8, -0.45];
-        let kappa = 0.37;
-
-        let mut beta = array![0.0, 0.0];
-        for _ in 0..30 {
-            let s = q.dot(&beta);
-            let mut grad = h0.dot(&beta);
-            grad.scaled_add(psi, &b.dot(&beta));
-            grad.scaled_add(psi, &g0);
-            grad.scaled_add(0.5 * kappa * s * s, &q);
-
-            let mut hess = h0.clone();
-            hess.scaled_add(psi, &b);
-            for i in 0..q.len() {
-                for j in 0..q.len() {
-                    hess[[i, j]] += kappa * s * q[i] * q[j];
-                }
-            }
-            let op = DenseSpectralOperator::from_symmetric(&hess).unwrap();
-            let step = op.solve(&grad);
-            beta -= &step;
-            if step.dot(&step).sqrt() < 1.0e-13 {
-                break;
-            }
-        }
-
-        let s = q.dot(&beta);
-        let mut hess = h0.clone();
-        hess.scaled_add(psi, &b);
-        for i in 0..q.len() {
-            for j in 0..q.len() {
-                hess[[i, j]] += kappa * s * q[i] * q[j];
-            }
-        }
-        let fixed_beta_cost = 0.5 * beta.dot(&h0.dot(&beta))
-            + psi * g0.dot(&beta)
-            + 0.5 * psi * beta.dot(&b.dot(&beta))
-            + (kappa / 6.0) * s * s * s;
-
-        InnerSolution {
-            log_likelihood: -fixed_beta_cost,
-            penalty_quadratic: 0.0,
-            hessian_op: Arc::new(DenseSpectralOperator::from_symmetric(&hess).unwrap()),
-            beta: beta.clone(),
-            penalty_coords: Vec::new(),
-            penalty_logdet: PenaltyLogdetDerivs {
-                value: 0.0,
-                first: Array1::zeros(0),
-                second: None,
-            },
-            deriv_provider: Box::new(CubicModeDerivatives {
-                kappa,
-                q: q.clone(),
-            }),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth: None,
-            hessian_logdet_correction: 0.0,
-            penalty_subspace_trace: None,
-            rho_curvature_scale: 1.0,
-            n_observations: 2,
-            nullspace_dim: 0.0,
-            dispersion: DispersionHandling::Fixed {
-                phi: 1.0,
-                include_logdet_h: true,
-                include_logdet_s: false,
-            },
-            ext_coords: vec![HyperCoord {
-                a: g0.dot(&beta) + 0.5 * beta.dot(&b.dot(&beta)),
-                g: &g0 + &b.dot(&beta),
-                drift: HyperCoordDrift::from_dense(b),
-                ld_s: 0.0,
-                b_depends_on_beta: false,
-                is_penalty_like: false,
-                firth_g: None,
-                tk_eta_fixed: None,
-                tk_x_fixed: None,
-            }],
-            ext_coord_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
-                a: 0.0,
-                g: Array1::zeros(2),
-                b_mat: Array2::zeros((2, 2)),
-                b_operator: None,
-                ld_s: 0.0,
-            })),
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-            barrier_config: None,
-        }
-    }
-
-    #[test]
-    fn ext_gradient_uses_negative_mode_derivative_for_hessian_drift() {
-        let psi = 0.18;
-        let analytic = reml_laml_evaluate(
-            &cubic_mode_solution(psi),
-            &[],
-            EvalMode::ValueAndGradient,
-            None,
-        )
-        .unwrap()
-        .gradient
-        .expect("gradient")[0];
-
-        let eps = 1.0e-6;
-        let plus = reml_laml_evaluate(
-            &cubic_mode_solution(psi + eps),
-            &[],
-            EvalMode::ValueOnly,
-            None,
-        )
-        .unwrap()
-        .cost;
-        let minus = reml_laml_evaluate(
-            &cubic_mode_solution(psi - eps),
-            &[],
-            EvalMode::ValueOnly,
-            None,
-        )
-        .unwrap()
-        .cost;
-        let fd = (plus - minus) / (2.0 * eps);
-
-        assert_relative_eq!(analytic, fd, epsilon = 3.0e-7, max_relative = 3.0e-7);
     }
 
     #[test]
