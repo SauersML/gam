@@ -19048,6 +19048,9 @@ pub mod closed_form_penalty {
         bare_d2_eta_kappa: &mut [f64],
         bare_d2_kappa: &mut f64,
         scale: f64,
+        scratch_dt1_eta: &mut [f64],
+        scratch_dtq_eta: &mut [f64],
+        scratch_d2tq_eta_diag: &mut [f64],
     ) {
         let half_d = d as f64 / 2.0;
         let log_4pi = (4.0 * std::f64::consts::PI).ln();
@@ -19060,19 +19063,23 @@ pub mod closed_form_penalty {
         let two_tau_cu = 2.0 * tau * tau * tau;
 
         let mut t1_value = 0.0_f64;
-        let mut dt1_eta = vec![0.0_f64; d];
-        let mut d2t1_eta_diag = vec![0.0_f64; d];
         for k in 0..d {
             let zk = z[k];
             let bk = b[k];
             t1_value += bk * (1.0 / two_tau - zk * zk / four_tau_sq);
-            dt1_eta[k] = bk * (zk * zk / (tau * tau) - 1.0 / tau);
-            d2t1_eta_diag[k] = 2.0 * bk / tau - 4.0 * bk * zk * zk / (tau * tau);
+            let dt1 = bk * (zk * zk / (tau * tau) - 1.0 / tau);
+            scratch_dt1_eta[k] = dt1;
+            scratch_dtq_eta[k] = dt1;
+            scratch_d2tq_eta_diag[k] = 2.0 * bk / tau - 4.0 * bk * zk * zk / (tau * tau);
         }
 
-        let (t_val, dtq_eta, d2tq_eta_diag) = match q {
-            0 => (1.0_f64, vec![0.0_f64; d], vec![0.0_f64; d]),
-            1 => (t1_value, dt1_eta.clone(), d2t1_eta_diag.clone()),
+        let t_val = match q {
+            0 => {
+                scratch_dtq_eta.fill(0.0);
+                scratch_d2tq_eta_diag.fill(0.0);
+                1.0_f64
+            }
+            1 => t1_value,
             2 => {
                 let mut sum_extra = 0.0_f64;
                 for k in 0..d {
@@ -19081,21 +19088,20 @@ pub mod closed_form_penalty {
                     sum_extra += bk * bk * (1.0 / two_tau_sq - zk * zk / two_tau_cu);
                 }
                 let t2_val = t1_value * t1_value + sum_extra;
-                let mut dt2 = vec![0.0_f64; d];
-                let mut d2t2_diag = vec![0.0_f64; d];
                 for k in 0..d {
                     let zk = z[k];
                     let bk = b[k];
+                    let dt1 = scratch_dt1_eta[k];
+                    let d2t1 = scratch_d2tq_eta_diag[k];
                     let extra_first =
                         -2.0 * bk * bk / (tau * tau) + 3.0 * bk * bk * zk * zk / (tau * tau * tau);
-                    dt2[k] = 2.0 * t1_value * dt1_eta[k] + extra_first;
+                    scratch_dtq_eta[k] = 2.0 * t1_value * dt1 + extra_first;
                     let extra_second =
                         8.0 * bk * bk / (tau * tau) - 18.0 * bk * bk * zk * zk / (tau * tau * tau);
-                    d2t2_diag[k] = 2.0 * dt1_eta[k] * dt1_eta[k]
-                        + 2.0 * t1_value * d2t1_eta_diag[k]
-                        + extra_second;
+                    scratch_d2tq_eta_diag[k] =
+                        2.0 * dt1 * dt1 + 2.0 * t1_value * d2t1 + extra_second;
                 }
-                (t2_val, dt2, d2t2_diag)
+                t2_val
             }
             _ => panic!("aniso_integrand_derivs_at_tau: q must be in {{0,1,2}}"),
         };
@@ -19129,7 +19135,7 @@ pub mod closed_form_penalty {
 
         for k in 0..d {
             let zk_sq = z[k] * z[k];
-            let h_term_k = (zk_sq / two_tau) * h * t_val + h * dtq_eta[k];
+            let h_term_k = (zk_sq / two_tau) * h * t_val + h * scratch_dtq_eta[k];
             bare_d_eta[k] += scale * w * h_term_k;
             bare_d2_eta_kappa[k] += scale * dw_dkappa * h_term_k;
         }
@@ -19139,15 +19145,15 @@ pub mod closed_form_penalty {
             for l in 0..d {
                 let zl_sq = z[l] * z[l];
                 let d2t_kl = if k == l {
-                    d2tq_eta_diag[k]
+                    scratch_d2tq_eta_diag[k]
                 } else {
-                    cross_t_factor * dt1_eta[k] * dt1_eta[l]
+                    cross_t_factor * scratch_dt1_eta[k] * scratch_dt1_eta[l]
                 };
                 let kron = if k == l { 1.0 } else { 0.0 };
                 let bracket = -kron * zk_sq / tau * t_val
                     + zk_sq * zl_sq / four_tau_sq * t_val
-                    + zk_sq / two_tau * dtq_eta[l]
-                    + zl_sq / two_tau * dtq_eta[k]
+                    + zk_sq / two_tau * scratch_dtq_eta[l]
+                    + zl_sq / two_tau * scratch_dtq_eta[k]
                     + d2t_kl;
                 bare_d2_eta[k * d + l] += scale * w * h * bracket;
             }
@@ -19209,6 +19215,9 @@ pub mod closed_form_penalty {
         let mut bare_d2_eta = vec![0.0_f64; d * d];
         let mut bare_d2_eta_kappa = vec![0.0_f64; d];
         let mut bare_d2_kappa = 0.0_f64;
+        let mut scratch_dt1_eta = vec![0.0_f64; d];
+        let mut scratch_dtq_eta = vec![0.0_f64; d];
+        let mut scratch_d2tq_eta_diag = vec![0.0_f64; d];
 
         for window in split_ys.windows(2) {
             let y_a = window[0];
@@ -19236,6 +19245,9 @@ pub mod closed_form_penalty {
                     &mut bare_d2_eta_kappa,
                     &mut bare_d2_kappa,
                     scale,
+                    &mut scratch_dt1_eta,
+                    &mut scratch_dtq_eta,
+                    &mut scratch_d2tq_eta_diag,
                 );
             }
         }
