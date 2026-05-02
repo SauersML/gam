@@ -2772,33 +2772,33 @@ fn run_operator_trust_region(
             continue;
         }
 
-        let eval_trial = match obj.eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)
-        {
-            Ok(eval) => match finite_outer_eval_or_error("outer operator eval failed", layout, eval)
-            {
-                Ok(eval) => eval,
-                Err(ObjectiveEvalError::Recoverable { message }) => {
-                    let elapsed = iter_start.elapsed().as_secs_f64();
-                    log::info!(
-                        "[ARC-timing] iter={iter} status=infeasible_trial cost={:.6e} \
-                         grad_norm={:.3e} pred_dec={:.3e} trust_radius={:.3e}->{:.3e} \
-                         hv_applies={} elapsed={:.3}s reason={}",
-                        eval_k.cost,
-                        g_norm,
-                        pred_dec,
-                        trust_radius,
-                        (trust_radius * 0.25).max(1e-12),
-                        counter.count(),
-                        elapsed,
-                        message,
-                    );
-                    trust_radius = (trust_radius * 0.25).max(1e-12);
-                    continue;
+        let eval_trial = match obj.eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian) {
+            Ok(eval) => {
+                match finite_outer_eval_or_error("outer operator eval failed", layout, eval) {
+                    Ok(eval) => eval,
+                    Err(ObjectiveEvalError::Recoverable { message }) => {
+                        let elapsed = iter_start.elapsed().as_secs_f64();
+                        log::info!(
+                            "[ARC-timing] iter={iter} status=infeasible_trial cost={:.6e} \
+                             grad_norm={:.3e} pred_dec={:.3e} trust_radius={:.3e}->{:.3e} \
+                             hv_applies={} elapsed={:.3}s reason={}",
+                            eval_k.cost,
+                            g_norm,
+                            pred_dec,
+                            trust_radius,
+                            (trust_radius * 0.25).max(1e-12),
+                            counter.count(),
+                            elapsed,
+                            message,
+                        );
+                        trust_radius = (trust_radius * 0.25).max(1e-12);
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(EstimationError::RemlOptimizationFailed(message));
+                    }
                 }
-                Err(ObjectiveEvalError::Fatal { message }) => {
-                    return Err(EstimationError::RemlOptimizationFailed(message));
-                }
-            },
+            }
             Err(err) => {
                 let elapsed = iter_start.elapsed().as_secs_f64();
                 log::info!(
@@ -2821,9 +2821,8 @@ fn run_operator_trust_region(
         let act_dec = eval_k.cost - eval_trial.cost;
         let rho = act_dec / pred_dec;
         let accepted_by_ratio = rho > OPERATOR_ETA_ACCEPT;
-        let accepted_by_descent = act_dec > 0.0
-            && act_dec.is_finite()
-            && trust_radius <= OPERATOR_DESCENT_ACCEPT_RADIUS;
+        let accepted_by_descent =
+            act_dec > 0.0 && act_dec.is_finite() && trust_radius <= OPERATOR_DESCENT_ACCEPT_RADIUS;
         let accepted = accepted_by_ratio || accepted_by_descent;
         let new_trust_radius = if rho > 0.75 && s_norm > 0.99 * trust_radius {
             (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX)
