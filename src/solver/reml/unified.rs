@@ -5126,7 +5126,10 @@ fn compute_base_h2_traces(
     if pairs.is_empty() {
         return Vec::new();
     }
-    if subspace.is_none() && hop.logdet_traces_match_hinv_kernel() {
+    if subspace.is_none()
+        && hop.prefers_stochastic_trace_estimation()
+        && hop.logdet_traces_match_hinv_kernel()
+    {
         let mut out = vec![0.0; pairs.len()];
         let mut dense_refs: Vec<&Array2<f64>> = Vec::new();
         let mut dense_slots = Vec::new();

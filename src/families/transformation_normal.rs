@@ -7346,6 +7346,7 @@ mod tests {
         assert!(op.is_implicit());
         let p = state.beta.len();
         assert_eq!(op.dim(), p);
+        assert!(op.has_fast_bilinear_view());
 
         let dense = op.to_dense();
         assert_eq!(dense.nrows(), p);
@@ -7381,6 +7382,18 @@ mod tests {
                 );
             }
         }
+
+        let left = toy_probe_vector(p, 905);
+        let right = toy_probe_vector(p, 906);
+        let got_bilinear = op.bilinear_view(left.view(), right.view());
+        let want_bilinear = right.dot(&dense.dot(&left));
+        let tol = 1e-10 * want_bilinear.abs().max(1.0) + 1e-10;
+        assert!(
+            (got_bilinear - want_bilinear).abs() <= tol,
+            "psi-psi operator bilinear mismatch: got={:.6e}, want={:.6e}",
+            got_bilinear,
+            want_bilinear
+        );
     }
 
     #[test]
