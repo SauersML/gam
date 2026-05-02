@@ -462,7 +462,13 @@ where
     if dim == 0 {
         return Ok(0.0);
     }
-    if dim <= 128 {
+    // For moderate operator dimensions, exact materialization is faster and
+    // more accurate than SLQ. A p=162 marginal-slope Hessian, for example,
+    // costs 162 Hessian matvecs plus a small Cholesky here; the SLQ branch
+    // would use roughly 48 probes × 32 Lanczos steps = 1536 matvecs.
+    // The dense matrix at p=1024 is only 8 MiB, so this still avoids OOM
+    // while cutting biobank-scale outer-eval wallclock substantially.
+    if dim <= 1024 {
         let mut matrix = materialize_symmetric_operator(dim, &apply)?;
         // Symmetrize defensively: matrix-free operator residuals can introduce
         // small asymmetry that trips Cholesky on otherwise-PSD systems.
@@ -494,7 +500,7 @@ where
                     logdet += clipped.ln();
                 }
                 log::warn!(
-                    "[STAGE] SLQ tiny-system Cholesky failed (dim={dim}); recovered \
+                    "[STAGE] SLQ small-system Cholesky failed (dim={dim}); recovered \
                      logdet via symmetric eigendecomposition with positive-eigenvalue \
                      floor {floor:.3e} (max|λ|={max_abs:.3e})"
                 );
