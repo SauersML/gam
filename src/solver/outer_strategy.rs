@@ -2438,6 +2438,7 @@ pub struct OuterResult {
 const OPERATOR_TRUST_RADIUS_INIT: f64 = 1.0;
 const OPERATOR_TRUST_RADIUS_MAX: f64 = 1.0e6;
 const OPERATOR_ETA_ACCEPT: f64 = 1.0e-4;
+const OPERATOR_DESCENT_ACCEPT_RADIUS: f64 = 1.0e-3;
 
 fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
     match bounds {
@@ -2771,21 +2772,63 @@ fn run_operator_trust_region(
             continue;
         }
 
-        let eval_trial = obj.eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)?;
-        let eval_trial =
-            finite_outer_eval_or_error("outer operator eval failed", layout, eval_trial).map_err(
-                |err| match err {
-                    ObjectiveEvalError::Recoverable { message }
-                    | ObjectiveEvalError::Fatal { message } => {
-                        EstimationError::RemlOptimizationFailed(message)
-                    }
-                },
-            )?;
+        let eval_trial = match obj.eval_with_order(&x_trial, OuterEvalOrder::ValueGradientHessian)
+        {
+            Ok(eval) => match finite_outer_eval_or_error("outer operator eval failed", layout, eval)
+            {
+                Ok(eval) => eval,
+                Err(ObjectiveEvalError::Recoverable { message }) => {
+                    let elapsed = iter_start.elapsed().as_secs_f64();
+                    log::info!(
+                        "[ARC-timing] iter={iter} status=infeasible_trial cost={:.6e} \
+                         grad_norm={:.3e} pred_dec={:.3e} trust_radius={:.3e}->{:.3e} \
+                         hv_applies={} elapsed={:.3}s reason={}",
+                        eval_k.cost,
+                        g_norm,
+                        pred_dec,
+                        trust_radius,
+                        (trust_radius * 0.25).max(1e-12),
+                        counter.count(),
+                        elapsed,
+                        message,
+                    );
+                    trust_radius = (trust_radius * 0.25).max(1e-12);
+                    continue;
+                }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(EstimationError::RemlOptimizationFailed(message));
+                }
+            },
+            Err(err) => {
+                let elapsed = iter_start.elapsed().as_secs_f64();
+                log::info!(
+                    "[ARC-timing] iter={iter} status=eval_error cost={:.6e} grad_norm={:.3e} \
+                     pred_dec={:.3e} trust_radius={:.3e}->{:.3e} hv_applies={} \
+                     elapsed={:.3}s reason={}",
+                    eval_k.cost,
+                    g_norm,
+                    pred_dec,
+                    trust_radius,
+                    (trust_radius * 0.25).max(1e-12),
+                    counter.count(),
+                    elapsed,
+                    err,
+                );
+                trust_radius = (trust_radius * 0.25).max(1e-12);
+                continue;
+            }
+        };
         let act_dec = eval_k.cost - eval_trial.cost;
         let rho = act_dec / pred_dec;
-        let accepted = rho > OPERATOR_ETA_ACCEPT;
+        let accepted_by_ratio = rho > OPERATOR_ETA_ACCEPT;
+        let accepted_by_descent = act_dec > 0.0
+            && act_dec.is_finite()
+            && trust_radius <= OPERATOR_DESCENT_ACCEPT_RADIUS;
+        let accepted = accepted_by_ratio || accepted_by_descent;
         let new_trust_radius = if rho > 0.75 && s_norm > 0.99 * trust_radius {
             (trust_radius * 2.0).min(OPERATOR_TRUST_RADIUS_MAX)
+        } else if accepted_by_descent && !accepted_by_ratio {
+            (trust_radius * 0.5).max(1e-12)
         } else if rho < 0.25 {
             (trust_radius * 0.5).max(1e-12)
         } else {
@@ -2802,7 +2845,13 @@ fn run_operator_trust_region(
             "[ARC-timing] iter={iter} status={} cost={:.6e}->{:.6e} grad_norm={:.3e} \
              rho={:.3} pred_dec={:.3e} act_dec={:.3e} trust_radius={:.3e}->{:.3e} \
              hv_applies={} elapsed={:.3}s",
-            if accepted { "accepted" } else { "rejected" },
+            if accepted_by_ratio {
+                "accepted"
+            } else if accepted_by_descent {
+                "accepted_descent"
+            } else {
+                "rejected"
+            },
             eval_k.cost,
             next_cost,
             g_norm,

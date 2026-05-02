@@ -3098,15 +3098,11 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = factor.nrows();
         let k = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|c| self.apply(&factor.column(c).to_owned()))
-            .collect();
         let mut out = Array2::<f64>::zeros((p, k));
-        for (c, bv) in cols.into_iter().enumerate() {
+        for c in 0..k {
+            let bv = self.apply(&factor.column(c).to_owned());
             out.column_mut(c).assign(&bv);
         }
         out
@@ -3182,15 +3178,11 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = factor.nrows();
         let k = factor.ncols();
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|c| self.apply(&factor.column(c).to_owned()))
-            .collect();
         let mut out = Array2::<f64>::zeros((p, k));
-        for (c, bv) in cols.into_iter().enumerate() {
+        for c in 0..k {
+            let bv = self.apply(&factor.column(c).to_owned());
             out.column_mut(c).assign(&bv);
         }
         out
