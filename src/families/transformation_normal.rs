@@ -5917,17 +5917,17 @@ impl TensorKroneckerPsiOperator {
         }
         let mut out = Array2::<f64>::zeros((self.n_data(), self.p_cov()));
         for j in 0..q {
-            let v_j = v_psi[j];
-            if v_j == 0.0 {
-                continue;
-            }
-            for k in 0..q {
-                let w_k = w_psi[k];
-                if w_k == 0.0 {
+            for k in j..q {
+                let coef = if j == k {
+                    v_psi[j] * w_psi[j]
+                } else {
+                    v_psi[j] * w_psi[k] + v_psi[k] * w_psi[j]
+                };
+                if coef == 0.0 {
                     continue;
                 }
-                let contrib = self.materialize_cov_second_axis(j, k)?;
-                out.scaled_add(v_j * w_k, &contrib);
+                let contrib = self.materialize_cov_second_axis_arc(j, k)?;
+                out.scaled_add(coef, contrib.as_ref());
             }
         }
         Ok(out)
@@ -6124,17 +6124,17 @@ impl TensorKroneckerPsiOperator {
         let p_cov = self.p_cov();
         let mut out = Array1::<f64>::zeros(p_resp * p_cov);
         for j in 0..q {
-            let v_j = v_psi[j];
-            if v_j == 0.0 {
-                continue;
-            }
-            for k in 0..q {
-                let w_k = w_psi[k];
-                if w_k == 0.0 {
+            for k in j..q {
+                let coef = if j == k {
+                    v_psi[j] * w_psi[j]
+                } else {
+                    v_psi[j] * w_psi[k] + v_psi[k] * w_psi[j]
+                };
+                if coef == 0.0 {
                     continue;
                 }
                 let contrib = self.lifted_transpose_second(resp_basis, j, k, residual)?;
-                out.scaled_add(v_j * w_k, &contrib);
+                out.scaled_add(coef, &contrib);
             }
         }
         Ok(out)
@@ -6160,17 +6160,17 @@ impl TensorKroneckerPsiOperator {
         }
         let mut out = Array1::<f64>::zeros(self.n_data());
         for j in 0..q {
-            let v_j = v_psi[j];
-            if v_j == 0.0 {
-                continue;
-            }
-            for k in 0..q {
-                let w_k = w_psi[k];
-                if w_k == 0.0 {
+            for k in j..q {
+                let coef = if j == k {
+                    v_psi[j] * w_psi[j]
+                } else {
+                    v_psi[j] * w_psi[k] + v_psi[k] * w_psi[j]
+                };
+                if coef == 0.0 {
                     continue;
                 }
                 let contrib = self.lifted_forward_second(resp_basis, j, k, beta)?;
-                out.scaled_add(v_j * w_k, &contrib);
+                out.scaled_add(coef, &contrib);
             }
         }
         Ok(out)
