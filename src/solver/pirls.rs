@@ -1920,12 +1920,15 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 jeffreys_logdet,
                 hat_diag: hat_diag.clone(),
             };
-            for i in 0..self.lastz.len() {
-                let wi = weights[i];
-                if wi > 0.0 {
-                    self.lastz[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
-                }
-            }
+            ndarray::Zip::from(&mut self.lastz)
+                .and(&hat_diag)
+                .and(&weights)
+                .and(&mu)
+                .par_for_each(|zi, &hii, &wi, &mui| {
+                    if wi > 0.0 {
+                        *zi += hii * (0.5 - mui) / wi;
+                    }
+                });
         }
 
         let z = &self.lastz;
@@ -1937,7 +1940,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             .and(&self.workspace.eta_buf)
             .and(z)
             .and(&weights)
-            .for_each(|wr, r, &eta, &zi, &wi| {
+            .par_for_each(|wr, r, &eta, &zi, &wi| {
                 let residual = eta - zi;
                 *r = residual;
                 *wr = residual * wi;
@@ -6315,33 +6318,79 @@ fn write_poisson_log_working_state(
 ) {
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
-    let n = eta.len();
-    let mut derivatives = derivatives;
-    for i in 0..n {
-        let eta_raw = eta[i];
-        let eta_i = eta_raw.clamp(-700.0, 700.0);
-        let mu_i = eta_i.exp().max(MIN_MU);
-        mu[i] = mu_i;
-        let raw_weight = priorweights[i].max(0.0) * mu_i;
-        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-        weights[i] = if raw_weight > 0.0 {
-            raw_weight.max(MIN_WEIGHT)
-        } else {
-            0.0
-        };
-        z[i] = eta_i + (y[i] - mu_i) / mu_i;
-        if let Some(derivs) = derivatives.as_mut() {
-            derivs.dmu_deta[i] = mu_i;
-            derivs.d2mu_deta2[i] = mu_i;
-            derivs.d3mu_deta3[i] = mu_i;
-            if floor_active || eta_raw != eta_i {
-                derivs.c[i] = 0.0;
-                derivs.d[i] = 0.0;
-            } else {
-                derivs.c[i] = raw_weight;
-                derivs.d[i] = raw_weight;
-            }
-        }
+    if let Some(derivs) = derivatives {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let dmu_s = derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous");
+        let d2_s = derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous");
+        let d3_s = derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous");
+        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .zip(dmu_s.par_iter_mut())
+            .zip(d2_s.par_iter_mut())
+            .zip(d3_s.par_iter_mut())
+            .zip(c_s.par_iter_mut())
+            .zip(d_s.par_iter_mut())
+            .enumerate()
+            .for_each(
+                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
+                    let eta_raw = eta[i];
+                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let mu_i = eta_i.exp().max(MIN_MU);
+                    *mu_o = mu_i;
+                    let raw_weight = priorweights[i].max(0.0) * mu_i;
+                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                    *w_o = if raw_weight > 0.0 {
+                        raw_weight.max(MIN_WEIGHT)
+                    } else {
+                        0.0
+                    };
+                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
+                    *dmu_o = mu_i;
+                    *d2_o = mu_i;
+                    *d3_o = mu_i;
+                    if floor_active || eta_raw != eta_i {
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                    } else {
+                        *c_o = raw_weight;
+                        *d_o = raw_weight;
+                    }
+                },
+            );
+    } else {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((mu_o, w_o), z_o))| {
+                let eta_i = eta[i].clamp(-700.0, 700.0);
+                let mu_i = eta_i.exp().max(MIN_MU);
+                *mu_o = mu_i;
+                let raw_weight = priorweights[i].max(0.0) * mu_i;
+                *w_o = if raw_weight > 0.0 {
+                    raw_weight.max(MIN_WEIGHT)
+                } else {
+                    0.0
+                };
+                *z_o = eta_i + (y[i] - mu_i) / mu_i;
+            });
     }
 }
 
@@ -6358,22 +6407,65 @@ fn write_gamma_log_working_state(
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
-    mut derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
     const MIN_MU: f64 = 1e-10;
-    for i in 0..eta.len() {
-        let eta_i = eta[i].clamp(-700.0, 700.0);
-        let mu_i = eta_i.exp().max(MIN_MU);
-        mu[i] = mu_i;
-        weights[i] = priorweights[i].max(0.0) * shape;
-        z[i] = eta_i + (y[i] - mu_i) / mu_i;
-        if let Some(derivs) = derivatives.as_mut() {
-            derivs.dmu_deta[i] = mu_i;
-            derivs.d2mu_deta2[i] = mu_i;
-            derivs.d3mu_deta3[i] = mu_i;
-            derivs.c[i] = 0.0;
-            derivs.d[i] = 0.0;
-        }
+    if let Some(derivs) = derivatives {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let dmu_s = derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous");
+        let d2_s = derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous");
+        let d3_s = derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous");
+        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .zip(dmu_s.par_iter_mut())
+            .zip(d2_s.par_iter_mut())
+            .zip(d3_s.par_iter_mut())
+            .zip(c_s.par_iter_mut())
+            .zip(d_s.par_iter_mut())
+            .enumerate()
+            .for_each(
+                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
+                    let eta_i = eta[i].clamp(-700.0, 700.0);
+                    let mu_i = eta_i.exp().max(MIN_MU);
+                    *mu_o = mu_i;
+                    *w_o = priorweights[i].max(0.0) * shape;
+                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
+                    *dmu_o = mu_i;
+                    *d2_o = mu_i;
+                    *d3_o = mu_i;
+                    *c_o = 0.0;
+                    *d_o = 0.0;
+                },
+            );
+    } else {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((mu_o, w_o), z_o))| {
+                let eta_i = eta[i].clamp(-700.0, 700.0);
+                let mu_i = eta_i.exp().max(MIN_MU);
+                *mu_o = mu_i;
+                *w_o = priorweights[i].max(0.0) * shape;
+                *z_o = eta_i + (y[i] - mu_i) / mu_i;
+            });
     }
 }
 
@@ -6389,7 +6481,6 @@ pub fn update_glmvectors(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
-    let n = eta.len();
     let link = inverse_link.link_function();
 
     // Fast vectorized path for pure logit (most common binomial link).
@@ -6398,30 +6489,80 @@ pub fn update_glmvectors(
         && inverse_link.mixture_state().is_none()
         && inverse_link.sas_state().is_none()
     {
-        let mut derivatives = derivatives;
-        for i in 0..n {
-            let eta_raw = eta[i];
-            let eta_c = eta_raw.clamp(-700.0, 700.0);
-            let jet = logit_inverse_link_jet5(eta_c);
-            let geom = bernoulli_logit_geometry_from_jet(
-                eta_raw,
-                eta_c,
-                y[i],
-                priorweights[i],
-                jet,
-                LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH,
-            );
-            mu[i] = geom.mu;
-            weights[i] = geom.weight;
-            z[i] = geom.z;
-
-            if let Some(derivs) = derivatives.as_mut() {
-                derivs.c[i] = geom.c;
-                derivs.d[i] = geom.d;
-                derivs.dmu_deta[i] = jet.d1;
-                derivs.d2mu_deta2[i] = jet.d2;
-                derivs.d3mu_deta3[i] = jet.d3;
-            }
+        if let Some(derivs) = derivatives {
+            let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+            let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+            let z_s = z.as_slice_mut().expect("z must be contiguous");
+            let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+            let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = derivs
+                .dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = derivs
+                .d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = derivs
+                .d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            mu_s.par_iter_mut()
+                .zip(weights_s.par_iter_mut())
+                .zip(z_s.par_iter_mut())
+                .zip(c_s.par_iter_mut())
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .for_each(
+                    |(i, (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o))| {
+                        let eta_raw = eta[i];
+                        let eta_c = eta_raw.clamp(-700.0, 700.0);
+                        let jet = logit_inverse_link_jet5(eta_c);
+                        let geom = bernoulli_logit_geometry_from_jet(
+                            eta_raw,
+                            eta_c,
+                            y[i],
+                            priorweights[i],
+                            jet,
+                            LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH,
+                        );
+                        *mu_o = geom.mu;
+                        *w_o = geom.weight;
+                        *z_o = geom.z;
+                        *c_o = geom.c;
+                        *d_o = geom.d;
+                        *dmu_o = jet.d1;
+                        *d2_o = jet.d2;
+                        *d3_o = jet.d3;
+                    },
+                );
+        } else {
+            let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+            let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+            let z_s = z.as_slice_mut().expect("z must be contiguous");
+            mu_s.par_iter_mut()
+                .zip(weights_s.par_iter_mut())
+                .zip(z_s.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, ((mu_o, w_o), z_o))| {
+                    let eta_raw = eta[i];
+                    let eta_c = eta_raw.clamp(-700.0, 700.0);
+                    let jet = logit_inverse_link_jet5(eta_c);
+                    let geom = bernoulli_logit_geometry_from_jet(
+                        eta_raw,
+                        eta_c,
+                        y[i],
+                        priorweights[i],
+                        jet,
+                        LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH,
+                    );
+                    *mu_o = geom.mu;
+                    *w_o = geom.weight;
+                    *z_o = geom.z;
+                });
         }
         return Ok(());
     }
@@ -6434,52 +6575,133 @@ pub fn update_glmvectors(
         | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
-            let mut derivatives = derivatives;
-            for i in 0..n {
-                let eta_used = match link {
-                    LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Probit
-                    | LinkFunction::CLogLog
-                    | LinkFunction::Sas
-                    | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
-                    LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Identity => eta[i],
-                };
-                if matches!(link, LinkFunction::Logit) {
-                    let jet = logit_inverse_link_jet5(eta_used);
-                    let geom = bernoulli_logit_geometry_from_jet(
-                        eta[i],
-                        eta_used,
-                        y[i],
-                        priorweights[i],
-                        jet,
-                        zero_on_nonsmooth,
-                    );
-                    mu[i] = geom.mu;
-                    weights[i] = geom.weight;
-                    z[i] = geom.z;
-                    if let Some(derivs) = derivatives.as_mut() {
-                        derivs.c[i] = geom.c;
-                        derivs.d[i] = geom.d;
-                        derivs.dmu_deta[i] = jet.d1;
-                        derivs.d2mu_deta2[i] = jet.d2;
-                        derivs.d3mu_deta3[i] = jet.d3;
-                    }
-                } else {
-                    let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                    let geom =
-                        bernoulli_geometry_from_jet(eta[i], eta_used, y[i], priorweights[i], jet);
-                    mu[i] = geom.mu;
-                    weights[i] = geom.weight;
-                    z[i] = geom.z;
-                    if let Some(derivs) = derivatives.as_mut() {
-                        derivs.c[i] = geom.c;
-                        derivs.d[i] = geom.d;
-                        derivs.dmu_deta[i] = jet.d1;
-                        derivs.d2mu_deta2[i] = jet.d2;
-                        derivs.d3mu_deta3[i] = jet.d3;
-                    }
-                }
+            if let Some(derivs) = derivatives {
+                let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+                let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+                let z_s = z.as_slice_mut().expect("z must be contiguous");
+                let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+                let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+                let dmu_s = derivs
+                    .dmu_deta
+                    .as_slice_mut()
+                    .expect("dmu_deta must be contiguous");
+                let d2_s = derivs
+                    .d2mu_deta2
+                    .as_slice_mut()
+                    .expect("d2mu_deta2 must be contiguous");
+                let d3_s = derivs
+                    .d3mu_deta3
+                    .as_slice_mut()
+                    .expect("d3mu_deta3 must be contiguous");
+                mu_s.par_iter_mut()
+                    .zip(weights_s.par_iter_mut())
+                    .zip(z_s.par_iter_mut())
+                    .zip(c_s.par_iter_mut())
+                    .zip(d_s.par_iter_mut())
+                    .zip(dmu_s.par_iter_mut())
+                    .zip(d2_s.par_iter_mut())
+                    .zip(d3_s.par_iter_mut())
+                    .enumerate()
+                    .try_for_each(
+                        |(
+                            i,
+                            (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o),
+                        )|
+                         -> Result<(), EstimationError> {
+                            let eta_used = match link {
+                                LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
+                                LinkFunction::Probit
+                                | LinkFunction::CLogLog
+                                | LinkFunction::Sas
+                                | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
+                                LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
+                                LinkFunction::Identity => eta[i],
+                            };
+                            if matches!(link, LinkFunction::Logit) {
+                                let jet = logit_inverse_link_jet5(eta_used);
+                                let geom = bernoulli_logit_geometry_from_jet(
+                                    eta[i],
+                                    eta_used,
+                                    y[i],
+                                    priorweights[i],
+                                    jet,
+                                    zero_on_nonsmooth,
+                                );
+                                *mu_o = geom.mu;
+                                *w_o = geom.weight;
+                                *z_o = geom.z;
+                                *c_o = geom.c;
+                                *d_o = geom.d;
+                                *dmu_o = jet.d1;
+                                *d2_o = jet.d2;
+                                *d3_o = jet.d3;
+                            } else {
+                                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                                let geom = bernoulli_geometry_from_jet(
+                                    eta[i],
+                                    eta_used,
+                                    y[i],
+                                    priorweights[i],
+                                    jet,
+                                );
+                                *mu_o = geom.mu;
+                                *w_o = geom.weight;
+                                *z_o = geom.z;
+                                *c_o = geom.c;
+                                *d_o = geom.d;
+                                *dmu_o = jet.d1;
+                                *d2_o = jet.d2;
+                                *d3_o = jet.d3;
+                            }
+                            Ok(())
+                        },
+                    )?;
+            } else {
+                let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+                let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+                let z_s = z.as_slice_mut().expect("z must be contiguous");
+                mu_s.par_iter_mut()
+                    .zip(weights_s.par_iter_mut())
+                    .zip(z_s.par_iter_mut())
+                    .enumerate()
+                    .try_for_each(|(i, ((mu_o, w_o), z_o))| -> Result<(), EstimationError> {
+                        let eta_used = match link {
+                            LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
+                            LinkFunction::Probit
+                            | LinkFunction::CLogLog
+                            | LinkFunction::Sas
+                            | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
+                            LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
+                            LinkFunction::Identity => eta[i],
+                        };
+                        if matches!(link, LinkFunction::Logit) {
+                            let jet = logit_inverse_link_jet5(eta_used);
+                            let geom = bernoulli_logit_geometry_from_jet(
+                                eta[i],
+                                eta_used,
+                                y[i],
+                                priorweights[i],
+                                jet,
+                                zero_on_nonsmooth,
+                            );
+                            *mu_o = geom.mu;
+                            *w_o = geom.weight;
+                            *z_o = geom.z;
+                        } else {
+                            let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                            let geom = bernoulli_geometry_from_jet(
+                                eta[i],
+                                eta_used,
+                                y[i],
+                                priorweights[i],
+                                jet,
+                            );
+                            *mu_o = geom.mu;
+                            *w_o = geom.weight;
+                            *z_o = geom.z;
+                        }
+                        Ok(())
+                    })?;
             }
             Ok(())
         }
@@ -6636,45 +6858,123 @@ pub fn update_glmvectors_integrated_for_link(
             inverse_link
         )));
     }
-    let n = eta.len();
-    let mut derivatives = derivatives;
-    for i in 0..n {
-        let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
-            crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(
-                quadctx,
-                eta[i],
-                se[i].hypot(state.latent_sd),
-            )?
-        } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
-            crate::quadrature::integrated_logit_inverse_link_jet_pirls(quadctx, eta[i], se[i])?
-        } else {
-            crate::quadrature::integrated_inverse_link_jetwith_state(
-                quadctx,
-                link,
-                eta[i],
-                se[i],
-                inverse_link.mixture_state(),
-                inverse_link.sas_state(),
-            )?
-        };
-        let local_jet = MixtureInverseLinkJet {
-            mu: jet.mean,
-            d1: jet.d1,
-            d2: jet.d2,
-            d3: jet.d3,
-        };
-        let e = eta[i].clamp(-700.0, 700.0);
-        let geom = bernoulli_geometry_from_jet(eta[i], e, y[i], priorweights[i], local_jet);
-        mu[i] = geom.mu;
-        weights[i] = geom.weight;
-        z[i] = geom.z;
-        if let Some(derivs) = derivatives.as_mut() {
-            derivs.c[i] = geom.c;
-            derivs.d[i] = geom.d;
-            derivs.dmu_deta[i] = local_jet.d1;
-            derivs.d2mu_deta2[i] = local_jet.d2;
-            derivs.d3mu_deta3[i] = local_jet.d3;
-        }
+    if let Some(derivs) = derivatives {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+        let dmu_s = derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous");
+        let d2_s = derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous");
+        let d3_s = derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .zip(c_s.par_iter_mut())
+            .zip(d_s.par_iter_mut())
+            .zip(dmu_s.par_iter_mut())
+            .zip(d2_s.par_iter_mut())
+            .zip(d3_s.par_iter_mut())
+            .enumerate()
+            .try_for_each(
+                |(i, (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o))|
+                 -> Result<(), EstimationError> {
+                    let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
+                        crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(
+                            quadctx,
+                            eta[i],
+                            se[i].hypot(state.latent_sd),
+                        )?
+                    } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                        crate::quadrature::integrated_logit_inverse_link_jet_pirls(
+                            quadctx, eta[i], se[i],
+                        )?
+                    } else {
+                        crate::quadrature::integrated_inverse_link_jetwith_state(
+                            quadctx,
+                            link,
+                            eta[i],
+                            se[i],
+                            inverse_link.mixture_state(),
+                            inverse_link.sas_state(),
+                        )?
+                    };
+                    let local_jet = MixtureInverseLinkJet {
+                        mu: jet.mean,
+                        d1: jet.d1,
+                        d2: jet.d2,
+                        d3: jet.d3,
+                    };
+                    let e = eta[i].clamp(-700.0, 700.0);
+                    let geom = bernoulli_geometry_from_jet(
+                        eta[i],
+                        e,
+                        y[i],
+                        priorweights[i],
+                        local_jet,
+                    );
+                    *mu_o = geom.mu;
+                    *w_o = geom.weight;
+                    *z_o = geom.z;
+                    *c_o = geom.c;
+                    *d_o = geom.d;
+                    *dmu_o = local_jet.d1;
+                    *d2_o = local_jet.d2;
+                    *d3_o = local_jet.d3;
+                    Ok(())
+                },
+            )?;
+    } else {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .enumerate()
+            .try_for_each(|(i, ((mu_o, w_o), z_o))| -> Result<(), EstimationError> {
+                let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
+                    crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(
+                        quadctx,
+                        eta[i],
+                        se[i].hypot(state.latent_sd),
+                    )?
+                } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                    crate::quadrature::integrated_logit_inverse_link_jet_pirls(
+                        quadctx, eta[i], se[i],
+                    )?
+                } else {
+                    crate::quadrature::integrated_inverse_link_jetwith_state(
+                        quadctx,
+                        link,
+                        eta[i],
+                        se[i],
+                        inverse_link.mixture_state(),
+                        inverse_link.sas_state(),
+                    )?
+                };
+                let local_jet = MixtureInverseLinkJet {
+                    mu: jet.mean,
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                };
+                let e = eta[i].clamp(-700.0, 700.0);
+                let geom = bernoulli_geometry_from_jet(eta[i], e, y[i], priorweights[i], local_jet);
+                *mu_o = geom.mu;
+                *w_o = geom.weight;
+                *z_o = geom.z;
+                Ok(())
+            })?;
     }
     Ok(())
 }
