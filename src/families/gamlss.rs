@@ -13628,238 +13628,161 @@ impl BinomialLocationScaleFamily {
         let mut d2h_tl = Array1::<f64>::zeros(n);
         let mut d2h_ll = Array1::<f64>::zeros(n);
         let mut objective_psi_psi = 0.0;
-        if n >= 2048 {
-            struct PsiSecondRow {
-                r_t: f64,
-                r_ls: f64,
-                dr_t_i: f64,
-                dr_t_j: f64,
-                dr_ls_i: f64,
-                dr_ls_j: f64,
-                d2r_t: f64,
-                d2r_ls: f64,
-                h_tt: f64,
-                h_tl: f64,
-                h_ll: f64,
-                dh_tt_i: f64,
-                dh_tt_j: f64,
-                dh_tl_i: f64,
-                dh_tl_j: f64,
-                dh_ll_i: f64,
-                dh_ll_j: f64,
-                d2h_tt: f64,
-                d2h_tl: f64,
-                d2h_ll: f64,
-                objective: f64,
-            }
-            let y_p = self.y.as_slice().expect("y must be contiguous");
-            let w_p = self.weights.as_slice().expect("weights must be contiguous");
-            let q_p = core.q0.as_slice().expect("q0 must be contiguous");
-            let sigma_p = core.sigma.as_slice().expect("sigma must be contiguous");
-            let mu_p = core.mu.as_slice().expect("mu must be contiguous");
-            let dmu_p = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
-            let d2mu_p = core
-                .d2mu_dq2
-                .as_slice()
-                .expect("d2mu_dq2 must be contiguous");
-            let d3mu_p = core
-                .d3mu_dq3
-                .as_slice()
-                .expect("d3mu_dq3 must be contiguous");
-            let z_t_i = dir_i
-                .z_t_psi
-                .as_slice()
-                .expect("z_t_psi_i must be contiguous");
-            let z_t_j = dir_j
-                .z_t_psi
-                .as_slice()
-                .expect("z_t_psi_j must be contiguous");
-            let z_ls_i = dir_i
-                .z_ls_psi
-                .as_slice()
-                .expect("z_ls_psi_i must be contiguous");
-            let z_ls_j = dir_j
-                .z_ls_psi
-                .as_slice()
-                .expect("z_ls_psi_j must be contiguous");
-            let z_t_ab = second_drifts
-                .z_t_ab
-                .as_slice()
-                .expect("z_t_ab must be contiguous");
-            let z_ls_ab = second_drifts
-                .z_ls_ab
-                .as_slice()
-                .expect("z_ls_ab must be contiguous");
-            let link_kind_p = &self.link_kind;
-            let rows: Result<Vec<PsiSecondRow>, String> = (0..n)
-                .into_par_iter()
-                .map(|row| {
-                    let q = q_p[row];
-                    let r = 1.0 / sigma_p[row];
-                    let q_i = -r * z_t_i[row] - q * z_ls_i[row];
-                    let q_j = -r * z_t_j[row] - q * z_ls_j[row];
-                    let q_ij = -r * z_t_ab[row]
-                        + r * (z_t_i[row] * z_ls_j[row] + z_t_j[row] * z_ls_i[row])
-                        + q * (z_ls_i[row] * z_ls_j[row] - z_ls_ab[row]);
-                    let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
-                        y_p[row],
-                        w_p[row],
-                        q,
-                        mu_p[row],
-                        dmu_p[row],
-                        d2mu_p[row],
-                        d3mu_p[row],
-                        link_kind_p,
-                    );
-                    let d = binomial_neglog_q_fourth_derivative_dispatch(
-                        y_p[row],
-                        w_p[row],
-                        q,
-                        mu_p[row],
-                        dmu_p[row],
-                        d2mu_p[row],
-                        d3mu_p[row],
-                        link_kind_p,
-                    )?;
-                    let u = a + q * b;
-                    let u_i = (2.0 * b + q * c) * q_i;
-                    let u_j = (2.0 * b + q * c) * q_j;
-                    Ok(PsiSecondRow {
-                        r_t: -a * r,
-                        r_ls: -a * q,
-                        dr_t_i: -b * q_i * r + a * r * z_ls_i[row],
-                        dr_t_j: -b * q_j * r + a * r * z_ls_j[row],
-                        dr_ls_i: -u * q_i,
-                        dr_ls_j: -u * q_j,
-                        d2r_t: r
-                            * (-c * q_i * q_j - b * q_ij
-                                + b * (q_i * z_ls_j[row] + q_j * z_ls_i[row])
-                                - a * z_ls_i[row] * z_ls_j[row]
-                                + a * z_ls_ab[row]),
-                        d2r_ls: -((2.0 * b + q * c) * q_i * q_j + u * q_ij),
-                        h_tt: b * r * r,
-                        h_tl: r * u,
-                        h_ll: q * u,
-                        dh_tt_i: r * r * (c * q_i - 2.0 * b * z_ls_i[row]),
-                        dh_tt_j: r * r * (c * q_j - 2.0 * b * z_ls_j[row]),
-                        dh_tl_i: r * (u_i - u * z_ls_i[row]),
-                        dh_tl_j: r * (u_j - u * z_ls_j[row]),
-                        dh_ll_i: (a + 3.0 * q * b + q * q * c) * q_i,
-                        dh_ll_j: (a + 3.0 * q * b + q * q * c) * q_j,
-                        d2h_tt: r
-                            * r
-                            * (d * q_i * q_j + c * q_ij
-                                - 2.0 * c * (q_j * z_ls_i[row] + q_i * z_ls_j[row])
-                                + 4.0 * b * z_ls_i[row] * z_ls_j[row]
-                                - 2.0 * b * z_ls_ab[row]),
-                        d2h_tl: r
-                            * (((3.0 * c + q * d) * q_j) * q_i + (2.0 * b + q * c) * q_ij
-                                - (2.0 * b + q * c) * (q_j * z_ls_i[row] + q_i * z_ls_j[row])
-                                + u * (z_ls_i[row] * z_ls_j[row] - z_ls_ab[row])),
-                        d2h_ll: (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j
-                            + (a + 3.0 * q * b + q * q * c) * q_ij,
-                        objective: a * q_ij + b * q_i * q_j,
-                    })
-                })
-                .collect();
-            for (row, vals) in rows?.into_iter().enumerate() {
-                r_t[row] = vals.r_t;
-                r_ls[row] = vals.r_ls;
-                dr_t_i[row] = vals.dr_t_i;
-                dr_t_j[row] = vals.dr_t_j;
-                dr_ls_i[row] = vals.dr_ls_i;
-                dr_ls_j[row] = vals.dr_ls_j;
-                d2r_t[row] = vals.d2r_t;
-                d2r_ls[row] = vals.d2r_ls;
-                h_tt[row] = vals.h_tt;
-                h_tl[row] = vals.h_tl;
-                h_ll[row] = vals.h_ll;
-                dh_tt_i[row] = vals.dh_tt_i;
-                dh_tt_j[row] = vals.dh_tt_j;
-                dh_tl_i[row] = vals.dh_tl_i;
-                dh_tl_j[row] = vals.dh_tl_j;
-                dh_ll_i[row] = vals.dh_ll_i;
-                dh_ll_j[row] = vals.dh_ll_j;
-                d2h_tt[row] = vals.d2h_tt;
-                d2h_tl[row] = vals.d2h_tl;
-                d2h_ll[row] = vals.d2h_ll;
-                objective_psi_psi += vals.objective;
-            }
-        } else {
-            for row in 0..n {
-                let q = core.q0[row];
-                let r = 1.0 / core.sigma[row];
-                let q_i = -r * dir_i.z_t_psi[row] - q * dir_i.z_ls_psi[row];
-                let q_j = -r * dir_j.z_t_psi[row] - q * dir_j.z_ls_psi[row];
-                let q_ij = -r * second_drifts.z_t_ab[row]
-                    + r * (dir_i.z_t_psi[row] * dir_j.z_ls_psi[row]
-                        + dir_j.z_t_psi[row] * dir_i.z_ls_psi[row])
-                    + q * (dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row] - second_drifts.z_ls_ab[row]);
+        struct PsiSecondRow {
+            r_t: f64,
+            r_ls: f64,
+            dr_t_i: f64,
+            dr_t_j: f64,
+            dr_ls_i: f64,
+            dr_ls_j: f64,
+            d2r_t: f64,
+            d2r_ls: f64,
+            h_tt: f64,
+            h_tl: f64,
+            h_ll: f64,
+            dh_tt_i: f64,
+            dh_tt_j: f64,
+            dh_tl_i: f64,
+            dh_tl_j: f64,
+            dh_ll_i: f64,
+            dh_ll_j: f64,
+            d2h_tt: f64,
+            d2h_tl: f64,
+            d2h_ll: f64,
+            objective: f64,
+        }
+        let y_p = self.y.as_slice().expect("y must be contiguous");
+        let w_p = self.weights.as_slice().expect("weights must be contiguous");
+        let q_p = core.q0.as_slice().expect("q0 must be contiguous");
+        let sigma_p = core.sigma.as_slice().expect("sigma must be contiguous");
+        let mu_p = core.mu.as_slice().expect("mu must be contiguous");
+        let dmu_p = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+        let d2mu_p = core
+            .d2mu_dq2
+            .as_slice()
+            .expect("d2mu_dq2 must be contiguous");
+        let d3mu_p = core
+            .d3mu_dq3
+            .as_slice()
+            .expect("d3mu_dq3 must be contiguous");
+        let z_t_i = dir_i
+            .z_t_psi
+            .as_slice()
+            .expect("z_t_psi_i must be contiguous");
+        let z_t_j = dir_j
+            .z_t_psi
+            .as_slice()
+            .expect("z_t_psi_j must be contiguous");
+        let z_ls_i = dir_i
+            .z_ls_psi
+            .as_slice()
+            .expect("z_ls_psi_i must be contiguous");
+        let z_ls_j = dir_j
+            .z_ls_psi
+            .as_slice()
+            .expect("z_ls_psi_j must be contiguous");
+        let z_t_ab = second_drifts
+            .z_t_ab
+            .as_slice()
+            .expect("z_t_ab must be contiguous");
+        let z_ls_ab = second_drifts
+            .z_ls_ab
+            .as_slice()
+            .expect("z_ls_ab must be contiguous");
+        let link_kind_p = &self.link_kind;
+        let rows: Result<Vec<PsiSecondRow>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let q = q_p[row];
+                let r = 1.0 / sigma_p[row];
+                let q_i = -r * z_t_i[row] - q * z_ls_i[row];
+                let q_j = -r * z_t_j[row] - q * z_ls_j[row];
+                let q_ij = -r * z_t_ab[row]
+                    + r * (z_t_i[row] * z_ls_j[row] + z_t_j[row] * z_ls_i[row])
+                    + q * (z_ls_i[row] * z_ls_j[row] - z_ls_ab[row]);
                 let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
-                    self.y[row],
-                    self.weights[row],
+                    y_p[row],
+                    w_p[row],
                     q,
-                    core.mu[row],
-                    core.dmu_dq[row],
-                    core.d2mu_dq2[row],
-                    core.d3mu_dq3[row],
-                    &self.link_kind,
+                    mu_p[row],
+                    dmu_p[row],
+                    d2mu_p[row],
+                    d3mu_p[row],
+                    link_kind_p,
                 );
                 let d = binomial_neglog_q_fourth_derivative_dispatch(
-                    self.y[row],
-                    self.weights[row],
+                    y_p[row],
+                    w_p[row],
                     q,
-                    core.mu[row],
-                    core.dmu_dq[row],
-                    core.d2mu_dq2[row],
-                    core.d3mu_dq3[row],
-                    &self.link_kind,
+                    mu_p[row],
+                    dmu_p[row],
+                    d2mu_p[row],
+                    d3mu_p[row],
+                    link_kind_p,
                 )?;
                 let u = a + q * b;
                 let u_i = (2.0 * b + q * c) * q_i;
                 let u_j = (2.0 * b + q * c) * q_j;
-
-                r_t[row] = -a * r;
-                r_ls[row] = -a * q;
-                dr_t_i[row] = -b * q_i * r + a * r * dir_i.z_ls_psi[row];
-                dr_t_j[row] = -b * q_j * r + a * r * dir_j.z_ls_psi[row];
-                dr_ls_i[row] = -u * q_i;
-                dr_ls_j[row] = -u * q_j;
-                d2r_t[row] = r
-                    * (-c * q_i * q_j - b * q_ij
-                        + b * (q_i * dir_j.z_ls_psi[row] + q_j * dir_i.z_ls_psi[row])
-                        - a * dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row]
-                        + a * second_drifts.z_ls_ab[row]);
-                d2r_ls[row] = -((2.0 * b + q * c) * q_i * q_j + u * q_ij);
-
-                h_tt[row] = b * r * r;
-                h_tl[row] = r * u;
-                h_ll[row] = q * u;
-                dh_tt_i[row] = r * r * (c * q_i - 2.0 * b * dir_i.z_ls_psi[row]);
-                dh_tt_j[row] = r * r * (c * q_j - 2.0 * b * dir_j.z_ls_psi[row]);
-                dh_tl_i[row] = r * (u_i - u * dir_i.z_ls_psi[row]);
-                dh_tl_j[row] = r * (u_j - u * dir_j.z_ls_psi[row]);
-                dh_ll_i[row] = (a + 3.0 * q * b + q * q * c) * q_i;
-                dh_ll_j[row] = (a + 3.0 * q * b + q * q * c) * q_j;
-                d2h_tt[row] = r
-                    * r
-                    * (d * q_i * q_j + c * q_ij
-                        - 2.0 * c * (q_j * dir_i.z_ls_psi[row] + q_i * dir_j.z_ls_psi[row])
-                        + 4.0 * b * dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row]
-                        - 2.0 * b * second_drifts.z_ls_ab[row]);
-                d2h_tl[row] = r
-                    * (((3.0 * c + q * d) * q_j) * q_i + (2.0 * b + q * c) * q_ij
-                        - (2.0 * b + q * c)
-                            * (q_j * dir_i.z_ls_psi[row] + q_i * dir_j.z_ls_psi[row])
-                        + u * (dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row]
-                            - second_drifts.z_ls_ab[row]));
-                d2h_ll[row] = (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j
-                    + (a + 3.0 * q * b + q * q * c) * q_ij;
-
-                objective_psi_psi += a * q_ij + b * q_i * q_j;
-            }
+                Ok(PsiSecondRow {
+                    r_t: -a * r,
+                    r_ls: -a * q,
+                    dr_t_i: -b * q_i * r + a * r * z_ls_i[row],
+                    dr_t_j: -b * q_j * r + a * r * z_ls_j[row],
+                    dr_ls_i: -u * q_i,
+                    dr_ls_j: -u * q_j,
+                    d2r_t: r
+                        * (-c * q_i * q_j - b * q_ij + b * (q_i * z_ls_j[row] + q_j * z_ls_i[row])
+                            - a * z_ls_i[row] * z_ls_j[row]
+                            + a * z_ls_ab[row]),
+                    d2r_ls: -((2.0 * b + q * c) * q_i * q_j + u * q_ij),
+                    h_tt: b * r * r,
+                    h_tl: r * u,
+                    h_ll: q * u,
+                    dh_tt_i: r * r * (c * q_i - 2.0 * b * z_ls_i[row]),
+                    dh_tt_j: r * r * (c * q_j - 2.0 * b * z_ls_j[row]),
+                    dh_tl_i: r * (u_i - u * z_ls_i[row]),
+                    dh_tl_j: r * (u_j - u * z_ls_j[row]),
+                    dh_ll_i: (a + 3.0 * q * b + q * q * c) * q_i,
+                    dh_ll_j: (a + 3.0 * q * b + q * q * c) * q_j,
+                    d2h_tt: r
+                        * r
+                        * (d * q_i * q_j + c * q_ij
+                            - 2.0 * c * (q_j * z_ls_i[row] + q_i * z_ls_j[row])
+                            + 4.0 * b * z_ls_i[row] * z_ls_j[row]
+                            - 2.0 * b * z_ls_ab[row]),
+                    d2h_tl: r
+                        * (((3.0 * c + q * d) * q_j) * q_i + (2.0 * b + q * c) * q_ij
+                            - (2.0 * b + q * c) * (q_j * z_ls_i[row] + q_i * z_ls_j[row])
+                            + u * (z_ls_i[row] * z_ls_j[row] - z_ls_ab[row])),
+                    d2h_ll: (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j
+                        + (a + 3.0 * q * b + q * q * c) * q_ij,
+                    objective: a * q_ij + b * q_i * q_j,
+                })
+            })
+            .collect();
+        for (row, vals) in rows?.into_iter().enumerate() {
+            r_t[row] = vals.r_t;
+            r_ls[row] = vals.r_ls;
+            dr_t_i[row] = vals.dr_t_i;
+            dr_t_j[row] = vals.dr_t_j;
+            dr_ls_i[row] = vals.dr_ls_i;
+            dr_ls_j[row] = vals.dr_ls_j;
+            d2r_t[row] = vals.d2r_t;
+            d2r_ls[row] = vals.d2r_ls;
+            h_tt[row] = vals.h_tt;
+            h_tl[row] = vals.h_tl;
+            h_ll[row] = vals.h_ll;
+            dh_tt_i[row] = vals.dh_tt_i;
+            dh_tt_j[row] = vals.dh_tt_j;
+            dh_tl_i[row] = vals.dh_tl_i;
+            dh_tl_j[row] = vals.dh_tl_j;
+            dh_ll_i[row] = vals.dh_ll_i;
+            dh_ll_j[row] = vals.dh_ll_j;
+            d2h_tt[row] = vals.d2h_tt;
+            d2h_tl[row] = vals.d2h_tl;
+            d2h_ll[row] = vals.d2h_ll;
+            objective_psi_psi += vals.objective;
         }
-
         let mut score_psi_psi = Array1::<f64>::zeros(total);
         score_psi_psi.slice_mut(s![0..pt]).assign(
             &(x_t_ab_map.transpose_mul(r_t.view())
