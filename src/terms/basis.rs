@@ -5836,7 +5836,9 @@ pub fn build_thin_plate_basiswithworkspace(
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let center_strategy =
+        thin_plate_knot_strategy_for_radial_rank(data.ncols(), &spec.center_strategy)?;
+    let centers = select_centers_by_strategy(data, &center_strategy)?;
     let internal_kernel_transform =
         thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)?;
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
@@ -15898,6 +15900,30 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
         dimension: d,
         radial_reparam,
     })
+}
+
+fn thin_plate_knot_strategy_for_radial_rank(
+    dimension: usize,
+    strategy: &CenterStrategy,
+) -> Result<CenterStrategy, BasisError> {
+    match realized_center_strategy(strategy) {
+        CenterStrategy::UserProvided(_) | CenterStrategy::UniformGrid { .. } => {
+            Ok(strategy.clone())
+        }
+        CenterStrategy::EqualMass { .. }
+        | CenterStrategy::EqualMassCovarRepresentative { .. }
+        | CenterStrategy::FarthestPoint { .. }
+        | CenterStrategy::KMeans { .. } => {
+            let radial_cols = center_strategy_num_centers(strategy).ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "thin-plate counted center strategy must expose a center count".to_string(),
+                )
+            })?;
+            let polynomial_cols = thin_plate_polynomial_basis_dimension(dimension);
+            center_strategy_with_num_centers(strategy, radial_cols + polynomial_cols)
+        }
+        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
+    }
 }
 
 fn active_thin_plate_penalty_derivatives(
@@ -29093,19 +29119,36 @@ mod tests {
                     let mut e_m = eta.clone();
                     e_p[l] += h_e;
                     e_m[l] -= h_e;
-                    let cross_fd = (v_at(&e_p, kappa + h_k)
+                    let cross_h = (v_at(&e_p, kappa + h_k)
                         - v_at(&e_p, kappa - h_k)
                         - v_at(&e_m, kappa + h_k)
                         + v_at(&e_m, kappa - h_k))
                         / (4.0 * h_e * h_k);
-                    let denom = cross_fd.abs().max(bundle.d2_eta_kappa[l].abs()).max(1e-8);
-                    let rel = (bundle.d2_eta_kappa[l] - cross_fd).abs() / denom;
+
+                    let h_e2 = 0.5 * h_e;
+                    let h_k2 = 0.5 * h_k;
+                    let mut e_p2 = eta.clone();
+                    let mut e_m2 = eta.clone();
+                    e_p2[l] += h_e2;
+                    e_m2[l] -= h_e2;
+                    let cross_h2 = (v_at(&e_p2, kappa + h_k2)
+                        - v_at(&e_p2, kappa - h_k2)
+                        - v_at(&e_m2, kappa + h_k2)
+                        + v_at(&e_m2, kappa - h_k2))
+                        / (4.0 * h_e2 * h_k2);
+                    let cross_richardson = (4.0 * cross_h2 - cross_h) / 3.0;
+
+                    let denom = cross_richardson
+                        .abs()
+                        .max(bundle.d2_eta_kappa[l].abs())
+                        .max(1e-8);
+                    let rel = (bundle.d2_eta_kappa[l] - cross_richardson).abs() / denom;
                     assert!(
                         rel < 1e-5,
                         "bundle ∂²_{{η_{l}κ}} vs FD: q={q} d={d} m={m} s={s} κ={kappa} \
                          bundle={:.6e} fd={:.6e} rel={rel:.3e}",
                         bundle.d2_eta_kappa[l],
-                        cross_fd
+                        cross_richardson
                     );
                 }
             }
