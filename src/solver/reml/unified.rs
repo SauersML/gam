@@ -4443,169 +4443,97 @@ pub fn reml_laml_evaluate(
     let use_stochastic_traces = can_use_stochastic_logdet_hinv_kernel(hop, total_p, incl_logdet_h)
         && solution.penalty_subspace_trace.is_none();
 
-    // When using stochastic traces, pre-collect all H_k matrices (both rho and
+    // When using stochastic traces, pre-collect all H_k drifts (both rho and
     // ext coordinates) and batch them through a single StochasticTraceEstimator.
     // This amortizes the H^{-1} solve cost: ONE solve per probe, shared across
-    // all k + ext_dim coordinates.
+    // all k + ext_dim coordinates. The collector must inspect the fully
+    // assembled drift (base coordinate plus SCOP/family correction) before
+    // deciding dense vs operator; checking only the base coordinate misses
+    // matrix-free derivative corrections and silently densifies them.
     let stochastic_trace_values: Option<Vec<f64>> = if use_stochastic_traces {
-        // Check if any coordinate uses operator-backed drifts.
-        let any_operator = solution
-            .penalty_coords
-            .iter()
-            .any(PenaltyCoordinate::uses_operator_fast_path)
-            || solution
-                .ext_coords
-                .iter()
-                .any(|c| c.drift.uses_operator_fast_path());
+        let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
+        let mut operators: Vec<Arc<dyn HyperOperator>> = Vec::new();
+        let mut coord_has_operator = Vec::with_capacity(k + ext_dim);
 
-        if any_operator {
-            let mut dense_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
-            let mut rho_ops = Vec::new();
-            let mut coord_has_operator = Vec::with_capacity(k + ext_dim);
-
-            for idx in 0..k {
-                let coord = &solution.penalty_coords[idx];
-                match penalty_total_drift_result(
-                    coord,
-                    curvature_lambdas[idx],
-                    rho_corrections[idx].as_ref(),
-                ) {
-                    DriftDerivResult::Dense(matrix) => {
-                        dense_matrices.push(matrix);
-                        coord_has_operator.push(false);
-                    }
-                    DriftDerivResult::Operator(op) => {
-                        rho_ops.push(op);
-                        coord_has_operator.push(true);
-                    }
+        // rho-coordinates: H_k = A_k + correction(v_k)
+        for idx in 0..k {
+            match penalty_total_drift_result(
+                &solution.penalty_coords[idx],
+                curvature_lambdas[idx],
+                rho_corrections[idx].as_ref(),
+            ) {
+                DriftDerivResult::Dense(matrix) => {
+                    dense_matrices.push(matrix);
+                    coord_has_operator.push(false);
+                }
+                DriftDerivResult::Operator(op) => {
+                    operators.push(op);
+                    coord_has_operator.push(true);
                 }
             }
-
-            let mut ext_ops: Vec<Arc<dyn HyperOperator>> = Vec::new();
-            for coord in solution.ext_coords.iter() {
-                let correction = if effective_deriv.has_corrections() {
-                    let v_i = hop.solve(&coord.g);
-                    // ext mode direction β_i = +v_i (positive convention);
-                    // pass −v_i so the trait returns D_β H[+v_i].
-                    let neg_v_i = v_i.mapv(|z| -z);
-                    effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
-                } else {
-                    None
-                };
-                match hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim()) {
-                    DriftDerivResult::Dense(matrix) => {
-                        coord_has_operator.push(false);
-                        dense_matrices.push(matrix);
-                    }
-                    DriftDerivResult::Operator(op) => {
-                        coord_has_operator.push(true);
-                        ext_ops.push(op);
-                    }
-                }
-            }
-
-            let mut generic_ops: Vec<&dyn HyperOperator> =
-                rho_ops.iter().map(|op| op.as_ref()).collect();
-            let mut implicit_ops: Vec<&ImplicitHyperOperator> = Vec::new();
-            for op in &ext_ops {
-                if let Some(imp) = op.as_implicit() {
-                    implicit_ops.push(imp);
-                }
-                generic_ops.push(op.as_ref());
-            }
-
-            let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
-            let raw_traces = if generic_ops.len() == implicit_ops.len() {
-                stochastic_trace_hinv_products(
-                    hop,
-                    StochasticTraceTargets::Structural {
-                        dense_matrices: &dense_refs,
-                        implicit_ops: &implicit_ops,
-                    },
-                )
-            } else {
-                stochastic_trace_hinv_products(
-                    hop,
-                    StochasticTraceTargets::Mixed {
-                        dense_matrices: &dense_refs,
-                        operators: &generic_ops,
-                    },
-                )
-            };
-
-            let mut result = Vec::with_capacity(k + ext_dim);
-            let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
-            let mut dense_cursor = 0usize;
-            let mut operator_cursor = n_dense_total;
-            for &has_operator in &coord_has_operator {
-                if has_operator {
-                    result.push(raw_traces[operator_cursor]);
-                    operator_cursor += 1;
-                } else {
-                    result.push(raw_traces[dense_cursor]);
-                    dense_cursor += 1;
-                }
-            }
-
-            Some(result)
-        } else {
-            // All-dense path: reached only when `any_operator` is false (i.e.
-            // no penalty or ext coordinate uses the operator fast-path), so
-            // every match arm here should resolve to `Dense(_)`. The
-            // `Operator(_)` arms keep the match exhaustive and materialize
-            // defensively; the debug_asserts catch any future refactor that
-            // forgets to set the `any_operator` flag for a new coord type.
-            let mut all_h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k + ext_dim);
-
-            // rho-coordinates: H_k = A_k + correction(v_k)
-            for idx in 0..k {
-                match penalty_total_drift_result(
-                    &solution.penalty_coords[idx],
-                    curvature_lambdas[idx],
-                    rho_corrections[idx].as_ref(),
-                ) {
-                    DriftDerivResult::Dense(matrix) => all_h_k_matrices.push(matrix),
-                    DriftDerivResult::Operator(op) => {
-                        debug_assert!(
-                            false,
-                            "all-dense stochastic-trace branch hit Operator drift for rho coord {idx}; \
-                             `any_operator` flag in unified.rs must be wrong"
-                        );
-                        all_h_k_matrices.push(op.to_dense());
-                    }
-                }
-            }
-
-            // ext-coordinates: Ḣ_i = B_i + D_β H[+v_i].
-            // ext mode direction β_i = +v_i (positive convention);
-            // pass −v_i so the trait returns D_β H[+v_i].
-            for coord in solution.ext_coords.iter() {
-                let correction = if effective_deriv.has_corrections() {
-                    let v_i = hop.solve(&coord.g);
-                    let neg_v_i = v_i.mapv(|z| -z);
-                    effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
-                } else {
-                    None
-                };
-                match hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim()) {
-                    DriftDerivResult::Dense(matrix) => all_h_k_matrices.push(matrix),
-                    DriftDerivResult::Operator(op) => {
-                        debug_assert!(
-                            false,
-                            "all-dense stochastic-trace branch hit Operator drift for ext coord; \
-                             `any_operator` flag in unified.rs must be wrong"
-                        );
-                        all_h_k_matrices.push(op.to_dense());
-                    }
-                }
-            }
-
-            let refs: Vec<&Array2<f64>> = all_h_k_matrices.iter().collect();
-            Some(stochastic_trace_hinv_products(
-                hop,
-                StochasticTraceTargets::Dense(&refs),
-            ))
         }
+
+        // ext-coordinates: H_i = B_i + D_beta H[+v_i].
+        for coord in solution.ext_coords.iter() {
+            let correction = if effective_deriv.has_corrections() {
+                let v_i = hop.solve(&coord.g);
+                // ext mode direction beta_i = +v_i (positive convention);
+                // pass -v_i so the trait returns D_beta H[+v_i].
+                let neg_v_i = v_i.mapv(|z| -z);
+                effective_deriv.hessian_derivative_correction_result(&neg_v_i)?
+            } else {
+                None
+            };
+            match hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim()) {
+                DriftDerivResult::Dense(matrix) => {
+                    dense_matrices.push(matrix);
+                    coord_has_operator.push(false);
+                }
+                DriftDerivResult::Operator(op) => {
+                    operators.push(op);
+                    coord_has_operator.push(true);
+                }
+            }
+        }
+
+        let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
+        let generic_ops: Vec<&dyn HyperOperator> = operators.iter().map(|op| op.as_ref()).collect();
+        let implicit_ops: Vec<&ImplicitHyperOperator> =
+            operators.iter().filter_map(|op| op.as_implicit()).collect();
+        let raw_traces = if generic_ops.is_empty() {
+            stochastic_trace_hinv_products(hop, StochasticTraceTargets::Dense(&dense_refs))
+        } else if generic_ops.len() == implicit_ops.len() {
+            stochastic_trace_hinv_products(
+                hop,
+                StochasticTraceTargets::Structural {
+                    dense_matrices: &dense_refs,
+                    implicit_ops: &implicit_ops,
+                },
+            )
+        } else {
+            stochastic_trace_hinv_products(
+                hop,
+                StochasticTraceTargets::Mixed {
+                    dense_matrices: &dense_refs,
+                    operators: &generic_ops,
+                },
+            )
+        };
+
+        let mut result = Vec::with_capacity(k + ext_dim);
+        let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
+        let mut dense_cursor = 0usize;
+        let mut operator_cursor = n_dense_total;
+        for &has_operator in &coord_has_operator {
+            if has_operator {
+                result.push(raw_traces[operator_cursor]);
+                operator_cursor += 1;
+            } else {
+                result.push(raw_traces[dense_cursor]);
+                dense_cursor += 1;
+            }
+        }
+        Some(result)
     } else {
         None
     };
@@ -4798,11 +4726,13 @@ pub fn reml_laml_evaluate(
         let n_obs = effective_deriv
             .scalar_glm_ingredients()
             .map(|ing| ing.x.nrows())
-            .unwrap_or(0);
+            .unwrap_or(solution.n_observations);
         let p_dim = hop.dim();
         let k_outer = k + solution.ext_coords.len();
-        let use_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer)
-            && hessian_kernel.is_some()
+        let callback_operator_kernel =
+            matches!(hessian_kernel, Some(OuterHessianDerivativeKernel::Callback { .. }));
+        let use_operator = hessian_kernel.is_some()
+            && (callback_operator_kernel || prefer_outer_hessian_operator(n_obs, p_dim, k_outer))
             && solution.penalty_subspace_trace.is_none();
         if use_operator {
             match build_outer_hessian_operator(
@@ -5730,7 +5660,7 @@ fn compute_outer_hessian(
                                 }
                             }
                         }
-                        eprintln!(
+                        log::warn!(
                             "[OUTER ext-ext non-finite] ({},{}): cross_trace={} base={} m_terms={} correction={} pair.a={} pair.ld_s={} g.dot(v_jj)={} pair_g_finite={} first_bad_pair_g={:?} b_mat_finite={} first_bad_b_mat={:?} b_operator_present={} b_mat_dim={}x{} ext_v[ii]_finite={} ext_v[jj]_finite={} coord_i.b_depends_on_beta={} coord_j.b_depends_on_beta={}",
                             ii,
                             jj,
@@ -5790,7 +5720,7 @@ fn compute_outer_hessian(
         // instead of just flagging the final outer-Hessian entry.
         let report_finite = |name: &str, value: f64, ii: usize, jj: usize| {
             if !value.is_finite() {
-                eprintln!(
+                log::warn!(
                     "[OUTER non-finite] {} at ({}, {}) = {}",
                     name, ii, jj, value,
                 );
@@ -5800,7 +5730,7 @@ fn compute_outer_hessian(
             report_finite("rho_a_vals[kk]", rho_a_vals[kk], kk, kk);
             for entry in penalty_a_k_betas[kk].iter() {
                 if !entry.is_finite() {
-                    eprintln!(
+                    log::warn!(
                         "[OUTER non-finite] penalty_a_k_betas[{}] has non-finite",
                         kk
                     );
@@ -5809,7 +5739,7 @@ fn compute_outer_hessian(
             }
             for entry in v_ks[kk].iter() {
                 if !entry.is_finite() {
-                    eprintln!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
+                    log::warn!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
                     break;
                 }
             }
@@ -5831,7 +5761,7 @@ fn compute_outer_hessian(
         if let Some(ref h_g) = leverage {
             for entry in h_g.iter() {
                 if !entry.is_finite() {
-                    eprintln!("[OUTER non-finite] leverage h^G has non-finite entries");
+                    log::warn!("[OUTER non-finite] leverage h^G has non-finite entries");
                     break;
                 }
             }
@@ -5839,7 +5769,7 @@ fn compute_outer_hessian(
         if let Some(ref z_c) = adjoint_z_c {
             for entry in z_c.iter() {
                 if !entry.is_finite() {
-                    eprintln!("[OUTER non-finite] adjoint_z_c has non-finite entries");
+                    log::warn!("[OUTER non-finite] adjoint_z_c has non-finite entries");
                     break;
                 }
             }
