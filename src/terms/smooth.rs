@@ -12851,6 +12851,7 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     analytic_joint_gradient_available: bool,
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
+    allow_tau_tau_gradient_only_preference: bool,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
@@ -12944,20 +12945,21 @@ where
         )
     })?;
     let analytic_outer_hessian_available = analytic_joint_hessian_available;
-    let tau_tau_policy = if analytic_outer_hessian_available {
-        let per_block_policy = best_specs
-            .iter()
-            .zip(boot_designs.iter())
-            .zip(block_term_indices.iter())
-            .map(|((spec, design), terms)| {
-                spatial_tau_tau_hessian_policy(data, spec, design, terms)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| err.to_string())?;
-        aggregate_tau_tau_hessian_policy(per_block_policy.into_iter().flatten())
-    } else {
-        None
-    };
+    let tau_tau_policy =
+        if analytic_outer_hessian_available && allow_tau_tau_gradient_only_preference {
+            let per_block_policy = best_specs
+                .iter()
+                .zip(boot_designs.iter())
+                .zip(block_term_indices.iter())
+                .map(|((spec, design), terms)| {
+                    spatial_tau_tau_hessian_policy(data, spec, design, terms)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| err.to_string())?;
+            aggregate_tau_tau_hessian_policy(per_block_policy.into_iter().flatten())
+        } else {
+            None
+        };
     let tau_tau_prefers_gradient_only = tau_tau_policy
         .is_some_and(crate::estimate::reml::TauTauHessianPolicy::prefer_gradient_only);
     let prefer_gradient_only = analytic_outer_hessian_available && tau_tau_prefers_gradient_only;
@@ -15426,6 +15428,7 @@ mod tests {
             true,
             true,
             false,
+            true,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -15699,6 +15702,7 @@ mod tests {
             true,
             true,
             false,
+            true,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
@@ -17645,6 +17649,7 @@ mod tests {
             true,
             true,
             false,
+            true,
             |theta, specs, designs| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
