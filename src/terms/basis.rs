@@ -5952,7 +5952,12 @@ pub fn build_thin_plate_basiswithworkspace(
             });
         }
         let radial_reparam_meta = Some(tps.radial_reparam.clone());
-        (design, identifiability_transform, candidates, radial_reparam_meta)
+        (
+            design,
+            identifiability_transform,
+            candidates,
+            radial_reparam_meta,
+        )
     };
     if let Some(z) = identifiability_transform.as_ref() {
         candidates = candidates
@@ -16007,39 +16012,37 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
     // becomes diag(Λ) — a numerically conditioned form whose Gram matrix has
     // near-orthogonal columns under Φ's metric, avoiding rank-collapse / log|H|
     // blowup at low log-λ that the raw [Φ Z] basis exhibits.
-    let (radial_reparam, radial_eigvals): (Array2<f64>, Array1<f64>) =
-        if let Some(frozen) = frozen_radial_reparam {
-            if frozen.nrows() != kernel_cols || frozen.ncols() != kernel_cols {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "thin-plate frozen radial reparam shape {:?} does not match radial dimension {}",
-                    frozen.dim(),
-                    kernel_cols
-                )));
+    let (radial_reparam, radial_eigvals): (Array2<f64>, Array1<f64>) = if let Some(frozen) =
+        frozen_radial_reparam
+    {
+        if frozen.nrows() != kernel_cols || frozen.ncols() != kernel_cols {
+            return Err(BasisError::DimensionMismatch(format!(
+                "thin-plate frozen radial reparam shape {:?} does not match radial dimension {}",
+                frozen.dim(),
+                kernel_cols
+            )));
+        }
+        let v = frozen.to_owned();
+        let vt_omega_v = fast_atb(&v, &omega_constrained);
+        let lambda_diag = fast_ab(&vt_omega_v, &v);
+        let mut evals = Array1::<f64>::zeros(kernel_cols);
+        for i in 0..kernel_cols {
+            evals[i] = lambda_diag[[i, i]].max(0.0);
+        }
+        (v, evals)
+    } else if kernel_cols == 0 {
+        (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
+    } else {
+        let sym = symmetrize_penalty(&omega_constrained);
+        let (mut evals, evecs) =
+            FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+        for v in evals.iter_mut() {
+            if *v < 0.0 {
+                *v = 0.0;
             }
-            let v = frozen.to_owned();
-            let vt_omega_v = fast_atb(&v, &omega_constrained);
-            let lambda_diag = fast_ab(&vt_omega_v, &v);
-            let mut evals = Array1::<f64>::zeros(kernel_cols);
-            for i in 0..kernel_cols {
-                evals[i] = lambda_diag[[i, i]].max(0.0);
-            }
-            (v, evals)
-        } else if kernel_cols == 0 {
-            (
-                Array2::<f64>::zeros((0, 0)),
-                Array1::<f64>::zeros(0),
-            )
-        } else {
-            let sym = symmetrize_penalty(&omega_constrained);
-            let (mut evals, evecs) =
-                FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
-            for v in evals.iter_mut() {
-                if *v < 0.0 {
-                    *v = 0.0;
-                }
-            }
-            (evecs, evals)
-        };
+        }
+        (evecs, evals)
+    };
 
     let kernel_rotated = if kernel_cols == 0 {
         kernel_constrained.clone()
@@ -19603,8 +19606,7 @@ pub mod closed_form_penalty {
             let mut taylor_table = vec![0.0_f64; max_order + 1];
             let mut all_ok = true;
             for k in 0..=max_order {
-                if let Some(v) = finite_part_duchon_taylor_odd_d_derivative(d, a, b, kappa, r, k)
-                {
+                if let Some(v) = finite_part_duchon_taylor_odd_d_derivative(d, a, b, kappa, r, k) {
                     taylor_table[k] = v;
                 } else {
                     all_ok = false;
@@ -20849,8 +20851,20 @@ pub mod closed_form_penalty {
             let (big_r_dbg, s1_dbg, s2_dbg, u1_dbg, u2_dbg) = aniso_invariants(eta, r);
             eprintln!(
                 "[radial pair NaN] q={} m={} s={} κ={} R={} s1={} s2={} u1={} u2={} value={} d_eta={:?} d_kappa={} d2_kappa={} d2_eta={:?}",
-                q, m, s, kappa, big_r_dbg, s1_dbg, s2_dbg, u1_dbg, u2_dbg,
-                value, d_eta, d_kappa, d2_kappa, d2_eta,
+                q,
+                m,
+                s,
+                kappa,
+                big_r_dbg,
+                s1_dbg,
+                s2_dbg,
+                u1_dbg,
+                u2_dbg,
+                value,
+                d_eta,
+                d_kappa,
+                d2_kappa,
+                d2_eta,
             );
         }
         PairBlockBundle {
