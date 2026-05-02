@@ -4434,12 +4434,6 @@ pub struct CustomFamilyWarmStart {
     inner: ConstrainedWarmStart,
 }
 
-impl CustomFamilyWarmStart {
-    pub(crate) fn first_block_beta(&self) -> Option<&Array1<f64>> {
-        self.inner.block_beta.first()
-    }
-}
-
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,

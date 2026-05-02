@@ -91,6 +91,19 @@ impl SavedLatentZNormalization {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransformationScoreCalibration {
+    pub feature_cols: Vec<usize>,
+    pub feature_center: Vec<f64>,
+    pub feature_scale: Vec<f64>,
+    pub rbf_centers: Vec<Vec<f64>>,
+    pub rbf_bandwidth: f64,
+    pub location_beta: Vec<f64>,
+    pub log_scale_beta: Vec<f64>,
+    pub global_mean: f64,
+    pub global_sd: f64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ColumnKindTag {
@@ -241,6 +254,10 @@ pub struct FittedModelPayload {
     /// Transformation-normal: median of the response used for anchoring.
     #[serde(default)]
     pub transformation_response_median: Option<f64>,
+    /// Transformation-normal saved score calibration:
+    /// z = ((h - X location_beta) / exp(X log_scale_beta) - global_mean) / global_sd.
+    #[serde(default)]
+    pub transformation_score_calibration: Option<TransformationScoreCalibration>,
     #[serde(default)]
     pub resolved_termspec: Option<TermCollectionSpec>,
     #[serde(default)]
@@ -337,6 +354,7 @@ impl FittedModelPayload {
             transformation_response_transform: None,
             transformation_response_degree: None,
             transformation_response_median: None,
+            transformation_score_calibration: None,
             resolved_termspec: None,
             resolved_termspec_noise: None,
             resolved_termspec_logslope: None,

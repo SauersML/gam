@@ -258,6 +258,85 @@ pub fn build_predict_input_for_model(
                 .design
                 .try_row_chunk(0..n)
                 .map_err(|e| e.to_string())?;
+            let calibration = payload
+                .transformation_score_calibration
+                .as_ref()
+                .ok_or("saved transformation-normal model missing score calibration")?;
+            let d = calibration.feature_cols.len();
+            if calibration.feature_center.len() != d || calibration.feature_scale.len() != d {
+                return Err(format!(
+                    "saved transformation-normal calibration normalization mismatch: feature_cols={}, center={}, scale={}",
+                    d,
+                    calibration.feature_center.len(),
+                    calibration.feature_scale.len()
+                ));
+            }
+            for center in &calibration.rbf_centers {
+                if center.len() != d {
+                    return Err(format!(
+                        "saved transformation-normal RBF center width {} != feature width {d}",
+                        center.len()
+                    ));
+                }
+            }
+            if !(calibration.global_sd.is_finite() && calibration.global_sd > 1.0e-12)
+                || !calibration.global_mean.is_finite()
+                || !(calibration.rbf_bandwidth.is_finite() && calibration.rbf_bandwidth > 0.0)
+            {
+                return Err(format!(
+                    "saved transformation-normal score calibration has invalid global mean/sd/bandwidth: mean={}, sd={}, bandwidth={}",
+                    calibration.global_mean, calibration.global_sd, calibration.rbf_bandwidth
+                ));
+            }
+            let p_poly = 1 + d + d * (d + 1) / 2;
+            let p_calib = p_poly + calibration.rbf_centers.len();
+            if calibration.location_beta.len() != p_calib
+                || calibration.log_scale_beta.len() != p_calib
+            {
+                return Err(format!(
+                    "saved transformation-normal calibration/design mismatch: location_beta={}, log_scale_beta={}, p_calib={p_calib}",
+                    calibration.location_beta.len(),
+                    calibration.log_scale_beta.len()
+                ));
+            }
+            let mut calib_mat = ndarray::Array2::<f64>::zeros((n, p_calib));
+            for i in 0..n {
+                calib_mat[[i, 0]] = 1.0;
+                let mut z = vec![0.0; d];
+                for (j, &col) in calibration.feature_cols.iter().enumerate() {
+                    if col >= data.ncols() {
+                        return Err(format!(
+                            "saved transformation-normal calibration feature column {col} out of range for {} columns",
+                            data.ncols()
+                        ));
+                    }
+                    z[j] = (data[[i, col]] - calibration.feature_center[j])
+                        / calibration.feature_scale[j];
+                    calib_mat[[i, 1 + j]] = z[j];
+                }
+                let mut col_out = 1 + d;
+                for a in 0..d {
+                    for b in a..d {
+                        calib_mat[[i, col_out]] = z[a] * z[b];
+                        col_out += 1;
+                    }
+                }
+                for (m, center) in calibration.rbf_centers.iter().enumerate() {
+                    let dist2 = (0..d)
+                        .map(|j| {
+                            let r = z[j] - center[j];
+                            r * r
+                        })
+                        .sum::<f64>();
+                    calib_mat[[i, p_poly + m]] = (-0.5 * dist2
+                        / (calibration.rbf_bandwidth * calibration.rbf_bandwidth))
+                        .exp();
+                }
+            }
+            let location_beta = ndarray::Array1::from_vec(calibration.location_beta.clone());
+            let log_scale_beta = ndarray::Array1::from_vec(calibration.log_scale_beta.clone());
+            let score_location = calib_mat.dot(&location_beta);
+            let score_log_scale = calib_mat.dot(&log_scale_beta);
 
             // Under SCOP-CTN with I-spline shape components,
             // `h'(y, x) = Σ_{r≥1} M_r(y) · γ_r(x)²`. Both M_r and γ_r² are
@@ -323,9 +402,29 @@ pub fn build_predict_input_for_model(
                 .collect();
             let h =
                 ndarray::Array1::<f64>::from_vec(h_vec.into_iter().collect::<Result<Vec<_>, _>>()?);
+            let h_with_offset = h + offset;
+            let calibrated = ndarray::Array1::from_iter(
+                h_with_offset
+                    .iter()
+                    .zip(score_location.iter())
+                    .zip(score_log_scale.iter())
+                    .map(|((&raw, &location), &log_scale)| {
+                        ((raw - location) / log_scale.exp() - calibration.global_mean)
+                            / calibration.global_sd
+                    }),
+            );
+            if calibrated
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX)
+            {
+                return Err(
+                    "prediction failed: transformation-normal score calibration produced non-finite or out-of-range z values"
+                        .to_string(),
+                );
+            }
             Ok(PredictInput {
                 design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
-                offset: h + offset,
+                offset: calibrated,
                 design_noise: None,
                 offset_noise: None,
                 auxiliary_scalar: None,

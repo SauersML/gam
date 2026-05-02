@@ -29,7 +29,6 @@ use crate::families::sigma_link::{
     logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
-use crate::linalg::utils::solve_spd_pcg_with_info;
 use crate::matrix::SymmetricMatrix;
 use crate::matrix::{DenseDesignOperator, DesignMatrix};
 use crate::mixture_link::{
@@ -45,7 +44,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
-use crate::types::{InverseLink, LinkFunction};
+use crate::types::{InverseLink, LinkFunction, RidgePolicy};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -1081,8 +1080,11 @@ pub(crate) fn solve_penalizedweighted_projection(
 
     let y_star = target_eta - offset;
     let xtwy = design.compute_xtwy(weights, &y_star)?;
-    let mut lambdas = Vec::with_capacity(penalties.len());
-    let mut preconditioner = design.diag_gram(weights)?;
+    let mut penalty_system = if penalties.is_empty() {
+        None
+    } else {
+        Some(Array2::<f64>::zeros((p, p)))
+    };
     for (k, s) in penalties.iter().enumerate() {
         let lambda = log_lambdas[k].exp();
         if !lambda.is_finite() || lambda < 0.0 {
@@ -1100,34 +1102,18 @@ pub(crate) fn solve_penalizedweighted_projection(
                 p
             ));
         }
-        lambdas.push(lambda);
-        s.add_scaled_diag_to(lambda, &mut preconditioner);
-    }
-    let ridge = ridge_floor.max(1e-12);
-    for j in 0..p {
-        preconditioner[j] += ridge;
+        if let Some(system) = penalty_system.as_mut() {
+            s.add_scaled_to(lambda, system);
+        }
     }
 
-    let max_iter = p.clamp(64, 4096) * 4;
-    let (beta, _) = solve_spd_pcg_with_info(
-        |v| {
-            let mut out = design.apply_weighted_normal(weights, v, None, 0.0);
-            for (lambda, penalty) in lambdas.iter().zip(penalties.iter()) {
-                out += &penalty.dot(v).mapv(|value| value * *lambda);
-            }
-            if ridge > 0.0 {
-                out += &v.mapv(|value| ridge * value);
-            }
-            out
-        },
+    let beta = design.solve_systemwith_policy(
+        weights,
         &xtwy,
-        &preconditioner,
-        1e-8,
-        max_iter,
-    )
-    .ok_or_else(|| {
-        "solve_penalizedweighted_projection matrix-free solve failed to converge".to_string()
-    })?;
+        penalty_system.as_ref(),
+        ridge_floor.max(1e-12),
+        RidgePolicy::explicit_stabilization_pospart(),
+    )?;
     if beta.iter().any(|v| !v.is_finite()) {
         return Err(
             "solve_penalizedweighted_projection produced non-finite coefficients".to_string(),
