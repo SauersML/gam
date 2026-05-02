@@ -3200,9 +3200,10 @@ pub fn build_smooth_design_withworkspace(
     })?;
     let mut local_designs = Vec::<DesignMatrix>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
-    let mut local_ops = Vec::<
-        Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
-    >::with_capacity(terms.len());
+    let mut local_ops =
+        Vec::<Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>>::with_capacity(
+            terms.len(),
+        );
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
     let mut local_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
     let mut local_pre_dropped_penaltyinfo = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
@@ -3531,29 +3532,32 @@ pub fn build_smooth_design_withworkspace(
             .into_iter()
             .zip(active_penaltyinfo_t.into_iter())
             .zip(ops_t.into_iter())
-            .map(|((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
-                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
-                // so `op.as_dense() == matrix` post-normalization.
-                let scaled_op = if c_new > 0.0 && c_new.is_finite() {
-                    op_in.map(|op| {
-                        std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
-                            op,
-                            1.0 / c_new,
-                        )) as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
+            .map(
+                |((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
+                    let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+                    // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
+                    // so `op.as_dense() == matrix` post-normalization.
+                    let scaled_op = if c_new > 0.0 && c_new.is_finite() {
+                        op_in.map(|op| {
+                            std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
+                                op,
+                                1.0 / c_new,
+                            ))
+                                as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
+                        })
+                    } else {
+                        None
+                    };
+                    Ok(PenaltyCandidate {
+                        nullspace_dim_hint: info.nullspace_dim_hint,
+                        matrix,
+                        source: info.source,
+                        normalization_scale: info.normalization_scale * c_new,
+                        kronecker_factors: None,
+                        op: scaled_op,
                     })
-                } else {
-                    None
-                };
-                Ok(PenaltyCandidate {
-                    nullspace_dim_hint: info.nullspace_dim_hint,
-                    matrix,
-                    source: info.source,
-                    normalization_scale: info.normalization_scale * c_new,
-                    kronecker_factors: None,
-                    op: scaled_op,
-                })
-            })
+                },
+            )
             .collect::<Result<Vec<_>, _>>()?;
         let (penalties_t, nullspaces_t, penaltyinfo_t, ops_t) =
             crate::terms::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;

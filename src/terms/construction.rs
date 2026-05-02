@@ -989,7 +989,12 @@ pub fn canonicalize_penalty_spec(
                     col_range.start, col_range.end
                 )));
             }
-            (local.view(), col_range.clone(), structure_hint.as_ref(), op.clone())
+            (
+                local.view(),
+                col_range.clone(),
+                structure_hint.as_ref(),
+                op.clone(),
+            )
         }
         PenaltySpec::Dense(m) => {
             if m.nrows() != p || m.ncols() != p {

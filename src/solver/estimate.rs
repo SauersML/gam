@@ -101,7 +101,10 @@ impl std::fmt::Debug for PenaltySpec {
                 op,
             } => f
                 .debug_struct("Block")
-                .field("local", &format_args!("{}×{}", local.nrows(), local.ncols()))
+                .field(
+                    "local",
+                    &format_args!("{}×{}", local.nrows(), local.ncols()),
+                )
                 .field("col_range", col_range)
                 .field("structure_hint", structure_hint)
                 .field("op", &op.as_ref().map(|o| o.dim()))
