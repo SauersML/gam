@@ -8106,6 +8106,19 @@ pub fn closed_form_anisotropic_pair_block(
     // pure-Duchon variant (`closed_form_anisotropic_pair_block_pure`).
     let r_eps = pure_duchon_diagonal_epsilon(centers, eta_raw);
 
+    // Smoothness-gate-fails dispatch. When `2(p+s) ≤ d + 2q` the kernel
+    // f(R) has a Riesz-type singularity at the origin and the radial
+    // (-Δ_B)^q chain underflows to the κ→0 leading-Riesz limit at R = r_eps,
+    // missing the Matérn contribution that dominates the analytic value (e.g.
+    // q=1, d=3, m=1, s=1: the diagonal entry is ~6e-22 from the radial chain
+    // while Schoenberg gives the true ~0.12). Mixing radial off-diagonals
+    // with Schoenberg diagonals creates a numerically inconsistent matrix
+    // that breaks downstream eigendecomposition. Route the entire pair-block
+    // through Schoenberg quadrature uniformly in this regime so the assembly
+    // is internally consistent. The radial chain remains the primary path
+    // for smooth-gate-passing cases (cheap, no quadrature cost).
+    let smoothness_gate_fails = 2 * (m + s) <= d + 2 * q;
+
     // Parallelize the K(K+1)/2 lower-triangular pair-block evaluations.
     // Each pair eval is independent; outputs are scattered into a symmetric
     // dense Array2 after the parallel reduction.
@@ -8142,8 +8155,13 @@ pub fn closed_form_anisotropic_pair_block(
                     r_eps_buf[0] = r_eps * eta_raw[0].exp();
                 }
                 j_prefactor
-                    * closed_form_penalty::anisotropic_duchon_penalty_radial(
+                    * closed_form_penalty::anisotropic_duchon_penalty(
                         q, m, s, kappa, eta_raw, &r_eps_buf,
+                    )
+            } else if smoothness_gate_fails {
+                j_prefactor
+                    * closed_form_penalty::anisotropic_duchon_penalty(
+                        q, m, s, kappa, eta_raw, &r_buf,
                     )
             } else {
                 j_prefactor
@@ -18452,15 +18470,43 @@ pub mod closed_form_penalty {
             f64::INFINITY
         };
         let cancellation_lost = chi > 1.0e4;
+        // Matérn-dominance probe is restricted to b > a; in Riesz-balanced
+        // regimes the Taylor / κ→0 limit is correct, and Schoenberg quadrature
+        // is itself unreliable at the small-R diagonals exercised by RC-A.
+        let matern_dominant = b > a;
         if cancellation_lost && x_taylor < 1.5 {
+            let schoenberg_isotropic = || -> f64 {
+                let eta_zeros = vec![0.0_f64; d];
+                let mut r_axis = vec![0.0_f64; d];
+                if d > 0 {
+                    r_axis[0] = r;
+                }
+                anisotropic_duchon_penalty(q, m, s, kappa, &eta_zeros, &r_axis)
+            };
             if d % 2 == 1 {
                 if let Some(tay) = finite_part_duchon_taylor_odd_d(d, a, b, kappa, r) {
+                    if matern_dominant {
+                        let sb = schoenberg_isotropic();
+                        if sb.is_finite() {
+                            let denom = sb.abs().max(tay.abs()).max(1e-300);
+                            let rel = (sb - tay).abs() / denom;
+                            if rel > 1.0e-1 {
+                                return sb;
+                            }
+                        }
+                    }
                     return tay;
                 }
             }
             // Even d (log-Riesz cases) and odd d when the recurrence stalls:
-            // fall back to the leading-term Riesz limit when very deep into
-            // the small-κR regime (R_N^d(R) is the κ → 0 analytic limit).
+            // prefer the Schoenberg quadrature when Matérn-dominant; otherwise
+            // fall back to leading-Riesz limit at very small κR.
+            if matern_dominant {
+                let sb = schoenberg_isotropic();
+                if sb.is_finite() {
+                    return sb;
+                }
+            }
             let limit = riesz_kernel_value(d, a + b, r);
             if kappa_r < 0.5 && limit.is_finite() && limit.abs() > 0.0 {
                 return limit;
@@ -18720,15 +18766,27 @@ pub mod closed_form_penalty {
             z_sq_sum += z[k] * z[k];
         }
 
-        let (nodes, weights) = gauss_legendre_80();
-        // Map y from [-1, 1] -> [-20, 20]
-        let y_lo = -20.0_f64;
-        let y_hi = 20.0_f64;
-        let half_len = 0.5 * (y_hi - y_lo);
-        let mid = 0.5 * (y_hi + y_lo);
-
+        // Recenter the y = ln(τ) integration window on the heat-kernel peak
+        // τ_peak ≈ |z|²/(2d). Gauss-Legendre's dense interior nodes cluster
+        // near the window midpoint; shifting the window so y_peak = midpoint
+        // puts the dense nodes where the integrand has its mass. This is the
+        // primary precision fix for the strict-tolerance test at small R.
+        // Tripling the node count to 240 layered on top recovers an
+        // additional factor of 3 in resolution. Safe to vary per-call here
+        // because this function evaluates a single pair entry; the η/κ-
+        // derivative path keeps the fixed window for cross-entry PSD safety.
+        let (nodes, weights) = gauss_legendre_240();
         let half_d = d as f64 / 2.0;
         let log_4pi = (4.0 * std::f64::consts::PI).ln();
+        let y_peak = if z_sq_sum > 0.0 {
+            (z_sq_sum / (2.0 * d as f64)).ln()
+        } else {
+            0.0
+        };
+        let y_lo = y_peak - 20.0_f64;
+        let y_hi = y_peak + 20.0_f64;
+        let half_len = 0.5 * (y_hi - y_lo);
+        let mid = 0.5 * (y_hi + y_lo);
 
         let mut acc = 0.0_f64;
         for (xi, wi) in nodes.iter().zip(weights.iter()) {
@@ -18751,6 +18809,17 @@ pub mod closed_form_penalty {
     fn gauss_legendre_80() -> (&'static [f64], &'static [f64]) {
         static CACHE: std::sync::OnceLock<(Vec<f64>, Vec<f64>)> = std::sync::OnceLock::new();
         let (n, w) = CACHE.get_or_init(|| compute_gauss_legendre(80));
+        (n.as_slice(), w.as_slice())
+    }
+
+    /// 240-point Gauss-Legendre rule, used by `anisotropic_duchon_penalty`'s
+    /// value-only Schoenberg evaluation when stricter precision is needed at
+    /// small R (the integrand peak τ ≈ R²/(2d) sits in the sparse part of the
+    /// y = ln τ grid; tripling the node count concentrates enough nodes
+    /// around the peak to recover the strict-tolerance regime).
+    fn gauss_legendre_240() -> (&'static [f64], &'static [f64]) {
+        static CACHE: std::sync::OnceLock<(Vec<f64>, Vec<f64>)> = std::sync::OnceLock::new();
+        let (n, w) = CACHE.get_or_init(|| compute_gauss_legendre(240));
         (n.as_slice(), w.as_slice())
     }
 
@@ -19833,6 +19902,75 @@ pub mod closed_form_penalty {
             return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
         }
 
+        // η = 0 short-circuit: at isotropic anisotropy the (-Δ_B)^q chain
+        // collapses exactly to the d-dimensional radial Laplacian iterated q
+        // times, which equals `isotropic_duchon_penalty(q, d, m, s, κ, R)`
+        // analytically. The fr-table → (-Δ_B)^q reduction is numerically
+        // noisier (cancellation between block-derivative sums whose analytic
+        // residue is exact zero) than iso's direct partial-fraction sum at
+        // the (a = 2m − q, b = 2s) decomposition, so prefer iso when valid.
+        if eta.iter().all(|&e| e == 0.0) {
+            return isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+        }
+
+        // Matérn-dominance check: when the Taylor representation in
+        // `radial_derivatives_of_isotropic_duchon`'s χ-gate would converge
+        // to the Riesz-only leading term `R_N^d · ₁F₂` while the analytic
+        // kernel value is dominated by Matérn-pole contributions, the radial
+        // (-Δ_B)^q chain inherits that error. Gated to b > a (genuine Matérn
+        // dominance: 2s > 2m) so this never fires in the Riesz-balanced
+        // regimes that the existing RC-A χ-gate path handles correctly,
+        // including small-R diagonals where Schoenberg quadrature itself is
+        // unreliable.
+        if s != 0 && kappa > 0.0 && 2 * s > 2 * m {
+            let a = 2 * m;
+            let b = 2 * s;
+            let kappa_r = kappa * big_r;
+            let x_taylor = kappa_r * kappa_r;
+            if x_taylor < 1.5 && d % 2 == 1 {
+                let kappa_sq = kappa * kappa;
+                let mut value_sum = 0.0_f64;
+                let mut value_max_term = 0.0_f64;
+                for j in 1..=a {
+                    let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+                    let binom = binomial_f64(a + b - j - 1, a - j);
+                    let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
+                    let val = coeff * riesz_kernel_value(d, j, big_r);
+                    value_sum += val;
+                    value_max_term = value_max_term.max(val.abs());
+                }
+                let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+                for ell in 1..=b {
+                    let binom = binomial_f64(a + b - ell - 1, b - ell);
+                    let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
+                    let val = coeff * matern_kernel_value(d, ell, kappa, big_r);
+                    value_sum += val;
+                    value_max_term = value_max_term.max(val.abs());
+                }
+                let chi_value = if value_sum.abs() > 0.0 {
+                    value_max_term / value_sum.abs()
+                } else {
+                    f64::INFINITY
+                };
+                if chi_value > 1.0e4 {
+                    let tay = finite_part_duchon_taylor_odd_d(d, a, b, kappa, big_r);
+                    let taylor_disagrees = match tay {
+                        Some(tv) => {
+                            let denom = value_sum.abs().max(tv.abs()).max(1e-300);
+                            (value_sum - tv).abs() / denom > 1.0e-1
+                        }
+                        None => true,
+                    };
+                    if taylor_disagrees {
+                        if eta.iter().all(|&e| e == 0.0) {
+                            return isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+                        }
+                        return anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+                    }
+                }
+            }
+        }
+
         // Radial derivatives of f at R, up to order 4 (sufficient for q ≤ 2).
         let max_order = match q {
             0 => 0,
@@ -19842,12 +19980,54 @@ pub mod closed_form_penalty {
         };
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 
-        match q {
+        let value = match q {
             0 => fr[0],
             1 => -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr),
             2 => anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr),
             _ => unreachable!(),
+        };
+        // Cancellation detector for the (-Δ_B)^q chain. Each block contribution
+        // to fr[k] has Riesz-Matérn cancellation (already protected by the
+        // χ-gate inside `radial_derivatives_of_isotropic_duchon`), but the
+        // `Δ_B` reduction itself adds another layer: terms in fr[k]·{u_p,s_p}/R^k
+        // can cancel analytically (e.g. (-Δ_d) R_1^d ≡ 0) and that cancellation
+        // is η-dependent. At small η perturbations, the floating-point sum
+        // retains O(ε·max_term) noise that can swamp the true small residual.
+        // When such cancellation is detected, fall back to the Schoenberg
+        // quadrature (numerically stable at any η for moderate R).
+        if q >= 1 {
+            let r2 = big_r * big_r;
+            let r3 = r2 * big_r;
+            let r4 = r2 * r2;
+            let r5 = r4 * big_r;
+            let r6 = r4 * r2;
+            let r7 = r6 * big_r;
+            let chain_max = if q == 1 {
+                let t1 = (fr[2] * u1 / r2).abs();
+                let t2 = (fr[1] * s1 / big_r).abs();
+                let t3 = (fr[1] * u1 / r3).abs();
+                t1.max(t2).max(t3)
+            } else {
+                // q == 2: anisotropic_laplacian_of_radial_second has 5 max
+                // contribution groups (u1², s1·u1, s1², u2, s2). Use the
+                // largest individual term as the cancellation reference.
+                let g1 = (u1 * u1 * fr[4] / r4).abs();
+                let g2 = (s1 * u1 * fr[3] / r3).abs();
+                let g3 = (s1 * s1 * fr[2] / r2).abs();
+                let g4 = (u2 * fr[3] / r3).abs();
+                let g5 = (s2 * fr[2] / r2).abs();
+                let g6 = (u1 * u1 * fr[1] / r7).abs();
+                let g7 = (s1 * u1 * fr[1] / r5).abs();
+                g1.max(g2).max(g3).max(g4).max(g5).max(g6).max(g7)
+            };
+            if chain_max > 0.0 && value.abs() < 1.0e-6 * chain_max && big_r > 1.0e-6 {
+                let sb = anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+                if sb.is_finite() {
+                    return sb;
+                }
+            }
         }
+        value
     }
 
     /// Δ_B f(R) with f given by its radial derivatives `[f, f', f'', …]`.
@@ -28768,9 +28948,62 @@ mod tests {
                 let gz = g.dot(&z);
                 let zgz = z.t().dot(&gz);
                 let sym = (&zgz + &zgz.t()) * 0.5;
-
-                let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
-                let scale = evals.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+                // faer's symmetric eigendecomposition has a usize-underflow
+                // path on near-rank-1 PSD inputs (which Schoenberg-quadrature
+                // pair-blocks routinely are). Use a jacobi-rotation eigensolver
+                // here since the matrix is small (≤ 6x6 in this test) and the
+                // algorithm has no integer arithmetic that could underflow.
+                let n = sym.nrows();
+                let mut a = vec![vec![0.0_f64; n]; n];
+                for i in 0..n {
+                    for j in 0..n {
+                        a[i][j] = sym[[i, j]];
+                    }
+                }
+                for _sweep in 0..50 {
+                    let mut max_off = 0.0_f64;
+                    let mut p = 0usize;
+                    let mut q_ix = 1usize;
+                    for i in 0..n {
+                        for j in (i + 1)..n {
+                            if a[i][j].abs() > max_off {
+                                max_off = a[i][j].abs();
+                                p = i;
+                                q_ix = j;
+                            }
+                        }
+                    }
+                    if max_off < 1.0e-14 {
+                        break;
+                    }
+                    let app = a[p][p];
+                    let aqq = a[q_ix][q_ix];
+                    let apq = a[p][q_ix];
+                    let theta = 0.5 * (aqq - app) / apq;
+                    let t = if theta >= 0.0 {
+                        1.0 / (theta + (1.0 + theta * theta).sqrt())
+                    } else {
+                        1.0 / (theta - (1.0 + theta * theta).sqrt())
+                    };
+                    let c = 1.0 / (1.0 + t * t).sqrt();
+                    let s = t * c;
+                    a[p][p] = app - t * apq;
+                    a[q_ix][q_ix] = aqq + t * apq;
+                    a[p][q_ix] = 0.0;
+                    a[q_ix][p] = 0.0;
+                    for i in 0..n {
+                        if i != p && i != q_ix {
+                            let aip = a[i][p];
+                            let aiq = a[i][q_ix];
+                            a[i][p] = c * aip - s * aiq;
+                            a[p][i] = a[i][p];
+                            a[i][q_ix] = s * aip + c * aiq;
+                            a[q_ix][i] = a[i][q_ix];
+                        }
+                    }
+                }
+                let evals: Vec<f64> = (0..n).map(|i| a[i][i]).collect();
+                let scale = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                 let tol = 1e-9 * scale + 1e-12;
                 let min_eig = evals.iter().cloned().fold(f64::INFINITY, f64::min);
                 assert!(
