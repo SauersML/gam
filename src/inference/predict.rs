@@ -76,6 +76,32 @@ fn conditional_prediction_backend<'a>(
     expected_dim: usize,
     label: &str,
 ) -> Option<PredictionCovarianceBackend<'a>> {
+    // The canonical conditional covariance is whatever the fitter exposes via
+    // `beta_covariance` (which is `Cov(β̂ | λ̂)` after any final reparameter
+    // alignment the fitter performed). The penalized Hessian is the precision
+    // matrix the fitter used to *derive* that covariance, but for the
+    // prediction path the dense covariance is the source of truth — using it
+    // directly avoids re-factorizing `H` and avoids silent disagreement when
+    // the stored covariance and Hessian were produced by different
+    // reparameterization stages of the fit.
+    //
+    // We fall back to factorizing the penalized Hessian only when no stored
+    // covariance is available. This keeps the conditional-covariance
+    // semantics in `predict_gam_with_uncertainty` consistent with
+    // `posterior_mean_backend_or_warn`, which already prefers
+    // `fit.beta_covariance()` over any indirect derivation.
+    if let Some(covariance) = fit.beta_covariance() {
+        if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
+            return Some(PredictionCovarianceBackend::from_dense(covariance.view()));
+        }
+        log::warn!(
+            "{label}: ignoring conditional covariance with shape {}x{}; expected {}x{}",
+            covariance.nrows(),
+            covariance.ncols(),
+            expected_dim,
+            expected_dim
+        );
+    }
     if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
         match PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
             hessian.clone(),
@@ -88,20 +114,7 @@ fn conditional_prediction_backend<'a>(
             }
         }
     }
-    fit.beta_covariance().and_then(|covariance| {
-        if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
-            Some(PredictionCovarianceBackend::from_dense(covariance.view()))
-        } else {
-            log::warn!(
-                "{label}: ignoring conditional covariance with shape {}x{}; expected {}x{}",
-                covariance.nrows(),
-                covariance.ncols(),
-                expected_dim,
-                expected_dim
-            );
-            None
-        }
-    })
+    None
 }
 
 fn selected_uncertainty_backend<'a>(
