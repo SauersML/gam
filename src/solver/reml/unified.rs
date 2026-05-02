@@ -10618,11 +10618,13 @@ impl StochasticTraceEstimator {
         }
 
         let mut q = Array1::<f64>::zeros(p);
+        let mut a_u = Array1::<f64>::zeros(p);
         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
             op.mul_vec_into(z.view(), q.view_mut());
+            op.mul_vec_into(u.view(), a_u.view_mut());
             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
-            probe_values[[0, 0]] = op.bilinear_view(r.view(), u.view());
+            probe_values[[0, 0]] = a_u.dot(&r);
         })[[0, 0]]
     }
 
