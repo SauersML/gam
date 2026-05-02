@@ -9290,7 +9290,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 
     fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        let estimator = StochasticTraceEstimator::with_defaults();
+        let estimator = StochasticTraceEstimator::for_outer_hessian(self.n_dim, 2);
         if std::ptr::eq(a, b) {
             return estimator.estimate_second_order_single_dense(self, a);
         }
@@ -9305,7 +9305,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
-        let estimator = StochasticTraceEstimator::with_defaults();
+        let estimator = StochasticTraceEstimator::for_outer_hessian(self.n_dim, 2);
         let matrices = [matrix];
         let cross = estimator.estimate_second_order_traces_with_operators(self, &matrices, &[op]);
         cross[[0, 1]]
@@ -9316,7 +9316,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        let estimator = StochasticTraceEstimator::with_defaults();
+        let estimator = StochasticTraceEstimator::for_outer_hessian(self.n_dim, 2);
         let no_dense: [&Array2<f64>; 0] = [];
         if std::ptr::addr_eq(left, right) {
             return estimator.estimate_second_order_single_operator(self, left);
@@ -9353,7 +9353,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
-        let estimator = StochasticTraceEstimator::with_defaults();
+        let estimator = StochasticTraceEstimator::for_outer_hessian(self.n_dim, 2);
         let no_ops: [&dyn HyperOperator; 0] = [];
         if std::ptr::eq(h_i, h_j) {
             return -estimator.estimate_second_order_single_dense(self, h_i);
@@ -9569,6 +9569,27 @@ impl Default for StochasticTraceConfig {
     }
 }
 
+impl StochasticTraceConfig {
+    /// Fast, scale-aware estimator for second-order outer-Hessian traces.
+    ///
+    /// These traces shape the ARC/Newton model; they are not the REML
+    /// objective itself. The default 200-probe estimator is too strict for
+    /// high-dimensional marginal-slope jobs because near-zero off-diagonal
+    /// cross traces never satisfy a pure relative-error test. A bounded probe
+    /// budget with a scale-relative zero floor preserves the large curvature
+    /// entries and lets ARC's trust-region logic absorb residual noise.
+    fn outer_hessian(dim: usize, n_coords: usize) -> Self {
+        let large_problem = dim >= 512 || n_coords >= 4;
+        Self {
+            n_probes_min: if large_problem { 4 } else { 6 },
+            n_probes_max: if large_problem { 8 } else { 24 },
+            relative_tol: if large_problem { 0.12 } else { 0.05 },
+            tau_rel: 1e-3,
+            seed: 0xC0A5_7ACE,
+        }
+    }
+}
+
 /// Stochastic trace estimator using Rademacher probes with adaptive stopping.
 ///
 /// Estimates `tr(H⁻¹ A_k)` for multiple matrices `A_k` simultaneously,
@@ -9631,6 +9652,10 @@ impl StochasticTraceEstimator {
     /// Create with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(StochasticTraceConfig::default())
+    }
+
+    fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
+        Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
     }
 
     fn estimate_from_probe_batch<F>(
@@ -10341,10 +10366,15 @@ impl StochasticTraceEstimator {
         }
         let sqrt_n = (n as f64).sqrt();
         let n_f = n as f64;
+        let scale_floor = means
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+            .max(1.0)
+            * self.config.tau_rel;
         for ((d, e), &mean) in means.indexed_iter() {
             let variance = m2s[[d, e]] / (n_f - 1.0);
             let std_dev = variance.max(0.0).sqrt();
-            let denom = sqrt_n * mean.abs().max(self.config.tau_rel);
+            let denom = sqrt_n * mean.abs().max(scale_floor);
             let rel_err = std_dev / denom;
             if rel_err > self.config.relative_tol {
                 return false;
@@ -10382,7 +10412,8 @@ fn stochastic_trace_hinv_crosses<'a>(
     generic_ops: &[&'a dyn HyperOperator],
     implicit_ops: &[&'a ImplicitHyperOperator],
 ) -> Array2<f64> {
-    let estimator = StochasticTraceEstimator::with_defaults();
+    let estimator =
+        StochasticTraceEstimator::for_outer_hessian(hop.dim(), coord_has_operator.len());
     let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
     let raw_cross = if generic_ops.len() == implicit_ops.len() {
         estimator.estimate_second_order_traces(hop, &dense_refs, implicit_ops)
