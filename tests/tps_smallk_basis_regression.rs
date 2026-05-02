@@ -1,6 +1,6 @@
 //! TPS basis-quality regression tests for the small-n / high-k regime.
 //!
-//! These tests encode the hypothesis that rust's k-knot maximin TPS basis
+//! These tests encode the hypothesis that rust's k-center equal-mass TPS basis
 //! is model-space limited at small n: even given full freedom (unpenalized
 //! OLS on the basis), the basis cannot approximate genuinely smooth target
 //! functions to better than the threshold the test asserts.
@@ -17,7 +17,7 @@
 //!     the basis from REML and the outer optimizer.
 //!   - Test B: same setup, but ridge-stabilize OLS with a tiny α relative
 //!     to the design Gram. This isolates "is it numerical conditioning"
-//!     from "is it model-space" — if Test B passes but Test A fails, the
+//!     from "is it model-space" - if Test B passes but Test A fails, the
 //!     issue is conditioning. If both fail, it's model-space.
 //!   - Test C: 1D analog with k=3 knots and n=40, mirroring the seed-100
 //!     fuzz scenario (additive_interaction signal style at extreme small n).
@@ -143,13 +143,13 @@ fn two_block_design(left: &Array2<f64>, right: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-fn farthest_point_tps_train_test_designs(
+fn equal_mass_tps_train_test_designs(
     x_train: &Array2<f64>,
     x_test: &Array2<f64>,
     centers: usize,
 ) -> (Array2<f64>, Array2<f64>) {
     let train_spec = ThinPlateBasisSpec {
-        center_strategy: CenterStrategy::FarthestPoint {
+        center_strategy: CenterStrategy::EqualMass {
             num_centers: centers,
         },
         length_scale: 1.0,
@@ -158,7 +158,7 @@ fn farthest_point_tps_train_test_designs(
         radial_reparam: None,
     };
     let train = build_thin_plate_basis(x_train.view(), &train_spec)
-        .expect("training TPS basis with farthest-point centers");
+        .expect("training TPS basis with equal-mass centers");
     let (fit_centers, radial_reparam) = match &train.metadata {
         BasisMetadata::ThinPlate {
             centers,
@@ -220,14 +220,14 @@ fn r_squared(y: &Array1<f64>, yhat: &Array1<f64>) -> f64 {
 /// **TEST A — basis-coverage on smooth 2D function, near-OLS.**
 ///
 /// Setup: n_train=120, n_test=300, x ~ Uniform([0,1]²), y = smooth_2d(x) + N(0,0.05²).
-/// Build TPS basis with k=18 maximin knots from the training data. Compute
+/// Build TPS basis with k=18 equal-mass centers from the training data. Compute
 /// β via near-OLS (tiny relative ridge = 1e-10) on the train basis. Predict
 /// on the test set using the SAME knots.
 ///
 /// Assertion: held-out R² ≥ 0.85.
 ///
 /// What this catches:
-///   - If rust's k=18 maximin TPS basis cannot represent the smooth target
+///   - If rust's k=18 equal-mass TPS basis cannot represent the smooth target
 ///     even given full freedom, this fails RED.
 ///   - The result is independent of REML, the outer optimizer, and lambda
 ///     selection — it's a pure statement about the basis function space.
@@ -246,7 +246,7 @@ fn tps_k18_basis_must_span_smooth_bivariate_function() {
     let noise = Normal::new(0.0, 0.05).unwrap();
     let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
 
-    let (basis_train, basis_test) = farthest_point_tps_train_test_designs(&xtr, &xte, 18);
+    let (basis_train, basis_test) = equal_mass_tps_train_test_designs(&xtr, &xte, 18);
 
     let beta = solve_ridge(&basis_train, &ytr, 1e-10);
     let yhat_test = basis_test.dot(&beta);
@@ -285,7 +285,7 @@ fn tps_k18_basis_must_span_smooth_bivariate_function_ridge_stabilized() {
     let noise = Normal::new(0.0, 0.05).unwrap();
     let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
 
-    let (basis_train, basis_test) = farthest_point_tps_train_test_designs(&xtr, &xte, 18);
+    let (basis_train, basis_test) = equal_mass_tps_train_test_designs(&xtr, &xte, 18);
 
     let beta = solve_ridge(&basis_train, &ytr, 1e-4);
     let yhat_test = basis_test.dot(&beta);
@@ -302,7 +302,7 @@ fn tps_k18_basis_must_span_smooth_bivariate_function_ridge_stabilized() {
 /// **TEST C — 1D analog at extreme small n (seed-100 regime).**
 ///
 /// Setup: n_train=40, n_test=200, x ~ Uniform([0,1]), y = smooth_1d(x) + N(0,0.05²).
-/// k=3 maximin knots — the same per-smooth knot count rust uses for the
+/// k=3 equal-mass centers - the same per-smooth center count rust uses for the
 /// seed-100 fuzz scenario.
 ///
 /// Assertion: held-out R² ≥ 0.70.
@@ -323,7 +323,7 @@ fn tps_k3_basis_must_span_smooth_univariate_function() {
     let noise = Normal::new(0.0, 0.05).unwrap();
     let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
 
-    let (basis_train, basis_test) = farthest_point_tps_train_test_designs(&xtr, &xte, 3);
+    let (basis_train, basis_test) = equal_mass_tps_train_test_designs(&xtr, &xte, 3);
 
     let beta = solve_ridge(&basis_train, &ytr, 1e-10);
     let yhat_test = basis_test.dot(&beta);
@@ -369,8 +369,8 @@ fn tps_two_marginal_k18_blocks_must_span_seed118_style_additive_signal() {
     let x0_tr_mat = x0_tr.view().insert_axis(ndarray::Axis(1)).to_owned();
     let x1_tr_mat = x1_tr.view().insert_axis(ndarray::Axis(1)).to_owned();
 
-    let (b0_train, _) = farthest_point_tps_train_test_designs(&x0_tr_mat, &x0_tr_mat, 18);
-    let (b1_train, _) = farthest_point_tps_train_test_designs(&x1_tr_mat, &x1_tr_mat, 18);
+    let (b0_train, _) = equal_mass_tps_train_test_designs(&x0_tr_mat, &x0_tr_mat, 18);
+    let (b1_train, _) = equal_mass_tps_train_test_designs(&x1_tr_mat, &x1_tr_mat, 18);
 
     let x_train = two_block_design(&b0_train, &b1_train);
     let beta = solve_ridge(&x_train, &ytr, 1e-10);
