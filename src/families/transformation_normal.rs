@@ -1986,8 +1986,6 @@ impl TransformationNormalFamily {
         let direction_mat = direction_mat.expect("directional CTN psi-psi path requires direction");
 
         struct PsiPairDirectionalAccum {
-            objective: f64,
-            score: Array1<f64>,
             hvp: Array1<f64>,
             gamma: Vec<f64>,
             gamma_i: Vec<f64>,
@@ -2002,8 +2000,6 @@ impl TransformationNormalFamily {
         impl PsiPairDirectionalAccum {
             fn new(p_total: usize, p_resp: usize) -> Self {
                 Self {
-                    objective: 0.0,
-                    score: Array1::<f64>::zeros(p_total),
                     hvp: Array1::<f64>::zeros(p_total),
                     gamma: vec![0.0; p_resp],
                     gamma_i: vec![0.0; p_resp],
@@ -2017,8 +2013,6 @@ impl TransformationNormalFamily {
             }
 
             fn merge(mut self, rhs: Self) -> Self {
-                self.objective += rhs.objective;
-                self.score.scaled_add(1.0, &rhs.score);
                 self.hvp.scaled_add(1.0, &rhs.hvp);
                 self
             }
@@ -2097,9 +2091,7 @@ impl TransformationNormalFamily {
                     let inv_hp_sq = inv_hp * inv_hp;
                     let inv_hp_cu = inv_hp_sq * inv_hp;
                     let inv_hp_qu = inv_hp_sq * inv_hp_sq;
-                    let value = h_i * h_j + h * h_ij - hp_ij * inv_hp + hp_i * hp_j * inv_hp_sq;
                     let wi = weights[row_idx];
-                    acc.objective += wi * value;
 
                     for k in 0..p_resp {
                         let offset = k * p_cov;
@@ -2178,11 +2170,6 @@ impl TransformationNormalFamily {
                                 )
                             };
 
-                            let grad = dh_i * h_j + h_i * dh_j + dh * h_ij + h * dh_ij
-                                - dhp_ij * inv_hp
-                                + hp_ij * dhp * inv_hp_sq
-                                + (dhp_i * hp_j + hp_i * dhp_j) * inv_hp_sq
-                                - 2.0 * hp_i * hp_j * dhp * inv_hp_cu;
                             let n1 = dhp_i * hp_j + hp_i * dhp_j;
                             let n1_dot =
                                 ddhp_i * hp_j + dhp_i * hp_j_dot + hp_i_dot * dhp_j + hp_i * ddhp_j;
@@ -2205,7 +2192,6 @@ impl TransformationNormalFamily {
                                 - 2.0 * n1 * hp_dot * inv_hp_cu
                                 - 2.0 * n2_dot * inv_hp_cu
                                 + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu;
-                            acc.score[offset + cidx] += wi * grad;
                             acc.hvp[offset + cidx] += wi * hv;
                         }
                     }
@@ -2217,7 +2203,7 @@ impl TransformationNormalFamily {
                 |left, right| left.merge(right),
             );
 
-        Ok((accum.objective, accum.score, Some(accum.hvp)))
+        Ok((0.0, Array1::<f64>::zeros(p_total), Some(accum.hvp)))
     }
 
     fn scop_psi_hessian_directional_derivative(
