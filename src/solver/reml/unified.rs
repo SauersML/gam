@@ -102,6 +102,20 @@ pub trait HessianOperator: Send + Sync {
     /// H⁻¹ M — multi-column solve.
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64>;
 
+    /// H⁻¹ v for stochastic trace probes.
+    ///
+    /// Exact backends use the normal solve. Matrix-free backends may override
+    /// this to use a looser PCG tolerance when the caller's Monte Carlo error
+    /// dominates the linear-solve error.
+    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, _rel_tol: f64) -> Array1<f64> {
+        self.solve(rhs)
+    }
+
+    /// H⁻¹ M for stochastic trace probes.
+    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, _rel_tol: f64) -> Array2<f64> {
+        self.solve_multi(rhs)
+    }
+
     /// tr(H⁻¹ A H⁻¹ B) for dense symmetric Hessian drifts.
     ///
     /// This is the second-order trace object used by EFS denominators and the
@@ -9228,12 +9242,12 @@ impl MatrixFreeSpdOperator {
         }
     }
 
-    fn solve_pcg(&self, rhs: &Array1<f64>) -> Option<Array1<f64>> {
+    fn solve_pcg_with_tol(&self, rhs: &Array1<f64>, rel_tol: f64) -> Option<Array1<f64>> {
         solve_spd_pcg_with_info(
             |v| (self.apply)(v),
             rhs,
             &self.preconditioner_diag,
-            self.solve_rel_tol,
+            rel_tol,
             self.max_iter,
         )
         .and_then(|(solution, info)| {
@@ -9242,6 +9256,10 @@ impl MatrixFreeSpdOperator {
                 && solution.iter().all(|v| v.is_finite()))
             .then_some(solution)
         })
+    }
+
+    fn solve_pcg(&self, rhs: &Array1<f64>) -> Option<Array1<f64>> {
+        self.solve_pcg_with_tol(rhs, self.solve_rel_tol)
     }
 
     fn materialize_dense_operator(&self) -> Option<DenseSpectralOperator> {
@@ -9347,6 +9365,24 @@ impl HessianOperator for MatrixFreeSpdOperator {
         for col in 0..rhs.ncols() {
             rhs_col.assign(&rhs.column(col));
             let solved = self.solve(&rhs_col);
+            out.column_mut(col).assign(&solved);
+        }
+        out
+    }
+
+    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
+        if let Some(solution) = self.solve_pcg_with_tol(rhs, rel_tol) {
+            return solution;
+        }
+        self.solve(rhs)
+    }
+
+    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.n_dim, rhs.ncols()));
+        let mut rhs_col = Array1::<f64>::zeros(self.n_dim);
+        for col in 0..rhs.ncols() {
+            rhs_col.assign(&rhs.column(col));
+            let solved = self.stochastic_trace_solve(&rhs_col, rel_tol);
             out.column_mut(col).assign(&solved);
         }
         out
@@ -9553,6 +9589,8 @@ pub struct StochasticTraceConfig {
     pub relative_tol: f64,
     /// Protection threshold τ_rel for near-zero traces (default: 1e-8).
     pub tau_rel: f64,
+    /// Relative tolerance for iterative solves inside stochastic trace probes.
+    pub solve_rel_tol: f64,
     /// RNG seed for reproducibility.
     pub seed: u64,
 }
@@ -9564,6 +9602,7 @@ impl Default for StochasticTraceConfig {
             n_probes_max: 200,
             relative_tol: 0.01,
             tau_rel: 1e-8,
+            solve_rel_tol: 1e-8,
             seed: 0xCAFE_BABE,
         }
     }
@@ -9585,6 +9624,7 @@ impl StochasticTraceConfig {
             n_probes_max: if large_problem { 8 } else { 24 },
             relative_tol: if large_problem { 0.12 } else { 0.05 },
             tau_rel: 1e-3,
+            solve_rel_tol: if large_problem { 1e-4 } else { 1e-5 },
             seed: 0xC0A5_7ACE,
         }
     }
@@ -9685,7 +9725,7 @@ impl StochasticTraceEstimator {
         let mut z = Array1::<f64>::zeros(p);
         for m in 0..self.config.n_probes_max {
             rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let w = hop.solve(&z);
+            let w = hop.stochastic_trace_solve(&z, self.config.solve_rel_tol);
             evaluate_probe(&z, &w, &mut probe_values);
 
             for k in 0..n_coords {
@@ -10009,7 +10049,7 @@ impl StochasticTraceEstimator {
 
         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
             // Step 1: u = H⁻¹ z (shared solve)
-            let u = hop.solve(z);
+            let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
 
             if let Some(ref x) = x_design {
                 design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
@@ -10033,7 +10073,7 @@ impl StochasticTraceEstimator {
             }
 
             // Step 3: R = H⁻¹ [q_1, ..., q_D] (block solve, total RHS)
-            let r = hop.solve_multi(&q_columns);
+            let r = hop.stochastic_trace_solve_multi(&q_columns, self.config.solve_rel_tol);
 
             // Step 4: Compute T[d, e] = u^T A_d r_e for all (d, e) pairs.
             // For dense A_d: T[d, e] = (A_d^T u)^T r_e = (A_d u)^T r_e (A_d symmetric)
@@ -10197,7 +10237,7 @@ impl StochasticTraceEstimator {
         let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
 
         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
-            let u = hop.solve(z);
+            let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
 
             for e in 0..n_dense {
                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
@@ -10207,7 +10247,7 @@ impl StochasticTraceEstimator {
                 op.mul_vec_into(z.view(), q_columns.column_mut(e));
             }
 
-            let r = hop.solve_multi(&q_columns);
+            let r = hop.stochastic_trace_solve_multi(&q_columns, self.config.solve_rel_tol);
 
             for d in 0..n_dense {
                 dense_matvec_into(dense_matrices[d], u.view(), dense_a_u[d].view_mut());
@@ -10248,9 +10288,9 @@ impl StochasticTraceEstimator {
 
         let mut q = Array1::<f64>::zeros(p);
         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
-            let u = hop.solve(z);
+            let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
             dense_matvec_into(matrix, z.view(), q.view_mut());
-            let r = hop.solve(&q);
+            let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
             probe_values[[0, 0]] = dense_bilinear(matrix, u.view(), r.view());
         })[[0, 0]]
     }
@@ -10273,7 +10313,7 @@ impl StochasticTraceEstimator {
         let mut p_work = Array1::<f64>::zeros(p);
         let mut q = Array1::<f64>::zeros(p);
         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
-            let u = hop.solve(z);
+            let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
             op.matvec_with_shared_xz_into(
                 &x_z,
@@ -10282,7 +10322,7 @@ impl StochasticTraceEstimator {
                 n_work.view_mut(),
                 p_work.view_mut(),
             );
-            let r = hop.solve(&q);
+            let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
 
             design_matrix_apply_view_into(&op.x_design, u.view(), x_u.view_mut());
             design_matrix_apply_view_into(&op.x_design, r.view(), x_r.view_mut());
@@ -10328,9 +10368,9 @@ impl StochasticTraceEstimator {
 
         let mut q = Array1::<f64>::zeros(p);
         self.estimate_matrix_from_probe_batch(hop, 1, |z, probe_values| {
-            let u = hop.solve(z);
+            let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
             op.mul_vec_into(z.view(), q.view_mut());
-            let r = hop.solve(&q);
+            let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
             probe_values[[0, 0]] = op.bilinear_view(r.view(), u.view());
         })[[0, 0]]
     }
@@ -11330,6 +11370,7 @@ mod tests {
             n_probes_max: 200,
             relative_tol: 0.005,
             tau_rel: 1e-10,
+            solve_rel_tol: 1e-8,
             seed: 42,
         };
         let estimator = StochasticTraceEstimator::new(config);
