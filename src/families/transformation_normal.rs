@@ -1843,6 +1843,106 @@ impl TransformationNormalFamily {
             None => None,
         };
 
+        if direction_mat.is_none() {
+            let weights = self.weights.as_ref();
+            let mut objective_psi_psi = 0.0;
+            let mut score_psi_psi = Array1::<f64>::zeros(p_total);
+            let mut gamma = vec![0.0; p_resp];
+            let mut gamma_i = vec![0.0; p_resp];
+            let mut gamma_j = vec![0.0; p_resp];
+            let mut gamma_ij = vec![0.0; p_resp];
+
+            for row_idx in 0..n {
+                let cov_row = cov.row(row_idx);
+                let cov_i_row = cov_i.row(row_idx);
+                let cov_j_row = cov_j.row(row_idx);
+                let cov_ij_row = cov_ij.row(row_idx);
+                let rv = self.response_val_basis.row(row_idx);
+                let rd = self.response_deriv_basis.row(row_idx);
+
+                for k in 0..p_resp {
+                    let beta_k = beta_mat.row(k);
+                    gamma[k] = beta_k.dot(&cov_row);
+                    gamma_i[k] = beta_k.dot(&cov_i_row);
+                    gamma_j[k] = beta_k.dot(&cov_j_row);
+                    gamma_ij[k] = beta_k.dot(&cov_ij_row);
+                }
+
+                let mut h = rv[0] * gamma[0];
+                let mut hp = rd[0] * gamma[0];
+                let mut h_i = rv[0] * gamma_i[0];
+                let mut h_j = rv[0] * gamma_j[0];
+                let mut h_ij = rv[0] * gamma_ij[0];
+                let mut hp_i = rd[0] * gamma_i[0];
+                let mut hp_j = rd[0] * gamma_j[0];
+                let mut hp_ij = rd[0] * gamma_ij[0];
+                for k in 1..p_resp {
+                    let g = gamma[k];
+                    let gi = gamma_i[k];
+                    let gj = gamma_j[k];
+                    let gij = gamma_ij[k];
+                    h += rv[k] * g * g;
+                    hp += rd[k] * g * g;
+                    h_i += 2.0 * rv[k] * g * gi;
+                    h_j += 2.0 * rv[k] * g * gj;
+                    h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
+                    hp_i += 2.0 * rd[k] * g * gi;
+                    hp_j += 2.0 * rd[k] * g * gj;
+                    hp_ij += 2.0 * rd[k] * (gj * gi + g * gij);
+                }
+
+                let inv_hp = 1.0 / hp;
+                let inv_hp_sq = inv_hp * inv_hp;
+                let inv_hp_cu = inv_hp_sq * inv_hp;
+                let value = h_i * h_j + h * h_ij - hp_ij * inv_hp + hp_i * hp_j * inv_hp_sq;
+                let wi = weights[row_idx];
+                objective_psi_psi += wi * value;
+
+                for k in 0..p_resp {
+                    let offset = k * p_cov;
+                    let (rvk, rdk) = (rv[k], rd[k]);
+                    let (g, gi, gj, gij) = (gamma[k], gamma_i[k], gamma_j[k], gamma_ij[k]);
+                    for cidx in 0..p_cov {
+                        let c = cov_row[cidx];
+                        let ci = cov_i_row[cidx];
+                        let cj = cov_j_row[cidx];
+                        let cij = cov_ij_row[cidx];
+                        let (dh, dhp, dh_i, dh_j, dh_ij, dhp_i, dhp_j, dhp_ij) = if k == 0 {
+                            (
+                                rvk * c,
+                                rdk * c,
+                                rvk * ci,
+                                rvk * cj,
+                                rvk * cij,
+                                rdk * ci,
+                                rdk * cj,
+                                rdk * cij,
+                            )
+                        } else {
+                            (
+                                2.0 * rvk * g * c,
+                                2.0 * rdk * g * c,
+                                2.0 * rvk * (gi * c + g * ci),
+                                2.0 * rvk * (gj * c + g * cj),
+                                2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
+                                2.0 * rdk * (gi * c + g * ci),
+                                2.0 * rdk * (gj * c + g * cj),
+                                2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
+                            )
+                        };
+                        let grad = dh_i * h_j + h_i * dh_j + dh * h_ij + h * dh_ij
+                            - dhp_ij * inv_hp
+                            + hp_ij * dhp * inv_hp_sq
+                            + (dhp_i * hp_j + hp_i * dhp_j) * inv_hp_sq
+                            - 2.0 * hp_i * hp_j * dhp * inv_hp_cu;
+                        score_psi_psi[offset + cidx] += wi * grad;
+                    }
+                }
+            }
+
+            return Ok((objective_psi_psi, score_psi_psi, None));
+        }
+
         #[derive(Clone)]
         struct JetHv {
             value: f64,
