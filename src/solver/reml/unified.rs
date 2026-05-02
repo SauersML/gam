@@ -4729,8 +4729,10 @@ pub fn reml_laml_evaluate(
             .unwrap_or(solution.n_observations);
         let p_dim = hop.dim();
         let k_outer = k + solution.ext_coords.len();
-        let callback_operator_kernel =
-            matches!(hessian_kernel, Some(OuterHessianDerivativeKernel::Callback { .. }));
+        let callback_operator_kernel = matches!(
+            hessian_kernel,
+            Some(OuterHessianDerivativeKernel::Callback { .. })
+        );
         let use_operator = hessian_kernel.is_some()
             && (callback_operator_kernel || prefer_outer_hessian_operator(n_obs, p_dim, k_outer))
             && solution.penalty_subspace_trace.is_none();
@@ -5722,7 +5724,10 @@ fn compute_outer_hessian(
             if !value.is_finite() {
                 log::warn!(
                     "[OUTER non-finite] {} at ({}, {}) = {}",
-                    name, ii, jj, value,
+                    name,
+                    ii,
+                    jj,
+                    value,
                 );
             }
         };
