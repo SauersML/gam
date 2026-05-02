@@ -55,7 +55,7 @@ use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -5498,8 +5498,8 @@ struct TensorKroneckerPsiOperator {
     response_val_basis: Arc<Array2<f64>>,
     covariate_design: DesignMatrix,
     covariate_derivs: Vec<CustomFamilyBlockPsiDerivative>,
-    covariate_dense_cache: Arc<OnceLock<Arc<Array2<f64>>>>,
-    covariate_first_cache: Arc<Vec<OnceLock<Arc<Array2<f64>>>>>,
+    covariate_dense_cache: Arc<Mutex<Option<Arc<Array2<f64>>>>>,
+    covariate_first_cache: Arc<Vec<Mutex<Option<Arc<Array2<f64>>>>>>,
 }
 
 impl TensorKroneckerPsiOperator {
@@ -5628,7 +5628,12 @@ impl TensorKroneckerPsiOperator {
     fn materialize_covariate_dense_arc(
         &self,
     ) -> Result<Arc<Array2<f64>>, crate::terms::basis::BasisError> {
-        if let Some(cached) = self.covariate_dense_cache.get() {
+        let mut cache = self.covariate_dense_cache.lock().map_err(|_| {
+            crate::terms::basis::BasisError::InvalidInput(
+                "tensor Kronecker covariate dense cache mutex poisoned".to_string(),
+            )
+        })?;
+        if let Some(cached) = cache.as_ref() {
             return Ok(cached.clone());
         }
         let dense = Arc::new(
@@ -5640,8 +5645,8 @@ impl TensorKroneckerPsiOperator {
                     ))
                 })?,
         );
-        let _ = self.covariate_dense_cache.set(dense.clone());
-        Ok(self.covariate_dense_cache.get().cloned().unwrap_or(dense))
+        *cache = Some(dense.clone());
+        Ok(dense)
     }
 
     fn materialize_cov_first_axis_uncached(
@@ -5676,13 +5681,18 @@ impl TensorKroneckerPsiOperator {
             )));
         }
         let axis_cache = &self.covariate_first_cache[axis];
-        if let Some(cached) = axis_cache.get() {
+        let mut cache = axis_cache.lock().map_err(|_| {
+            crate::terms::basis::BasisError::InvalidInput(format!(
+                "tensor Kronecker covariate first-derivative cache mutex poisoned for axis {axis}"
+            ))
+        })?;
+        if let Some(cached) = cache.as_ref() {
             return Ok(cached.clone());
         }
 
         let materialized = Arc::new(self.materialize_cov_first_axis_uncached(axis)?);
-        let _ = axis_cache.set(materialized.clone());
-        Ok(axis_cache.get().cloned().unwrap_or(materialized))
+        *cache = Some(materialized.clone());
+        Ok(materialized)
     }
 
     fn materialize_cov_first(
@@ -8113,9 +8123,9 @@ pub fn build_tensor_psi_derivatives(
             response_val_basis: Arc::new(family.response_val_basis.clone()),
             covariate_design: family.covariate_design.clone(),
             covariate_derivs: covariate_psi_derivs.to_vec(),
-            covariate_dense_cache: Arc::new(OnceLock::new()),
+            covariate_dense_cache: Arc::new(Mutex::new(None)),
             covariate_first_cache: Arc::new(
-                (0..n_axes).map(|_| OnceLock::new()).collect::<Vec<_>>(),
+                (0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
             ),
         });
 
