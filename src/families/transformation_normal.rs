@@ -3791,6 +3791,10 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
             .expect("validated CTN psi-psi bilinear inputs should not fail")
     }
 
+    fn has_fast_bilinear_view(&self) -> bool {
+        true
+    }
+
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
