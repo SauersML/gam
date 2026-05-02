@@ -1,70 +1,31 @@
-//! Operator form of the closed-form Duchon penalty (currently a lazy
-//! materializer).
+//! Operator form of the closed-form Duchon penalty.
 //!
 //! ## Status
 //!
-//! This module exposes the closed-form anisotropic Duchon penalty as an
-//! *operator* with `matvec`, `diag`, `trace`, and `log_det_plus_lambda_i`
-//! methods — the same surface a true matrix-free implementation would have.
-//! Today, however, every `matvec` ultimately falls back to a fully
-//! materialized `K×K` dense Gram (see "Cancellation budget" below). A
-//! `OnceLock<Array2<f64>>` cache amortizes that build over the lifetime of
-//! the operator, so repeated matvecs cost `O(K²)` flops without rebuild —
-//! but the `O(K²)` *memory* is unavoidable in the current implementation.
-//!
-//! For our K range (200–2000) this is acceptable. At K = 2000 the cache is
-//! one 32 MB allocation per operator; a typical run keeps a handful of
-//! operators alive (one per derivative order × axis), so total penalty
-//! memory stays under ~100 MB.
-//!
-//! ## Cancellation budget
-//!
-//! A genuinely matrix-free `matvec` would chain
-//!     `S' w = T^T diag(Z, I_poly)^T G_raw diag(Z, I_poly) T w`
-//! by applying each factor to a vector. Doing so produces heavy floating-
-//! point cancellation under typical `Z` (e.g. `Z` projecting out a near-
-//! constant mode of `G_raw` whose row-sums largely cancel against off-
-//! diagonal contributions). Vector-chain associativity disagrees with the
-//! materialized chain at a magnitude proportional to that cancellation,
-//! not at FP roundoff. The materialized path uses `fast_atb`/`fast_ab`
-//! which preserve the dense reference; we mirror it by building the same
-//! `K×K` matrix and computing `out = M · w`.
-//!
-//! ## Future work for a true matrix-free path
-//!
-//! The integration analysis on 2026-04-30 (memory:
-//! `matrix_free_penalty_integration_assessment.md`) concluded that wiring
-//! the operator surface through `PenaltyCandidate` / `CanonicalPenaltyBlock`
-//! / PIRLS / REML is a multi-week refactor that yields **zero** speedup
-//! until two things change:
-//!   1. `matvec` becomes truly matrix-free (no `K×K` storage), which
-//!      requires a numerically stable formulation of the constrained chain
-//!      that matches `dense_form` to FP precision under cancellation.
-//!   2. The downstream Hessian assembly `H = X^T W X + Σ λ_k S_k` learns
-//!      to consume operator-form `S_k` (e.g. PCG-against-implicit-H), since
-//!      the destination Hessian is currently dense `p × p` and adding an
-//!      operator to a dense destination materializes it column-by-column.
-//!
-//! Until those land, this module is best treated as a memory-aware lazy
-//! materializer: same numbers as the dense path, single `dense_form` build
-//! per operator instance.
+//! `matvec` is analytic and streaming: it applies the constraint transforms,
+//! evaluates the raw pair kernel row-by-row with Kahan summation, and never
+//! allocates the raw `K×K` Gram. `dense_form()` is still available for
+//! callers that explicitly need a materialized matrix, and caches only that
+//! opt-in dense build.
 
 use std::sync::OnceLock;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
+use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use crate::faer_ndarray::{fast_ab, fast_atb};
 use crate::linalg::utils::stochastic_lanczos_logdet_spd_operator;
-use crate::terms::basis::closed_form_anisotropic_pair_block;
+use crate::terms::basis::{
+    closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_value,
+    pure_duchon_diagonal_epsilon,
+};
 
 /// Matrix-free closed-form anisotropic Duchon penalty operator.
 ///
 /// Stores the parameters of the closed-form pair-block (`q, m, s, κ, η`, knot
-/// centers, and optional constraint factors), plus a `OnceLock` cache of the
-/// fully assembled dense `dim × dim` operator. The first `matvec` (or any
-/// other call that needs the dense form) builds the cache; subsequent calls
-/// reuse it. See module docs for the cancellation-budget reason the cache
-/// holds a dense matrix instead of the operator parameters alone.
+/// centers, and optional constraint factors). The hot `matvec` path stays
+/// matrix-free; `cached_dense` is populated only by `dense_form()`.
 pub struct ClosedFormPenaltyOperator {
     /// Derivative order (0 = mass, 1 = tension, 2 = stiffness).
     q: usize,
@@ -76,10 +37,10 @@ pub struct ClosedFormPenaltyOperator {
     kappa: f64,
     /// Knot centers in the un-anisotropized coordinate, shape (K, d).
     centers: Array2<f64>,
-    /// Per-axis centered anisotropy log-scales (length d). The pair-block
-    /// builder consumes these directly and applies the `J = exp(Σ η_k)`
-    /// Jacobian internally.
-    eta_centered: Vec<f64>,
+    /// Per-axis raw anisotropy log-scales (length d). The pair-block builder
+    /// consumes these directly and applies the `J = exp(Σ η_k)` Jacobian
+    /// internally.
+    eta_raw: Vec<f64>,
     /// Optional kernel-nullspace transform Z (K × kernel_cols).
     kernel_nullspace: Option<Array2<f64>>,
     /// Number of polynomial-block columns padded after the kernel block.
@@ -103,7 +64,7 @@ impl Clone for ClosedFormPenaltyOperator {
             s: self.s,
             kappa: self.kappa,
             centers: self.centers.clone(),
-            eta_centered: self.eta_centered.clone(),
+            eta_raw: self.eta_raw.clone(),
             kernel_nullspace: self.kernel_nullspace.clone(),
             polynomial_block_cols: self.polynomial_block_cols,
             outer_identifiability: self.outer_identifiability.clone(),
@@ -127,13 +88,13 @@ impl ClosedFormPenaltyOperator {
         outer_identifiability: Option<&Array2<f64>>,
     ) -> Self {
         let d = centers.ncols();
-        let eta_centered: Vec<f64> = if let Some(eta) = aniso_log_scales {
-            let mean = if eta.len() <= 1 {
-                0.0
-            } else {
-                eta.iter().sum::<f64>() / eta.len() as f64
-            };
-            eta.iter().map(|&v| (v - mean).clamp(-50.0, 50.0)).collect()
+        let eta_raw: Vec<f64> = if let Some(eta) = aniso_log_scales {
+            assert_eq!(
+                eta.len(),
+                d,
+                "ClosedFormPenaltyOperator::new: eta dimension mismatch"
+            );
+            eta.to_vec()
         } else {
             vec![0.0_f64; d]
         };
@@ -143,7 +104,7 @@ impl ClosedFormPenaltyOperator {
             s,
             kappa,
             centers: centers.to_owned(),
-            eta_centered,
+            eta_raw,
             kernel_nullspace: kernel_nullspace.cloned(),
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
@@ -198,23 +159,35 @@ impl ClosedFormPenaltyOperator {
             "ClosedFormPenaltyOperator::matvec: output dim mismatch"
         );
 
-        // The constraint chain `T^T diag(Z, I_poly)^T G_raw diag(Z, I_poly) T`
-        // produces heavy floating-point cancellation under typical Z (e.g. Z
-        // projecting out a near-constant mode of G_raw whose row-sums largely
-        // cancel against off-diagonal contributions). Any matvec scheme that
-        // associates the chain differently from `dense_form` — symmetry-
-        // halved accumulation, `Z (Gv)` vs `(Z^T G Z) v`, BLAS-vs-manual
-        // reductions — disagrees with the dense path at a magnitude
-        // proportional to the cancellation budget, not at FP roundoff.
-        //
-        // To stay bit-compatible with `dense_form` we use the same
-        // materialized constrained operator and compute `out = M w` against
-        // it. The `OnceLock` cache amortizes the `K×K` build over the
-        // lifetime of the operator; the first call pays the build cost,
-        // subsequent calls are just a dense gemv. See module docs for why
-        // a vector-chain matvec disagrees with `dense_form` numerically.
-        let m = self.ensure_dense();
-        out.assign(&m.dot(&w));
+        let pre = match &self.outer_identifiability {
+            Some(t) => t.dot(&w),
+            None => w.to_owned(),
+        };
+        let kernel_cols = self
+            .kernel_nullspace
+            .as_ref()
+            .map(|z| z.ncols())
+            .unwrap_or_else(|| self.centers.nrows());
+        let pre_kernel = pre.slice(ndarray::s![0..kernel_cols]);
+        let raw_input = match &self.kernel_nullspace {
+            Some(z) => z.dot(&pre_kernel),
+            None => pre_kernel.to_owned(),
+        };
+        let raw_output = self.raw_pair_matvec(raw_input.view());
+        let kernel_output = match &self.kernel_nullspace {
+            Some(z) => z.t().dot(&raw_output),
+            None => raw_output,
+        };
+        let total_pre = kernel_cols + self.polynomial_block_cols;
+        let mut projected = Array1::<f64>::zeros(total_pre);
+        projected
+            .slice_mut(ndarray::s![0..kernel_cols])
+            .assign(&kernel_output);
+        let final_output = match &self.outer_identifiability {
+            Some(t) => t.t().dot(&projected),
+            None => projected,
+        };
+        out.assign(&final_output);
     }
 
     /// Diagonal `S[i,i]` for i in 0..dim. With constraint composition the
@@ -288,10 +261,10 @@ impl ClosedFormPenaltyOperator {
             self.m,
             self.s,
             self.kappa,
-            if self.eta_centered.iter().all(|&e| e == 0.0) {
+            if self.eta_raw.iter().all(|&e| e == 0.0) {
                 None
             } else {
-                Some(self.eta_centered.as_slice())
+                Some(self.eta_raw.as_slice())
             },
         );
         let kernel_cols = self
@@ -323,6 +296,46 @@ impl ClosedFormPenaltyOperator {
             }
             None => g_padded,
         }
+    }
+
+    fn raw_pair_matvec(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(
+            v.len(),
+            self.centers.nrows(),
+            "ClosedFormPenaltyOperator::raw_pair_matvec: input dim mismatch"
+        );
+        let k = self.centers.nrows();
+        let d = self.centers.ncols();
+        let r_eps = pure_duchon_diagonal_epsilon(self.centers.view(), &self.eta_raw);
+        let rows: Vec<f64> = (0..k)
+            .into_par_iter()
+            .map(|i| {
+                let mut r: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
+                r.resize(d, 0.0);
+                let mut sum = 0.0_f64;
+                let mut correction = 0.0_f64;
+                for j in 0..k {
+                    for axis in 0..d {
+                        r[axis] = self.centers[[i, axis]] - self.centers[[j, axis]];
+                    }
+                    let gij = closed_form_anisotropic_pair_value(
+                        self.q,
+                        self.m,
+                        self.s,
+                        self.kappa,
+                        &self.eta_raw,
+                        r.as_slice(),
+                        r_eps,
+                    );
+                    let y = gij * v[j] - correction;
+                    let next = sum + y;
+                    correction = (next - sum) - y;
+                    sum = next;
+                }
+                sum
+            })
+            .collect();
+        Array1::from_vec(rows)
     }
 }
 
@@ -427,6 +440,64 @@ mod tests {
         let want = dense.dot(&v);
         for i in 0..n {
             assert_abs_diff_eq!(got[i], want[i], epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_operator_matvec_stays_matrix_free_until_dense_requested() {
+        let centers = small_centers();
+        let op = ClosedFormPenaltyOperator::new(
+            centers.view(),
+            1,
+            2,
+            1,
+            1.0,
+            Some(&[0.35, 0.10]),
+            None,
+            0,
+            None,
+        );
+        let v = Array1::from_vec(vec![0.2, -0.1, 0.4, -0.3, 0.7]);
+        let mut out = Array1::<f64>::zeros(op.dim());
+        op.matvec(v.view(), out.view_mut());
+        assert!(
+            op.cached_dense.get().is_none(),
+            "matvec must not populate the dense KxK cache"
+        );
+        let dense = op.dense_form();
+        assert!(
+            op.cached_dense.get().is_some(),
+            "dense_form should be the only path that populates the dense cache"
+        );
+        let expected = dense.dot(&v);
+        for i in 0..op.dim() {
+            assert_abs_diff_eq!(out[i], expected[i], epsilon = 1e-8);
+        }
+    }
+
+    #[test]
+    fn test_operator_preserves_raw_anisotropy_coordinates() {
+        let centers = small_centers();
+        let eta = [0.35, 0.10];
+        let op =
+            ClosedFormPenaltyOperator::new(centers.view(), 1, 2, 1, 1.0, Some(&eta), None, 0, None);
+        let dense = op.dense_form();
+        let reference = crate::terms::basis::closed_form_operator_penalty_in_total_basis(
+            centers.view(),
+            1,
+            2,
+            1,
+            1.0,
+            Some(&eta),
+            None,
+            0,
+            None,
+        );
+        for i in 0..op.dim() {
+            for j in 0..op.dim() {
+                let scale = reference[[i, j]].abs().max(1.0);
+                assert_abs_diff_eq!(dense[[i, j]], reference[[i, j]], epsilon = 1e-12 * scale);
+            }
         }
     }
 

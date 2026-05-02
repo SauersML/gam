@@ -4576,29 +4576,26 @@ fn build_parametric_constraint_block_for_term(
     let n = data.nrows();
     let p_data = data.ncols();
     let feature_cols = smooth_term_feature_cols(termspec);
-    let overlapping_linear_term_indices: Vec<usize> = linear_terms
+    let mut parametric_cols = Vec::<usize>::new();
+    for linear in linear_terms
         .iter()
-        .enumerate()
-        .filter_map(|(idx, linear)| {
-            if feature_cols.contains(&linear.feature_col) {
-                Some(idx)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut c = Array2::<f64>::zeros((n, 1 + overlapping_linear_term_indices.len()));
-    c.column_mut(0).fill(1.0);
-    for (j, &lin_idx) in overlapping_linear_term_indices.iter().enumerate() {
-        let linear = &linear_terms[lin_idx];
+        .filter(|linear| feature_cols.contains(&linear.feature_col))
+    {
         if linear.feature_col >= p_data {
             return Err(BasisError::DimensionMismatch(format!(
                 "linear term '{}' feature column {} out of bounds for {} columns",
                 linear.name, linear.feature_col, p_data
             )));
         }
-        c.column_mut(j + 1).assign(&data.column(linear.feature_col));
+        if !parametric_cols.contains(&linear.feature_col) {
+            parametric_cols.push(linear.feature_col);
+        }
+    }
+
+    let mut c = Array2::<f64>::zeros((n, 1 + parametric_cols.len()));
+    c.column_mut(0).fill(1.0);
+    for (j, &feature_col) in parametric_cols.iter().enumerate() {
+        c.column_mut(j + 1).assign(&data.column(feature_col));
     }
     Ok(c)
 }
@@ -14126,6 +14123,8 @@ mod tests {
             [0.5, 0.2],
             [0.7, 0.9],
             [1.0, 0.8],
+            [1.2, 1.1],
+            [1.4, 1.3],
         ];
         let spec = TermCollectionSpec {
             linear_terms: vec![LinearTermSpec {
@@ -14234,8 +14233,77 @@ mod tests {
         let rel = num / (b_norm * c_norm).max(1e-300);
         assert!(
             rel <= 1e-10,
-            "Option 5 orthogonality residual too large: {rel}"
+            "smooth residual against model-owned parametric block too large: {rel}"
         );
+    }
+
+    #[test]
+    fn thin_plate_default_identifiability_keeps_own_linear_nullspace_without_linear_terms() {
+        let data = array![
+            [-1.9, -1.2],
+            [-1.3, -0.7],
+            [-0.8, -0.4],
+            [-0.2, 0.1],
+            [0.0, 0.3],
+            [0.4, 0.5],
+            [0.9, 0.8],
+            [1.4, 1.1],
+            [1.9, 1.5],
+            [2.3, 1.8],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: (0..2)
+                .map(|feature| SmoothTermSpec {
+                    name: format!("tps_x{feature}"),
+                    basis: SmoothBasisSpec::ThinPlate {
+                        feature_cols: vec![feature],
+                        spec: ThinPlateBasisSpec {
+                            center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
+                            length_scale: 1.0,
+                            double_penalty: false,
+                            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                            radial_reparam: None,
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                })
+                .collect(),
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let design_dense = design.design.to_dense();
+        let smooth_start = 1 + spec.linear_terms.len();
+        for (term_idx, term) in design.smooth.terms.iter().enumerate() {
+            let block = design_dense
+                .slice(s![
+                    ..,
+                    (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end)
+                ])
+                .to_owned();
+            let intercept = Array2::<f64>::ones((data.nrows(), 1));
+            let intercept_cross = block.t().dot(&intercept);
+            let intercept_num = intercept_cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let block_norm = block.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let intercept_norm = (data.nrows() as f64).sqrt();
+            let intercept_rel = intercept_num / (block_norm * intercept_norm).max(1e-300);
+            assert!(
+                intercept_rel <= 1e-10,
+                "ThinPlate term {term_idx} is not centered against the intercept: {intercept_rel:.3e}"
+            );
+
+            let x = data.column(term_idx).to_owned();
+            let cross = block.t().dot(&x);
+            let cross_norm = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let x_norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let rel = cross_norm / (block_norm * x_norm).max(1e-300);
+            assert!(
+                rel >= 1e-3,
+                "ThinPlate term {term_idx} incorrectly removed its own linear nullspace: {rel:.3e}"
+            );
+        }
     }
 
     #[test]
