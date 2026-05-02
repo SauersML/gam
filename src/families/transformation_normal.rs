@@ -2350,25 +2350,40 @@ impl CustomFamily for TransformationNormalFamily {
         let scan_start = std::time::Instant::now();
 
         // Fraction-to-boundary: find the largest α ∈ (0, 1] such that
-        // h'(β + α · δ) > 0 at every observed row and h'(y_g; x_i) > ε at
-        // every (covariate, response-grid) pair on the monotonicity grid.
+        // h'(y_i; x_i; β + α · δ) ≥ ε at every observed row and
+        // h'(y_g; x_i) ≥ ε at every (covariate, response-grid) pair on the
+        // monotonicity grid. Both reductions use the same strict-feasibility
+        // margin TRANSFORMATION_MONOTONICITY_EPS as the predict-time
+        // monotonicity check (`src/inference/predict_input.rs`).
+        //
+        // Under SCOP-CTN with I-spline shape components,
+        // `h'(y, x) = Σ_{r≥1} M_r(y) · γ_r(x)²` is structurally non-negative
+        // for every β: M_r ≥ 0 (M-spline on clamped knots) and γ_r² ≥ 0.
+        // This scan therefore protects only the *numerical floor* — keeping
+        // h' away from the −log h' singularity in the likelihood — not
+        // monotonicity itself. Using slack=0 on the observation rows
+        // previously allowed the optimizer to converge to a β with
+        // h'(y_i, x_i) ∈ (0, ε), which is fit-feasible but predict-rejected
+        // (the −log h' barrier in the likelihood pushes h' toward 0⁺
+        // asymptotically but does not enforce any specific lower bound).
+        // Matching slacks closes that gap.
         //
         // Each design owns its own streaming reduction over its virtual rows
         // (KhatriRao: n observations; Kronecker: n_cov × n_grid pairs without
         // materializing the dense forward image). Both return the smallest
-        // binding step ratio, or +∞ if no row binds. The grid uses the
-        // strict-feasibility margin TRANSFORMATION_MONOTONICITY_EPS; observed
-        // rows use 0.0 (the log-h' barrier in the likelihood already keeps
-        // h' away from zero on observed rows). Composing via `f64::min` is
-        // associative for non-NaN inputs, so the final α_max is bit-equivalent
-        // to a single scan over the union of binding rows.
+        // binding step ratio, or +∞ if no row binds. Composing via `f64::min`
+        // is associative for non-NaN inputs, so the final α_max is
+        // bit-equivalent to a single scan over the union of binding rows.
         //
         // Observation-row reduction stays on the un-cached path because the
         // KhatriRao variant streams over `n` observation rows directly via
         // `forward_mul`; there is no factored projection to reuse there.
-        let alpha_obs = self
-            .x_deriv_kron
-            .scop_affine_squared_min_step_to_boundary(beta, delta, 0.0, 1e-14);
+        let alpha_obs = self.x_deriv_kron.scop_affine_squared_min_step_to_boundary(
+            beta,
+            delta,
+            TRANSFORMATION_MONOTONICITY_EPS,
+            1e-14,
+        );
         let alpha_grid = self
             .x_deriv_grid_kron
             .scop_affine_squared_min_step_to_boundary(
@@ -4434,6 +4449,7 @@ impl KroneckerDesign {
     ) -> f64 {
         debug_assert_eq!(d.nrows(), n);
         debug_assert_eq!(d.ncols(), p_resp);
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         // Compute H = c · response_gridᵀ and dH = d · response_gridᵀ in
         // chunked passes; classify rows and reduce the boundary step.
         const CHUNK_ROWS: usize = 1024;
@@ -4448,7 +4464,7 @@ impl KroneckerDesign {
         let (active_pairs, min_inactive, alpha_full): (Vec<(usize, usize)>, f64, f64) = (0
             ..n_chunks)
             .into_par_iter()
-            .map(|chunk_idx| {
+            .map(|chunk_idx: usize| {
                 let start = chunk_idx * CHUNK_ROWS;
                 let end = (start + CHUNK_ROWS).min(n);
                 let m = end - start;
@@ -5733,8 +5749,10 @@ mod tests {
         let row = family
             .row_quantities(&state.beta)
             .expect("toy row quantities");
-        let direct_h = family.x_val_kron.forward_mul(&state.beta) + family.offset.as_ref();
-        let direct_h_prime = family.x_deriv_kron.forward_mul(&state.beta);
+        // SCOP-CTN forward: h = X_val · γ²-affine + offset, h' = X_deriv · γ²-affine.
+        let direct_h = family.x_val_kron.scop_affine_squared_forward(&state.beta)
+            + family.offset.as_ref();
+        let direct_h_prime = family.x_deriv_kron.scop_affine_squared_forward(&state.beta);
         let weights = family.weights.as_ref();
 
         assert_eq!(row.h.as_ref(), &direct_h);
@@ -5856,7 +5874,7 @@ mod tests {
         let beta = &block_states[0].beta;
         let alpha_obs_uncached = family
             .x_deriv_kron
-            .min_step_to_boundary(beta, &delta, 0.0, 1e-14);
+            .min_step_to_boundary(beta, &delta, TRANSFORMATION_MONOTONICITY_EPS, 1e-14);
         let alpha_grid_uncached = family.x_deriv_grid_kron.min_step_to_boundary(
             beta,
             &delta,
@@ -5881,14 +5899,29 @@ mod tests {
 
     #[test]
     fn warm_start_absorbs_offset_into_affine_seed() {
-        let response = array![2.0, 5.0];
+        // FOLLOW-UP: the SCOP squared-γ warm-start algorithm at
+        // `compute_warm_start` (src/families/transformation_normal.rs ~5126)
+        // does not yet exactly recover h(y) = (y - location)/scale even when
+        // the I-spline span contains the affine target. The closed-form
+        // γ_const = sqrt(mean_inv_tau / mean_M_sum) is only exact when the
+        // M-spline column sums are uniform across rows; on a generic basis it
+        // produces an approximate seed.
+        //
+        // This test pins the contract that warm-start must asymptotically
+        // recover the affine seed under SCOP-CTN, n=4 to satisfy
+        // `build_response_basis`'s n>=4 minimum. It is currently expected to
+        // fail; see the open follow-up task "Restore exact-affine warm-start
+        // recovery for SCOP-CTN" before relaxing the assertion tolerance.
+        let response = array![2.0, 3.0, 4.0, 5.0];
         let (val_basis, deriv_basis, knots, transform, _p_resp) = toy_response_basis(&response);
-        let weights = array![1.0, 1.0];
-        let offset = array![0.7, 0.7];
-        let covariate_design = DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [1.0]]));
+        let weights = Array1::from_elem(response.len(), 1.0);
+        let offset = Array1::from_elem(response.len(), 0.7);
+        let cov_rows = response.len();
+        let covariate_design =
+            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem((cov_rows, 1), 1.0)));
         let warm_start = TransformationWarmStart {
-            location: array![1.0, 1.0],
-            scale: array![2.0, 2.0],
+            location: Array1::from_elem(response.len(), 1.0),
+            scale: Array1::from_elem(response.len(), 2.0),
         };
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             &response,
@@ -5912,14 +5945,10 @@ mod tests {
             .expect("row quantities at initial beta");
         let h = row.h.as_ref();
         let h_prime = row.h_prime.as_ref();
-        let expected_h = array![0.5, 2.0];
-        let expected_h_prime = array![0.5, 0.5];
+        // expected_h[i] = (response[i] - location)/scale = (y - 1)/2.
+        let expected_h: Array1<f64> = response.mapv(|y| (y - 1.0) / 2.0);
+        let expected_h_prime = Array1::from_elem(response.len(), 0.5);
 
-        // The SCOP-CTN warm start projects the affine target h(y) =
-        // (y - location)/scale into the squared-γ I-spline span. The 1e-9
-        // tolerance absorbs the projection's numerical floor; a degree-1
-        // I-spline span on the response support contains all affine
-        // functions exactly.
         for i in 0..expected_h.len() {
             assert!(
                 (h[i] - expected_h[i]).abs() < 1e-9,
