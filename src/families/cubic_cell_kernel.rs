@@ -1137,13 +1137,17 @@ fn exp_neg_half_square(x: f64) -> f64 {
 
 /// Fill `out[0..=max_degree]` with the raw truncated standard-normal moments
 ///
-///     T_n(a, b) = ∫_a^b z^n exp(-z²/2) dz
+/// ```text
+/// T_n(a, b) = ∫_a^b z^n exp(-z²/2) dz
+/// ```
 ///
 /// using the integration-by-parts recurrence
 ///
-///     T_0(a, b) = √(2π) (Φ(b) − Φ(a))
-///     T_1(a, b) = exp(−a²/2) − exp(−b²/2)
-///     T_n(a, b) = a^(n−1) e^{−a²/2} − b^(n−1) e^{−b²/2} + (n−1) T_{n−2}(a, b)
+/// ```text
+/// T_0(a, b) = √(2π) (Φ(b) − Φ(a))
+/// T_1(a, b) = exp(−a²/2) − exp(−b²/2)
+/// T_n(a, b) = a^(n−1) e^{−a²/2} − b^(n−1) e^{−b²/2} + (n−1) T_{n−2}(a, b)
+/// ```
 ///
 /// Computed in one forward sweep so each call evaluates `erf` and
 /// `exp(−x²/2)` exactly twice (once at `a`, once at `b`) regardless of the
