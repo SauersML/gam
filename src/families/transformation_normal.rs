@@ -775,6 +775,10 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let mut gradient = Array1::<f64>::zeros(p_total);
         let mut hessian = Array2::<f64>::zeros((p_total, p_total));
+        let mut gamma = vec![0.0; p_resp];
+        let mut dh_factor = vec![0.0; p_resp];
+        let mut dhp_factor = vec![0.0; p_resp];
+        let mut second_diag = vec![0.0; p_resp];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -786,14 +790,11 @@ impl TransformationNormalFamily {
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
 
-            let mut gamma = vec![0.0; p_resp];
             for k in 0..p_resp {
                 gamma[k] = beta_mat.row(k).dot(&cov_row);
             }
 
-            let mut dh_factor = vec![0.0; p_resp];
-            let mut dhp_factor = vec![0.0; p_resp];
-            let mut second_diag = vec![0.0; p_resp];
+            second_diag.fill(0.0);
             dh_factor[0] = rv[0];
             dhp_factor[0] = rd[0];
             for k in 1..p_resp {
@@ -832,6 +833,63 @@ impl TransformationNormalFamily {
         }
 
         Ok((gradient, hessian))
+    }
+
+    fn scop_gradient(
+        &self,
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total {
+            return Err(format!(
+                "SCOP gradient beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+                beta.len()
+            ));
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        let cov = self
+            .covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP gradient requires row chunk: {e}"))?;
+        let weights = self.weights.as_ref();
+        let h = row_quantities.h.as_ref();
+        let h_prime = row_quantities.h_prime.as_ref();
+        let mut gradient = Array1::<f64>::zeros(p_total);
+        let mut gamma = vec![0.0; p_resp];
+
+        for i in 0..n {
+            let cov_row = cov.row(i);
+            let rv = self.response_val_basis.row(i);
+            let rd = self.response_deriv_basis.row(i);
+            let wi = weights[i];
+            let hi = h[i];
+            let inv_hp = 1.0 / h_prime[i];
+
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+            }
+
+            let score0 = wi * (-hi * rv[0] + rd[0] * inv_hp);
+            for c in 0..p_cov {
+                gradient[c] += score0 * cov_row[c];
+            }
+            for k in 1..p_resp {
+                let score_factor = wi * 2.0 * gamma[k] * (-hi * rv[k] + rd[k] * inv_hp);
+                let offset = k * p_cov;
+                for c in 0..p_cov {
+                    gradient[offset + c] += score_factor * cov_row[c];
+                }
+            }
+        }
+
+        Ok(gradient)
     }
 
     /// Directional derivative of the SCOP negative Hessian.
@@ -2484,7 +2542,7 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
         let log_likelihood = row_quantities.log_likelihood;
-        let (gradient, _) = self.scop_gradient_and_negative_hessian(beta, &row_quantities)?;
+        let gradient = self.scop_gradient(beta, &row_quantities)?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
