@@ -146,6 +146,17 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     "r_gamboostlss",
     "r_bamlss",
     "r_brms",
+    # mgcv is an external comparison reference, not the system under test.
+    # It deterministically cannot construct the requested basis on some
+    # high-dimensional joint-PC scenarios (e.g. 16-D thin-plate where the
+    # default null-space dimension M = C(d+m-1, m-1) far exceeds any
+    # tractable k, producing the well-known "negative length vectors are
+    # not allowed" allocation error in the tprs/Duchon constructor).
+    # Surface those rows in the diagnostic output, but don't fail the
+    # shard for an external-library limitation we don't control.
+    "r_mgcv",
+    "r_mgcv_gaulss",
+    "r_mgcv_coxph",
 }
 _BENCH_CI_PROFILE = os.environ.get("BENCH_CI_PROFILE", "full").strip().lower() or "full"
 _LEAN_PROFILE_EXCLUDED_CONTENDERS = {
@@ -5815,12 +5826,36 @@ if (is.null(mgcv_formula) || !nzchar(mgcv_formula)) {
 ftxt <- mgcv_formula
 
 t0 <- proc.time()[["elapsed"]]
-fit <- gam(as.formula(ftxt), family=fam, data=train_df, method="REML", select=use_select)
+fit <- tryCatch(
+  gam(as.formula(ftxt), family=fam, data=train_df, method="REML", select=use_select),
+  error = function(e) e
+)
 fit_sec <- proc.time()[["elapsed"]] - t0
 
+if (inherits(fit, "error")) {
+  out <- list(
+    status="failed",
+    error=paste0("r_mgcv fit failed: ", conditionMessage(fit))
+  )
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+
 pred_t0 <- proc.time()[["elapsed"]]
-p <- as.numeric(predict(fit, newdata=test_df, type="response"))
+p <- tryCatch(
+  as.numeric(predict(fit, newdata=test_df, type="response")),
+  error = function(e) e
+)
 pred_sec <- proc.time()[["elapsed"]] - pred_t0
+
+if (inherits(p, "error")) {
+  out <- list(
+    status="failed",
+    error=paste0("r_mgcv predict failed: ", conditionMessage(p))
+  )
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
 
 if (family_name == "binomial") {
   ord <- order(p)
@@ -5868,7 +5903,18 @@ if (family_name == "binomial") {
   if (is.finite(fit_scale) && fit_scale > 0) {
     sigma_hat <- sqrt(fit_scale)
   } else {
-    p_train <- as.numeric(predict(fit, newdata=train_df, type="response"))
+    p_train <- tryCatch(
+      as.numeric(predict(fit, newdata=train_df, type="response")),
+      error = function(e) e
+    )
+    if (inherits(p_train, "error")) {
+      out <- list(
+        status="failed",
+        error=paste0("r_mgcv train-predict failed: ", conditionMessage(p_train))
+      )
+      write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+      quit(save="no")
+    }
     sigma_hat <- sqrt(mean((y_train - p_train)^2))
   }
   sigma_hat <- max(as.numeric(sigma_hat), 1e-12)
