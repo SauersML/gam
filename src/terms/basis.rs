@@ -10579,7 +10579,15 @@ fn duchon_matern_kernel_general_from_distance(
         &coeffs_local
     };
     let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale.max(1e-8);
-    if r <= collision_taylor_radius {
+    // The near-collision Taylor expansion uses phi(0) plus even-order
+    // derivative collision limits. Those limits only exist when the kernel
+    // is finite at the origin, i.e. when 2(p+s) > d. Below that threshold
+    // the partial-fraction blocks individually diverge at r=0 but their
+    // sum is still a well-defined function for any r > 0 (each Bessel-K
+    // and r^{2m-d}-type block is finite away from origin). Fall through
+    // to the direct sum in that regime; r=0 itself remains an error.
+    let kernel_finite_at_origin = 2 * (p_order + s_order) > k_dim;
+    if r <= collision_taylor_radius && kernel_finite_at_origin {
         return duchon_hybrid_kernel_near_collision_value(
             r,
             length_scale,
