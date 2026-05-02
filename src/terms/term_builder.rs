@@ -326,6 +326,7 @@ pub fn build_smooth_basis(
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
+                    radial_reparam: None,
                 },
                 input_scales: None,
             })
