@@ -10494,41 +10494,32 @@ impl StochasticTraceEstimator {
         }
 
         let mut q_columns = Array2::zeros((p, total));
-        let mut dense_a_u: Vec<Array1<f64>> = (0..n_dense).map(|_| Array1::zeros(p)).collect();
+        let mut a_u_columns = Array2::zeros((p, total));
 
         self.estimate_matrix_from_probe_batch(hop, total, |z, probe_values| {
             let u = hop.stochastic_trace_solve(z, self.config.solve_rel_tol);
 
             for e in 0..n_dense {
                 dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+                dense_matvec_into(dense_matrices[e], u.view(), a_u_columns.column_mut(e));
             }
             for (oi, op) in operators.iter().enumerate() {
                 let e = n_dense + oi;
                 op.mul_vec_into(z.view(), q_columns.column_mut(e));
+                op.mul_vec_into(u.view(), a_u_columns.column_mut(e));
             }
 
             let r = hop.stochastic_trace_solve_multi(&q_columns, self.config.solve_rel_tol);
 
-            for d in 0..n_dense {
-                dense_matvec_into(dense_matrices[d], u.view(), dense_a_u[d].view_mut());
-            }
-
             for d in 0..total {
+                let a_d_u = a_u_columns.column(d);
                 for e in d..total {
                     let r_e = r.column(e);
-                    let val = if d < n_dense {
-                        dense_a_u[d].dot(&r_e)
-                    } else {
-                        operators[d - n_dense].bilinear_view(r_e, u.view())
-                    };
+                    let val = a_d_u.dot(&r_e);
                     probe_values[[d, e]] = val;
                     if d != e {
                         let r_d = r.column(d);
-                        let val_sym = if e < n_dense {
-                            dense_a_u[e].dot(&r_d)
-                        } else {
-                            operators[e - n_dense].bilinear_view(r_d, u.view())
-                        };
+                        let val_sym = a_u_columns.column(e).dot(&r_d);
                         probe_values[[e, d]] = val_sym;
                     }
                 }
