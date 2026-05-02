@@ -29,7 +29,7 @@ use crate::basis::{
 use crate::faer_ndarray::{fast_ab, fast_ab_into, fast_atb};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    CustomFamilyPsiDerivativeOperator, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, FamilyEvaluation, MaterializablePsiDerivativeOperator,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
@@ -39,6 +39,7 @@ use crate::families::custom_family::{
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
 };
+use crate::inference::model::TransformationScoreCalibration;
 use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
 };
@@ -4902,18 +4903,16 @@ fn build_tensor_penalties_kronecker(
     p_cov: usize,
     config: &TransformationNormalConfig,
 ) -> Result<Vec<PenaltyMatrix>, String> {
-    let eye_resp = Array2::<f64>::eye(p_resp);
     let eye_cov = Array2::<f64>::eye(p_cov);
     let mut penalties = Vec::new();
 
-    let mut location_resp = Array2::<f64>::zeros((p_resp, p_resp));
-    location_resp[[0, 0]] = 1.0;
     let mut shape_resp = Array2::<f64>::eye(p_resp);
     shape_resp[[0, 0]] = 0.0;
 
-    // Covariate penalties: split the derivative-free location row from the
-    // squared monotone shape rows. Sharing one λ across both roles oversmooths
-    // b(x) whenever the shape rows need stronger regularization.
+    // Covariate roughness belongs to the squared monotone shape rows. The
+    // derivative-free location row is the conditional centering field itself;
+    // penalizing it by REML under-corrects broad population shifts and leaves
+    // h(Y|x) calibrated only marginally instead of conditionally.
     for s_cov in covariate_penalties {
         let right = match s_cov {
             PenaltyMatrix::Dense(right) => right,
@@ -4925,10 +4924,6 @@ fn build_tensor_penalties_kronecker(
                 )
             }
         };
-        penalties.push(PenaltyMatrix::KroneckerFactored {
-            left: location_resp.clone(),
-            right: right.clone(),
-        });
         penalties.push(PenaltyMatrix::KroneckerFactored {
             left: shape_resp.clone(),
             right,
@@ -4943,10 +4938,13 @@ fn build_tensor_penalties_kronecker(
         });
     }
 
-    // Double penalty: global ridge (I_resp ⊗ I_cov = I_total)
+    // Double penalty: shape-row ridge only. The location row is identified by
+    // the likelihood as the conditional centering field; keep it outside every
+    // SCOP roughness/shrinkage penalty so population shifts can be calibrated
+    // in the selected covariate span.
     if config.double_penalty {
         penalties.push(PenaltyMatrix::KroneckerFactored {
-            left: eye_resp,
+            left: shape_resp,
             right: eye_cov,
         });
     }
@@ -5165,6 +5163,311 @@ fn estimate_default_warm_start(
         .mapv(|eta| eta.exp().max(residual_floor));
 
     Ok(TransformationWarmStart { location, scale })
+}
+
+fn transformation_calibration_feature_cols(spec: &TermCollectionSpec) -> Vec<usize> {
+    let mut cols = Vec::new();
+    for linear in &spec.linear_terms {
+        cols.push(linear.feature_col);
+    }
+    for smooth in &spec.smooth_terms {
+        match &smooth.basis {
+            crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
+                cols.push(*feature_col);
+            }
+            crate::smooth::SmoothBasisSpec::ThinPlate { feature_cols, .. }
+            | crate::smooth::SmoothBasisSpec::Matern { feature_cols, .. }
+            | crate::smooth::SmoothBasisSpec::Duchon { feature_cols, .. }
+            | crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+                cols.extend(feature_cols.iter().copied());
+            }
+        }
+    }
+    cols.sort_unstable();
+    cols.dedup();
+    cols
+}
+
+fn build_transformation_score_calibration_design(
+    data: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    feature_cols: &[usize],
+    feature_center: Option<&[f64]>,
+    feature_scale: Option<&[f64]>,
+    rbf_centers: Option<&[Vec<f64>]>,
+    rbf_bandwidth: Option<f64>,
+) -> Result<(Array2<f64>, Vec<f64>, Vec<f64>, Vec<Vec<f64>>, f64), String> {
+    let n = data.nrows();
+    let d = feature_cols.len();
+    if d == 0 {
+        return Err(
+            "transformation score calibration requires at least one covariate feature".to_string(),
+        );
+    }
+    let weight_sum = weights.iter().copied().sum::<f64>();
+    if !(weight_sum.is_finite() && weight_sum > 0.0) {
+        return Err(
+            "transformation score calibration requires positive finite weights".to_string(),
+        );
+    }
+    let mut center = vec![0.0; d];
+    let mut scale = vec![1.0; d];
+    if let (Some(saved_center), Some(saved_scale)) = (feature_center, feature_scale) {
+        if saved_center.len() != d || saved_scale.len() != d {
+            return Err(format!(
+                "transformation score calibration feature normalization mismatch: center={}, scale={}, d={d}",
+                saved_center.len(),
+                saved_scale.len()
+            ));
+        }
+        center.copy_from_slice(saved_center);
+        scale.copy_from_slice(saved_scale);
+    } else {
+        for (j, &col) in feature_cols.iter().enumerate() {
+            if col >= data.ncols() {
+                return Err(format!(
+                    "transformation score calibration feature column {col} out of range for {} columns",
+                    data.ncols()
+                ));
+            }
+            center[j] = (0..n).map(|i| weights[i] * data[[i, col]]).sum::<f64>() / weight_sum;
+            let var = (0..n)
+                .map(|i| {
+                    let r = data[[i, col]] - center[j];
+                    weights[i] * r * r
+                })
+                .sum::<f64>()
+                / weight_sum;
+            scale[j] = var.sqrt().max(1.0e-12);
+        }
+    }
+
+    let mut z = Array2::<f64>::zeros((n, d));
+    for (j, &col) in feature_cols.iter().enumerate() {
+        if col >= data.ncols() {
+            return Err(format!(
+                "transformation score calibration feature column {col} out of range for {} columns",
+                data.ncols()
+            ));
+        }
+        for i in 0..n {
+            z[[i, j]] = (data[[i, col]] - center[j]) / scale[j];
+        }
+    }
+
+    let centers = if let Some(saved) = rbf_centers {
+        saved.to_vec()
+    } else {
+        let k = n.min(32).max(1);
+        (0..k)
+            .map(|m| {
+                let row = if k == 1 { 0 } else { m * (n - 1) / (k - 1) };
+                z.row(row).to_vec()
+            })
+            .collect::<Vec<_>>()
+    };
+    for center_row in &centers {
+        if center_row.len() != d {
+            return Err(format!(
+                "transformation score calibration RBF center width {} != feature width {d}",
+                center_row.len()
+            ));
+        }
+    }
+    let bandwidth = rbf_bandwidth.unwrap_or_else(|| (d as f64).sqrt().max(1.0));
+    if !(bandwidth.is_finite() && bandwidth > 0.0) {
+        return Err(format!(
+            "transformation score calibration requires positive finite RBF bandwidth, got {bandwidth}"
+        ));
+    }
+
+    let p_poly = 1 + d + d * (d + 1) / 2;
+    let p = p_poly + centers.len();
+    let mut design = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        design[[i, 0]] = 1.0;
+        for j in 0..d {
+            design[[i, 1 + j]] = z[[i, j]];
+        }
+        let mut col = 1 + d;
+        for a in 0..d {
+            for b in a..d {
+                design[[i, col]] = z[[i, a]] * z[[i, b]];
+                col += 1;
+            }
+        }
+        for (m, center_row) in centers.iter().enumerate() {
+            let dist2 = (0..d)
+                .map(|j| {
+                    let r = z[[i, j]] - center_row[j];
+                    r * r
+                })
+                .sum::<f64>();
+            design[[i, p_poly + m]] = (-0.5 * dist2 / (bandwidth * bandwidth)).exp();
+        }
+    }
+    Ok((design, center, scale, centers, bandwidth))
+}
+
+fn calibrate_transformation_scores(
+    family: &TransformationNormalFamily,
+    mut fit: UnifiedFitResult,
+    calibration_data: ArrayView2<'_, f64>,
+    covariate_spec: &TermCollectionSpec,
+) -> Result<(UnifiedFitResult, TransformationScoreCalibration), String> {
+    let Some(block_state) = fit.block_states.first() else {
+        return Err("transformation score calibration requires one fitted block".to_string());
+    };
+    let p_resp = family.response_val_basis.ncols();
+    let p_cov = family.covariate_design.ncols();
+    let p_total = p_resp * p_cov;
+    if block_state.beta.len() != p_total {
+        return Err(format!(
+            "transformation calibration beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+            block_state.beta.len()
+        ));
+    }
+
+    let row_quantities = family.row_quantities(&block_state.beta)?;
+    let h = row_quantities.h.as_ref();
+    let zero_offset = Array1::<f64>::zeros(family.n_obs());
+    let empty_penalties: Vec<PenaltyMatrix> = Vec::new();
+    let empty_log_lambdas = Array1::<f64>::zeros(0);
+    let feature_cols = transformation_calibration_feature_cols(covariate_spec);
+    let (calibration_matrix, feature_center, feature_scale, rbf_centers, rbf_bandwidth) =
+        build_transformation_score_calibration_design(
+            calibration_data,
+            family.weights.as_ref(),
+            &feature_cols,
+            None,
+            None,
+            None,
+            None,
+        )?;
+    let calibration_design = DesignMatrix::from(calibration_matrix);
+    let location_beta = solve_penalizedweighted_projection(
+        &calibration_design,
+        &zero_offset,
+        h,
+        family.weights.as_ref(),
+        &empty_penalties,
+        &empty_log_lambdas,
+        1.0e-12,
+    )?;
+
+    let location = calibration_design.matrixvectormultiply(&location_beta);
+    let centered_h = h - &location;
+    let weight_sum = family.weights.iter().copied().sum::<f64>();
+    if !(weight_sum.is_finite() && weight_sum > 0.0) {
+        return Err("transformation calibration requires positive finite total weight".to_string());
+    }
+    let centered_weighted_sum = centered_h
+        .iter()
+        .zip(family.weights.iter())
+        .map(|(&value, &weight)| weight * value)
+        .sum::<f64>();
+    let centered_mean = centered_weighted_sum / weight_sum;
+    let centered_var = centered_h
+        .iter()
+        .zip(family.weights.iter())
+        .map(|(&value, &weight)| weight * (value - centered_mean).powi(2))
+        .sum::<f64>()
+        / weight_sum;
+    if !(centered_var.is_finite() && centered_var > 1.0e-24) {
+        return Err(format!(
+            "transformation calibration produced non-positive centered score variance {centered_var}"
+        ));
+    }
+
+    let residual_floor = centered_var.sqrt() * 1.0e-6 + 1.0e-12;
+    let log_scale_target = Array1::from_iter(
+        centered_h
+            .iter()
+            .map(|&value| value.abs().max(residual_floor).ln() - STANDARD_NORMAL_LOG_ABS_MEAN),
+    );
+    let log_scale_beta = solve_penalizedweighted_projection(
+        &calibration_design,
+        &zero_offset,
+        &log_scale_target,
+        family.weights.as_ref(),
+        &empty_penalties,
+        &empty_log_lambdas,
+        1.0e-12,
+    )?;
+    let log_scale_eta = calibration_design.matrixvectormultiply(&log_scale_beta);
+    let scaled = Array1::from_iter(
+        centered_h
+            .iter()
+            .zip(log_scale_eta.iter())
+            .map(|(&value, &log_scale)| value / log_scale.exp()),
+    );
+    if scaled.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "transformation calibration produced non-finite conditionally scaled scores"
+                .to_string(),
+        );
+    }
+
+    let global_mean = scaled
+        .iter()
+        .zip(family.weights.iter())
+        .map(|(&value, &weight)| weight * value)
+        .sum::<f64>()
+        / weight_sum;
+    let global_var = scaled
+        .iter()
+        .zip(family.weights.iter())
+        .map(|(&value, &weight)| weight * (value - global_mean).powi(2))
+        .sum::<f64>()
+        / weight_sum;
+    if !(global_var.is_finite() && global_var > 1.0e-24) {
+        return Err(format!(
+            "transformation calibration produced non-positive global score variance {global_var}"
+        ));
+    }
+    let global_sd = global_var.sqrt();
+    let calibrated_h = scaled.mapv(|value| (value - global_mean) / global_sd);
+    if calibrated_h
+        .iter()
+        .any(|value| !value.is_finite() || value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX)
+    {
+        return Err(
+            "transformation calibration produced non-finite or out-of-range scores".to_string(),
+        );
+    }
+    let log_likelihood = row_quantities
+        .h_prime
+        .iter()
+        .zip(log_scale_eta.iter())
+        .zip(calibrated_h.iter())
+        .zip(family.weights.iter())
+        .map(|(((&hp, &log_scale), &z), &weight)| {
+            weight * (-0.5 * z * z + hp.ln() - log_scale - global_sd.ln())
+        })
+        .sum::<f64>();
+    if !log_likelihood.is_finite() {
+        return Err("transformation calibration produced non-finite log-likelihood".to_string());
+    }
+
+    if let Some(state) = fit.block_states.first_mut() {
+        state.eta = calibrated_h;
+    }
+    fit.log_likelihood = log_likelihood;
+    fit.deviance = -2.0 * log_likelihood;
+    Ok((
+        fit,
+        TransformationScoreCalibration {
+            feature_cols,
+            feature_center,
+            feature_scale,
+            rbf_centers,
+            rbf_bandwidth,
+            location_beta: location_beta.to_vec(),
+            log_scale_beta: log_scale_beta.to_vec(),
+            global_mean,
+            global_sd,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -5773,6 +6076,89 @@ mod tests {
         let rho = ctn_penalty_scale_log_lambdas(&penalties, &likelihood_gram);
         assert!((rho[0] - 4.0_f64.ln()).abs() < 1.0e-12);
         assert!((rho[1] - 2.0_f64.ln()).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
+        let response = array![-1.0, -0.2, 0.6, 1.3];
+        let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
+        let weights = Array1::from_elem(response.len(), 1.0);
+        let offset = Array1::zeros(response.len());
+        let cov_design = array![[1.0, 0.2], [1.0, -0.1], [1.0, 0.4], [1.0, -0.3]];
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
+            val_basis,
+            deriv_basis,
+            vec![],
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
+            &weights,
+            &offset,
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov_design.clone())),
+            vec![],
+            &toy_scop_ctn_config(),
+            None,
+        )
+        .expect("toy transformation family");
+
+        let ds0 = array![[1.0, 0.25], [0.25, 2.0]];
+        let ds1 = array![[3.0, -0.5], [-0.5, 4.0]];
+        let ds1_second = array![[5.0, 0.75], [0.75, 6.0]];
+        let mut cov_deriv = CustomFamilyBlockPsiDerivative::new(
+            None,
+            Array2::zeros((response.len(), cov_design.ncols())),
+            Array2::zeros((0, 0)),
+            Some(vec![(0, ds0.clone()), (1, ds1.clone())]),
+            None,
+            None,
+            Some(vec![vec![(1, ds1_second.clone())]]),
+        );
+        cov_deriv.s_psi_penalty_components = Some(vec![
+            (0, PenaltyMatrix::Dense(ds0.clone())),
+            (1, PenaltyMatrix::Dense(ds1.clone())),
+        ]);
+        cov_deriv.s_psi_psi_penalty_components =
+            Some(vec![vec![(1, PenaltyMatrix::Dense(ds1_second.clone()))]]);
+
+        let tensor_derivs =
+            build_tensor_psi_derivatives(&family, &[cov_deriv]).expect("tensor derivatives");
+        let first = tensor_derivs[0]
+            .s_psi_penalty_components
+            .as_ref()
+            .expect("first derivatives");
+        let got_indices: Vec<usize> = first.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(got_indices, vec![0, 1]);
+        assert_shape_penalty_component(&first[0].1, p_resp, &ds0);
+        assert_shape_penalty_component(&first[1].1, p_resp, &ds1);
+
+        let second = tensor_derivs[0]
+            .s_psi_psi_penalty_components
+            .as_ref()
+            .expect("second derivatives");
+        assert_eq!(second.len(), 1);
+        let got_second_indices: Vec<usize> = second[0].iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(got_second_indices, vec![1]);
+        assert_shape_penalty_component(&second[0][0].1, p_resp, &ds1_second);
+    }
+
+    fn assert_shape_penalty_component(
+        penalty: &PenaltyMatrix,
+        p_resp: usize,
+        expected_right: &Array2<f64>,
+    ) {
+        let PenaltyMatrix::KroneckerFactored { left, right } = penalty else {
+            panic!("expected KroneckerFactored penalty component");
+        };
+        assert_eq!(right, expected_right);
+        assert_eq!(left.nrows(), p_resp);
+        assert_eq!(left.ncols(), p_resp);
+        for r in 0..p_resp {
+            for c in 0..p_resp {
+                let expected = if r == c && r > 0 { 1.0 } else { 0.0 };
+                assert_eq!(left[[r, c]], expected);
+            }
+        }
     }
 
     fn toy_covariate_design_and_derivs(
@@ -7553,14 +7939,16 @@ fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f6
 ///
 /// Each output entry contains:
 /// - implicit `x_psi` / `x_psi_psi` operators that preserve Kronecker structure
-/// - factored tensor penalty derivatives `I_resp ⊗ ∂S_cov/∂ψ`
+/// - factored tensor penalty derivatives matching the SCOP penalty layout:
+///   `E_shape ⊗ ∂S_cov/∂ψ` at the same covariate penalty index `m`.
 pub fn build_tensor_psi_derivatives(
     family: &TransformationNormalFamily,
     covariate_psi_derivs: &[CustomFamilyBlockPsiDerivative],
 ) -> Result<Vec<CustomFamilyBlockPsiDerivative>, String> {
     let p_resp = family.response_val_basis.ncols();
     let n_axes = covariate_psi_derivs.len();
-    let eye_resp = Array2::<f64>::eye(p_resp);
+    let mut shape_resp = Array2::<f64>::eye(p_resp);
+    shape_resp[[0, 0]] = 0.0;
     let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> =
         Arc::new(TensorKroneckerPsiOperator {
             response_val_basis: Arc::new(family.response_val_basis.clone()),
@@ -7574,35 +7962,11 @@ pub fn build_tensor_psi_derivatives(
         let s_psi_penalty_components = cov_deriv
             .s_psi_penalty_components
             .as_ref()
-            .map(|components| {
-                components
-                    .iter()
-                    .map(|(idx, ds_cov)| -> Result<_, String> {
-                        Ok((
-                            *idx,
-                            PenaltyMatrix::KroneckerFactored {
-                                left: eye_resp.clone(),
-                                right: extract_covariate_penalty_factor(ds_cov)?,
-                            },
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
+            .map(|components| lift_covariate_penalty_derivative_components(components, &shape_resp))
             .transpose()?
             .or_else(|| {
                 cov_deriv.s_psi_components.as_ref().map(|components| {
-                    components
-                        .iter()
-                        .map(|(idx, ds_cov)| {
-                            (
-                                *idx,
-                                PenaltyMatrix::KroneckerFactored {
-                                    left: eye_resp.clone(),
-                                    right: ds_cov.clone(),
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>()
+                    lift_dense_covariate_penalty_derivative_components(components, &shape_resp)
                 })
             });
         let s_psi_psi_penalty_components = cov_deriv
@@ -7611,18 +7975,7 @@ pub fn build_tensor_psi_derivatives(
             .map(|rows| {
                 rows.iter()
                     .map(|cov_pen_pairs| -> Result<_, String> {
-                        cov_pen_pairs
-                            .iter()
-                            .map(|(idx, ds2)| -> Result<_, String> {
-                                Ok((
-                                    *idx,
-                                    PenaltyMatrix::KroneckerFactored {
-                                        left: eye_resp.clone(),
-                                        right: extract_covariate_penalty_factor(ds2)?,
-                                    },
-                                ))
-                            })
-                            .collect::<Result<Vec<_>, _>>()
+                        lift_covariate_penalty_derivative_components(cov_pen_pairs, &shape_resp)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -7631,18 +7984,10 @@ pub fn build_tensor_psi_derivatives(
                 cov_deriv.s_psi_psi_components.as_ref().map(|rows| {
                     rows.iter()
                         .map(|cov_pen_pairs| {
-                            cov_pen_pairs
-                                .iter()
-                                .map(|(idx, ds2)| {
-                                    (
-                                        *idx,
-                                        PenaltyMatrix::KroneckerFactored {
-                                            left: eye_resp.clone(),
-                                            right: ds2.clone(),
-                                        },
-                                    )
-                                })
-                                .collect::<Vec<_>>()
+                            lift_dense_covariate_penalty_derivative_components(
+                                cov_pen_pairs,
+                                &shape_resp,
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -7668,6 +8013,48 @@ pub fn build_tensor_psi_derivatives(
     Ok(derivs)
 }
 
+fn lift_dense_covariate_penalty_derivative_components(
+    components: &[(usize, Array2<f64>)],
+    shape_resp: &Array2<f64>,
+) -> Vec<(usize, PenaltyMatrix)> {
+    let mut out = Vec::with_capacity(components.len());
+    for &(idx, ref ds_cov) in components {
+        push_lifted_covariate_penalty_component(&mut out, idx, ds_cov.clone(), shape_resp);
+    }
+    out
+}
+
+fn lift_covariate_penalty_derivative_components(
+    components: &[(usize, PenaltyMatrix)],
+    shape_resp: &Array2<f64>,
+) -> Result<Vec<(usize, PenaltyMatrix)>, String> {
+    let mut out = Vec::with_capacity(components.len());
+    for (idx, ds_cov) in components {
+        push_lifted_covariate_penalty_component(
+            &mut out,
+            *idx,
+            extract_covariate_penalty_factor(ds_cov)?,
+            shape_resp,
+        );
+    }
+    Ok(out)
+}
+
+fn push_lifted_covariate_penalty_component(
+    out: &mut Vec<(usize, PenaltyMatrix)>,
+    cov_penalty_idx: usize,
+    ds_cov: Array2<f64>,
+    shape_resp: &Array2<f64>,
+) {
+    out.push((
+        cov_penalty_idx,
+        PenaltyMatrix::KroneckerFactored {
+            left: shape_resp.clone(),
+            right: ds_cov,
+        },
+    ));
+}
+
 #[derive(Clone)]
 struct TransformationExactGeometryCache {
     key: Vec<u64>,
@@ -7679,12 +8066,6 @@ struct TransformationExactGeometryCache {
 }
 
 impl TransformationExactGeometryCache {
-    fn block_spec(&self) -> Result<&ParameterBlockSpec, String> {
-        self.blocks
-            .first()
-            .ok_or_else(|| "missing transformation block spec".to_string())
-    }
-
     fn update_initial_beta(&mut self, beta_hint: Option<&Array1<f64>>) {
         let Some(spec) = self.blocks.first_mut() else {
             return;
@@ -7761,6 +8142,7 @@ pub struct TransformationNormalFitResult {
     pub fit: UnifiedFitResult,
     pub covariate_spec_resolved: TermCollectionSpec,
     pub covariate_design: TermCollectionDesign,
+    pub score_calibration: TransformationScoreCalibration,
 }
 
 /// Fit a conditional transformation model with N-block spatial length-scale
@@ -7782,12 +8164,13 @@ pub fn fit_transformation_normal(
     warm_start: Option<&TransformationWarmStart>,
 ) -> Result<TransformationNormalFitResult, String> {
     let options = options.clone();
+    let covariate_spec = covariate_spec.clone();
 
     // 1. Build a bootstrap covariate design first so the response basis can
     // adapt to the tensor width instead of always using the global default.
-    let boot_design = build_term_collection_design(covariate_data, covariate_spec)
+    let boot_design = build_term_collection_design(covariate_data, &covariate_spec)
         .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
-    let boot_spec = freeze_term_collection_from_design(covariate_spec, &boot_design)
+    let boot_spec = freeze_term_collection_from_design(&covariate_spec, &boot_design)
         .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
     let mut effective_config = config.clone();
     effective_config.response_num_internal_knots =
@@ -7799,7 +8182,7 @@ pub fn fit_transformation_normal(
         build_response_basis(response, &effective_config)?;
 
     // 3. Check whether spatial κ optimization is needed.
-    let spatial_terms = spatial_length_scale_term_indices(covariate_spec);
+    let spatial_terms = spatial_length_scale_term_indices(&covariate_spec);
 
     if spatial_terms.is_empty() || !kappa_options.enabled {
         // ------------------------------------------------------------------
@@ -7830,12 +8213,15 @@ pub fn fit_transformation_normal(
         let blocks = vec![family.block_spec()];
         let fit = fit_custom_family(&family, &blocks, &options)
             .map_err(|e| format!("transformation fit failed: {e}"))?;
+        let (fit, score_calibration) =
+            calibrate_transformation_scores(&family, fit, covariate_data, &cov_spec_resolved)?;
 
         return Ok(TransformationNormalFitResult {
             family,
             fit,
             covariate_spec_resolved: cov_spec_resolved,
             covariate_design: cov_design,
+            score_calibration,
         });
     }
 
@@ -7844,27 +8230,27 @@ pub fn fit_transformation_normal(
     // ------------------------------------------------------------------
 
     let kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(
-        covariate_spec,
+        &covariate_spec,
         &spatial_terms,
         kappa_options,
     )
     .reseed_from_data(
         covariate_data,
-        covariate_spec,
+        &covariate_spec,
         &spatial_terms,
         kappa_options,
     );
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         covariate_data,
-        covariate_spec,
+        &covariate_spec,
         &spatial_terms,
         &kappa_dims,
         kappa_options,
     );
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         covariate_data,
-        covariate_spec,
+        &covariate_spec,
         &spatial_terms,
         &kappa_dims,
         kappa_options,
@@ -7943,7 +8329,6 @@ pub fn fit_transformation_normal(
 
     // Shared mutable state for warm-starting across optimizer iterations.
     let beta_hint: RefCell<Option<Array1<f64>>> = RefCell::new(None);
-    let exact_warm_start: RefCell<Option<CustomFamilyWarmStart>> = RefCell::new(None);
 
     let joint_setup =
         ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
@@ -8020,9 +8405,6 @@ pub fn fit_transformation_normal(
             geom_start.elapsed().as_secs_f64(),
         );
 
-        // The exact-inner warm start embeds geometry-dependent state.
-        // Reuse it across rho updates, but drop it when the spatial basis changes.
-        exact_warm_start.replace(None);
         exact_geometry_cache.replace(Some(TransformationExactGeometryCache {
             key,
             covariate_spec_resolved: effective_spec,
@@ -8068,12 +8450,11 @@ pub fn fit_transformation_normal(
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             geometry.update_initial_log_lambdas(&rho)?;
             geometry.update_initial_beta(beta_hint.borrow().as_ref());
-            let warm_start = exact_warm_start.borrow();
             let fit = fit_custom_family_fixed_log_lambdas(
                 &geometry.family,
                 &geometry.blocks,
                 &options,
-                warm_start.as_ref(),
+                None,
                 0,
                 0.0,
                 true,
@@ -8115,6 +8496,17 @@ pub fn fit_transformation_normal(
                 fit,
                 covariate_spec_resolved: geometry.covariate_spec_resolved.clone(),
                 covariate_design: geometry.covariate_design.clone(),
+                score_calibration: TransformationScoreCalibration {
+                    feature_cols: Vec::new(),
+                    feature_center: Vec::new(),
+                    feature_scale: Vec::new(),
+                    rbf_centers: Vec::new(),
+                    rbf_bandwidth: 1.0,
+                    location_beta: Vec::new(),
+                    log_scale_beta: Vec::new(),
+                    global_mean: 0.0,
+                    global_sd: 1.0,
+                },
             })
         },
         // exact_fn
@@ -8134,7 +8526,7 @@ pub fn fit_transformation_normal(
                 &options,
                 &rho,
                 &geometry.derivative_blocks,
-                exact_warm_start.borrow().as_ref(),
+                None,
                 eval_mode,
             )
             .map_err(|e| format!("transformation exact_fn: {e}"))?;
@@ -8147,13 +8539,6 @@ pub fn fit_transformation_normal(
                     eval.gradient.len(),
                 );
             }
-
-            if let Some(beta) = eval.warm_start.first_block_beta()
-                && beta.len() == geometry.block_spec()?.design.ncols()
-            {
-                *beta_hint.borrow_mut() = Some(beta.clone());
-            }
-            exact_warm_start.replace(Some(eval.warm_start));
 
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && !eval.outer_hessian.is_analytic()
@@ -8180,18 +8565,21 @@ pub fn fit_transformation_normal(
                 &options,
                 &rho,
                 &geometry.derivative_blocks,
-                exact_warm_start.borrow().as_ref(),
+                None,
             )
             .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
-            if let Some(beta) = eval.warm_start.first_block_beta()
-                && beta.len() == geometry.block_spec()?.design.ncols()
-            {
-                *beta_hint.borrow_mut() = Some(beta.clone());
-            }
-            exact_warm_start.replace(Some(eval.warm_start));
             Ok(eval.efs_eval)
         },
     )?;
 
-    Ok(solved.fit)
+    let mut fit = solved.fit;
+    let (calibrated_fit, score_calibration) = calibrate_transformation_scores(
+        &fit.family,
+        fit.fit.clone(),
+        covariate_data,
+        &fit.covariate_spec_resolved,
+    )?;
+    fit.fit = calibrated_fit;
+    fit.score_calibration = score_calibration;
+    Ok(fit)
 }
