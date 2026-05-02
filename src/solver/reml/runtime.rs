@@ -96,6 +96,26 @@ struct DerivativeContext {
 
 impl<'a> RemlState<'a> {
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
+        // The Tierney-Kadane skewness correction has analytic value and
+        // first ρ-derivative paths (`tierney_kadane_analytic_core`), but
+        // its analytic outer-Hessian is not implemented and the
+        // production finite-difference stencils for it are disabled.
+        // `tierney_kadane_terms` therefore returns an `InvalidInput` error
+        // for `ValueGradientHessian` mode whenever TK is active (Firth +
+        // non-identity link). Without gating the outer evaluator that
+        // failure cascades through seed validation and aborts the entire
+        // REML fit (e.g. the `cli_firth_fit_*` integration test). Treat
+        // analytic outer Hessian as disabled in those configurations so
+        // the optimizer falls back to its gradient-only descent path
+        // (BFGS / quasi-Newton); the spectral exact Hessian path is then
+        // not requested and TK never sees `ValueGradientHessian`. The
+        // explicit safety guard in `tierney_kadane_terms` still rejects
+        // any caller that constructs Hessian mode directly (covered by
+        // `firth_exacthessian_rejects_without_tk_second_derivatives`).
+        if self.config.firth_bias_reduction && self.config.link_function() != LinkFunction::Identity
+        {
+            return false;
+        }
         true
     }
 
