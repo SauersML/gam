@@ -2206,6 +2206,251 @@ impl TransformationNormalFamily {
         Ok((0.0, Array1::<f64>::zeros(p_total), Some(accum.hvp)))
     }
 
+    fn scop_psi_psi_bilinear_from_cov(
+        &self,
+        beta: &Array1<f64>,
+        cov: ArrayView2<'_, f64>,
+        cov_i: ArrayView2<'_, f64>,
+        cov_j: ArrayView2<'_, f64>,
+        cov_ij: ArrayView2<'_, f64>,
+        left: ArrayView1<'_, f64>,
+        right: ArrayView1<'_, f64>,
+    ) -> Result<f64, String> {
+        let n = self.response_val_basis.nrows();
+        let p_resp = self.response_val_basis.ncols();
+        let p_cov = self.covariate_design.ncols();
+        let p_total = p_resp * p_cov;
+        if beta.len() != p_total || left.len() != p_total || right.len() != p_total {
+            return Err(format!(
+                "SCOP psi-psi bilinear length mismatch: beta={}, left={}, right={}, expected={p_total}",
+                beta.len(),
+                left.len(),
+                right.len()
+            ));
+        }
+        for (name, mat) in [
+            ("cov", cov),
+            ("cov_i", cov_i),
+            ("cov_j", cov_j),
+            ("cov_ij", cov_ij),
+        ] {
+            if mat.nrows() != n || mat.ncols() != p_cov {
+                return Err(format!(
+                    "SCOP psi-psi bilinear {name} shape {}x{} != expected {}x{}",
+                    mat.nrows(),
+                    mat.ncols(),
+                    n,
+                    p_cov
+                ));
+            }
+        }
+        let beta_mat = beta
+            .view()
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi-psi bilinear beta reshape failed: {e}"))?;
+        let left_mat = left
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi-psi bilinear left reshape failed: {e}"))?;
+        let right_mat = right
+            .into_shape_with_order((p_resp, p_cov))
+            .map_err(|e| format!("SCOP psi-psi bilinear right reshape failed: {e}"))?;
+
+        struct PsiPairBilinearAccum {
+            value: f64,
+            gamma: Vec<f64>,
+            gamma_i: Vec<f64>,
+            gamma_j: Vec<f64>,
+            gamma_ij: Vec<f64>,
+            left: Vec<f64>,
+            left_i: Vec<f64>,
+            left_j: Vec<f64>,
+            left_ij: Vec<f64>,
+            right: Vec<f64>,
+            right_i: Vec<f64>,
+            right_j: Vec<f64>,
+            right_ij: Vec<f64>,
+        }
+
+        impl PsiPairBilinearAccum {
+            fn new(p_resp: usize) -> Self {
+                Self {
+                    value: 0.0,
+                    gamma: vec![0.0; p_resp],
+                    gamma_i: vec![0.0; p_resp],
+                    gamma_j: vec![0.0; p_resp],
+                    gamma_ij: vec![0.0; p_resp],
+                    left: vec![0.0; p_resp],
+                    left_i: vec![0.0; p_resp],
+                    left_j: vec![0.0; p_resp],
+                    left_ij: vec![0.0; p_resp],
+                    right: vec![0.0; p_resp],
+                    right_i: vec![0.0; p_resp],
+                    right_j: vec![0.0; p_resp],
+                    right_ij: vec![0.0; p_resp],
+                }
+            }
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let weights = self.weights.as_ref();
+        let total = (0..n)
+            .into_par_iter()
+            .fold(
+                || PsiPairBilinearAccum::new(p_resp),
+                |mut acc, row_idx| {
+                    let cov_row = cov.row(row_idx);
+                    let cov_i_row = cov_i.row(row_idx);
+                    let cov_j_row = cov_j.row(row_idx);
+                    let cov_ij_row = cov_ij.row(row_idx);
+                    let rv = self.response_val_basis.row(row_idx);
+                    let rd = self.response_deriv_basis.row(row_idx);
+
+                    for k in 0..p_resp {
+                        let beta_k = beta_mat.row(k);
+                        let left_k = left_mat.row(k);
+                        let right_k = right_mat.row(k);
+                        acc.gamma[k] = beta_k.dot(&cov_row);
+                        acc.gamma_i[k] = beta_k.dot(&cov_i_row);
+                        acc.gamma_j[k] = beta_k.dot(&cov_j_row);
+                        acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
+                        acc.left[k] = left_k.dot(&cov_row);
+                        acc.left_i[k] = left_k.dot(&cov_i_row);
+                        acc.left_j[k] = left_k.dot(&cov_j_row);
+                        acc.left_ij[k] = left_k.dot(&cov_ij_row);
+                        acc.right[k] = right_k.dot(&cov_row);
+                        acc.right_i[k] = right_k.dot(&cov_i_row);
+                        acc.right_j[k] = right_k.dot(&cov_j_row);
+                        acc.right_ij[k] = right_k.dot(&cov_ij_row);
+                    }
+
+                    let mut h = rv[0] * acc.gamma[0];
+                    let mut hp = rd[0] * acc.gamma[0];
+                    let mut h_i = rv[0] * acc.gamma_i[0];
+                    let mut h_j = rv[0] * acc.gamma_j[0];
+                    let mut h_ij = rv[0] * acc.gamma_ij[0];
+                    let mut hp_i = rd[0] * acc.gamma_i[0];
+                    let mut hp_j = rd[0] * acc.gamma_j[0];
+                    let mut hp_ij = rd[0] * acc.gamma_ij[0];
+
+                    let mut h_l = rv[0] * acc.left[0];
+                    let mut hp_l = rd[0] * acc.left[0];
+                    let mut h_i_l = rv[0] * acc.left_i[0];
+                    let mut h_j_l = rv[0] * acc.left_j[0];
+                    let mut h_ij_l = rv[0] * acc.left_ij[0];
+                    let mut hp_i_l = rd[0] * acc.left_i[0];
+                    let mut hp_j_l = rd[0] * acc.left_j[0];
+                    let mut hp_ij_l = rd[0] * acc.left_ij[0];
+
+                    let mut h_r = rv[0] * acc.right[0];
+                    let mut hp_r = rd[0] * acc.right[0];
+                    let mut h_i_r = rv[0] * acc.right_i[0];
+                    let mut h_j_r = rv[0] * acc.right_j[0];
+                    let mut h_ij_r = rv[0] * acc.right_ij[0];
+                    let mut hp_i_r = rd[0] * acc.right_i[0];
+                    let mut hp_j_r = rd[0] * acc.right_j[0];
+                    let mut hp_ij_r = rd[0] * acc.right_ij[0];
+
+                    let mut h_lr = 0.0;
+                    let mut hp_lr = 0.0;
+                    let mut h_i_lr = 0.0;
+                    let mut h_j_lr = 0.0;
+                    let mut h_ij_lr = 0.0;
+                    let mut hp_i_lr = 0.0;
+                    let mut hp_j_lr = 0.0;
+                    let mut hp_ij_lr = 0.0;
+
+                    for k in 1..p_resp {
+                        let g = acc.gamma[k];
+                        let gi = acc.gamma_i[k];
+                        let gj = acc.gamma_j[k];
+                        let gij = acc.gamma_ij[k];
+                        let l = acc.left[k];
+                        let li = acc.left_i[k];
+                        let lj = acc.left_j[k];
+                        let lij = acc.left_ij[k];
+                        let r = acc.right[k];
+                        let ri = acc.right_i[k];
+                        let rj = acc.right_j[k];
+                        let rij = acc.right_ij[k];
+
+                        h += rv[k] * g * g;
+                        hp += rd[k] * g * g;
+                        h_i += 2.0 * rv[k] * g * gi;
+                        h_j += 2.0 * rv[k] * g * gj;
+                        h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
+                        hp_i += 2.0 * rd[k] * g * gi;
+                        hp_j += 2.0 * rd[k] * g * gj;
+                        hp_ij += 2.0 * rd[k] * (gj * gi + g * gij);
+
+                        h_l += 2.0 * rv[k] * g * l;
+                        hp_l += 2.0 * rd[k] * g * l;
+                        h_i_l += 2.0 * rv[k] * (l * gi + g * li);
+                        h_j_l += 2.0 * rv[k] * (l * gj + g * lj);
+                        h_ij_l += 2.0 * rv[k] * (lj * gi + gj * li + l * gij + g * lij);
+                        hp_i_l += 2.0 * rd[k] * (l * gi + g * li);
+                        hp_j_l += 2.0 * rd[k] * (l * gj + g * lj);
+                        hp_ij_l += 2.0 * rd[k] * (lj * gi + gj * li + l * gij + g * lij);
+
+                        h_r += 2.0 * rv[k] * g * r;
+                        hp_r += 2.0 * rd[k] * g * r;
+                        h_i_r += 2.0 * rv[k] * (r * gi + g * ri);
+                        h_j_r += 2.0 * rv[k] * (r * gj + g * rj);
+                        h_ij_r += 2.0 * rv[k] * (rj * gi + gj * ri + r * gij + g * rij);
+                        hp_i_r += 2.0 * rd[k] * (r * gi + g * ri);
+                        hp_j_r += 2.0 * rd[k] * (r * gj + g * rj);
+                        hp_ij_r += 2.0 * rd[k] * (rj * gi + gj * ri + r * gij + g * rij);
+
+                        h_lr += 2.0 * rv[k] * l * r;
+                        hp_lr += 2.0 * rd[k] * l * r;
+                        h_i_lr += 2.0 * rv[k] * (l * ri + r * li);
+                        h_j_lr += 2.0 * rv[k] * (l * rj + r * lj);
+                        h_ij_lr += 2.0 * rv[k] * (lj * ri + rj * li + l * rij + r * lij);
+                        hp_i_lr += 2.0 * rd[k] * (l * ri + r * li);
+                        hp_j_lr += 2.0 * rd[k] * (l * rj + r * lj);
+                        hp_ij_lr += 2.0 * rd[k] * (lj * ri + rj * li + l * rij + r * lij);
+                    }
+
+                    let inv_hp = 1.0 / hp;
+                    let inv_hp_sq = inv_hp * inv_hp;
+                    let inv_hp_cu = inv_hp_sq * inv_hp;
+                    let inv_hp_qu = inv_hp_sq * inv_hp_sq;
+                    let numerator_l = hp_i_l * hp_j + hp_i * hp_j_l;
+                    let numerator_r = hp_i_r * hp_j + hp_i * hp_j_r;
+                    let numerator_lr =
+                        hp_i_lr * hp_j + hp_i_l * hp_j_r + hp_i_r * hp_j_l + hp_i * hp_j_lr;
+                    let value_lr = h_i_lr * h_j
+                        + h_i_l * h_j_r
+                        + h_i_r * h_j_l
+                        + h_i * h_j_lr
+                        + h_lr * h_ij
+                        + h_l * h_ij_r
+                        + h_r * h_ij_l
+                        + h * h_ij_lr
+                        - hp_ij_lr * inv_hp
+                        + hp_ij_l * hp_r * inv_hp_sq
+                        + hp_ij_r * hp_l * inv_hp_sq
+                        + hp_ij * hp_lr * inv_hp_sq
+                        - 2.0 * hp_ij * hp_l * hp_r * inv_hp_cu
+                        + numerator_lr * inv_hp_sq
+                        - 2.0 * numerator_l * hp_r * inv_hp_cu
+                        - 2.0 * numerator_r * hp_l * inv_hp_cu
+                        - 2.0 * hp_i * hp_j * hp_lr * inv_hp_cu
+                        + 6.0 * hp_i * hp_j * hp_l * hp_r * inv_hp_qu;
+                    acc.value += weights[row_idx] * value_lr;
+                    acc
+                },
+            )
+            .reduce(
+                || PsiPairBilinearAccum::new(p_resp),
+                |mut left, right| {
+                    left.value += right.value;
+                    left
+                },
+            )
+            .value;
+        Ok(total)
+    }
+
     fn scop_psi_hessian_directional_derivative(
         &self,
         beta: &Array1<f64>,
@@ -3528,6 +3773,22 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p_total());
         self.apply(v)
+    }
+
+    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
+        debug_assert_eq!(v.len(), self.p_total());
+        debug_assert_eq!(u.len(), self.p_total());
+        self.family
+            .scop_psi_psi_bilinear_from_cov(
+                &self.beta,
+                self.cov.view(),
+                self.cov_i.view(),
+                self.cov_j.view(),
+                self.cov_ij.view(),
+                v,
+                u,
+            )
+            .expect("validated CTN psi-psi bilinear inputs should not fail")
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
