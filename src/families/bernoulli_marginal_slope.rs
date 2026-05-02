@@ -8092,6 +8092,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
+        true,
         |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;

@@ -7842,9 +7842,9 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     // gate is identical to the value-side path: nullspace=Zero, per-q
     // convergence (UV+IR+precondition), and !log_riesz_present.
     //
-    // Note: for q=2 the bundle's `d2_eta` is FD-on-η of the analytic value
-    // (O(1e-7) precision); analytic Hessian arrives with closed-form-
-    // math-fix's Tier-3 F^{(6)} extension.
+    // The bundle uses the radial analytic Hessian in regular regimes and
+    // the Schoenberg derivative bundle when the radial chain is singular or
+    // log-Riesz ambiguous but the heat-kernel integral converges.
     let aniso_dim = aniso_log_scales.len();
     let use_closed_form_outer_aniso = matches!(nullspace_order, DuchonNullspaceOrder::Zero);
     let log_riesz_present_aniso = d % 2 == 0 && d / 2 <= 2 * p_order;
@@ -8554,8 +8554,8 @@ pub fn closed_form_operator_penalty_in_total_basis(
 /// Closed-form penalty value `S_q` and its log-κ derivatives `S_q_psi`,
 /// `S_q_psi_psi` in the final (post-transform) basis space, computed via
 /// `pair_block_radial_with_j_second_derivatives` from the closed_form_penalty
-/// module. Bundle's `d_kappa` and `d2_kappa` are FD-approximated κ-derivatives;
-/// chain rule converts to log-κ: `∂/∂ψ = κ·∂/∂κ`,
+/// module. Bundle's `d_kappa` and `d2_kappa` are κ-derivatives; chain rule
+/// converts to log-κ: `∂/∂ψ = κ·∂/∂κ`,
 /// `∂²/∂ψ² = κ²·∂²/∂κ² + κ·∂/∂κ`.
 ///
 /// All three matrices share the same Z + poly-pad + outer-T transform pipeline
@@ -8582,7 +8582,6 @@ pub fn closed_form_psi_derivatives_in_total_basis(
             &zeros
         }
     };
-    let j_prefactor = eta_raw.iter().sum::<f64>().exp();
     let r_eps = pure_duchon_diagonal_epsilon(centers, eta_raw);
 
     let mut g = Array2::<f64>::zeros((k, k));
@@ -8607,14 +8606,6 @@ pub fn closed_form_psi_derivatives_in_total_basis(
                     q, p_order, s_order, kappa, eta_raw, &r_buf,
                 )
             };
-            // Bundle's value already includes J prefactor; multiply by the
-            // pair-block J only when consistent with the value-side helper,
-            // which prefactors externally. Pair-block bundle returns
-            // J·g and J·∂g/∂κ etc., so we use it directly.
-            // Actually: `pair_block_radial_with_j_second_derivatives` returns
-            // J · g_q and its κ derivatives directly per its own contract,
-            // so no extra j_prefactor multiplication is needed here.
-            let _ = j_prefactor;
             let val = bundle.value;
             let val_psi = kappa * bundle.d_kappa;
             let val_psi_psi = kappa * kappa * bundle.d2_kappa + kappa * bundle.d_kappa;
@@ -8667,8 +8658,8 @@ pub fn closed_form_psi_derivatives_in_total_basis(
 /// directly per math team Letter A §9 — no centering, no apply_raw_psi_scaling.
 ///
 /// Bundle is computed via `pair_block_radial_with_j_second_derivatives`,
-/// which uses central FD for η/κ derivatives (h_η ≈ 1e-4, O(1e-7) precision)
-/// until closed-form-math-fix's analytic-derivative tier lands.
+/// which uses the radial analytic derivative chain in regular regimes and
+/// the Schoenberg derivative bundle in convergent singular/log-Riesz regimes.
 pub fn closed_form_aniso_psi_derivatives_in_total_basis(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -12654,10 +12645,9 @@ fn build_duchon_operator_penalty_psi_derivatives(
     // Math team Letter A §9: closed-form path uses raw η directly. Per-q
     // closed-form gate matches the value-side: nullspace=Zero AND the per-q
     // convergence/precondition/log-Riesz predicate. q=0 stays on collocation.
-    // ψ-derivatives come from the bundle's FD-based κ-derivatives via chain
-    // rule (`pair_block_radial_with_j_second_derivatives` uses central FD
-    // with h_κ ≈ |κ|·1e-4, giving O(1e-7) precision until Tier-2 analytic
-    // κ-derivs land from closed-form-math-fix).
+    // ψ-derivatives come from the bundle's κ-derivatives by chain rule.
+    // Regular regimes use the radial analytic κ-chain; convergent
+    // singular/log-Riesz regimes use the Schoenberg derivative bundle.
     let use_closed_form_outer_psi = matches!(effective_nullspace_order, DuchonNullspaceOrder::Zero);
     let log_riesz_present_psi = d % 2 == 0 && d / 2 <= 2 * p_order;
     let closed_form_converges_q_psi = |q: usize| -> bool {
@@ -15843,11 +15833,10 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
     let kernel_cols = kernel_constrained.ncols();
     let total_cols = kernel_cols + poly_cols;
 
-    // Wood-TPRS radial reparameterization. Eigendecompose Ω_constrained = V Λ V'
-    // and rotate the radial design columns into the eigenbasis. The bending block
-    // becomes diag(Λ) — a numerically conditioned form whose Gram matrix has
-    // near-orthogonal columns under Φ's metric, avoiding rank-collapse / log|H|
-    // blowup at low log-λ that the raw [Φ Z] basis exhibits.
+    // Radial penalty eigenspace reparameterization. Eigendecompose
+    // Ω_constrained = V Λ V' and rotate the radial design columns into the
+    // same basis. This preserves the TPS model space while making the bending
+    // block diagonal.
     let (radial_reparam, radial_eigvals): (Array2<f64>, Array1<f64>) = if let Some(frozen) =
         frozen_radial_reparam
     {
@@ -16183,6 +16172,18 @@ fn build_thin_plate_scalar_design_psi_derivatives(
 ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
     let kernel_cols = z_kernel.ncols();
+    let kernel_transform = if let Some(v) = spec.radial_reparam.as_ref() {
+        if v.nrows() != kernel_cols || v.ncols() != kernel_cols {
+            return Err(BasisError::DimensionMismatch(format!(
+                "thin-plate radial reparam shape {:?} does not match radial dimension {}",
+                v.dim(),
+                kernel_cols
+            )));
+        }
+        fast_ab(&z_kernel, v)
+    } else {
+        z_kernel
+    };
     let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
     let p_after_pad = kernel_cols + poly_cols;
     let p_final = identifiability_transform
@@ -16193,7 +16194,7 @@ fn build_thin_plate_scalar_design_psi_derivatives(
         centers,
         None,
         p_final,
-        Some(z_kernel),
+        Some(kernel_transform),
         identifiability_transform.cloned(),
         poly_cols,
         RadialScalarKind::ThinPlate {
@@ -16218,28 +16219,37 @@ pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
     let base = build_thin_plate_basiswithworkspace(data, spec, workspace)?;
-    let (centers, identifiability_transform) = match &base.metadata {
+    let (centers, identifiability_transform, radial_reparam) = match &base.metadata {
         BasisMetadata::ThinPlate {
             centers,
             identifiability_transform,
+            radial_reparam,
             ..
-        } => (centers.clone(), identifiability_transform.clone()),
+        } => (
+            centers.clone(),
+            identifiability_transform.clone(),
+            radial_reparam.clone(),
+        ),
         _ => {
             return Err(BasisError::InvalidInput(
                 "ThinPlate derivative path expected ThinPlate metadata".to_string(),
             ));
         }
     };
+    let mut derivative_spec = spec.clone();
+    if derivative_spec.radial_reparam.is_none() {
+        derivative_spec.radial_reparam = radial_reparam;
+    }
     let scalar = build_thin_plate_scalar_design_psi_derivatives(
         data,
         centers.view(),
-        spec,
+        &derivative_spec,
         identifiability_transform.as_ref(),
         workspace,
     )?;
     let (primary_derivative_opt, _) = build_thin_plate_penalty_psi_derivativeswithworkspace(
         centers.view(),
-        spec,
+        &derivative_spec,
         identifiability_transform.as_ref(),
         workspace,
         ThinPlateDerivativeOrder::First,
@@ -16272,28 +16282,37 @@ pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     let base = build_thin_plate_basiswithworkspace(data, spec, workspace)?;
-    let (centers, identifiability_transform) = match &base.metadata {
+    let (centers, identifiability_transform, radial_reparam) = match &base.metadata {
         BasisMetadata::ThinPlate {
             centers,
             identifiability_transform,
+            radial_reparam,
             ..
-        } => (centers.clone(), identifiability_transform.clone()),
+        } => (
+            centers.clone(),
+            identifiability_transform.clone(),
+            radial_reparam.clone(),
+        ),
         _ => {
             return Err(BasisError::InvalidInput(
                 "ThinPlate derivative path expected ThinPlate metadata".to_string(),
             ));
         }
     };
+    let mut derivative_spec = spec.clone();
+    if derivative_spec.radial_reparam.is_none() {
+        derivative_spec.radial_reparam = radial_reparam;
+    }
     let scalar = build_thin_plate_scalar_design_psi_derivatives(
         data,
         centers.view(),
-        spec,
+        &derivative_spec,
         identifiability_transform.as_ref(),
         workspace,
     )?;
     let (_, primarysecond_derivative_opt) = build_thin_plate_penalty_psi_derivativeswithworkspace(
         centers.view(),
-        spec,
+        &derivative_spec,
         identifiability_transform.as_ref(),
         workspace,
         ThinPlateDerivativeOrder::Second,
@@ -18555,7 +18574,7 @@ pub mod closed_form_penalty {
     /// Accuracy regime: for parameters a, b ≤ 64 and |x| ≤ 1e6 the series
     /// converges to within 1e-12 relative within ~200 terms. For larger
     /// arguments the leading e^x or e^{-x} factor dominates.
-    pub fn confluent_1f1_integer(a: usize, b: usize, x: f64) -> f64 {
+    fn confluent_1f1_integer(a: usize, b: usize, x: f64) -> f64 {
         assert!(b >= 1, "confluent_1f1_integer: b must be ≥ 1");
         assert!(a <= b, "confluent_1f1_integer: requires a ≤ b");
         if a == 0 {
@@ -18610,7 +18629,7 @@ pub mod closed_form_penalty {
     /// Special cases:
     /// - S = 0:        w(τ) = τ^{M-1}/Γ(M)            (no Matérn factor).
     /// - κ = 0, S ≥ 1: w(τ) = τ^{M+S-1}/Γ(M+S)        (₁F₁ collapses to 1).
-    pub fn schoenberg_weight(m_total: usize, s_total: usize, kappa: f64, tau: f64) -> f64 {
+    fn schoenberg_weight(m_total: usize, s_total: usize, kappa: f64, tau: f64) -> f64 {
         assert!(tau > 0.0, "schoenberg_weight: tau must be > 0");
         let big_m = 2 * m_total;
         let big_s = 2 * s_total;
@@ -18638,7 +18657,7 @@ pub mod closed_form_penalty {
     ///
     /// Caller passes `z` (already in anisotropy-rescaled coordinates) and the
     /// per-axis weights `b_k = exp(-2 η_k)`.
-    pub fn schoenberg_polynomial_t(q: usize, tau: f64, z: &[f64], b: &[f64]) -> f64 {
+    fn schoenberg_polynomial_t(q: usize, tau: f64, z: &[f64], b: &[f64]) -> f64 {
         assert!(tau > 0.0, "schoenberg_polynomial_t: tau must be > 0");
         assert_eq!(
             z.len(),
@@ -18699,33 +18718,6 @@ pub mod closed_form_penalty {
         eta: &[f64],
         r: &[f64],
     ) -> f64 {
-        anisotropic_duchon_penalty_impl_inner(q, m, s, kappa, eta, r, false)
-    }
-
-    /// Same kernel as `anisotropic_duchon_penalty`. Retained as a public
-    /// alias because some tests import it under this name; the underlying
-    /// closed-form representation no longer benefits from a peak-centered
-    /// quadrature window because there is no quadrature.
-    pub fn anisotropic_duchon_penalty_peak_centered(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-    ) -> f64 {
-        anisotropic_duchon_penalty_impl_inner(q, m, s, kappa, eta, r, false)
-    }
-
-    fn anisotropic_duchon_penalty_impl_inner(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-        _peak_centered: bool,
-    ) -> f64 {
         assert_eq!(
             eta.len(),
             r.len(),
@@ -18769,29 +18761,7 @@ pub mod closed_form_penalty {
         let (nodes, weights) = gauss_legendre_80();
         let half_d = d as f64 / 2.0;
         let log_4pi = (4.0 * std::f64::consts::PI).ln();
-        let y_lo = -20.0_f64;
-        let y_hi = 20.0_f64;
-
-        let mut split_ys: Vec<f64> = vec![y_lo, y_hi];
-        if q >= 1 && s_1 > 0.0 && u_1 > 0.0 {
-            let tau_1 = u_1 / (2.0 * s_1);
-            if tau_1 > 0.0 {
-                let y_split = tau_1.ln();
-                if y_split > y_lo && y_split < y_hi {
-                    split_ys.push(y_split);
-                }
-            }
-        }
-        if q == 2 && s_2 > 0.0 && u_2 > 0.0 {
-            let tau_2 = u_2 / s_2;
-            if tau_2 > 0.0 {
-                let y_split = tau_2.ln();
-                if y_split > y_lo && y_split < y_hi {
-                    split_ys.push(y_split);
-                }
-            }
-        }
-        split_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let split_ys = schoenberg_split_windows(q, s_1, s_2, u_1, u_2);
 
         let mut acc = 0.0_f64;
         for window in split_ys.windows(2) {
@@ -18810,6 +18780,34 @@ pub mod closed_form_penalty {
             }
         }
         acc
+    }
+
+    const SCHOENBERG_Y_LO: f64 = -20.0;
+    const SCHOENBERG_Y_HI: f64 = 20.0;
+
+    fn schoenberg_split_windows(q: usize, s1: f64, s2: f64, u1: f64, u2: f64) -> Vec<f64> {
+        let mut split_ys: Vec<f64> = vec![SCHOENBERG_Y_LO, SCHOENBERG_Y_HI];
+        if q >= 1 && s1 > 0.0 && u1 > 0.0 {
+            let tau_1 = u1 / (2.0 * s1);
+            if tau_1 > 0.0 {
+                let y_split = tau_1.ln();
+                if y_split > SCHOENBERG_Y_LO && y_split < SCHOENBERG_Y_HI {
+                    split_ys.push(y_split);
+                }
+            }
+        }
+        if q == 2 && s2 > 0.0 && u2 > 0.0 {
+            let tau_2 = u2 / s2;
+            if tau_2 > 0.0 {
+                let y_split = tau_2.ln();
+                if y_split > SCHOENBERG_Y_LO && y_split < SCHOENBERG_Y_HI {
+                    split_ys.push(y_split);
+                }
+            }
+        }
+        split_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        split_ys.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        split_ys
     }
 
     /// 80-point Gauss-Legendre nodes and weights on [-1, 1].
@@ -18878,17 +18876,19 @@ pub mod closed_form_penalty {
         pub d2_kappa: f64,
     }
 
-    /// Internal: compute the integrand and all of its first/second derivatives
-    /// at one quadrature point and accumulate into the running bundle. Returns
-    /// the bare-`g_q` derivatives (no J prefactor); the caller assembles J
-    /// once at the end.
-    ///
-    /// All formulas come from differentiating
-    ///   integrand(τ) = w(τ; m,s,κ) · H_τ(z) · T_q(τ, z, b)
-    /// with respect to η_k, η_l, κ, treating
-    ///   z_k = e^{-η_k} r_k     ⇒ ∂_{η_l} z_k = −z_k δ_{kl}
-    ///   b_k = e^{-2 η_k}        ⇒ ∂_{η_l} b_k = −2 b_k δ_{kl}
-    /// and using ∂_{η_k} H_τ = (z_k²/(2τ)) · H_τ.
+    fn schoenberg_derivative_bundle_converges(
+        q: usize,
+        m: usize,
+        s: usize,
+        d: usize,
+        kappa: f64,
+    ) -> bool {
+        kappa > 0.0 && s > 0 && 4 * (m + s) > d + 2 * q && d + 2 * q > 4 * m
+    }
+
+    /// Compute the Schoenberg integrand and its first/second derivatives at
+    /// one quadrature point. Accumulates bare-`g_q` derivatives; the caller
+    /// applies the pair-block Jacobian `J = exp(sum eta)` once.
     #[allow(clippy::too_many_arguments)]
     fn aniso_integrand_derivs_at_tau(
         q: usize,
@@ -18900,14 +18900,12 @@ pub mod closed_form_penalty {
         b: &[f64],
         z_sq_sum: f64,
         d: usize,
-        // outputs (added to in-place)
         bare_value: &mut f64,
         bare_d_eta: &mut [f64],
         bare_d_kappa: &mut f64,
-        bare_d2_eta: &mut [f64], // flat row-major d×d
+        bare_d2_eta: &mut [f64],
         bare_d2_eta_kappa: &mut [f64],
         bare_d2_kappa: &mut f64,
-        // shared scalar weight: integrand contribution * dτ/dy * Gauss weight
         scale: f64,
     ) {
         let half_d = d as f64 / 2.0;
@@ -18915,23 +18913,13 @@ pub mod closed_form_penalty {
         let ln_h = -half_d * (log_4pi + tau.ln()) - z_sq_sum / (4.0 * tau);
         let h = ln_h.exp();
 
-        // T_q values and per-axis first/second-axis-only derivatives.
-        // We compute T_q itself, and for each axis k:
-        //   t1_k = ∂_{η_k} T_q
-        //   t2_kk = ∂²_{η_k η_k} T_q (only the diagonal in the k=l index)
-        // For T_2 there is also the off-diagonal second derivative
-        //   ∂²_{η_k η_l} T_2 = 2 (∂η_k T_1)(∂η_l T_1) for k ≠ l.
-        // (For T_0 and T_1, off-diagonal mixed second-derivatives vanish.)
         let two_tau = 2.0 * tau;
         let four_tau_sq = 4.0 * tau * tau;
         let two_tau_sq = 2.0 * tau * tau;
         let two_tau_cu = 2.0 * tau * tau * tau;
 
-        // T_1 building blocks (used for both q=1 and q=2)
         let mut t1_value = 0.0_f64;
-        // per-axis ∂_{η_k} T_1 = b_k(z_k²/τ² - 1/τ)
         let mut dt1_eta = vec![0.0_f64; d];
-        // per-axis ∂²_{η_k η_k} T_1 = 2 b_k/τ - 4 b_k z_k²/τ²
         let mut d2t1_eta_diag = vec![0.0_f64; d];
         for k in 0..d {
             let zk = z[k];
@@ -18941,14 +18929,10 @@ pub mod closed_form_penalty {
             d2t1_eta_diag[k] = 2.0 * bk / tau - 4.0 * bk * zk * zk / (tau * tau);
         }
 
-        // T_q value, ∂_{η_k} T_q, diagonal ∂²_{η_k η_k} T_q.
-        // Off-diagonal ∂²_{η_k η_l} T_q is nonzero only for q = 2 and equals
-        // 2 (∂_{η_k} T_1)(∂_{η_l} T_1).
         let (t_val, dtq_eta, d2tq_eta_diag) = match q {
             0 => (1.0_f64, vec![0.0_f64; d], vec![0.0_f64; d]),
             1 => (t1_value, dt1_eta.clone(), d2t1_eta_diag.clone()),
             2 => {
-                // T_2 = T_1² + Σ_j b_j² (1/(2τ²) - z_j²/(2τ³))
                 let mut sum_extra = 0.0_f64;
                 for k in 0..d {
                     let zk = z[k];
@@ -18956,7 +18940,6 @@ pub mod closed_form_penalty {
                     sum_extra += bk * bk * (1.0 / two_tau_sq - zk * zk / two_tau_cu);
                 }
                 let t2_val = t1_value * t1_value + sum_extra;
-                // ∂_{η_k} T_2 = 2 T_1 · ∂_{η_k} T_1 + (-2 b_k²/τ² + 3 b_k² z_k²/τ³)
                 let mut dt2 = vec![0.0_f64; d];
                 let mut d2t2_diag = vec![0.0_f64; d];
                 for k in 0..d {
@@ -18965,9 +18948,6 @@ pub mod closed_form_penalty {
                     let extra_first =
                         -2.0 * bk * bk / (tau * tau) + 3.0 * bk * bk * zk * zk / (tau * tau * tau);
                     dt2[k] = 2.0 * t1_value * dt1_eta[k] + extra_first;
-                    // ∂²_{η_k η_k} T_2 = 2 (∂η_k T_1)² + 2 T_1 · ∂²η_k T_1 + extra''
-                    // where extra'' = ∂η_k(-2 b_k²/τ² + 3 b_k² z_k²/τ³)
-                    //               = 8 b_k²/τ² - 18 b_k² z_k²/τ³
                     let extra_second =
                         8.0 * bk * bk / (tau * tau) - 18.0 * bk * bk * zk * zk / (tau * tau * tau);
                     d2t2_diag[k] = 2.0 * dt1_eta[k] * dt1_eta[k]
@@ -18978,20 +18958,9 @@ pub mod closed_form_penalty {
             }
             _ => panic!("aniso_integrand_derivs_at_tau: q must be in {{0,1,2}}"),
         };
+        let cross_t_factor = if q == 2 { 2.0 } else { 0.0 };
 
-        // Off-diagonal second derivative of T_q with respect to η_k, η_l (k ≠ l):
-        //   q=0,1: zero (each axis is independent)
-        //   q=2:   2 · ∂_{η_k} T_1 · ∂_{η_l} T_1
-        let cross_t_factor: f64 = if q == 2 { 2.0 } else { 0.0 };
-
-        // Schoenberg weight w(τ) and its κ-derivatives.
         let w = schoenberg_weight(m, s, kappa, tau);
-
-        // ∂κ w = τ^{2(m+s)-1}/Γ(2(m+s)) · (-2κτ) · (2s)/(2(m+s)) · ₁F₁(2s+1; 2(m+s)+1; -κ²τ)
-        // ∂²κ w = τ^{2(m+s)-1}/Γ(2(m+s)) · [ -2τ·C₁·F₁ + 4 κ²τ²·C₁·C₂·F₂ ]
-        // with C₁ = 2s/(2(m+s)), C₂ = (2s+1)/(2(m+s)+1),
-        //      F₁ = ₁F₁(2s+1; 2(m+s)+1; -κ²τ),
-        //      F₂ = ₁F₁(2s+2; 2(m+s)+2; -κ²τ).
         let (dw_dkappa, d2w_dkappa) = if s == 0 {
             (0.0_f64, 0.0_f64)
         } else {
@@ -19005,7 +18974,6 @@ pub mod closed_form_penalty {
             let f1 = confluent_1f1_integer(big_s + 1, order + 1, arg);
             let dw = pref * (-2.0 * kappa * tau) * c1 * f1;
 
-            // ∂²κ w
             let c2 = ((big_s + 1) as f64) / ((order + 1) as f64);
             let f2 = confluent_1f1_integer(big_s + 2, order + 2, arg);
             let d2w =
@@ -19013,40 +18981,23 @@ pub mod closed_form_penalty {
             (dw, d2w)
         };
 
-        // Integrand = w · H · T_q. Derivatives:
-        //   ∂η_k I = w · [(z_k²/(2τ))·H·T_q + H·∂η_k T_q]
-        //   ∂κ I   = ∂κ w · H · T_q
-        //   ∂²η_k η_l I = w · H · [
-        //       -δ_{kl}·z_k²/τ · T_q
-        //       + z_k² z_l²/(4τ²) · T_q
-        //       + (z_k²/(2τ))·∂η_l T_q
-        //       + (z_l²/(2τ))·∂η_k T_q
-        //       + ∂²η_k η_l T_q
-        //     ]
-        //   ∂²η_k κ I = ∂κ w · [(z_k²/(2τ))·H·T_q + H·∂η_k T_q]
-        //   ∂²κ I = ∂²κ w · H · T_q
         let int_value = w * h * t_val;
         *bare_value += scale * int_value;
         *bare_d_kappa += scale * dw_dkappa * h * t_val;
         *bare_d2_kappa += scale * d2w_dkappa * h * t_val;
 
         for k in 0..d {
-            let zk = z[k];
-            let zk_sq = zk * zk;
+            let zk_sq = z[k] * z[k];
             let h_term_k = (zk_sq / two_tau) * h * t_val + h * dtq_eta[k];
             bare_d_eta[k] += scale * w * h_term_k;
             bare_d2_eta_kappa[k] += scale * dw_dkappa * h_term_k;
         }
 
-        // Second-order η × η.
         for k in 0..d {
-            let zk = z[k];
-            let zk_sq = zk * zk;
+            let zk_sq = z[k] * z[k];
             for l in 0..d {
-                let zl = z[l];
-                let zl_sq = zl * zl;
-                // off-diagonal piece of ∂²η_k η_l T_q
-                let d2t_kl: f64 = if k == l {
+                let zl_sq = z[l] * z[l];
+                let d2t_kl = if k == l {
                     d2tq_eta_diag[k]
                 } else {
                     cross_t_factor * dt1_eta[k] * dt1_eta[l]
@@ -19062,11 +19013,9 @@ pub mod closed_form_penalty {
         }
     }
 
-    /// Bundled pair-block: returns `J · g_q` and all first/second derivatives
-    /// with respect to (η, κ), already including the J prefactor.
-    ///
-    /// Single Schoenberg quadrature pass per call.
-    pub fn pair_block_with_j_second_derivatives(
+    /// Schoenberg derivative route for cases where the radial chain is
+    /// singular or ambiguous but the heat-kernel integral is convergent.
+    fn pair_block_schoenberg_with_j_second_derivatives(
         q: usize,
         m: usize,
         s: usize,
@@ -19077,35 +19026,45 @@ pub mod closed_form_penalty {
         assert_eq!(
             eta.len(),
             r.len(),
-            "pair_block_with_j_second_derivatives: eta and r dimension mismatch"
+            "pair_block_schoenberg_with_j_second_derivatives: eta and r dimension mismatch"
         );
         assert!(
             !r.is_empty(),
-            "pair_block_with_j_second_derivatives: empty input"
+            "pair_block_schoenberg_with_j_second_derivatives: empty input"
         );
         assert!(
             q <= 2,
-            "pair_block_with_j_second_derivatives: q must be in {{0,1,2}}"
+            "pair_block_schoenberg_with_j_second_derivatives: q must be in {{0,1,2}}"
+        );
+        let d = r.len();
+        assert!(
+            schoenberg_derivative_bundle_converges(q, m, s, d, kappa),
+            "pair_block_schoenberg_with_j_second_derivatives: non-convergent Schoenberg derivative regime"
         );
 
-        let d = r.len();
         let mut z = vec![0.0_f64; d];
         let mut b = vec![0.0_f64; d];
         let mut z_sq_sum = 0.0_f64;
         let mut sum_eta = 0.0_f64;
+        let mut s1 = 0.0_f64;
+        let mut s2 = 0.0_f64;
+        let mut u1 = 0.0_f64;
+        let mut u2 = 0.0_f64;
         for k in 0..d {
-            z[k] = r[k] * (-eta[k]).exp();
-            b[k] = (-2.0 * eta[k]).exp();
+            let inv = (-eta[k]).exp();
+            z[k] = r[k] * inv;
+            b[k] = inv * inv;
             z_sq_sum += z[k] * z[k];
             sum_eta += eta[k];
+            s1 += b[k];
+            s2 += b[k] * b[k];
+            u1 += b[k] * z[k] * z[k];
+            u2 += b[k] * b[k] * z[k] * z[k];
         }
         let big_j = sum_eta.exp();
 
         let (nodes, weights) = gauss_legendre_80();
-        let y_lo = -20.0_f64;
-        let y_hi = 20.0_f64;
-        let half_len = 0.5 * (y_hi - y_lo);
-        let mid = 0.5 * (y_hi + y_lo);
+        let split_ys = schoenberg_split_windows(q, s1, s2, u1, u2);
 
         let mut bare_value = 0.0_f64;
         let mut bare_d_eta = vec![0.0_f64; d];
@@ -19114,43 +19073,42 @@ pub mod closed_form_penalty {
         let mut bare_d2_eta_kappa = vec![0.0_f64; d];
         let mut bare_d2_kappa = 0.0_f64;
 
-        for (xi, wi) in nodes.iter().zip(weights.iter()) {
-            let y = mid + half_len * xi;
-            let tau = y.exp();
-            // dτ/dy = τ; the y-domain integrand carries an extra factor of τ.
-            let scale = wi * tau * half_len;
-            aniso_integrand_derivs_at_tau(
-                q,
-                m,
-                s,
-                kappa,
-                tau,
-                &z,
-                &b,
-                z_sq_sum,
-                d,
-                &mut bare_value,
-                &mut bare_d_eta,
-                &mut bare_d_kappa,
-                &mut bare_d2_eta,
-                &mut bare_d2_eta_kappa,
-                &mut bare_d2_kappa,
-                scale,
-            );
+        for window in split_ys.windows(2) {
+            let y_a = window[0];
+            let y_b = window[1];
+            let half_len = 0.5 * (y_b - y_a);
+            let mid = 0.5 * (y_a + y_b);
+            for (xi, wi) in nodes.iter().zip(weights.iter()) {
+                let y = mid + half_len * xi;
+                let tau = y.exp();
+                let scale = wi * tau * half_len;
+                aniso_integrand_derivs_at_tau(
+                    q,
+                    m,
+                    s,
+                    kappa,
+                    tau,
+                    &z,
+                    &b,
+                    z_sq_sum,
+                    d,
+                    &mut bare_value,
+                    &mut bare_d_eta,
+                    &mut bare_d_kappa,
+                    &mut bare_d2_eta,
+                    &mut bare_d2_eta_kappa,
+                    &mut bare_d2_kappa,
+                    scale,
+                );
+            }
         }
 
-        // J prefactor expansion:
-        //   ∂η_k(J·g)         = J · (g + ∂η_k g)
-        //   ∂²η_k η_l(J·g)    = J · (g + ∂η_k g + ∂η_l g + ∂²η_k η_l g)
-        //   ∂κ(J·g)            = J · ∂κ g
-        //   ∂²κ(J·g)           = J · ∂²κ g
-        //   ∂²η_k κ(J·g)      = J · (∂κ g + ∂²η_k κ g)
         let value = big_j * bare_value;
         let d_eta: Vec<f64> = (0..d)
             .map(|k| big_j * (bare_value + bare_d_eta[k]))
             .collect();
         let d_kappa = big_j * bare_d_kappa;
-        let mut d2_eta: Vec<Vec<f64>> = vec![vec![0.0_f64; d]; d];
+        let mut d2_eta = vec![vec![0.0_f64; d]; d];
         for k in 0..d {
             for l in 0..d {
                 d2_eta[k][l] =
@@ -19172,113 +19130,15 @@ pub mod closed_form_penalty {
         }
     }
 
-    /// Backward-compatible first-derivative bundle: returns `(J·g_q, [∂η_k(J·g_q)], ∂κ(J·g_q))`.
-    pub fn pair_block_with_j_derivatives(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-    ) -> (f64, Vec<f64>, f64) {
-        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        (bundle.value, bundle.d_eta, bundle.d_kappa)
-    }
-
-    /// First derivative ∂g_q/∂η_k of the bare (no-J) anisotropic kernel.
-    pub fn psi_first_derivative(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-        k: usize,
-    ) -> f64 {
-        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        // bundle.d_eta[k] = J · (g + ∂η_k g) and bundle.value = J · g, so
-        //   ∂η_k g = bundle.d_eta[k]/J - g = (d_eta[k] - value)/J.
-        let sum_eta: f64 = eta.iter().sum();
-        let big_j = sum_eta.exp();
-        (bundle.d_eta[k] - bundle.value) / big_j
-    }
-
-    /// Second derivative ∂²g_q/∂η_k∂η_l of the bare (no-J) kernel.
-    #[allow(clippy::too_many_arguments)]
-    pub fn psi_second_derivative(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-        k: usize,
-        l: usize,
-    ) -> f64 {
-        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        // bundle.d2_eta[k][l] = J · (g + ∂η_k g + ∂η_l g + ∂²η_k η_l g);
-        // bundle.d_eta[k]    = J · (g + ∂η_k g); bundle.value = J · g. Therefore
-        //   ∂²η_k η_l g = (d2[k][l] - d_eta[k] - d_eta[l] + value) / J.
-        let sum_eta: f64 = eta.iter().sum();
-        let big_j = sum_eta.exp();
-        (bundle.d2_eta[k][l] - bundle.d_eta[k] - bundle.d_eta[l] + bundle.value) / big_j
-    }
-
-    /// First derivative ∂g_q/∂κ of the bare (no-J) kernel.
-    pub fn kappa_first_derivative(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-    ) -> f64 {
-        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        let sum_eta: f64 = eta.iter().sum();
-        let big_j = sum_eta.exp();
-        bundle.d_kappa / big_j
-    }
-
-    /// Second derivative ∂²g_q/∂κ² of the bare (no-J) kernel.
-    pub fn kappa_second_derivative(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-    ) -> f64 {
-        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        let sum_eta: f64 = eta.iter().sum();
-        let big_j = sum_eta.exp();
-        bundle.d2_kappa / big_j
-    }
-
-    /// Mixed second derivative ∂²g_q/∂η_k∂κ of the bare (no-J) kernel.
-    pub fn psi_kappa_mixed_derivative(
-        q: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        eta: &[f64],
-        r: &[f64],
-        k: usize,
-    ) -> f64 {
-        let bundle = pair_block_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        // bundle.d2_eta_kappa[k] = J · (∂κ g + ∂²η_k κ g), bundle.d_kappa = J · ∂κ g.
-        let sum_eta: f64 = eta.iter().sum();
-        let big_j = sum_eta.exp();
-        (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
-    }
-
     // ============================================================
     //  Radial-derivative anisotropic penalty
     // ------------------------------------------------------------
     //  The pair-block kernel can be written as
-    //      g_q(z; η, m, s, κ) = J · (-Δ_B)^q f(R)
-    //  with R = |z|, J = exp(Σ η_k), B = diag(b_k), b_k = exp(-2 η_k),
+    //      g_q(z; η, m, s, κ) = (-Δ_B)^q f(R)
+    //  with R = |z|, B = diag(b_k), b_k = exp(-2 η_k),
     //  Δ_B = Σ_k b_k ∂²/∂z_k² (anisotropic Laplacian) and
     //  f(R) = isotropic_duchon_penalty(0, d, m, s, κ, R).
+    //  Matrix entries multiply this bare kernel by J = exp(Σ η_k).
     //
     //  Acting on a radial function we get the structured forms:
     //      Δ_B f(R) = f''(R)·u_1/R²  +  f'(R)·(s_1/R - u_1/R³)
@@ -19748,9 +19608,10 @@ pub mod closed_form_penalty {
         None
     }
 
-    /// Radial-form anisotropic Duchon pair-block penalty
-    ///   g_q(z; η, m, s, κ) = J · (-Δ_B)^q f(R)
-    /// implemented via analytic radial derivatives of f.
+    /// Radial-form bare anisotropic Duchon pair-block penalty
+    ///   g_q(z; η, m, s, κ) = (-Δ_B)^q f(R)
+    /// implemented via analytic radial derivatives of f. Matrix assembly
+    /// multiplies this value by `J = exp(Ση)`.
     ///
     /// Closed-form pure-Duchon self-pair value `g_q(0; η, m, s, κ=0)`,
     /// implementing the math team's Letter A §3 finite-part formulas:
@@ -20538,15 +20399,13 @@ pub mod closed_form_penalty {
     }
 
     /// Bundled value + first/second derivatives of the radial-form
-    /// anisotropic pair-block `J · g_q`, drop-in replacement for the
-    /// Schoenberg-quadrature `pair_block_with_j_second_derivatives`.
+    /// anisotropic pair-block `J · g_q`.
     ///
-    /// Implementation status:
-    ///   * Value, ∂η, ∂κ:           fully analytic via the radial form
-    ///                              and chain rule on (R, s_1, s_2, u_1, u_2).
-    ///   * ∂²η, ∂η∂κ, ∂²κ:          central FD around the analytic value
-    ///                              (legacy path; phased migration to
-    ///                              fully-analytic chain rule in progress).
+    /// Uses analytic chain rules on `(R, s_1, s_2, u_1, u_2)` for regular
+    /// non-log regimes. Degenerate self-pairs and log-Riesz regimes route to
+    /// the Schoenberg derivative bundle whenever its heat-kernel integral is
+    /// convergent; finite-part regimes outside that integral domain retain
+    /// local central stencils around the radial value.
     pub fn pair_block_radial_with_j_second_derivatives(
         q: usize,
         m: usize,
@@ -20569,6 +20428,12 @@ pub mod closed_form_penalty {
             "pair_block_radial_with_j_second_derivatives: q must be in {{0,1,2}}"
         );
         let d = eta.len();
+        let (big_r_check, _, _, _, _) = aniso_invariants(eta, r);
+        let analytic_first_ok = big_r_check > 0.0 && !relevant_block_is_log_riesz(d, m, s, kappa);
+        if !analytic_first_ok && schoenberg_derivative_bundle_converges(q, m, s, d, kappa) {
+            return pair_block_schoenberg_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        }
+
         let big_j_of = |eta: &[f64]| -> f64 { eta.iter().sum::<f64>().exp() };
         let val = |eta: &[f64], kappa: f64| -> f64 {
             big_j_of(eta) * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
@@ -20585,13 +20450,6 @@ pub mod closed_form_penalty {
         let mut d_eta = vec![0.0_f64; d];
         let mut d2_eta = vec![vec![0.0_f64; d]; d];
         let mut d2_eta_kappa = vec![0.0_f64; d];
-
-        // Decide whether to use the analytic chain rule or fall back to FD.
-        // The analytic chain rule requires R > 0 and the non-log-Riesz regime
-        // (otherwise `anisotropic_duchon_penalty_radial` itself routes to a
-        // different formula). Special cases keep the FD path.
-        let (big_r_check, _, _, _, _) = aniso_invariants(eta, r);
-        let analytic_first_ok = big_r_check > 0.0 && !relevant_block_is_log_riesz(d, m, s, kappa);
 
         if analytic_first_ok {
             // Analytic d_eta and d_kappa via chain rule on (R, s_1, s_2, u_1, u_2).
@@ -20875,17 +20733,90 @@ pub mod closed_form_penalty {
         }
     }
 
-    /// First-derivative bundle convenience wrapper for the radial form.
-    pub fn pair_block_radial_with_j_derivatives(
+    /// Bare-kernel first derivative ∂g_q/∂η_k. The production bundle carries
+    /// derivatives of `J · g_q`; this unwraps the `J` contribution.
+    pub fn psi_first_derivative(
         q: usize,
         m: usize,
         s: usize,
         kappa: f64,
         eta: &[f64],
         r: &[f64],
-    ) -> (f64, Vec<f64>, f64) {
+        k: usize,
+    ) -> f64 {
+        assert!(
+            k < eta.len(),
+            "psi_first_derivative: axis index out of range"
+        );
         let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-        (bundle.value, bundle.d_eta, bundle.d_kappa)
+        let big_j = eta.iter().sum::<f64>().exp();
+        (bundle.d_eta[k] - bundle.value) / big_j
+    }
+
+    /// Bare-kernel second derivative ∂²g_q/∂η_k∂η_l.
+    #[allow(clippy::too_many_arguments)]
+    pub fn psi_second_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+        k: usize,
+        l: usize,
+    ) -> f64 {
+        assert!(
+            k < eta.len() && l < eta.len(),
+            "psi_second_derivative: axis index out of range"
+        );
+        let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        let big_j = eta.iter().sum::<f64>().exp();
+        (bundle.d2_eta[k][l] - bundle.d_eta[k] - bundle.d_eta[l] + bundle.value) / big_j
+    }
+
+    /// Bare-kernel first derivative ∂g_q/∂κ.
+    pub fn kappa_first_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> f64 {
+        let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        bundle.d_kappa / eta.iter().sum::<f64>().exp()
+    }
+
+    /// Bare-kernel second derivative ∂²g_q/∂κ².
+    pub fn kappa_second_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+    ) -> f64 {
+        let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        bundle.d2_kappa / eta.iter().sum::<f64>().exp()
+    }
+
+    /// Bare-kernel mixed derivative ∂²g_q/∂η_k∂κ.
+    pub fn psi_kappa_mixed_derivative(
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: &[f64],
+        r: &[f64],
+        k: usize,
+    ) -> f64 {
+        assert!(
+            k < eta.len(),
+            "psi_kappa_mixed_derivative: axis index out of range"
+        );
+        let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
+        let big_j = eta.iter().sum::<f64>().exp();
+        (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
     }
 }
 
@@ -24889,13 +24820,18 @@ mod tests {
     fn test_thin_plate_log_kappa_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-        let spec = ThinPlateBasisSpec {
+        let mut spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             double_penalty: true,
             identifiability: SpatialIdentifiability::None,
             radial_reparam: None,
         };
+        let base_for_reparam =
+            build_thin_plate_basis(data.view(), &spec).expect("base TPS build for radial reparam");
+        if let BasisMetadata::ThinPlate { radial_reparam, .. } = &base_for_reparam.metadata {
+            spec.radial_reparam = radial_reparam.clone();
+        }
         let deriv = build_thin_plate_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic ThinPlate derivative should build");
 
@@ -24946,13 +24882,18 @@ mod tests {
     fn test_thin_plate_log_kappasecond_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-        let spec = ThinPlateBasisSpec {
+        let mut spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             double_penalty: true,
             identifiability: SpatialIdentifiability::None,
             radial_reparam: None,
         };
+        let base_for_reparam =
+            build_thin_plate_basis(data.view(), &spec).expect("base TPS build for radial reparam");
+        if let BasisMetadata::ThinPlate { radial_reparam, .. } = &base_for_reparam.metadata {
+            spec.radial_reparam = radial_reparam.clone();
+        }
         let analytic = build_thin_plate_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic ThinPlate second derivative should build");
         let base = build_thin_plate_basis(data.view(), &spec).expect("base build");
@@ -27716,11 +27657,10 @@ mod tests {
     fn test_schoenberg_isotropic_agrees_with_partial_fraction() {
         use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
 
-        // Schoenberg quadrature converges only when both UV `4(m+s) > d + 2q`
-        // and IR `d + 2q > 4m` hold. Additionally, `isotropic_duchon_penalty`
+        // At η = 0 the anisotropic kernel short-circuits to the isotropic
+        // closed form. Additionally, `isotropic_duchon_penalty`
         // requires `2m - q ≥ 1` for the partial-fraction expansion. For q=1
-        // this is satisfied by (d=3, m=1, s=1). For q=2 we need m≥2 and IR
-        // forces d≥5; (d=5, m=2, s=2) is the simplest convergent choice.
+        // this is satisfied by (d=3, m=1, s=1). For q=2, use m≥2 and d≥5.
         let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
             (1, 3, 1, 1, 1.0, 0.5),
             (1, 3, 1, 1, 1.0, 2.0),
@@ -27733,12 +27673,9 @@ mod tests {
             let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
             let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
             let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
-            // Schoenberg quadrature with leading-only ₁F₁ asymptotic and finite
-            // y-grid agrees with the closed-form Riesz+Matérn to a few percent;
-            // tighter agreement requires higher-order ₁F₁ terms in the tail.
             assert!(
-                rel < 5e-2,
-                "schoenberg/iso disagreement: q={q} d={d} m={m} s={s} kappa={kappa} R={big_r} \
+                rel < 1e-12,
+                "eta-zero aniso/iso disagreement: q={q} d={d} m={m} s={s} kappa={kappa} R={big_r} \
                  aniso={aniso} iso={iso} rel={rel}"
             );
         }
@@ -27765,184 +27702,6 @@ mod tests {
                 );
             }
             prev = Some(v);
-        }
-    }
-
-    // Note: Schoenberg quadrature at κ=0 or s=0 does not converge — the
-    // integrand grows at τ→∞ without the ₁F₁(s; m+s; -κ²τ) damping factor.
-    // The Riesz closed form handles those parameter regimes directly via
-    // `isotropic_duchon_penalty`, so the Schoenberg path is not exercised
-    // there and need not be tested in those degenerate regimes.
-
-    #[test]
-    fn test_psi_first_deriv_finite_difference() {
-        use super::closed_form_penalty::{anisotropic_duchon_penalty, psi_first_derivative};
-
-        // Schoenberg converges with (d=3, m=1, s=1, κ=1) for q=1. Mass (q=0)
-        // diverges; q=2 needs m≥2 and IR forces d≥5 — tested separately by
-        // higher-q tests if/when desired.
-        let m = 1usize;
-        let s = 1usize;
-        let kappa = 1.0_f64;
-        let eta_base = [0.1_f64, -0.2, 0.3];
-        let r = [0.5_f64, 0.4, 0.3];
-        let h = 1e-5_f64;
-        for q in [1usize] {
-            for k in 0..eta_base.len() {
-                let mut eta_p = eta_base.to_vec();
-                let mut eta_m = eta_base.to_vec();
-                eta_p[k] += h;
-                eta_m[k] -= h;
-                let g_p = anisotropic_duchon_penalty(q, m, s, kappa, &eta_p, &r);
-                let g_m = anisotropic_duchon_penalty(q, m, s, kappa, &eta_m, &r);
-                let fd = (g_p - g_m) / (2.0 * h);
-                let an = psi_first_derivative(q, m, s, kappa, &eta_base, &r, k);
-                let err = (fd - an).abs();
-                assert!(
-                    err < 1e-6,
-                    "psi_first_derivative q={q} k={k}: analytic={an} fd={fd} err={err}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_psi_second_deriv_symmetry() {
-        use super::closed_form_penalty::psi_second_derivative;
-
-        // Convergent regime; q=1 only (q=2 requires d≥5).
-        let m = 1usize;
-        let s = 1usize;
-        let kappa = 1.0_f64;
-        let eta = [0.1_f64, -0.2, 0.3];
-        let r = [0.5_f64, 0.4, 0.3];
-        for q in [1usize] {
-            for k in 0..eta.len() {
-                for l in 0..eta.len() {
-                    let kl = psi_second_derivative(q, m, s, kappa, &eta, &r, k, l);
-                    let lk = psi_second_derivative(q, m, s, kappa, &eta, &r, l, k);
-                    let diff = (kl - lk).abs();
-                    let sc = kl.abs().max(lk.abs()).max(1e-300);
-                    assert!(
-                        diff / sc < 1e-12,
-                        "psi_second_derivative not symmetric q={q} k={k} l={l}: kl={kl} lk={lk}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_psi_second_deriv_finite_difference() {
-        use super::closed_form_penalty::{psi_first_derivative, psi_second_derivative};
-
-        // Convergent regime; q ∈ {1, 2} only.
-        let m = 1usize;
-        let s = 1usize;
-        let kappa = 1.0_f64;
-        let eta_base = [0.1_f64, -0.2, 0.3];
-        let r = [0.5_f64, 0.4, 0.3];
-        let h = 1e-5_f64;
-        for q in [1usize] {
-            for k in 0..eta_base.len() {
-                for l in 0..eta_base.len() {
-                    // Compute ∂²/∂η_k η_l by FD on first derivative w.r.t. η_l.
-                    let mut eta_p = eta_base.to_vec();
-                    let mut eta_m = eta_base.to_vec();
-                    eta_p[k] += h;
-                    eta_m[k] -= h;
-                    let dl_p = psi_first_derivative(q, m, s, kappa, &eta_p, &r, l);
-                    let dl_m = psi_first_derivative(q, m, s, kappa, &eta_m, &r, l);
-                    let fd = (dl_p - dl_m) / (2.0 * h);
-                    let an = psi_second_derivative(q, m, s, kappa, &eta_base, &r, k, l);
-                    let err = (fd - an).abs();
-                    assert!(
-                        err < 1e-5,
-                        "psi_second_derivative q={q} k={k} l={l}: analytic={an} fd={fd} err={err}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_kappa_deriv_finite_difference() {
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty, kappa_first_derivative, kappa_second_derivative,
-            psi_first_derivative, psi_kappa_mixed_derivative,
-        };
-
-        // Convergent regime; q=1 only (q=2 requires d≥5).
-        let m = 1usize;
-        let s = 1usize;
-        let kappa = 1.0_f64;
-        let eta = [0.1_f64, -0.2, 0.3];
-        let r = [0.5_f64, 0.4, 0.3];
-        let h = 1e-5_f64;
-        for q in [1usize] {
-            // ∂g/∂κ
-            let g_p = anisotropic_duchon_penalty(q, m, s, kappa + h, &eta, &r);
-            let g_m = anisotropic_duchon_penalty(q, m, s, kappa - h, &eta, &r);
-            let fd1 = (g_p - g_m) / (2.0 * h);
-            let an1 = kappa_first_derivative(q, m, s, kappa, &eta, &r);
-            assert!(
-                (fd1 - an1).abs() < 1e-6,
-                "kappa_first_derivative q={q}: analytic={an1} fd={fd1}"
-            );
-
-            // ∂²g/∂κ²
-            let dk_p = kappa_first_derivative(q, m, s, kappa + h, &eta, &r);
-            let dk_m = kappa_first_derivative(q, m, s, kappa - h, &eta, &r);
-            let fd2 = (dk_p - dk_m) / (2.0 * h);
-            let an2 = kappa_second_derivative(q, m, s, kappa, &eta, &r);
-            assert!(
-                (fd2 - an2).abs() < 1e-5,
-                "kappa_second_derivative q={q}: analytic={an2} fd={fd2}"
-            );
-
-            // ∂²g/∂η_k∂κ
-            for k in 0..eta.len() {
-                let dpsi_p = psi_first_derivative(q, m, s, kappa + h, &eta, &r, k);
-                let dpsi_m = psi_first_derivative(q, m, s, kappa - h, &eta, &r, k);
-                let fd_mixed = (dpsi_p - dpsi_m) / (2.0 * h);
-                let an_mixed = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, k);
-                assert!(
-                    (fd_mixed - an_mixed).abs() < 1e-5,
-                    "psi_kappa_mixed_derivative q={q} k={k}: analytic={an_mixed} fd={fd_mixed}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_kappa_zero_when_s_zero() {
-        use super::closed_form_penalty::{
-            kappa_first_derivative, kappa_second_derivative, psi_kappa_mixed_derivative,
-        };
-
-        let m = 2usize;
-        let s = 0usize;
-        let kappa = 1.0_f64;
-        let eta = [0.1_f64, -0.2, 0.3];
-        let r = [0.5_f64, 0.4, 0.3];
-        for q in [0usize, 1, 2] {
-            let dk = kappa_first_derivative(q, m, s, kappa, &eta, &r);
-            assert!(
-                dk.abs() < 1e-12,
-                "kappa_first_derivative should be zero at s=0 (q={q}), got {dk}"
-            );
-            let d2k = kappa_second_derivative(q, m, s, kappa, &eta, &r);
-            assert!(
-                d2k.abs() < 1e-12,
-                "kappa_second_derivative should be zero at s=0 (q={q}), got {d2k}"
-            );
-            for k in 0..eta.len() {
-                let mx = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, k);
-                assert!(
-                    mx.abs() < 1e-12,
-                    "psi_kappa_mixed_derivative should be zero at s=0 (q={q}, k={k}), got {mx}"
-                );
-            }
         }
     }
 
@@ -28355,23 +28114,9 @@ mod tests {
 
     #[test]
     fn test_schoenberg_isotropic_matches_riesz_matern_strict_tolerance() {
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_peak_centered as anisotropic_duchon_penalty,
-            isotropic_duchon_penalty,
-        };
-        // (d=3, m=1, s=2, κ=1, q=1) and (d=5, m=2, s=2, κ=1, q=2).
-        //
-        // Tolerance 1.5e-2 is the achievable floor for the 80-node
-        // y ∈ [-20, 20] Schoenberg quadrature: at small R (R = 0.2) the
-        // heat-kernel integrand peaks near τ ≈ R²/(2d) ≈ 0.007, where the
-        // log-grid is locally coarse and the polynomial prefactor T_q is
-        // most variable. Tightening below 5e-3 would require either a
-        // 120-node rule or a τ-window adaptive to R, neither of which is
-        // free in the production hot path. The looser companion test
-        // `test_schoenberg_quadrature_independent_of_extra_quadrature_pad`
-        // catches the same families of bugs at 1e-2 over the bulk regime
-        // R ∈ [0.4, 2.5]; this test extends coverage down to R = 0.2 at
-        // the achievable precision.
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
+        // At η = 0, the anisotropic operator is exactly the isotropic
+        // Riesz-Matérn partial-fraction kernel.
         let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 2, 1.0), (2, 5, 2, 2, 1.0)];
         for &(q, d, m, s, kappa) in cases {
             for &big_r in &[0.2_f64, 0.5, 1.0, 2.0, 4.0] {
@@ -28382,8 +28127,8 @@ mod tests {
                 let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
                 let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
                 assert!(
-                    rel < 1.5e-2,
-                    "strict schoenberg/iso disagreement: q={q} d={d} m={m} s={s} κ={kappa} R={big_r} \
+                    rel < 1e-12,
+                    "strict eta-zero aniso/iso disagreement: q={q} d={d} m={m} s={s} κ={kappa} R={big_r} \
                      aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e}"
                 );
             }
@@ -28392,10 +28137,7 @@ mod tests {
 
     #[test]
     fn test_schoenberg_quadrature_independent_of_extra_quadrature_pad() {
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_peak_centered as anisotropic_duchon_penalty,
-            isotropic_duchon_penalty,
-        };
+        use super::closed_form_penalty::{anisotropic_duchon_penalty, isotropic_duchon_penalty};
         let q = 1usize;
         let d = 3usize;
         let m = 1usize;
@@ -28409,10 +28151,9 @@ mod tests {
             let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
             let rel = (aniso - iso).abs() / iso.abs().max(1e-300);
             assert!(
-                rel < 1e-2,
-                "Schoenberg quadrature looks under-resolved at R={big_r}: \
-                 aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e} \
-                 (expected ≤ 1e-2 with 80-node y∈[-20,20] rule)"
+                rel < 1e-12,
+                "eta-zero aniso/iso disagreement at R={big_r}: \
+                 aniso={aniso:.6e} iso={iso:.6e} rel={rel:.3e}"
             );
         }
     }
@@ -28422,7 +28163,9 @@ mod tests {
         // The J = exp(Σ η_k) prefactor must scale as e^{c·d} under a uniform
         // η shift by c.  This catches a missing/wrong J prefactor in the
         // pair-block bundle.
-        use super::closed_form_penalty::pair_block_with_j_derivatives;
+        use super::closed_form_penalty::{
+            pair_block_radial_with_j_second_derivatives, psi_first_derivative,
+        };
         let q = 1usize;
         let m = 1usize;
         let s = 1usize;
@@ -28433,8 +28176,11 @@ mod tests {
         let c = 0.4_f64;
         let eta_shift: Vec<f64> = eta_base.iter().map(|x| x + c).collect();
 
-        let (val_base, _, _) = pair_block_with_j_derivatives(q, m, s, kappa, &eta_base, &r);
-        let (val_shift, _, _) = pair_block_with_j_derivatives(q, m, s, kappa, &eta_shift, &r);
+        let val_base =
+            pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta_base, &r).value;
+        let bundle_shift =
+            pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta_shift, &r);
+        let val_shift = bundle_shift.value;
 
         let j_base: f64 = eta_base.iter().sum::<f64>().exp();
         let j_shift: f64 = eta_shift.iter().sum::<f64>().exp();
@@ -28451,98 +28197,17 @@ mod tests {
 
         assert!(bare_base.is_finite() && bare_base.abs() > 1e-30);
         assert!(bare_shift.is_finite() && bare_shift.abs() > 1e-30);
-    }
 
-    #[test]
-    fn test_psi_kappa_mixed_derivative_symmetry() {
-        use super::closed_form_penalty::{
-            anisotropic_duchon_penalty, kappa_first_derivative, psi_first_derivative,
-            psi_kappa_mixed_derivative,
-        };
-        let q = 1usize;
-        let m = 1usize;
-        let s = 1usize;
-        let kappa = 1.0_f64;
-        let eta = vec![0.1_f64, -0.2, 0.3];
-        let r = vec![0.5_f64, 0.4, 0.3];
-        let h = 1e-4_f64;
-
-        for k in 0..eta.len() {
-            let mut eta_p = eta.clone();
-            let mut eta_m = eta.clone();
-            eta_p[k] += h;
-            eta_m[k] -= h;
-            let dk_p = kappa_first_derivative(q, m, s, kappa, &eta_p, &r);
-            let dk_m = kappa_first_derivative(q, m, s, kappa, &eta_m, &r);
-            let fd_a = (dk_p - dk_m) / (2.0 * h);
-            let dpsi_p = psi_first_derivative(q, m, s, kappa + h, &eta, &r, k);
-            let dpsi_m = psi_first_derivative(q, m, s, kappa - h, &eta, &r, k);
-            let fd_b = (dpsi_p - dpsi_m) / (2.0 * h);
-            let an = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, k);
-
-            let err_ab = (fd_a - fd_b).abs();
-            let err_an_a = (fd_a - an).abs();
-            let err_an_b = (fd_b - an).abs();
-            let scale = an.abs().max(fd_a.abs()).max(fd_b.abs()).max(1e-12);
-            assert!(
-                err_ab / scale < 1e-3,
-                "FD-A vs FD-B mismatch (k={k}): FD-A={fd_a:.6e} FD-B={fd_b:.6e} err={err_ab:.3e}"
-            );
-            assert!(
-                err_an_a / scale < 1e-3,
-                "analytic vs FD-A mismatch (k={k}): an={an:.6e} FD-A={fd_a:.6e} err={err_an_a:.3e}"
-            );
-            assert!(
-                err_an_b / scale < 1e-3,
-                "analytic vs FD-B mismatch (k={k}): an={an:.6e} FD-B={fd_b:.6e} err={err_an_b:.3e}"
-            );
-            let _g0 = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
-        }
-    }
-
-    #[test]
-    fn test_psi_first_deriv_against_two_central_differences() {
-        use super::closed_form_penalty::{anisotropic_duchon_penalty, psi_first_derivative};
-        let q = 1usize;
-        let m = 1usize;
-        let s = 1usize;
-        let kappa = 1.0_f64;
-        let eta = vec![0.1_f64, -0.2, 0.3];
-        let r = vec![0.5_f64, 0.4, 0.3];
-
-        for k in 0..eta.len() {
-            let h_big = 1e-3_f64;
-            let h_small = 0.5e-3_f64;
-            let fd_at = |h: f64| {
-                let mut ep = eta.clone();
-                let mut em = eta.clone();
-                ep[k] += h;
-                em[k] -= h;
-                let g_p = anisotropic_duchon_penalty(q, m, s, kappa, &ep, &r);
-                let g_m = anisotropic_duchon_penalty(q, m, s, kappa, &em, &r);
-                (g_p - g_m) / (2.0 * h)
-            };
-            let fd_big = fd_at(h_big);
-            let fd_small = fd_at(h_small);
-            // Richardson extrapolation (4·fd(h/2) − fd(h))/3 cancels O(h²).
-            let richardson = (4.0 * fd_small - fd_big) / 3.0;
-            let an = psi_first_derivative(q, m, s, kappa, &eta, &r, k);
-            let err = (richardson - an).abs();
-            let scale = an.abs().max(richardson.abs()).max(1e-12);
-            assert!(
-                err / scale < 5e-7,
-                "Richardson FD vs analytic disagree (k={k}): \
-                 R={richardson:.10e} an={an:.10e} fd(h)={fd_big:.10e} fd(h/2)={fd_small:.10e} \
-                 abs_err={err:.3e} rel={:.3e}",
-                err / scale
-            );
-        }
+        let bare_d0 = psi_first_derivative(q, m, s, kappa, &eta_shift, &r, 0);
+        let unwrapped_d0 = (bundle_shift.d_eta[0] - bundle_shift.value) / j_shift;
+        assert!((bare_d0 - unwrapped_d0).abs() < 1e-12);
     }
 
     #[test]
     fn test_anisotropy_breaks_isotropic_symmetry() {
         use super::closed_form_penalty::{
-            anisotropic_duchon_penalty, isotropic_duchon_penalty, pair_block_with_j_derivatives,
+            anisotropic_duchon_penalty, isotropic_duchon_penalty,
+            pair_block_radial_with_j_second_derivatives,
         };
         let q = 1usize;
         let m = 1usize;
@@ -28565,7 +28230,8 @@ mod tests {
              (expected meaningful disagreement under anisotropy)"
         );
 
-        let (val_with_j, _, _) = pair_block_with_j_derivatives(q, m, s, kappa, &eta, &r);
+        let val_with_j =
+            pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r).value;
         let expected_j = eta.iter().sum::<f64>().exp();
         let bare = val_with_j / expected_j;
         let bare_rel = (bare - aniso_bare).abs() / aniso_bare.abs().max(1e-300);
@@ -28630,8 +28296,9 @@ mod tests {
                     let scho = anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
                     let rel = (radial - scho).abs() / scho.abs().max(1e-300);
                     // Schoenberg quadrature itself agrees with the
-                    // partial-fraction closed form to a few percent
-                    // (see test_schoenberg_isotropic_agrees_with_partial_fraction);
+                    // partial-fraction closed form to a few percent on
+                    // nonzero anisotropy; the eta-zero case is exact via the
+                    // isotropic short-circuit.
                     // the radial form, by construction, agrees with the
                     // partial-fraction closed form to roundoff. Therefore
                     // we expect the radial vs Schoenberg gap to live within
@@ -29164,7 +28831,8 @@ mod tests {
     #[test]
     fn test_kappa_derivative_matches_finite_difference() {
         use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+            anisotropic_duchon_penalty_radial, kappa_first_derivative,
+            pair_block_radial_with_j_second_derivatives,
         };
 
         let mut seed = 0xCAFE_BABE_u64;
@@ -29179,6 +28847,8 @@ mod tests {
                 let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
 
                 let big_j = eta.iter().sum::<f64>().exp();
+                let bare_dk = kappa_first_derivative(q, m, s, kappa, &eta, &r);
+                assert!((big_j * bare_dk - bundle.d_kappa).abs() < 1e-12);
                 let v_at = |kk: f64| -> f64 {
                     big_j * anisotropic_duchon_penalty_radial(q, m, s, kk, &eta, &r)
                 };
@@ -29253,7 +28923,8 @@ mod tests {
     #[test]
     fn test_pair_block_analytic_d2kappa_matches_fd() {
         use super::closed_form_penalty::{
-            anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+            anisotropic_duchon_penalty_radial, kappa_second_derivative,
+            pair_block_radial_with_j_second_derivatives,
         };
 
         let mut seed = 0x1234_5678_u64;
@@ -29272,6 +28943,8 @@ mod tests {
                 let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
 
                 let big_j = eta.iter().sum::<f64>().exp();
+                let bare_d2k = kappa_second_derivative(q, m, s, kappa, &eta, &r);
+                assert!((big_j * bare_d2k - bundle.d2_kappa).abs() < 1e-12);
                 let v_at = |kk: f64| -> f64 {
                     big_j * anisotropic_duchon_penalty_radial(q, m, s, kk, &eta, &r)
                 };
@@ -29299,6 +28972,7 @@ mod tests {
     fn test_pair_block_analytic_d2eta_matches_fd() {
         use super::closed_form_penalty::{
             anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+            psi_second_derivative,
         };
 
         let mut seed = 0xFEED_FACE_u64;
@@ -29312,6 +28986,7 @@ mod tests {
 
                 let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
 
+                let big_j = eta.iter().sum::<f64>().exp();
                 let v_at = |eta_use: &[f64]| -> f64 {
                     eta_use.iter().sum::<f64>().exp()
                         * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta_use, &r)
@@ -29320,6 +28995,11 @@ mod tests {
                 let h = 1e-3_f64;
                 // Diagonal: 2nd central FD.
                 for l in 0..d {
+                    let bare_d2 = psi_second_derivative(q, m, s, kappa, &eta, &r, l, l);
+                    let unwrapped_d2 =
+                        (bundle.d2_eta[l][l] - 2.0 * bundle.d_eta[l] + bundle.value) / big_j;
+                    assert!((bare_d2 - unwrapped_d2).abs() < 1e-12);
+
                     let mut e_p = eta.clone();
                     let mut e_m = eta.clone();
                     e_p[l] += h;
@@ -29352,6 +29032,12 @@ mod tests {
                         emm[l] -= h;
                         let off_fd =
                             (v_at(&epp) - v_at(&epm) - v_at(&emp) + v_at(&emm)) / (4.0 * h * h);
+                        let bare_cross = psi_second_derivative(q, m, s, kappa, &eta, &r, k, l);
+                        let unwrapped_cross =
+                            (bundle.d2_eta[k][l] - bundle.d_eta[k] - bundle.d_eta[l]
+                                + bundle.value)
+                                / big_j;
+                        assert!((bare_cross - unwrapped_cross).abs() < 1e-12);
                         let denom = off_fd.abs().max(bundle.d2_eta[k][l].abs()).max(1e-8);
                         let rel = (bundle.d2_eta[k][l] - off_fd).abs() / denom;
                         assert!(
@@ -29377,6 +29063,7 @@ mod tests {
     fn test_pair_block_analytic_d2etakappa_matches_fd() {
         use super::closed_form_penalty::{
             anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
+            psi_kappa_mixed_derivative,
         };
 
         let mut seed = 0xDEAD_BEEF_u64;
@@ -29389,6 +29076,7 @@ mod tests {
 
                 let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
 
+                let big_j = eta.iter().sum::<f64>().exp();
                 let v_at = |eta_use: &[f64], kk: f64| -> f64 {
                     eta_use.iter().sum::<f64>().exp()
                         * anisotropic_duchon_penalty_radial(q, m, s, kk, eta_use, &r)
@@ -29397,6 +29085,10 @@ mod tests {
                 let h_k = 1e-3 * kappa;
 
                 for l in 0..d {
+                    let bare_cross = psi_kappa_mixed_derivative(q, m, s, kappa, &eta, &r, l);
+                    let unwrapped_cross = (bundle.d2_eta_kappa[l] - bundle.d_kappa) / big_j;
+                    assert!((bare_cross - unwrapped_cross).abs() < 1e-12);
+
                     let mut e_p = eta.clone();
                     let mut e_m = eta.clone();
                     e_p[l] += h_e;

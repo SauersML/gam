@@ -23,13 +23,16 @@
 //!     fuzz scenario (additive_interaction signal style at extreme small n).
 
 use faer::Side;
-use gam::basis::{create_thin_plate_spline_basis, create_thin_plate_spline_basis_with_knot_count};
+use gam::basis::{
+    BasisMetadata, CenterStrategy, SpatialIdentifiability, ThinPlateBasisSpec,
+    build_thin_plate_basis,
+};
 use gam::faer_ndarray::FaerCholesky;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Normal};
+use rand_distr::{Distribution, Exp, Normal};
 
 // ─── Data generators ──────────────────────────────────────────────────────────
 
@@ -60,6 +63,123 @@ fn uniform_2d(rng: &mut StdRng, n: usize) -> Array2<f64> {
 
 fn uniform_1d(rng: &mut StdRng, n: usize) -> Array1<f64> {
     Array1::from_iter((0..n).map(|_| rng.random_range(0.0..1.0)))
+}
+
+fn skewed_2d(rng: &mut StdRng, n: usize) -> Array2<f64> {
+    let exp = Exp::new(1.0).expect("valid exponential rate");
+    let mut x = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        x[[i, 0]] = exp.sample(rng);
+        x[[i, 1]] = exp.sample(rng);
+    }
+    for col in 0..2 {
+        let mean = x.column(col).iter().sum::<f64>() / n as f64;
+        for i in 0..n {
+            x[[i, col]] -= mean;
+        }
+    }
+    x
+}
+
+fn standardize(mut y: Array1<f64>) -> Array1<f64> {
+    let mean = y.iter().sum::<f64>() / y.len() as f64;
+    for v in y.iter_mut() {
+        *v -= mean;
+    }
+    let var = y.iter().map(|v| v * v).sum::<f64>() / y.len().max(1) as f64;
+    let sd = var.sqrt();
+    if sd > 1e-12 {
+        for v in y.iter_mut() {
+            *v /= sd;
+        }
+    }
+    y
+}
+
+fn zscore_train_test(mut train: Array2<f64>, mut test: Array2<f64>) -> (Array2<f64>, Array2<f64>) {
+    for col in 0..train.ncols() {
+        let mean = train.column(col).iter().sum::<f64>() / train.nrows() as f64;
+        let var = train
+            .column(col)
+            .iter()
+            .map(|v| {
+                let d = *v - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / train.nrows().max(1) as f64;
+        let sd = var.sqrt().max(1e-12);
+        for i in 0..train.nrows() {
+            train[[i, col]] = (train[[i, col]] - mean) / sd;
+        }
+        for i in 0..test.nrows() {
+            test[[i, col]] = (test[[i, col]] - mean) / sd;
+        }
+    }
+    (train, test)
+}
+
+fn sawtooth_signal(x: &Array1<f64>) -> Array1<f64> {
+    let freq = 3.5;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    x.mapv(|v| {
+        let z = freq * v / two_pi;
+        2.0 * (z - (0.5 + z).floor())
+    })
+}
+
+fn polynomial_signal(x: &Array1<f64>) -> Array1<f64> {
+    x.mapv(|v| 0.35 * v.powi(4) - 0.8 * v.powi(3) + 0.25 * v.powi(2) + 0.5 * v)
+}
+
+fn two_block_design(left: &Array2<f64>, right: &Array2<f64>) -> Array2<f64> {
+    assert_eq!(left.nrows(), right.nrows());
+    let mut out = Array2::<f64>::zeros((left.nrows(), left.ncols() + right.ncols()));
+    for i in 0..left.nrows() {
+        for j in 0..left.ncols() {
+            out[[i, j]] = left[[i, j]];
+        }
+        for j in 0..right.ncols() {
+            out[[i, left.ncols() + j]] = right[[i, j]];
+        }
+    }
+    out
+}
+
+fn equal_mass_tps_train_test_designs(
+    x_train: &Array2<f64>,
+    x_test: &Array2<f64>,
+    centers: usize,
+) -> (Array2<f64>, Array2<f64>) {
+    let train_spec = ThinPlateBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint {
+            num_centers: centers,
+        },
+        length_scale: 1.0,
+        double_penalty: false,
+        identifiability: SpatialIdentifiability::None,
+        radial_reparam: None,
+    };
+    let train = build_thin_plate_basis(x_train.view(), &train_spec)
+        .expect("training TPS basis with equal-mass centers");
+    let (fit_centers, radial_reparam) = match &train.metadata {
+        BasisMetadata::ThinPlate {
+            centers,
+            radial_reparam,
+            ..
+        } => (centers.clone(), radial_reparam.clone()),
+        _ => panic!("expected ThinPlate metadata"),
+    };
+    let test_spec = ThinPlateBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(fit_centers),
+        length_scale: 1.0,
+        double_penalty: false,
+        identifiability: SpatialIdentifiability::None,
+        radial_reparam,
+    };
+    let test = build_thin_plate_basis(x_test.view(), &test_spec)
+        .expect("test TPS basis with frozen centers");
+    (train.design.to_dense(), test.design.to_dense())
 }
 
 // ─── Linear-algebra helpers ──────────────────────────────────────────────────
@@ -129,13 +249,10 @@ fn tps_k18_basis_must_span_smooth_bivariate_function() {
     let noise = Normal::new(0.0, 0.05).unwrap();
     let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
 
-    let (basis_train, knots) = create_thin_plate_spline_basis_with_knot_count(xtr.view(), 18)
-        .expect("TPS basis on training data");
-    let basis_test = create_thin_plate_spline_basis(xte.view(), knots.view())
-        .expect("TPS basis on test data with shared knots");
+    let (basis_train, basis_test) = equal_mass_tps_train_test_designs(&xtr, &xte, 18);
 
-    let beta = solve_ridge(&basis_train.basis, &ytr, 1e-10);
-    let yhat_test = basis_test.basis.dot(&beta);
+    let beta = solve_ridge(&basis_train, &ytr, 1e-10);
+    let yhat_test = basis_test.dot(&beta);
     let r2 = r_squared(&yte_clean, &yhat_test);
 
     assert!(
@@ -171,13 +288,10 @@ fn tps_k18_basis_must_span_smooth_bivariate_function_ridge_stabilized() {
     let noise = Normal::new(0.0, 0.05).unwrap();
     let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
 
-    let (basis_train, knots) = create_thin_plate_spline_basis_with_knot_count(xtr.view(), 18)
-        .expect("TPS basis on training data");
-    let basis_test = create_thin_plate_spline_basis(xte.view(), knots.view())
-        .expect("TPS basis on test data with shared knots");
+    let (basis_train, basis_test) = equal_mass_tps_train_test_designs(&xtr, &xte, 18);
 
-    let beta = solve_ridge(&basis_train.basis, &ytr, 1e-4);
-    let yhat_test = basis_test.basis.dot(&beta);
+    let beta = solve_ridge(&basis_train, &ytr, 1e-4);
+    let yhat_test = basis_test.dot(&beta);
     let r2 = r_squared(&yte_clean, &yhat_test);
 
     assert!(
@@ -212,13 +326,10 @@ fn tps_k3_basis_must_span_smooth_univariate_function() {
     let noise = Normal::new(0.0, 0.05).unwrap();
     let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
 
-    let (basis_train, knots) = create_thin_plate_spline_basis_with_knot_count(xtr.view(), 3)
-        .expect("TPS basis on training data");
-    let basis_test = create_thin_plate_spline_basis(xte.view(), knots.view())
-        .expect("TPS basis on test data with shared knots");
+    let (basis_train, basis_test) = equal_mass_tps_train_test_designs(&xtr, &xte, 3);
 
-    let beta = solve_ridge(&basis_train.basis, &ytr, 1e-10);
-    let yhat_test = basis_test.basis.dot(&beta);
+    let beta = solve_ridge(&basis_train, &ytr, 1e-10);
+    let yhat_test = basis_test.dot(&beta);
     let r2 = r_squared(&yte_clean, &yhat_test);
 
     assert!(
@@ -230,7 +341,62 @@ fn tps_k3_basis_must_span_smooth_univariate_function() {
     );
 }
 
-/// **TEST D — REML must find an interior optimum, not the upper boundary.**
+/// **TEST D — seed-118 marginal geometry, without REML.**
+///
+/// The seed-118 fuzz failure is not a single 2D TPS; it is two independent
+/// one-dimensional TPS smooths with k=18 on skewed covariates:
+///
+///   y ~ s(x0, type=tps, centers=18) + s(x1, type=tps, centers=18)
+///
+/// This test builds exactly that two-block basis and fits it by near-OLS on a
+/// deterministic additive sawtooth-plus-polynomial target. If this fails, the
+/// marginal k=18 basis itself is the bottleneck. If this passes while the full
+/// GAM still over-smooths, the bug is in REML/outer smoothing-parameter
+/// selection rather than basis coverage.
+#[test]
+fn tps_two_marginal_k18_blocks_must_span_seed118_style_additive_signal() {
+    let mut rng = StdRng::seed_from_u64(0x118_BA51_C046E);
+    let x_all_raw = skewed_2d(&mut rng, 150);
+    let y0_all = standardize(sawtooth_signal(&x_all_raw.column(0).to_owned()));
+    let y1_all = standardize(polynomial_signal(&x_all_raw.column(1).to_owned()));
+    let y_all_clean = y0_all + &(0.75 * y1_all);
+
+    let xtr_raw = x_all_raw.slice(s![0..120, ..]).to_owned();
+    let xte_raw = x_all_raw.slice(s![120..150, ..]).to_owned();
+    let (xtr, xte) = zscore_train_test(xtr_raw, xte_raw);
+    let ytr_clean = y_all_clean.slice(s![0..120]).to_owned();
+    let yte_clean = y_all_clean.slice(s![120..150]).to_owned();
+    let x0_tr = xtr.column(0).to_owned();
+    let x1_tr = xtr.column(1).to_owned();
+    let x0_te = xte.column(0).to_owned();
+    let x1_te = xte.column(1).to_owned();
+    let noise = Normal::new(0.0, 0.02).unwrap();
+    let ytr = Array1::from_iter(ytr_clean.iter().map(|v| v + noise.sample(&mut rng)));
+
+    let x0_tr_mat = x0_tr.view().insert_axis(ndarray::Axis(1)).to_owned();
+    let x1_tr_mat = x1_tr.view().insert_axis(ndarray::Axis(1)).to_owned();
+    let x0_te_mat = x0_te.view().insert_axis(ndarray::Axis(1)).to_owned();
+    let x1_te_mat = x1_te.view().insert_axis(ndarray::Axis(1)).to_owned();
+
+    let (b0_train, b0_test) = equal_mass_tps_train_test_designs(&x0_tr_mat, &x0_te_mat, 18);
+    let (b1_train, b1_test) = equal_mass_tps_train_test_designs(&x1_tr_mat, &x1_te_mat, 18);
+
+    let x_train = two_block_design(&b0_train, &b1_train);
+    let x_test = two_block_design(&b0_test, &b1_test);
+    let beta = solve_ridge(&x_train, &ytr, 1e-10);
+    let yhat_test = x_test.dot(&beta);
+    let r2 = r_squared(&yte_clean, &yhat_test);
+
+    assert!(
+        r2 >= 0.82,
+        "Two marginal TPS k=18 blocks fail to span seed-118-style additive signal: \
+         held-out R² = {:.4} < 0.82. This localizes the failure to marginal \
+         basis capacity rather than REML.",
+        r2
+    );
+}
+
+/// **TEST E — REML must find an interior optimum, not the upper boundary.**
 ///
 /// This test will be added in a follow-up once the rust API for fitting a
 /// TPS smooth via fit_gam is reconciled with the current PenaltySpec /
